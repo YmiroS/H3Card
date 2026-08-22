@@ -38,13 +38,11 @@
  "134": {
   "class_type": "ComfyMathExpression",
   "inputs": {
-   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
-   "values": [
-    [
-     "142",
-     0
-    ]
-   ]
+   "values.a": [
+    "142",
+    0
+   ],
+   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"
   },
   "_meta": {
    "title": "Math Expression"
