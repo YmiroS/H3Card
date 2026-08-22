@@ -678,7 +678,16 @@ function openPanel(id) {
   }
   if (!cap) { el.panel.appendChild(errBox("能力不可用")); return placePanel(); }
 
-  const specs = cap.inputs;
+  // 合并模式的槽位按图槽最多那条画（它是超集），但默认值得取「按当前张数真正会跑的
+  // 那条」。不这么做的话，面板显示的是首尾帧那条的示例提示词，只传一张图跑的却是
+  // 图生视频那条的示例提示词 —— 看到的和出片的不是一回事。
+  const rcap = CAPS[runCap(c)];
+  const specs = (rcap && rcap !== cap)
+    ? cap.inputs.map((s) => {
+      const o = rcap.inputs.find(x => x.key === s.key);
+      return o && o.default !== s.default ? { ...s, default: o.default } : s;
+    })
+    : cap.inputs;
   // 中间这坨才滚动：模式切换留在顶部、运行按钮留在底部，参数再多也不会被推出屏幕
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
@@ -730,7 +739,7 @@ function openPanel(id) {
   for (const s of rows) body.appendChild(rowEl(c, s));
 
   // --- 高级 ---
-  const adv = specs.filter(x => x.advanced);
+  const adv = specs.filter(x => x.advanced && !x.mirror);
   if (adv.length) {
     const box = document.createElement("div"); box.className = "adv";
     const t = document.createElement("button");
