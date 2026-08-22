@@ -1,0 +1,64 @@
+{
+ "id": "flux2_klein_storyboard9",
+ "name": "九宫格Qwen3.5-Flux2-Kelin一键故事分镜",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\3-Flux2-klein全系列\\九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json",
+ "group": "图片",
+ "outputType": "image",
+ "card": "image",
+ "slots": "img1+aud0",
+ "images": 1,
+ "audios": 0,
+ "graph": "graphs/flux2_klein_storyboard9.api.json",
+ "output": {
+  "node": "9"
+ },
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "76",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "写实风格，苗疆女孩探险的故事",
+   "target": {
+    "node": "183:182",
+    "input": "custom_prompt"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 311130314938631,
+   "target": {
+    "node": "183:182",
+    "input": "seed",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 551420480417732,
+   "target": {
+    "node": "183:167",
+    "input": "noise_seed",
+    "vtype": "INT"
+   },
+   "mirror": true
+  }
+ ],
+ "warnings": [
+  "子图工作流：使用已导出的 flux2_klein_storyboard9.api.json（本地未重新转换）"
+ ]
+}

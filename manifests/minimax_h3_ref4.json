@@ -1,0 +1,86 @@
+{
+ "id": "minimax_h3_ref4",
+ "name": "MiniMax H3  四图全能参考单采",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3  四图全能参考单采.json",
+ "group": "视频",
+ "outputType": "video",
+ "card": "video",
+ "slots": "img3+aud0",
+ "images": 3,
+ "audios": 0,
+ "graph": "graphs/minimax_h3_ref4.api.json",
+ "output": {
+  "node": "38"
+ },
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "场景",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "47",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "images[1]",
+   "label": "角色",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "48",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "images[2]",
+   "label": "图片",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "49",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "",
+   "target": {
+    "node": "68",
+    "input": "text"
+   }
+  },
+  {
+   "key": "duration",
+   "label": "时长(秒)",
+   "type": "slider",
+   "min": 3,
+   "max": 30,
+   "step": 1,
+   "default": 10,
+   "target": {
+    "node": "20",
+    "input": "value",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 911243928847175,
+   "target": {
+    "node": "3",
+    "input": "noise_seed",
+    "vtype": "INT"
+   }
+  }
+ ],
+ "warnings": []
+}

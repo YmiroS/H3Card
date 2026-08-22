@@ -1,0 +1,416 @@
+{
+  "9": {
+    "inputs": {
+      "filename_prefix": "Flux2-Klein",
+      "images": [
+        "183:181",
+        0
+      ]
+    },
+    "class_type": "SaveImage",
+    "_meta": {
+      "title": "保存图像"
+    }
+  },
+  "76": {
+    "inputs": {
+      "image": "ComfyUI_temp_sroto_00004_.png"
+    },
+    "class_type": "LoadImage",
+    "_meta": {
+      "title": "加载图像"
+    }
+  },
+  "183:160": {
+    "inputs": {
+      "noise": [
+        "183:167",
+        0
+      ],
+      "guider": [
+        "183:161",
+        0
+      ],
+      "sampler": [
+        "183:166",
+        0
+      ],
+      "sigmas": [
+        "183:162",
+        0
+      ],
+      "latent_image": [
+        "183:169",
+        0
+      ]
+    },
+    "class_type": "SamplerCustomAdvanced",
+    "_meta": {
+      "title": "自定义采样器(高级)"
+    }
+  },
+  "183:161": {
+    "inputs": {
+      "cfg": 1,
+      "model": [
+        "183:172",
+        0
+      ],
+      "positive": [
+        "183:168:77",
+        0
+      ],
+      "negative": [
+        "183:168:184",
+        0
+      ]
+    },
+    "class_type": "CFGGuider",
+    "_meta": {
+      "title": "CFG引导"
+    }
+  },
+  "183:162": {
+    "inputs": {
+      "steps": 4,
+      "width": [
+        "183:174",
+        0
+      ],
+      "height": [
+        "183:174",
+        1
+      ]
+    },
+    "class_type": "Flux2Scheduler",
+    "_meta": {
+      "title": "Flux2代 调度器"
+    }
+  },
+  "183:163": {
+    "inputs": {
+      "conditioning": [
+        "183:176",
+        0
+      ]
+    },
+    "class_type": "ConditioningZeroOut",
+    "_meta": {
+      "title": "条件零化"
+    }
+  },
+  "183:164": {
+    "inputs": {
+      "vae_name": "flux2-vae.safetensors"
+    },
+    "class_type": "VAELoader",
+    "_meta": {
+      "title": "加载VAE"
+    }
+  },
+  "183:166": {
+    "inputs": {
+      "sampler_name": "res_2m"
+    },
+    "class_type": "KSamplerSelect",
+    "_meta": {
+      "title": "K采样器选择"
+    }
+  },
+  "183:168:184": {
+    "inputs": {
+      "conditioning": [
+        "183:163",
+        0
+      ],
+      "latent": [
+        "183:168:78",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "参考Latent"
+    }
+  },
+  "183:168:77": {
+    "inputs": {
+      "conditioning": [
+        "183:176",
+        0
+      ],
+      "latent": [
+        "183:168:78",
+        0
+      ]
+    },
+    "class_type": "ReferenceLatent",
+    "_meta": {
+      "title": "参考Latent"
+    }
+  },
+  "183:168:78": {
+    "inputs": {
+      "pixels": [
+        "76",
+        0
+      ],
+      "vae": [
+        "183:164",
+        0
+      ]
+    },
+    "class_type": "VAEEncode",
+    "_meta": {
+      "title": "VAE编码"
+    }
+  },
+  "183:169": {
+    "inputs": {
+      "width": [
+        "183:174",
+        0
+      ],
+      "height": [
+        "183:174",
+        1
+      ],
+      "batch_size": 1
+    },
+    "class_type": "EmptyFlux2LatentImage",
+    "_meta": {
+      "title": "Flux2代 空Latent"
+    }
+  },
+  "183:172": {
+    "inputs": {
+      "enable_fp16_accumulation": true,
+      "model": [
+        "183:170",
+        0
+      ]
+    },
+    "class_type": "ModelPatchTorchSettings",
+    "_meta": {
+      "title": "模型贴片Torch设置"
+    }
+  },
+  "183:174": {
+    "inputs": {
+      "image": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "GetImageSize",
+    "_meta": {
+      "title": "获取图像尺寸"
+    }
+  },
+  "183:177": {
+    "inputs": {
+      "separator": "",
+      "prompt2": [
+        "183:175",
+        0
+      ]
+    },
+    "class_type": "easy promptConcat",
+    "_meta": {
+      "title": "提示词合并"
+    }
+  },
+  "183:179": {
+    "inputs": {
+      "model": "Qwen3.5-27B-UD-IQ3_XXS.gguf",
+      "mmproj": "mmproj-F16.gguf",
+      "chat_handler": "Qwen3.5",
+      "n_ctx": 8192,
+      "vram_limit": -1,
+      "image_min_tokens": 0,
+      "image_max_tokens": 0
+    },
+    "class_type": "llama_cpp_model_loader",
+    "_meta": {
+      "title": "Llama-Cpp 模型加载器"
+    }
+  },
+  "183:187": {
+    "inputs": {
+      "clip_name": "qwen_3_8b_fp4mixed.safetensors",
+      "type": "flux2",
+      "device": "default"
+    },
+    "class_type": "CLIPLoader",
+    "_meta": {
+      "title": "加载CLIP"
+    }
+  },
+  "183:189": {
+    "inputs": {
+      "anything": [
+        "183:181",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "清理GPU占用"
+    }
+  },
+  "183:181": {
+    "inputs": {
+      "samples": [
+        "183:160",
+        0
+      ],
+      "vae": [
+        "183:164",
+        0
+      ]
+    },
+    "class_type": "VAEDecode",
+    "_meta": {
+      "title": "VAE解码"
+    }
+  },
+  "183:170": {
+    "inputs": {
+      "sage_attention": "auto",
+      "allow_compile": true,
+      "model": [
+        "183:186",
+        0
+      ]
+    },
+    "class_type": "PathchSageAttentionKJ",
+    "_meta": {
+      "title": "SAGE注意力补丁(KJ)"
+    }
+  },
+  "183:182": {
+    "inputs": {
+      "preset_prompt": "Normal - Describe",
+      "custom_prompt": "写实风格，苗疆女孩探险的故事",
+      "system_prompt": "Role: 视觉连续性导演 (Visual Continuity Director)\n1. 核心机制：焦点接力 (Focus Relay)\n\n为了实现“流水般”的叙事，你必须遵循微观因果律，而非单纯的动作。\n接力规则：\n\n物理接力：镜头 A 结尾手触碰到门 -> 镜头 B 从门被推开的缝隙看进去。\n视线接力：镜头 A 结尾角色看向天空 -> 镜头 B 也是仰视视角，展示角色眼中的景象。\n环境接力：镜头 A 结尾一阵风吹乱头发 -> 镜头 B 是一片被风吹起的树叶掠过镜头。\n\n2. 图像调性自适应 (Tone Adaptation) - 关键步骤\n\n在生成前，请先判断【参考图像】的属性：\n类型 A [静谧/情感]：衔接靠光影变化、微表情、眼泪、风吹草动。\n类型 B [悬疑/探索]：衔接靠脚步移动、手部触碰、手电筒光束、门的开合。\n类型 C [激烈/战斗]：衔接靠速度线、碰撞、碎片、物理位移。\n\n3. 9镜头通用流体结构 (Universal Fluid Structure)\n\n无论什么类型，必须严格遵循以下镜头焦点的转移逻辑：\n\n镜头1 [全景入画]：大环境 -> 视觉锚点(Visual Anchor) 处于环境中。\n镜头2 [推进/聚焦]：镜头推近 -> 聚焦于 Visual Anchor 的某个局部（眼睛/手/配饰）。\n镜头3 [触发/诱因]：环境发生微小变化（光线移动/风吹过/出现声音），引起 Visual Anchor 注意。\n镜头4 [反应/互动]：Visual Anchor 做出反应（转头/伸手/起步/眼神流转）。\n镜头5 [过程/流动]：Visual Anchor 正在进行某个动作（行走/奔跑/抚摸/哭泣），强调动作的进行时。\n镜头6 [高点/特写]：动作的关键瞬间或情绪的最高点（手指触碰物体/泪水滴落/全力冲刺）。\n镜头7 [变化/后果]：由于镜头6的动作，环境产生了反馈（物体亮起/花瓣散开/门打开/敌人倒下）。\n镜头8 [余韵/局部]：聚焦于变化的后果细节（发光的纹路/地上的水渍/飘落的羽毛）。\n镜头9 [拉远/出画]：镜头拉远，Visual Anchor 与改变后的环境融为一体或离开。\n\n4. 参考案例 (Non-Combat Case: 情感/治愈)\n(假设提示词输入：夕阳下抱着吉他的女孩)\nAI Output:\n(Scene：1) 远景/逆光 :: 夕阳将金色的光辉洒满草地，抱着木吉他的长发女孩独自坐在山坡的长椅上，身影被拉得很长 :: 宁静，暖色调\n(Scene：2) 推进/侧面特写 :: 镜头缓慢推进，微风轻轻吹起抱着木吉他的长发女孩耳边的碎发，她的睫毛在夕阳下闪烁微光 :: 细腻，发丝飘动\n(Scene：3) 特写/手部 :: 抱着木吉他的长发女孩的纤细手指轻轻按在琴弦上，空气中仿佛凝固着即将弹奏前的寂静 :: 准备动作，指尖细节\n(Scene：4) 中景/开始 :: 抱着木吉他的长发女孩的手腕轻柔地摆动，拨响了第一根琴弦，琴弦震动的波纹仿佛在空气中扩散 :: 动作起始，优雅\n(Scene：5) 环绕镜头/动态 :: 随着旋律的流淌，抱着木吉他的长发女孩闭上眼睛沉浸在音乐中，镜头围绕她缓慢旋转，捕捉她陶醉的神情 :: 沉浸感，流动\n(Scene：6) 极近特写/高潮 :: 抱着木吉他的长发女孩眼角滑落一滴晶莹的泪珠，泪珠正好滴落在琴箱的边缘，折射出夕阳的红光 :: 情绪爆发，微距美学\n(Scene：7) 过肩镜头/视线 :: 顺着抱着木吉他的长发女孩睁开的视线望去，远处的飞鸟正成群结队地飞向落日 :: 视线引导，开阔\n(Scene：8) 远景/背面 :: 抱着木吉他的长发女孩停止了弹奏，依然保持着抱琴的姿势，看着飞鸟消失在地平线 :: 动作结束，留白\n(Scene：9) 大远景/拉高 :: 镜头垂直拉高，抱着木吉他的长发女孩变成了草地上一个小小的点，被巨大的星空夜幕逐渐笼罩 :: 时间流逝，结局\n\n5. 正式执行 (Execute)\n\n请分析我上传的图片，首先判断是[静谧/情感]、[悬疑/探索]还是[激烈/战斗]等类型，然后提取Visual Anchor，严格按照“焦点接力”逻辑生成9行分镜。图像内容提供参考，可以不是分镜的具体内容。要求：禁止废话，禁止空行，禁止代词，确保镜头之间有电影剪辑般的逻辑连贯性。\n\n# : 强制排版约束 (Output Layout) - 重要\n1.  **紧凑输出**：所有输出必须是一个**连续的文本块**。\n2.  **零空行**：在 `Scene` 与 `Scene` 之间，**严禁插入空行**。\n3.  **换行符**：仅允许使用单次换行（Single Line Break），禁止使用段落分行。\n4.  **仅场景**：仅允许scene的描述，禁止描述故事题目等和scene无直接相关的词\n\n# Example (排版正确示范)\nScene：...\nScene：...\nScene：...\n(注意：上面这三行是紧挨着的，中间没有空隙)\n\n# Action\n请执行生成，确保结果紧凑无空行。",
+      "inference_mode": "images",
+      "max_frames": 24,
+      "max_size": 256,
+      "seed": 311130314938631,
+      "force_offload": false,
+      "save_states": false,
+      "llama_model": [
+        "183:179",
+        0
+      ],
+      "parameters": [
+        "183:173",
+        0
+      ],
+      "images": [
+        "76",
+        0
+      ]
+    },
+    "class_type": "llama_cpp_instruct_adv",
+    "_meta": {
+      "title": "llama_cpp_指令（高级）"
+    }
+  },
+  "183:190": {
+    "inputs": {
+      "anything": [
+        "183:182",
+        0
+      ]
+    },
+    "class_type": "easy cleanGpuUsed",
+    "_meta": {
+      "title": "清理GPU占用"
+    }
+  },
+  "183:180": {
+    "inputs": {
+      "text_0": "Scene：1 远景/逆光 :: 熙攘的苗疆古街集市，阳光穿过屋檐洒下光柱，身穿蓝绿刺绣长裙头戴银花冠的少女高举一只古朴铜铃，成为画面中心的视觉锚点 :: 暖调，集市背景虚化\nScene：2 推进/聚焦 :: 镜头快速推进至少女高举的铜铃特写，阳光在铜铃表面雕刻的古老图腾上反射出耀眼的金属光泽 :: 质感，金属反光\nScene：3 触发/诱因 :: 铜铃内部因少女的手指微动而发出清脆声响，声波仿佛具象化为肉眼可见的涟漪扩散 :: 声音视觉化，动态波纹\nScene：4 反应/互动 :: 少女嘴角上扬露出自信微笑，眼神中闪烁着探险的期待，手腕顺势向下挥动 :: 表情特写，动作起始\nScene：5 过程/流动 :: 镜头跟随手腕的挥动轨迹，铜铃在空中划出一道优雅的弧线，带动周围空气微微流动 :: 动态模糊，轨迹跟随\nScene：6 高点/特写 :: 铜铃撞击的瞬间，铃舌与铃壁碰撞激起细微的震动，少女眼中的光芒与铜铃的震动频率同步 :: 微距，震动细节\nScene：7 变化/后果 :: 随着清脆的铃声传开，集市背景中原本模糊的人影似乎被声音吸引，纷纷向镜头方向侧目 :: 环境反馈，视线汇聚\nScene：8 余韵/局部 :: 镜头聚焦于铜铃底部的流苏，在余音中轻轻颤动，阳光在流苏间跳跃闪烁 :: 细节特写，光影斑驳\nScene：9 拉远/出画 :: 镜头迅速拉远，少女站在喧闹的街道中央，手中的铜铃仍在回荡，仿佛开启了通往神秘世界的门扉 :: 大景，叙事闭环",
+      "text": [
+        "183:190",
+        0
+      ]
+    },
+    "class_type": "ShowText|pysssss",
+    "_meta": {
+      "title": "展示文本🐍"
+    }
+  },
+  "183:175": {
+    "inputs": {
+      "prompt": [
+        "183:180",
+        0
+      ],
+      "start_index": 0,
+      "max_rows": 1000,
+      "remove_empty_lines": ""
+    },
+    "class_type": "easy promptLine",
+    "_meta": {
+      "title": "提示词行"
+    }
+  },
+  "183:167": {
+    "inputs": {
+      "noise_seed": 551420480417732
+    },
+    "class_type": "RandomNoise",
+    "_meta": {
+      "title": "随机噪波"
+    }
+  },
+  "183:176": {
+    "inputs": {
+      "text": [
+        "183:177",
+        0
+      ],
+      "clip": [
+        "183:187",
+        0
+      ]
+    },
+    "class_type": "CLIPTextEncode",
+    "_meta": {
+      "title": "CLIP Text Encode (Positive Prompt)"
+    }
+  },
+  "183:173": {
+    "inputs": {
+      "max_tokens": 1024,
+      "top_k": 30,
+      "top_p": 0.9,
+      "min_p": 0.05,
+      "typical_p": 1,
+      "temperature": 0.8,
+      "repeat_penalty": 1,
+      "frequency_penalty": 0,
+      "presence_penalty": 1,
+      "mirostat_mode": 0,
+      "mirostat_eta": 0.1,
+      "mirostat_tau": 5,
+      "state_uid": -1
+    },
+    "class_type": "llama_cpp_parameters",
+    "_meta": {
+      "title": "llama_cpp_参数"
+    }
+  },
+  "183:186": {
+    "inputs": {
+      "unet_name": "flux-2-klein-9b-fp8.safetensors",
+      "weight_dtype": "default"
+    },
+    "class_type": "UNETLoader",
+    "_meta": {
+      "title": "UNET加载器"
+    }
+  }
+}

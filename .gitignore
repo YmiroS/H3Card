@@ -1,0 +1,9 @@
+# 运行时数据（可再生 / 用户产物），不入库
+data/
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 软删除的项目文件
+*.deleted

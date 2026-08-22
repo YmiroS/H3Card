@@ -1,0 +1,154 @@
+{
+ "42": {
+  "class_type": "ConditioningZeroOut",
+  "inputs": {
+   "conditioning": [
+    "45",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Conditioning Zero Out"
+  }
+ },
+ "44": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "47",
+    0
+   ],
+   "positive": [
+    "45",
+    0
+   ],
+   "negative": [
+    "42",
+    0
+   ],
+   "latent_image": [
+    "41",
+    0
+   ],
+   "seed": 193753633731160,
+   "steps": 9,
+   "cfg": 1,
+   "sampler_name": "res_multistep",
+   "scheduler": "simple",
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "43": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "44",
+    0
+   ],
+   "vae": [
+    "40",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "9": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "43",
+    0
+   ],
+   "filename_prefix": "z-image"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ },
+ "45": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "39",
+    0
+   ],
+   "text": "开心女生在跳舞"
+  },
+  "_meta": {
+   "title": "CLIP Text Encode (Prompt)"
+  }
+ },
+ "40": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "flux-ae.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "39": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen_3_4b.safetensors",
+   "type": "lumina2",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "41": {
+  "class_type": "EmptySD3LatentImage",
+  "inputs": {
+   "width": 768,
+   "height": 1024,
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "EmptySD3LatentImage"
+  }
+ },
+ "47": {
+  "class_type": "ModelSamplingAuraFlow",
+  "inputs": {
+   "model": [
+    "48",
+    0
+   ],
+   "shift": 3
+  },
+  "_meta": {
+   "title": "ModelSamplingAuraFlow"
+  }
+ },
+ "46": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "zImageTurboQuantized_fp8ScaledE4m3fnKJ.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "48": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "46",
+    0
+   ],
+   "lora_name": "Kook_Zimage_真实幻想_Turbo.safetensors",
+   "strength_model": 1
+  },
+  "_meta": {
+   "title": "Load LoRA"
+  }
+ }
+}
