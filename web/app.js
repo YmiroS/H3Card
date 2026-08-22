@@ -47,7 +47,11 @@ function toast(msg) {
   toastTimer = setTimeout(() => (el.toast.style.display = "none"), 2600);
 }
 const uid = () => Math.random().toString(36).slice(2, 10);
+/** 卡片属于哪一类。以卡内选中的能力为准，c.type 只是兜底：
+    能力被拆成独立卡片后（比如漫剧从"生视频"里单独抽出来），老项目里存的
+    c.type 还指着旧卡，按 c.type 找会拿到一个模式列表里根本没有它的卡。 */
 const cardDef = (t) => CARDS.find(c => c.id === t) || CARDS[0];
+const defOf = (c) => CARDS.find(d => d.modes.some(m => m.id === c.cap)) || cardDef(c.type);
 const capOf = (c) => CAPS[c.cap] || null;
 
 /* ================= H3 画布换算 =================
@@ -292,14 +296,14 @@ function render() {
 }
 
 function buildCard(c) {
-  const def = cardDef(c.type);
+  const def = defOf(c);
   const d = document.createElement("div");
   d.className = "card" + (selId === c.id ? " sel" : "");
   d.dataset.id = c.id;
   d.style.left = c.x + "px"; d.style.top = c.y + "px";
   d.innerHTML = `
     <div class="ch"><span>${def ? def.icon : "▪"}</span><span class="t"></span><button class="x" title="删除">✕</button></div>
-    <div class="body"><span class="ph">${c.type === "card_video" ? "🎬" : "🖼"}</span></div>
+    <div class="body"><span class="ph">${(def && def.outputType) === "video" ? "🎬" : "🖼"}</span></div>
     <div class="bar"><i></i></div>
     <div class="cf"><span class="st"></span><span class="meta" style="margin-left:auto"></span></div>
     <div class="port" title="拖到空白处 → 用本卡产物新建下游卡"></div>`;
@@ -609,7 +613,7 @@ function placePanel() {
 function openPanel(id) {
   const c = PROJ.cards.find(x => x.id === id);
   if (!c) return closePanel();
-  const def = cardDef(c.type), cap = capOf(c);
+  const def = defOf(c), cap = capOf(c);
   // 切 tab / 传图都会整块重画，同一张卡要留住滚动位置，不然每次都弹回顶部
   const old = el.panel.querySelector(".pbody");
   const scrolled = (old && el.panel._id === id) ? old.scrollTop : 0;

@@ -47,10 +47,18 @@
     "id": "minimax_h3_ref4",
     "name": "H3 四图参考生视频",
     "slots": "img3+aud0"
-   },
+   }
+  ]
+ },
+ {
+  "id": "minimax_h3_comic20",
+  "name": "漫剧4宫格",
+  "icon": "▦",
+  "outputType": "video",
+  "modes": [
    {
     "id": "minimax_h3_comic20",
-    "name": "H3 漫剧20宫格·1分钟",
+    "name": "漫剧4宫格",
     "slots": "img5+aud0"
    }
   ]

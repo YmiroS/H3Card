@@ -48,7 +48,7 @@ DISPLAY = {
     "minimax_h3_talk1": "H3 说话唱歌·单人",
     "minimax_h3_talk2": "H3 说话唱歌·双人",
     "minimax_h3_ref4": "H3 四图参考生视频",
-    "minimax_h3_comic20": "H3 漫剧20宫格·1分钟",
+    "minimax_h3_comic20": "漫剧4宫格",
 }
 
 # 文件名里的噪音：实现细节、版本号、厂商前缀
@@ -774,7 +774,9 @@ def scan(path: Path, oi, rel_key=None):
         "source": str(path),
         "group": {"video": "视频", "image": "图片", "audio": "音频"}.get(out_type, "其他"),
         "outputType": out_type,
-        "card": out_type,                       # 归并到哪张卡
+        # 归并到哪张卡。素材形态有硬要求的（比如每张图得是宫格拼图）单独成卡：
+        # 玩法跟普通生视频不是一回事，塞进同一张卡的模式列表里没人找得到。
+        "card": wid if note else out_type,
         "slots": f"img{n_img}+aud{n_aud}",      # 槽位指纹
         "images": n_img,
         "audios": n_aud,
@@ -848,11 +850,12 @@ def main():
         "audio": ("card_audio", "生音频", "🎵"),
     }
     cards = []
-    for out_type, ms in groups.items():
-        cid, cname, icon = CARD_META.get(out_type, ("card_" + out_type, out_type, "◻"))
+    for key, ms in groups.items():
         ms.sort(key=lambda m: (m["images"], m["audios"]))
+        # 没进 CARD_META 的 key 就是单独成卡的能力，卡名直接用它自己的名字
+        cid, cname, icon = CARD_META.get(key, (key, ms[0]["name"], "▦"))
         cards.append({
-            "id": cid, "name": cname, "icon": icon, "outputType": out_type,
+            "id": cid, "name": cname, "icon": icon, "outputType": ms[0]["outputType"],
             "modes": [{"id": m["id"], "name": m["name"], "slots": m["slots"]} for m in ms],
         })
     (ROOT / "manifests" / "_cards.json").write_text(
