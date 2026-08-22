@@ -224,6 +224,13 @@ async def handle_event(session, ev):
     pid = d.get("prompt_id")
     job = JOBS.get(pid) if pid else None
 
+    # 失败 / 取消 / 完成都是终局。ComfyUI 报错之后还会补发 executing(node=None)、
+    # progress 这类收尾事件，放进来会把状态改回 done —— 一次失败在界面上显示成
+    # "生成成功"，卡片还挂着上一次的产物，比直接报错更难查。
+    if job and job["status"] in ("error", "canceled", "done") and t in (
+            "execution_start", "executing", "progress", "progress_state"):
+        return
+
     if t == "execution_start" and job:
         job.update(status="running", started=time.time())
     elif t == "executing" and job:
