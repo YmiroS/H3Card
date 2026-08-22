@@ -40,7 +40,15 @@
      "1": "minimax_h3_talk1",
      "2": "minimax_h3_talk2"
     }
-   },
+   }
+  ]
+ },
+ {
+  "id": "minimax_h3_ref4",
+  "name": "H3 四图参考生视频",
+  "icon": "🎬",
+  "outputType": "video",
+  "modes": [
    {
     "id": "minimax_h3_ref4",
     "name": "H3 四图参考生视频",

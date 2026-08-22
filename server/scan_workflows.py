@@ -51,6 +51,10 @@ DISPLAY = {
     "minimax_h3_comic20": "漫剧4宫格",
 }
 
+# 画布上单独占一张卡的能力。素材形态有硬要求的（有 note，比如漫剧要宫格拼图）
+# 会自动单独成卡；这里补的是玩法差别大、不该藏在别人模式列表里第 N 项的。
+SOLO = {"minimax_h3_ref4"}
+
 # 文件名里的噪音：实现细节、版本号、厂商前缀
 NOISE_PAREN = re.compile(r"[（(][^）)]*(?:步|加速|版|V\d)[^）)]*[）)]")
 VENDOR = re.compile(r"mini\s*max\s*[-_ ]?h3|minimaxh3|minimax", re.I)
@@ -821,9 +825,9 @@ def scan(path: Path, oi, rel_key=None):
         "source": str(path),
         "group": {"video": "视频", "image": "图片", "audio": "音频"}.get(out_type, "其他"),
         "outputType": out_type,
-        # 归并到哪张卡。素材形态有硬要求的（比如每张图得是宫格拼图）单独成卡：
+        # 归并到哪张卡。素材形态有硬要求的（比如每张图得是宫格拼图）自动单独成卡，
         # 玩法跟普通生视频不是一回事，塞进同一张卡的模式列表里没人找得到。
-        "card": wid if note else out_type,
+        "card": wid if (note or wid in SOLO) else out_type,
         "slots": f"img{n_img}+aud{n_aud}",      # 槽位指纹
         "images": n_img,
         "audios": n_aud,
@@ -899,8 +903,11 @@ def main():
     cards = []
     for key, ms in groups.items():
         ms.sort(key=lambda m: (m["images"], m["audios"]))
-        # 没进 CARD_META 的 key 就是单独成卡的能力，卡名直接用它自己的名字
-        cid, cname, icon = CARD_META.get(key, (key, ms[0]["name"], "▦"))
+        # 没进 CARD_META 的 key 就是单独成卡的能力，卡名直接用它自己的名字；
+        # 要宫格拼图的给个 ▦，其余跟着产出类型的图标走
+        solo_icon = "▦" if ms[0].get("note") else CARD_META.get(ms[0]["outputType"],
+                                                               (0, 0, "◻"))[2]
+        cid, cname, icon = CARD_META.get(key, (key, ms[0]["name"], solo_icon))
         cards.append({
             "id": cid, "name": cname, "icon": icon, "outputType": ms[0]["outputType"],
             "modes": build_modes(ms),
