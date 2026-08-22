@@ -13,6 +13,7 @@
  "output": {
   "node": "38"
  },
+ "note": null,
  "inputs": [
   {
    "key": "images[0]",

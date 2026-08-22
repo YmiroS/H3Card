@@ -13,6 +13,7 @@
  "output": {
   "node": "79"
  },
+ "note": "每张图都要是 2×2 的四宫格拼图，上传后自动切成 4 个分镜、连成一段视频。传满 5 张就是 20 宫格，按顺序接成一整条完整视频。",
  "inputs": [
   {
    "key": "images[0]",
@@ -23,7 +24,11 @@
     "node": "193",
     "input": "image",
     "kind": "upload_image"
-   }
+   },
+   "grid": [
+    2,
+    2
+   ]
   },
   {
    "key": "images[1]",
@@ -38,7 +43,11 @@
    "dropIfEmpty": {
     "node": "296",
     "input": "image_2"
-   }
+   },
+   "grid": [
+    2,
+    2
+   ]
   },
   {
    "key": "images[2]",
@@ -53,7 +62,11 @@
    "dropIfEmpty": {
     "node": "296",
     "input": "image_3"
-   }
+   },
+   "grid": [
+    2,
+    2
+   ]
   },
   {
    "key": "images[3]",
@@ -68,7 +81,11 @@
    "dropIfEmpty": {
     "node": "296",
     "input": "image_4"
-   }
+   },
+   "grid": [
+    2,
+    2
+   ]
   },
   {
    "key": "images[4]",
@@ -83,7 +100,11 @@
    "dropIfEmpty": {
     "node": "296",
     "input": "image_5"
-   }
+   },
+   "grid": [
+    2,
+    2
+   ]
   },
   {
    "key": "prompt",
