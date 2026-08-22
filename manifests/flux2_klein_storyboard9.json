@@ -37,6 +37,22 @@
    }
   },
   {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 4,
+   "hint": "越大越精细也越慢。默认值是配合加速模型调好的，调低会花，调高基本白等",
+   "advanced": true,
+   "target": {
+    "node": "183:162",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
    "key": "seed",
    "label": "种子",
    "type": "seed",

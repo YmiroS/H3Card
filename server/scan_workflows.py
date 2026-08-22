@@ -56,6 +56,19 @@ DISPLAY = {
 # 会自动单独成卡；这里补的是玩法差别大、不该藏在别人模式列表里第 N 项的。
 SOLO = {"minimax_h3_ref4"}
 
+# 高级旋钮：这几个 widget 名不管挂在哪个节点上语义都一样，值得开出来给人调。
+# 范围只能自己给 —— object_info 的范围是给专业用户的（步数上限 10000、LoRA 强度
+# -100~100），照抄出来的滑条根本没法用。
+# key -> (界面名, 最小, 最大, 步进, 说明)
+KNOBS = {
+    "steps": ("采样步数", 1, 40, 1,
+              "越大越精细也越慢。默认值是配合加速模型调好的，调低会花，调高基本白等"),
+    "strength_model": ("加速模型强度", 0, 2, 0.05,
+                       "调低更接近原始模型、画质略好但慢很多；调到 0 等于不用加速"),
+    "processing_control_value": ("提速档位", 0, 0.5, 0.005,
+                                 "越大越快，代价是细节和动作幅度变差；0 = 不提速"),
+}
+
 # 文件名里的噪音：实现细节、版本号、厂商前缀
 NOISE_PAREN = re.compile(r"[（(][^）)]*(?:步|加速|版|V\d)[^）)]*[）)]")
 VENDOR = re.compile(r"mini\s*max\s*[-_ ]?h3|minimaxh3|minimax", re.I)
@@ -506,8 +519,12 @@ def derive_inputs(api, oi):
                 hint = f"{title or ''} {f}".lower()
                 if low in ("seed", "noise_seed", "rand_seed"):
                     seeds.append((nid, f, v, t))
+                elif low in KNOBS and t in ("INT", "FLOAT"):
+                    # 这几个旋钮基本都长在采样器/LoRA/加速这类"后台节点"上，
+                    # 所以要抢在 HIDDEN_TYPES 之前放行
+                    params.append((nid, title, f, v, "knob", t))
                 elif ct in HIDDEN_TYPES:
-                    continue                              # 后台节点只取种子
+                    continue                              # 后台节点只取种子和白名单旋钮
                 elif low in RES_FIELDS and (low == "scale_to_length"
                                             or is_size_provider(oi, ct)):
                     res.append((nid, f, low, v, t, opts))
@@ -636,6 +653,16 @@ def derive_inputs(api, oi):
             out.append({"key": "duration", "label": "时长(秒)", "type": "slider",
                         "min": 3, "max": 30, "step": 1, "default": val,
                         "target": {"node": nid, "input": field, "vtype": vt}})
+        elif kind == "knob":
+            key = field.lower()
+            label, lo, hi, step, hint = KNOBS[key]
+            item = {"key": key, "label": label, "type": "slider",
+                    "min": lo, "max": max(hi, val), "step": step, "default": val,
+                    "hint": hint, "advanced": True,
+                    "target": {"node": nid, "input": field, "vtype": vt}}
+            if any(x["key"] == key for x in out):
+                item["mirror"] = True      # 同名旋钮出现多次：只画一个框，一起改
+            out.append(item)
         elif kind == "size":
             out.append({"key": title, "label": {"width": "宽", "height": "高"}[title],
                         "type": "number", "default": val,
@@ -662,10 +689,13 @@ def derive_inputs(api, oi):
         if item:
             out.append(item)
     for nid, title in crops:
-        out.append({"key": "audio_start", "label": "音频起点", "type": "text", "default": "0:00",
-                    "advanced": True, "target": {"node": nid, "input": "start_time"}})
-        out.append({"key": "audio_end", "label": "音频终点", "type": "text", "default": "0:05",
-                    "advanced": True, "target": {"node": nid, "input": "end_time"}})
+        # 默认值必须读工作流里的真值。写死 0:05 的话，模板本来裁 10 秒的（说话唱歌·双人
+        # 就是）会被面板悄悄改成 5 秒，音频被砍一半还看不出是谁干的
+        for key, label, field in (("audio_start", "音频起点", "start_time"),
+                                  ("audio_end", "音频终点", "end_time")):
+            out.append({"key": key, "label": label, "type": "text",
+                        "default": api[nid]["inputs"].get(field), "advanced": True,
+                        "target": {"node": nid, "input": field}})
     for i, (nid, field, val, vt) in enumerate(seeds):
         item = {"key": "seed", "label": "种子", "type": "seed", "default": val,
                 "target": {"node": nid, "input": field, "vtype": vt or "INT"}}

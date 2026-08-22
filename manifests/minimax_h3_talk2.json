@@ -61,6 +61,54 @@
    "hint": "Input Text (Prompt)"
   },
   {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 8,
+   "hint": "越大越精细也越慢。默认值是配合加速模型调好的，调低会花，调高基本白等",
+   "advanced": true,
+   "target": {
+    "node": "124",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "strength_model",
+   "label": "加速模型强度",
+   "type": "slider",
+   "min": 0,
+   "max": 2,
+   "step": 0.05,
+   "default": 1,
+   "hint": "调低更接近原始模型、画质略好但慢很多；调到 0 等于不用加速",
+   "advanced": true,
+   "target": {
+    "node": "242",
+    "input": "strength_model",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "processing_control_value",
+   "label": "提速档位",
+   "type": "slider",
+   "min": 0,
+   "max": 0.5,
+   "step": 0.005,
+   "default": 0.12,
+   "hint": "越大越快，代价是细节和动作幅度变差；0 = 不提速",
+   "advanced": true,
+   "target": {
+    "node": "244",
+    "input": "processing_control_value",
+    "vtype": "FLOAT"
+   }
+  },
+  {
    "key": "aspect_ratio",
    "label": "画面比例",
    "type": "select",
@@ -109,7 +157,7 @@
    "key": "audio_end",
    "label": "音频终点",
    "type": "text",
-   "default": "0:05",
+   "default": "0:10",
    "advanced": true,
    "target": {
     "node": "177",
