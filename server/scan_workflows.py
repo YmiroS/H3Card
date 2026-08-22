@@ -108,12 +108,17 @@ DURATION_HINTS = ("duration", "时长", "秒")
 #   ResolutionSelector          -> aspect_ratio + megapixels  -> width/height
 #   ImageScaleByAspectRatio V2  -> scale_to_length（长边像素）
 # 这几个输入名在任何插件里语义都一致，所以按名字识别，不认节点类名。
-# (标签, 控件, (min, max, step))：上限故意收窄——H3 视频超过 ~2MP / 长边 1536
-# 基本必爆显存，把插件作者给的 16MP 直接摊给用户等于让人踩坑。
+# (标签, 控件, (min, max, step))
+# 上限来自 MiniMax H3 自己的画布常数（comfy_extras/nodes_minimax_h3.py:26-28）：
+#   BASE_SHORT_EDGE = 768        原生短边
+#   MAX_PIXELS = 768 * 1344      面积上限
+#   CANVAS_MULTIPLE = 32         宽高必须是 32 的倍数
+# 换算到 ResolutionSelector 的 megapixels：16:9 下 1.0MP = 1376×768，正好顶到原生
+# 短边；再往上是训练分布外，只会更慢更糊，所以封在 1.1 而不是插件作者给的 16。
 RES_FIELDS = {
     "aspect_ratio":    ("画面比例", "select", None),
-    "megapixels":      ("清晰度(百万像素)", "slider", (0.2, 2.0, 0.1)),
-    "scale_to_length": ("分辨率(长边)", "number", (256, 1536, 32)),
+    "megapixels":      ("分辨率", "slider", (0.2, 1.1, 0.01)),
+    "scale_to_length": ("分辨率(长边)", "number", (512, 1344, 32)),
 }
 
 

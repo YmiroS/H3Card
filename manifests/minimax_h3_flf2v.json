@@ -70,8 +70,8 @@
     "input": "value",
     "vtype": "INT"
    },
-   "min": 256,
-   "max": 1536,
+   "min": 512,
+   "max": 1344,
    "step": 32
   },
   {

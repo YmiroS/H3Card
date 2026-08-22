@@ -50,6 +50,49 @@ const uid = () => Math.random().toString(36).slice(2, 10);
 const cardDef = (t) => CARDS.find(c => c.id === t) || CARDS[0];
 const capOf = (c) => CAPS[c.cap] || null;
 
+/* ================= H3 画布换算 =================
+   ComfyUI 里视频分辨率不是直接填 width/height，而是两条链路算出来的，
+   所以面板上要把它翻译回大家习惯的「多少 p」（p = 短边像素）。
+
+   ResolutionSelector（comfy_extras/nodes_resolution.py）：
+     total = megapixels * 1024 * 1024        ← 注意是 1024²，不是 100 万
+     scale = sqrt(total / (wr * hr))
+     w = round(wr * scale / 32) * 32   h 同理
+   MiniMax H3 的原生画布（comfy_extras/nodes_minimax_h3.py:26-28）：
+     短边 768、面积上限 768*1344、宽高必须是 32 的倍数。
+   于是 16:9 下：0.4MP=864×480(480p)  0.5MP=960×544(544p)
+                0.7MP=1152×640(640p) 1.0MP=1376×768(768p，顶到原生) */
+const RATIO_WH = {
+  "1:1 (Square)": [1, 1], "2:3 (Portrait Photo)": [2, 3], "3:2 (Photo)": [3, 2],
+  "3:4 (Portrait Standard)": [3, 4], "4:3 (Standard)": [4, 3],
+  "9:16 (Portrait Widescreen)": [9, 16], "16:9 (Widescreen)": [16, 9],
+  "21:9 (Ultrawide)": [21, 9],
+};
+const H3_P = [480, 544, 640, 768];
+// scale_to_side=longest 那条链路给的是长边；这几个长边在 16:9 素材上正好落到上面的短边
+const H3_LONG = { 480: 832, 544: 960, 640: 1152, 768: 1344 };
+const MULT = 32;
+
+/** 正算：比例 + megapixels -> [宽, 高]，与 ResolutionSelector 逐步一致 */
+function resFromMP(ratio, mp) {
+  const [wr, hr] = RATIO_WH[ratio] || [1, 1];
+  const scale = Math.sqrt(mp * 1024 * 1024 / (wr * hr));
+  return [Math.round(wr * scale / MULT) * MULT, Math.round(hr * scale / MULT) * MULT];
+}
+/** 反算：想让短边正好落在 p 上，megapixels 该给多少。
+    32 的取整网格上不是每个 megapixels 都能命中，所以按 0.01 往两边试，验算命中为准。*/
+function mpForP(ratio, p) {
+  const [wr, hr] = RATIO_WH[ratio] || [1, 1];
+  const scale = p / Math.min(wr, hr);
+  const base = Math.round(scale * scale * wr * hr / (1024 * 1024) * 100) / 100;
+  for (const d of [0, 1, -1, 2, -2, 3, -3]) {
+    const v = Math.round((base + d * 0.01) * 100) / 100;
+    if (v > 0 && Math.min(...resFromMP(ratio, v)) === p) return v;
+  }
+  return base;
+}
+const shortOf16x9 = (L) => Math.round(L * 9 / 16 / MULT) * MULT;
+
 /* ================= 能力说明浮层 ================= */
 const OUT_TXT = { image: "图片 (png)", video: "视频 (mp4，含音轨)", audio: "音频" };
 
@@ -73,8 +116,8 @@ function capBrief(cap) {
   if (dur) opt.push(`时长 ${dur.min}–${dur.max} 秒`);
   if (size.length) opt.push("画面宽高");
   if (ratio) opt.push(`画面比例（${ratio.options.length} 档，默认 ${ratio.default}）`);
-  if (mp) opt.push(`清晰度 ${mp.min}–${mp.max} 百万像素`);
-  if (side) opt.push(`分辨率长边 ${side.min}–${side.max}，比例跟随原图`);
+  if (mp) opt.push(`分辨率 ${H3_P[0]}p–${H3_P[H3_P.length - 1]}p（短边，768p 为 H3 原生）`);
+  if (side) opt.push(`分辨率长边 ${side.min}–${side.max}，画面比例跟随原图`);
   if (cap.inputs.some(s => s.type === "seed")) opt.push("种子");
   return { need, opt, out: OUT_TXT[cap.outputType] || cap.outputType, file: cap.file || cap.id };
 }
@@ -730,7 +773,11 @@ function rowEl(c, s) {
     const sel = document.createElement("select"); sel.style.flex = "1";
     for (const o of s.options) { const op = document.createElement("option"); op.value = op.textContent = o; sel.appendChild(op); }
     if (cur != null) sel.value = cur;
-    sel.onchange = () => { c.params[s.key] = sel.value; save(); };
+    sel.onchange = () => {
+      c.params[s.key] = sel.value; save();
+      // 比例一换，同一 megapixels 对应的 p 数就变了，整块重画才不会显示过期读数
+      if (s.key === "aspect_ratio") openPanel(c.id);
+    };
     row.appendChild(sel);
   } else {
     const i = document.createElement("input");
@@ -742,7 +789,58 @@ function rowEl(c, s) {
     i.oninput = () => { c.params[s.key] = i.type === "number" ? (i.value === "" ? "" : parseFloat(i.value)) : i.value; save(); };
     row.appendChild(i);
   }
+  if (s.key === "megapixels" || s.key === "scale_to_length") augRes(c, s, row);
   return row;
+}
+
+/** 给分辨率那一行补上「多少 p」读数和 480/544/640/768p 快捷键。
+    滑到 megapixels=0.5 谁都不知道那是 544p —— 这行读数就是为了消掉这个翻译成本。 */
+function augRes(c, s, row) {
+  const cap = capOf(c);
+  const rt = cap.inputs.find(x => x.key === "aspect_ratio");
+  const ratio = rt ? (c.params.aspect_ratio != null ? c.params.aspect_ratio : rt.default)
+    : "16:9 (Widescreen)";
+  const out = document.createElement("span"); out.className = "resout";
+  const inputs = [...row.querySelectorAll("input")];
+
+  const sync = () => {
+    const v = parseFloat(c.params[s.key] != null ? c.params[s.key] : s.default);
+    if (!isFinite(v)) { out.textContent = ""; return; }
+    if (s.key === "megapixels") {
+      const [w, h] = resFromMP(ratio, v);
+      out.textContent = `${w}×${h} · ${Math.min(w, h)}p`;
+      out.title = `${ratio}，${v} 百万像素`;
+    } else {
+      out.textContent = `16:9 素材 → ${Math.round(v)}×${shortOf16x9(v)} · ${shortOf16x9(v)}p`;
+      out.title = "长边固定为这个值，短边按素材原比例算，所以 p 数随素材变";
+    }
+  };
+  const setAll = (v) => {
+    for (const i of inputs) i.value = v;
+    c.params[s.key] = v;
+    sync(); save();
+  };
+
+  const pre = document.createElement("span"); pre.className = "presets";
+  for (const p of H3_P) {
+    const v = s.key === "megapixels" ? mpForP(ratio, p) : H3_LONG[p];
+    const b = document.createElement("button"); b.textContent = p + "p";
+    // 超宽比例下高 p 会顶穿 H3 的面积上限（21:9 的 768p 要 1.31MP），直接禁掉
+    if (v > s.max) {
+      b.disabled = true;
+      b.title = `${ratio} 下 ${p}p 需要 ${v} 百万像素，超过 H3 的画布上限 ${s.max}`;
+    } else {
+      b.title = p === 768 ? "H3 原生短边（768×1344），再往上是训练分布外，只会更慢更糊"
+        : `短边 ${p}`;
+      b.onclick = () => setAll(v);
+    }
+    pre.appendChild(b);
+  }
+  const line2 = document.createElement("div"); line2.className = "resline";
+  line2.append(out, pre);
+  row.appendChild(line2);
+  for (const i of inputs) i.addEventListener("input", sync);
+  sync();
 }
 
 /* ================= 运行 / 轮询 ================= */
