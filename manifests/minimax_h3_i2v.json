@@ -50,16 +50,18 @@
    }
   },
   {
-   "key": "n168",
-   "label": "缩放到长度",
+   "key": "scale_to_length",
+   "label": "分辨率(长边)",
    "type": "number",
    "default": 1024,
-   "advanced": true,
    "target": {
     "node": "168",
     "input": "value",
     "vtype": "INT"
-   }
+   },
+   "min": 256,
+   "max": 1536,
+   "step": 32
   },
   {
    "key": "seed",

@@ -6,6 +6,7 @@
   --acc2: #ff2d95;           /* 霓虹品红：输出端口 / 危险 */
   --ok: #4dff9f; --warn: #ffb000; --err: #ff3b5c;
   --mono: "JetBrains Mono", Consolas, "Cascadia Mono", monospace;
+  color-scheme: dark;   /* 让原生 select 下拉、滚动条跟着走暗色 */
 }
 html, body { height: 100%; }
 body {

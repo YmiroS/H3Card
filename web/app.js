@@ -59,6 +59,9 @@ function capBrief(cap) {
   const imgs = by("image"), auds = by("audio"), txts = by("textarea");
   const dur = cap.inputs.find(s => s.key === "duration");
   const size = cap.inputs.filter(s => s.key === "width" || s.key === "height");
+  const ratio = cap.inputs.find(s => s.key === "aspect_ratio");
+  const mp = cap.inputs.find(s => s.key === "megapixels");
+  const side = cap.inputs.find(s => s.key === "scale_to_length");
   const need = [], opt = [];
   if (imgs.length) {
     (imgs.every(s => s.required) ? need : opt).push(
@@ -69,6 +72,9 @@ function capBrief(cap) {
   if (txts.length) need.push(txts.length > 1 ? `提示词 ×${txts.length}` : "提示词");
   if (dur) opt.push(`时长 ${dur.min}–${dur.max} 秒`);
   if (size.length) opt.push("画面宽高");
+  if (ratio) opt.push(`画面比例（${ratio.options.length} 档，默认 ${ratio.default}）`);
+  if (mp) opt.push(`清晰度 ${mp.min}–${mp.max} 百万像素`);
+  if (side) opt.push(`分辨率长边 ${side.min}–${side.max}，比例跟随原图`);
   if (cap.inputs.some(s => s.type === "seed")) opt.push("种子");
   return { need, opt, out: OUT_TXT[cap.outputType] || cap.outputType, file: cap.file || cap.id };
 }
