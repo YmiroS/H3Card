@@ -88,27 +88,31 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #empty .cta button:hover { border-color: var(--acc); color: #cfe0ff; }
 
 /* ---------- 卡片 ---------- */
+/* 注意：卡片不能 overflow:hidden，否则右侧凸出的输出圆点会被裁掉一半，
+   只剩几像素可点。改成各子块自己收边。 */
 .card {
   position: absolute; width: 268px; background: var(--panel);
-  border: 1px solid var(--line); border-radius: 10px; overflow: hidden;
+  border: 1px solid var(--line); border-radius: 10px;
   box-shadow: 0 6px 24px #0008;
 }
 .card.sel { border-color: var(--acc); box-shadow: 0 6px 28px #4c8dff40; }
 .card .ch {
   display: flex; align-items: center; gap: 6px; padding: 7px 9px;
   font-size: 12px; color: var(--dim); cursor: move; background: #131317;
+  border-radius: 9px 9px 0 0;
 }
 .card .ch .t { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #c3c3cc; }
 .card .ch .x:hover { color: var(--err); }
 .card .body {
   height: 168px; background: #0e0e12; display: flex; align-items: center;
-  justify-content: center; position: relative;
+  justify-content: center; position: relative; overflow: hidden;
 }
 .card .body img, .card .body video { width: 100%; height: 100%; object-fit: contain; }
 .card .ph { color: #4a4a55; font-size: 30px; }
 .card .cf {
   padding: 6px 9px; font-size: 11px; color: var(--dim);
   display: flex; align-items: center; gap: 6px; border-top: 1px solid var(--line);
+  border-radius: 0 0 9px 9px; background: var(--panel);
 }
 .card .cf .st.run { color: var(--acc); }
 .card .cf .st.done { color: var(--ok); }
@@ -116,11 +120,15 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 .bar { height: 3px; background: #23232a; }
 .bar i { display: block; height: 100%; background: var(--acc); width: 0; transition: width .3s; }
 .port {
-  position: absolute; right: -7px; top: 50%; width: 14px; height: 14px;
-  margin-top: -7px; border-radius: 50%; background: #2a2a32;
-  border: 2px solid #5a5a68; cursor: crosshair; z-index: 3;
+  position: absolute; right: -8px; top: 50%; width: 16px; height: 16px;
+  margin-top: -8px; border-radius: 50%; background: #2a2a32;
+  border: 2px solid #5a5a68; cursor: crosshair; z-index: 5;
+  transition: transform .12s, background .12s;
 }
-.port:hover { background: var(--acc); border-color: #9dc0ff; }
+/* 透明外扩：实际可点范围 40×40，不用瞄准那颗小圆点 */
+.port::before { content: ""; position: absolute; inset: -12px; border-radius: 50%; }
+.port:hover { background: var(--acc); border-color: #9dc0ff; transform: scale(1.25); }
+.card:hover .port { border-color: #7b7b8c; }
 .badge {
   position: absolute; left: 6px; top: 6px; padding: 1px 6px; border-radius: 4px;
   background: #000000aa; font-size: 10px; color: #ccc;
