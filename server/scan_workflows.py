@@ -56,6 +56,10 @@ DISPLAY = {
 # 会自动单独成卡；这里补的是玩法差别大、不该藏在别人模式列表里第 N 项的。
 SOLO = {"minimax_h3_ref4"}
 
+# 要把工作流里「关着的备用素材槽」开出来的能力（见 revive_bypassed）。
+# 四图参考的第 4 个图槽在模板里是绕过状态，名字叫四图、实际只有三格。
+REVIVE = {"minimax_h3_ref4"}
+
 # 高级旋钮：这几个 widget 名不管挂在哪个节点上语义都一样，值得开出来给人调。
 # 范围只能自己给 —— object_info 的范围是给专业用户的（步数上限 10000、LoRA 强度
 # -100~100），照抄出来的滑条根本没法用。
@@ -177,7 +181,13 @@ def ord_group(api, nids):
 
 
 def is_optional(oi, ct, name):
-    return name in (oi.get(ct, {}).get("input", {}).get("optional") or {})
+    opt = oi.get(ct, {}).get("input", {}).get("optional") or {}
+    if name in opt:
+        return True
+    # 动态字典输入：节点定义里只声明父项（ref_images），实际连线是
+    # ref_images.ref_image_3 这种带点的子项。父项选填 = 每个子项都能不接
+    base = name.split(".")[0]
+    return base != name and base in opt
 
 
 # =====================================================================
@@ -300,12 +310,40 @@ def build_resolver(wf, oi, warns):
     return nodes, links, resolve
 
 
-def ui_to_api(wf, oi, warns):
+def revive_bypassed(wf, warns):
+    """把「关着的备用素材槽」开回来（只对 REVIVE 点名的工作流做）。
+
+    素材节点被设成绕过（mode 4）时，它没有同类型输入可以直通，那根线其实就是断的。
+    四图参考只剩三个图槽就是这么来的：第 4 张图的 LoadImage → SetNode → GetNode
+    整条链都是绕过状态，开回来才对得上"四图"这个名字。
+
+    为什么要点名、不能一律开：说话唱歌·双人 里也留着两个关着的备用参考图槽，
+    开出来会把它变成 4 图，跟「按图片张数路由到单人/双人」直接打架（传 2 张会被
+    判去跑单人，白扔一张图）。备用槽要不要露给用户是产品判断，从图里推不出来。
+    """
+    n = 0
+    for node in wf.get("nodes", []):
+        if node.get("mode") != 4:
+            continue
+        if node.get("type") in ("LoadImage", "LoadAudio") and not any(
+                i.get("link") is not None for i in node.get("inputs", [])):
+            node["mode"] = 0
+            n += 1
+        elif node.get("type") in VIRTUAL_TYPES or node.get("type") in (
+                "SetNode", "GetNode", "easy setNode", "easy getNode"):
+            node["mode"] = 0          # 中转节点本身没语义，跟着素材一起开
+    if n:
+        warns.append(f"已启用 {n} 个原本关着的备用素材槽")
+
+
+def ui_to_api(wf, oi, warns, revive=False):
     """
     关键点：新版界面格式里 node["inputs"] 已经把 widget 也列进去了（带 "widget" 键），
     顺序与 widgets_values 一一对应；唯一的偏移来自 control_after_generate 多出的一个值。
     所以不需要猜 widget 下标。
     """
+    if revive:
+        revive_bypassed(wf, warns)
     nodes, links, resolve = build_resolver(wf, oi, warns)
 
     api = {}
@@ -557,17 +595,18 @@ def derive_inputs(api, oi):
     img_g = ord_group(api, [n for n, _t in images])
     txt_g = ord_group(api, [n for n, _t, _f, _v in texts])
     pair, drop = {}, {}                # texts下标->images下标 / images下标->可断开的链接
-    if len(img_g) == 1 and len(txt_g) == 1:
+    if len(img_g) == 1:
         ic, im = next(iter(img_g.items()))
-        _tc, tm = next(iter(txt_g.items()))
-        if len(im) > 1 and set(im) == set(tm):
-            pair = {tm[k][0]: im[k][0] for k in im}
-            # 没上传的图要把链接整根断开，列表才会真的变短（否则模板里作者
-            # 自带的演示图会顶上来，循环还是跑满 5 轮）。只对声明为 optional
-            # 的编号槽这么干：required 槽断了会直接报结构错误。
-            ct = api[ic]["class_type"]
-            drop = {i: {"node": ic, "input": cin} for k, (i, cin) in im.items()
-                    if is_optional(oi, ct, cin)}
+        # 没上传的图要把链接整根断开，编号列表才会真的变短（否则模板里的演示图会
+        # 顶上来照跑一轮）。只对声明为 optional 的编号槽这么干：required 槽断了
+        # 会直接报结构错误。这跟"图配提示词"无关，任何编号图槽都要断。
+        ct = api[ic]["class_type"]
+        drop = {i: {"node": ic, "input": cin} for k, (i, cin) in im.items()
+                if is_optional(oi, ct, cin)}
+        if len(txt_g) == 1:
+            _tc, tm = next(iter(txt_g.items()))
+            if len(im) > 1 and set(im) == set(tm):
+                pair = {tm[k][0]: im[k][0] for k in im}
 
     # ---- 哪些文本框是「作者调好的规范」而不是用户提示词 ------------------
     # 同一个 llama_cpp_instruct_adv 节点，在别的工作流里 custom_prompt 就是用户
@@ -616,8 +655,8 @@ def derive_inputs(api, oi):
                 "target": {"node": nid, "input": "image", "kind": "upload_image"}}
         if hint:
             item["hint"] = hint
-        if i in drop:
-            item["dropIfEmpty"] = drop[i]
+        if i in drop and not item["required"]:
+            item["dropIfEmpty"] = drop[i]      # 必填槽没得断，空着就直接报错了
         g = grid_of(api, nid)
         if g:
             item["grid"] = list(g)
@@ -853,7 +892,7 @@ def scan(path: Path, oi, rel_key=None):
         warns = [f"子图工作流：使用已导出的 {api_path.name}（本地未重新转换）"]
         api = json.loads(api_path.read_text(encoding="utf-8"))
     else:
-        api = ui_to_api(wf, oi, warns)
+        api = ui_to_api(wf, oi, warns, revive=wid in REVIVE)
     repair_loop_count(api, oi, warns)
     inputs, outputs, n_img, n_aud, note = derive_inputs(api, oi)
     out_type = outputs[0][1] if outputs else "unknown"

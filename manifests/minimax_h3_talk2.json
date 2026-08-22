@@ -35,6 +35,10 @@
     "node": "227",
     "input": "image",
     "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "136",
+    "input": "ref_images.ref_image_0"
    }
   },
   {
