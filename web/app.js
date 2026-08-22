@@ -734,7 +734,7 @@ function promptBlock(c, s, label) {
   const hd = document.createElement("div"); hd.className = "phd";
   const nm = document.createElement("span"); nm.textContent = label || s.label;
   const tag = document.createElement("span"); tag.className = "demo";
-  tag.textContent = "⚠ 这是工作流自带的示例文案，改成你要的内容";
+  tag.textContent = "⚠ 这是示例文案，改成你要的内容";
   const clr = document.createElement("button"); clr.textContent = "清空";
   hd.append(nm, tag, clr);
 
@@ -768,16 +768,16 @@ function templateBlock(c, s) {
     const dirty = ta.value.trim() !== String(s.default || "").trim();
     const open = inner.style.display !== "none";
     hd.textContent = `${open ? "▾" : "▸"} ${s.label}`
-      + (dirty ? "（已被改过，出片结构可能跑偏）" : "（作者预设，默认不用动）");
+      + (dirty ? "（已被改过，出片结构可能跑偏）" : "（预设，默认不用动）");
     hd.classList.toggle("dirty", dirty);
     rst.style.display = dirty ? "" : "none";
   };
   hd.onclick = () => { inner.style.display = inner.style.display === "none" ? "" : "none"; sync(); };
 
   const note = document.createElement("div"); note.className = "tplnote";
-  note.textContent = "⚠ " + (s.note || "作者调好的参数，改了会影响出片。");
+  note.textContent = "⚠ " + (s.note || "预设参数，改了会影响出片。");
   const rst = document.createElement("button"); rst.className = "tplrst";
-  rst.textContent = "恢复作者预设";
+  rst.textContent = "恢复预设";
   rst.onclick = () => { ta.value = s.default || ""; c.params[s.key] = ta.value; sync(); save(); };
   ta.oninput = () => { c.params[s.key] = ta.value; sync(); save(); };
 
