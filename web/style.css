@@ -347,6 +347,11 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 #menu button:hover { background: #00e5ff1c; color: #bdf1ff; }
 #menu button.danger:hover { background: #ff2d951c; color: #ffc2dd; }
+#menu .grp {
+  padding: 7px 10px 3px; color: var(--acc); font-size: 11px; letter-spacing: 2px;
+  opacity: .75;
+}
+#menu .grp + button { margin-top: 0; }
 #menu .hd {
   padding: 4px 10px 6px; color: var(--dim); font-size: 11px; letter-spacing: 1px;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
