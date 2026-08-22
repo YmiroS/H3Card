@@ -148,6 +148,22 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #panel .modes button:hover { color: var(--txt); }
 #panel .modes button.on { background: #22293a; color: #cfe0ff; border-color: #2f3d5c; }
 #panel textarea { width: 100%; min-height: 62px; }
+#panel .pblock { margin-bottom: 8px; }
+#panel .pblock textarea { min-height: 88px; }
+#panel .pblock textarea.isdemo { border-color: #5c4a2a; color: #d9c89f; }
+#panel .phd {
+  display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
+  font-size: 11px; color: var(--dim);
+}
+#panel .phd .demo {
+  flex: 1; color: var(--warn); overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+#panel .phd button {
+  margin-left: auto; padding: 1px 7px; border-radius: 5px;
+  color: var(--dim); border: 1px solid var(--line);
+}
+#panel .phd button:hover { color: var(--txt); border-color: #3a3a44; }
 #panel .slots { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
 .slot {
   width: 66px; text-align: center; color: var(--dim); font-size: 11px; cursor: pointer;

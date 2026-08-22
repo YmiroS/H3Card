@@ -113,11 +113,15 @@ def patch_graph(cap, params, uploaded):
                 val = params.setdefault("_seed_used", random.randint(0, 2 ** 53))
             val = int(val)
         else:
-            if key not in params or params[key] in (None, ""):
-                continue                       # 用默认值
+            if key not in params or params[key] is None:
+                continue                       # 前端没给这一项：保留模板默认值
             val = params[key]
             if spec["type"] in ("slider", "number"):
+                if val == "":
+                    continue
                 val = float(val) if tgt.get("vtype") == "FLOAT" else int(float(val))
+            # 注意：文本清空后必须写入 ""，不能当"没给"跳过，
+            # 否则模板里作者自带的演示提示词会悄悄生效（出片跑偏）
         g[node]["inputs"][field] = val
     if missing:
         raise web.HTTPBadRequest(reason="必填素材未提供：" + "、".join(missing))

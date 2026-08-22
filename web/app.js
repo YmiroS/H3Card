@@ -445,11 +445,7 @@ function openPanel(id) {
 
   // --- 提示词 ---
   for (const s of specs.filter(x => x.type === "textarea" && !x.advanced)) {
-    const ta = document.createElement("textarea");
-    ta.placeholder = s.label;
-    ta.value = c.params[s.key] != null ? c.params[s.key] : (s.default || "");
-    ta.oninput = () => { c.params[s.key] = ta.value; save(); };
-    el.panel.appendChild(ta);
+    el.panel.appendChild(promptBlock(c, s));
   }
 
   // --- 素材槽 ---
@@ -511,6 +507,31 @@ function openPanel(id) {
 }
 
 function errBox(t) { const d = document.createElement("div"); d.className = "err"; d.textContent = t; return d; }
+
+/** 提示词块：默认值是工作流作者的演示文案，必须让用户看见并且一键清掉 */
+function promptBlock(c, s) {
+  const wrap = document.createElement("div"); wrap.className = "pblock";
+  const hd = document.createElement("div"); hd.className = "phd";
+  const nm = document.createElement("span"); nm.textContent = s.label;
+  const tag = document.createElement("span"); tag.className = "demo";
+  tag.textContent = "⚠ 这是工作流自带的示例文案，改成你要的内容";
+  const clr = document.createElement("button"); clr.textContent = "清空";
+  hd.append(nm, tag, clr);
+
+  const ta = document.createElement("textarea");
+  ta.placeholder = `${s.label}：描述你想要的画面/动作/镜头`;
+  ta.value = c.params[s.key] != null ? c.params[s.key] : (s.default || "");
+  const sync = () => {
+    const isDemo = !!s.default && ta.value.trim() === String(s.default).trim();
+    tag.style.display = isDemo ? "" : "none";
+    ta.classList.toggle("isdemo", isDemo);
+  };
+  ta.oninput = () => { c.params[s.key] = ta.value; sync(); save(); };
+  clr.onclick = () => { ta.value = ""; c.params[s.key] = ""; sync(); ta.focus(); save(); };
+  sync();
+  wrap.append(hd, ta);
+  return wrap;
+}
 function paintTitle(c) {
   if (!c._el) return;
   const t = c._el.querySelector(".ch .t"), cap = capOf(c);
@@ -605,10 +626,20 @@ function rowEl(c, s) {
 }
 
 /* ================= 运行 / 轮询 ================= */
+/** 所见即所得：面板里显示的值就是提交的值。
+    以前没动过的输入框不会进 params，ComfyUI 于是用了模板里作者的演示值 —
+    图生视频出鼠标广告就是这么来的。 */
 function payloadOf(c) {
-  const assets = {};
+  const cap = capOf(c), params = {}, assets = {};
+  for (const s of cap.inputs) {
+    if (s.type === "image" || s.type === "audio" || s.mirror) continue;
+    const v = c.params[s.key];
+    if (v != null) params[s.key] = v;
+    else if (s.type === "seed") params[s.key] = -1;      // 每次随机
+    else if (s.default !== undefined) params[s.key] = s.default;
+  }
   for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
-  return { capability: c.cap, params: c.params, assets };
+  return { capability: c.cap, params, assets };
 }
 
 async function run(c) {
