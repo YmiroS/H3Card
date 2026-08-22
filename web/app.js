@@ -628,11 +628,14 @@ function openPanel(id) {
 
   // --- 提示词 ---
   const texts = specs.filter(x => x.type === "textarea" && !x.advanced);
-  const paired = texts.filter(x => x.pairWith && specs.some(y => y.key === x.pairWith));
+  const tpl = texts.filter(x => x.template);     // 作者调好的规范，折起来放最后
+  const norm = texts.filter(x => !x.template);
+  const paired = norm.filter(x => x.pairWith && specs.some(y => y.key === x.pairWith));
   if (paired.length > 1) body.appendChild(promptTabs(c, paired));
-  for (const s of texts) {
+  for (const s of norm) {
     if (!paired.includes(s) || paired.length < 2) body.appendChild(promptBlock(c, s));
   }
+  for (const s of tpl) body.appendChild(templateBlock(c, s));
 
   // --- 常规参数 ---
   // mirror = 多个节点共用同一个参数框（如两个采样器共用种子），只画一次
@@ -747,6 +750,40 @@ function promptBlock(c, s, label) {
   clr.onclick = () => { ta.value = ""; c.params[s.key] = ""; sync(); ta.focus(); save(); };
   sync();
   wrap.append(hd, ta);
+  return wrap;
+}
+
+/** 作者调好的规范（漫剧那份剧本格式规范就是）：默认折起来。
+    它字段类型跟提示词一样，但里面是规则不是内容 —— 改它是换出片结构，
+    所以不能跟提示词并排摆着等人顺手覆盖。清空更糟：节点会退回自带预设，
+    分镜数量和硬切规则一起没了。 */
+function templateBlock(c, s) {
+  const wrap = document.createElement("div"); wrap.className = "tpl";
+  const hd = document.createElement("button"); hd.className = "tplhd";
+  const inner = document.createElement("div"); inner.style.display = "none";
+
+  const ta = document.createElement("textarea");
+  ta.value = c.params[s.key] != null ? c.params[s.key] : (s.default || "");
+  const sync = () => {
+    const dirty = ta.value.trim() !== String(s.default || "").trim();
+    const open = inner.style.display !== "none";
+    hd.textContent = `${open ? "▾" : "▸"} ${s.label}`
+      + (dirty ? "（已被改过，出片结构可能跑偏）" : "（作者预设，默认不用动）");
+    hd.classList.toggle("dirty", dirty);
+    rst.style.display = dirty ? "" : "none";
+  };
+  hd.onclick = () => { inner.style.display = inner.style.display === "none" ? "" : "none"; sync(); };
+
+  const note = document.createElement("div"); note.className = "tplnote";
+  note.textContent = "⚠ " + (s.note || "作者调好的参数，改了会影响出片。");
+  const rst = document.createElement("button"); rst.className = "tplrst";
+  rst.textContent = "恢复作者预设";
+  rst.onclick = () => { ta.value = s.default || ""; c.params[s.key] = ta.value; sync(); save(); };
+  ta.oninput = () => { c.params[s.key] = ta.value; sync(); save(); };
+
+  inner.append(note, ta, rst);
+  sync();
+  wrap.append(hd, inner);
   return wrap;
 }
 function paintTitle(c) {

@@ -392,6 +392,16 @@ def direct_consumer(api, nid):
     return cs[0] if cs else (None, None)
 
 
+def upstream(api, nid, seen=None):
+    """nid 顺着连线往上游能追到的全部节点 id（跨多层）"""
+    seen = set() if seen is None else seen
+    for v in api.get(str(nid), {}).get("inputs", {}).values():
+        if isinstance(v, list) and len(v) == 2 and str(v[0]) in api and str(v[0]) not in seen:
+            seen.add(str(v[0]))
+            upstream(api, v[0], seen)
+    return seen
+
+
 def traced_label(api, nid, depth=0, seen=None):
     """顺着数据流往下找语义明确的输入名；GENERIC 只做兜底"""
     seen = seen or set()
@@ -493,6 +503,18 @@ def derive_inputs(api, oi):
             drop = {i: {"node": ic, "input": cin} for k, (i, cin) in im.items()
                     if is_optional(oi, ct, cin)}
 
+    # ---- 哪些文本框是「作者调好的规范」而不是用户提示词 ------------------
+    # 同一个 llama_cpp_instruct_adv 节点，在别的工作流里 custom_prompt 就是用户
+    # 随手写的一句话；在漫剧里它是两千多字的剧本格式规范，真正的用户内容从另一根
+    # 线（system_prompt）送进来。所以字段名和长度都不能当判据，只能看结构：
+    # 这个文本框所在的节点，已经从上游收到了配对提示词 —— 那它就是"规则"不是"内容"。
+    tpl = set()
+    if pair:
+        for i, (nid, _t, _f, _v) in enumerate(texts):
+            up = upstream(api, nid) if i not in pair else set()
+            if any(str(tc) in up for tc in txt_g):
+                tpl.add(i)
+
     out = []
     used = {}
     res_seen = set()
@@ -541,12 +563,18 @@ def derive_inputs(api, oi):
         out.append(item)
     for i, (nid, title, field, val) in enumerate(texts):
         ct = api[nid]["class_type"]
-        label, hint = pick_label(None if default_title(oi, ct, title) else title, "提示词")
+        label, hint = pick_label(None if default_title(oi, ct, title) else title,
+                                "出片规范" if i in tpl else "提示词")
         item = {"key": "prompt" if i == 0 else f"prompt{i + 1}", "label": uniq(label),
                 "type": "textarea", "default": val,
                 "target": {"node": nid, "input": field}}
         if hint:
             item["hint"] = hint
+        if i in tpl:
+            # 面板会把它折起来，别让它长得像"第 6 条提示词"引人去改
+            item["template"] = True
+            item["note"] = ("作者调好的出片规范：分几个镜头、每镜多长、怎么硬切，都由它决定。"
+                            "默认不用动，改了会直接影响成片结构。")
         if i in pair:
             # 面板把这些提示词收进一排 tab，第 k 个 tab 跟着第 k 张图亮/灭
             item["pairWith"] = f"images[{pair[i]}]"
