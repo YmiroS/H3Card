@@ -589,6 +589,9 @@ function openPanel(id) {
   const c = PROJ.cards.find(x => x.id === id);
   if (!c) return closePanel();
   const def = cardDef(c.type), cap = capOf(c);
+  // 切 tab / 传图都会整块重画，同一张卡要留住滚动位置，不然每次都弹回顶部
+  const old = el.panel.querySelector(".pbody");
+  const scrolled = (old && el.panel._id === id) ? old.scrollTop : 0;
   el.panel._id = id;
   el.panel.innerHTML = "";
   el.panel.style.display = "";
@@ -613,17 +616,22 @@ function openPanel(id) {
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
 
-  // --- 提示词 ---
-  for (const s of specs.filter(x => x.type === "textarea" && !x.advanced)) {
-    body.appendChild(promptBlock(c, s));
-  }
-
   // --- 素材槽 ---
+  // 放在提示词前面：漫剧那种一图一提示词的工作流，tab 是跟着图长出来的，
+  // 先看到图槽才讲得通
   const media = specs.filter(x => x.type === "image" || x.type === "audio");
   if (media.length) {
     const wrap = document.createElement("div"); wrap.className = "slots";
     for (const s of media) wrap.appendChild(slotEl(c, s));
     body.appendChild(wrap);
+  }
+
+  // --- 提示词 ---
+  const texts = specs.filter(x => x.type === "textarea" && !x.advanced);
+  const paired = texts.filter(x => x.pairWith && specs.some(y => y.key === x.pairWith));
+  if (paired.length > 1) body.appendChild(promptTabs(c, paired));
+  for (const s of texts) {
+    if (!paired.includes(s) || paired.length < 2) body.appendChild(promptBlock(c, s));
   }
 
   // --- 常规参数 ---
@@ -674,22 +682,61 @@ function openPanel(id) {
   el.panel.appendChild(foot);
 
   placePanel();
+  body.scrollTop = scrolled;      // 必须等内容进了 DOM 才有 scrollHeight 可滚
 }
 
 function errBox(t) { const d = document.createElement("div"); d.className = "err"; d.textContent = t; return d; }
 
+/** 图 ↔ 提示词是一对一跑的（第 k 张图配第 k 条提示词，见 manifest 的 pairWith），
+    所以提示词收成一排 tab、跟着图走：没上传第 k 张图，第 k 条提示词就不存在。
+    后端也照这个关系清空未配对的提示词，两边的列表长度才对得上。 */
+function promptTabs(c, list) {
+  const cap = capOf(c);
+  const name = (s) => {
+    const im = cap.inputs.find(x => x.key === s.pairWith);
+    const t = im ? im.label : s.label;
+    return /^\d+$/.test(t) ? "图" + t : t;       // 作者只标了序号时补个"图"字
+  };
+  const wrap = document.createElement("div"); wrap.className = "ptabs";
+  const strip = document.createElement("div"); strip.className = "tabs";
+  const on = list.map(s => !!c.assets[s.pairWith]);
+  if (c._tab == null || !on[c._tab]) c._tab = on.indexOf(true);
+
+  list.forEach((s, i) => {
+    const b = document.createElement("button");
+    const txt = String(c.params[s.key] != null ? c.params[s.key] : s.default || "").trim();
+    b.textContent = name(s) + (on[i] && txt ? " ●" : "");
+    if (!on[i]) {
+      b.className = "off";
+      b.title = `上传「${name(s)}」后启用 —— 提示词是一张图配一条`;
+    } else {
+      b.className = i === c._tab ? "on" : "";
+      b.onclick = () => { c._tab = i; openPanel(c.id); };
+    }
+    strip.appendChild(b);
+  });
+  wrap.appendChild(strip);
+  if (c._tab >= 0) wrap.appendChild(promptBlock(c, list[c._tab], name(list[c._tab]) + " 的提示词"));
+  else {
+    const p = document.createElement("div"); p.className = "tabempty";
+    p.textContent = "先上传图片。每加一张图，这里就多一条它专属的提示词。";
+    wrap.appendChild(p);
+  }
+  return wrap;
+}
+
 /** 提示词块：默认值是工作流作者的演示文案，必须让用户看见并且一键清掉 */
-function promptBlock(c, s) {
+function promptBlock(c, s, label) {
   const wrap = document.createElement("div"); wrap.className = "pblock";
   const hd = document.createElement("div"); hd.className = "phd";
-  const nm = document.createElement("span"); nm.textContent = s.label;
+  const nm = document.createElement("span"); nm.textContent = label || s.label;
   const tag = document.createElement("span"); tag.className = "demo";
   tag.textContent = "⚠ 这是工作流自带的示例文案，改成你要的内容";
   const clr = document.createElement("button"); clr.textContent = "清空";
   hd.append(nm, tag, clr);
 
   const ta = document.createElement("textarea");
-  ta.placeholder = `${s.label}：描述你想要的画面/动作/镜头`;
+  ta.placeholder = `${label || s.label}：描述你想要的画面/动作/镜头`;
   ta.value = c.params[s.key] != null ? c.params[s.key] : (s.default || "");
   const sync = () => {
     const isDemo = !!s.default && ta.value.trim() === String(s.default).trim();

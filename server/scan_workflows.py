@@ -133,6 +133,35 @@ def is_size_provider(oi, ct):
     return "width" in names and "height" in names and "image" not in names
 
 
+# 「编号列表」槽位：image_1 / prompt_3 / any_2 …
+# 一堆同名带序号的输入，语义上是"往这个列表里塞第 k 项"。
+ORD_SLOT = re.compile(r"^(.+?)_(\d+)$")
+
+
+def ord_slot(api, nid):
+    """nid 的输出接进了某个编号列表的第几号槽 -> (收集器id, 输入名, 序号)。
+
+    不是编号槽（普通的 .image / .audio）就返回 (None, None, None)。
+    """
+    cid, cin = direct_consumer(api, nid)
+    m = ORD_SLOT.match(cin or "")
+    return (cid, cin, int(m.group(2))) if m else (None, None, None)
+
+
+def ord_group(api, nids):
+    """把一批节点按「接到同一个编号列表」归类 -> {收集器id: {序号: (在 nids 里的下标, 输入名)}}"""
+    g = {}
+    for i, nid in enumerate(nids):
+        cid, cin, k = ord_slot(api, nid)
+        if cid is not None:
+            g.setdefault(cid, {})[k] = (i, cin)
+    return g
+
+
+def is_optional(oi, ct, name):
+    return name in (oi.get(ct, {}).get("input", {}).get("optional") or {})
+
+
 # =====================================================================
 # object_info
 # =====================================================================
@@ -444,6 +473,26 @@ def derive_inputs(api, oi):
     if images and all(re.fullmatch(r"\d+", (t or "").strip() or "x") for _n, t in images):
         images.sort(key=lambda it: int(it[1].strip()))
 
+    # ---- 图 ↔ 提示词配对 ----------------------------------------------
+    # 漫剧那类工作流把图和提示词分别塞进两个编号列表（ImageBatchMultiple+.image_k
+    # 和 easy promptList.prompt_k），再用同一个循环下标从两边取出来配对跑：
+    # 也就是「第 k 张图配第 k 条提示词」。序号集合完全对齐才算配对成功，
+    # 免得凑巧都带序号的两组无关输入被硬凑一起。
+    img_g = ord_group(api, [n for n, _t in images])
+    txt_g = ord_group(api, [n for n, _t, _f, _v in texts])
+    pair, drop = {}, {}                # texts下标->images下标 / images下标->可断开的链接
+    if len(img_g) == 1 and len(txt_g) == 1:
+        ic, im = next(iter(img_g.items()))
+        _tc, tm = next(iter(txt_g.items()))
+        if len(im) > 1 and set(im) == set(tm):
+            pair = {tm[k][0]: im[k][0] for k in im}
+            # 没上传的图要把链接整根断开，列表才会真的变短（否则模板里作者
+            # 自带的演示图会顶上来，循环还是跑满 5 轮）。只对声明为 optional
+            # 的编号槽这么干：required 槽断了会直接报结构错误。
+            ct = api[ic]["class_type"]
+            drop = {i: {"node": ic, "input": cin} for k, (i, cin) in im.items()
+                    if is_optional(oi, ct, cin)}
+
     out = []
     used = {}
     res_seen = set()
@@ -479,6 +528,8 @@ def derive_inputs(api, oi):
                 "target": {"node": nid, "input": "image", "kind": "upload_image"}}
         if hint:
             item["hint"] = hint
+        if i in drop:
+            item["dropIfEmpty"] = drop[i]
         out.append(item)
     for i, (nid, title) in enumerate(audios):
         label, hint = pick_label(None if default_title(oi, "LoadAudio", title) else title, "音频")
@@ -496,6 +547,9 @@ def derive_inputs(api, oi):
                 "target": {"node": nid, "input": field}}
         if hint:
             item["hint"] = hint
+        if i in pair:
+            # 面板把这些提示词收进一排 tab，第 k 个 tab 跟着第 k 张图亮/灭
+            item["pairWith"] = f"images[{pair[i]}]"
         out.append(item)
     for nid, title, field, val, kind, vt in params:
         if kind == "duration":
@@ -561,6 +615,38 @@ def required_keys(oi, ct):
     return keys
 
 
+def repair_loop_count(api, oi, warns):
+    """把「循环次数」接到量表上——作者忘接的那根线。
+
+    漫剧20宫格是这么长的：forLoopStart 的下标同时去 indexAnything 取第 k 张图和
+    第 k 条提示词，所以循环该跑「图有几张」次。作者放了一个 lengthAnything 量了
+    图的条数，却没把它接进 total，total 还是写死的 1 —— 结果传 5 张图也只出 1 条。
+
+    判据全靠结构，不认节点类名：total 是死数字、下标喂给了某个 indexAnything、
+    而同一个列表上挂着一个输出 INT 又没人用的量表节点。三条同时成立才改。
+    """
+    for lid, node in list(api.items()):
+        total = node["inputs"].get("total")
+        if not isinstance(total, int):
+            continue
+        # 这个循环的下标在索引哪些列表
+        lists = {str(x["inputs"]["any"][0])
+                 for x in api.values()
+                 if isinstance(x["inputs"].get("index"), list)
+                 and str(x["inputs"]["index"][0]) == str(lid)
+                 and isinstance(x["inputs"].get("any"), list)}
+        for cid in lists:
+            for mid, m in api.items():
+                if (oi.get(m["class_type"], {}).get("output") == ["INT"]
+                        and isinstance(m["inputs"].get("any"), list)
+                        and str(m["inputs"]["any"][0]) == cid
+                        and not consumers(api, mid)):
+                    node["inputs"]["total"] = [mid, 0]
+                    warns.append(f"已修：#{lid}.total 写死 {total}，改接 "
+                                 f"#{mid} {m['class_type']}（按 #{cid} 的条数循环）")
+                    return
+
+
 def validate_api(api, oi):
     """提交前的结构自检：必填项是否齐全、连线是否悬空"""
     errs = []
@@ -600,6 +686,7 @@ def scan(path: Path, oi, rel_key=None):
         api = json.loads(api_path.read_text(encoding="utf-8"))
     else:
         api = ui_to_api(wf, oi, warns)
+    repair_loop_count(api, oi, warns)
     inputs, outputs, n_img, n_aud = derive_inputs(api, oi)
     out_type = outputs[0][1] if outputs else "unknown"
     warns += [f"结构错误 {e}" for e in validate_api(api, oi)]

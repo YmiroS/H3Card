@@ -415,7 +415,10 @@
  "206": {
   "class_type": "easy forLoopStart",
   "inputs": {
-   "total": 1
+   "total": [
+    "203",
+    0
+   ]
   },
   "_meta": {
    "title": "For Loop Start"
