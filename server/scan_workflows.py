@@ -252,16 +252,9 @@ def ui_to_api(wf, oi, warns):
                 if src:
                     inputs[name] = [str(src[0]), src[1]]   # ComfyUI 要求节点 id 是字符串
 
-        # V3 自增长输入 ref_images.ref_image_0 -> {"ref_images": [[..],[..]]}
-        grouped = {}
-        for k in list(inputs.keys()):
-            if "." in k:
-                head = k.split(".")[0]
-                grouped.setdefault(head, []).append((k, inputs.pop(k)))
-        for head, items in grouped.items():
-            items.sort(key=lambda kv: kv[0])
-            inputs[head] = [v for _k, v in items]
-
+        # V3 自增长输入（ref_images.ref_image_0 / values.a）必须保持点号平铺，
+        # ComfyUI 的 build_nested_inputs 自己会按 dynamic_paths 折成嵌套结构；
+        # 若在这里折成 {"ref_images": [[..]]}，校验期报 "Required input is missing"。
         api[str(n["id"])] = {
             "class_type": ct,
             "inputs": inputs,
@@ -271,8 +264,9 @@ def ui_to_api(wf, oi, warns):
     # 清掉指向已删除节点的连线
     for nid, node in api.items():
         for k, v in list(node["inputs"].items()):
-            if isinstance(v, list) and len(v) == 2 and isinstance(v[0], int):
-                if str(v[0]) not in api:
+            if (isinstance(v, list) and len(v) == 2
+                    and isinstance(v[0], str) and isinstance(v[1], int)):
+                if v[0] not in api:
                     warns.append(f"节点 {nid}.{k} 的上游 {v[0]} 已被跳过，输入被移除")
                     node["inputs"].pop(k)
     return api
@@ -379,7 +373,10 @@ def derive_inputs(api, oi):
                 elif t == "STRING" and is_primitive and isinstance(v, str):
                     texts.append((nid, title, f, v))
                 elif t in ("INT", "FLOAT"):
-                    if any(h in hint for h in DURATION_HINTS):
+                    # 只有 Primitive 节点上的 duration 才是作者刻意暴露的时长旋钮；
+                    # 别的节点（如 EmptyAudio.duration=0.01 的静音占位）同名但语义无关，
+                    # 当成普通高级数值，否则时长滑条会写进错误的节点
+                    if any(h in hint for h in DURATION_HINTS) and is_primitive:
                         params.append((nid, title, f, v, "duration", t))
                     elif low in ("width", "height"):
                         params.append((nid, low, f, v, "size", t))
@@ -454,6 +451,26 @@ def derive_inputs(api, oi):
     return out, outputs, len(images), len(audios)
 
 
+def required_keys(oi, ct):
+    """展开 V3 自增长输入后真正的必填 key 集合。
+
+    ComfyUI 的 get_finalized_class_inputs 会把 COMFY_AUTOGROW_V3 展成点号平铺的
+    子 key（values.a / ref_images.ref_image_0），前 min 个且模板内层是 required
+    的才算必填。不展开就查不出 "Required input is missing"。
+    """
+    keys = []
+    for k, spec in (oi[ct]["input"].get("required") or {}).items():
+        if not (isinstance(spec, list) and spec and spec[0] == "COMFY_AUTOGROW_V3"):
+            keys.append(k)
+            continue
+        tpl = spec[1]["template"]
+        names = tpl.get("names") or [f"{tpl['prefix']}{i}" for i in range(tpl["max"])]
+        inner_required = "required" in tpl.get("input", {})
+        if inner_required:
+            keys += [f"{k}.{n}" for n in names[:tpl.get("min", 0)]]
+    return keys
+
+
 def validate_api(api, oi):
     """提交前的结构自检：必填项是否齐全、连线是否悬空"""
     errs = []
@@ -463,8 +480,8 @@ def validate_api(api, oi):
             errs.append(f"#{nid} 未知节点 {ct}")
             continue
         ins = n.get("inputs", {})
-        for k in oi[ct]["input"].get("required", {}):
-            if k not in ins and not any(x.split(".")[0] == k for x in ins):
+        for k in required_keys(oi, ct):
+            if k not in ins:
                 errs.append(f"#{nid}({ct}) 缺必填输入 {k}")
         for k, v in ins.items():
             if isinstance(v, list) and len(v) == 2 and isinstance(v[1], int) \

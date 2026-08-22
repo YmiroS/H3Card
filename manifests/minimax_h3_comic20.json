@@ -135,20 +135,6 @@
    "min": 3,
    "max": 30,
    "step": 1,
-   "default": 0.010000000000000002,
-   "target": {
-    "node": "252",
-    "input": "duration",
-    "vtype": "FLOAT"
-   }
-  },
-  {
-   "key": "duration",
-   "label": "时长(秒)",
-   "type": "slider",
-   "min": 3,
-   "max": 30,
-   "step": 1,
    "default": 12,
    "target": {
     "node": "343",

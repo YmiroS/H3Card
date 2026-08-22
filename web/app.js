@@ -461,7 +461,9 @@ function openPanel(id) {
   }
 
   // --- 常规参数 ---
-  const rows = specs.filter(x => !["image", "audio", "textarea"].includes(x.type) && !x.advanced);
+  // mirror = 多个节点共用同一个参数框（如两个采样器共用种子），只画一次
+  const rows = specs.filter(x => !["image", "audio", "textarea"].includes(x.type)
+    && !x.advanced && !x.mirror);
   for (const s of rows) el.panel.appendChild(rowEl(c, s));
 
   // --- 高级 ---
