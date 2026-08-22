@@ -195,11 +195,16 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 
 /* ---------- 参数面板 ---------- */
 #panel {
-  position: absolute; z-index: 30; width: 420px; background: #080c17f2;
+  position: absolute; z-index: 30; width: 520px; background: #080c17f2;
   border: 1px solid var(--acc); border-radius: 3px; padding: 12px;
   backdrop-filter: blur(8px);
   box-shadow: 0 14px 44px #000d, 0 0 22px #00e5ff2e;
+  /* 竖向三段：模式钉在顶部、参数区滚动、运行按钮钉在底部。
+     max-height 由 placePanel() 按窗口高度写进 style，这里只负责分段 */
+  display: flex; flex-direction: column; overflow: hidden;
 }
+/* min-height:0 必须有：flex 子项默认 min-height:auto，会被内容撑开而不产生滚动条 */
+#panel .pbody { flex: 1; min-height: 0; overflow-y: auto; padding-right: 2px; }
 #panel .modes { display: flex; gap: 4px; margin-bottom: 10px; flex-wrap: wrap; }
 #panel .modes button {
   padding: 4px 9px; border-radius: 2px; font-size: 12px;
@@ -242,7 +247,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #panel .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; flex-wrap: wrap; }
 /* 分辨率行的第二行：换算读数 + 480/544/640/768p 快捷键 */
 #panel .resline {
-  flex: 0 0 100%; display: flex; align-items: center; gap: 8px; padding-left: 62px;
+  flex: 0 0 100%; display: flex; align-items: center; gap: 8px; padding-left: 86px;
 }
 #panel .resout { font-family: var(--mono); font-size: 11px; color: var(--acc); }
 #panel .presets { display: flex; gap: 4px; margin-left: auto; }
@@ -254,7 +259,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #panel .presets button:disabled {
   color: #33405a; border-color: #16202f; cursor: not-allowed; box-shadow: none;
 }
-#panel .row label { color: var(--dim); min-width: 54px; letter-spacing: .5px; }
+#panel .row label { color: var(--dim); min-width: 78px; letter-spacing: .5px; }
 #panel .row input[type=range] { flex: 1; accent-color: var(--acc); }
 #panel .row input[type=number], #panel .row input[type=text] { width: 92px; }
 #panel .adv { color: var(--dim); font-size: 12px; margin-top: 8px; }
