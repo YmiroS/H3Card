@@ -95,7 +95,8 @@ async def comfy_upload(session, field_name, filename, data):
 def patch_graph(cap, params, uploaded):
     """按 manifest 把用户参数写进 API 工作流模板"""
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
-    missing = []
+    labels = {s["key"]: s["label"] for s in cap["inputs"]}
+    missing, blank = [], []
     for spec in cap["inputs"]:
         key, tgt = spec["key"], spec["target"]
         node, field = str(tgt["node"]), tgt["input"]
@@ -106,6 +107,12 @@ def patch_graph(cap, params, uploaded):
             if not val:
                 if spec.get("required"):
                     missing.append(spec["label"])
+                drop = spec.get("dropIfEmpty")
+                if drop:
+                    # 编号列表里的空槽要把线整根拔掉，列表才真的变短。
+                    # 光留模板默认值的话，作者自带的演示图会顶上来照跑一轮。
+                    # 拔线后这个 LoadImage 就没人依赖了，ComfyUI 不会执行它。
+                    g[str(drop["node"])]["inputs"].pop(drop["input"], None)
                 continue                       # 未填的可选素材：保留模板里的默认值
         elif spec["type"] == "seed":
             val = params.get("seed")
@@ -113,18 +120,29 @@ def patch_graph(cap, params, uploaded):
                 val = params.setdefault("_seed_used", random.randint(0, 2 ** 53))
             val = int(val)
         else:
-            if key not in params or params[key] is None:
+            pair = spec.get("pairWith")
+            if pair and not uploaded.get(pair):
+                # 配对的图没上传 -> 这条也必须清空。收集节点会丢掉空串，
+                # 两边一起变短，第 k 张图才还能对上第 k 条提示词
+                val = ""
+            elif key not in params or params[key] is None:
                 continue                       # 前端没给这一项：保留模板默认值
-            val = params[key]
-            if spec["type"] in ("slider", "number"):
-                if val == "":
-                    continue
-                val = float(val) if tgt.get("vtype") == "FLOAT" else int(float(val))
-            # 注意：文本清空后必须写入 ""，不能当"没给"跳过，
-            # 否则模板里作者自带的演示提示词会悄悄生效（出片跑偏）
+            else:
+                val = params[key]
+                if spec["type"] in ("slider", "number"):
+                    if val == "":
+                        continue
+                    val = float(val) if tgt.get("vtype") == "FLOAT" else int(float(val))
+                elif pair and not str(val).strip():
+                    blank.append(f"{labels.get(pair, pair)}")
+                # 注意：文本清空后必须写入 ""，不能当"没给"跳过，
+                # 否则模板里作者自带的演示提示词会悄悄生效（出片跑偏）
         g[node]["inputs"][field] = val
     if missing:
         raise web.HTTPBadRequest(reason="必填素材未提供：" + "、".join(missing))
+    if blank:
+        raise web.HTTPBadRequest(
+            reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
     return g
 
 
@@ -294,6 +312,9 @@ async def api_generate(request):
         diff = {f"#{n}.{k}": [tpl[n]["inputs"].get(k), v]
                 for n, nd in graph.items() for k, v in nd["inputs"].items()
                 if tpl[n]["inputs"].get(k) != v}
+        diff.update({f"#{n}.{k}": [v, "<断开>"]           # dropIfEmpty 拔掉的线
+                     for n, nd in tpl.items() for k, v in nd["inputs"].items()
+                     if k not in graph[n]["inputs"]})
         return web.json_response({"dry_run": True, "changed": diff})
     pid = await comfy_submit(request.app["session"], graph)
     JOBS[pid] = {"id": pid, "capability": cid, "name": cap["name"],
