@@ -74,6 +74,18 @@
     "120",
     0
    ],
+   "ref_images.ref_image_0": [
+    "227",
+    0
+   ],
+   "ref_images.ref_image_1": [
+    "137",
+    0
+   ],
+   "ref_audios.ref_audio_0": [
+    "177",
+    0
+   ],
    "prompt": [
     "138",
     0
@@ -90,23 +102,7 @@
     "131",
     1
    ],
-   "ref_image_size": "match",
-   "ref_images": [
-    [
-     "227",
-     0
-    ],
-    [
-     "137",
-     0
-    ]
-   ],
-   "ref_audios": [
-    [
-     "177",
-     0
-    ]
-   ]
+   "ref_image_size": "match"
   },
   "_meta": {
    "title": "MiniMax H3 Reference to Video"
@@ -115,13 +111,11 @@
  "131": {
   "class_type": "ComfyMathExpression",
   "inputs": {
-   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
-   "values": [
-    [
-     "132",
-     0
-    ]
-   ]
+   "values.a": [
+    "132",
+    0
+   ],
+   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"
   },
   "_meta": {
    "title": "Math Expression"

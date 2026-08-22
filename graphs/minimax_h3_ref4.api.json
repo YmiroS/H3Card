@@ -73,13 +73,11 @@
  "33": {
   "class_type": "ComfyMathExpression",
   "inputs": {
-   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
-   "values": [
-    [
-     "20",
-     0
-    ]
-   ]
+   "values.a": [
+    "20",
+    0
+   ],
+   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"
   },
   "_meta": {
    "title": "Math Expression"
@@ -143,6 +141,18 @@
     "10",
     0
    ],
+   "ref_images.ref_image_0": [
+    "47",
+    0
+   ],
+   "ref_images.ref_image_1": [
+    "48",
+    0
+   ],
+   "ref_images.ref_image_2": [
+    "49",
+    0
+   ],
    "prompt": [
     "68",
     0
@@ -159,21 +169,7 @@
     "33",
     1
    ],
-   "ref_image_size": "match",
-   "ref_images": [
-    [
-     "47",
-     0
-    ],
-    [
-     "48",
-     0
-    ],
-    [
-     "49",
-     0
-    ]
-   ]
+   "ref_image_size": "match"
   },
   "_meta": {
    "title": "MiniMax H3 Reference to Video"

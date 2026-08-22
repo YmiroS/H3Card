@@ -209,6 +209,12 @@ ComfyUI（127.0.0.1:8188，不对外）
    `KeyError: 43`（`execution.py:933`），报错信息还指向无关的 SaveImage 节点，极难定位。必须 `["43", 0]`。
 2. **数值类型要跟节点声明一致**：时长节点是 `PrimitiveFloat`，若写成整数，`7.5` 会被截断成 7。
    现在 manifest 的 target 里带 `vtype`，由扫描器从 `object_info` 读出。
+3. **V3 自增长输入（`COMFY_AUTOGROW_V3`）必须点号平铺，不能折成数组**：
+   `ComfyMathExpression.values` / `MiniMaxH3ReferenceToVideo.ref_images` 在 API 图里得写成
+   `"values.a": ["142",0]`、`"ref_images.ref_image_0": [...]`。折成 `"values": [["142",0]]`
+   会在校验期报 `#178: Required input is missing`（ComfyUI 侧 `get_finalized_class_inputs`
+   先把 autogrow 展成点号 key，再由 `build_nested_inputs` 折回嵌套）。
+   扫描器的 `required_keys()` 现在会展开 autogrow，这类错误在扫描阶段就能查出。
 
 ## 8. 已知坑
 
