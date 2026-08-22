@@ -252,6 +252,28 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #panel .ptabs .pblock { margin: 8px 0 0; }
 #panel .tabempty { padding: 12px 4px; color: var(--dim); font-size: 12px; }
 
+/* 作者预设的规范：折叠态只占一行，别让它长得像"又一条提示词" */
+#panel .tpl { margin: 8px 0; border: 1px dashed var(--line); border-radius: 2px; }
+#panel .tplhd {
+  width: 100%; text-align: left; padding: 7px 9px; font-size: 12px; color: var(--dim);
+  letter-spacing: .5px;
+}
+#panel .tplhd:hover { color: var(--acc); }
+#panel .tplhd.dirty { color: var(--warn); }
+#panel .tpl .tplnote {
+  margin: 0 9px 6px; font-size: 11px; line-height: 1.6; color: var(--warn);
+  border-left: 2px solid var(--warn); padding-left: 7px;
+}
+#panel .tpl textarea {
+  width: calc(100% - 18px); margin: 0 9px; min-height: 132px;
+  font-family: var(--mono); font-size: 11px; color: #9fb4cc;
+}
+#panel .tplrst {
+  margin: 6px 9px 9px; padding: 3px 9px; border-radius: 2px; font-size: 11px;
+  color: var(--dim); border: 1px solid var(--line);
+}
+#panel .tplrst:hover { color: var(--acc); border-color: var(--acc); }
+
 #panel .slots { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
 .slot { width: 66px; text-align: center; color: var(--dim); font-size: 11px; cursor: pointer; }
 .slot .box {
