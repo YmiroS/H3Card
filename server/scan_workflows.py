@@ -402,6 +402,38 @@ def upstream(api, nid, seen=None):
     return seen
 
 
+ZH_GRID = {4: "四宫格", 6: "六宫格", 9: "九宫格", 12: "十二宫格", 16: "十六宫格"}
+GRID_COLS = ("水平", "横向", "column", "cols", "horizontal", "x_count")
+GRID_ROWS = ("垂直", "纵向", "row", "rows", "vertical", "y_count")
+
+
+def grid_of(api, nid, depth=0, seen=None):
+    """这张上传图下游有没有「切格子」节点 -> (列数, 行数)。
+
+    漫剧那条工作流要求每张图本身就是一张 2×2 的四宫格拼图，下游会把它切成 4 个
+    分镜。不说清楚的话，用户传一张普通图进去只会被切成四块碎片，还不知道为什么。
+    判据不认节点类名：同一个节点上同时有「横向数量」和「纵向数量」两个整数输入、
+    乘积大于 1，那它就是在切格子。
+    """
+    seen = set() if seen is None else seen
+    if str(nid) in seen or depth > 8:
+        return None
+    seen.add(str(nid))
+    for cid, _k in consumers(api, nid):
+        ins = api[cid]["inputs"]
+        pick = lambda hints: next(                                   # noqa: E731
+            (v for f, v in ins.items()
+             if isinstance(v, int) and not isinstance(v, bool)
+             and any(h in f.lower() for h in hints)), None)
+        c, r = pick(GRID_COLS), pick(GRID_ROWS)
+        if c and r and c * r > 1:
+            return (c, r)
+        g = grid_of(api, cid, depth + 1, seen)
+        if g:
+            return g
+    return None
+
+
 def traced_label(api, nid, depth=0, seen=None):
     """顺着数据流往下找语义明确的输入名；GENERIC 只做兜底"""
     seen = seen or set()
@@ -552,6 +584,9 @@ def derive_inputs(api, oi):
             item["hint"] = hint
         if i in drop:
             item["dropIfEmpty"] = drop[i]
+        g = grid_of(api, nid)
+        if g:
+            item["grid"] = list(g)
         out.append(item)
     for i, (nid, title) in enumerate(audios):
         label, hint = pick_label(None if default_title(oi, "LoadAudio", title) else title, "音频")
@@ -620,7 +655,18 @@ def derive_inputs(api, oi):
         if i:
             item["mirror"] = True          # 多个采样器共用同一个种子输入框
         out.append(item)
-    return out, outputs, len(images), len(audios)
+
+    # 切格子的工作流：这是用户唯一会踩的坑，写成卡片说明摆在最上面
+    note = None
+    grids = [tuple(s["grid"]) for s in out if s.get("grid")]
+    if grids:
+        c, r = grids[0]
+        per, n = c * r, len(grids)
+        note = (f"每张图都要是 {c}×{r} 的{ZH_GRID.get(per, str(per) + '宫格')}拼图，"
+                f"上传后自动切成 {per} 个分镜、连成一段视频。"
+                + (f"传满 {n} 张就是 {per * n} 宫格，按顺序接成一整条完整视频。"
+                   if n > 1 else ""))
+    return out, outputs, len(images), len(audios), note
 
 
 def required_keys(oi, ct):
@@ -715,7 +761,7 @@ def scan(path: Path, oi, rel_key=None):
     else:
         api = ui_to_api(wf, oi, warns)
     repair_loop_count(api, oi, warns)
-    inputs, outputs, n_img, n_aud = derive_inputs(api, oi)
+    inputs, outputs, n_img, n_aud, note = derive_inputs(api, oi)
     out_type = outputs[0][1] if outputs else "unknown"
     warns += [f"结构错误 {e}" for e in validate_api(api, oi)]
     if not outputs:
@@ -734,6 +780,7 @@ def scan(path: Path, oi, rel_key=None):
         "audios": n_aud,
         "graph": f"graphs/{wid}.api.json",
         "output": {"node": outputs[0][0]} if outputs else None,
+        "note": note,
         "inputs": inputs,
         "warnings": warns,
     }

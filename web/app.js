@@ -95,6 +95,23 @@ const shortOf16x9 = (L) => Math.round(L * 9 / 16 / MULT) * MULT;
 
 /* ================= 能力说明浮层 ================= */
 const OUT_TXT = { image: "图片 (png)", video: "视频 (mp4，含音轨)", audio: "音频" };
+const GRID_ZH = { 4: "四宫格", 6: "六宫格", 9: "九宫格", 12: "十二宫格", 16: "十六宫格" };
+
+/** 这个素材槽要的是一张几宫格拼图（manifest 的 grid，由下游切图节点推出来） */
+function gridWord(s) {
+  const g = s && s.grid;
+  if (!g) return "";
+  const n = g[0] * g[1];
+  return GRID_ZH[n] || `${n}格`;
+}
+
+/** 槽位显示名。原始标签只有序号时补个词；要拼图的直接写成"四宫格3"，
+    让人在点上传之前就知道该找什么样的图 */
+function slotName(s) {
+  const t = String(s.label || "").trim(), w = gridWord(s);
+  if (/^\d+$/.test(t)) return (w || (s.type === "audio" ? "音频" : "图")) + t;
+  return w ? `${t}（${w}）` : t;
+}
 
 /** 从 manifest 反推这个工作流吃什么、吐什么 —— 不写死任何工作流 */
 function capBrief(cap) {
@@ -108,7 +125,7 @@ function capBrief(cap) {
   const need = [], opt = [];
   if (imgs.length) {
     (imgs.every(s => s.required) ? need : opt).push(
-      `图片 ×${imgs.length}：${imgs.map(s => s.label + (s.required ? "" : "?")).join(" / ")}`);
+      `图片 ×${imgs.length}：${imgs.map(s => slotName(s) + (s.required ? "" : "?")).join(" / ")}`);
   }
   if (auds.length) need.push(`音频 ×${auds.length}：${auds.map(s => s.label).join(" / ")}`);
   if (!imgs.length && !auds.length) need.push("不需要素材，纯提示词驱动");
@@ -127,6 +144,10 @@ function briefEl(cap, name) {
   const d = document.createElement("div");
   const h = document.createElement("b"); h.textContent = name || cap.name;
   d.appendChild(h);
+  if (cap.note) {
+    const n = document.createElement("div"); n.className = "note";
+    n.textContent = cap.note; d.appendChild(n);
+  }
   const row = (k, v) => {
     const r = document.createElement("div"); r.className = "io";
     const i = document.createElement("i"); i.textContent = k;
@@ -616,6 +637,14 @@ function openPanel(id) {
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
 
+  // --- 玩法说明 ---
+  // 素材有硬性要求（比如每张图必须是四宫格拼图）的工作流，不讲清楚就是白跑一轮
+  if (cap.note) {
+    const n = document.createElement("div"); n.className = "pnote";
+    n.textContent = cap.note;
+    body.appendChild(n);
+  }
+
   // --- 素材槽 ---
   // 放在提示词前面：漫剧那种一图一提示词的工作流，tab 是跟着图长出来的，
   // 先看到图槽才讲得通
@@ -695,11 +724,8 @@ function errBox(t) { const d = document.createElement("div"); d.className = "err
     后端也照这个关系清空未配对的提示词，两边的列表长度才对得上。 */
 function promptTabs(c, list) {
   const cap = capOf(c);
-  const name = (s) => {
-    const im = cap.inputs.find(x => x.key === s.pairWith);
-    const t = im ? im.label : s.label;
-    return /^\d+$/.test(t) ? "图" + t : t;       // 作者只标了序号时补个"图"字
-  };
+  // tab 名跟着素材槽走：槽叫"四宫格3"，这条就是"四宫格3 的提示词"
+  const name = (s) => slotName(cap.inputs.find(x => x.key === s.pairWith) || s);
   const wrap = document.createElement("div"); wrap.className = "ptabs";
   const strip = document.createElement("div"); strip.className = "tabs";
   const on = list.map(s => !!c.assets[s.pairWith]);
@@ -797,14 +823,14 @@ function slotEl(c, s) {
   const a = c.assets[s.key];
   const d = document.createElement("div");
   d.className = "slot" + (a ? " filled" : s.required ? " req" : "");
-  d.title = (s.hint || s.label) + (s.required ? "（必填）" : "");
+  d.title = (s.hint || slotName(s)) + (s.required ? "（必填）" : "");
   d.innerHTML = `<div class="box"></div><span class="lbl"></span>`;
-  d.querySelector(".lbl").textContent = s.label;
+  d.querySelector(".lbl").textContent = slotName(s);
   const box = d.querySelector(".box");
   if (a) {
     box.innerHTML = a.kind === "image" ? `<img src="${a.url}">`
       : a.kind === "video" ? `<video src="${a.url}" muted></video>` : `🎵`;
-  } else box.textContent = s.type === "audio" ? "🎵" : "＋";
+  } else box.textContent = s.type === "audio" ? "🎵" : gridWord(s) ? "田" : "＋";
   d.onclick = () => pickFile(c, s);
   d.oncontextmenu = (ev) => {
     ev.preventDefault();
