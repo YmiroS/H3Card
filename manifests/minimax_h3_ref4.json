@@ -1,6 +1,7 @@
 {
  "id": "minimax_h3_ref4",
- "name": "MiniMax H3  四图全能参考单采",
+ "name": "H3 四图参考生视频",
+ "file": "MiniMax H3  四图全能参考单采",
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3  四图全能参考单采.json",
  "group": "视频",
  "outputType": "video",

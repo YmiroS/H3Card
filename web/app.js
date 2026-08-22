@@ -161,7 +161,7 @@ function render() {
 }
 
 function buildCard(c) {
-  const def = cardDef(c.type), cap = capOf(c);
+  const def = cardDef(c.type);
   const d = document.createElement("div");
   d.className = "card" + (selId === c.id ? " sel" : "");
   d.dataset.id = c.id;
@@ -172,12 +172,12 @@ function buildCard(c) {
     <div class="bar"><i></i></div>
     <div class="cf"><span class="st"></span><span class="meta" style="margin-left:auto"></span></div>
     <div class="port" title="拖到空白处 → 用本卡产物新建下游卡"></div>`;
-  d.querySelector(".ch .t").textContent = cap ? cap.name : (c.cap || "未选择能力");
+  c._el = d;
+  paintTitle(c);
   d.querySelector(".ch .x").onclick = (ev) => { ev.stopPropagation(); delCard(c.id); };
   d.querySelector(".ch").onmousedown = (ev) => startDrag(ev, c, d);
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
   d.onmousedown = (ev) => { ev.stopPropagation(); pick(c.id); };
-  c._el = d;
   paint(c);
   return d;
 }
@@ -431,8 +431,8 @@ function openPanel(id) {
     for (const md of def.modes) {
       const b = document.createElement("button");
       b.className = md.id === c.cap ? "on" : "";
-      b.textContent = shortName(md.name);
-      b.title = md.name + "  [" + md.slots + "]";
+      b.textContent = md.name;
+      b.title = `${md.name}\n工作流：${(CAPS[md.id] || {}).file || md.id}\n槽位：${md.slots}`;
       b.onclick = () => { c.cap = md.id; openPanel(id); paintTitle(c); save(); };
       m.appendChild(b);
     }
@@ -511,9 +511,11 @@ function openPanel(id) {
 }
 
 function errBox(t) { const d = document.createElement("div"); d.className = "err"; d.textContent = t; return d; }
-function paintTitle(c) { if (c._el) c._el.querySelector(".ch .t").textContent = capOf(c) ? capOf(c).name : c.cap; }
-function shortName(n) {
-  return n.replace(/^@/, "").replace(/[（(][^）)]*[）)]/g, "").replace(/：/g, " ").trim().slice(0, 12) || n.slice(0, 12);
+function paintTitle(c) {
+  if (!c._el) return;
+  const t = c._el.querySelector(".ch .t"), cap = capOf(c);
+  t.textContent = cap ? cap.name : c.cap;
+  t.title = cap ? `${cap.name}\n工作流：${cap.file || cap.id}` : c.cap;
 }
 
 function slotEl(c, s) {
