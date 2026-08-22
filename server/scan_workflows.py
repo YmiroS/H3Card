@@ -740,6 +740,53 @@ def validate_api(api, oi):
     return errs
 
 
+def fingerprint(m):
+    """能力的「输入指纹」：图片槽不算，其余 key 排序。
+    两条工作流指纹相同、只差图片张数 —— 那就是同一件事的不同张数版本。"""
+    return (m["audios"], tuple(sorted(i["key"] for i in m["inputs"] if i["type"] != "image")))
+
+
+def build_modes(ms):
+    """把「只差图片张数」的能力合并成一个模式：传几张图，就跑哪条工作流。
+
+    图生视频(1图) 和 首尾帧生视频(2图) 的输入除了多一个尾帧槽完全一样，对用户
+    来说本来就是一件事 —— 传一张是图生视频，传两张是首尾帧。让人先选模式再想
+    张数是多余的；更糟的是选了首尾帧却只传一张，模板自带的演示尾帧会顶上来照跑。
+    合并后张数说话，模式列表也短了。
+    """
+    fam = {}
+    for m in ms:
+        fam.setdefault(fingerprint(m), []).append(m)
+    ladders = {}                                  # 合并后的 top id -> 阶梯
+    for group in fam.values():
+        counts = {m["images"] for m in group}
+        if len(group) < 2 or len(counts) != len(group) or min(counts) < 1:
+            continue                              # 张数撞车或压根没有图槽：不合并
+        group.sort(key=lambda m: m["images"])
+        top = group[-1]
+        # 多出来的图槽必须是选填的，否则合并后用户看到一个必填槽却不需要填
+        extra = [i for i in top["inputs"]
+                 if i["type"] == "image" and int(i["key"][7:-1]) >= group[0]["images"]]
+        if any(i.get("required") for i in extra):
+            continue
+        ladders[top["id"]] = {
+            "name": group[0]["name"].split("·")[0],   # "说话唱歌·单人" -> "说话唱歌"
+            "ladder": {str(m["images"]): m["id"] for m in group},
+            "members": {m["id"] for m in group},
+        }
+    merged = {i for L in ladders.values() for i in L["members"]} - set(ladders)
+    modes = []
+    for m in ms:
+        if m["id"] in merged:
+            continue                              # 已经并进同族的 top 里了
+        md = {"id": m["id"], "name": m["name"], "slots": m["slots"]}
+        if m["id"] in ladders:
+            md["name"] = ladders[m["id"]]["name"]
+            md["ladder"] = ladders[m["id"]]["ladder"]
+        modes.append(md)
+    return modes
+
+
 def slugify(name):
     s = re.sub(r"[^A-Za-z0-9]+", "_", name).strip("_").lower()
     return s if len(re.sub(r"[^a-z0-9]", "", s)) >= 3 else ""
@@ -856,7 +903,7 @@ def main():
         cid, cname, icon = CARD_META.get(key, (key, ms[0]["name"], "▦"))
         cards.append({
             "id": cid, "name": cname, "icon": icon, "outputType": ms[0]["outputType"],
-            "modes": [{"id": m["id"], "name": m["name"], "slots": m["slots"]} for m in ms],
+            "modes": build_modes(ms),
         })
     (ROOT / "manifests" / "_cards.json").write_text(
         json.dumps(cards, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -865,6 +912,8 @@ def main():
         print(f"    {c['icon']} {c['name']}  ({len(c['modes'])} 模式)")
         for md in c["modes"]:
             print(f"        [{md['slots']:<10}] {md['id']:<26} {md['name']}")
+            for n, wid in sorted(md.get("ladder", {}).items()):
+                print(f"            {n} 张图 -> {wid}")
     print(f"\n共 {len(manifests)} 个能力 -> chouka/manifests/")
 
 

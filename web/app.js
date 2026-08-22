@@ -51,7 +51,22 @@ const uid = () => Math.random().toString(36).slice(2, 10);
     能力被拆成独立卡片后（比如漫剧从"生视频"里单独抽出来），老项目里存的
     c.type 还指着旧卡，按 c.type 找会拿到一个模式列表里根本没有它的卡。 */
 const cardDef = (t) => CARDS.find(c => c.id === t) || CARDS[0];
-const defOf = (c) => CARDS.find(d => d.modes.some(m => m.id === c.cap)) || cardDef(c.type);
+const modeHas = (md, cid) => md.id === cid
+  || !!(md.ladder && Object.values(md.ladder).includes(cid));
+const defOf = (c) => CARDS.find(d => d.modes.some(m => modeHas(m, c.cap))) || cardDef(c.type);
+const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHas(m, c.cap)); };
+const filledImgs = (c) => Object.keys(c.assets || {})
+  .filter(k => k.startsWith("images[") && c.assets[k]).length;
+
+/** 合并模式真正要跑的能力：按已上传的图片张数挑（1 张=图生视频，2 张=首尾帧）。
+    面板一直用张数最多那条能力来画（槽位是它的超集），提交时才落到具体这条。 */
+function runCap(c) {
+  const md = modeOf(c);
+  if (!md || !md.ladder) return c.cap;
+  const steps = Object.keys(md.ladder).map(Number).sort((a, b) => a - b);
+  const n = Math.max(filledImgs(c), steps[0]);      // 一张都没传时按最低档算
+  return md.ladder[String(steps.filter(s => s <= n).pop())] || c.cap;
+}
 const capOf = (c) => CAPS[c.cap] || null;
 
 /* ================= H3 画布换算 =================
@@ -239,6 +254,12 @@ async function openProject(pid) {
   catch (e) { return toast(e.message); }
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
+  // 能力被合并/拆分过之后，老项目里存的 cap 可能已经不是模式入口了
+  // （图生视频并进了首尾帧那条），统一归到模式入口，参数和素材的 key 是通的
+  for (const c of PROJ.cards) {
+    const md = modeOf(c);
+    if (md && md.id !== c.cap) c.cap = md.id;
+  }
   view = Object.assign({ x: 60, y: 70, k: 1 }, PROJ.view || {});
   selId = null;
   closePanel();
@@ -628,7 +649,7 @@ function openPanel(id) {
       const b = document.createElement("button");
       b.className = md.id === c.cap ? "on" : "";
       b.textContent = md.name;
-      hoverBrief(b, () => CAPS[md.id]);
+      hoverBrief(b, () => CAPS[md.id], () => md.name);
       b.onclick = () => { tipHide(); c.cap = md.id; openPanel(id); paintTitle(c); save(); };
       m.appendChild(b);
     }
@@ -646,6 +667,17 @@ function openPanel(id) {
   if (cap.note) {
     const n = document.createElement("div"); n.className = "pnote";
     n.textContent = cap.note;
+    body.appendChild(n);
+  }
+  // 合并模式：把"传几张跑哪条"摊开写，并标出现在会跑哪条
+  const md = modeOf(c);
+  if (md && md.ladder) {
+    const now = runCap(c);
+    const n = document.createElement("div"); n.className = "pnote";
+    n.textContent = "看图片张数决定跑哪条工作流："
+      + Object.keys(md.ladder).map(Number).sort((a, b) => a - b)
+        .map(k => `${k} 张 → ${(CAPS[md.ladder[k]] || {}).name || md.ladder[k]}`).join("；")
+      + `。当前 ${filledImgs(c)} 张，会跑「${(CAPS[now] || {}).name || now}」。`;
     body.appendChild(n);
   }
 
@@ -818,8 +850,9 @@ function templateBlock(c, s) {
 }
 function paintTitle(c) {
   if (!c._el) return;
-  const t = c._el.querySelector(".ch .t"), cap = capOf(c);
-  t.textContent = c.name || (cap ? cap.name : c.cap);
+  const t = c._el.querySelector(".ch .t"), cap = capOf(c), md = modeOf(c);
+  // 合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）
+  t.textContent = c.name || (md && md.ladder ? md.name : cap ? cap.name : c.cap);
   t.classList.toggle("named", !!c.name);
 }
 
@@ -969,7 +1002,7 @@ function augRes(c, s, row) {
     以前没动过的输入框不会进 params，ComfyUI 于是用了模板里作者的演示值 —
     图生视频出鼠标广告就是这么来的。 */
 function payloadOf(c) {
-  const cap = capOf(c), params = {}, assets = {};
+  const cap = CAPS[runCap(c)] || capOf(c), params = {}, assets = {};
   for (const s of cap.inputs) {
     if (s.type === "image" || s.type === "audio" || s.mirror) continue;
     const v = c.params[s.key];
@@ -978,7 +1011,7 @@ function payloadOf(c) {
     else if (s.default !== undefined) params[s.key] = s.default;
   }
   for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
-  return { capability: c.cap, params, assets };
+  return { capability: cap.id, params, assets };
 }
 
 async function run(c) {

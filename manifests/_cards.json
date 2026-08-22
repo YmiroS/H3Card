@@ -24,24 +24,22 @@
   "outputType": "video",
   "modes": [
    {
-    "id": "minimax_h3_i2v",
-    "name": "H3 图生视频",
-    "slots": "img1+aud0"
-   },
-   {
-    "id": "minimax_h3_talk1",
-    "name": "H3 说话唱歌·单人",
-    "slots": "img1+aud1"
-   },
-   {
     "id": "minimax_h3_flf2v",
-    "name": "H3 首尾帧生视频",
-    "slots": "img2+aud0"
+    "name": "H3 图生视频",
+    "slots": "img2+aud0",
+    "ladder": {
+     "1": "minimax_h3_i2v",
+     "2": "minimax_h3_flf2v"
+    }
    },
    {
     "id": "minimax_h3_talk2",
-    "name": "H3 说话唱歌·双人",
-    "slots": "img2+aud1"
+    "name": "H3 说话唱歌",
+    "slots": "img2+aud1",
+    "ladder": {
+     "1": "minimax_h3_talk1",
+     "2": "minimax_h3_talk2"
+    }
    },
    {
     "id": "minimax_h3_ref4",
