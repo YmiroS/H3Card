@@ -18,7 +18,7 @@ const el = {
   side: $("#side"), plist: $("#plist"), dot: $("#dot"),
   ptitle: $("#ptitle"), hint: $("#hint"), addcard: $("#addcard"), fit: $("#fit"),
   stage: $("#stage"), world: $("#world"), wires: $("#wires"),
-  empty: $("#empty"), panel: $("#panel"), menu: $("#menu"),
+  empty: $("#empty"), panel: $("#panel"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
 };
 
@@ -49,6 +49,67 @@ function toast(msg) {
 const uid = () => Math.random().toString(36).slice(2, 10);
 const cardDef = (t) => CARDS.find(c => c.id === t) || CARDS[0];
 const capOf = (c) => CAPS[c.cap] || null;
+
+/* ================= 能力说明浮层 ================= */
+const OUT_TXT = { image: "图片 (png)", video: "视频 (mp4，含音轨)", audio: "音频" };
+
+/** 从 manifest 反推这个工作流吃什么、吐什么 —— 不写死任何工作流 */
+function capBrief(cap) {
+  const by = (t) => cap.inputs.filter(s => s.type === t);
+  const imgs = by("image"), auds = by("audio"), txts = by("textarea");
+  const dur = cap.inputs.find(s => s.key === "duration");
+  const size = cap.inputs.filter(s => s.key === "width" || s.key === "height");
+  const need = [], opt = [];
+  if (imgs.length) {
+    (imgs.every(s => s.required) ? need : opt).push(
+      `图片 ×${imgs.length}：${imgs.map(s => s.label + (s.required ? "" : "?")).join(" / ")}`);
+  }
+  if (auds.length) need.push(`音频 ×${auds.length}：${auds.map(s => s.label).join(" / ")}`);
+  if (!imgs.length && !auds.length) need.push("不需要素材，纯提示词驱动");
+  if (txts.length) need.push(txts.length > 1 ? `提示词 ×${txts.length}` : "提示词");
+  if (dur) opt.push(`时长 ${dur.min}–${dur.max} 秒`);
+  if (size.length) opt.push("画面宽高");
+  if (cap.inputs.some(s => s.type === "seed")) opt.push("种子");
+  return { need, opt, out: OUT_TXT[cap.outputType] || cap.outputType, file: cap.file || cap.id };
+}
+
+function briefEl(cap, name) {
+  const b = capBrief(cap);
+  const d = document.createElement("div");
+  const h = document.createElement("b"); h.textContent = name || cap.name;
+  d.appendChild(h);
+  const row = (k, v) => {
+    const r = document.createElement("div"); r.className = "io";
+    const i = document.createElement("i"); i.textContent = k;
+    const s = document.createElement("span"); s.textContent = v;
+    r.append(i, s); d.appendChild(r);
+  };
+  row("输入", b.need.join("　·　"));
+  if (b.opt.length) row("可调", b.opt.join("　·　"));
+  row("产出", b.out);
+  const f = document.createElement("div"); f.className = "fn";
+  f.textContent = b.file; d.appendChild(f);
+  return d;
+}
+
+function tipShow(node, x, y) {
+  el.tip.innerHTML = ""; el.tip.appendChild(node);
+  el.tip.style.display = "";
+  el.tip.style.left = Math.max(8, Math.min(x, innerWidth - el.tip.offsetWidth - 8)) + "px";
+  el.tip.style.top = (y + el.tip.offsetHeight > innerHeight - 8
+    ? y - el.tip.offsetHeight - 16 : y) + "px";
+}
+const tipHide = () => (el.tip.style.display = "none");
+
+/** 给元素挂"悬停显示能力说明" */
+function hoverBrief(node, capGetter, nameGetter) {
+  node.addEventListener("mouseenter", () => {
+    const cap = capGetter(); if (!cap) return;
+    const r = node.getBoundingClientRect();
+    tipShow(briefEl(cap, nameGetter && nameGetter()), r.left, r.bottom + 8);
+  });
+  node.addEventListener("mouseleave", tipHide);
+}
 
 /* ================= 启动 ================= */
 (async function boot() {
@@ -178,6 +239,11 @@ function buildCard(c) {
   d.querySelector(".ch").onmousedown = (ev) => startDrag(ev, c, d);
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
   d.onmousedown = (ev) => { ev.stopPropagation(); pick(c.id); };
+  d.oncontextmenu = (ev) => {
+    ev.preventDefault(); ev.stopPropagation();
+    tipHide(); pick(c.id); cardMenu(ev.clientX, ev.clientY, c);
+  };
+  hoverBrief(d.querySelector(".ch"), () => capOf(c), () => c.name);
   paint(c);
   return d;
 }
@@ -245,6 +311,7 @@ function pick(id) {
 function startDrag(ev, c, d) {
   if (ev.button !== 0) return;
   ev.stopPropagation();
+  tipHide();
   pick(c.id);
   const s = { mx: ev.clientX, my: ev.clientY, x: c.x, y: c.y };
   const mv = (e) => {
@@ -259,6 +326,7 @@ function startDrag(ev, c, d) {
 
 function startWire(ev, c) {
   ev.stopPropagation(); ev.preventDefault();
+  tipHide();
   const a = cardBox(c.id);
   const p = document.createElementNS(SVGNS, "path");
   p.setAttribute("class", "tmp");
@@ -323,26 +391,72 @@ function bindGlobal() {
     openMenu(ev.clientX, ev.clientY, toWorld(ev.clientX, ev.clientY));
   });
 
+  el.stage.addEventListener("contextmenu", (ev) => {
+    ev.preventDefault();
+    if (!PROJ || ev.target.closest(".card")) return;
+    tipHide();
+    openMenu(ev.clientX, ev.clientY, toWorld(ev.clientX, ev.clientY));
+  });
+
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") { closeMenu(); selId = null; closePanel(); }
+    if (ev.key === "Escape") { closeMenu(); tipHide(); selId = null; closePanel(); }
   });
 }
 
-/* ================= 新建卡片菜单 ================= */
-function openMenu(cx, cy, at) {
-  el.menu.innerHTML = `<div class="hd">新建卡片</div>`;
-  for (const def of CARDS) {
-    if (!def.modes.length) continue;
+/* ================= 右键菜单 ================= */
+/** items: [{icon, text, danger, run}] */
+function showMenu(cx, cy, title, items) {
+  el.menu.innerHTML = "";
+  const hd = document.createElement("div"); hd.className = "hd";
+  hd.textContent = title; el.menu.appendChild(hd);
+  for (const it of items) {
     const b = document.createElement("button");
-    b.innerHTML = `<span>${def.icon}</span><span>${def.name}</span>`;
-    b.onclick = () => { closeMenu(); addCard(def.id, at.x - CW / 2, at.y - 40); };
+    if (it.danger) b.className = "danger";
+    const i = document.createElement("span"); i.textContent = it.icon || "▸";
+    const t = document.createElement("span"); t.textContent = it.text;
+    b.append(i, t);
+    b.onclick = () => { closeMenu(); it.run(); };
     el.menu.appendChild(b);
   }
   el.menu.style.display = "";
-  el.menu.style.left = Math.min(cx, innerWidth - 180) + "px";
-  el.menu.style.top = Math.min(cy, innerHeight - 130) + "px";
+  el.menu.style.left = Math.min(cx, innerWidth - el.menu.offsetWidth - 8) + "px";
+  el.menu.style.top = Math.min(cy, innerHeight - el.menu.offsetHeight - 8) + "px";
 }
 const closeMenu = () => (el.menu.style.display = "none");
+
+function openMenu(cx, cy, at) {
+  showMenu(cx, cy, "新建卡片", CARDS.filter(d => d.modes.length).map(def => ({
+    icon: def.icon, text: def.name,
+    run: () => addCard(def.id, at.x - CW / 2, at.y - 40),
+  })));
+}
+
+function cardMenu(cx, cy, c) {
+  const cap = capOf(c);
+  showMenu(cx, cy, c.name || (cap ? cap.name : "卡片"), [
+    { icon: "✎", text: "重命名卡片", run: () => renameCard(c) },
+    { icon: "↑", text: "运行", run: () => run(c) },
+    { icon: "⧉", text: "复制卡片", run: () => cloneCard(c) },
+    { icon: "✕", text: "删除卡片", danger: true, run: () => delCard(c.id) },
+  ]);
+}
+
+function renameCard(c) {
+  const cap = capOf(c);
+  const n = prompt("卡片名字（留空恢复成工作流名）", c.name || (cap ? cap.name : ""));
+  if (n === null) return;
+  c.name = n.trim().slice(0, 40) || null;
+  paintTitle(c); save();
+}
+
+function cloneCard(c) {
+  const n = addCard(c.type, c.x + 24, c.y + 28);
+  Object.assign(n, {
+    cap: c.cap, name: c.name, params: JSON.parse(JSON.stringify(c.params || {})),
+    assets: JSON.parse(JSON.stringify(c.assets || {})),
+  });
+  paintTitle(n); openPanel(n.id); save();
+}
 
 function addCard(type, x, y) {
   const def = cardDef(type);
@@ -432,8 +546,8 @@ function openPanel(id) {
       const b = document.createElement("button");
       b.className = md.id === c.cap ? "on" : "";
       b.textContent = md.name;
-      b.title = `${md.name}\n工作流：${(CAPS[md.id] || {}).file || md.id}\n槽位：${md.slots}`;
-      b.onclick = () => { c.cap = md.id; openPanel(id); paintTitle(c); save(); };
+      hoverBrief(b, () => CAPS[md.id]);
+      b.onclick = () => { tipHide(); c.cap = md.id; openPanel(id); paintTitle(c); save(); };
       m.appendChild(b);
     }
     el.panel.appendChild(m);
@@ -535,8 +649,8 @@ function promptBlock(c, s) {
 function paintTitle(c) {
   if (!c._el) return;
   const t = c._el.querySelector(".ch .t"), cap = capOf(c);
-  t.textContent = cap ? cap.name : c.cap;
-  t.title = cap ? `${cap.name}\n工作流：${cap.file || cap.id}` : c.cap;
+  t.textContent = c.name || (cap ? cap.name : c.cap);
+  t.classList.toggle("named", !!c.name);
 }
 
 function slotEl(c, s) {
