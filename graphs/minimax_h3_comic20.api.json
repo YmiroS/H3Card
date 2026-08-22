@@ -1,0 +1,926 @@
+{
+ "120": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "360",
+    0
+   ],
+   "width": [
+    "346",
+    0
+   ],
+   "height": [
+    "346",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "Resize Image v2"
+  }
+ },
+ "113": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "361",
+    0
+   ],
+   "width": [
+    "346",
+    0
+   ],
+   "height": [
+    "346",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "Resize Image v2"
+  }
+ },
+ "116": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "363",
+    0
+   ],
+   "width": [
+    "346",
+    0
+   ],
+   "height": [
+    "346",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "Resize Image v2"
+  }
+ },
+ "244": {
+  "class_type": "easy batchAnything",
+  "inputs": {
+   "any_1": [
+    "206",
+    2
+   ],
+   "any_2": [
+    "316",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy batchAnything"
+  }
+ },
+ "232": {
+  "class_type": "easy promptList",
+  "inputs": {
+   "prompt_1": [
+    "272",
+    0
+   ],
+   "prompt_2": [
+    "273",
+    0
+   ],
+   "prompt_3": [
+    "274",
+    0
+   ],
+   "prompt_4": [
+    "275",
+    0
+   ],
+   "prompt_5": [
+    "276",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy promptList"
+  }
+ },
+ "250": {
+  "class_type": "easy isNone",
+  "inputs": {
+   "any": [
+    "206",
+    3
+   ]
+  },
+  "_meta": {
+   "title": "easy isNone"
+  }
+ },
+ "288": {
+  "class_type": "llama_cpp_model_loader",
+  "inputs": {
+   "model": "Qwen3.5-27B-UD-IQ3_XXS.gguf",
+   "mmproj": "mmproj-F16.gguf",
+   "chat_handler": "Qwen3.5",
+   "n_ctx": 8192,
+   "vram_limit": -1,
+   "image_min_tokens": 0,
+   "image_max_tokens": 0
+  },
+  "_meta": {
+   "title": "Llama-cpp Model Loader"
+  }
+ },
+ "273": {
+  "class_type": "Text Multiline",
+  "inputs": {
+   "text": "画面起于中景，莉亚高举的马灯如同磁石，将幽蓝的光晕投射在几株徐徐绽放的紫色幻象花上。镜头在光影摇曳中向右侧轻缓平移（Pan），像是被丛林深处的某种律动所牵引，随后在茂密的蓝色植被间定格——一只由纯净星尘构成的灵狐正悄然现身，它的双瞳闪烁着智慧的微光。莉亚惊喜地屏住呼吸，轻声唤道：“是你吗？森林的指引者？”灵狐闻声轻盈一跃，镜头顺着它的跳跃轨迹划出一道优美的弧线，追踪它踏上长满翠绿苔藓的巨型断木，留下一串如流星扫过的碎影。紧接着，镜头迅速切换为侧向跟踪长镜头（Tracking Shot），与奔跑的莉亚保持同步。她清脆的笑声在空气中荡漾：“等等我！”画面在一人一狐于幻彩森林中极速穿梭的动势中达到高潮，流光溢彩的背景在快门感下化作流动的线条，叙事在充满生命力的跃动中无限延展。\n【音效设计】：紫色花苞张开时极其细微的“沙沙”声，灵狐步履间伴随的清脆星尘碰撞音（类似轻柔的风铃残响），莉亚皮靴踩在松软腐殖土上的轻快脚步声，以及耳畔因快速奔跑而产生的、混合着草木清香的微风呼啸声。"
+  },
+  "_meta": {
+   "title": "Text Multiline"
+  }
+ },
+ "274": {
+  "class_type": "Text Multiline",
+  "inputs": {
+   "text": "画面起于震撼的大俯拍全景，幽蓝的能量河流在悬崖下奔涌，镜头俯瞰着灵狐如流光般跃过悬浮的岩阵。随即，镜头通过一个急促的推近（Push-in）切入莉亚的近景，画面带有轻微的呼吸感晃动，捕捉她面对深渊时颤抖的睫毛与紧握提灯的手指，她低声急促地自语：“别看下面，别看下面……”就在她纵身一跃的刹那，镜头迅速切换至低仰角的大远景侧随，莉亚微小的身影在巨大的发光瀑布前划过一道勇敢的弧线，斗篷在风中猎猎作响。随着她稳稳踏上对岸的实地，镜头的动势由极快转为极稳，机位缓缓降落并以温柔的弧度围绕着她与迎上来的灵狐转动（Orbit）。莉亚如释重负地蹲下身，手掌触碰到灵狐温热而晶莹的皮毛，紧绷的情绪随着她嘴角浮现的微笑彻底消解在森林尽头透出的第一缕暖光中。\n【音效设计】：岩石悬浮时发出的低频磁场脉冲声，下方能量溪流奔腾的液态电磁音，特写镜头下莉亚沉重且急促的呼吸声，跃起时衣料在大气中紧绷的撕裂感，以及落地时靴子扎实踩进厚实草地的闷响。"
+  },
+  "_meta": {
+   "title": "Text Multiline"
+  }
+ },
+ "275": {
+  "class_type": "Text Multiline",
+  "inputs": {
+   "text": "画面起于莉亚的主观视角（POV），她戴着半指手套的双臂缓缓拨开层叠交错的阔叶，刺目的圣光瞬间从指缝间倾泻而出。随着叶片彻底分向两侧，镜头以一个惊人的大广角拉开，建立起宏大的客观视点：一棵通体脉络流淌着翠绿强光的巨型生命之树在繁星下傲然伫立，根系如巨龙般扎入发光菌群。莉亚提着马灯，在这股神圣的力量面前停下脚步，仰头轻声呢喃：“这就是一切的源头……”镜头随即从她身后平稳推进（Push-in），跟随她走向树干基部那如同神庙入口的裂隙。环境音在此刻骤然沉寂，镜头缓缓锁向她试探性伸出的右手，直至极近景的特写。当她的指尖即将触碰树皮时，金色的能量电弧在空隙间跳跃闪烁，画面在指尖与树干接触前的最后一毫米定格，仿佛整个森林的呼吸都在这一刻彻底凝固。\n【音效设计】：厚实叶片摩擦脊背的干涩声，因绝对静谧而产生的轻微耳鸣感，地底深处传来的、如同巨型心脏搏动般的沉闷共鸣声，以及指尖接近树皮时，能量放电产生的细微“噼啪”静电音。"
+  },
+  "_meta": {
+   "title": "Text Multiline"
+  }
+ },
+ "276": {
+  "class_type": "Text Multiline",
+  "inputs": {
+   "text": "画面起于极近景的触碰点，当莉亚的手掌彻底贴合树皮的瞬间，寂静被原始的生命力撕裂，翠绿的强光如星暴般以指尖为中心炸裂开来。镜头以此爆发点为原点，开始急速向后拉远（Rapid Zoom-out），原本幽暗的森林被这股澎湃的能量波层层点亮。无数发光的孢子与灵动的光球从地表腾空而起，灵狐在光雨中轻盈翻腾，莉亚仰头注视着这神迹般的时刻，声音在光影交织中显得细小而坚定：“醒来吧……”\n镜头在持续的后拉动势中，见证了枯木在强光洗礼下瞬间抽出嫩芽、异花竞相绽放的奇景。随后，镜头以一个柔顺的弧度重新拉回（Track-in），聚焦在莉亚的正脸特写上。她站在那棵完全复苏、通体流溢着神圣辉光的生命之树前，瞳孔中倒映着万物重生的绚烂。她微微露出一抹释然的笑意，画面在她充满希望的神情中定格，森林深处响起了第一声清晨般的草木低吟。\n【音效设计】：指尖触碰瞬间爆发出的、带有厚重低音炮质感的能量脉冲音，无数光球升腾时如气泡破裂般的急促清响，万物生长时木质纤维快速拉伸、花苞瞬间绽放的密集沙沙声，以及森林整体响起的一阵如管风琴般空灵而悠长的共鸣风声。"
+  },
+  "_meta": {
+   "title": "Text Multiline"
+  }
+ },
+ "251": {
+  "class_type": "If ANY execute A else B",
+  "inputs": {
+   "ANY": [
+    "250",
+    0
+   ],
+   "IF_TRUE": [
+    "252",
+    0
+   ],
+   "IF_FALSE": [
+    "206",
+    3
+   ]
+  },
+  "_meta": {
+   "title": "If ANY execute A else B"
+  }
+ },
+ "56": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "341": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+   "type": "minimax",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "252": {
+  "class_type": "EmptyAudio",
+  "inputs": {
+   "duration": 0.010000000000000002,
+   "sample_rate": 44100,
+   "channels": 2
+  },
+  "_meta": {
+   "title": "Empty Audio"
+  }
+ },
+ "324": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "338",
+    0
+   ],
+   "guider": [
+    "327",
+    0
+   ],
+   "sampler": [
+    "335",
+    0
+   ],
+   "sigmas": [
+    "319",
+    0
+   ],
+   "latent_image": [
+    "337",
+    1
+   ]
+  },
+  "_meta": {
+   "title": "SamplerCustomAdvanced"
+  }
+ },
+ "190": {
+  "class_type": "easy cleanGpuUsed",
+  "inputs": {
+   "anything": [
+    "316",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy cleanGpuUsed"
+  }
+ },
+ "304": {
+  "class_type": "VAEDecodeAudio",
+  "inputs": {
+   "samples": [
+    "324",
+    0
+   ],
+   "vae": [
+    "302",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode Audio"
+  }
+ },
+ "302": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "344": {
+  "class_type": "ComfyMathExpression",
+  "inputs": {
+   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+   "values": [
+    [
+     "343",
+     0
+    ]
+   ]
+  },
+  "_meta": {
+   "title": "Math Expression"
+  }
+ },
+ "343": {
+  "class_type": "PrimitiveFloat",
+  "inputs": {
+   "value": 12
+  },
+  "_meta": {
+   "title": "Float (duration)"
+  }
+ },
+ "316": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "324",
+    0
+   ],
+   "vae": [
+    "56",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "262": {
+  "class_type": "AudioConcat",
+  "inputs": {
+   "audio1": [
+    "251",
+    0
+   ],
+   "audio2": [
+    "304",
+    0
+   ],
+   "direction": "after"
+  },
+  "_meta": {
+   "title": "Concatenate Audio"
+  }
+ },
+ "207": {
+  "class_type": "easy forLoopEnd",
+  "inputs": {
+   "flow": [
+    "206",
+    0
+   ],
+   "initial_value1": [
+    "244",
+    0
+   ],
+   "initial_value2": [
+    "262",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "For Loop End"
+  }
+ },
+ "327": {
+  "class_type": "BasicGuider",
+  "inputs": {
+   "model": [
+    "370",
+    0
+   ],
+   "conditioning": [
+    "337",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Basic Guider"
+  }
+ },
+ "338": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 42
+  },
+  "_meta": {
+   "title": "RandomNoise"
+  }
+ },
+ "189": {
+  "class_type": "easy cleanGpuUsed",
+  "inputs": {
+   "anything": [
+    "289",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy cleanGpuUsed"
+  }
+ },
+ "206": {
+  "class_type": "easy forLoopStart",
+  "inputs": {
+   "total": 1
+  },
+  "_meta": {
+   "title": "For Loop Start"
+  }
+ },
+ "287": {
+  "class_type": "llama_cpp_parameters",
+  "inputs": {
+   "max_tokens": 1024,
+   "top_k": 30,
+   "top_p": 0.9,
+   "min_p": 0.05,
+   "typical_p": 1,
+   "temperature": 0.8,
+   "repeat_penalty": 1,
+   "frequency_penalty": 0,
+   "presence_penalty": 1,
+   "mirostat_mode": 0,
+   "mirostat_eta": 0.1,
+   "mirostat_tau": 5,
+   "state_uid": -1
+  },
+  "_meta": {
+   "title": "Llama-cpp Parameters"
+  }
+ },
+ "193": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-1.png"
+  },
+  "_meta": {
+   "title": "1"
+  }
+ },
+ "194": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-2.png"
+  },
+  "_meta": {
+   "title": "2"
+  }
+ },
+ "195": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-4.png"
+  },
+  "_meta": {
+   "title": "4"
+  }
+ },
+ "289": {
+  "class_type": "llama_cpp_instruct_adv",
+  "inputs": {
+   "llama_model": [
+    "288",
+    0
+   ],
+   "parameters": [
+    "287",
+    0
+   ],
+   "images": [
+    "216",
+    0
+   ],
+   "preset_prompt": "Normal - Describe",
+   "custom_prompt": "# Role\n你是一名好莱坞级别的电影分镜视频导演兼 LTX-2.3 / 通用视频模型 JSON 剧本架构师。你的核心任务是：接收用户提供的【四张四宫格参考图（帧1、帧2、帧3、帧4）的描述】以及【动作与台词要求】，将其转化为一个符合严格 JSON 格式的 **15秒多镜头电影剧本**。所有输出的提示词描述必须是**纯中文**。\n\n# Core Task & Cinematic Logic\n你必须将四张图片的故事序列转化为 JSON 数据结构中的 `shot_list`（镜头列表）。为了避免 AI 视频模型产生糟糕的画面融化、叠化或转场特效，你必须在每个镜头的 `content`（镜头内容描述）中严格遵守以下“四帧硬切”逻辑：\n\n1. **Shot 1 (对应图1起势):** \n描述开头精准锁定第一张图的构图与状态。必须强制加入“镜头内持续微动态”（如：发丝持续飘动、衣物随着动作起伏、胸腔随着呼吸起伏、背景光影流动），确保画面不僵化。\n2. **Shot 2 (对应图2硬切):** \n`content` 描述必须以强调**直接切换**起手（例如：“画面无缝直接硬切（Hard Cut）至第二幅构图，没有任何过渡、融化或叠化特效”）。保持持续的动作与微表情。如果该镜头有台词，必须强调角色开口说话，口型清晰且与台词完美同步。\n3. **Shot 3 (对应图3硬切):** \n`content` 描述同样必须强调硬切（例如：“镜头干净利落地硬切至第三幅画面，拒绝任何转场特效”）。继续推进人物动作与空间动态。\n4. **Shot 4 (对应图4收束):** \n`content` 描述强调最终落幅（例如：最后一次清脆的硬切，画面精准定格在第四幅画面的构图与神态）。如果有结尾台词，再次强调口型同步与情感爆发。\n\n# Output JSON Rules\n1. **纯 JSON 输出：** 只输出一个合法的 JSON 对象，不加任何 Markdown 标记（不要 ```json ），不要任何解释性文字。\n2. **语言要求：** JSON 内的所有值（除了参数字段名外）**必须全部使用中文**进行极其详尽、极具画面感的电影级描述。\n3. **时长逻辑：** 剧本总时长为 12 秒（`duration: 15`），请将这 12 秒合理分配给 `shot_list` 中的 4 个镜头（例如：2.5s, 2.5s, 3s, 4s），保证它们相加等于 12。\n4. **镜头数量：** `shot_list` 数组中**必须且只能包含 4 个对象**，依次对应图1到图4。\n\n# Input Format (用户将会提供以下内容)\n[Frame 1]: 图1描述\n[Frame 2]: 图2描述\n[Frame 3]: 图3描述\n[Frame 4]: 图4描述\n[Character & Costume]: 角色身份与服装打扮\n[Action & Plot]: 整体剧情动作\n[Dialogues]: 中文台词及分配的帧数\n[Audio & Mood]: 环境音、配乐与整体氛围\n\n# JSON Structure Template (必须严格遵循此结构输出)\n{\n  \"prompt\": 4K 50fps 杜比视界 电影质感...（根据用户输入生成包含整体画风、光影、氛围和配乐的中文总描述，需强调全片采用硬切手法，保持极高真实度与微动态）,\n  \"scene_list\":[\n    {\n      \"scene_name\": \"（场景名称）\",\n      \"scene_type\": \"（内景/外景）\",\n      \"time_period\": \"（时间与天气）\",\n      \"env_attr\": \"（环境关键词）\",\n      \"space_attr\": \"（空间感关键词）\",\n      \"light_attr\": \"（光影关键词）\",\n      \"sound_attr\": \"（声音氛围关键词）\",\n      \"ambient_sound\": \"（环境音效词组）\",\n      \"shot_list\":[\n        {\n          \"character\": \"（角色名）\",\n          \"character_costume\": \"（服装描述）\",\n          \"action_type\": \"（动作类型）\",\n          \"motion_speed\": \"（正常/慢/快）\",\n          \"emotion\": \"（情绪）\",\n          \"shot_scale\": \"（特写/近景/中景等）\",\n          \"camera_angle\": \"（平视/俯拍/仰拍等）\",\n          \"shot_move\": \"（固定/推/拉/摇/移）\",\n          \"shot_depth\": \"（浅景深/正常景深/深景深）\",\n          \"shot_pace\": \"（慢/正常/快）\",\n          \"shot_duration\": \"（如：3.5s）\",\n          \"content\": （极其详尽的画面描述！对于图1，强调起势与持续微动态；对于图2-4，开头必须写明画面无缝硬切至...，绝无过渡融化特效，并描述微动作、光影和口型同步情况）,\n          \"vfx\": （视觉特效，无则填“无”）,\n          \"dialogue\": （中文台词及说话语气，如：（冷笑）你今晚是我的了。 无则填“无”）,\n          \"sound_effect\": （特定动作音效）,\n          \"foley_sound\": （拟音，如脚步声、布料摩擦声）\n        }\n        // ...（此处必须补齐对应的第2、3、4个shot对象，严格对应图2、图3、图4）\n      ]\n    }\n  ],\n  \"parameters\": {\n    \"resolution\": \"1920X1280\",\n    \"fps\": 25,\n    \"duration\": 10,\n    \"cfg_scale\": 8,\n    \"motion_bucket\": 120,\n    \"enhance_prompt\": true,\n    \"audio_generation\": true\n  }\n}\n\n# Final Instruction\n接收到用户的输入后，直接输出包含4个镜头的完整 JSON 字符串。",
+   "system_prompt": [
+    "237",
+    0
+   ],
+   "inference_mode": "images",
+   "max_frames": 24,
+   "max_size": 256,
+   "seed": 690887182190218,
+   "force_offload": "randomize",
+   "save_states": false
+  },
+  "_meta": {
+   "title": "Llama-cpp Instruct"
+  }
+ },
+ "337": {
+  "class_type": "MiniMaxH3ReferenceToVideo",
+  "inputs": {
+   "clip": [
+    "341",
+    0
+   ],
+   "vae": [
+    "56",
+    0
+   ],
+   "audio_vae": [
+    "302",
+    0
+   ],
+   "prompt": [
+    "290",
+    0
+   ],
+   "width": [
+    "120",
+    1
+   ],
+   "height": [
+    "120",
+    2
+   ],
+   "length": [
+    "344",
+    1
+   ],
+   "ref_image_size": "match",
+   "ref_images": [
+    [
+     "120",
+     0
+    ],
+    [
+     "113",
+     0
+    ],
+    [
+     "115",
+     0
+    ],
+    [
+     "116",
+     0
+    ]
+   ]
+  },
+  "_meta": {
+   "title": "MiniMax H3 Reference to Video"
+  }
+ },
+ "290": {
+  "class_type": "ShowText|pysssss",
+  "inputs": {
+   "text": [
+    "289",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Show Text 🐍"
+  }
+ },
+ "197": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "5-5.png"
+  },
+  "_meta": {
+   "title": "5"
+  }
+ },
+ "196": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-3.png"
+  },
+  "_meta": {
+   "title": "3"
+  }
+ },
+ "296": {
+  "class_type": "ImageBatchMultiple+",
+  "inputs": {
+   "image_1": [
+    "193",
+    0
+   ],
+   "image_2": [
+    "194",
+    0
+   ],
+   "image_3": [
+    "196",
+    0
+   ],
+   "image_4": [
+    "195",
+    0
+   ],
+   "image_5": [
+    "197",
+    0
+   ],
+   "method": "lanczos"
+  },
+  "_meta": {
+   "title": "🔧 Images Batch Multiple"
+  }
+ },
+ "216": {
+  "class_type": "easy indexAnything",
+  "inputs": {
+   "any": [
+    "296",
+    0
+   ],
+   "index": [
+    "206",
+    1
+   ]
+  },
+  "_meta": {
+   "title": "四宫格图片"
+  }
+ },
+ "237": {
+  "class_type": "easy indexAnything",
+  "inputs": {
+   "any": [
+    "232",
+    0
+   ],
+   "index": [
+    "206",
+    1
+   ]
+  },
+  "_meta": {
+   "title": "用户提示词"
+  }
+ },
+ "203": {
+  "class_type": "easy lengthAnything",
+  "inputs": {
+   "any": [
+    "296",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy lengthAnything"
+  }
+ },
+ "79": {
+  "class_type": "VHS_VideoCombine",
+  "inputs": {
+   "images": [
+    "207",
+    0
+   ],
+   "audio": [
+    "207",
+    1
+   ],
+   "frame_rate": 24,
+   "loop_count": 0,
+   "filename_prefix": "minimax",
+   "format": "video/h264-mp4",
+   "pingpong": "yuv420p",
+   "save_output": 19,
+   "pix_fmt": true,
+   "crf": false,
+   "save_metadata": false,
+   "trim_to_audio": true
+  },
+  "_meta": {
+   "title": "Video Combine 🎥🅥🅗🅢"
+  }
+ },
+ "245": {
+  "class_type": "PreviewImage",
+  "inputs": {
+   "images": [
+    "216",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Preview Image"
+  }
+ },
+ "246": {
+  "class_type": "ShowText|pysssss",
+  "inputs": {
+   "text": [
+    "237",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Show Text 🐍"
+  }
+ },
+ "107": {
+  "class_type": "PreviewImage",
+  "inputs": {
+   "images": [
+    "108",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Preview Image"
+  }
+ },
+ "360": {
+  "class_type": "ImageFromBatch+",
+  "inputs": {
+   "image": [
+    "108",
+    0
+   ],
+   "start": 0,
+   "length": 1
+  },
+  "_meta": {
+   "title": "🔧 Image From Batch"
+  }
+ },
+ "108": {
+  "class_type": "GuHaiAutoImageSplit",
+  "inputs": {
+   "图像": [
+    "216",
+    0
+   ],
+   "保存目录": "output",
+   "水平张数": 2,
+   "垂直张数": 2,
+   "移除画布边缘": true,
+   "移除描边": 0,
+   "文件名前缀": "孤海图像分割_",
+   "保存格式": "PNG"
+  },
+  "_meta": {
+   "title": "孤海自动分割图像"
+  }
+ },
+ "115": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "362",
+    0
+   ],
+   "width": [
+    "346",
+    0
+   ],
+   "height": [
+    "346",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "Resize Image v2"
+  }
+ },
+ "361": {
+  "class_type": "ImageFromBatch+",
+  "inputs": {
+   "image": [
+    "108",
+    0
+   ],
+   "start": 1,
+   "length": 1
+  },
+  "_meta": {
+   "title": "🔧 Image From Batch"
+  }
+ },
+ "362": {
+  "class_type": "ImageFromBatch+",
+  "inputs": {
+   "image": [
+    "108",
+    0
+   ],
+   "start": 2,
+   "length": 1
+  },
+  "_meta": {
+   "title": "🔧 Image From Batch"
+  }
+ },
+ "363": {
+  "class_type": "ImageFromBatch+",
+  "inputs": {
+   "image": [
+    "108",
+    0
+   ],
+   "start": 3,
+   "length": 1
+  },
+  "_meta": {
+   "title": "🔧 Image From Batch"
+  }
+ },
+ "319": {
+  "class_type": "BasicScheduler",
+  "inputs": {
+   "model": [
+    "370",
+    0
+   ],
+   "scheduler": "beta",
+   "steps": 8,
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "BasicScheduler"
+  }
+ },
+ "335": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler"
+  },
+  "_meta": {
+   "title": "KSamplerSelect"
+  }
+ },
+ "346": {
+  "class_type": "ResolutionSelector",
+  "inputs": {
+   "aspect_ratio": "16:9 (Widescreen)",
+   "megapixels": 0.5,
+   "multiple": 32
+  },
+  "_meta": {
+   "title": "Resolution Selector"
+  }
+ },
+ "272": {
+  "class_type": "Text Multiline",
+  "inputs": {
+   "text": "画面起于全景，莉亚提着散发幽蓝微光的马灯，正步入一片由巨型发光真菌环绕的奇幻森林。镜头跟随她的背影缓慢推移（Push-in），看着她穿过扭曲的植物拱门，仿佛跨入了一道通往异界的裂缝。随着她伸手拨开如垂帘般落下的发光柳叶，镜头灵巧地绕至正面并压近至近景，捕捉到她因惊叹而微启的双唇与映照着蓝光的眼瞳，她屏住呼吸轻声呢喃：“它真的存在……”紧接着，镜头顺着她下放的手臂顺势下摇（Tilt-down），锁定在正踏入深绿色苔藓的皮靴上，每一步落下，足底都荡开一圈圈如霓虹律动的水波纹，惊起四周的光点。随后，镜头以前景中悬浮的生物为支点，轻盈地向后拉远（Dolly-out），揭示出整片迷雾森林的宏大——无数发光的透明水母状生物在半空中如呼吸般起伏游弋，莉亚渺小的身影在一片幽蓝的绚烂中渐行渐远，彻底融入这片静谧的幻境。\n【音效设计】：马灯内部魔力流动的微弱低频嗡鸣，指尖拨开垂柳时细碎的枝叶摩擦声，靴子踩在湿润苔藓上的沉闷挤压感，以及森林深处传来的、如同深海鲸鸣般空灵悠长的共鸣音。"
+  },
+  "_meta": {
+   "title": "Text Multiline"
+  }
+ },
+ "33": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "368": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "33",
+    0
+   ],
+   "lora_name": "minimax_h3_turbo_4step_comfyui_pruned.safetensors",
+   "strength_model": 1
+  },
+  "_meta": {
+   "title": "Load LoRA"
+  }
+ },
+ "369": {
+  "class_type": "PathchSageAttentionKJ",
+  "inputs": {
+   "model": [
+    "368",
+    0
+   ],
+   "sage_attention": "auto",
+   "allow_compile": false
+  },
+  "_meta": {
+   "title": "Patch Sage Attention KJ"
+  }
+ },
+ "370": {
+  "class_type": "TESpeedMiniMaxH3",
+  "inputs": {
+   "model": [
+    "369",
+    0
+   ],
+   "processing_control_value": 0.12,
+   "processing_percent_1": 0.1,
+   "processing_percent_2": 0.9,
+   "mcs": 2,
+   "device": "auto"
+  },
+  "_meta": {
+   "title": "TE-Speed-MiniMaxH3"
+  }
+ }
+}

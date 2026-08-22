@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>抽卡系统</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ---------- 左侧项目栏 ---------- -->
+<aside id="side">
+  <div class="head">
+    <b>抽卡系统</b>
+    <span class="dot" id="dot" title="ComfyUI 连接状态"></span>
+  </div>
+  <button id="newproj">＋ 新建项目</button>
+  <div id="plist"></div>
+</aside>
+
+<!-- ---------- 主区 ---------- -->
+<main id="main">
+  <div id="topbar">
+    <button class="tbtn" id="toggle" title="收起/展开项目栏">☰</button>
+    <span id="ptitle"></span>
+    <button class="tbtn" id="addcard" style="display:none">＋ 新建卡片</button>
+    <button class="tbtn" id="fit" style="display:none">复位视图</button>
+    <span id="hint"></span>
+  </div>
+
+  <div id="stage">
+    <svg id="wires"></svg>
+    <div id="world"></div>
+  </div>
+
+  <div id="empty">
+    <div class="big">还没有打开画布</div>
+    <div class="cta">
+      <button id="createHere">＋ 新建画布创作</button>
+    </div>
+    <div style="font-size:12px">画布内：双击空白处新建卡片 · 拖右侧圆点连线传产物 · 滚轮缩放</div>
+  </div>
+</main>
+
+<div id="panel" style="display:none"></div>
+<div id="menu" style="display:none"></div>
+<div id="toast"></div>
+<input type="file" id="picker" style="display:none">
+
+<script src="app.js"></script>
+</body>
+</html>
