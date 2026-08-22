@@ -274,6 +274,13 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 #panel .tplrst:hover { color: var(--acc); border-color: var(--acc); }
 
+/* 玩法说明：素材有硬性要求时钉在参数区最上面，第一眼就能看见 */
+#panel .pnote {
+  margin-bottom: 10px; padding: 7px 9px; font-size: 12px; line-height: 1.7;
+  color: #ffd88a; background: #ffb00012;
+  border: 1px solid #ffb00040; border-left: 2px solid var(--warn); border-radius: 2px;
+}
+
 #panel .slots { display: flex; gap: 8px; margin: 10px 0; flex-wrap: wrap; }
 .slot { width: 66px; text-align: center; color: var(--dim); font-size: 11px; cursor: pointer; }
 .slot .box {
@@ -356,6 +363,10 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #tip b {
   display: block; color: #bdf1ff; letter-spacing: 1px; margin-bottom: 6px;
   text-shadow: 0 0 10px #00e5ff66;
+}
+#tip .note {
+  margin-bottom: 7px; padding-left: 7px; line-height: 1.6;
+  border-left: 2px solid var(--warn); color: #ffd88a;
 }
 #tip .io { display: flex; gap: 8px; margin-top: 3px; line-height: 1.6; }
 #tip .io i {

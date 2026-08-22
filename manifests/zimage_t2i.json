@@ -13,6 +13,7 @@
  "output": {
   "node": "9"
  },
+ "note": null,
  "inputs": [
   {
    "key": "prompt",
