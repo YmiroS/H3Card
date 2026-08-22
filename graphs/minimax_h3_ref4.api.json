@@ -153,6 +153,10 @@
     "49",
     0
    ],
+   "ref_images.ref_image_3": [
+    "66",
+    0
+   ],
    "prompt": [
     "68",
     0
@@ -240,6 +244,15 @@
   }
  },
  "49": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "S3.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "66": {
   "class_type": "LoadImage",
   "inputs": {
    "image": "S3.png"
