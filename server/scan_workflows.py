@@ -25,6 +25,7 @@ OBJECT_INFO = ROOT / "data" / "object_info.json"
 ZH_CACHE = ROOT / "data" / "zh_nodes.json"
 ZH_PACK = COMFY / "custom_nodes" / "ComfyUI-Chinese-Translation" / "zh-CN" / "Nodes"
 COMFY_URL = "http://127.0.0.1:8188"
+MISSING = object()          # 「widgets_values 里根本没这一项」，区别于「值是 None」
 
 # P0 默认扫描清单：相对 WF_DIR 的路径 -> 固定 id
 ALIASES = {
@@ -307,9 +308,13 @@ def ui_to_api(wf, oi, warns):
             warns.append(f"未知节点类型 {ct}（id={n['id']}），可能缺插件")
             continue
 
-        wv = n.get("widgets_values") or []
-        if isinstance(wv, dict):           # 少数节点用 dict 存
-            wv = list(wv.values())
+        # widgets_values 有两种存法。列表：按 node["inputs"] 里 widget 的顺序对位。
+        # 字典：按名字存（VHS_VideoCombine 就是），而且字典顺序和 inputs 顺序不一样
+        # ——拍平成列表再对位会整段错位，crf 会拿到 False，ffmpeg 直接报
+        # 'Unable to parse option value "False"'，视频存不出来。所以字典必须按名字取。
+        wv = n.get("widgets_values")
+        wvd = wv if isinstance(wv, dict) else None
+        wv = [] if wvd is not None else (wv or [])
 
         inputs = {}
         wi = 0
@@ -318,18 +323,26 @@ def ui_to_api(wf, oi, warns):
             is_widget = "widget" in inp
             link = inp.get("link")
             if is_widget:
-                val = wv[wi] if wi < len(wv) else None
                 _t, opts = spec_of(oi, ct, name)
-                wi += 1
-                if opts.get("control_after_generate"):
-                    wi += 1                # 跳过 randomize/fixed
+                if wvd is not None:
+                    val = wvd[name] if name in wvd else MISSING
+                else:
+                    val = wv[wi] if wi < len(wv) else None
+                    wi += 1
+                    if opts.get("control_after_generate"):
+                        wi += 1            # 跳过 randomize/fixed
                 if name in ("audioUI",) or inp.get("type") in ("AUDIO_UI",):
                     continue               # 纯 UI 组件
                 if inp.get("type") in ("IMAGEUPLOAD", "AUDIOUPLOAD"):
                     continue               # 上传按钮
                 if link is not None:
                     src = resolve(*links.get(link, (None, 0)))
-                    inputs[name] = [str(src[0]), src[1]] if src else val
+                    inputs[name] = [str(src[0]), src[1]] if src else (
+                        None if val is MISSING else val)
+                elif val is MISSING:
+                    # 名字对不上就别硬塞，留空让 ComfyUI 用节点自己的默认值
+                    warns.append(f"#{n['id']} {ct}.{name} 不在 widgets_values 里，用节点默认值")
+                    continue
                 else:
                     inputs[name] = val
             else:
