@@ -34,6 +34,10 @@
     "node": "194",
     "input": "image",
     "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "296",
+    "input": "image_2"
    }
   },
   {
@@ -45,6 +49,10 @@
     "node": "196",
     "input": "image",
     "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "296",
+    "input": "image_3"
    }
   },
   {
@@ -56,6 +64,10 @@
     "node": "195",
     "input": "image",
     "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "296",
+    "input": "image_4"
    }
   },
   {
@@ -67,6 +79,10 @@
     "node": "197",
     "input": "image",
     "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "296",
+    "input": "image_5"
    }
   },
   {
@@ -77,7 +93,8 @@
    "target": {
     "node": "272",
     "input": "text"
-   }
+   },
+   "pairWith": "images[0]"
   },
   {
    "key": "prompt2",
@@ -87,7 +104,8 @@
    "target": {
     "node": "273",
     "input": "text"
-   }
+   },
+   "pairWith": "images[1]"
   },
   {
    "key": "prompt3",
@@ -97,7 +115,8 @@
    "target": {
     "node": "274",
     "input": "text"
-   }
+   },
+   "pairWith": "images[2]"
   },
   {
    "key": "prompt4",
@@ -107,7 +126,8 @@
    "target": {
     "node": "275",
     "input": "text"
-   }
+   },
+   "pairWith": "images[3]"
   },
   {
    "key": "prompt5",
@@ -117,7 +137,8 @@
    "target": {
     "node": "276",
     "input": "text"
-   }
+   },
+   "pairWith": "images[4]"
   },
   {
    "key": "prompt6",
@@ -201,5 +222,7 @@
    "mirror": true
   }
  ],
- "warnings": []
+ "warnings": [
+  "已修：#206.total 写死 1，改接 #203 easy lengthAnything（按 #296 的条数循环）"
+ ]
 }
