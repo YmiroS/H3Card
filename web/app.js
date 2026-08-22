@@ -573,11 +573,16 @@ function placePanel() {
   if (el.panel.style.display === "none") return;
   const c = PROJ && PROJ.cards.find(x => x.id === el.panel._id);
   if (!c || !c._el) return closePanel();
+  const GAP = 8, TOP = 52;                 // TOP 给顶栏让位
+  // 先限高再量高：漫剧20宫格那种 6 个提示词的面板不封顶会直接长到屏幕外，
+  // 量出来的 offsetHeight 就没法用来做"放不下就上移"的判断了
+  el.panel.style.maxHeight = (innerHeight - TOP - GAP) + "px";
   const r = el.stage.getBoundingClientRect();
-  const left = r.left + view.x + (c.x + CW / 2) * view.k - el.panel.offsetWidth / 2;
-  const top = r.top + view.y + (c.y + c._el.offsetHeight + 12) * view.k;
-  el.panel.style.left = Math.max(8, Math.min(left, innerWidth - el.panel.offsetWidth - 8)) + "px";
-  el.panel.style.top = Math.max(50, Math.min(top, innerHeight - 90)) + "px";
+  const w = el.panel.offsetWidth, h = el.panel.offsetHeight;
+  const left = r.left + view.x + (c.x + CW / 2) * view.k - w / 2;
+  const below = r.top + view.y + (c.y + c._el.offsetHeight + 12) * view.k;
+  el.panel.style.left = Math.max(GAP, Math.min(left, innerWidth - w - GAP)) + "px";
+  el.panel.style.top = Math.max(TOP, Math.min(below, innerHeight - h - GAP)) + "px";
 }
 
 function openPanel(id) {
@@ -604,11 +609,13 @@ function openPanel(id) {
   if (!cap) { el.panel.appendChild(errBox("能力不可用")); return placePanel(); }
 
   const specs = cap.inputs;
-  const mk = (h) => { const d = document.createElement("div"); d.innerHTML = h; return d.firstElementChild; };
+  // 中间这坨才滚动：模式切换留在顶部、运行按钮留在底部，参数再多也不会被推出屏幕
+  const body = document.createElement("div"); body.className = "pbody";
+  el.panel.appendChild(body);
 
   // --- 提示词 ---
   for (const s of specs.filter(x => x.type === "textarea" && !x.advanced)) {
-    el.panel.appendChild(promptBlock(c, s));
+    body.appendChild(promptBlock(c, s));
   }
 
   // --- 素材槽 ---
@@ -616,14 +623,14 @@ function openPanel(id) {
   if (media.length) {
     const wrap = document.createElement("div"); wrap.className = "slots";
     for (const s of media) wrap.appendChild(slotEl(c, s));
-    el.panel.appendChild(wrap);
+    body.appendChild(wrap);
   }
 
   // --- 常规参数 ---
   // mirror = 多个节点共用同一个参数框（如两个采样器共用种子），只画一次
   const rows = specs.filter(x => !["image", "audio", "textarea"].includes(x.type)
     && !x.advanced && !x.mirror);
-  for (const s of rows) el.panel.appendChild(rowEl(c, s));
+  for (const s of rows) body.appendChild(rowEl(c, s));
 
   // --- 高级 ---
   const adv = specs.filter(x => x.advanced);
@@ -632,7 +639,7 @@ function openPanel(id) {
     const t = document.createElement("button");
     t.textContent = `▸ 高级 (${adv.length})`;
     const items = document.createElement("div"); items.className = "items"; items.style.display = "none";
-    for (const s of adv) items.appendChild(s.type === "textarea" ? rowEl(c, s) : rowEl(c, s));
+    for (const s of adv) items.appendChild(rowEl(c, s));
     t.onclick = () => {
       const open = items.style.display === "none";
       items.style.display = open ? "" : "none";
@@ -640,10 +647,10 @@ function openPanel(id) {
       placePanel();
     };
     box.appendChild(t); box.appendChild(items);
-    el.panel.appendChild(box);
+    body.appendChild(box);
   }
 
-  if (c.error) el.panel.appendChild(errBox(c.error));
+  if (c.error) body.appendChild(errBox(c.error));
 
   // --- 底部 ---
   const foot = document.createElement("div"); foot.className = "foot";
