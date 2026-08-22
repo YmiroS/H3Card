@@ -1,0 +1,378 @@
+{
+ "124": {
+  "class_type": "BasicScheduler",
+  "inputs": {
+   "model": [
+    "244",
+    0
+   ],
+   "scheduler": "beta",
+   "steps": 8,
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "BasicScheduler"
+  }
+ },
+ "123": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler"
+  },
+  "_meta": {
+   "title": "KSamplerSelect"
+  }
+ },
+ "126": {
+  "class_type": "BasicGuider",
+  "inputs": {
+   "model": [
+    "244",
+    0
+   ],
+   "conditioning": [
+    "136",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Basic Guider"
+  }
+ },
+ "128": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+   "type": "minimax",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "120": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "136": {
+  "class_type": "MiniMaxH3ReferenceToVideo",
+  "inputs": {
+   "clip": [
+    "128",
+    0
+   ],
+   "vae": [
+    "119",
+    0
+   ],
+   "audio_vae": [
+    "120",
+    0
+   ],
+   "prompt": [
+    "138",
+    0
+   ],
+   "width": [
+    "115",
+    0
+   ],
+   "height": [
+    "115",
+    1
+   ],
+   "length": [
+    "131",
+    1
+   ],
+   "ref_image_size": "match",
+   "ref_images": [
+    [
+     "227",
+     0
+    ],
+    [
+     "137",
+     0
+    ]
+   ],
+   "ref_audios": [
+    [
+     "177",
+     0
+    ]
+   ]
+  },
+  "_meta": {
+   "title": "MiniMax H3 Reference to Video"
+  }
+ },
+ "131": {
+  "class_type": "ComfyMathExpression",
+  "inputs": {
+   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17",
+   "values": [
+    [
+     "132",
+     0
+    ]
+   ]
+  },
+  "_meta": {
+   "title": "Math Expression"
+  }
+ },
+ "172": {
+  "class_type": "VRGDG_MiniMaxH3AudioDrive",
+  "inputs": {
+   "av_latent": [
+    "136",
+    1
+   ],
+   "source_audio": [
+    "177",
+    0
+   ],
+   "audio_vae": [
+    "120",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "LOCK SOURCE AUDIO / GENERATE VIDEO ONLY"
+  }
+ },
+ "138": {
+  "class_type": "PrimitiveStringMultiline",
+  "inputs": {
+   "value": "电影近景镜头，image1的男武侠和iamge2的女子面对面对话，背景是一片竹林，高清"
+  },
+  "_meta": {
+   "title": "Input Text (Prompt)"
+  }
+ },
+ "177": {
+  "class_type": "AudioCrop",
+  "inputs": {
+   "audio": [
+    "171",
+    0
+   ],
+   "start_time": "0:00",
+   "end_time": "0:10"
+  },
+  "_meta": {
+   "title": "AudioCrop"
+  }
+ },
+ "115": {
+  "class_type": "ResolutionSelector",
+  "inputs": {
+   "aspect_ratio": "16:9 (Widescreen)",
+   "megapixels": 0.4,
+   "multiple": 32
+  },
+  "_meta": {
+   "title": "Resolution Selector (Size)"
+  }
+ },
+ "132": {
+  "class_type": "PrimitiveFloat",
+  "inputs": {
+   "value": [
+    "179",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Float (Duration)"
+  }
+ },
+ "125": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "129",
+    0
+   ],
+   "guider": [
+    "126",
+    0
+   ],
+   "sampler": [
+    "123",
+    0
+   ],
+   "sigmas": [
+    "124",
+    0
+   ],
+   "latent_image": [
+    "172",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "SamplerCustomAdvanced"
+  }
+ },
+ "122": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "125",
+    0
+   ],
+   "vae": [
+    "119",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "129": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 48506132514761
+  },
+  "_meta": {
+   "title": "RandomNoise"
+  }
+ },
+ "171": {
+  "class_type": "LoadAudio",
+  "inputs": {
+   "audio": "“我不要当他师父，我要做他妻子”#杨过小龙女 #神雕侠侣 #对口型飙演技 #港风 #港剧经典.mp3"
+  },
+  "_meta": {
+   "title": "SOURCE AUDIO — drives lips and final soundtrack"
+  }
+ },
+ "142": {
+  "class_type": "VHS_VideoCombine",
+  "inputs": {
+   "images": [
+    "122",
+    0
+   ],
+   "audio": [
+    "172",
+    1
+   ],
+   "frame_rate": 24,
+   "loop_count": 0,
+   "filename_prefix": "pixstudio",
+   "format": "video/h264-mp4",
+   "pingpong": "yuv420p",
+   "save_output": 19,
+   "save_metadata": false,
+   "trim_to_audio": false,
+   "pix_fmt": false,
+   "crf": true
+  },
+  "_meta": {
+   "title": "Video Combine 🎥🅥🅗🅢"
+  }
+ },
+ "119": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "179": {
+  "class_type": "SoundFlow_GetLength",
+  "inputs": {
+   "audio": [
+    "177",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Audio Get Length"
+  }
+ },
+ "227": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "GPT Image 2_1784722097888_0.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "137": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "GPT Image 2_1784721817190_0.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "174": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "242": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "174",
+    0
+   ],
+   "lora_name": "minimax_h3_turbo_4step_comfyui_pruned.safetensors",
+   "strength_model": 1
+  },
+  "_meta": {
+   "title": "Load LoRA"
+  }
+ },
+ "243": {
+  "class_type": "PathchSageAttentionKJ",
+  "inputs": {
+   "model": [
+    "242",
+    0
+   ],
+   "sage_attention": "auto",
+   "allow_compile": false
+  },
+  "_meta": {
+   "title": "Patch Sage Attention KJ"
+  }
+ },
+ "244": {
+  "class_type": "TESpeedMiniMaxH3",
+  "inputs": {
+   "model": [
+    "243",
+    0
+   ],
+   "processing_control_value": 0.12,
+   "processing_percent_1": 0.1,
+   "processing_percent_2": 0.9,
+   "mcs": 2,
+   "device": "auto"
+  },
+  "_meta": {
+   "title": "TE-Speed-MiniMaxH3"
+  }
+ }
+}
