@@ -38,6 +38,32 @@ ALIASES = {
     "1-minimax H3/@minimax-批量化漫剧20宫格-直出1分钟视频V3.json": "minimax_h3_comic20",
 }
 
+# 画布上的模式名（人工微调）。没写的能力走 short_name() 自动清洗文件名。
+# 要求：一眼看出这个工作流干什么，不带 @ 前缀、不带"4步加速版"这类实现细节。
+DISPLAY = {
+    "zimage_t2i": "Z-Image 文生图",
+    "flux2_klein_storyboard9": "九宫格故事分镜",
+    "minimax_h3_i2v": "H3 图生视频",
+    "minimax_h3_flf2v": "H3 首尾帧生视频",
+    "minimax_h3_talk1": "H3 说话唱歌·单人",
+    "minimax_h3_talk2": "H3 说话唱歌·双人",
+    "minimax_h3_ref4": "H3 四图参考生视频",
+    "minimax_h3_comic20": "H3 漫剧20宫格·1分钟",
+}
+
+# 文件名里的噪音：实现细节、版本号、厂商前缀
+NOISE_PAREN = re.compile(r"[（(][^）)]*(?:步|加速|版|V\d)[^）)]*[）)]")
+VENDOR = re.compile(r"mini\s*max\s*[-_ ]?h3|minimaxh3|minimax", re.I)
+
+
+def short_name(stem):
+    """把工作流文件名清洗成人能读的模式名（没有 DISPLAY 覆盖时用）"""
+    s = stem.lstrip("@").strip()
+    s = NOISE_PAREN.sub("", s)
+    s = VENDOR.sub("H3", s)
+    s = re.sub(r"[_：:\-]+", " ", s)
+    return re.sub(r"\s+", " ", s).strip() or stem
+
 # ---------- 分类表：只用于"要不要暴露给用户"，不参与取值 ----------
 SKIP_TYPES = {
     "MarkdownNote", "Note", "LG_Note", "Label (rgthree)",
@@ -518,7 +544,8 @@ def scan(path: Path, oi, rel_key=None):
 
     manifest = {
         "id": wid,
-        "name": path.stem,
+        "name": DISPLAY.get(wid) or short_name(path.stem),
+        "file": path.stem,                      # 原始文件名，出问题时对得上
         "source": str(path),
         "group": {"video": "视频", "image": "图片", "audio": "音频"}.get(out_type, "其他"),
         "outputType": out_type,

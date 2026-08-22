@@ -7,12 +7,12 @@
   "modes": [
    {
     "id": "zimage_t2i",
-    "name": "z-Image-标准版文生图",
+    "name": "Z-Image 文生图",
     "slots": "img0+aud0"
    },
    {
     "id": "flux2_klein_storyboard9",
-    "name": "九宫格Qwen3.5-Flux2-Kelin一键故事分镜",
+    "name": "九宫格故事分镜",
     "slots": "img1+aud0"
    }
   ]
@@ -25,32 +25,32 @@
   "modes": [
    {
     "id": "minimax_h3_i2v",
-    "name": "@MinimaxH3：图生视频 (4步加速版)",
+    "name": "H3 图生视频",
     "slots": "img1+aud0"
    },
    {
     "id": "minimax_h3_talk1",
-    "name": "@MiniMax H3_ 说话唱歌 单人（4步加速版）",
+    "name": "H3 说话唱歌·单人",
     "slots": "img1+aud1"
    },
    {
     "id": "minimax_h3_flf2v",
-    "name": "@MinimaxH3：首尾帧生视频（4步加速版）",
+    "name": "H3 首尾帧生视频",
     "slots": "img2+aud0"
    },
    {
     "id": "minimax_h3_talk2",
-    "name": "@MiniMax H3_ 说话唱歌 双人（4步加速版）",
+    "name": "H3 说话唱歌·双人",
     "slots": "img2+aud1"
    },
    {
     "id": "minimax_h3_ref4",
-    "name": "MiniMax H3  四图全能参考单采",
+    "name": "H3 四图参考生视频",
     "slots": "img3+aud0"
    },
    {
     "id": "minimax_h3_comic20",
-    "name": "@minimax-批量化漫剧20宫格-直出1分钟视频V3",
+    "name": "H3 漫剧20宫格·1分钟",
     "slots": "img5+aud0"
    }
   ]

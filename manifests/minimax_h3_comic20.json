@@ -1,6 +1,7 @@
 {
  "id": "minimax_h3_comic20",
- "name": "@minimax-批量化漫剧20宫格-直出1分钟视频V3",
+ "name": "H3 漫剧20宫格·1分钟",
+ "file": "@minimax-批量化漫剧20宫格-直出1分钟视频V3",
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@minimax-批量化漫剧20宫格-直出1分钟视频V3.json",
  "group": "视频",
  "outputType": "video",
