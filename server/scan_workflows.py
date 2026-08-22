@@ -104,6 +104,29 @@ SAVE_TYPES = {
 }
 DURATION_HINTS = ("duration", "时长", "秒")
 
+# 分辨率旋钮。视频工作流几乎没有裸的 width/height：尺寸由「尺寸提供者」节点算出来
+#   ResolutionSelector          -> aspect_ratio + megapixels  -> width/height
+#   ImageScaleByAspectRatio V2  -> scale_to_length（长边像素）
+# 这几个输入名在任何插件里语义都一致，所以按名字识别，不认节点类名。
+# (标签, 控件, (min, max, step))：上限故意收窄——H3 视频超过 ~2MP / 长边 1536
+# 基本必爆显存，把插件作者给的 16MP 直接摊给用户等于让人踩坑。
+RES_FIELDS = {
+    "aspect_ratio":    ("画面比例", "select", None),
+    "megapixels":      ("清晰度(百万像素)", "slider", (0.2, 2.0, 0.1)),
+    "scale_to_length": ("分辨率(长边)", "number", (256, 1536, 32)),
+}
+
+
+def is_size_provider(oi, ct):
+    """节点的输出就是一对 width/height（如 ResolutionSelector），而不是图片。
+
+    图片缩放节点（ImageResizeKJv2 / ImageScaleByAspectRatio）也顺带输出
+    width/height，但它们的 aspect_ratio 是"怎么裁这张图"，语义不同，
+    暴露出去会让用户以为在选出片比例，结果只是给原图加黑边。
+    """
+    names = [str(x).lower() for x in (oi.get(ct, {}).get("output_name") or [])]
+    return "width" in names and "height" in names and "image" not in names
+
 
 # =====================================================================
 # object_info
@@ -365,7 +388,7 @@ def pick_label(title, generic):
 
 
 def derive_inputs(api, oi):
-    images, audios, texts, params, seeds, outputs, crops = [], [], [], [], [], [], []
+    images, audios, texts, params, seeds, outputs, crops, res = [], [], [], [], [], [], [], []
     for nid, node in sorted(api.items(), key=lambda kv: int(str(kv[0]).split(":")[0])):
         ct, ins = node["class_type"], node["inputs"]
         title = node["_meta"]["title"]
@@ -392,6 +415,9 @@ def derive_inputs(api, oi):
                     seeds.append((nid, f, v, t))
                 elif ct in HIDDEN_TYPES:
                     continue                              # 后台节点只取种子
+                elif low in RES_FIELDS and (low == "scale_to_length"
+                                            or is_size_provider(oi, ct)):
+                    res.append((nid, f, low, v, t, opts))
                 elif t == "STRING" and opts.get("multiline") and isinstance(v, str):
                     if any(x in low for x in ("system", "negative", "suffix", "prefix")):
                         continue
@@ -415,6 +441,26 @@ def derive_inputs(api, oi):
 
     out = []
     used = {}
+    res_seen = set()
+
+    def res_item(key, nid, field, val, vt, opts):
+        """分辨率旋钮。同一个 key 出现多次（首帧/尾帧各缩放一次）时，
+        第 2 个起标 mirror：面板只画一个输入框，后端照样写进每个节点。"""
+        label, kind, bound = RES_FIELDS[key]
+        item = {"key": key, "label": label, "type": kind, "default": val,
+                "target": {"node": nid, "input": field}}
+        if kind == "select":
+            item["options"] = list(opts.get("options") or [])
+            if not item["options"]:
+                return None
+        else:
+            item["target"]["vtype"] = vt if vt in ("INT", "FLOAT") else "INT"
+            lo, hi, st = bound
+            item.update(min=lo, max=hi, step=st)
+        if key in res_seen:
+            item["mirror"] = True
+        res_seen.add(key)
+        return item
 
     def uniq(label):
         used[label] = used.get(label, 0) + 1
@@ -457,12 +503,25 @@ def derive_inputs(api, oi):
                         "target": {"node": nid, "input": field, "vtype": vt}})
         else:
             ct = api[nid]["class_type"]
+            cid, cin = direct_consumer(api, nid)
+            # Primitive 节点本身没有语义，看它喂给谁：喂给 scale_to_length
+            # 就是这条工作流的分辨率旋钮（i2v/首尾帧生视频都是这么接的），
+            # 不能当成匿名"高级数值"藏起来
+            if cin in RES_FIELDS:
+                _t, copts = spec_of(oi, api[cid]["class_type"], cin)
+                item = res_item(cin, nid, field, val, vt, copts)
+                if item:
+                    out.append(item)
+                    continue
             if default_title(oi, ct, title):
-                cid, cin = direct_consumer(api, nid)
                 title = zh_widget(api[cid]["class_type"], cin) if cin else "数值"
             out.append({"key": f"n{nid}", "label": title, "type": "number",
                         "default": val, "advanced": True,
                         "target": {"node": nid, "input": field, "vtype": vt}})
+    for nid, field, key, val, t, opts in res:
+        item = res_item(key, nid, field, val, t, opts)
+        if item:
+            out.append(item)
     for nid, title in crops:
         out.append({"key": "audio_start", "label": "音频起点", "type": "text", "default": "0:00",
                     "advanced": True, "target": {"node": nid, "input": "start_time"}})
