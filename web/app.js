@@ -499,12 +499,17 @@ function bindGlobal() {
 }
 
 /* ================= 右键菜单 ================= */
-/** items: [{icon, text, danger, run}] */
+/** items: [{icon, text, danger, run}]，{group:"…"} 是一行分类小标题 */
 function showMenu(cx, cy, title, items) {
   el.menu.innerHTML = "";
   const hd = document.createElement("div"); hd.className = "hd";
   hd.textContent = title; el.menu.appendChild(hd);
   for (const it of items) {
+    if (it.group) {
+      const g = document.createElement("div"); g.className = "grp";
+      g.textContent = it.group; el.menu.appendChild(g);
+      continue;
+    }
     const b = document.createElement("button");
     if (it.danger) b.className = "danger";
     const i = document.createElement("span"); i.textContent = it.icon || "▸";
@@ -519,11 +524,27 @@ function showMenu(cx, cy, title, items) {
 }
 const closeMenu = () => (el.menu.style.display = "none");
 
+/** 新建卡片菜单：按产出分成生图/生视频两类，条目直接是具体玩法。
+    卡片名（"生视频"）和分类名是同一个词，所以列卡片会变成"生视频 > 生视频"，
+    不如把卡内的模式摊出来选，建出来的卡就已经是想要的那个模式。 */
+const OUT_GROUP = { image: "生图", video: "生视频", audio: "生音频" };
+
 function openMenu(cx, cy, at) {
-  showMenu(cx, cy, "新建卡片", CARDS.filter(d => d.modes.length).map(def => ({
-    icon: def.icon, text: def.name,
-    run: () => addCard(def.id, at.x - CW / 2, at.y - 40),
-  })));
+  const items = [];
+  for (const [out, gname] of Object.entries(OUT_GROUP)) {
+    const defs = CARDS.filter(d => d.modes.length && d.outputType === out);
+    if (!defs.length) continue;
+    items.push({ group: gname });
+    for (const def of defs) {
+      for (const md of def.modes) {
+        items.push({
+          icon: def.icon, text: md.name,
+          run: () => addCard(def.id, at.x - CW / 2, at.y - 40, md.id),
+        });
+      }
+    }
+  }
+  showMenu(cx, cy, "新建卡片", items);
 }
 
 function cardMenu(cx, cy, c) {
@@ -553,9 +574,9 @@ function cloneCard(c) {
   paintTitle(n); openPanel(n.id); save();
 }
 
-function addCard(type, x, y) {
+function addCard(type, x, y, cap) {
   const def = cardDef(type);
-  const c = { id: uid(), type, cap: def.modes[0].id, x: Math.round(x), y: Math.round(y), params: {}, assets: {}, status: null, progress: 0, outputs: [] };
+  const c = { id: uid(), type, cap: cap || def.modes[0].id, x: Math.round(x), y: Math.round(y), params: {}, assets: {}, status: null, progress: 0, outputs: [] };
   PROJ.cards.push(c);
   el.world.appendChild(buildCard(c));
   pick(c.id); drawWires(); save();
