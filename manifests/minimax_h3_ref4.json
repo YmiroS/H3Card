@@ -6,8 +6,8 @@
  "group": "视频",
  "outputType": "video",
  "card": "minimax_h3_ref4",
- "slots": "img3+aud0",
- "images": 3,
+ "slots": "img4+aud0",
+ "images": 4,
  "audios": 0,
  "graph": "graphs/minimax_h3_ref4.api.json",
  "output": {
@@ -35,6 +35,10 @@
     "node": "48",
     "input": "image",
     "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_1"
    }
   },
   {
@@ -46,6 +50,25 @@
     "node": "49",
     "input": "image",
     "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_2"
+   }
+  },
+  {
+   "key": "images[3]",
+   "label": "图片2",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "66",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_3"
    }
   },
   {
@@ -166,5 +189,7 @@
    }
   }
  ],
- "warnings": []
+ "warnings": [
+  "已启用 1 个原本关着的备用素材槽"
+ ]
 }
