@@ -64,13 +64,15 @@ REVIVE = {"minimax_h3_ref4"}
 # 范围只能自己给 —— object_info 的范围是给专业用户的（步数上限 10000、LoRA 强度
 # -100~100），照抄出来的滑条根本没法用。
 # key -> (界面名, 最小, 最大, 步进, 说明)
+# 说明里的 {d} 会替换成这条工作流里的真实默认值 —— 推荐值不能写死在文案里，
+# 同一个 steps 在不同工作流是 4 / 8 / 9，写死就会跟面板上的数字对不上。
 KNOBS = {
     "steps": ("采样步数", 1, 40, 1,
-              "越大越精细也越慢。默认值是配合加速模型调好的，调低会花，调高基本白等"),
+              "推荐 {d}：模型带加速 LoRA，{d} 步就到位了。往下调会花，往上调基本白等"),
     "strength_model": ("加速模型强度", 0, 2, 0.05,
-                       "调低更接近原始模型、画质略好但慢很多；调到 0 等于不用加速"),
+                       "推荐 {d}（全开）：省时间全靠它。往下调画质略好但慢很多，0 = 不加速、慢好几倍"),
     "processing_control_value": ("提速档位", 0, 0.5, 0.005,
-                                 "越大越快，代价是细节和动作幅度变差；0 = 不提速"),
+                                 "推荐 {d}：再快画面就开始糊、动作发飘，这一档是不掉画质的上限。0 = 不提速"),
 }
 
 # 文件名里的噪音：实现细节、版本号、厂商前缀
@@ -697,7 +699,7 @@ def derive_inputs(api, oi):
             label, lo, hi, step, hint = KNOBS[key]
             item = {"key": key, "label": label, "type": "slider",
                     "min": lo, "max": max(hi, val), "step": step, "default": val,
-                    "hint": hint, "advanced": True,
+                    "hint": hint.replace("{d}", f"{val:g}"), "advanced": True,
                     "target": {"node": nid, "input": field, "vtype": vt}}
             if any(x["key"] == key for x in out):
                 item["mirror"] = True      # 同名旋钮出现多次：只画一个框，一起改
