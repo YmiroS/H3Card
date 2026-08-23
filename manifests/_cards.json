@@ -40,6 +40,11 @@
      "1": "minimax_h3_talk1",
      "2": "minimax_h3_talk2"
     }
+   },
+   {
+    "id": "minimax_h3_comic20",
+    "name": "漫剧4宫格",
+    "slots": "img5+aud0"
    }
   ]
  },
@@ -66,19 +71,6 @@
     "id": "minimax_h3_ref9",
     "name": "H3全能参考(通用)",
     "slots": "img9+aud0"
-   }
-  ]
- },
- {
-  "id": "minimax_h3_comic20",
-  "name": "漫剧4宫格",
-  "icon": "▦",
-  "outputType": "video",
-  "modes": [
-   {
-    "id": "minimax_h3_comic20",
-    "name": "漫剧4宫格",
-    "slots": "img5+aud0"
    }
   ]
  }

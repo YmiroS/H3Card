@@ -54,16 +54,18 @@ DISPLAY = {
     "minimax_h3_comic20": "漫剧4宫格",
 }
 
-# 画布上单独占一张卡的能力。素材形态有硬要求的（有 note，比如漫剧要宫格拼图）
-# 会自动单独成卡；这里补的是玩法差别大、不该藏在别人模式列表里第 N 项的。
+# 画布上单独占一张卡的能力。默认按产出类型归并（都出视频就都在「生视频」里当模式），
+# 只有玩法差别大、不该藏在别人模式列表里第 N 项的才写进来。
+# 注意：素材形态有要求（比如漫剧要宫格拼图）不是单独成卡的理由 —— 那是这条模式的
+# 用法说明，面板上有 note 提示就够了。
 SOLO = {"minimax_h3_ref4", "minimax_h3_ref9"}
 
 # 要把工作流里「关着的备用素材槽」开出来的能力（见 revive_bypassed）。
 # 四图参考的第 4 个图槽在模板里是绕过状态，名字叫四图、实际只有三格。
 REVIVE = {"minimax_h3_ref4"}
 
-# 玩法说明，钉在参数面板最上面。只写「不知道就会跑废一轮」的用法，
-# 素材形态的硬要求（宫格拼图那种）是自动认出来的，不用写在这里。
+# 玩法说明，钉在参数面板最上面。只写「不知道就会跑废一轮」的用法。
+# 素材形态的硬要求（宫格拼图那种）是从图里自动认出来的，不用写在这里。
 NOTES = {
     "minimax_h3_ref9": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 "
                        "<Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。",
@@ -918,16 +920,14 @@ def scan(path: Path, oi, rel_key=None):
         "source": str(path),
         "group": {"video": "视频", "image": "图片", "audio": "音频"}.get(out_type, "其他"),
         "outputType": out_type,
-        # 归并到哪张卡。素材形态有硬要求的（比如每张图得是宫格拼图）自动单独成卡，
-        # 玩法跟普通生视频不是一回事，塞进同一张卡的模式列表里没人找得到。
-        "card": wid if (note or wid in SOLO) else out_type,
+        # 归并到哪张卡：默认按产出类型，只有 SOLO 里点名的才自己占一张
+        "card": wid if wid in SOLO else out_type,
         "slots": f"img{n_img}+aud{n_aud}",      # 槽位指纹
         "images": n_img,
         "audios": n_aud,
         "graph": f"graphs/{wid}.api.json",
         "output": {"node": outputs[0][0]} if outputs else None,
         "note": note or NOTES.get(wid),
-        "grid": bool(note),                     # 素材必须是宫格拼图（卡片图标要用 ▦）
         "inputs": inputs,
         "warnings": warns,
     }
@@ -997,10 +997,8 @@ def main():
     cards = []
     for key, ms in groups.items():
         ms.sort(key=lambda m: (m["images"], m["audios"]))
-        # 没进 CARD_META 的 key 就是单独成卡的能力，卡名直接用它自己的名字；
-        # 要宫格拼图的给个 ▦，其余跟着产出类型的图标走
-        solo_icon = "▦" if ms[0].get("grid") else CARD_META.get(ms[0]["outputType"],
-                                                               (0, 0, "◻"))[2]
+        # 没进 CARD_META 的 key 就是单独成卡的能力，卡名和图标都跟着它自己走
+        solo_icon = CARD_META.get(ms[0]["outputType"], (0, 0, "◻"))[2]
         cid, cname, icon = CARD_META.get(key, (key, ms[0]["name"], solo_icon))
         cards.append({
             "id": cid, "name": cname, "icon": icon, "outputType": ms[0]["outputType"],
