@@ -386,6 +386,36 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   word-break: break-all;
 }
 
+/* ---------- 产物大图 / 视频详情 ---------- */
+/* 卡片和槽位里的图、视频不参与浏览器自带的拖拽：拖出来只会得到一个半透明幽灵图，
+   还容易被误当成"拖它去连线"。看大图请双击或右键。 */
+.card .body img, .card .body video, .slot .box img, .slot .box video {
+  -webkit-user-drag: none; user-select: none;
+}
+#view {
+  position: fixed; inset: 0; z-index: 120; background: #04070ceb;
+  display: flex; align-items: center; justify-content: center;
+}
+#view .vbox {
+  display: flex; flex-direction: column; align-items: center; gap: 10px;
+  max-width: 94vw;
+}
+#view img, #view video {
+  max-width: 94vw; max-height: 84vh; background: #070a12;
+  border: 1px solid var(--line); box-shadow: 0 0 46px #00e5ff20;
+}
+#view audio { width: min(560px, 80vw); }
+#view .vinfo {
+  font-family: var(--mono); font-size: 12px; color: var(--dim);
+  text-align: center; word-break: break-all; max-width: 94vw;
+}
+#view .vx {
+  position: fixed; top: 14px; right: 18px; width: 32px; height: 32px;
+  background: #080c17f2; border: 1px solid var(--line); border-radius: 2px;
+  color: var(--dim);
+}
+#view .vx:hover { color: var(--acc); border-color: var(--acc); }
+
 #toast {
   position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
   background: #080c17f5; border: 1px solid var(--acc); padding: 9px 16px;
