@@ -8,15 +8,8 @@ const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
 const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
 
-/** 该让浏览器自己弹右键菜单的地方：产物图/视频/音频（要「图片另存为」）、
- *  输入框（要复制粘贴）。另外按住 Ctrl 或 Shift 右键，任何地方都强制走原生菜单。 */
-function wantsNativeMenu(ev) {
-  if (ev.ctrlKey || ev.shiftKey) return true;
-  const t = ev.target;
-  // 素材格自己有菜单（清空 / 定位文件），比"图片另存为"有用：文件本来就在硬盘上
-  if (t.closest(".slot")) return false;
-  return !!(t.closest("input, textarea, select") || t.matches("img, video, audio"));
-}
+// 全站不弹浏览器原生右键菜单：想存图/定位文件走卡片和素材格自己的菜单
+document.addEventListener("contextmenu", (ev) => ev.preventDefault());
 
 let CARDS = [];            // 卡种（生图 / 生视频）
 let CAPS = {};             // 能力清单
@@ -66,9 +59,20 @@ const uid = () => Math.random().toString(36).slice(2, 10);
     能力被拆成独立卡片后（比如漫剧从"生视频"里单独抽出来），老项目里存的
     c.type 还指着旧卡，按 c.type 找会拿到一个模式列表里根本没有它的卡。 */
 const cardDef = (t) => CARDS.find(c => c.id === t) || CARDS[0];
+const MEDIA = ["image", "audio", "video"];
+const KIND_ZH = { image: "图片", video: "视频", audio: "音频" };
 const modeHas = (md, cid) => md.id === cid
-  || !!(md.ladder && Object.values(md.ladder).includes(cid));
-const defOf = (c) => CARDS.find(d => d.modes.some(m => modeHas(m, c.cap))) || cardDef(c.type);
+  || !!(md.ladder && Object.values(md.ladder).includes(cid))
+  || !!(md.route && Object.values(md.route).some(r => r.cap === cid));
+/** 一个模式落到画布上时先跑哪条能力。路由卡（route）用排在最前那一路当初始状态 */
+const modeCap = (md) => md.route ? md.route[Object.keys(md.route)[0]].cap : md.id;
+/** 同一条能力可能同时挂在两张卡上（补帧既有自己那张卡，也是「画质增强」的视频那一路），
+    所以先认卡片自己记的 c.type，只有它对不上时才去全局找。 */
+const defOf = (c) => {
+  const own = CARDS.find(d => d.id === c.type);
+  if (own && own.modes.some(m => modeHas(m, c.cap))) return own;
+  return CARDS.find(d => d.modes.some(m => modeHas(m, c.cap))) || cardDef(c.type);
+};
 const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHas(m, c.cap)); };
 const filledImgs = (c) => Object.keys(c.assets || {})
   .filter(k => k.startsWith("images[") && c.assets[k]).length;
@@ -83,6 +87,31 @@ function runCap(c) {
   return md.ladder[String(steps.filter(s => s <= n).pop())] || c.cap;
 }
 const capOf = (c) => CAPS[c.cap] || null;
+
+/** 路由卡上放进这种素材该切到哪一路（已经在那一路上就返回 null）。
+    和 ladder 不一样，这里两条工作流的参数完全不同，画不出一张"并集"面板，
+    所以是放素材那一刻就把卡切过去，切完面板/参数/产出全都走原来那套。 */
+function routeFor(c, kind) {
+  const md = modeOf(c);
+  const r = md && md.route && md.route[kind];
+  return r && r.cap !== c.cap ? r : null;
+}
+
+/** 往某一格放素材。路由卡要先按素材类型换能力 —— 换完槽位名都变了（images[0] →
+    video[0]），所以旧素材和旧连线一起清掉，不然会留下一格对不上任何槽的孤儿。 */
+function putAsset(c, s, file) {
+  const r = file && file.kind ? routeFor(c, file.kind) : null;
+  if (r) {
+    c.cap = r.cap;
+    c.assets = {};
+    PROJ.edges = PROJ.edges.filter(e => e.to !== c.id);
+    s = { key: r.slot };
+    paintTitle(c);
+    drawWires();
+  }
+  c.assets[s.key] = file;
+  return s;
+}
 
 /* ================= H3 画布换算 =================
    ComfyUI 里视频分辨率不是直接填 width/height，而是两条链路算出来的，
@@ -143,14 +172,14 @@ function gridWord(s) {
     让人在点上传之前就知道该找什么样的图 */
 function slotName(s) {
   const t = String(s.label || "").trim(), w = gridWord(s);
-  if (/^\d+$/.test(t)) return (w || (s.type === "audio" ? "音频" : "图")) + t;
+  if (/^\d+$/.test(t)) return (w || (s.type === "image" ? "图" : KIND_ZH[s.type] || "")) + t;
   return w ? `${t}（${w}）` : t;
 }
 
 /** 从 manifest 反推这个工作流吃什么、吐什么 —— 不写死任何工作流 */
 function capBrief(cap) {
   const by = (t) => cap.inputs.filter(s => s.type === t);
-  const imgs = by("image"), auds = by("audio"), txts = by("textarea");
+  const imgs = by("image"), auds = by("audio"), vids = by("video"), txts = by("textarea");
   const dur = cap.inputs.find(s => s.key === "duration");
   const size = cap.inputs.filter(s => s.key === "width" || s.key === "height");
   const ratio = cap.inputs.find(s => s.key === "aspect_ratio");
@@ -162,7 +191,8 @@ function capBrief(cap) {
       `图片 ×${imgs.length}：${imgs.map(s => slotName(s) + (s.required ? "" : "?")).join(" / ")}`);
   }
   if (auds.length) need.push(`音频 ×${auds.length}：${auds.map(s => s.label).join(" / ")}`);
-  if (!imgs.length && !auds.length) need.push("不需要素材，纯提示词驱动");
+  if (vids.length) need.push(`视频 ×${vids.length}：${vids.map(s => s.label).join(" / ")}`);
+  if (!imgs.length && !auds.length && !vids.length) need.push("不需要素材，纯提示词驱动");
   if (txts.length) need.push(txts.length > 1 ? `提示词 ×${txts.length}` : "提示词");
   if (dur) opt.push(`时长 ${dur.min}–${dur.max} 秒`);
   if (size.length) opt.push("画面宽高");
@@ -279,7 +309,8 @@ async function openProject(pid) {
   // （图生视频并进了首尾帧那条），统一归到模式入口，参数和素材的 key 是通的
   for (const c of PROJ.cards) {
     const md = modeOf(c);
-    if (md && md.id !== c.cap) c.cap = md.id;
+    // 路由卡的模式 id 不是能力 id（它就是那张卡），c.cap 已经是两路里的一条，别动
+    if (md && !md.route && md.id !== c.cap) c.cap = md.id;
     seedHistory(c);
   }
   view = Object.assign({ x: 60, y: 70, k: 1 }, PROJ.view || {});
@@ -385,10 +416,7 @@ function buildCard(c) {
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
   d.onmousedown = (ev) => { ev.stopPropagation(); pick(c.id); };
   d.oncontextmenu = (ev) => {
-    // stopPropagation 一定要有：不然冒泡到 stage 的 contextmenu 又会被 preventDefault，
-    // 原生菜单还是弹不出来
     ev.stopPropagation();
-    if (wantsNativeMenu(ev)) return;
     ev.preventDefault();
     tipHide(); pick(c.id); cardMenu(ev.clientX, ev.clientY, c);
   };
@@ -709,7 +737,6 @@ function bindGlobal() {
   });
 
   el.stage.addEventListener("contextmenu", (ev) => {
-    if (wantsNativeMenu(ev)) return;
     ev.preventDefault();
     if (!PROJ || ev.target.closest(".card")) return;
     tipHide();
@@ -786,7 +813,7 @@ function openMenu(cx, cy, at) {
       for (const md of def.modes) {
         items.push({
           icon: def.icon, text: md.name,
-          run: () => addCard(def.id, at.x - CW / 2, at.y - 40, md.id),
+          run: () => addCard(def.id, at.x - CW / 2, at.y - 40, modeCap(md)),
         });
       }
     }
@@ -921,7 +948,7 @@ function cloneCard(c) {
 
 function addCard(type, x, y, cap) {
   const def = cardDef(type);
-  const c = { id: uid(), type, cap: cap || def.modes[0].id, x: Math.round(x), y: Math.round(y), params: {}, assets: {}, status: null, progress: 0, outputs: [] };
+  const c = { id: uid(), type, cap: cap || modeCap(def.modes[0]), x: Math.round(x), y: Math.round(y), params: {}, assets: {}, status: null, progress: 0, outputs: [] };
   PROJ.cards.push(c);
   el.world.appendChild(buildCard(c));
   pick(c.id); drawWires(); save();
@@ -946,9 +973,15 @@ async function linkTo(from, to) {
   if (!to) return;
   const out = (from.outputs || [])[0];
   if (!out) return toast("上游还没有产物，先运行它");
-  const spec = firstFreeSlot(to, out.kind === "audio" ? "audio" : "image");
+  // 路由卡先按上游产物的类型切到对应那一路，切完槽位名才对得上（见 routeFor）
+  const r = routeFor(to, out.kind);
+  if (r) { to.cap = r.cap; to.assets = {}; paintTitle(to); }
+  const spec = r ? { key: r.slot, label: KIND_ZH[out.kind] || "素材" }
+    // 同类型的槽优先（视频产物接进视频槽）；没有就沿用老规矩，当参考图使
+    : (firstFreeSlot(to, out.kind)
+      || firstFreeSlot(to, out.kind === "audio" ? "audio" : "image"));
   if (!spec) return toast("下游卡没有可接收的槽位");
-  PROJ.edges = PROJ.edges.filter(e => !(e.to === to.id && e.slot === spec.key));
+  PROJ.edges = PROJ.edges.filter(e => !(e.to === to.id && (r || e.slot === spec.key)));
   PROJ.edges.push({ from: from.id, to: to.id, slot: spec.key });
   drawWires(); save();
   try {
@@ -1176,10 +1209,10 @@ function openPanel(id) {
     const m = document.createElement("div"); m.className = "modes";
     for (const md of def.modes) {
       const b = document.createElement("button");
-      b.className = md.id === c.cap ? "on" : "";
+      b.className = modeHas(md, c.cap) ? "on" : "";
       b.textContent = md.name;
-      hoverBrief(b, () => CAPS[md.id], () => md.name);
-      b.onclick = () => { tipHide(); c.cap = md.id; openPanel(id); paintTitle(c); save(); };
+      hoverBrief(b, () => CAPS[modeCap(md)], () => md.name);
+      b.onclick = () => { tipHide(); c.cap = modeCap(md); openPanel(id); paintTitle(c); save(); };
       m.appendChild(b);
     }
     el.panel.appendChild(m);
@@ -1190,12 +1223,22 @@ function openPanel(id) {
   // 那条」。不这么做的话，面板显示的是首尾帧那条的示例提示词，只传一张图跑的却是
   // 图生视频那条的示例提示词 —— 看到的和出片的不是一回事。
   const rcap = CAPS[runCap(c)];
-  const specs = (rcap && rcap !== cap)
+  let specs = (rcap && rcap !== cap)
     ? cap.inputs.map((s) => {
       const o = rcap.inputs.find(x => x.key === s.key);
       return o && o.default !== s.default ? { ...s, default: o.default } : s;
     })
     : cap.inputs;
+  const md = modeOf(c);
+  // 路由卡的入口只有一格、两种素材都收，所以空着的时候不能叫「图片」（见 ROUTE_CARDS.entry）。
+  // 一旦放进去了就露出真名（图片/视频），那正好是"路由到哪一路了"的反馈
+  if (md && md.entry) {
+    const i = specs.findIndex(x => MEDIA.includes(x.type));
+    if (i >= 0 && !c.assets[specs[i].key]) {
+      specs = specs.slice();
+      specs[i] = { ...specs[i], label: md.entry.label };
+    }
+  }
   // 中间这坨才滚动：模式切换留在顶部、运行按钮留在底部，参数再多也不会被推出屏幕
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
@@ -1207,8 +1250,17 @@ function openPanel(id) {
     n.textContent = cap.note;
     body.appendChild(n);
   }
+  // 路由卡：说清楚放什么会跑什么，并标出现在这一格是哪一路
+  if (md && md.route) {
+    const filled = Object.keys(md.route).find(k => md.route[k].cap === c.cap
+      && c.assets[md.route[k].slot]);
+    const n = document.createElement("div"); n.className = "pnote";
+    n.textContent = md.entry.hint
+      + (filled ? `现在放的是${KIND_ZH[filled] || filled}，会跑「${cap.name}」。`
+        : "现在还没放素材。");
+    body.appendChild(n);
+  }
   // 合并模式：把"传几张跑哪条"摊开写，并标出现在会跑哪条
-  const md = modeOf(c);
   if (md && md.ladder) {
     const now = runCap(c);
     const n = document.createElement("div"); n.className = "pnote";
@@ -1222,7 +1274,7 @@ function openPanel(id) {
   // --- 素材槽 ---
   // 放在提示词前面：漫剧那种一图一提示词的工作流，tab 是跟着图长出来的，
   // 先看到图槽才讲得通
-  const media = specs.filter(x => x.type === "image" || x.type === "audio");
+  const media = specs.filter(x => MEDIA.includes(x.type));
   if (media.length) {
     const wrap = document.createElement("div"); wrap.className = "slots";
     for (const s of media) wrap.appendChild(slotEl(c, s));
@@ -1254,7 +1306,7 @@ function openPanel(id) {
   // --- 常规参数 ---
   // mirror = 多个节点共用同一个参数框（如两个采样器共用种子），只画一次
   // ranged = 已经画成上面那条选区了，别在这儿再出一对文本框
-  const rows = specs.filter(x => !["image", "audio", "textarea"].includes(x.type)
+  const rows = specs.filter(x => !MEDIA.includes(x.type) && x.type !== "textarea"
     && !x.advanced && !x.mirror && !ranged.has(x.key));
   // 旋钮下面那行小字：光靠 label 说不清的（"分辨率"是每格的还是整张的）必须摆在
   // 明面上。以前只有「高级」里的旋钮画它，常规旋钮的 hint 只当 tooltip，不悬停看不见
@@ -1412,8 +1464,10 @@ function templateBlock(c, s) {
 function paintTitle(c) {
   if (!c._el) return;
   const t = c._el.querySelector(".ch .t"), cap = capOf(c), md = modeOf(c);
-  // 合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）
-  t.textContent = c.name || (md && md.ladder ? md.name : cap ? cap.name : c.cap);
+  // 合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
+  // 路由卡同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频
+  t.textContent = c.name
+    || (md && (md.ladder || md.route) ? md.name : cap ? cap.name : c.cap);
   t.classList.toggle("named", !!c.name);
 }
 
@@ -1428,11 +1482,11 @@ function slotEl(c, s) {
   if (a) {
     box.innerHTML = a.kind === "image" ? `<img src="${a.url}" draggable="false">`
       : a.kind === "video" ? `<video src="${a.url}" muted draggable="false"></video>` : `🎵`;
-  } else box.textContent = s.type === "audio" ? "🎵" : gridWord(s) ? "田" : "＋";
+  } else box.textContent = s.type === "audio" ? "🎵"
+    : s.type === "video" ? "🎬" : gridWord(s) ? "田" : "＋";
   d.onclick = () => pickFile(c, s);
   d.oncontextmenu = (ev) => {
     ev.stopPropagation();
-    if (wantsNativeMenu(ev)) return;         // 右键素材缩略图要能「图片另存为」
     ev.preventDefault();
     if (!a) return;
     // 以前右键直接就把这一格清了，手滑一下素材就没了，还跟"右键=看菜单"的直觉相反
@@ -1565,14 +1619,18 @@ function audioRange(c, slot, sSpec, eSpec) {
 }
 
 function pickFile(c, s) {
-  el.picker.accept = s.type === "audio" ? "audio/*" : "image/*";
+  // 路由卡那一格两种都收，accept 不能只写一种，否则选视频时文件对话框里根本看不到
+  const r = modeOf(c), both = r && r.route && Object.keys(r.route).length > 1
+    && Object.values(r.route).some(x => x.slot === s.key);
+  el.picker.accept = both ? Object.keys(r.route).map(k => `${k}/*`).join(",")
+    : s.type === "audio" ? "audio/*" : s.type === "video" ? "video/*" : "image/*";
   el.picker.onchange = async () => {
     const f = el.picker.files[0]; el.picker.value = "";
     if (!f) return;
     const fd = new FormData(); fd.append("file", f, f.name);
     try {
       const r = await api("/api/upload", { method: "POST", body: fd });
-      c.assets[s.key] = r.files[0];
+      putAsset(c, s, r.files[0]);
       openPanel(c.id); save();
     } catch (e) { toast("上传失败：" + e.message); }
   };
@@ -1690,7 +1748,7 @@ function augRes(c, s, row) {
 function payloadOf(c) {
   const cap = CAPS[runCap(c)] || capOf(c), params = {}, assets = {};
   for (const s of cap.inputs) {
-    if (s.type === "image" || s.type === "audio" || s.mirror) continue;
+    if (MEDIA.includes(s.type) || s.mirror) continue;
     const v = c.params[s.key];
     if (v != null) params[s.key] = v;
     else if (s.type === "seed") params[s.key] = -1;      // 每次随机

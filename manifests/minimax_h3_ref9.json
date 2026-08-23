@@ -7,9 +7,10 @@
  "outputType": "video",
  "kind": "gen",
  "card": "minimax_h3_ref9",
- "slots": "img9+aud0",
+ "slots": "img9+aud0+vid0",
  "images": 9,
  "audios": 0,
+ "videos": 0,
  "graph": "graphs/minimax_h3_ref9.api.json",
  "output": {
   "node": "38"
@@ -262,7 +263,8 @@
     "node": "3",
     "input": "noise_seed",
     "vtype": "INT"
-   }
+   },
+   "max": 18446744073709551615
   }
  ],
  "warnings": []

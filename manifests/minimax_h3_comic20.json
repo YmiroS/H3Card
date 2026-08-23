@@ -7,9 +7,10 @@
  "outputType": "video",
  "kind": "gen",
  "card": "video",
- "slots": "img5+aud0",
+ "slots": "img5+aud0+vid0",
  "images": 5,
  "audios": 0,
+ "videos": 0,
  "graph": "graphs/minimax_h3_comic20.api.json",
  "output": {
   "node": "79"
@@ -279,7 +280,8 @@
     "node": "289",
     "input": "seed",
     "vtype": "INT"
-   }
+   },
+   "max": 18446744073709551615
   },
   {
    "key": "seed",
@@ -291,6 +293,7 @@
     "input": "noise_seed",
     "vtype": "INT"
    },
+   "max": 18446744073709551615,
    "mirror": true
   }
  ],

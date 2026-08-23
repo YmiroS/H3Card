@@ -7,9 +7,10 @@
  "outputType": "video",
  "kind": "gen",
  "card": "video",
- "slots": "img2+aud0",
+ "slots": "img2+aud0+vid0",
  "images": 2,
  "audios": 0,
+ "videos": 0,
  "graph": "graphs/minimax_h3_flf2v.api.json",
  "output": {
   "node": "92"
@@ -133,7 +134,8 @@
     "node": "131",
     "input": "noise_seed",
     "vtype": "INT"
-   }
+   },
+   "max": 18446744073709551615
   }
  ],
  "warnings": []
