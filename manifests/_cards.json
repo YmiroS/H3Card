@@ -9,12 +9,12 @@
    {
     "id": "zimage_t2i",
     "name": "Z-Image 文生图",
-    "slots": "img0+aud0"
+    "slots": "img0+aud0+vid0"
    },
    {
     "id": "flux2_klein_storyboard9",
     "name": "多宫格故事分镜",
-    "slots": "img1+aud0"
+    "slots": "img1+aud0+vid0"
    }
   ]
  },
@@ -28,7 +28,7 @@
    {
     "id": "minimax_h3_flf2v",
     "name": "H3 图生视频",
-    "slots": "img2+aud0",
+    "slots": "img2+aud0+vid0",
     "ladder": {
      "1": "minimax_h3_i2v",
      "2": "minimax_h3_flf2v"
@@ -37,7 +37,7 @@
    {
     "id": "minimax_h3_talk2",
     "name": "H3 说话唱歌",
-    "slots": "img2+aud1",
+    "slots": "img2+aud1+vid0",
     "ladder": {
      "1": "minimax_h3_talk1",
      "2": "minimax_h3_talk2"
@@ -46,7 +46,7 @@
    {
     "id": "minimax_h3_comic20",
     "name": "漫剧4宫格",
-    "slots": "img5+aud0"
+    "slots": "img5+aud0+vid0"
    }
   ]
  },
@@ -60,7 +60,7 @@
    {
     "id": "minimax_h3_ref4",
     "name": "H3 四图参考生视频",
-    "slots": "img4+aud0"
+    "slots": "img4+aud0+vid0"
    }
   ]
  },
@@ -74,7 +74,7 @@
    {
     "id": "minimax_h3_ref9",
     "name": "H3全能参考(通用)",
-    "slots": "img9+aud0"
+    "slots": "img9+aud0+vid0"
    }
   ]
  },
@@ -88,7 +88,51 @@
    {
     "id": "grid4_stitch",
     "name": "四图拼四宫格",
-    "slots": "img4+aud0"
+    "slots": "img4+aud0+vid0"
+   }
+  ]
+ },
+ {
+  "id": "gimmvfi_interp",
+  "name": "视频补帧插针(GIMM-VFI)",
+  "icon": "🧩",
+  "outputType": "video",
+  "kind": "tool",
+  "modes": [
+   {
+    "id": "gimmvfi_interp",
+    "name": "视频补帧插针(GIMM-VFI)",
+    "slots": "img0+aud0+vid1"
+   }
+  ]
+ },
+ {
+  "id": "card_enhance",
+  "name": "画质增强",
+  "icon": "✨",
+  "outputType": "image",
+  "kind": "tool",
+  "modes": [
+   {
+    "id": "card_enhance",
+    "name": "画质增强",
+    "slots": "image/video",
+    "route": {
+     "image": {
+      "cap": "seedvr2_image_up",
+      "slot": "images[0]",
+      "name": "SeedVR2 图片高清放大"
+     },
+     "video": {
+      "cap": "gimmvfi_interp",
+      "slot": "video[0]",
+      "name": "视频补帧插针(GIMM-VFI)"
+     }
+    },
+    "entry": {
+     "label": "素材",
+     "hint": "放图片就重画放大（更清楚），放视频就补中间帧（更顺滑）。放进来之后下面的参数会自动换成对应的那一套。"
+    }
    }
   ]
  }

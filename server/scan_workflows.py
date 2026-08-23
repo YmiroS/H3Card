@@ -41,6 +41,8 @@ ALIASES = {
     "1-minimax H3/MiniMax H3 全能参考(通用) 九图单采.json": "minimax_h3_ref9",
     "1-minimax H3/@minimax-批量化漫剧20宫格-直出1分钟视频V3.json": "minimax_h3_comic20",
     "0-工具箱/四图拼四宫格.json": "grid4_stitch",
+    "SeedVR2图片视频高清/视频补帧插针(GIMM-VFI).json": "gimmvfi_interp",
+    "SeedVR2图片视频高清/SeedVR2图片高清放大.json": "seedvr2_image_up",
 }
 
 # 画布上的模式名（人工微调）。没写的能力走 short_name() 自动清洗文件名。
@@ -56,13 +58,32 @@ DISPLAY = {
     "minimax_h3_ref9": "H3全能参考(通用)",
     "minimax_h3_comic20": "漫剧4宫格",
     "grid4_stitch": "四图拼四宫格",
+    "gimmvfi_interp": "视频补帧插针(GIMM-VFI)",
+    "seedvr2_image_up": "SeedVR2 图片高清放大",
 }
 
 # 画布上单独占一张卡的能力。默认按产出类型归并（都出视频就都在「生视频」里当模式），
 # 只有玩法差别大、不该藏在别人模式列表里第 N 项的才写进来。
 # 注意：素材形态有要求（比如漫剧要宫格拼图）不是单独成卡的理由 —— 那是这条模式的
 # 用法说明，面板上有 note 提示就够了。
-SOLO = {"minimax_h3_ref4", "minimax_h3_ref9"}
+SOLO = {"minimax_h3_ref4", "minimax_h3_ref9", "gimmvfi_interp"}
+
+# 按素材类型路由的合并卡：一张卡，放图片跑一条工作流、放视频跑另一条。
+# 和 ladder（按图片张数路由，见 build_modes）不是一回事 —— 那边是同一件事的不同张数；
+# 这边两条工作流做的本是两件事（重建放大 / 补帧插针），但用户的诉求是同一个：
+# 「手上这份素材，让它更清楚更顺滑」。拆成两张卡的话，用户得先自己判断该找哪张。
+# 进了这里的能力默认不再单独成卡；想同时保留自己那张卡的写进 SOLO。
+ROUTE_CARDS = {
+    "card_enhance": {
+        "name": "画质增强", "icon": "✨",
+        # 排在前面的那路是卡片的初始状态（图片更常见也更快，所以图片在前）
+        "route": {"image": "seedvr2_image_up", "video": "gimmvfi_interp"},
+        # 入口那一格的文案：卡片上只有一格，两种素材都收，所以不能叫「图片」
+        "entry": {"label": "素材",
+                  "hint": "放图片就重画放大（更清楚），放视频就补中间帧（更顺滑）。"
+                          "放进来之后下面的参数会自动换成对应的那一套。"},
+    },
+}
 
 # 要把工作流里「关着的备用素材槽」开出来的能力（见 revive_bypassed）。
 # 四图参考的第 4 个图槽在模板里是绕过状态，名字叫四图、实际只有三格。
@@ -76,6 +97,11 @@ NOTES = {
     "grid4_stitch": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」"
                     "要的素材，拼完直接连线过去。分镜顺序就是这个顺序。"
                     "画面比例和分辨率要跟下游那张卡调成一样，切回来的每格才不会再被裁一刀。",
+    "gimmvfi_interp": "给视频「加中间帧」：每两帧之间补出新的画面，帧率翻倍、时长不变，"
+                      "所以看起来更顺滑，不会变慢也不会变长。"
+                      "很吃时间和显存 —— 先拿几秒的短片段试，别一上来就丢整段。",
+    "seedvr2_image_up": "重画式放大：不是拉大像素，是照着原图重新画一遍，"
+                        "所以脸和字可能跟原图有出入，别用在要一模一样的场合。",
 }
 
 # 高级旋钮：这几个 widget 名不管挂在哪个节点上语义都一样，值得开出来给人调。
@@ -92,9 +118,21 @@ KNOBS = {
     "processing_control_value": ("提速档位", 0, 0.5, 0.005,
                                  "推荐 {d}：再快画面就开始糊、动作发飘，这一档是不掉画质的上限。0 = 不提速"),
     "max_rows": ("出图张数", 1, 9, 1, "一句提示词出一张图，{d} 张是一整套。调小只画前几张，剩下的不生成"),
+    "interpolation_factor": ("补帧倍数", 2, 4, 1,
+                             "推荐 {d}：帧率翻 {d} 倍、时长不变，画面更顺滑。"
+                             "每加一倍时间和显存都跟着涨，4 倍要跑很久"),
+    "resolution": ("放大到(短边)", 512, 2048, 64,
+                   "推荐 {d}：出片短边有多少像素，长边按原图比例跟着放。"
+                   "往上调更清楚，但时间和显存涨得很快；先调小试一版，满意了再放大"),
+    "frame_load_cap": ("只处理前几帧", 0, 300, 15,
+                       "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）"
+                       "试一版，满意了再改回 0"),
+    "scale_by": ("重画前先缩小", 0.25, 1, 0.05,
+                 "推荐 {d}：先把原图缩到这个比例，再照着重新画大。"
+                 "缩一点画得反而更细 —— 不缩的话糊的地方会被照着糊的重画一遍。1 = 不缩"),
 }
 # 上面这些旋钮默认折进「高级」。写在这里的是玩法本身的旋钮，要摆在面板正面。
-PRIMARY_KNOBS = {"max_rows"}
+PRIMARY_KNOBS = {"max_rows", "interpolation_factor", "resolution"}
 # 表里的上限是硬上限。这类旋钮在图里常写成一个"等于不限"的大数（promptLine 的
 # max_rows=1000），那不是作者调过的设置，照抄成默认值滑条就变成 1000 档没法用。
 HARD_MAX = {"max_rows"}
@@ -144,6 +182,10 @@ TEXT_TYPES = {
     "easy negative": "negative",
     "CLIPTextEncode": "text",
     "String Literal": "string",
+}
+VIDEO_LOADERS = {  # 上传视频的节点 -> 收文件名的那个输入名
+    "VHS_LoadVideo": "video",
+    "VHS_LoadVideoPath": "video",
 }
 SAVE_TYPES = {
     "SaveImage": "image", "PreviewImage": "image", "SaveAnimatedWEBP": "image",
@@ -492,6 +534,59 @@ def direct_consumer(api, nid):
     return cs[0] if cs else (None, None)
 
 
+def num(v):
+    """'2' -> 2。ComfyLiterals 把数字存成字符串，滑条要的是数"""
+    if isinstance(v, str):
+        try:
+            f = float(v)
+            return int(f) if f.is_integer() else f
+        except ValueError:
+            return v
+    return v
+
+
+def route_card(wid):
+    """这条能力被哪张「按素材类型路由」的合并卡收走了。
+
+    SOLO 里点名的不算被收走 —— 补帧既在合并卡里当视频那一路，也留着自己那张卡，
+    想直接补帧的人不用先猜「画质增强」里有没有这功能。
+    """
+    if wid in SOLO:
+        return None
+    return next((cid for cid, c in ROUTE_CARDS.items()
+                 if wid in c["route"].values()), None)
+
+
+def literal_out(oi, ct):
+    """节点本身就是个「写死的数字」：一个输入、一个数字输出。返回那个输出类型。
+
+    ComfyLiterals 的 Int 是典型：Number 声明成 STRING、输出却是 INT，
+    按输入类型根本认不出它是旋钮。这种节点自己没有语义，只能看它喂给谁 ——
+    跟下面 Primitive 看 RES_FIELDS 是同一个思路。
+    """
+    node = oi.get(ct) or {}
+    outs = list(node.get("output") or [])
+    if len(outs) == 1 and outs[0] in ("INT", "FLOAT") \
+            and len(node.get("input", {}).get("required", {})) == 1:
+        return outs[0]
+    return None
+
+
+def fed_knob(api, nid):
+    """nid 的输出喂进了哪个已知旋钮（KNOBS 的 key）。
+
+    补帧倍数就是这么接的：一个 Int 节点同时喂 interpolation_factor 和帧率乘法，
+    两边必须一起变，所以旋钮要写在这个 Int 上，不能直接改采样节点的输入。
+    """
+    return next((k.lower() for _c, k in consumers(api, nid) if k.lower() in KNOBS), None)
+
+
+def formula_node(oi, ct):
+    """输出全是数字的节点，它那个多行文本框是公式不是提示词（MathExpression 的 a*b）"""
+    outs = list((oi.get(ct) or {}).get("output") or [])
+    return bool(outs) and all(o in ("INT", "FLOAT") for o in outs)
+
+
 def upstream(api, nid, seen=None):
     """nid 顺着连线往上游能追到的全部节点 id（跨多层）"""
     seen = set() if seen is None else seen
@@ -605,6 +700,7 @@ def pick_label(title, generic):
 
 def derive_inputs(api, oi):
     images, audios, texts, params, seeds, outputs, crops, res = [], [], [], [], [], [], [], []
+    videos = []
     for nid, node in sorted(api.items(), key=lambda kv: int(str(kv[0]).split(":")[0])):
         ct, ins = node["class_type"], node["inputs"]
         title = node["_meta"]["title"]
@@ -613,6 +709,15 @@ def derive_inputs(api, oi):
             images.append((nid, title))
         elif ct == "LoadAudio":
             audios.append((nid, title))
+        elif ct in VIDEO_LOADERS:
+            videos.append((nid, VIDEO_LOADERS[ct], title))
+            # 上传节点自己也带旋钮（VHS 的 frame_load_cap = 只读前几帧），
+            # 这是补帧这类慢活唯一的"先试一小段"开关，不能跟着上传槽一起跳过
+            for f, v in ins.items():
+                if is_literal(v) and f.lower() in KNOBS:
+                    t, _o = spec_of(oi, ct, f)
+                    if t in ("INT", "FLOAT"):
+                        params.append((nid, title, f, v, "knob", t))
         elif ct == "AudioCrop":
             crops.append((nid, title))
         elif ct in SAVE_TYPES:
@@ -621,6 +726,8 @@ def derive_inputs(api, oi):
             # 通用规则：按输入的类型 + 名字 + object_info 选项判定角色，
             # 不依赖节点类名白名单，任何插件节点都能识别
             is_primitive = ct.startswith("Primitive") or ct in TEXT_TYPES
+            lit_t = literal_out(oi, ct)
+            lit_key = fed_knob(api, nid) if lit_t else None
             for f, v in ins.items():
                 if not is_literal(v):
                     continue
@@ -628,11 +735,17 @@ def derive_inputs(api, oi):
                 low = f.lower()
                 hint = f"{title or ''} {f}".lower()
                 if low in ("seed", "noise_seed", "rand_seed"):
-                    seeds.append((nid, f, v, t))
+                    # 种子上限各节点不一样（KSampler 是 2^64，SeedVR2 只到 2^32-1），
+                    # 随机种子必须按这个上限来，超了 ComfyUI 直接拒收整个任务
+                    seeds.append((nid, f, v, t, opts.get("max")))
                 elif low in KNOBS and t in ("INT", "FLOAT"):
                     # 这几个旋钮基本都长在采样器/LoRA/加速这类"后台节点"上，
                     # 所以要抢在 HIDDEN_TYPES 之前放行
                     params.append((nid, title, f, v, "knob", t))
+                elif lit_key:
+                    # 数字中转节点喂给了一个已知旋钮：这个数字就是那个旋钮的值。
+                    # 声明类型不算数（Int.Number 写的是 STRING），按输出类型走
+                    params.append((nid, title, f, num(v), "knob", lit_t))
                 elif ct in HIDDEN_TYPES:
                     continue                              # 后台节点只取种子和白名单旋钮
                 elif low in RES_FIELDS and (low == "scale_to_length"
@@ -641,6 +754,8 @@ def derive_inputs(api, oi):
                 elif t == "STRING" and opts.get("multiline") and isinstance(v, str):
                     if any(x in low for x in ("system", "negative", "suffix", "prefix")):
                         continue
+                    if formula_node(oi, ct):
+                        continue          # 公式不是提示词，开出来只会被人当输入框填坏
                     texts.append((nid, title, f, v))
                 elif t == "STRING" and is_primitive and isinstance(v, str):
                     texts.append((nid, title, f, v))
@@ -742,6 +857,15 @@ def derive_inputs(api, oi):
         if g:
             item["grid"] = list(g)
         out.append(item)
+    for i, (nid, field, title) in enumerate(videos):
+        ct = api[nid]["class_type"]
+        label, hint = pick_label(None if default_title(oi, ct, title) else title, "视频")
+        item = {"key": f"video[{i}]", "label": uniq(label), "type": "video",
+                "required": i == 0,
+                "target": {"node": nid, "input": field, "kind": "upload_video"}}
+        if hint:
+            item["hint"] = hint
+        out.append(item)
     for i, (nid, title) in enumerate(audios):
         label, hint = pick_label(None if default_title(oi, "LoadAudio", title) else title, "音频")
         item = {"key": f"audio[{i}]", "label": uniq(label), "type": "audio",
@@ -774,10 +898,15 @@ def derive_inputs(api, oi):
                         "min": 3, "max": 30, "step": 1, "default": val,
                         "target": {"node": nid, "input": field, "vtype": vt}})
         elif kind == "knob":
-            key = field.lower()
+            # 输入名不在表里的话，这是个数字中转节点，旋钮身份来自它喂给的那个输入
+            key = field.lower() if field.lower() in KNOBS else fed_knob(api, nid)
             label, lo, hi, step, hint = KNOBS[key]
             if key in HARD_MAX:
                 val = min(val, hi)
+            if isinstance(val, float):
+                # 图里存的是浮点噪声（0.5000000000000001），照抄进滑条既对不上步进
+                # 也会在面板上原样显示出来
+                val = round(val, 4)
             item = {"key": key, "label": label, "type": "slider",
                     "min": lo, "max": max(hi, val), "step": step, "default": val,
                     "hint": hint.replace("{d}", f"{val:g}"),
@@ -829,9 +958,13 @@ def derive_inputs(api, oi):
             else:
                 item["advanced"] = True
             out.append(item)
-    for i, (nid, field, val, vt) in enumerate(seeds):
+    # 多个采样器共用一个种子输入框，那就得取所有节点里最小的那个上限
+    smax = min([m for *_r, m in seeds if isinstance(m, (int, float))] or [0]) or None
+    for i, (nid, field, val, vt, _m) in enumerate(seeds):
         item = {"key": "seed", "label": "种子", "type": "seed", "default": val,
                 "target": {"node": nid, "input": field, "vtype": vt or "INT"}}
+        if smax:
+            item["max"] = int(smax)
         if i:
             item["mirror"] = True          # 多个采样器共用同一个种子输入框
         out.append(item)
@@ -846,20 +979,24 @@ def derive_inputs(api, oi):
                 f"上传后自动切成 {per} 个分镜、连成一段视频。"
                 + (f"传满 {n} 张就是 {per * n} 宫格，按顺序接成一整条完整视频。"
                    if n > 1 else ""))
-    return out, outputs, len(images), len(audios), note
+    return out, outputs, len(images), len(audios), len(videos), note
 
 
 def is_tool(inputs):
     """纯加工能力：不采样、不写提示词，只是把素材换个形状（拼图 / 裁切 / 缩放）。
 
-    判据是「既没有种子、也没有提示词」—— 生成类工作流总得有个采样器要种子、
-    总得有句提示词描述要画什么；工具两样都没有，产出完全由输入素材决定，
-    同样的素材跑两次结果一模一样。
+    判据是「要素材、但不写提示词」—— 生成类总得有句提示词描述要画什么；
+    工具没有，它只认手上这份素材，改什么全看素材本身。
+    反过来「必须有素材」也不能少，不然纯参数的工作流会被误判成工具。
+
+    种子不能当判据：补帧、重画放大内部都用扩散模型、都要种子，但用户的诉求
+    不是"创作一张新的"，而是"把这份素材弄好点"，那就是工具。
 
     工具要单独成卡（不能并进「生图」的模式列表），菜单里也单独一组：它不创作，
     混在生图里会让人以为它也在画画。所以这个判断顺手替它免了 SOLO 登记。
     """
-    return not any(i["type"] in ("seed", "textarea") for i in inputs)
+    kinds = {i["type"] for i in inputs}
+    return bool(kinds & {"image", "audio", "video"}) and "textarea" not in kinds
 
 
 def required_keys(oi, ct):
@@ -960,6 +1097,32 @@ def fingerprint(m):
     return (m["audios"], tuple(sorted(i["key"] for i in m["inputs"] if i["type"] != "image")))
 
 
+def route_card_def(cid, spec, by_id):
+    """按素材类型路由的合并卡（见 ROUTE_CARDS）。
+
+    只有一个模式，模式上挂 route：素材是图片就切到这条能力，是视频就切到那条。
+    和 ladder 不同，这里两条能力的参数完全不一样（补帧倍数 / 放大到多少），
+    没法画一张"并集"面板，所以放素材的那一刻就把卡片切成对应的能力 ——
+    切完之后面板、参数、产出类型全都走原来那套，前端不用额外知道什么。
+    """
+    route = {}
+    for kind, wid in spec["route"].items():
+        m = by_id.get(wid)
+        if not m:
+            print(f"!! {cid} 少了 {kind} 那一路：{wid} 没扫到")
+            continue
+        slot = next((i["key"] for i in m["inputs"] if i["type"] == kind), None)
+        if not slot:
+            print(f"!! {cid}: {wid} 没有 {kind} 输入槽")
+            continue
+        route[kind] = {"cap": wid, "slot": slot, "name": m["name"]}
+    first = by_id[route[next(iter(route))]["cap"]]
+    mode = {"id": cid, "name": spec["name"], "slots": "/".join(route),
+            "route": route, "entry": dict(spec["entry"])}
+    return {"id": cid, "name": spec["name"], "icon": spec["icon"],
+            "outputType": first["outputType"], "kind": "tool", "modes": [mode]}
+
+
 def build_modes(ms):
     """把「只差图片张数」的能力合并成一个模式：传几张图，就跑哪条工作流。
 
@@ -1023,7 +1186,7 @@ def scan(path: Path, oi, rel_key=None):
         api = ui_to_api(wf, oi, warns, revive=wid in REVIVE)
     repair_loop_count(api, oi, warns)
     repair_bool_widgets(api, oi, warns)
-    inputs, outputs, n_img, n_aud, note = derive_inputs(api, oi)
+    inputs, outputs, n_img, n_aud, n_vid, note = derive_inputs(api, oi)
     out_type = outputs[0][1] if outputs else "unknown"
     warns += [f"结构错误 {e}" for e in validate_api(api, oi)]
     if not outputs:
@@ -1038,11 +1201,13 @@ def scan(path: Path, oi, rel_key=None):
         "group": {"video": "视频", "image": "图片", "audio": "音频"}.get(out_type, "其他"),
         "outputType": out_type,
         "kind": "tool" if tool else "gen",      # 工具（只加工素材）还是创作
-        # 归并到哪张卡：默认按产出类型，SOLO 里点名的和工具都自己占一张
-        "card": wid if (tool or wid in SOLO) else out_type,
-        "slots": f"img{n_img}+aud{n_aud}",      # 槽位指纹
+        # 归并到哪张卡：ROUTE_CARDS 点名的进合并卡，SOLO 里点名的和工具自己占一张，
+        # 其余按产出类型并到「生图 / 生视频 / 生音频」里当模式
+        "card": route_card(wid) or (wid if (tool or wid in SOLO) else out_type),
+        "slots": f"img{n_img}+aud{n_aud}+vid{n_vid}",   # 槽位指纹
         "images": n_img,
         "audios": n_aud,
+        "videos": n_vid,
         "graph": f"graphs/{wid}.api.json",
         "output": {"node": outputs[0][0]} if outputs else None,
         "note": note or NOTES.get(wid),
@@ -1114,8 +1279,12 @@ def main():
         "video": ("card_video", "生视频", "🎬"),
         "audio": ("card_audio", "生音频", "🎵"),
     }
+    by_id = {m["id"]: m for m in manifests}
     cards = []
     for key, ms in groups.items():
+        if key in ROUTE_CARDS:
+            cards.append(route_card_def(key, ROUTE_CARDS[key], by_id))
+            continue
         ms.sort(key=lambda m: (m["images"], m["audios"]))
         kind = ms[0].get("kind", "gen")
         # 没进 CARD_META 的 key 就是单独成卡的能力，卡名和图标都跟着它自己走。
@@ -1137,6 +1306,8 @@ def main():
             print(f"        [{md['slots']:<10}] {md['id']:<26} {md['name']}")
             for n, wid in sorted(md.get("ladder", {}).items()):
                 print(f"            {n} 张图 -> {wid}")
+            for k, r in md.get("route", {}).items():
+                print(f"            放{k} -> {r['cap']}  (填 {r['slot']})")
     print(f"\n共 {len(manifests)} 个能力 -> chouka/manifests/")
 
 

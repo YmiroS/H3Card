@@ -7,9 +7,10 @@
  "outputType": "image",
  "kind": "gen",
  "card": "image",
- "slots": "img1+aud0",
+ "slots": "img1+aud0+vid0",
  "images": 1,
  "audios": 0,
+ "videos": 0,
  "graph": "graphs/flux2_klein_storyboard9.api.json",
  "output": {
   "node": "9"
@@ -78,7 +79,8 @@
     "node": "183:182",
     "input": "seed",
     "vtype": "INT"
-   }
+   },
+   "max": 18446744073709551615
   },
   {
    "key": "seed",
@@ -90,6 +92,7 @@
     "input": "noise_seed",
     "vtype": "INT"
    },
+   "max": 18446744073709551615,
    "mirror": true
   }
  ],
