@@ -1,0 +1,77 @@
+{
+ "id": "gimmvfi_interp",
+ "name": "视频补帧插针(GIMM-VFI)",
+ "file": "视频补帧插针(GIMM-VFI)",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\SeedVR2图片视频高清\\视频补帧插针(GIMM-VFI).json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "tool",
+ "card": "gimmvfi_interp",
+ "slots": "img0+aud0+vid1",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "graph": "graphs/gimmvfi_interp.api.json",
+ "output": {
+  "node": "8"
+ },
+ "note": "给视频「加中间帧」：每两帧之间补出新的画面，帧率翻倍、时长不变，所以看起来更顺滑，不会变慢也不会变长。很吃时间和显存 —— 先拿几秒的短片段试，别一上来就丢整段。",
+ "inputs": [
+  {
+   "key": "video[0]",
+   "label": "视频",
+   "type": "video",
+   "required": true,
+   "target": {
+    "node": "7",
+    "input": "video",
+    "kind": "upload_video"
+   }
+  },
+  {
+   "key": "frame_load_cap",
+   "label": "只处理前几帧",
+   "type": "slider",
+   "min": 0,
+   "max": 300,
+   "step": 15,
+   "default": 0,
+   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
+   "advanced": true,
+   "target": {
+    "node": "7",
+    "input": "frame_load_cap",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "interpolation_factor",
+   "label": "补帧倍数",
+   "type": "slider",
+   "min": 2,
+   "max": 4,
+   "step": 1,
+   "default": 2,
+   "hint": "推荐 2：帧率翻 2 倍、时长不变，画面更顺滑。每加一倍时间和显存都跟着涨，4 倍要跑很久",
+   "advanced": false,
+   "target": {
+    "node": "32",
+    "input": "Number",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 793432876184206,
+   "target": {
+    "node": "2",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  }
+ ],
+ "warnings": []
+}

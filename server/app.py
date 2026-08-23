@@ -130,7 +130,7 @@ def patch_graph(cap, params, uploaded):
         node, field = str(tgt["node"]), tgt["input"]
         if node not in g:
             raise web.HTTPBadRequest(reason=f"工作流里没有节点 {node}（能力 {cap['id']} 需重新扫描）")
-        if spec["type"] in ("image", "audio"):
+        if spec["type"] in ("image", "audio", "video"):
             val = uploaded.get(key)
             if not val:
                 if spec.get("required"):
@@ -144,9 +144,12 @@ def patch_graph(cap, params, uploaded):
                 continue                       # 未填的可选素材：保留模板里的默认值
         elif spec["type"] == "seed":
             val = params.get("seed")
+            # 上限按 manifest 里那个节点自己声明的来：SeedVR2 只收到 2^32-1，
+            # 随手掷一个 2^53 会让 ComfyUI 拒收整个任务（"bigger than max of …"）
+            hi = min(int(spec.get("max") or 2 ** 53), 2 ** 53)
             if val in (None, "", -1, "-1"):
-                val = params.setdefault("_seed_used", random.randint(0, 2 ** 53))
-            val = int(val)
+                val = params.setdefault("_seed_used", random.randint(0, hi))
+            val = min(int(val), hi)
         else:
             pair = spec.get("pairWith")
             if pair and not uploaded.get(pair):

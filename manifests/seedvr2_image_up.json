@@ -1,0 +1,79 @@
+{
+ "id": "seedvr2_image_up",
+ "name": "SeedVR2 图片高清放大",
+ "file": "SeedVR2图片高清放大",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\SeedVR2图片视频高清\\SeedVR2图片高清放大.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "tool",
+ "card": "card_enhance",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "graph": "graphs/seedvr2_image_up.api.json",
+ "output": {
+  "node": "2"
+ },
+ "note": "重画式放大：不是拉大像素，是照着原图重新画一遍，所以脸和字可能跟原图有出入，别用在要一模一样的场合。",
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "6",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "scale_by",
+   "label": "重画前先缩小",
+   "type": "slider",
+   "min": 0.25,
+   "max": 1,
+   "step": 0.05,
+   "default": 0.5,
+   "hint": "推荐 0.5：先把原图缩到这个比例，再照着重新画大。缩一点画得反而更细 —— 不缩的话糊的地方会被照着糊的重画一遍。1 = 不缩",
+   "advanced": true,
+   "target": {
+    "node": "1",
+    "input": "scale_by",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "resolution",
+   "label": "放大到(短边)",
+   "type": "slider",
+   "min": 512,
+   "max": 2048,
+   "step": 64,
+   "default": 2048,
+   "hint": "推荐 2048：出片短边有多少像素，长边按原图比例跟着放。往上调更清楚，但时间和显存涨得很快；先调小试一版，满意了再放大",
+   "advanced": false,
+   "target": {
+    "node": "3",
+    "input": "resolution",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 1415775640,
+   "target": {
+    "node": "3",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 4294967295
+  }
+ ],
+ "warnings": [
+  "已修：#5.cache_model 的值 'sdpa' 不是布尔，按节点默认值 False 送"
+ ]
+}

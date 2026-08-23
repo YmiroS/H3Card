@@ -7,9 +7,10 @@
  "outputType": "image",
  "kind": "gen",
  "card": "image",
- "slots": "img0+aud0",
+ "slots": "img0+aud0+vid0",
  "images": 0,
  "audios": 0,
+ "videos": 0,
  "graph": "graphs/zimage_t2i.api.json",
  "output": {
   "node": "9"
@@ -89,7 +90,8 @@
     "node": "44",
     "input": "seed",
     "vtype": "INT"
-   }
+   },
+   "max": 18446744073709551615
   }
  ],
  "warnings": []

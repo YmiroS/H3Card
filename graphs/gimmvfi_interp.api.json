@@ -1,0 +1,119 @@
+{
+ "8": {
+  "class_type": "VHS_VideoCombine",
+  "inputs": {
+   "images": [
+    "2",
+    0
+   ],
+   "audio": [
+    "7",
+    2
+   ],
+   "frame_rate": [
+    "34",
+    1
+   ],
+   "loop_count": 0,
+   "filename_prefix": "AnimateDiff",
+   "format": "video/h264-mp4",
+   "pingpong": false,
+   "save_output": true,
+   "pix_fmt": "yuv420p",
+   "crf": 19,
+   "save_metadata": true,
+   "trim_to_audio": false
+  },
+  "_meta": {
+   "title": "Video Combine 🎥🅥🅗🅢"
+  }
+ },
+ "33": {
+  "class_type": "VHS_VideoInfoSource",
+  "inputs": {
+   "video_info": [
+    "7",
+    3
+   ]
+  },
+  "_meta": {
+   "title": "Video Info (Source) 🎥🅥🅗🅢"
+  }
+ },
+ "34": {
+  "class_type": "MathExpression|pysssss",
+  "inputs": {
+   "a": [
+    "33",
+    0
+   ],
+   "b": [
+    "32",
+    0
+   ],
+   "expression": "a*b"
+  },
+  "_meta": {
+   "title": "Math Expression 🐍"
+  }
+ },
+ "1": {
+  "class_type": "DownloadAndLoadGIMMVFIModel",
+  "inputs": {
+   "model": "gimmvfi_r_arb_lpips_fp32.safetensors",
+   "precision": "fp32",
+   "torch_compile": false
+  },
+  "_meta": {
+   "title": "(Down)Load GIMMVFI Model"
+  }
+ },
+ "7": {
+  "class_type": "VHS_LoadVideo",
+  "inputs": {
+   "video": "AnimateDiff_00001-audio.mp4",
+   "force_rate": 0,
+   "custom_width": 0,
+   "custom_height": 0,
+   "frame_load_cap": 0,
+   "skip_first_frames": 0,
+   "select_every_nth": 1,
+   "format": "None"
+  },
+  "_meta": {
+   "title": "Load Video (Upload) 🎥🅥🅗🅢"
+  }
+ },
+ "2": {
+  "class_type": "GIMMVFI_interpolate",
+  "inputs": {
+   "gimmvfi_model": [
+    "1",
+    0
+   ],
+   "images": [
+    "7",
+    0
+   ],
+   "ds_factor": 1,
+   "interpolation_factor": [
+    "32",
+    0
+   ],
+   "seed": 793432876184206,
+   "output_flows": false
+  },
+  "_meta": {
+   "title": "GIMM-VFI Interpolate"
+  }
+ },
+ "32": {
+  "class_type": "Int",
+  "inputs": {
+   "Number": "2"
+  },
+  "_meta": {
+   "title": "Int"
+  }
+ }
+}
