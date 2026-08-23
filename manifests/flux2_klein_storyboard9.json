@@ -1,10 +1,11 @@
 {
  "id": "flux2_klein_storyboard9",
- "name": "九宫格故事分镜",
+ "name": "多宫格故事分镜",
  "file": "九宫格Qwen3.5-Flux2-Kelin一键故事分镜",
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\3-Flux2-klein全系列\\九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json",
  "group": "图片",
  "outputType": "image",
+ "kind": "gen",
  "card": "image",
  "slots": "img1+aud0",
  "images": 1,
@@ -49,6 +50,22 @@
    "target": {
     "node": "183:162",
     "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "max_rows",
+   "label": "出图张数",
+   "type": "slider",
+   "min": 1,
+   "max": 9,
+   "step": 1,
+   "default": 9,
+   "hint": "一句提示词出一张图，9 张是一整套。调小只画前几张，剩下的不生成",
+   "advanced": false,
+   "target": {
+    "node": "183:175",
+    "input": "max_rows",
     "vtype": "INT"
    }
   },

@@ -5,6 +5,7 @@
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@MinimaxH3：图生视频 (4步加速版).json",
  "group": "视频",
  "outputType": "video",
+ "kind": "gen",
  "card": "video",
  "slots": "img1+aud0",
  "images": 1,

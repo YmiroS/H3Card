@@ -3,7 +3,9 @@
    卡片字段全部由后端 /api/cards 的 manifest 生成，前端不写死任何工作流 */
 
 const $ = (s, r = document) => r.querySelector(s);
-const CW = 268;            // 卡片宽度，与 style.css 保持一致
+const CW = 268;            // 卡片默认宽度，与 style.css 保持一致
+const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
+const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
 
 /** 该让浏览器自己弹右键菜单的地方：产物图/视频/音频（要「图片另存为」）、
@@ -11,6 +13,8 @@ const SVGNS = "http://www.w3.org/2000/svg";
 function wantsNativeMenu(ev) {
   if (ev.ctrlKey || ev.shiftKey) return true;
   const t = ev.target;
+  // 素材格自己有菜单（清空 / 定位文件），比"图片另存为"有用：文件本来就在硬盘上
+  if (t.closest(".slot")) return false;
   return !!(t.closest("input, textarea, select") || t.matches("img, video, audio"));
 }
 
@@ -26,7 +30,7 @@ const el = {
   side: $("#side"), plist: $("#plist"), dot: $("#dot"),
   ptitle: $("#ptitle"), hint: $("#hint"), addcard: $("#addcard"), fit: $("#fit"),
   stage: $("#stage"), world: $("#world"), wires: $("#wires"),
-  empty: $("#empty"), panel: $("#panel"), menu: $("#menu"), tip: $("#tip"),
+  empty: $("#empty"), panel: $("#panel"), hist: $("#hist"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
   view: $("#view"), vbox: $("#view .vbox"),
 };
@@ -276,6 +280,7 @@ async function openProject(pid) {
   for (const c of PROJ.cards) {
     const md = modeOf(c);
     if (md && md.id !== c.cap) c.cap = md.id;
+    seedHistory(c);
   }
   view = Object.assign({ x: 60, y: 70, k: 1 }, PROJ.view || {});
   selId = null;
@@ -350,6 +355,12 @@ function render() {
   el.hint.textContent = `${PROJ.cards.length} 张卡`;
 }
 
+/** 画面区的空占位：还没出过东西、或者这一轮失败/取消了都用它 */
+function phHTML(c) {
+  const def = defOf(c);
+  return `<span class="ph">${(def && def.outputType) === "video" ? "🎬" : "🖼"}</span>`;
+}
+
 function buildCard(c) {
   const def = defOf(c);
   const d = document.createElement("div");
@@ -358,14 +369,19 @@ function buildCard(c) {
   d.style.left = c.x + "px"; d.style.top = c.y + "px";
   d.innerHTML = `
     <div class="ch"><span>${def ? def.icon : "▪"}</span><span class="t"></span><button class="x" title="删除">✕</button></div>
-    <div class="body"><span class="ph">${(def && def.outputType) === "video" ? "🎬" : "🖼"}</span></div>
+    <div class="body">${phHTML(c)}</div>
     <div class="bar"><i></i></div>
     <div class="cf"><span class="st"></span><span class="meta" style="margin-left:auto"></span></div>
+    <div class="rz tl" title="拖动改大小（按住 Shift 只改宽）"></div>
+    <div class="rz br" title="拖动改大小（按住 Shift 只改宽）"></div>
     <div class="port" title="拖到空白处 → 用本卡产物新建下游卡"></div>`;
   c._el = d;
+  applySize(c);
   paintTitle(c);
   d.querySelector(".ch .x").onclick = (ev) => { ev.stopPropagation(); delCard(c.id); };
   d.querySelector(".ch").onmousedown = (ev) => startDrag(ev, c, d);
+  d.querySelector(".rz.tl").onmousedown = (ev) => startResize(ev, c, d, -1);
+  d.querySelector(".rz.br").onmousedown = (ev) => startResize(ev, c, d, 1);
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
   d.onmousedown = (ev) => { ev.stopPropagation(); pick(c.id); };
   d.oncontextmenu = (ev) => {
@@ -377,21 +393,99 @@ function buildCard(c) {
     tipHide(); pick(c.id); cardMenu(ev.clientX, ev.clientY, c);
   };
   d.ondblclick = (ev) => {
-    // 双击卡名 = 整条选中，方便直接 Ctrl+C（标题栏平时要留给拖动，没法拖选）
-    const t = ev.target.closest(".ch .t");
-    if (t) { ev.stopPropagation(); getSelection().selectAllChildren(t); return; }
-    if (!ev.target.closest(".body")) return;
-    // 播放条是浏览器画在 video 里的，点它拿到的 target 还是 video 本身，没法直接区分。
-    // 只能按位置判断：落在底部这条里就是在操作播放条，别抢它的双击
-    if (ev.target.matches("video, audio")) {
+    const body = ev.target.closest(".body");
+    if (!body) return;
+    if (ev.target.closest(".vprog")) return;   // 在进度条上连点是在定位，别抢它
+    // 音频那条播放条是浏览器画在 audio 里的，点它拿到的 target 还是 audio 本身，
+    // 没法直接区分，只能按位置判断：落在底部这条里就是在操作播放条，别抢它的双击
+    if (ev.target.matches("audio")) {
       const r = ev.target.getBoundingClientRect();
       if (ev.clientY > r.bottom - 34 * view.k) return;
     }
-    openViewer(c);
+    // 大窗口里那份才是带播放条的，卡里这份别在背后接着响
+    for (const v of body.querySelectorAll("video")) v.pause();
+    // 宫格里双击哪一格就从哪一张开始看
+    openViewer(c, +(ev.target.dataset.i || 0));
   };
+  bindCardVideo(d.querySelector(".body"));
   hoverBrief(d.querySelector(".ch"), () => capOf(c), () => c.name);
   paint(c);
   return d;
+}
+
+/* 全屏幕只许一个东西在响。一屏摊着十几张卡，多开两个视频就分不清声音是哪来的，
+   那个还在放的往往已经被滚出视野，只能听见声音找不着人。
+   统一挂在 document 捕获阶段（play/pause 不冒泡），卡片视频、宫格里的视频、
+   大窗口里的视频和音频全走这一条，各处不用自己记着关别人。 */
+let NOWPLAYING = null;
+document.addEventListener("play", (ev) => {
+  for (const o of document.querySelectorAll("video, audio")) if (o !== ev.target) o.pause();
+  NOWPLAYING = ev.target;
+}, true);
+document.addEventListener("pause", (ev) => {
+  if (NOWPLAYING === ev.target) NOWPLAYING = null;
+}, true);
+// 点到别处就停。范围按「它所在的那一块」算而不是按媒体元素本身：进度条、选区手柄都是
+// 它的兄弟节点，按元素算的话一按进度条就先被这里停掉，拖完也就不会接着放了
+document.addEventListener("mousedown", (ev) => {
+  if (!NOWPLAYING) return;
+  const box = NOWPLAYING.closest(".body, .vbox, .arange");
+  if (!box || !box.contains(ev.target)) NOWPLAYING.pause();
+}, true);
+
+/** 卡片里视频的交互：单击放/停、按住横向拖动定位、进度条可直接拖。
+ *
+ *  拖进度必须是「按住」而不是「滑过」：滑过的话一旦暂停，鼠标就停在画面上，
+ *  手抖一个像素都会重新定位，画面看着像被鼠标拽着平移。
+ *
+ *  绑在 .body 上做事件委托，paint() 换掉里面的 innerHTML 也不用重新绑。 */
+function bindCardVideo(body) {
+  const seek = (v, clientX, box) => {
+    if (!isFinite(v.duration) || !v.duration) return;
+    const r = box.getBoundingClientRect();
+    v.currentTime = Math.min(Math.max((clientX - r.left) / r.width, 0), 1) * v.duration;
+  };
+  body.onmousedown = (ev) => {
+    if (ev.button !== 0) return;
+    const bar = ev.target.closest(".vprog");
+    const v = bar ? body.querySelector("video") : ev.target.closest("video");
+    if (!v) return;
+    // 不 stopPropagation：让它冒泡到卡片上去选中这张卡，卡片那层自己会拦住画布平移
+    ev.preventDefault();                 // 顺手掐掉浏览器自带的拖拽幽灵图
+    const x0 = ev.clientX, playing = !v.paused;
+    let dragged = !!bar;                 // 直接按在进度条上就是要定位，不用等位移
+    if (bar) { v.pause(); seek(v, ev.clientX, bar); }
+    const mv = (e) => {
+      if (!dragged && Math.abs(e.clientX - x0) < 3) return;   // 手抖不算拖
+      if (!dragged) { dragged = true; v.pause(); }
+      seek(v, e.clientX, bar || v);
+    };
+    const up = () => {
+      document.removeEventListener("mousemove", mv);
+      document.removeEventListener("mouseup", up);
+      if (!dragged) { if (v.paused) v.play().catch(() => {}); else v.pause(); }
+      else if (playing) v.play().catch(() => {});             // 拖完接着放
+    };
+    document.addEventListener("mousemove", mv);
+    document.addEventListener("mouseup", up);
+  };
+  // timeupdate 不冒泡，只能挂捕获阶段（捕获照样会经过祖先节点）
+  body.addEventListener("timeupdate", (ev) => {
+    const f = body.querySelector(".vprog i"), v = ev.target;
+    if (!f || !isFinite(v.duration) || !v.duration) return;
+    f.style.width = (v.currentTime / v.duration * 100) + "%";
+  }, true);
+}
+
+/** 把卡片自己的尺寸写到 DOM 上。
+ *  宽度改整张卡；高度只改画面区（.body），标题栏和状态栏保持自然高度。
+ *  出一整组产物时（.body.grid）画面区高度交回 CSS 自动撑开 —— 宫格是靠宽度
+ *  等比排的，硬压一个高度只会把后几行裁掉。 */
+function applySize(c) {
+  const d = c._el; if (!d) return;
+  d.style.width = cardW(c) + "px";
+  const body = d.querySelector(".body");
+  body.style.height = (c.h && !body.classList.contains("grid")) ? c.h + "px" : "";
 }
 
 function paint(c) {
@@ -399,33 +493,65 @@ function paint(c) {
   const body = d.querySelector(".body");
   const st = d.querySelector(".st"), meta = d.querySelector(".meta");
   const bar = d.querySelector(".bar i");
-  const out = (c.outputs || [])[0];
+  const outs = c.outputs || [];
+  const out = outs[0];
+  // sig 而不是单个 url：一张卡可能出一整组图（分镜九宫格），少一张多一张都要重画
+  const sig = outs.map(o => o.url).join("|");
+  // dataset.url 同时当"画面区现在装的是什么"的记号，"busy" 是给加载态占的名字
+  // （sig 是一串 URL，撞不上）
+  const busy = c.status === "queued" || c.status === "running";
 
-  if (out && body.dataset.url !== out.url) {
-    body.dataset.url = out.url;
+  if (busy && body.dataset.url !== "busy") {
+    // 上一轮的产物必须撤掉：留着旧图，看着像已经出完了，还会有人去点它看大图
+    body.dataset.url = "busy";
+    body.classList.remove("grid");
+    applySize(c);
+    body.innerHTML = `<div class="load"></div>`;
+  } else if (!busy && !outs.length && body.dataset.url === "busy") {
+    // 失败/取消：转圈得停下来，不然一直转着像还在跑
+    body.dataset.url = "";
+    body.innerHTML = phHTML(c);
+  }
+
+  if (outs.length && body.dataset.url !== sig) {
+    body.dataset.url = sig;
+    body.classList.toggle("grid", outs.length > 1);
+    applySize(c);      // 宫格的画面区是自动高度，进出宫格都要重新决定 c.h 生不生效
     // draggable=false：卡片里的图/视频不该能拖出去（拖出来是浏览器自带的行为，
     // 会拽出一个半透明幽灵图，还容易被当成"拖它去连线"）。CSS 里另有 user-drag 兜底
-    body.innerHTML = out.kind === "video"
-      ? `<video src="${out.url}" controls loop preload="metadata" draggable="false"></video>`
-      : out.kind === "audio"
-        ? `<audio src="${out.url}" controls style="width:92%"></audio>`
-        : `<img src="${out.url}" alt="" draggable="false">`;
-    if (c.seed != null) {
-      const b = document.createElement("span");
-      b.className = "badge"; b.textContent = "seed " + c.seed;
-      body.appendChild(b);
+    // 卡片里的视频一律不给 controls：268px 宽的卡塞一条播放条就挡掉半幅画面。
+    // 单击播放/暂停、暂停时横向滑动拖进度、双击进大窗口看带播放条的完整预览（见 buildCard）
+    if (outs.length > 1) {
+      // 一组产物铺成宫格，data-i 供双击时定位到具体哪一张
+      body.style.setProperty("--cols", outs.length <= 4 ? 2 : outs.length <= 9 ? 3 : 4);
+      body.innerHTML = outs.map((o, i) => o.kind === "video"
+        ? `<video src="${o.url}" data-i="${i}" loop preload="metadata" draggable="false"></video>`
+        : `<img src="${o.url}" data-i="${i}" alt="" draggable="false">`).join("");
+    } else {
+      // .vprog 是自己画的进度条：不给 controls 就没有任何进度反馈，按住拖也没了准头
+      body.innerHTML = out.kind === "video"
+        ? `<video src="${out.url}" loop preload="metadata" draggable="false"></video>`
+          + `<div class="vprog" title="拖动定位进度"><i></i></div>`
+        : out.kind === "audio"
+          ? `<audio src="${out.url}" controls style="width:92%"></audio>`
+          : `<img src="${out.url}" alt="" draggable="false">`;
     }
+    // seed 不再压在画面上，改由右侧「历史产物」栏单独一行展示
   }
 
   const s = c.status;
   st.className = "st" + (s === "running" || s === "queued" ? " run" : s === "done" ? " done" : s === "error" ? " err" : "");
   st.textContent = s === "queued" ? (c.queue_remaining > 1 ? `排队中 (${c.queue_remaining})` : "排队中")
     : s === "running" ? `生成中 ${Math.round((c.progress || 0) * 100)}%`
-    : s === "done" ? "已完成"
+                        + (c.step ? ` · ${c.step}` : "")
+    : s === "done" ? (fmtEla(c.ms) ? `已完成 · ${fmtEla(c.ms)}` : "已完成")
     : s === "error" ? "失败"
     : s === "canceled" ? "已取消" : "待生成";
+  st.title = st.textContent;           // 挤成省略号时鼠标悬停还能看全
   bar.style.width = (s === "running" || s === "queued" ? (c.progress || 0.02) * 100 : s === "done" ? 100 : 0) + "%";
-  meta.textContent = c.error ? String(c.error).slice(0, 40) : (out ? out.filename.slice(-22) : "");
+  meta.textContent = c.error ? String(c.error).slice(0, 40)
+    : outs.length > 1 ? `${outs.length} 张`
+    : out ? out.filename.slice(-22) : "";
   meta.title = c.error || "";
 }
 
@@ -434,7 +560,7 @@ function cardBox(id) {
   const c = PROJ.cards.find(x => x.id === id);
   if (!c) return null;
   const h = c._el ? c._el.offsetHeight : 230;
-  return { x: c.x, y: c.y, w: CW, h };
+  return { x: c.x, y: c.y, w: cardW(c), h };
 }
 function drawWires() {
   el.wires.innerHTML = "";
@@ -453,6 +579,7 @@ function drawWires() {
 function pick(id) {
   selId = id;
   for (const c of PROJ.cards) if (c._el) c._el.classList.toggle("sel", c.id === id);
+  openHistory(id);      // 先开栏子再摆面板：面板要按变窄之后的画布找位置
   openPanel(id);
 }
 
@@ -471,6 +598,40 @@ function startDrag(ev, c, d) {
     c.x = Math.round(s.x + (e.clientX - s.mx) / view.k);
     c.y = Math.round(s.y + (e.clientY - s.my) / view.k);
     d.style.left = c.x + "px"; d.style.top = c.y + "px";
+    drawWires();
+  };
+  const up = () => {
+    document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+    if (moved) { veilPanel(false); placePanel(); save(); }
+  };
+  document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+}
+
+/** 拖角改大小。dir=1 是右下角（左上角钉住），dir=-1 是左上角（右下角钉住，
+ *  所以位置要跟着一起变）。按住 Shift 只改宽 —— 宫格的排布只看宽度，调宫格卡时
+ *  往往不想顺手把画面区高度也动了。 */
+function startResize(ev, c, d, dir) {
+  if (ev.button !== 0) return;
+  ev.stopPropagation(); ev.preventDefault();
+  tipHide(); pick(c.id);
+  const body = d.querySelector(".body");
+  const s = { mx: ev.clientX, my: ev.clientY, x: c.x, y: c.y,
+              w: cardW(c), h: c.h || body.offsetHeight, ch: d.offsetHeight };
+  const fit = (v, lo, hi) => Math.max(lo, Math.min(hi, Math.round(v)));
+  let moved = false;
+  const mv = (e) => {
+    if (!moved && Math.abs(e.clientX - s.mx) + Math.abs(e.clientY - s.my) < 3) return;
+    if (!moved) { moved = true; veilPanel(true); }
+    c.w = fit(s.w + (e.clientX - s.mx) / view.k * dir, CW_MIN, CW_MAX);
+    if (!e.shiftKey) c.h = fit(s.h + (e.clientY - s.my) / view.k * dir, CH_MIN, CH_MAX);
+    applySize(c);
+    if (dir < 0) {
+      // 右下角钉住：位置补偿要用「真的量出来」的高度。宫格卡的画面区是自动高度，
+      // c.h 根本没生效，照 c.h 算会让卡片凭空往上跳一截
+      c.x = s.x + (s.w - c.w);
+      c.y = s.y + (s.ch - d.offsetHeight);
+      d.style.left = c.x + "px"; d.style.top = c.y + "px";
+    }
     drawWires();
   };
   const up = () => {
@@ -561,6 +722,10 @@ function bindGlobal() {
   });
 
   document.addEventListener("keydown", (ev) => {
+    // 大图开着时左右键翻同一张卡的下一个产物（分镜九宫格）
+    if (el.view.style.display !== "none" && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) {
+      ev.preventDefault(); stepViewer(ev.key === "ArrowRight" ? 1 : -1); return;
+    }
     if (ev.key !== "Escape") return;
     // 大图开着时 Esc 只关大图，不该顺手把卡片选中状态和参数面板一起清掉
     if (el.view.style.display !== "none") { closeViewer(); return; }
@@ -596,13 +761,25 @@ const closeMenu = () => (el.menu.style.display = "none");
 
 /** 新建卡片菜单：按产出分成生图/生视频两类，条目直接是具体玩法。
     卡片名（"生视频"）和分类名是同一个词，所以列卡片会变成"生视频 > 生视频"，
-    不如把卡内的模式摊出来选，建出来的卡就已经是想要的那个模式。 */
+    不如把卡内的模式摊出来选，建出来的卡就已经是想要的那个模式。
+
+    工具（拼图/裁切这类只加工素材、不创作的）单独一组放最后：它的产出也是图片，
+    混进"生图"里会让人以为它也在画画，而且真正要找它的时候翻不到。 */
 const OUT_GROUP = { image: "生图", video: "生视频", audio: "生音频" };
+
+function menuGroups() {
+  const gs = [];
+  for (const [out, gname] of Object.entries(OUT_GROUP)) {
+    gs.push([gname, CARDS.filter(
+      d => d.modes.length && d.kind !== "tool" && d.outputType === out)]);
+  }
+  gs.push(["工具", CARDS.filter(d => d.modes.length && d.kind === "tool")]);
+  return gs;
+}
 
 function openMenu(cx, cy, at) {
   const items = [];
-  for (const [out, gname] of Object.entries(OUT_GROUP)) {
-    const defs = CARDS.filter(d => d.modes.length && d.outputType === out);
+  for (const [gname, defs] of menuGroups()) {
     if (!defs.length) continue;
     items.push({ group: gname });
     for (const def of defs) {
@@ -620,17 +797,44 @@ function openMenu(cx, cy, at) {
 /* ================= 产物大图 / 详情 ================= */
 const VIEW_WORD = { video: "放大播放", audio: "放大播放" };
 
+// 大图正在看哪一组产物的第几张：{ outs, idx, seed }
+// outs 显式传进来而不是每次读 c.outputs：历史产物栏里点的是过去某一轮，
+// 那一组产物已经不是卡片当前的 outputs 了
+let VIEW = null;
+
 function closeViewer() {
   el.vbox.innerHTML = "";          // 清空才会停掉正在播的视频
   el.view.style.display = "none";
+  VIEW = null;
 }
 
-function openViewer(c) {
-  const out = (c.outputs || [])[0];
-  if (!out) { toast("这张卡还没有产物，先运行一次"); return; }
+function openViewer(c, i = 0, outs = null, seed = undefined) {
+  const list = outs || c.outputs || [];
+  if (!list.length) { toast("这张卡还没有产物，先运行一次"); return; }
+  VIEW = {
+    outs: list, idx: Math.min(Math.max(i, 0), list.length - 1),
+    seed: seed !== undefined ? seed : (c ? c.seed : null),
+  };
+  paintViewer();
+  el.view.style.display = "";
+}
+
+// 一组产物里前后翻，左右方向键也走这里
+function stepViewer(d) {
+  if (!VIEW) return;
+  const n = VIEW.outs.length;
+  if (n < 2) return;
+  VIEW.idx = (VIEW.idx + d + n) % n;
+  paintViewer();
+}
+
+function paintViewer() {
+  const { outs, idx, seed } = VIEW;
+  const out = outs[idx];
   const info = document.createElement("div"); info.className = "vinfo";
   const bits = [out.filename];
-  if (c.seed != null) bits.push("seed " + c.seed);
+  if (outs.length > 1) bits.unshift(`${idx + 1} / ${outs.length}`);
+  if (seed != null) bits.push("seed " + seed);
   const put = () => (info.textContent = bits.join("　·　"));
 
   let m;
@@ -638,17 +842,17 @@ function openViewer(c) {
     m = document.createElement("video");
     m.src = out.url; m.controls = m.autoplay = m.loop = true;
     m.onloadedmetadata = () => {
-      bits.splice(1, 0, `${m.videoWidth}×${m.videoHeight}`, fmtDur(m.duration));
+      bits.splice(bits.indexOf(out.filename) + 1, 0, `${m.videoWidth}×${m.videoHeight}`, fmtDur(m.duration));
       put();
     };
   } else if (out.kind === "audio") {
     m = document.createElement("audio");
     m.src = out.url; m.controls = m.autoplay = true;
-    m.onloadedmetadata = () => { bits.splice(1, 0, fmtDur(m.duration)); put(); };
+    m.onloadedmetadata = () => { bits.splice(bits.indexOf(out.filename) + 1, 0, fmtDur(m.duration)); put(); };
   } else {
     m = document.createElement("img");
     m.src = out.url;
-    m.onload = () => { bits.splice(1, 0, `${m.naturalWidth}×${m.naturalHeight}`); put(); };
+    m.onload = () => { bits.splice(bits.indexOf(out.filename) + 1, 0, `${m.naturalWidth}×${m.naturalHeight}`); put(); };
   }
   m.draggable = false;
   put();
@@ -659,7 +863,15 @@ function openViewer(c) {
 
   el.vbox.innerHTML = "";
   el.vbox.append(m, info, x);
-  el.view.style.display = "";
+  if (outs.length > 1) {
+    for (const [cls, sym, d] of [["p", "‹", -1], ["n", "›", 1]]) {
+      const b = document.createElement("button");
+      b.className = "vnav " + cls; b.textContent = sym;
+      b.title = d < 0 ? "上一张 (←)" : "下一张 (→)";
+      b.onclick = () => stepViewer(d);
+      el.vbox.appendChild(b);
+    }
+  }
 }
 
 // 秒 -> 0:07 / 1:23。视频详情里 7.04 秒这种读数没人看得懂
@@ -671,14 +883,23 @@ function fmtDur(s) {
 
 function cardMenu(cx, cy, c) {
   const cap = capOf(c);
-  const out = (c.outputs || [])[0];
+  const outs = c.outputs || [];
+  const out = outs[0];
+  const vword = outs.length > 1 ? `逐张看大图（${outs.length} 张）` : (VIEW_WORD[out && out.kind] || "查看大图");
   showMenu(cx, cy, c.name || (cap ? cap.name : "卡片"), [
-    ...(out ? [{ icon: "⛶", text: VIEW_WORD[out.kind] || "查看大图", run: () => openViewer(c) }] : []),
+    ...(out ? [{ icon: "⛶", text: vword, run: () => openViewer(c) }] : []),
     { icon: "✎", text: "重命名卡片", run: () => renameCard(c) },
     { icon: "↑", text: "运行", run: () => run(c) },
     { icon: "⧉", text: "复制卡片", run: () => cloneCard(c) },
+    // 拖角改过大小才给这条：没改过的卡摆一个点了没反应的菜单项只会让人以为坏了
+    ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
     { icon: "✕", text: "删除卡片", danger: true, run: () => delCard(c.id) },
   ]);
+}
+
+function resetSize(c) {
+  delete c.w; delete c.h;      // 删掉而不是写回 268/168：默认值将来改了，老卡也跟着走
+  applySize(c); drawWires(); placePanel(); save();
 }
 
 function renameCard(c) {
@@ -757,8 +978,150 @@ async function importOutput(out) {
   return r.files[0];
 }
 
+/** 素材格里的图/视频/音频：复用产物大图那套查看器，不用为它再写一个 */
+function openAsset(a) {
+  openViewer(null, 0, [{
+    url: a.url, kind: a.kind,
+    filename: (a.origin || a.url).split(/[\\/]/).pop(),
+  }], null);
+}
+
+/** 在资源管理器里选中这份素材。只把文件名发过去，路径由服务端在 data/uploads 里拼 */
+async function revealAsset(a) {
+  try { await jpost("/api/reveal", { name: a.url.split("/").pop() }); }
+  catch (e) { toast("定位失败：" + e.message); }
+}
+
+/* ================= 右侧历史产物栏 ================= */
+const HIST_MAX = 20;               // 每张卡留 20 轮；再往前的去 ComfyUI 的 output 目录里找
+
+/** 一轮产物的签名，用来判重：轮询会反复读到同一轮，不能记成好多条 */
+const runSig = (outs) => (outs || []).map(o => o.url).join("|");
+
+/** 把卡片刚出的这一轮记进历史（最新的在最前面） */
+function pushHistory(c) {
+  const outs = c.outputs || [];
+  if (!outs.length) return;
+  c.history = c.history || [];
+  const sig = runSig(outs);
+  if (c.history.some(h => runSig(h.outputs) === sig)) return;
+  c.history.unshift({
+    ts: Date.now(), seed: c.seed != null ? c.seed : null,
+    cap: runCap(c), ms: c.ms != null ? c.ms : null, outputs: outs,
+  });
+  if (c.history.length > HIST_MAX) c.history.length = HIST_MAX;
+}
+
+/** 老项目里的卡只有 outputs 没有 history，补一条占位，别让人以为产物丢了。
+ *  ts 记 null：那一轮的时间我们确实不知道，显示成"早前"，不编一个假时间 */
+function seedHistory(c) {
+  if (c.history) return;
+  c.history = (c.outputs || []).length
+    ? [{ ts: null, seed: c.seed != null ? c.seed : null, cap: c.cap, outputs: c.outputs }]
+    : [];
+}
+
+/** 这一轮真花了多久。数据来自服务端 job 的 started/ended（跟浏览器同一台机器，
+    不用担心时钟差），不知道就返回空串不显示 —— 不拿「现在减开始」编一个假数字。
+    名字别叫 fmtDur：那个是给视频时长用的（秒、0:07 样式），同名会互相顶掉。 */
+function fmtEla(ms) {
+  if (!(ms > 0)) return "";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}秒`;
+  const m = Math.floor(s / 60);
+  return m < 60 ? `${m}分${s % 60}秒` : `${Math.floor(m / 60)}时${m % 60}分`;
+}
+
+function histTime(ts) {
+  if (!ts) return "早前";
+  const d = new Date(ts), p = (n) => String(n).padStart(2, "0");
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const hm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  return ts >= today.getTime() ? hm : `${p(d.getMonth() + 1)}-${p(d.getDate())} ${hm}`;
+}
+
+function closeHistory() {
+  el.hist.style.display = "none";
+  el.hist.innerHTML = "";          // 清空才会停掉缩略图里正在加载的视频
+  el.hist._id = null;
+}
+
+function openHistory(id) {
+  const c = PROJ && PROJ.cards.find(x => x.id === id);
+  if (!c) return closeHistory();
+  seedHistory(c);
+  const list = document.createElement("div"); list.className = "hlist";
+  const cap = capOf(c);
+
+  const hd = document.createElement("div"); hd.className = "hhd";
+  hd.innerHTML = `<b>历史产物</b><span class="n"></span><button class="x" title="收起">✕</button>`;
+  hd.querySelector(".n").textContent = c.history.length ? `${c.history.length} 轮` : "";
+  hd.querySelector(".x").onclick = closeHistory;
+
+  if (!c.history.length) {
+    const e = document.createElement("div"); e.className = "hempty";
+    e.textContent = "这张卡还没出过东西。\n运行一次，每一轮的产物和 seed 都会留在这里。";
+    e.style.whiteSpace = "pre-line";
+    list.appendChild(e);
+  }
+  for (const [i, h] of c.history.entries()) list.appendChild(histRun(c, h, i === 0));
+
+  el.hist.innerHTML = "";
+  el.hist.append(hd, list);
+  el.hist._id = id;
+  el.hist.style.display = "";
+  // 摆面板的活交给紧跟着的 openPanel()：那时画布已经被栏子挤窄，量出来的边界才是对的
+}
+
+function histRun(c, h, cur) {
+  const outs = h.outputs || [];
+  const box = document.createElement("div");
+  box.className = "hrun" + (cur ? " cur" : "");
+
+  const rh = document.createElement("div"); rh.className = "rh";
+  const capName = (CAPS[h.cap] && CAPS[h.cap].name) || "";
+  rh.innerHTML = `<span class="tag"></span><span class="nm"></span><span class="cnt"></span>`;
+  rh.querySelector(".tag").textContent = cur ? "最新" : histTime(h.ts);
+  rh.querySelector(".nm").textContent = cur ? histTime(h.ts) : capName;
+  rh.querySelector(".cnt").textContent =
+    [outs.length > 1 ? `${outs.length} 张` : "", fmtEla(h.ms)].filter(Boolean).join(" · ");
+  rh.title = capName;
+
+  const rg = document.createElement("div");
+  rg.className = "rg" + (outs.length === 1 ? " one" : "");
+  rg.style.setProperty("--hcols", outs.length === 1 ? 1 : outs.length <= 4 ? 2 : 3);
+  rg.innerHTML = outs.map((o, i) => o.kind === "video"
+    ? `<video src="${o.url}" data-i="${i}" muted loop preload="metadata" draggable="false"></video>`
+    : o.kind === "audio"
+      ? `<div class="rg-a" data-i="${i}" title="${o.filename}">🎵</div>`
+      : `<img src="${o.url}" data-i="${i}" alt="" draggable="false">`).join("");
+  rg.onclick = (ev) => {
+    const t = ev.target.closest("[data-i]");
+    if (t) openViewer(c, +t.dataset.i, outs, h.seed);
+  };
+
+  box.append(rh, rg);
+
+  // seed 专区：独占一行，不压在画面上
+  const rs = document.createElement("div"); rs.className = "rs";
+  rs.innerHTML = `<i>seed</i><span></span>`;
+  rs.querySelector("span").textContent = h.seed != null ? String(h.seed) : "未记录";
+  if (h.seed != null) {
+    const cp = document.createElement("button");
+    cp.textContent = "复制"; cp.title = "复制 seed";
+    cp.onclick = () => navigator.clipboard.writeText(String(h.seed))
+      .then(() => toast("已复制 seed " + h.seed), () => toast("复制失败，手动选中即可"));
+    rs.appendChild(cp);
+  }
+  box.appendChild(rs);
+  return box;
+}
+
 /* ================= 参数面板 ================= */
-function closePanel() { el.panel.style.display = "none"; el.panel._id = null; }
+function closePanel() {
+  el.panel.style.display = "none"; el.panel._id = null;
+  closeHistory();
+}
 
 /** 拖卡片时把面板藏起来（用 visibility 而不是 display：还能量到宽高，松手好复位） */
 function veilPanel(on) {
@@ -778,16 +1141,18 @@ function placePanel() {
   const w = el.panel.offsetWidth, h = el.panel.offsetHeight;
   // 卡片在屏幕上的矩形（offsetHeight 是世界坐标，要乘缩放）
   const cx = r.left + view.x + c.x * view.k, cy = r.top + view.y + c.y * view.k;
-  const cw = CW * view.k, ch = c._el.offsetHeight * view.k;
-  const clampX = (v) => Math.max(GAP, Math.min(v, innerWidth - w - GAP));
+  const cw = cardW(c) * view.k, ch = c._el.offsetHeight * view.k;
+  // 横向按画布自己的左右边界夹，而不是整个窗口：右边开着历史产物栏时，
+  // 按 innerWidth 夹会让面板滑到栏子底下去
+  const clampX = (v) => Math.max(r.left + GAP, Math.min(v, r.right - w - GAP));
   const clampY = (v) => Math.max(TOP, Math.min(v, innerHeight - h - GAP));
   const midX = clampX(cx + cw / 2 - w / 2), midY = clampY(cy + ch / 2 - h / 2);
   // 下 → 右 → 上 → 左，取第一个放得下的；四边都放不下就挑那边空地最宽的
   const sides = [
     { room: innerHeight - GAP - (cy + ch + GAP), left: midX, top: cy + ch + GAP, need: h },
-    { room: innerWidth - GAP - (cx + cw + GAP), left: cx + cw + GAP, top: midY, need: w },
+    { room: r.right - GAP - (cx + cw + GAP), left: cx + cw + GAP, top: midY, need: w },
     { room: (cy - GAP) - TOP, left: midX, top: cy - GAP - h, need: h },
-    { room: (cx - GAP) - GAP, left: cx - GAP - w, top: midY, need: w },
+    { room: (cx - GAP) - (r.left + GAP), left: cx - GAP - w, top: midY, need: w },
   ];
   const p = sides.find(s => s.room >= s.need) || sides.reduce((a, b) => (b.room > a.room ? b : a));
   el.panel.style.left = clampX(p.left) + "px";
@@ -864,6 +1229,17 @@ function openPanel(id) {
     body.appendChild(wrap);
   }
 
+  // --- 音频选区 ---
+  // 起止点不画成两个文本框：要裁哪一段全靠听（第几秒开始唱），手打 "0:05" 得先知道
+  // 这音频哪一秒在唱什么，只能反复试跑。manifest 里的 rangeOf 指向它裁的那个音频槽
+  const ranged = new Set();
+  for (const s of media) {
+    const rg = specs.filter(x => x.rangeOf === s.key);
+    if (rg.length !== 2) continue;      // 不是成对的起止点，还是交给普通旋钮画
+    body.appendChild(audioRange(c, s, rg[0], rg[1]));
+    for (const x of rg) ranged.add(x.key);
+  }
+
   // --- 提示词 ---
   const texts = specs.filter(x => x.type === "textarea" && !x.advanced);
   const tpl = texts.filter(x => x.template);     // 作者调好的规范，折起来放最后
@@ -877,26 +1253,30 @@ function openPanel(id) {
 
   // --- 常规参数 ---
   // mirror = 多个节点共用同一个参数框（如两个采样器共用种子），只画一次
+  // ranged = 已经画成上面那条选区了，别在这儿再出一对文本框
   const rows = specs.filter(x => !["image", "audio", "textarea"].includes(x.type)
-    && !x.advanced && !x.mirror);
-  for (const s of rows) body.appendChild(rowEl(c, s));
+    && !x.advanced && !x.mirror && !ranged.has(x.key));
+  // 旋钮下面那行小字：光靠 label 说不清的（"分辨率"是每格的还是整张的）必须摆在
+  // 明面上。以前只有「高级」里的旋钮画它，常规旋钮的 hint 只当 tooltip，不悬停看不见
+  const addRow = (box, s) => {
+    box.appendChild(rowEl(c, s));
+    if (s.hint) {
+      const nt = document.createElement("div");
+      nt.className = "knobnote"; nt.textContent = s.hint;
+      box.appendChild(nt);
+    }
+  };
+  for (const s of rows) addRow(body, s);
 
   // --- 高级 ---
-  const adv = specs.filter(x => x.advanced && !x.mirror);
+  const adv = specs.filter(x => x.advanced && !x.mirror && !ranged.has(x.key));
   if (adv.length) {
     const box = document.createElement("div"); box.className = "adv";
     const t = document.createElement("button");
     t.textContent = `▸ 高级 (${adv.length})`;
     const items = document.createElement("div"); items.className = "items"; items.style.display = "none";
-    for (const s of adv) {
-      items.appendChild(rowEl(c, s));
-      // 高级参数默认值都是调好的，不写清楚推荐多少、为什么，用户只能瞎拉滑条
-      if (s.hint) {
-        const nt = document.createElement("div");
-        nt.className = "knobnote"; nt.textContent = s.hint;
-        items.appendChild(nt);
-      }
-    }
+    // 高级参数默认值都是调好的，不写清楚推荐多少、为什么，用户只能瞎拉滑条
+    for (const s of adv) addRow(items, s);
     t.onclick = () => {
       const open = items.style.display === "none";
       items.style.display = open ? "" : "none";
@@ -1056,14 +1436,131 @@ function slotEl(c, s) {
     ev.preventDefault();
     if (!a) return;
     // 以前右键直接就把这一格清了，手滑一下素材就没了，还跟"右键=看菜单"的直觉相反
-    showMenu(ev.clientX, ev.clientY, slotName(s), [{
-      icon: "✕", text: "清空这一格", danger: true, run: () => {
-        delete c.assets[s.key];
-        PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.slot === s.key));
-        drawWires(); openPanel(c.id); save();
+    showMenu(ev.clientX, ev.clientY, a.origin || slotName(s), [
+      { icon: "⛶", text: a.kind === "image" ? "查看大图" : "放大播放", run: () => openAsset(a) },
+      { icon: "📁", text: "定位文件", run: () => revealAsset(a) },
+      {
+        icon: "✕", text: "清空这一格", danger: true, run: () => {
+          delete c.assets[s.key];
+          PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.slot === s.key));
+          drawWires(); openPanel(c.id); save();
+        },
       },
-    }]);
+    ]);
   };
+  return d;
+}
+
+/* 时间码只发「分:秒」的整秒形式。上游 AudioCrop 是 60*int(分)+int(秒) 硬解的：
+   写 "1:02:03" 它只看前两段、写 "5.5" 它按 5 秒算，两种都不报错，静默裁错一段。
+   分可以超过 59（"75:03" 就是 75 分 3 秒），它自己会乘 60。 */
+const tsec = (v) => {
+  const p = String(v == null ? "" : v).split(":");
+  const n = p.length > 1 ? (+p[0]) * 60 + (+p[1]) : +p[0];
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : 0;
+};
+const tstr = (n) => `${Math.floor(n / 60)}:${String(Math.round(n) % 60).padStart(2, "0")}`;
+
+/** 音频选区：一条能试听、能拖的条子，代替「音频起点 / 音频终点」那两个文本框。
+    传进来的音频往前有几秒废话、副歌从第几秒起，这些只能听出来，填数字填不出来。
+    上面那对手柄拖选段，点条子本身是把播放位置挪过去听，两件事不抢同一个手势。 */
+function audioRange(c, slot, sSpec, eSpec) {
+  const d = document.createElement("div"); d.className = "arange";
+  const ttl = document.createElement("div"); ttl.className = "atitle";
+  ttl.textContent = "用音频的哪一段";
+  d.appendChild(ttl);
+
+  const a = c.assets[slot.key];
+  if (!a) {
+    const n = document.createElement("div"); n.className = "anote";
+    n.textContent = `先在上面的「${slotName(slot)}」传一段音频，这里就能试听、拖着选要用的一段。`;
+    d.appendChild(n);
+    return d;
+  }
+
+  const au = document.createElement("audio");
+  au.src = a.url; au.preload = "metadata";
+  d.appendChild(au);
+
+  const bar = document.createElement("div"); bar.className = "atrack";
+  bar.innerHTML = `<div class="asel"></div><div class="ahead"></div>`
+    + `<div class="ahd s" title="拖动：选段从这里开始"></div>`
+    + `<div class="ahd e" title="拖动：选段到这里结束"></div>`;
+  const sel = bar.querySelector(".asel"), head = bar.querySelector(".ahead");
+  const hs = bar.querySelector(".ahd.s"), he = bar.querySelector(".ahd.e");
+  d.appendChild(bar);
+
+  const out = document.createElement("div"); out.className = "aout";
+  d.appendChild(out);
+  const btns = document.createElement("div"); btns.className = "abtn";
+  d.appendChild(btns);
+  const note = document.createElement("div"); note.className = "anote";
+  note.textContent = "点条子上任意位置就从那儿开始听；听到该起／该停的地方，按下面两个按钮把边界钉在那里。";
+  d.appendChild(note);
+
+  let st = tsec(c.params[sSpec.key] != null ? c.params[sSpec.key] : sSpec.default);
+  let en = tsec(c.params[eSpec.key] != null ? c.params[eSpec.key] : eSpec.default);
+  // 元数据还没到时先按选区自己撑出个长度，不然除以 0，条子画不出来
+  const dur = () => Math.floor(au.duration) || Math.max(en, 1);
+
+  function setRange(ns, ne) {
+    const D = dur();
+    ns = Math.max(0, Math.min(Math.round(ns), D - 1));
+    // 至少留 1 秒：AudioCrop 遇到 start >= end 是直接抛 ValueError 整条任务红掉
+    ne = Math.max(ns + 1, Math.min(Math.round(ne), D));
+    if (ns === st && ne === en) return render();
+    st = ns; en = ne;
+    c.params[sSpec.key] = tstr(st); c.params[eSpec.key] = tstr(en);
+    render(); save();
+  }
+  // 换了条更短的音频时，把超出真实长度的选区收回来。默认终点 0:05 撞上 3 秒的素材，
+  // 面板上还写着 0:05 而实际只裁到 0:03，那 2 秒的差就成了没法解释的怪事
+  au.onloadedmetadata = () => setRange(st, en);
+
+  let stopAt = 0;
+  const playFrom = (t, until) => { stopAt = until; au.currentTime = t; au.play(); };
+  au.ontimeupdate = () => { if (stopAt && au.currentTime >= stopAt) au.pause(); render(); };
+  au.onplay = au.onpause = au.onended = () => render();
+
+  const mk = (txt, title, fn) => {
+    const b = document.createElement("button");
+    b.textContent = txt; b.title = title; b.onclick = fn;
+    btns.appendChild(b); return b;
+  };
+  const play = mk("▶ 试听选段", "只放选中的这一段", () => au.paused ? playFrom(st, en) : au.pause());
+  mk("▶ 整条", "从头放到尾，用来找该从哪儿起", () => playFrom(0, 0));
+  mk("⇤ 起点钉在这", "把选段开头挪到当前播放位置", () => setRange(Math.floor(au.currentTime), en));
+  mk("终点钉在这 ⇥", "把选段结尾挪到当前播放位置", () => setRange(st, Math.ceil(au.currentTime)));
+
+  const pos = (ev) => {
+    const r = bar.getBoundingClientRect();
+    return Math.max(0, Math.min(1, (ev.clientX - r.left) / r.width)) * dur();
+  };
+  const drag = (which) => (ev) => {
+    ev.stopPropagation(); ev.preventDefault();     // 别让画布把这一拖当成框选
+    const mv = (e) => which === "s" ? setRange(pos(e), en) : setRange(st, pos(e));
+    const up = () => {
+      window.removeEventListener("mousemove", mv);
+      window.removeEventListener("mouseup", up);
+    };
+    window.addEventListener("mousemove", mv); window.addEventListener("mouseup", up);
+  };
+  hs.onmousedown = drag("s"); he.onmousedown = drag("e");
+  // 手柄压在条子上面，它们自己 stopPropagation，所以拖手柄不会顺带跳播放位置
+  bar.onmousedown = (ev) => { ev.stopPropagation(); au.currentTime = pos(ev); render(); };
+
+  function render() {
+    const D = dur();
+    const pct = (t) => Math.max(0, Math.min(t, D)) / D * 100 + "%";
+    sel.style.left = pct(st);
+    sel.style.width = (Math.min(en, D) - st) / D * 100 + "%";
+    hs.style.left = pct(st); he.style.left = pct(en);
+    head.style.left = pct(au.currentTime);
+    out.textContent = `${tstr(st)} → ${tstr(en)}　选中 ${en - st} 秒`
+      + (au.duration ? `　（整条 ${tstr(Math.floor(au.duration))}）` : "");
+    play.textContent = au.paused ? "▶ 试听选段" : "⏸ 停";
+  }
+  render();
   return d;
 }
 
@@ -1206,9 +1703,8 @@ function payloadOf(c) {
 async function run(c) {
   const cap = capOf(c);
   if (!cap) return toast("能力不可用");
-  c.error = null; c.progress = 0; c.status = "queued"; c.outputs = [];
-  if (c._el) c._el.querySelector(".body").dataset.url = "";
-  paint(c); openPanel(c.id);
+  c.error = null; c.progress = 0; c.status = "queued"; c.outputs = []; c.ms = null; c.step = "";
+  paint(c); openPanel(c.id);      // status 一进 queued，paint 就把画面区换成加载态
   try {
     const job = await jpost("/api/generate", payloadOf(c));
     c.job = job.id; c.seed = job.seed; c.status = job.status;
@@ -1235,14 +1731,18 @@ async function pollJobs() {
     try { j = await api(`/api/job/${c.job}`); } catch (e) { continue; }
     const was = c.status;
     c.status = j.status; c.progress = j.progress; c.error = j.error;
-    c.queue_remaining = j.queue_remaining;
+    c.queue_remaining = j.queue_remaining; c.step = j.step || "";
     if (j.seed != null) c.seed = j.seed;
+    // 耗时按服务端的起止时间算，别用浏览器这边的轮询间隔（差一整个轮询周期）
+    if (j.started && j.ended) c.ms = Math.round((j.ended - j.started) * 1000);
     if (j.outputs && j.outputs.length) c.outputs = j.outputs;
     paint(c);
     if (was !== c.status) {
       dirty = true;
       if (el.panel._id === c.id) openPanel(c.id);
       if (c.status === "done") {
+        pushHistory(c);
+        if (el.hist._id === c.id) openHistory(c.id);
         drawWires();
         // 下游已连线的卡自动吃掉新产物
         for (const e of PROJ.edges.filter(e => e.from === c.id)) {

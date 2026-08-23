@@ -4,6 +4,7 @@
   "name": "生图",
   "icon": "🖼",
   "outputType": "image",
+  "kind": "gen",
   "modes": [
    {
     "id": "zimage_t2i",
@@ -12,7 +13,7 @@
    },
    {
     "id": "flux2_klein_storyboard9",
-    "name": "九宫格故事分镜",
+    "name": "多宫格故事分镜",
     "slots": "img1+aud0"
    }
   ]
@@ -22,6 +23,7 @@
   "name": "生视频",
   "icon": "🎬",
   "outputType": "video",
+  "kind": "gen",
   "modes": [
    {
     "id": "minimax_h3_flf2v",
@@ -53,6 +55,7 @@
   "name": "H3 四图参考生视频",
   "icon": "🎬",
   "outputType": "video",
+  "kind": "gen",
   "modes": [
    {
     "id": "minimax_h3_ref4",
@@ -66,11 +69,26 @@
   "name": "H3全能参考(通用)",
   "icon": "🎬",
   "outputType": "video",
+  "kind": "gen",
   "modes": [
    {
     "id": "minimax_h3_ref9",
     "name": "H3全能参考(通用)",
     "slots": "img9+aud0"
+   }
+  ]
+ },
+ {
+  "id": "grid4_stitch",
+  "name": "四图拼四宫格",
+  "icon": "🧩",
+  "outputType": "image",
+  "kind": "tool",
+  "modes": [
+   {
+    "id": "grid4_stitch",
+    "name": "四图拼四宫格",
+    "slots": "img4+aud0"
    }
   ]
  }
