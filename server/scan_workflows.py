@@ -36,6 +36,7 @@ ALIASES = {
     "1-minimax H3/@MiniMax H3_ 说话唱歌 单人（4步加速版）.json": "minimax_h3_talk1",
     "1-minimax H3/@MiniMax H3_ 说话唱歌 双人（4步加速版）.json": "minimax_h3_talk2",
     "1-minimax H3/MiniMax H3  四图全能参考单采.json": "minimax_h3_ref4",
+    "1-minimax H3/MiniMax H3 全能参考(通用) 九图单采.json": "minimax_h3_ref9",
     "1-minimax H3/@minimax-批量化漫剧20宫格-直出1分钟视频V3.json": "minimax_h3_comic20",
 }
 
@@ -49,16 +50,24 @@ DISPLAY = {
     "minimax_h3_talk1": "H3 说话唱歌·单人",
     "minimax_h3_talk2": "H3 说话唱歌·双人",
     "minimax_h3_ref4": "H3 四图参考生视频",
+    "minimax_h3_ref9": "H3全能参考(通用)",
     "minimax_h3_comic20": "漫剧4宫格",
 }
 
 # 画布上单独占一张卡的能力。素材形态有硬要求的（有 note，比如漫剧要宫格拼图）
 # 会自动单独成卡；这里补的是玩法差别大、不该藏在别人模式列表里第 N 项的。
-SOLO = {"minimax_h3_ref4"}
+SOLO = {"minimax_h3_ref4", "minimax_h3_ref9"}
 
 # 要把工作流里「关着的备用素材槽」开出来的能力（见 revive_bypassed）。
 # 四图参考的第 4 个图槽在模板里是绕过状态，名字叫四图、实际只有三格。
 REVIVE = {"minimax_h3_ref4"}
+
+# 玩法说明，钉在参数面板最上面。只写「不知道就会跑废一轮」的用法，
+# 素材形态的硬要求（宫格拼图那种）是自动认出来的，不用写在这里。
+NOTES = {
+    "minimax_h3_ref9": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 "
+                       "<Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。",
+}
 
 # 高级旋钮：这几个 widget 名不管挂在哪个节点上语义都一样，值得开出来给人调。
 # 范围只能自己给 —— object_info 的范围是给专业用户的（步数上限 10000、LoRA 强度
@@ -917,7 +926,8 @@ def scan(path: Path, oi, rel_key=None):
         "audios": n_aud,
         "graph": f"graphs/{wid}.api.json",
         "output": {"node": outputs[0][0]} if outputs else None,
-        "note": note,
+        "note": note or NOTES.get(wid),
+        "grid": bool(note),                     # 素材必须是宫格拼图（卡片图标要用 ▦）
         "inputs": inputs,
         "warnings": warns,
     }
@@ -989,7 +999,7 @@ def main():
         ms.sort(key=lambda m: (m["images"], m["audios"]))
         # 没进 CARD_META 的 key 就是单独成卡的能力，卡名直接用它自己的名字；
         # 要宫格拼图的给个 ▦，其余跟着产出类型的图标走
-        solo_icon = "▦" if ms[0].get("note") else CARD_META.get(ms[0]["outputType"],
+        solo_icon = "▦" if ms[0].get("grid") else CARD_META.get(ms[0]["outputType"],
                                                                (0, 0, "◻"))[2]
         cid, cname, icon = CARD_META.get(key, (key, ms[0]["name"], solo_icon))
         cards.append({

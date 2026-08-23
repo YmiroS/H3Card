@@ -1,24 +1,24 @@
 {
- "id": "minimax_h3_ref4",
- "name": "H3 四图参考生视频",
- "file": "MiniMax H3  四图全能参考单采",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3  四图全能参考单采.json",
+ "id": "minimax_h3_ref9",
+ "name": "H3全能参考(通用)",
+ "file": "MiniMax H3 全能参考(通用) 九图单采",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3 全能参考(通用) 九图单采.json",
  "group": "视频",
  "outputType": "video",
- "card": "minimax_h3_ref4",
- "slots": "img4+aud0",
- "images": 4,
+ "card": "minimax_h3_ref9",
+ "slots": "img9+aud0",
+ "images": 9,
  "audios": 0,
- "graph": "graphs/minimax_h3_ref4.api.json",
+ "graph": "graphs/minimax_h3_ref9.api.json",
  "output": {
   "node": "38"
  },
- "note": null,
+ "note": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。",
  "grid": false,
  "inputs": [
   {
    "key": "images[0]",
-   "label": "场景",
+   "label": "参考图1",
    "type": "image",
    "required": true,
    "target": {
@@ -29,7 +29,7 @@
   },
   {
    "key": "images[1]",
-   "label": "角色",
+   "label": "参考图2",
    "type": "image",
    "required": false,
    "target": {
@@ -44,7 +44,7 @@
   },
   {
    "key": "images[2]",
-   "label": "图片",
+   "label": "参考图3",
    "type": "image",
    "required": false,
    "target": {
@@ -59,7 +59,7 @@
   },
   {
    "key": "images[3]",
-   "label": "图片2",
+   "label": "参考图4",
    "type": "image",
    "required": false,
    "target": {
@@ -70,6 +70,81 @@
    "dropIfEmpty": {
     "node": "45",
     "input": "ref_images.ref_image_3"
+   }
+  },
+  {
+   "key": "images[4]",
+   "label": "参考图5",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "72",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_4"
+   }
+  },
+  {
+   "key": "images[5]",
+   "label": "参考图6",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "73",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_5"
+   }
+  },
+  {
+   "key": "images[6]",
+   "label": "参考图7",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "74",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_6"
+   }
+  },
+  {
+   "key": "images[7]",
+   "label": "参考图8",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "75",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_7"
+   }
+  },
+  {
+   "key": "images[8]",
+   "label": "参考图9",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "76",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_8"
    }
   },
   {
@@ -190,7 +265,5 @@
    }
   }
  ],
- "warnings": [
-  "已启用 1 个原本关着的备用素材槽"
- ]
+ "warnings": []
 }

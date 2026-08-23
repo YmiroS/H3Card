@@ -57,6 +57,19 @@
   ]
  },
  {
+  "id": "minimax_h3_ref9",
+  "name": "H3全能参考(通用)",
+  "icon": "🎬",
+  "outputType": "video",
+  "modes": [
+   {
+    "id": "minimax_h3_ref9",
+    "name": "H3全能参考(通用)",
+    "slots": "img9+aud0"
+   }
+  ]
+ },
+ {
   "id": "minimax_h3_comic20",
   "name": "漫剧4宫格",
   "icon": "▦",
