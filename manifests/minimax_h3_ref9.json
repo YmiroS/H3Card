@@ -5,6 +5,7 @@
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3 全能参考(通用) 九图单采.json",
  "group": "视频",
  "outputType": "video",
+ "kind": "gen",
  "card": "minimax_h3_ref9",
  "slots": "img9+aud0",
  "images": 9,

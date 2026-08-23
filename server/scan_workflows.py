@@ -26,6 +26,8 @@ ZH_CACHE = ROOT / "data" / "zh_nodes.json"
 ZH_PACK = COMFY / "custom_nodes" / "ComfyUI-Chinese-Translation" / "zh-CN" / "Nodes"
 COMFY_URL = "http://127.0.0.1:8188"
 MISSING = object()          # 「widgets_values 里根本没这一项」，区别于「值是 None」
+# 种子后面那个「生成后控制」下拉的取值，它在 widgets_values 里白占一格
+CONTROL_AFTER = ("randomize", "fixed", "increment", "decrement")
 
 # P0 默认扫描清单：相对 WF_DIR 的路径 -> 固定 id
 ALIASES = {
@@ -38,13 +40,14 @@ ALIASES = {
     "1-minimax H3/MiniMax H3  四图全能参考单采.json": "minimax_h3_ref4",
     "1-minimax H3/MiniMax H3 全能参考(通用) 九图单采.json": "minimax_h3_ref9",
     "1-minimax H3/@minimax-批量化漫剧20宫格-直出1分钟视频V3.json": "minimax_h3_comic20",
+    "0-工具箱/四图拼四宫格.json": "grid4_stitch",
 }
 
 # 画布上的模式名（人工微调）。没写的能力走 short_name() 自动清洗文件名。
 # 要求：一眼看出这个工作流干什么，不带 @ 前缀、不带"4步加速版"这类实现细节。
 DISPLAY = {
     "zimage_t2i": "Z-Image 文生图",
-    "flux2_klein_storyboard9": "九宫格故事分镜",
+    "flux2_klein_storyboard9": "多宫格故事分镜",
     "minimax_h3_i2v": "H3 图生视频",
     "minimax_h3_flf2v": "H3 首尾帧生视频",
     "minimax_h3_talk1": "H3 说话唱歌·单人",
@@ -52,6 +55,7 @@ DISPLAY = {
     "minimax_h3_ref4": "H3 四图参考生视频",
     "minimax_h3_ref9": "H3全能参考(通用)",
     "minimax_h3_comic20": "漫剧4宫格",
+    "grid4_stitch": "四图拼四宫格",
 }
 
 # 画布上单独占一张卡的能力。默认按产出类型归并（都出视频就都在「生视频」里当模式），
@@ -69,6 +73,9 @@ REVIVE = {"minimax_h3_ref4"}
 NOTES = {
     "minimax_h3_ref9": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 "
                        "<Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。",
+    "grid4_stitch": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」"
+                    "要的素材，拼完直接连线过去。分镜顺序就是这个顺序。"
+                    "画面比例和分辨率要跟下游那张卡调成一样，切回来的每格才不会再被裁一刀。",
 }
 
 # 高级旋钮：这几个 widget 名不管挂在哪个节点上语义都一样，值得开出来给人调。
@@ -84,7 +91,13 @@ KNOBS = {
                        "推荐 {d}（全开）：省时间全靠它。往下调画质略好但慢很多，0 = 不加速、慢好几倍"),
     "processing_control_value": ("提速档位", 0, 0.5, 0.005,
                                  "推荐 {d}：再快画面就开始糊、动作发飘，这一档是不掉画质的上限。0 = 不提速"),
+    "max_rows": ("出图张数", 1, 9, 1, "一句提示词出一张图，{d} 张是一整套。调小只画前几张，剩下的不生成"),
 }
+# 上面这些旋钮默认折进「高级」。写在这里的是玩法本身的旋钮，要摆在面板正面。
+PRIMARY_KNOBS = {"max_rows"}
+# 表里的上限是硬上限。这类旋钮在图里常写成一个"等于不限"的大数（promptLine 的
+# max_rows=1000），那不是作者调过的设置，照抄成默认值滑条就变成 1000 档没法用。
+HARD_MAX = {"max_rows"}
 
 # 文件名里的噪音：实现细节、版本号、厂商前缀
 NOISE_PAREN = re.compile(r"[（(][^）)]*(?:步|加速|版|V\d)[^）)]*[）)]")
@@ -387,13 +400,19 @@ def ui_to_api(wf, oi, warns, revive=False):
             is_widget = "widget" in inp
             link = inp.get("link")
             if is_widget:
-                _t, opts = spec_of(oi, ct, name)
+                wt, opts = spec_of(oi, ct, name)
                 if wvd is not None:
                     val = wvd[name] if name in wvd else MISSING
                 else:
                     val = wv[wi] if wi < len(wv) else None
                     wi += 1
-                    if opts.get("control_after_generate"):
+                    # 界面会给所有叫 seed 的数字小部件配一个 randomize 下拉，哪怕
+                    # object_info 里没声明 control_after_generate（llama_cpp_instruct_adv
+                    # 就没声明）。只认声明会漏跳一格，之后的小部件全体错位 ——
+                    # force_offload 会拿到 'randomize'。所以再按值兜一层。
+                    if opts.get("control_after_generate") or (
+                            wt in ("INT", "FLOAT") and wi < len(wv)
+                            and wv[wi] in CONTROL_AFTER):
                         wi += 1            # 跳过 randomize/fixed
                 if name in ("audioUI",) or inp.get("type") in ("AUDIO_UI",):
                     continue               # 纯 UI 组件
@@ -513,6 +532,46 @@ def grid_of(api, nid, depth=0, seen=None):
         if g:
             return g
     return None
+
+
+def sized_pieces(api, nid):
+    """这个尺寸节点算的是「每一份」的尺寸，还是整张成品的尺寸 -> 份数，不是就 0。
+
+    「分辨率」这个词在拼图工作流里是歧义的：拼四宫格时填 0.5MP，得到的是每格
+    0.5MP、整张 2MP。不说清楚的话，用户按下游视频卡的分辨率去填，出来的整图会大一倍。
+
+    判据不认节点类名，只看结构，三条同时成立才算：
+      1. 这个尺寸被 N(>1) 个节点各用了一遍，且这 N 个是同一种节点 —— N 路平行缩放；
+      2. 这 N 路最后汇进同一个节点；
+      3. 那个汇合节点「除了这 N 路什么都不收」—— 它只干合并这一件事。
+    第 3 条是关键。少了它，首尾帧生视频（首帧尾帧各缩一次，都进 H3 节点）和漫剧
+    四宫格（4 张参考图各缩一次，都进 H3 节点）会被误判成拼图；那两处的尺寸说的是
+    成片画面尺寸，本来就该叫「分辨率」。H3 节点还要收提示词、种子、length，
+    输入数对不上，就被这一条挡掉了。
+    """
+    users = {str(cid) for cid, _k in consumers(api, nid)}
+    if len(users) < 2 or len({api[u]["class_type"] for u in users}) != 1:
+        return 0
+    for sink in set.intersection(*[{str(c) for c, _ in consumers(api, u)} for u in users]):
+        ins = api[sink]["inputs"]
+        srcs = {str(v[0]) for v in ins.values() if isinstance(v, list) and len(v) == 2}
+        if len(ins) == len(users) and srcs == users:
+            return len(users)
+    return 0
+
+
+def slot_optional(api, oi, nid):
+    """这张上传图空着，工作流还跑得动吗 —— 看它接进去的那个输入是不是选填。
+
+    以前所有图槽都只有第一个算必填。对生成类工作流是对的：首尾帧的尾帧、参考图的
+    第 2~9 张，在节点定义里都声明成 optional，空着就用模板默认值或者干脆断线。
+    但拼图这类工具不一样 —— ImageGridComposite2x2 的 image1~4 全是必填，少一张
+    torch.cat 直接抛异常。判据只查 object_info，不认节点类名。
+    """
+    cid, cin = direct_consumer(api, nid)
+    if cid is None:
+        return True                       # 没人用它，空着也无所谓
+    return is_optional(oi, api[cid]["class_type"], cin)
 
 
 def traced_label(api, nid, depth=0, seen=None):
@@ -643,6 +702,15 @@ def derive_inputs(api, oi):
         label, kind, bound = RES_FIELDS[key]
         item = {"key": key, "label": label, "type": kind, "default": val,
                 "target": {"node": nid, "input": field}}
+        # 拼图工作流里这个尺寸说的是「每一格」。比例不用改口：2×2 拼起来比例不变，
+        # 两种读法是同一个数。分辨率不行，差 4 倍面积，得写在明面上
+        n = sized_pieces(api, nid)
+        if n and kind != "select":
+            k = round(n ** 0.5)
+            item["label"] = "每格" + label
+            item["hint"] = (f"填的是拼图里每一格的大小，不是拼完那张整图的大小。"
+                            f"{n} 张各自缩到这个尺寸再拼起来"
+                            + (f"，整图宽高各是它的 {k} 倍。" if k * k == n else "。"))
         if kind == "select":
             item["options"] = list(opts.get("options") or [])
             if not item["options"]:
@@ -664,7 +732,7 @@ def derive_inputs(api, oi):
         gen = traced_label(api, nid) or "图片"
         label, hint = pick_label(None if default_title(oi, "LoadImage", title) else title, gen)
         item = {"key": f"images[{i}]", "label": uniq(label), "type": "image",
-                "required": i == 0,
+                "required": i == 0 or not slot_optional(api, oi, nid),
                 "target": {"node": nid, "input": "image", "kind": "upload_image"}}
         if hint:
             item["hint"] = hint
@@ -708,9 +776,12 @@ def derive_inputs(api, oi):
         elif kind == "knob":
             key = field.lower()
             label, lo, hi, step, hint = KNOBS[key]
+            if key in HARD_MAX:
+                val = min(val, hi)
             item = {"key": key, "label": label, "type": "slider",
                     "min": lo, "max": max(hi, val), "step": step, "default": val,
-                    "hint": hint.replace("{d}", f"{val:g}"), "advanced": True,
+                    "hint": hint.replace("{d}", f"{val:g}"),
+                    "advanced": key not in PRIMARY_KNOBS,
                     "target": {"node": nid, "input": field, "vtype": vt}}
             if any(x["key"] == key for x in out):
                 item["mirror"] = True      # 同名旋钮出现多次：只画一个框，一起改
@@ -740,14 +811,24 @@ def derive_inputs(api, oi):
         item = res_item(key, nid, field, val, t, opts)
         if item:
             out.append(item)
+    aud_slot = {str(nid): f"audio[{i}]" for i, (nid, _t) in enumerate(audios)}
     for nid, title in crops:
+        # 裁的是哪一条上传音频：顺着 AudioCrop 往上游找 LoadAudio，找到就把这一对
+        # 起止点标成那个槽的"选区"，面板会画成一条能拖能试听的波形条（见 audioRange）
+        up = upstream(api, nid)
+        src = next((v for k, v in aud_slot.items() if k in up), None)
         # 默认值必须读工作流里的真值。写死 0:05 的话，模板本来裁 10 秒的（说话唱歌·双人
         # 就是）会被面板悄悄改成 5 秒，音频被砍一半还看不出是谁干的
         for key, label, field in (("audio_start", "音频起点", "start_time"),
                                   ("audio_end", "音频终点", "end_time")):
-            out.append({"key": key, "label": label, "type": "text",
-                        "default": api[nid]["inputs"].get(field), "advanced": True,
-                        "target": {"node": nid, "input": field}})
+            item = {"key": key, "label": label, "type": "text",
+                    "default": api[nid]["inputs"].get(field),
+                    "target": {"node": nid, "input": field}}
+            if src:
+                item["rangeOf"] = src      # 有得试听，就不用藏进「高级」让人手打 0:05 了
+            else:
+                item["advanced"] = True
+            out.append(item)
     for i, (nid, field, val, vt) in enumerate(seeds):
         item = {"key": "seed", "label": "种子", "type": "seed", "default": val,
                 "target": {"node": nid, "input": field, "vtype": vt or "INT"}}
@@ -766,6 +847,19 @@ def derive_inputs(api, oi):
                 + (f"传满 {n} 张就是 {per * n} 宫格，按顺序接成一整条完整视频。"
                    if n > 1 else ""))
     return out, outputs, len(images), len(audios), note
+
+
+def is_tool(inputs):
+    """纯加工能力：不采样、不写提示词，只是把素材换个形状（拼图 / 裁切 / 缩放）。
+
+    判据是「既没有种子、也没有提示词」—— 生成类工作流总得有个采样器要种子、
+    总得有句提示词描述要画什么；工具两样都没有，产出完全由输入素材决定，
+    同样的素材跑两次结果一模一样。
+
+    工具要单独成卡（不能并进「生图」的模式列表），菜单里也单独一组：它不创作，
+    混在生图里会让人以为它也在画画。所以这个判断顺手替它免了 SOLO 登记。
+    """
+    return not any(i["type"] in ("seed", "textarea") for i in inputs)
 
 
 def required_keys(oi, ct):
@@ -818,6 +912,27 @@ def repair_loop_count(api, oi, warns):
                     warns.append(f"已修：#{lid}.total 写死 {total}，改接 "
                                  f"#{mid} {m['class_type']}（按 #{cid} 的条数循环）")
                     return
+
+
+def repair_bool_widgets(api, oi, warns):
+    """把布尔小部件的空值填回节点默认值。
+
+    ComfyUI 界面里从没动过的布尔小部件，导出 API 时会写成空串（分镜那条的
+    easy promptLine.remove_empty_lines 就是 ""）。空串送进去等于关着，可作者的
+    节点默认是开着的 —— 于是"去掉空行"失效，提示词之间的空行也被当成一条提示词，
+    白跑一张没主体的图。判据只看类型：声明是 BOOLEAN、值却不是 True/False
+    （空串、或者小部件错位串进来的 "randomize" 之类）。
+    """
+    for nid, node in api.items():
+        for f, v in node["inputs"].items():
+            if isinstance(v, bool) or not is_literal(v):
+                continue
+            t, opts = spec_of(oi, node["class_type"], f)
+            if t != "BOOLEAN":
+                continue
+            dv = bool(opts.get("default", True))
+            node["inputs"][f] = dv
+            warns.append(f"已修：#{nid}.{f} 的值 {v!r} 不是布尔，按节点默认值 {dv} 送")
 
 
 def validate_api(api, oi):
@@ -907,12 +1022,14 @@ def scan(path: Path, oi, rel_key=None):
     else:
         api = ui_to_api(wf, oi, warns, revive=wid in REVIVE)
     repair_loop_count(api, oi, warns)
+    repair_bool_widgets(api, oi, warns)
     inputs, outputs, n_img, n_aud, note = derive_inputs(api, oi)
     out_type = outputs[0][1] if outputs else "unknown"
     warns += [f"结构错误 {e}" for e in validate_api(api, oi)]
     if not outputs:
         warns.append("找不到输出节点（SaveImage/SaveVideo/…），无法取回产物")
 
+    tool = is_tool(inputs)
     manifest = {
         "id": wid,
         "name": DISPLAY.get(wid) or short_name(path.stem),
@@ -920,8 +1037,9 @@ def scan(path: Path, oi, rel_key=None):
         "source": str(path),
         "group": {"video": "视频", "image": "图片", "audio": "音频"}.get(out_type, "其他"),
         "outputType": out_type,
-        # 归并到哪张卡：默认按产出类型，只有 SOLO 里点名的才自己占一张
-        "card": wid if wid in SOLO else out_type,
+        "kind": "tool" if tool else "gen",      # 工具（只加工素材）还是创作
+        # 归并到哪张卡：默认按产出类型，SOLO 里点名的和工具都自己占一张
+        "card": wid if (tool or wid in SOLO) else out_type,
         "slots": f"img{n_img}+aud{n_aud}",      # 槽位指纹
         "images": n_img,
         "audios": n_aud,
@@ -931,8 +1049,10 @@ def scan(path: Path, oi, rel_key=None):
         "inputs": inputs,
         "warnings": warns,
     }
-    if not subs:
-        api_path.write_text(json.dumps(api, ensure_ascii=False, indent=1), encoding="utf-8")
+    # 子图工作流也要写回：它的输入就是这份已导出的 api.json，上面那些 repair_* 只改了
+    # 内存，不写回去的话真正提交给 ComfyUI 的还是没修的图。重扫一次是幂等的，
+    # 从 ComfyUI 重新「导出(API)」覆盖后再扫，照样会把修补重新打上。
+    api_path.write_text(json.dumps(api, ensure_ascii=False, indent=1), encoding="utf-8")
     (ROOT / "manifests" / f"{wid}.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     return manifest
@@ -997,11 +1117,15 @@ def main():
     cards = []
     for key, ms in groups.items():
         ms.sort(key=lambda m: (m["images"], m["audios"]))
-        # 没进 CARD_META 的 key 就是单独成卡的能力，卡名和图标都跟着它自己走
-        solo_icon = CARD_META.get(ms[0]["outputType"], (0, 0, "◻"))[2]
+        kind = ms[0].get("kind", "gen")
+        # 没进 CARD_META 的 key 就是单独成卡的能力，卡名和图标都跟着它自己走。
+        # 工具的产出也是图片，跟「生图」共用 🖼 会看不出区别，单独给个 🧩。
+        solo_icon = "🧩" if kind == "tool" else \
+            CARD_META.get(ms[0]["outputType"], (0, 0, "◻"))[2]
         cid, cname, icon = CARD_META.get(key, (key, ms[0]["name"], solo_icon))
         cards.append({
             "id": cid, "name": cname, "icon": icon, "outputType": ms[0]["outputType"],
+            "kind": kind,                       # 前端菜单按它分「工具」一组
             "modes": build_modes(ms),
         })
     (ROOT / "manifests" / "_cards.json").write_text(

@@ -17,6 +17,7 @@ import os
 import json
 import mimetypes
 import random
+import subprocess
 import time
 import uuid
 from pathlib import Path
@@ -32,6 +33,7 @@ PORT = 8199
 
 CLIENT_ID = uuid.uuid4().hex
 JOBS = {}                  # prompt_id -> job dict
+STEPS = {}                 # prompt_id -> {节点 id: 人能看懂的步骤名}
 CAPS = {}                  # capability id -> manifest
 CARDS = []
 STATE = {"comfy_online": False}
@@ -46,6 +48,14 @@ AUD_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 # 能力清单
 # =====================================================================
 def load_caps():
+    # 汉化词条（扫描器生成的缓存）：只用来把「现在在跑哪个节点」翻成人话，缺了不影响跑
+    zh = ROOT / "data" / "zh_nodes.json"
+    ZH_NODES.clear()
+    if zh.exists():
+        try:
+            ZH_NODES.update(json.loads(zh.read_text(encoding="utf-8")))
+        except Exception as e:
+            print(f"[抽卡系统] 读不了 {zh.name}（步骤名会显示英文类名）：{e}")
     CAPS.clear()
     for f in (ROOT / "manifests").glob("*.json"):
         if f.name.startswith("_"):
@@ -61,6 +71,24 @@ def load_caps():
         c["modes"] = [md for md in c["modes"]
                       if CAPS.get(md["id"], {}).get("_graph_ok")]
     return len(CAPS)
+
+
+ZH_NODES = {}              # class_type -> 汉化词条，只用它的 titles[0]
+
+
+def step_labels(graph):
+    """节点 id -> 「现在在干什么」。
+
+    取节点类型的中文名（"K采样器""图像缩放"），一看就懂。工作流里的节点标题
+    反而经常是 "1"、"Video Combine 🎥🅥🅗🅢" 这种，没法当步骤名，只在没有
+    汉化词条时才退回去用。
+    """
+    labels = {}
+    for nid, nd in graph.items():
+        ct = nd.get("class_type") or ""
+        zh = (ZH_NODES.get(ct) or {}).get("titles") or []
+        labels[nid] = zh[0] if zh else ((nd.get("_meta") or {}).get("title") or ct)
+    return labels
 
 
 def kind_of(name):
@@ -236,9 +264,13 @@ async def handle_event(session, ev):
     elif t == "executing" and job:
         if d.get("node") is None:
             job["outputs"] = await collect_outputs(session, pid)
-            job.update(status="done", progress=1.0, ended=time.time())
+            job.update(status="done", progress=1.0, ended=time.time(), step="")
+            STEPS.pop(pid, None)
         else:
-            job["node"] = d.get("display_node") or d["node"]
+            nid = str(d.get("display_node") or d["node"])
+            job["node"] = nid
+            # 没登记的节点（子图里层）就退回节点号，总比什么都不显示强
+            job["step"] = STEPS.get(pid, {}).get(nid) or f"#{nid}"
     elif t == "progress" and job:
         mx = d.get("max") or 1
         job["progress"] = round(d.get("value", 0) / mx, 4)
@@ -252,8 +284,9 @@ async def handle_event(session, ev):
             job["progress"] = round(n.get("value", 0) / mx, 4)
             job["status"] = "running"
     elif t == "execution_error" and job:
-        job.update(status="error", ended=time.time(),
+        job.update(status="error", ended=time.time(), step="",
                    error=f"#{d.get('node_id')} {d.get('node_type')}: {d.get('exception_message')}")
+        STEPS.pop(pid, None)
     elif t == "execution_cached" and job:
         job["cached"] = d.get("nodes", [])
     elif t == "status":
@@ -324,11 +357,13 @@ async def api_generate(request):
                      if k not in graph[n]["inputs"]})
         return web.json_response({"dry_run": True, "changed": diff})
     pid = await comfy_submit(request.app["session"], graph)
+    # 步骤名单独放 STEPS，不塞进 job：job 每次轮询整份回给前端，59 个节点名白传
+    STEPS[pid] = step_labels(graph)
     JOBS[pid] = {"id": pid, "capability": cid, "name": cap["name"],
                  "outputType": cap["outputType"], "status": "queued",
                  "progress": 0.0, "created": time.time(),
                  "seed": params.get("_seed_used", params.get("seed")),
-                 "outputs": [], "error": None}
+                 "step": "", "outputs": [], "error": None}
     return web.json_response(JOBS[pid])
 
 
@@ -458,6 +493,27 @@ async def api_file(request):
         return resp
 
 
+async def api_reveal(request):
+    """在资源管理器里选中素材文件。
+
+    路径全由服务端拼：客户端只能给一个文件名，且只放行 data/uploads 这一个目录，
+    免得这个接口被当成"打开任意路径"用。
+    """
+    body = await request.json()
+    name = Path((body.get("name") or "").replace("\\", "/")).name
+    if not name:
+        raise web.HTTPBadRequest(reason="缺 name")
+    up = (ROOT / "data" / "uploads").resolve()
+    p = (up / name).resolve()
+    if p.parent != up or not p.is_file():
+        raise web.HTTPNotFound(reason="素材文件已经不在了")
+    if os.name != "nt":
+        raise web.HTTPBadRequest(reason="定位文件只支持 Windows")
+    # explorer /select 正常也会返回非 0，别去看返回码
+    subprocess.Popen(["explorer", f"/select,{p}"])
+    return web.json_response({"ok": True, "path": str(p)})
+
+
 async def index(request):
     return web.FileResponse(ROOT / "web" / "index.html")
 
@@ -499,6 +555,7 @@ def make_app():
     app.router.add_put("/api/projects/{pid}", api_project_save)
     app.router.add_delete("/api/projects/{pid}", api_project_delete)
     app.router.add_get("/api/file", api_file)
+    app.router.add_post("/api/reveal", api_reveal)
     up = ROOT / "data" / "uploads"
     up.mkdir(parents=True, exist_ok=True)
     app.router.add_static("/api/upload/", up)

@@ -1,0 +1,190 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-1.png"
+  },
+  "_meta": {
+   "title": "1"
+  }
+ },
+ "2": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-2.png"
+  },
+  "_meta": {
+   "title": "2"
+  }
+ },
+ "3": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-3.png"
+  },
+  "_meta": {
+   "title": "3"
+  }
+ },
+ "4": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "4-4.png"
+  },
+  "_meta": {
+   "title": "4"
+  }
+ },
+ "10": {
+  "class_type": "ResolutionSelector",
+  "inputs": {
+   "aspect_ratio": "16:9 (Widescreen)",
+   "megapixels": 0.5,
+   "multiple": 32
+  },
+  "_meta": {
+   "title": "每格尺寸"
+  }
+ },
+ "21": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "width": [
+    "10",
+    0
+   ],
+   "height": [
+    "10",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "统一到每格尺寸 1"
+  }
+ },
+ "22": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "2",
+    0
+   ],
+   "width": [
+    "10",
+    0
+   ],
+   "height": [
+    "10",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "统一到每格尺寸 2"
+  }
+ },
+ "23": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "3",
+    0
+   ],
+   "width": [
+    "10",
+    0
+   ],
+   "height": [
+    "10",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "统一到每格尺寸 3"
+  }
+ },
+ "24": {
+  "class_type": "ImageResizeKJv2",
+  "inputs": {
+   "image": [
+    "4",
+    0
+   ],
+   "width": [
+    "10",
+    0
+   ],
+   "height": [
+    "10",
+    1
+   ],
+   "upscale_method": "lanczos",
+   "keep_proportion": "crop",
+   "pad_color": "0, 0, 0",
+   "crop_position": "center",
+   "divisible_by": 2,
+   "device": "cpu"
+  },
+  "_meta": {
+   "title": "统一到每格尺寸 4"
+  }
+ },
+ "30": {
+  "class_type": "ImageGridComposite2x2",
+  "inputs": {
+   "image1": [
+    "21",
+    0
+   ],
+   "image2": [
+    "22",
+    0
+   ],
+   "image3": [
+    "23",
+    0
+   ],
+   "image4": [
+    "24",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "拼成 2×2"
+  }
+ },
+ "40": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "30",
+    0
+   ],
+   "filename_prefix": "grid4"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ }
+}

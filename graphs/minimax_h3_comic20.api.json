@@ -497,7 +497,7 @@
    "max_frames": 24,
    "max_size": 256,
    "seed": 690887182190218,
-   "force_offload": "randomize",
+   "force_offload": false,
    "save_states": false
   },
   "_meta": {

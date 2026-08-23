@@ -5,6 +5,7 @@
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\4-Z-Image全系列\\z-Image-标准版文生图.json",
  "group": "图片",
  "outputType": "image",
+ "kind": "gen",
  "card": "image",
  "slots": "img0+aud0",
  "images": 0,

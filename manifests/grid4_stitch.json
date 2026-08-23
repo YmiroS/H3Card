@@ -1,0 +1,100 @@
+{
+ "id": "grid4_stitch",
+ "name": "四图拼四宫格",
+ "file": "四图拼四宫格",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\四图拼四宫格.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "tool",
+ "card": "grid4_stitch",
+ "slots": "img4+aud0",
+ "images": 4,
+ "audios": 0,
+ "graph": "graphs/grid4_stitch.api.json",
+ "output": {
+  "node": "40"
+ },
+ "note": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」要的素材，拼完直接连线过去。分镜顺序就是这个顺序。画面比例和分辨率要跟下游那张卡调成一样，切回来的每格才不会再被裁一刀。",
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "1",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "images[1]",
+   "label": "2",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "2",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "images[2]",
+   "label": "3",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "3",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "images[3]",
+   "label": "4",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "4",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "aspect_ratio",
+   "label": "画面比例",
+   "type": "select",
+   "default": "16:9 (Widescreen)",
+   "target": {
+    "node": "10",
+    "input": "aspect_ratio"
+   },
+   "options": [
+    "1:1 (Square)",
+    "2:3 (Portrait Photo)",
+    "3:2 (Photo)",
+    "3:4 (Portrait Standard)",
+    "4:3 (Standard)",
+    "9:16 (Portrait Widescreen)",
+    "16:9 (Widescreen)",
+    "21:9 (Ultrawide)"
+   ]
+  },
+  {
+   "key": "megapixels",
+   "label": "每格分辨率",
+   "type": "slider",
+   "default": 0.5,
+   "target": {
+    "node": "10",
+    "input": "megapixels",
+    "vtype": "FLOAT"
+   },
+   "hint": "填的是拼图里每一格的大小，不是拼完那张整图的大小。4 张各自缩到这个尺寸再拼起来，整图宽高各是它的 2 倍。",
+   "min": 0.2,
+   "max": 1.1,
+   "step": 0.01
+  }
+ ],
+ "warnings": []
+}

@@ -5,6 +5,7 @@
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@MiniMax H3_ 说话唱歌 双人（4步加速版）.json",
  "group": "视频",
  "outputType": "video",
+ "kind": "gen",
  "card": "video",
  "slots": "img2+aud1",
  "images": 2,
@@ -151,22 +152,22 @@
    "label": "音频起点",
    "type": "text",
    "default": "0:00",
-   "advanced": true,
    "target": {
     "node": "177",
     "input": "start_time"
-   }
+   },
+   "rangeOf": "audio[0]"
   },
   {
    "key": "audio_end",
    "label": "音频终点",
    "type": "text",
    "default": "0:10",
-   "advanced": true,
    "target": {
     "node": "177",
     "input": "end_time"
-   }
+   },
+   "rangeOf": "audio[0]"
   },
   {
    "key": "seed",
