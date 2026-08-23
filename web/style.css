@@ -129,7 +129,13 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   position: absolute; width: 268px; background: var(--panel);
   border: 1px solid var(--line); border-radius: 3px;
   box-shadow: 0 4px 22px #000b, 0 0 0 1px #00e5ff08;
+  /* 卡片整体不可选：拖动时不会拉出一片蓝色高亮。真正想复制的文字下面单独开口子 */
+  user-select: none;
 }
+/* 状态栏（种子/文件名）和角标：直接拖选 + Ctrl+C */
+.card .cf, .card .badge { user-select: text; cursor: text; }
+/* 卡名：标题栏要留给拖动，所以不能拖选，双击整条选中（见 app.js 的 ondblclick） */
+.card .ch .t { user-select: text; }
 /* 四角切角括号 */
 .card::before, .card::after {
   content: ""; position: absolute; width: 11px; height: 11px; pointer-events: none;

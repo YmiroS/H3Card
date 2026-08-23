@@ -6,6 +6,14 @@ const $ = (s, r = document) => r.querySelector(s);
 const CW = 268;            // 卡片宽度，与 style.css 保持一致
 const SVGNS = "http://www.w3.org/2000/svg";
 
+/** 该让浏览器自己弹右键菜单的地方：产物图/视频/音频（要「图片另存为」）、
+ *  输入框（要复制粘贴）。另外按住 Ctrl 或 Shift 右键，任何地方都强制走原生菜单。 */
+function wantsNativeMenu(ev) {
+  if (ev.ctrlKey || ev.shiftKey) return true;
+  const t = ev.target;
+  return !!(t.closest("input, textarea, select") || t.matches("img, video, audio"));
+}
+
 let CARDS = [];            // 卡种（生图 / 生视频）
 let CAPS = {};             // 能力清单
 let PROJ = null;           // 当前项目
@@ -33,7 +41,9 @@ async function api(path, opt) {
   if (!r.ok) {
     const msg = (txt || r.statusText || "请求失败").replace(/<[^>]*>/g, " ")
       .replace(/\s+/g, " ").trim();
-    throw new Error(msg.slice(0, 300));
+    const err = new Error(msg.slice(0, 300));
+    err.status = r.status;
+    throw err;
   }
   return data;
 }
@@ -210,6 +220,9 @@ function hoverBrief(node, capGetter, nameGetter) {
   } catch (e) { toast("后端未就绪：" + e.message); }
   await loadProjects();
   bindGlobal();
+  // 一进来就打开示例（locked 那个），新用户不用先面对一张空画布
+  const demo = projects.find(p => p.locked);
+  if (demo) await openProject(demo.id);
   setInterval(health, 5000);
   setInterval(pollJobs, 700);
 })();
@@ -228,10 +241,13 @@ async function loadProjects() {
   for (const p of projects) {
     const d = document.createElement("div");
     d.className = "pitem" + (PROJ && PROJ.id === p.id ? " on" : "");
-    d.innerHTML = `<span class="nm"></span><span class="ct">${p.cards}</span><button class="del" title="删除">✕</button>`;
+    // locked 的项目（示例）不给删除按钮，服务端也会拒
+    d.innerHTML = `<span class="nm"></span><span class="ct">${p.cards}</span>`
+      + (p.locked ? "" : `<button class="del" title="删除">✕</button>`);
     d.querySelector(".nm").textContent = p.name;
     d.onclick = () => openProject(p.id);
-    d.querySelector(".del").onclick = async (ev) => {
+    const del = d.querySelector(".del");
+    if (del) del.onclick = async (ev) => {
       ev.stopPropagation();
       if (!confirm(`删除项目「${p.name}」？（文件会保留为 .deleted）`)) return;
       await api(`/api/projects/${p.id}`, { method: "DELETE" });
@@ -283,17 +299,34 @@ function showEmpty() {
 /** 卡片对象上挂了 _el（DOM），序列化前必须剥掉，否则 JSON 循环引用 */
 const plain = (c) => Object.fromEntries(Object.entries(c).filter(([k]) => k[0] !== "_"));
 
+/** 保存串行化：两次 PUT 撞在一起会带同一个 rev，后一次要被服务端顶掉 */
+let saveChain = Promise.resolve();
+
 function save() {
   if (!PROJ) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(async () => {
-    if (!PROJ) return;
-    PROJ.view = view;
-    try {
-      await jput(`/api/projects/${PROJ.id}`,
-        { name: PROJ.name, cards: PROJ.cards.map(plain), edges: PROJ.edges, view });
-    } catch (e) { toast("保存失败：" + e.message); }
-  }, 700);
+  saveTimer = setTimeout(() => { saveChain = saveChain.then(doSave); }, 700);
+}
+
+async function doSave() {
+  if (!PROJ) return;
+  const id = PROJ.id;
+  PROJ.view = view;
+  try {
+    const r = await jput(`/api/projects/${id}`, {
+      rev: PROJ.rev || 0, name: PROJ.name,
+      cards: PROJ.cards.map(plain), edges: PROJ.edges, view,
+    });
+    if (PROJ && PROJ.id === id) PROJ.rev = r.rev;
+  } catch (e) {
+    // 409：画布在别处（另一个标签页 / 服务端脚本）被改过。这份内存快照已经是旧的，
+    // 硬写会把别处的产物抹掉，所以丢掉本地这份、重新加载。
+    if (e.status === 409 && PROJ && PROJ.id === id) {
+      toast("画布在别处被改过，已重新加载");
+      return openProject(id);
+    }
+    toast("保存失败：" + e.message);
+  }
 }
 
 /* ================= 视图 ================= */
@@ -336,10 +369,17 @@ function buildCard(c) {
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
   d.onmousedown = (ev) => { ev.stopPropagation(); pick(c.id); };
   d.oncontextmenu = (ev) => {
-    ev.preventDefault(); ev.stopPropagation();
+    // stopPropagation 一定要有：不然冒泡到 stage 的 contextmenu 又会被 preventDefault，
+    // 原生菜单还是弹不出来
+    ev.stopPropagation();
+    if (wantsNativeMenu(ev)) return;
+    ev.preventDefault();
     tipHide(); pick(c.id); cardMenu(ev.clientX, ev.clientY, c);
   };
   d.ondblclick = (ev) => {
+    // 双击卡名 = 整条选中，方便直接 Ctrl+C（标题栏平时要留给拖动，没法拖选）
+    const t = ev.target.closest(".ch .t");
+    if (t) { ev.stopPropagation(); getSelection().selectAllChildren(t); return; }
     if (!ev.target.closest(".body")) return;
     // 播放条是浏览器画在 video 里的，点它拿到的 target 还是 video 本身，没法直接区分。
     // 只能按位置判断：落在底部这条里就是在操作播放条，别抢它的双击
@@ -419,16 +459,24 @@ function pick(id) {
 function startDrag(ev, c, d) {
   if (ev.button !== 0) return;
   ev.stopPropagation();
+  ev.preventDefault();          // 标题栏是拖动把手，别让它同时被拖成半截高亮
   tipHide();
   pick(c.id);
   const s = { mx: ev.clientX, my: ev.clientY, x: c.x, y: c.y };
+  let moved = false;
   const mv = (e) => {
+    // 4px 阈值：手抖一下不算拖，也就不会白闪一次面板
+    if (!moved && Math.abs(e.clientX - s.mx) + Math.abs(e.clientY - s.my) < 4) return;
+    if (!moved) { moved = true; veilPanel(true); }
     c.x = Math.round(s.x + (e.clientX - s.mx) / view.k);
     c.y = Math.round(s.y + (e.clientY - s.my) / view.k);
     d.style.left = c.x + "px"; d.style.top = c.y + "px";
-    drawWires(); placePanel();
+    drawWires();
   };
-  const up = () => { document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); save(); };
+  const up = () => {
+    document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+    if (moved) { veilPanel(false); placePanel(); save(); }
+  };
   document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
 }
 
@@ -500,6 +548,7 @@ function bindGlobal() {
   });
 
   el.stage.addEventListener("contextmenu", (ev) => {
+    if (wantsNativeMenu(ev)) return;
     ev.preventDefault();
     if (!PROJ || ev.target.closest(".card")) return;
     tipHide();
@@ -711,20 +760,38 @@ async function importOutput(out) {
 /* ================= 参数面板 ================= */
 function closePanel() { el.panel.style.display = "none"; el.panel._id = null; }
 
+/** 拖卡片时把面板藏起来（用 visibility 而不是 display：还能量到宽高，松手好复位） */
+function veilPanel(on) {
+  if (el.panel.style.display === "none") return;
+  el.panel.style.visibility = on ? "hidden" : "";
+}
+
 function placePanel() {
   if (el.panel.style.display === "none") return;
   const c = PROJ && PROJ.cards.find(x => x.id === el.panel._id);
   if (!c || !c._el) return closePanel();
   const GAP = 8, TOP = 52;                 // TOP 给顶栏让位
   // 先限高再量高：漫剧20宫格那种 6 个提示词的面板不封顶会直接长到屏幕外，
-  // 量出来的 offsetHeight 就没法用来做"放不下就上移"的判断了
+  // 量出来的 offsetHeight 就没法用来做"放不下就换边"的判断了
   el.panel.style.maxHeight = (innerHeight - TOP - GAP) + "px";
   const r = el.stage.getBoundingClientRect();
   const w = el.panel.offsetWidth, h = el.panel.offsetHeight;
-  const left = r.left + view.x + (c.x + CW / 2) * view.k - w / 2;
-  const below = r.top + view.y + (c.y + c._el.offsetHeight + 12) * view.k;
-  el.panel.style.left = Math.max(GAP, Math.min(left, innerWidth - w - GAP)) + "px";
-  el.panel.style.top = Math.max(TOP, Math.min(below, innerHeight - h - GAP)) + "px";
+  // 卡片在屏幕上的矩形（offsetHeight 是世界坐标，要乘缩放）
+  const cx = r.left + view.x + c.x * view.k, cy = r.top + view.y + c.y * view.k;
+  const cw = CW * view.k, ch = c._el.offsetHeight * view.k;
+  const clampX = (v) => Math.max(GAP, Math.min(v, innerWidth - w - GAP));
+  const clampY = (v) => Math.max(TOP, Math.min(v, innerHeight - h - GAP));
+  const midX = clampX(cx + cw / 2 - w / 2), midY = clampY(cy + ch / 2 - h / 2);
+  // 下 → 右 → 上 → 左，取第一个放得下的；四边都放不下就挑那边空地最宽的
+  const sides = [
+    { room: innerHeight - GAP - (cy + ch + GAP), left: midX, top: cy + ch + GAP, need: h },
+    { room: innerWidth - GAP - (cx + cw + GAP), left: cx + cw + GAP, top: midY, need: w },
+    { room: (cy - GAP) - TOP, left: midX, top: cy - GAP - h, need: h },
+    { room: (cx - GAP) - GAP, left: cx - GAP - w, top: midY, need: w },
+  ];
+  const p = sides.find(s => s.room >= s.need) || sides.reduce((a, b) => (b.room > a.room ? b : a));
+  el.panel.style.left = clampX(p.left) + "px";
+  el.panel.style.top = clampY(p.top) + "px";
 }
 
 function openPanel(id) {
@@ -737,6 +804,7 @@ function openPanel(id) {
   el.panel._id = id;
   el.panel.innerHTML = "";
   el.panel.style.display = "";
+  el.panel.style.visibility = "";     // 上一次拖卡片藏起来后没复位的话，这里兜一下
 
   // --- 模式切换 ---
   if (def.modes.length > 1) {
@@ -983,10 +1051,18 @@ function slotEl(c, s) {
   } else box.textContent = s.type === "audio" ? "🎵" : gridWord(s) ? "田" : "＋";
   d.onclick = () => pickFile(c, s);
   d.oncontextmenu = (ev) => {
+    ev.stopPropagation();
+    if (wantsNativeMenu(ev)) return;         // 右键素材缩略图要能「图片另存为」
     ev.preventDefault();
-    delete c.assets[s.key];
-    PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.slot === s.key));
-    drawWires(); openPanel(c.id); save();
+    if (!a) return;
+    // 以前右键直接就把这一格清了，手滑一下素材就没了，还跟"右键=看菜单"的直觉相反
+    showMenu(ev.clientX, ev.clientY, slotName(s), [{
+      icon: "✕", text: "清空这一格", danger: true, run: () => {
+        delete c.assets[s.key];
+        PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.slot === s.key));
+        drawWires(); openPanel(c.id); save();
+      },
+    }]);
   };
   return d;
 }
