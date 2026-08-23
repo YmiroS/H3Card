@@ -745,7 +745,15 @@ function openPanel(id) {
     const t = document.createElement("button");
     t.textContent = `▸ 高级 (${adv.length})`;
     const items = document.createElement("div"); items.className = "items"; items.style.display = "none";
-    for (const s of adv) items.appendChild(rowEl(c, s));
+    for (const s of adv) {
+      items.appendChild(rowEl(c, s));
+      // 高级参数默认值都是调好的，不写清楚推荐多少、为什么，用户只能瞎拉滑条
+      if (s.hint) {
+        const nt = document.createElement("div");
+        nt.className = "knobnote"; nt.textContent = s.hint;
+        items.appendChild(nt);
+      }
+    }
     t.onclick = () => {
       const open = items.style.display === "none";
       items.style.display = open ? "" : "none";
