@@ -20,6 +20,7 @@ const el = {
   stage: $("#stage"), world: $("#world"), wires: $("#wires"),
   empty: $("#empty"), panel: $("#panel"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
+  view: $("#view"), vbox: $("#view .vbox"),
 };
 
 /* ================= 工具 ================= */
@@ -338,6 +339,16 @@ function buildCard(c) {
     ev.preventDefault(); ev.stopPropagation();
     tipHide(); pick(c.id); cardMenu(ev.clientX, ev.clientY, c);
   };
+  d.ondblclick = (ev) => {
+    if (!ev.target.closest(".body")) return;
+    // 播放条是浏览器画在 video 里的，点它拿到的 target 还是 video 本身，没法直接区分。
+    // 只能按位置判断：落在底部这条里就是在操作播放条，别抢它的双击
+    if (ev.target.matches("video, audio")) {
+      const r = ev.target.getBoundingClientRect();
+      if (ev.clientY > r.bottom - 34 * view.k) return;
+    }
+    openViewer(c);
+  };
   hoverBrief(d.querySelector(".ch"), () => capOf(c), () => c.name);
   paint(c);
   return d;
@@ -352,11 +363,13 @@ function paint(c) {
 
   if (out && body.dataset.url !== out.url) {
     body.dataset.url = out.url;
+    // draggable=false：卡片里的图/视频不该能拖出去（拖出来是浏览器自带的行为，
+    // 会拽出一个半透明幽灵图，还容易被当成"拖它去连线"）。CSS 里另有 user-drag 兜底
     body.innerHTML = out.kind === "video"
-      ? `<video src="${out.url}" controls loop preload="metadata"></video>`
+      ? `<video src="${out.url}" controls loop preload="metadata" draggable="false"></video>`
       : out.kind === "audio"
         ? `<audio src="${out.url}" controls style="width:92%"></audio>`
-        : `<img src="${out.url}" alt="">`;
+        : `<img src="${out.url}" alt="" draggable="false">`;
     if (c.seed != null) {
       const b = document.createElement("span");
       b.className = "badge"; b.textContent = "seed " + c.seed;
@@ -493,8 +506,16 @@ function bindGlobal() {
     openMenu(ev.clientX, ev.clientY, toWorld(ev.clientX, ev.clientY));
   });
 
+  // 点大图外面的黑底关掉；点到图/视频本身不关，否则想拉进度条一松手窗就没了
+  el.view.addEventListener("mousedown", (ev) => {
+    if (ev.target === el.view) closeViewer();
+  });
+
   document.addEventListener("keydown", (ev) => {
-    if (ev.key === "Escape") { closeMenu(); tipHide(); selId = null; closePanel(); }
+    if (ev.key !== "Escape") return;
+    // 大图开着时 Esc 只关大图，不该顺手把卡片选中状态和参数面板一起清掉
+    if (el.view.style.display !== "none") { closeViewer(); return; }
+    closeMenu(); tipHide(); selId = null; closePanel();
   });
 }
 
@@ -547,9 +568,63 @@ function openMenu(cx, cy, at) {
   showMenu(cx, cy, "新建卡片", items);
 }
 
+/* ================= 产物大图 / 详情 ================= */
+const VIEW_WORD = { video: "放大播放", audio: "放大播放" };
+
+function closeViewer() {
+  el.vbox.innerHTML = "";          // 清空才会停掉正在播的视频
+  el.view.style.display = "none";
+}
+
+function openViewer(c) {
+  const out = (c.outputs || [])[0];
+  if (!out) { toast("这张卡还没有产物，先运行一次"); return; }
+  const info = document.createElement("div"); info.className = "vinfo";
+  const bits = [out.filename];
+  if (c.seed != null) bits.push("seed " + c.seed);
+  const put = () => (info.textContent = bits.join("　·　"));
+
+  let m;
+  if (out.kind === "video") {
+    m = document.createElement("video");
+    m.src = out.url; m.controls = m.autoplay = m.loop = true;
+    m.onloadedmetadata = () => {
+      bits.splice(1, 0, `${m.videoWidth}×${m.videoHeight}`, fmtDur(m.duration));
+      put();
+    };
+  } else if (out.kind === "audio") {
+    m = document.createElement("audio");
+    m.src = out.url; m.controls = m.autoplay = true;
+    m.onloadedmetadata = () => { bits.splice(1, 0, fmtDur(m.duration)); put(); };
+  } else {
+    m = document.createElement("img");
+    m.src = out.url;
+    m.onload = () => { bits.splice(1, 0, `${m.naturalWidth}×${m.naturalHeight}`); put(); };
+  }
+  m.draggable = false;
+  put();
+
+  const x = document.createElement("button");
+  x.className = "vx"; x.textContent = "✕"; x.title = "关闭 (Esc)";
+  x.onclick = closeViewer;
+
+  el.vbox.innerHTML = "";
+  el.vbox.append(m, info, x);
+  el.view.style.display = "";
+}
+
+// 秒 -> 0:07 / 1:23。视频详情里 7.04 秒这种读数没人看得懂
+function fmtDur(s) {
+  if (!isFinite(s)) return "时长未知";
+  const t = Math.round(s);
+  return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
+}
+
 function cardMenu(cx, cy, c) {
   const cap = capOf(c);
+  const out = (c.outputs || [])[0];
   showMenu(cx, cy, c.name || (cap ? cap.name : "卡片"), [
+    ...(out ? [{ icon: "⛶", text: VIEW_WORD[out.kind] || "查看大图", run: () => openViewer(c) }] : []),
     { icon: "✎", text: "重命名卡片", run: () => renameCard(c) },
     { icon: "↑", text: "运行", run: () => run(c) },
     { icon: "⧉", text: "复制卡片", run: () => cloneCard(c) },
@@ -903,8 +978,8 @@ function slotEl(c, s) {
   d.querySelector(".lbl").textContent = slotName(s);
   const box = d.querySelector(".box");
   if (a) {
-    box.innerHTML = a.kind === "image" ? `<img src="${a.url}">`
-      : a.kind === "video" ? `<video src="${a.url}" muted></video>` : `🎵`;
+    box.innerHTML = a.kind === "image" ? `<img src="${a.url}" draggable="false">`
+      : a.kind === "video" ? `<video src="${a.url}" muted draggable="false"></video>` : `🎵`;
   } else box.textContent = s.type === "audio" ? "🎵" : gridWord(s) ? "田" : "＋";
   d.onclick = () => pickFile(c, s);
   d.oncontextmenu = (ev) => {
