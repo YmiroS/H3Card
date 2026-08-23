@@ -378,7 +378,8 @@ async def api_projects(request):
             d = json.loads(f.read_text(encoding="utf-8"))
             out.append({"id": d["id"], "name": d.get("name", "未命名"),
                         "updated": d.get("updated", 0),
-                        "cards": len(d.get("cards", []))})
+                        "cards": len(d.get("cards", [])),
+                        "locked": bool(d.get("locked"))})
         except Exception:
             continue
     out.sort(key=lambda p: p["updated"], reverse=True)
@@ -410,17 +411,28 @@ async def api_project_save(request):
         raise web.HTTPNotFound(reason="项目不存在")
     old = json.loads(p.read_text(encoding="utf-8"))
     body = await request.json()
+    # 前端每次都整份 PUT，没有版本号就是「后写的赢」：一个开着旧快照的标签页随便点一下，
+    # 就能把别处刚写进去的产物抹掉。带上打开时拿到的 rev，对不上就让它先重新加载。
+    # rev 是必填的：不带版本号的写入一律拒，否则一个没刷新过的老页面又能悄悄盖掉数据
+    rev = old.get("rev", 0)
+    if body.get("rev") != rev:
+        # reason 走 HTTP 头，只能是 ASCII，中文提示由前端自己出
+        raise web.HTTPConflict(reason="stale rev")
     for k in ("name", "cards", "edges", "view"):
         if k in body:
             old[k] = body[k]
+    old["rev"] = rev + 1
     old["updated"] = time.time()
     p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
-    return web.json_response({"ok": True, "updated": old["updated"]})
+    return web.json_response({"ok": True, "updated": old["updated"], "rev": old["rev"]})
 
 
 async def api_project_delete(request):
     p = proj_path(request.match_info["pid"])
     if p.exists():
+        # locked 的项目（示例）不给删：它是新用户进来第一眼看到的东西
+        if json.loads(p.read_text(encoding="utf-8")).get("locked"):
+            raise web.HTTPForbidden(reason="locked project")
         p.rename(p.with_suffix(".json.deleted"))   # 软删除，误点不丢工作
     return web.json_response({"ok": True})
 
