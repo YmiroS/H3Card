@@ -1,0 +1,269 @@
+{
+ "id": "minimax_h3_ref9",
+ "name": "H3全能参考(通用)",
+ "file": "MiniMax H3 全能参考(通用) 九图单采",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3 全能参考(通用) 九图单采.json",
+ "group": "视频",
+ "outputType": "video",
+ "card": "minimax_h3_ref9",
+ "slots": "img9+aud0",
+ "images": 9,
+ "audios": 0,
+ "graph": "graphs/minimax_h3_ref9.api.json",
+ "output": {
+  "node": "38"
+ },
+ "note": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。",
+ "grid": false,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "参考图1",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "47",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "images[1]",
+   "label": "参考图2",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "48",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_1"
+   }
+  },
+  {
+   "key": "images[2]",
+   "label": "参考图3",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "49",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_2"
+   }
+  },
+  {
+   "key": "images[3]",
+   "label": "参考图4",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "66",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_3"
+   }
+  },
+  {
+   "key": "images[4]",
+   "label": "参考图5",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "72",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_4"
+   }
+  },
+  {
+   "key": "images[5]",
+   "label": "参考图6",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "73",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_5"
+   }
+  },
+  {
+   "key": "images[6]",
+   "label": "参考图7",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "74",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_6"
+   }
+  },
+  {
+   "key": "images[7]",
+   "label": "参考图8",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "75",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_7"
+   }
+  },
+  {
+   "key": "images[8]",
+   "label": "参考图9",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "76",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": {
+    "node": "45",
+    "input": "ref_images.ref_image_8"
+   }
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "",
+   "target": {
+    "node": "68",
+    "input": "text"
+   }
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 8,
+   "hint": "推荐 8：模型带加速 LoRA，8 步就到位了。往下调会花，往上调基本白等",
+   "advanced": true,
+   "target": {
+    "node": "1",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "duration",
+   "label": "时长(秒)",
+   "type": "slider",
+   "min": 3,
+   "max": 30,
+   "step": 1,
+   "default": 10,
+   "target": {
+    "node": "20",
+    "input": "value",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "strength_model",
+   "label": "加速模型强度",
+   "type": "slider",
+   "min": 0,
+   "max": 2,
+   "step": 0.05,
+   "default": 1,
+   "hint": "推荐 1（全开）：省时间全靠它。往下调画质略好但慢很多，0 = 不加速、慢好几倍",
+   "advanced": true,
+   "target": {
+    "node": "69",
+    "input": "strength_model",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "processing_control_value",
+   "label": "提速档位",
+   "type": "slider",
+   "min": 0,
+   "max": 0.5,
+   "step": 0.005,
+   "default": 0.12,
+   "hint": "推荐 0.12：再快画面就开始糊、动作发飘，这一档是不掉画质的上限。0 = 不提速",
+   "advanced": true,
+   "target": {
+    "node": "71",
+    "input": "processing_control_value",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "aspect_ratio",
+   "label": "画面比例",
+   "type": "select",
+   "default": "16:9 (Widescreen)",
+   "target": {
+    "node": "44",
+    "input": "aspect_ratio"
+   },
+   "options": [
+    "1:1 (Square)",
+    "2:3 (Portrait Photo)",
+    "3:2 (Photo)",
+    "3:4 (Portrait Standard)",
+    "4:3 (Standard)",
+    "9:16 (Portrait Widescreen)",
+    "16:9 (Widescreen)",
+    "21:9 (Ultrawide)"
+   ]
+  },
+  {
+   "key": "megapixels",
+   "label": "分辨率",
+   "type": "slider",
+   "default": 0.7,
+   "target": {
+    "node": "44",
+    "input": "megapixels",
+    "vtype": "FLOAT"
+   },
+   "min": 0.2,
+   "max": 1.1,
+   "step": 0.01
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 911243928847175,
+   "target": {
+    "node": "3",
+    "input": "noise_seed",
+    "vtype": "INT"
+   }
+  }
+ ],
+ "warnings": []
+}
