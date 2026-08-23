@@ -14,7 +14,6 @@
   "node": "38"
  },
  "note": null,
- "grid": false,
  "inputs": [
   {
    "key": "images[0]",

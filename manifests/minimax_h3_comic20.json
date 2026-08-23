@@ -5,7 +5,7 @@
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@minimax-批量化漫剧20宫格-直出1分钟视频V3.json",
  "group": "视频",
  "outputType": "video",
- "card": "minimax_h3_comic20",
+ "card": "video",
  "slots": "img5+aud0",
  "images": 5,
  "audios": 0,
@@ -14,7 +14,6 @@
   "node": "79"
  },
  "note": "每张图都要是 2×2 的四宫格拼图，上传后自动切成 4 个分镜、连成一段视频。传满 5 张就是 20 宫格，按顺序接成一整条完整视频。",
- "grid": true,
  "inputs": [
   {
    "key": "images[0]",
