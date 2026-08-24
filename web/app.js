@@ -405,6 +405,7 @@ function buildCard(c) {
     <div class="cf"><span class="st"></span><span class="meta" style="margin-left:auto"></span></div>
     <div class="rz tl" title="拖动改大小（按住 Shift 只改宽）"></div>
     <div class="rz br" title="拖动改大小（按住 Shift 只改宽）"></div>
+    <div class="inport"></div>
     <div class="port" title="拖到空白处 → 用本卡产物新建下游卡"></div>`;
   c._el = d;
   applySize(c);
@@ -677,6 +678,8 @@ function startWire(ev, c) {
   p.setAttribute("class", "tmp");
   el.wires.appendChild(p);
   const x1 = a.x + a.w, y1 = a.y + a.h / 2;
+  // 拉线期间把所有收得下的入口点亮，不用一张张试哪张接得上
+  el.world.classList.add("wiring");
   let last = null;
   const mv = (e) => {
     const w = toWorld(e.clientX, e.clientY);
@@ -687,6 +690,7 @@ function startWire(ev, c) {
   const up = (e) => {
     document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
     p.remove();
+    el.world.classList.remove("wiring");
     const tc = e.target.closest && e.target.closest(".card");
     if (tc && tc.dataset.id !== c.id) linkTo(c, PROJ.cards.find(x => x.id === tc.dataset.id));
     else if (last) spawnDownstream(c, last);
@@ -1469,6 +1473,21 @@ function paintTitle(c) {
   t.textContent = c.name
     || (md && (md.ladder || md.route) ? md.name : cap ? cap.name : c.cap);
   t.classList.toggle("named", !!c.name);
+  paintPort(c);
+}
+
+/** 左边那颗绿点：这张卡收得下上游产物。纯文生图没有素材槽，不画点 ——
+    画了就是在说"往这儿接"，接过去只会弹"没有可接收的槽位"。
+    路由卡按它两路的类型报（图片/视频都收），不管当前切到了哪一路。
+    跟着 paintTitle 一起刷，因为换模式、换路由都会改能力，能收什么也跟着变。 */
+function paintPort(c) {
+  const p = c._el && c._el.querySelector(".inport");
+  if (!p) return;
+  const md = modeOf(c), cap = capOf(c);
+  const kinds = md && md.route ? Object.keys(md.route)
+    : [...new Set((cap ? cap.inputs : []).filter(s => MEDIA.includes(s.type)).map(s => s.type))];
+  p.style.display = kinds.length ? "" : "none";
+  p.title = `上游卡的产物拖到这里（收${kinds.map(k => KIND_ZH[k] || k).join(" / ")}）`;
 }
 
 function slotEl(c, s) {
