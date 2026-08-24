@@ -258,3 +258,99 @@ history（`execution.py` 的 `self.history` 不落盘）。**跟提交格式、�
 —— 这就是「拿到产物定位不到工作流」的原因。mp4 是存得下 workflow 的
 （`comfy_api/latest/_input_impl/video_types.py` 的 `use_metadata_tags`），只是没给它。
 两件事都还没动。
+
+---
+
+## 环境补丁：给 cupy 补上 nvrtc，补帧才跑得起来（2026-08-24）
+
+**这一条不改核心代码，改的是 `python_embeded` 里装了什么 + 启动脚本的环境变量。**
+
+### 症状
+
+`GIMMVFI_interpolate` 节点一跑就报：
+
+```
+'CUDA_HOME' not set, unable to find cuda-toolkit installation.
+```
+
+换采样器、换模型、改参数全都无效 —— 根因在环境，不在工作流。
+
+### 根因
+
+`ComfyUI-GIMM-VFI/gimmvfi/generalizable_INR/modules/softsplat.py` 用 **cupy 现场编译
+CUDA 核**（`cuda_launch()` 里 `cupy.RawModule`）。包里装的是 `cupy_cuda12x` 13.6.0，
+但**没装任何 CUDA Toolkit**，`nvrtc` 这个编译器 DLL 整个包里都找不到
+（只有 `torch/lib/nvrtc64_130_0.dll`，那是 CUDA **13** 的，torch 自己用，cupy 要的是
+`nvrtc64_120_0.dll`）。所以这个包自带的补帧工作流**从来就跑不起来**。
+
+`softsplat.py` 那段的逻辑是：
+
+```python
+try:
+    os.environ.setdefault("CUDA_HOME", cupy.cuda.get_cuda_path())
+except Exception:
+    if "CUDA_HOME" not in os.environ:
+        raise RuntimeError("'CUDA_HOME' not set, unable to find cuda-toolkit installation.")
+```
+
+`get_cuda_path()` 返回 `None` → `setdefault(key, None)` 抛 TypeError → 落到 except →
+`CUDA_HOME` 也没有 → 抛出那句话。所以它其实**并不真的用** `CUDA_HOME`，只是拿它当
+"有没有 CUDA 环境"的哨兵。
+
+### 修法（两个 pip 包 + 两个环境变量，缺一不可）
+
+```bash
+cd /d/ComfyUI_Mie_V33
+./python_embeded/python.exe -m pip install nvidia-cuda-nvrtc-cu12          # 76 MB，提供 nvrtc64_120_0.dll
+./python_embeded/python.exe -m pip install "nvidia-cuda-runtime-cu12==12.9.*"  # 3.6 MB，只要它的头文件
+```
+
+第二个包是 cupy 自己点名要的：`cupy/_environment.py` 的
+`_get_include_dir_from_conda_or_wheel()` 里写着「nvrtc ≥ 12.2 的 fp16 头文件依赖
+CUDA Runtime 的头文件」，找不到就编译报 `cannot open source file "cuda_fp16.h"`。
+版本号要跟 nvrtc 对上（都是 12.9）。
+
+然后在 `1_1点击启动comfyui.bat` 顶上加两行：
+
+```bat
+set "CUDA_PATH=%~dp0python_embeded\Lib\site-packages\nvidia\cuda_nvrtc"
+set "PATH=%CUDA_PATH%\bin;%PATH%"
+```
+
+**两行的作用不一样，都不能省**（实测过四种组合）：
+
+| 只设 | 结果 |
+|---|---|
+| 什么都不设 | `CuPy failed to load nvrtc64_120_0.dll` |
+| 只设 `PATH` | 同上 —— Python 3.8+ 的 `ctypes.CDLL` **不查 PATH** |
+| 只设 `CUDA_PATH` | `nvrtc: error: failed to open nvrtc-builtins64_129.dll` —— nvrtc 自己加载隔壁那个 builtins 时**只查 PATH** |
+| 两个都设 | ✅ |
+
+`CUDA_PATH` 走的是 cupy `_environment.py:_setup_win32_dll_directory()`：它会把
+`%CUDA_PATH%\bin` 喂给 `os.add_dll_directory()`。`nvidia/cuda_nvrtc/` 恰好就是
+`bin/` + `include/` 的 toolkit 目录结构，直接指过去即可。
+
+顺带 `CUDA_PATH` 一设上，`get_cuda_path()` 就有返回值了，上面那个 `CUDA_HOME` 哨兵也
+一起过掉，不用再单独设 `CUDA_HOME`。
+
+### 验证判据
+
+```bash
+# 1) cupy 能编译最简核
+./python_embeded/python.exe -c "import cupy; print((cupy.arange(10)*2).sum())"   # -> 90
+# 2) 真跑一遍补帧，出片帧率翻倍、时长不变
+```
+
+实测：768×1024 的片子、`只处理前几帧 = 60`、`补帧倍数 = 2` → 33 秒出片，
+源 24 fps / 前 60 帧 = 2.5 秒，出片 **48 fps / 2.48 秒**。帧率翻倍、时长不变，符合预期。
+
+### 影响面
+
+包里真正 `import cupy` 的只有两个插件：`ComfyUI-GIMM-VFI` 和 `comfyui-frame-interpolation`
+（后者 `config.yaml` 里 `ops_backend: "cupy"`，之前同样是坏的，现在也跟着能用了）。
+**SeedVR2 不用 cupy** —— 早先 grep 命中 `causal_inflation_lib.py` 是假阳性，那是变量名
+`memory_occupy` 里含 "cupy" 这几个字母。torch 自带一整套 CUDA 库，从不查 cupy。
+所以这一改**动不到任何原来能用的能力**。
+
+⚠️ 整合包「升级」或「一键修复」之后，`1_1点击启动comfyui.bat` 那两行可能被覆盖，
+补帧又会报 `CUDA_HOME not set` —— 回来照抄一遍即可（pip 包一般还在）。
