@@ -693,7 +693,7 @@ function startWire(ev, c) {
     el.world.classList.remove("wiring");
     const tc = e.target.closest && e.target.closest(".card");
     if (tc && tc.dataset.id !== c.id) linkTo(c, PROJ.cards.find(x => x.id === tc.dataset.id));
-    else if (last) spawnDownstream(c, last);
+    else if (last) spawnDownstream(c, last, e.clientX, e.clientY);
   };
   document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
 }
@@ -996,14 +996,46 @@ async function linkTo(from, to) {
   } catch (e) { toast("引用失败：" + e.message); }
 }
 
-async function spawnDownstream(from, at) {
+/** 这个模式收得下 kind 类型的素材吗。
+    路由卡看它有没有那一路；阶梯模式的 md.id 是张数最多那条（超集），
+    它有的槽少张数那条都有，所以只看超集就够。 */
+function modeTakes(md, kind) {
+  if (md.route) return !!md.route[kind];
+  const cap = CAPS[modeCap(md)];
+  return !!cap && cap.inputs.some(s => s.type === kind);
+}
+
+/** 从出口拖到空白处：列出真收得下这份产物的玩法让人自己挑。
+    以前是按产出类型猜一张（图→生视频、视频→生图），猜错的概率不低，
+    而且"视频接进生图当参考图"根本跑不通（LoadImage 读不了 mp4）。
+    这里只列槽位类型对得上的，选完直接建卡 + 连线。 */
+async function spawnDownstream(from, at, cx, cy) {
   const out = (from.outputs || [])[0];
-  // 图 → 视频；视频/音频 → 生图（当参考）
-  const want = out && out.kind === "video" ? "card_image" : "card_video";
-  const def = CARDS.find(d => d.id === want && d.modes.length) || CARDS.find(d => d.modes.length);
-  if (!def) return;
-  const c = addCard(def.id, at.x, at.y - 40);
-  if (out) await linkTo(from, c);
+  // 还没跑过就按这条能力"将来会出什么"来列 —— 先把链子搭起来、回头再跑是常见做法，
+  // 不能因为上游还空着就什么都不给建（linkTo 那边会提醒去跑上游）
+  const kind = out ? out.kind : (capOf(from) || defOf(from) || {}).outputType;
+  if (!kind) return;
+  const items = [];
+  for (const [gname, defs] of menuGroups()) {
+    const hit = [];
+    for (const def of defs) {
+      for (const md of def.modes) if (modeTakes(md, kind)) hit.push([def, md]);
+    }
+    if (!hit.length) continue;
+    items.push({ group: gname });
+    for (const [def, md] of hit) {
+      items.push({
+        icon: def.icon, text: md.name,
+        run: async () => {
+          const c = addCard(def.id, at.x, at.y - 40, modeCap(md));
+          await linkTo(from, c);
+        },
+      });
+    }
+  }
+  const zh = KIND_ZH[kind] || kind;
+  if (!items.length) return toast(`没有卡片收${zh}素材`);
+  showMenu(cx, cy, `把这个${zh}接给…`, items);
 }
 
 /** 把 ComfyUI 输出目录里的产物搬进 input 目录，得到可用的 LoadImage 值 */
