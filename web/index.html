@@ -4,6 +4,9 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>抽卡系统</title>
+<!-- 浏览器标签页的图标。favicon.png 是 64²、icon.png 是 256²（加到主屏幕/书签用大的那张） -->
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="apple-touch-icon" href="icon.png">
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -11,6 +14,7 @@
 <!-- ---------- 左侧项目栏 ---------- -->
 <aside id="side">
   <div class="head">
+    <img src="icon.png" alt="" class="logo" draggable="false">
     <b>抽卡系统</b>
     <span class="dot" id="dot" title="ComfyUI 连接状态"></span>
   </div>
@@ -26,6 +30,7 @@
     <button class="tbtn" id="addcard" style="display:none">＋ 新建卡片</button>
     <button class="tbtn" id="fit" style="display:none">复位视图</button>
     <span id="hint"></span>
+    <button class="tbtn" id="jobsbtn" title="查看所有任务">任务</button>
   </div>
 
   <div id="stage">
@@ -45,6 +50,7 @@
 <!-- ---------- 右侧历史产物栏 ---------- -->
 <aside id="hist" style="display:none"></aside>
 
+<div id="jobs" style="display:none"></div>
 <div id="panel" style="display:none"></div>
 <div id="view" style="display:none"><div class="vbox"></div></div>
 <div id="menu" style="display:none"></div>

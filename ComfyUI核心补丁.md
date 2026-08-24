@@ -110,7 +110,8 @@ return [-video_out.to(video_x.dtype), -audio_out.to(audio_x.dtype)]
 
 ```bash
 cd /d/ComfyUI_Mie_V33
-./ComfyUI/ffmpeg.exe -i ComfyUI/output/video/<产物>.mp4 -vn -ac 1 -ar 16000 -f wav /tmp/a.wav
+FF=python_embeded/Lib/site-packages/imageio_ffmpeg/binaries/ffmpeg-win-x86_64-v7.1.exe
+$FF -i ComfyUI/output/video/<产物>.mp4 -vn -ac 1 -ar 16000 -f wav /tmp/a.wav
 ```
 
 判据：音频 latent 的 std 应该在 **0.5~0.6** 量级（坏的时候只有 0.26）；

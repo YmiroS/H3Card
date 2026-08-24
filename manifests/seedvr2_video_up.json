@@ -37,7 +37,7 @@
    "step": 15,
    "default": 0,
    "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
-   "advanced": true,
+   "advanced": false,
    "target": {
     "node": "968",
     "input": "frame_load_cap",

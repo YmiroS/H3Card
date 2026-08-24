@@ -1,0 +1,269 @@
+{
+ "69": {
+  "class_type": "ConditioningZeroOut",
+  "inputs": {
+   "conditioning": [
+    "68",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Conditioning Zero Out"
+  }
+ },
+ "70": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "31",
+    0
+   ],
+   "positive": [
+    "68",
+    0
+   ],
+   "negative": [
+    "69",
+    0
+   ],
+   "latent_image": [
+    "73",
+    0
+   ],
+   "seed": 908470704303342,
+   "steps": 9,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "71": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "70",
+    0
+   ],
+   "vae": [
+    "33",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "72": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "71",
+    0
+   ],
+   "filename_prefix": "ComfyUI"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ },
+ "73": {
+  "class_type": "VAEEncode",
+  "inputs": {
+   "pixels": [
+    "63",
+    0
+   ],
+   "vae": [
+    "33",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Encode"
+  }
+ },
+ "31": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "zImageTurboQuantized_fp8ScaledE4m3fnKJ.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "32": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen_3_4b.safetensors",
+   "type": "qwen_image",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "33": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "flux-ae.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "66": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "05fe66b31eda0994d9a3e101ef7aa15056ef0f3aaaa414e096996a940dd9e12d.jpg"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "82": {
+  "class_type": "ShowText|pysssss",
+  "inputs": {
+   "text": [
+    "81",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Show Text 🐍"
+  }
+ },
+ "68": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "32",
+    0
+   ],
+   "text": [
+    "89",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "CLIP Text Encode (Prompt)"
+  }
+ },
+ "89": {
+  "class_type": "easy cleanGpuUsed",
+  "inputs": {
+   "anything": [
+    "82",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy cleanGpuUsed"
+  }
+ },
+ "65": {
+  "class_type": "GetImageSize",
+  "inputs": {
+   "image": [
+    "66",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Get Image Size"
+  }
+ },
+ "63": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {
+   "image": [
+    "66",
+    0
+   ],
+   "aspect_ratio": "custom",
+   "proportional_width": 1,
+   "proportional_height": 1,
+   "fit": "crop",
+   "method": "lanczos",
+   "round_to_multiple": "8",
+   "scale_to_side": "longest",
+   "scale_to_length": [
+    "65",
+    0
+   ],
+   "background_color": "#000000"
+  },
+  "_meta": {
+   "title": "LayerUtility: ImageScaleByAspectRatio V2"
+  }
+ },
+ "79": {
+  "class_type": "llama_cpp_model_loader",
+  "inputs": {
+   "model": "Qwen3.5-27B-UD-IQ3_XXS.gguf",
+   "mmproj": "mmproj-F16.gguf",
+   "chat_handler": "Qwen3.5",
+   "n_ctx": 8192,
+   "vram_limit": -1,
+   "image_min_tokens": 0,
+   "image_max_tokens": 0
+  },
+  "_meta": {
+   "title": "Llama-cpp Model Loader"
+  }
+ },
+ "80": {
+  "class_type": "llama_cpp_parameters",
+  "inputs": {
+   "max_tokens": 1024,
+   "top_k": 30,
+   "top_p": 0.9,
+   "min_p": 0.05,
+   "typical_p": 1,
+   "temperature": 0.8,
+   "repeat_penalty": 1,
+   "frequency_penalty": 0,
+   "presence_penalty": 1,
+   "mirostat_mode": 0,
+   "mirostat_eta": 0.1,
+   "mirostat_tau": 5,
+   "state_uid": -1
+  },
+  "_meta": {
+   "title": "Llama-cpp Parameters"
+  }
+ },
+ "81": {
+  "class_type": "llama_cpp_instruct_adv",
+  "inputs": {
+   "llama_model": [
+    "79",
+    0
+   ],
+   "parameters": [
+    "80",
+    0
+   ],
+   "images": [
+    "66",
+    0
+   ],
+   "preset_prompt": "Normal - Describe",
+   "custom_prompt": "详细描述图像内容",
+   "system_prompt": "你是一个专业的图像描述专家，用简洁、专业的语言描述提示词的内容。",
+   "inference_mode": "video",
+   "max_frames": 24,
+   "max_size": 256,
+   "seed": 1,
+   "force_offload": false,
+   "save_states": false
+  },
+  "_meta": {
+   "title": "Llama-cpp Instruct"
+  }
+ }
+}

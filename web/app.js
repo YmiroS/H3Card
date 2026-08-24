@@ -15,6 +15,7 @@ let CARDS = [];            // 卡种（生图 / 生视频）
 let CAPS = {};             // 能力清单
 let PROJ = null;           // 当前项目
 let projects = [];
+let TASKS = [];            // 服务端所有任务（不限本项目），右上角计数和任务浮窗都看它
 let view = { x: 60, y: 70, k: 1 };
 let selId = null;
 let saveTimer = null;
@@ -25,6 +26,7 @@ const el = {
   stage: $("#stage"), world: $("#world"), wires: $("#wires"),
   empty: $("#empty"), panel: $("#panel"), hist: $("#hist"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
+  jobsbtn: $("#jobsbtn"), jobs: $("#jobs"),
   view: $("#view"), vbox: $("#view .vbox"),
 };
 
@@ -74,6 +76,12 @@ const defOf = (c) => {
   return CARDS.find(d => d.modes.some(m => modeHas(m, c.cap))) || cardDef(c.type);
 };
 const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHas(m, c.cap)); };
+/** 卡片显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
+    路由卡同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频 */
+const titleOf = (c) => {
+  const cap = capOf(c), md = modeOf(c);
+  return c.name || (md && (md.ladder || md.route) ? md.name : cap ? cap.name : c.cap);
+};
 const filledImgs = (c) => Object.keys(c.assets || {})
   .filter(k => k.startsWith("images[") && c.assets[k]).length;
 
@@ -110,6 +118,7 @@ function putAsset(c, s, file) {
     drawWires();
   }
   c.assets[s.key] = file;
+  paintKind(c);            // 路由卡的卡脚徽标从「跟素材」变成真类型
   return s;
 }
 
@@ -258,6 +267,7 @@ function hoverBrief(node, capGetter, nameGetter) {
   const demo = projects.find(p => p.locked);
   if (demo) await openProject(demo.id);
   setInterval(health, 5000);
+  pollJobs();
   setInterval(pollJobs, 700);
 })();
 
@@ -386,10 +396,21 @@ function render() {
   el.hint.textContent = `${PROJ.cards.length} 张卡`;
 }
 
+/** 这张卡这一轮会出什么：认真正会跑的那条能力，不是卡片定义。
+    路由卡的卡片定义写死是 image（`_cards.json` 取第一路），切到视频那一路后还报"图片"
+    就是在骗人；工具卡的卡片图标（🧩 ✨）本身也不说明出图还是出视频。 */
+const outKindOf = (c) => ((CAPS[runCap(c)] || capOf(c) || defOf(c) || {}).outputType) || "image";
+/** 路由卡还一格素材都没放：出图还是出视频要等放进来那一刻才定，别先报一个。
+    （新建的路由卡 c.cap 是排在最前那一路 = 图片，直接读它会误报"出图片"） */
+const kindUndecided = (c) => {
+  const md = modeOf(c);
+  return !!(md && md.route) && !Object.values(c.assets || {}).some(Boolean);
+};
+
 /** 画面区的空占位：还没出过东西、或者这一轮失败/取消了都用它 */
 function phHTML(c) {
-  const def = defOf(c);
-  return `<span class="ph">${(def && def.outputType) === "video" ? "🎬" : "🖼"}</span>`;
+  return `<span class="ph">${kindUndecided(c) ? "🖼🎬"
+    : outKindOf(c) === "video" ? "🎬" : "🖼"}</span>`;
 }
 
 function buildCard(c) {
@@ -402,7 +423,7 @@ function buildCard(c) {
     <div class="ch"><span>${def ? def.icon : "▪"}</span><span class="t"></span><button class="x" title="删除">✕</button></div>
     <div class="body">${phHTML(c)}</div>
     <div class="bar"><i></i></div>
-    <div class="cf"><span class="st"></span><span class="meta" style="margin-left:auto"></span></div>
+    <div class="cf"><span class="kt"></span><span class="st"></span><span class="meta" style="margin-left:auto"></span></div>
     <div class="rz tl" title="拖动改大小（按住 Shift 只改宽）"></div>
     <div class="rz br" title="拖动改大小（按住 Shift 只改宽）"></div>
     <div class="inport"></div>
@@ -707,10 +728,12 @@ function bindGlobal() {
     openMenu(r.left + 140, r.top + 120, toWorld(r.left + 140, r.top + 120));
   };
   el.fit.onclick = () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); };
+  el.jobsbtn.onclick = toggleJobs;
+  addEventListener("resize", () => { placePanel(); placeJobs(); });
 
   el.stage.addEventListener("mousedown", (ev) => {
     if (ev.button !== 0) return;
-    closeMenu();
+    closeMenu(); closeJobs();
     selId = null; closePanel();
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
     const s = { mx: ev.clientX, my: ev.clientY, x: view.x, y: view.y };
@@ -760,6 +783,8 @@ function bindGlobal() {
     if (ev.key !== "Escape") return;
     // 大图开着时 Esc 只关大图，不该顺手把卡片选中状态和参数面板一起清掉
     if (el.view.style.display !== "none") { closeViewer(); return; }
+    // 任务浮窗开着时 Esc 只关它，别顺手把选中的卡和参数面板一起清掉
+    if (el.jobs.style.display !== "none") { closeJobs(); return; }
     closeMenu(); tipHide(); selId = null; closePanel();
   });
 }
@@ -991,6 +1016,7 @@ async function linkTo(from, to) {
   try {
     toast(`引用上游产物 → ${spec.label}`);
     to.assets[spec.key] = await importOutput(out);
+    paintKind(to);
     if (selId === to.id) openPanel(to.id);
     save();
   } catch (e) { toast("引用失败：" + e.message); }
@@ -1499,13 +1525,34 @@ function templateBlock(c, s) {
 }
 function paintTitle(c) {
   if (!c._el) return;
-  const t = c._el.querySelector(".ch .t"), cap = capOf(c), md = modeOf(c);
-  // 合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
-  // 路由卡同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频
-  t.textContent = c.name
-    || (md && (md.ladder || md.route) ? md.name : cap ? cap.name : c.cap);
+  const t = c._el.querySelector(".ch .t");
+  t.textContent = titleOf(c);
   t.classList.toggle("named", !!c.name);
+  paintKind(c);
   paintPort(c);
+}
+
+/** 卡脚最左边那枚徽标：这张卡出图还是出视频。
+    卡片图标（🧩 工具、✨ 画质增强）和用户自己改的卡名都可能完全看不出类型，
+    产物出来之前画面区又是空的 —— 所以类型要有个固定位置常驻，不靠猜。
+    路由卡还没放素材时两路都可能，标「跟素材」；放进去那一刻 paintTitle 会重刷。
+    跟着 paintTitle 一起刷：换模式、换路由、按张数换能力都会改产出类型。 */
+function paintKind(c) {
+  const k = c._el && c._el.querySelector(".cf .kt");
+  if (!k) return;
+  const md = modeOf(c);
+  const undecided = kindUndecided(c);
+  const kind = outKindOf(c);
+  k.dataset.kind = undecided ? "both" : kind;
+  k.textContent = undecided ? "🖼🎬 跟素材" : kind === "video" ? "🎬 视频" : "🖼 图片";
+  const ins = md && md.route ? Object.keys(md.route)
+    : [...new Set(((capOf(c) || {}).inputs || [])
+        .filter(s => MEDIA.includes(s.type)).map(s => s.type))];
+  k.title = (undecided ? "放图片就出图片、放视频就出视频" : `这张卡出${KIND_ZH[kind]}`)
+    + (ins.length ? `；要${ins.map(x => KIND_ZH[x] || x).join(" / ")}素材` : "；不用素材");
+  // 还没出过产物时画面区那个大图标也是同一个信息，一起换掉（有产物就别动它）
+  const body = c._el.querySelector(".body");
+  if (body && body.querySelector(".ph")) body.innerHTML = phHTML(c);
 }
 
 /** 左边那颗绿点：这张卡收得下上游产物。纯文生图没有素材槽，不画点 ——
@@ -1548,6 +1595,7 @@ function slotEl(c, s) {
         icon: "✕", text: "清空这一格", danger: true, run: () => {
           delete c.assets[s.key];
           PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.slot === s.key));
+          paintKind(c);
           drawWires(); openPanel(c.id); save();
         },
       },
@@ -1739,7 +1787,37 @@ function rowEl(c, s) {
     row.appendChild(i);
   }
   if (s.key === "megapixels" || s.key === "scale_to_length") augRes(c, s, row);
+  if (s.key === "frame_load_cap") augFrames(c, s, row);
   return row;
+}
+
+/** 「只处理前几帧」下面那行读数：这段视频一共多少帧。
+    滑条上限是个死数（300），素材可能只有 243 帧 —— 不报总帧数，用户没法判断自己
+    填的这个数是"截一小段"还是"跟整段一样"。帧数只能探文件，上传时就探好存进素材
+    记录；这条改动之前存的素材没有，现探一次（/api/media）再补回记录里。 */
+async function augFrames(c, s, row) {
+  const a = Object.values(c.assets || {}).find(x => x && x.kind === "video");
+  const out = document.createElement("span"); out.className = "resout";
+  const line = document.createElement("div"); line.className = "resline";
+  line.appendChild(out); row.appendChild(line);
+  if (!a) { out.textContent = "放进视频后这里显示总帧数"; return; }
+  let miss = "读取总帧数…";
+  const draw = () => {
+    if (!a.frames) { out.textContent = miss; return; }
+    const v = parseFloat(c.params[s.key] != null ? c.params[s.key] : s.default) || 0;
+    out.textContent = `这段共 ${a.frames} 帧`
+      + (a.fps ? ` · ${(+a.fps).toFixed(0)} fps · ${(+a.duration).toFixed(1)} 秒` : "")
+      + (v > 0 && v < a.frames ? ` → 只跑前 ${v} 帧` : " → 整段都跑");
+  };
+  draw();
+  for (const i of row.querySelectorAll("input")) i.addEventListener("input", draw);
+  if (a.frames) return;
+  try {
+    Object.assign(a, await api("/api/media?ref=" + encodeURIComponent(a.ref)));
+    if (a.frames) save();
+  } catch (e) { /* 探不到就落到下面那句 */ }
+  miss = "总帧数读不出来（填 0 = 整段，一定没错）";
+  draw();
 }
 
 /** 给分辨率那一行补上「多少 p」读数和 480/544/640/768p 快捷键。
@@ -1806,7 +1884,9 @@ function payloadOf(c) {
     else if (s.default !== undefined) params[s.key] = s.default;
   }
   for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
-  return { capability: cap.id, params, assets };
+  // card/cardName 只给任务浮窗用：光有能力名说不清是哪张卡在跑，也没法点回去
+  return { capability: cap.id, params, assets,
+           project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c) };
 }
 
 async function run(c) {
@@ -1830,14 +1910,25 @@ async function cancel(c) {
   try { await jpost(`/api/job/${c.job}/cancel`); } catch (e) { toast(e.message); }
 }
 
+/** 一次把所有任务捞回来：右上角的计数要算上别的项目/别处提交的活儿，
+    所以不能只按当前项目的卡片一张张问。 */
 async function pollJobs() {
+  try { TASKS = (await api("/api/jobs")).jobs || []; } catch (e) { return; }
+  paintJobsBtn();
+  if (el.jobs.style.display !== "none") renderJobs();
   if (!PROJ) return;
   const live = PROJ.cards.filter(c => c.job && ["queued", "running"].includes(c.status));
   if (!live.length) return;
   let dirty = false;
   for (const c of live) {
-    let j;
-    try { j = await api(`/api/job/${c.job}`); } catch (e) { continue; }
+    const j = TASKS.find(x => x.id === c.job);
+    // 任务被从列表里删掉了（在浮窗里删的）。服务端删之前已经把活儿停了，
+    // 这里必须跟着落地，不然卡片会一直转圈等一个不存在的任务
+    if (!j) {
+      c.status = "canceled"; c.step = ""; c.job = null; paint(c); dirty = true;
+      if (el.panel._id === c.id) openPanel(c.id);
+      continue;
+    }
     const was = c.status;
     c.status = j.status; c.progress = j.progress; c.error = j.error;
     c.queue_remaining = j.queue_remaining; c.step = j.step || "";
@@ -1865,4 +1956,201 @@ async function pollJobs() {
     }
   }
   if (dirty) save();
+}
+
+/* ================= 任务浮窗 ================= */
+const JOB_ZH = { queued: "等待中", running: "运行中", done: "已完成",
+                 error: "失败", canceled: "已取消" };
+const jobLive = (j) => j.status === "queued" || j.status === "running";
+const jobCls = (j) => j.status === "running" ? "run" : j.status === "queued" ? "wait"
+  : j.status === "done" ? "done" : j.status === "error" ? "bad" : "gone";
+
+/** 右上角那颗按钮。数字 = 还没跑完的任务数；后面那截字说明它们是在跑还是在等，
+    颜色同一件事再说一遍（青=在跑、橙=在等、灰=闲着），不点开也知道现在什么状况。 */
+function paintJobsBtn() {
+  const live = TASKS.filter(jobLive);
+  const run = live.find(j => j.status === "running");
+  const b = el.jobsbtn;
+  const sig = `${live.length}|${run ? Math.round((run.progress || 0) * 100) : -1}`;
+  if (b._sig === sig) return;        // 700ms 一次的轮询，没变就别重画
+  b._sig = sig;
+  b.classList.toggle("run", !!run);
+  b.classList.toggle("wait", !run && live.length > 0);
+  b.innerHTML = `任务<span class="n">(${live.length})</span>`;
+  const s = run ? `运行中 ${Math.round((run.progress || 0) * 100)}%`
+    : live.length ? "等待中" : "";
+  if (s) {
+    const t = document.createElement("span"); t.className = "s"; t.textContent = s;
+    b.appendChild(t);
+  }
+  b.title = live.length ? `${live.length} 个任务没跑完，点开可以看详情、停止或删除`
+    : "现在没有任务在跑，点开看历史";
+}
+
+function toggleJobs() {
+  if (el.jobs.style.display === "none") {
+    el.jobs.style.display = "";
+    el.jobsbtn.classList.add("open");
+    renderJobs(); placeJobs();
+    pollJobs();          // 刚打开别先给人看上一轮 700ms 前的旧状态
+  } else closeJobs();
+}
+
+function closeJobs() {
+  el.jobs.style.display = "none";
+  el.jobs.innerHTML = "";
+  el.jobs._sig = null;
+  el.jobsbtn.classList.remove("open");
+}
+
+/** 挂在按钮下面，右边缘对齐。宽度够不着就往左躲，别飘到窗外 */
+function placeJobs() {
+  if (el.jobs.style.display === "none") return;
+  const GAP = 8, r = el.jobsbtn.getBoundingClientRect();
+  el.jobs.style.maxHeight = (innerHeight - r.bottom - GAP * 2) + "px";
+  const w = el.jobs.offsetWidth;
+  el.jobs.style.top = (r.bottom + GAP) + "px";
+  el.jobs.style.left = Math.max(GAP, Math.min(r.right - w, innerWidth - w - GAP)) + "px";
+}
+
+/** 列表骨架的签名：有哪些任务、各自什么状态。只有它变了才重建 DOM ——
+    每 700ms 整块重画会让按钮在 mousedown 和 mouseup 之间被换掉，那一下点击就丢了。
+    进度、步骤、耗时这些一直在变的东西交给 fillJobRow 原地刷。 */
+const jobsSig = () => TASKS.map(j => `${j.id}:${j.status}:${j.error ? 1 : 0}`).join(",");
+
+function renderJobs() {
+  const sig = jobsSig();
+  if (el.jobs._sig === sig) {
+    for (const d of el.jobs.querySelectorAll(".jrow")) {
+      const j = TASKS.find(x => x.id === d._id);
+      if (j) fillJobRow(d, j);
+    }
+    return;
+  }
+  el.jobs._sig = sig;
+  // 骨架重建时要留住滚动位置，不然新任务一进来列表就被弹回顶部
+  const old = el.jobs.querySelector(".jlist");
+  const scrolled = old ? old.scrollTop : 0;
+
+  el.jobs.innerHTML = "";
+  const hd = document.createElement("div"); hd.className = "jhd";
+  const ttl = document.createElement("b");
+  const n = TASKS.filter(jobLive).length;
+  ttl.textContent = n ? `任务 · ${n} 个没跑完` : "任务";
+  hd.appendChild(ttl);
+  if (TASKS.some(j => !jobLive(j))) {
+    const clr = document.createElement("button");
+    clr.className = "lnk"; clr.textContent = "清空已结束";
+    clr.title = "只清列表里的记录，已经出好的产物还在卡片上";
+    clr.onclick = clearDoneJobs;
+    hd.appendChild(clr);
+  }
+  const x = document.createElement("button");
+  x.className = "x"; x.textContent = "✕"; x.title = "关闭"; x.onclick = closeJobs;
+  hd.appendChild(x);
+
+  const list = document.createElement("div"); list.className = "jlist";
+  if (!TASKS.length) {
+    const e = document.createElement("div"); e.className = "jempty";
+    e.textContent = "还没有任务。在卡片上点「生成」，任务就会出现在这里。";
+    list.appendChild(e);
+  }
+  for (const j of TASKS) list.appendChild(jobRow(j));
+
+  el.jobs.append(hd, list);
+  list.scrollTop = scrolled;
+}
+
+function jobRow(j) {
+  const d = document.createElement("div");
+  d.className = "jrow " + jobCls(j);
+  d._id = j.id;
+
+  const r1 = document.createElement("div"); r1.className = "r1";
+  const nm = document.createElement("span"); nm.className = "nm";
+  // 卡片名才是用户认得出的那个（"角色图放大"），能力名（"SeedVR2 图片高清放大"）退到第二行
+  nm.textContent = j.cardName || j.name;
+  nm.title = j.cardName && j.cardName !== j.name ? `${j.cardName}（${j.name}）` : j.name;
+  d._st = document.createElement("span"); d._st.className = "st";
+  r1.append(nm, d._st);
+
+  const r2 = document.createElement("div"); r2.className = "r2";
+  d._sp = document.createElement("span"); d._sp.className = "sp";
+  d._tm = document.createElement("span");
+  r2.append(d._sp, d._tm);
+  d.append(r1, r2);
+
+  if (jobLive(j)) {
+    const bar = document.createElement("div"); bar.className = "bar";
+    d._bar = document.createElement("i");
+    bar.appendChild(d._bar); d.appendChild(bar);
+  }
+  if (j.error) {
+    const m = document.createElement("div"); m.className = "msg";
+    m.textContent = j.error; d.appendChild(m);
+  }
+
+  const acts = document.createElement("div"); acts.className = "acts";
+  if (jobLive(j)) acts.appendChild(actBtn("停止", () => stopTask(j)));
+  acts.appendChild(actBtn("删除", () => delTask(j), true));
+  if (j.project && j.card) acts.appendChild(actBtn("看卡片", () => focusTask(j)));
+  d.appendChild(acts);
+
+  fillJobRow(d, j);
+  return d;
+}
+
+/** 只刷每次轮询都在变的那几处：状态百分比、当前步骤、耗时、进度条 */
+function fillJobRow(d, j) {
+  const pct = Math.round((j.progress || 0) * 100);
+  // 排队的不报"前面还有几个"：ComfyUI 的 queue_remaining 是整条队列的长度，
+  // 不是这一条自己的位次，拿它当位次就是编数字。队列长度改在浮窗标题上说一次
+  d._st.textContent = j.status === "running" ? `运行中 ${pct}%`
+    : JOB_ZH[j.status] || j.status;
+  d._sp.textContent = j.step || j.name;   // 在跑就报当前步骤，没跑就报用的哪条能力
+  const ela = j.started ? fmtEla(((j.ended || Date.now() / 1000) - j.started) * 1000) : "";
+  d._tm.textContent = histTime(j.created * 1000) + (ela ? ` · ${ela}` : "");
+  if (d._bar) d._bar.style.width = pct + "%";
+}
+
+function actBtn(text, run, danger) {
+  const b = document.createElement("button");
+  if (danger) b.className = "danger";
+  b.textContent = text;
+  b.onclick = run;
+  return b;
+}
+
+async function stopTask(j) {
+  try { await jpost(`/api/job/${j.id}/cancel`); } catch (e) { return toast(e.message); }
+  pollJobs();
+}
+
+async function delTask(j) {
+  // 还在跑的删掉等于先停后删，这一步不可逆（跑到一半的算力就没了），所以问一句
+  if (jobLive(j) && !confirm("这个任务还没跑完，删除会先把它停掉。继续？")) return;
+  try { await api(`/api/job/${j.id}`, { method: "DELETE" }); } catch (e) { return toast(e.message); }
+  pollJobs();
+}
+
+async function clearDoneJobs() {
+  try { await jpost("/api/jobs/clear"); } catch (e) { return toast(e.message); }
+  pollJobs();
+}
+
+/** 从任务跳回它对应的那张卡：不在当前画布就先把那张画布打开 */
+async function focusTask(j) {
+  if (!PROJ || PROJ.id !== j.project) {
+    if (!projects.some(p => p.id === j.project)) return toast("这个任务所在的画布已经不在了");
+    await openProject(j.project);
+  }
+  const c = PROJ.cards.find(x => x.id === j.card);
+  if (!c) return toast("这张卡片已经从画布上删掉了");
+  const r = el.stage.getBoundingClientRect();
+  view.x = r.width / 2 - (c.x + cardW(c) / 2) * view.k;
+  view.y = r.height / 3 - c.y * view.k;
+  applyView();
+  selId = c.id;
+  for (const o of PROJ.cards) if (o._el) o._el.classList.toggle("sel", o.id === c.id);
+  openPanel(c.id); placePanel(); placeJobs(); save();
 }
