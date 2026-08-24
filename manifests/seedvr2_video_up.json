@@ -1,0 +1,159 @@
+{
+ "id": "seedvr2_video_up",
+ "name": "SeedVR2 视频高清放大",
+ "file": "SeedVR2视频高清修复放大 v2",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\SeedVR2图片视频高清\\SeedVR2视频高清修复放大 v2.json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "tool",
+ "card": "card_enhance",
+ "slots": "img0+aud0+vid1",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "graph": "graphs/seedvr2_video_up.api.json",
+ "output": {
+  "node": "1082"
+ },
+ "note": "把视频一帧一帧重新画清楚。帧数不变、时长不变，所以画面更清楚但不会更顺滑 —— 要更顺滑用「视频补帧插针」那张卡。非常慢（每一帧都要过一遍模型），先把「只处理前几帧」填 60 试一版，确认清晰度和帧率合心意了再改回 0 跑整段。",
+ "inputs": [
+  {
+   "key": "video[0]",
+   "label": "视频",
+   "type": "video",
+   "required": true,
+   "target": {
+    "node": "968",
+    "input": "video",
+    "kind": "upload_video"
+   }
+  },
+  {
+   "key": "frame_load_cap",
+   "label": "只处理前几帧",
+   "type": "slider",
+   "min": 0,
+   "max": 300,
+   "step": 15,
+   "default": 0,
+   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
+   "advanced": true,
+   "target": {
+    "node": "968",
+    "input": "frame_load_cap",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "resolution",
+   "label": "放大到(短边)",
+   "type": "slider",
+   "min": 512,
+   "max": 2048,
+   "step": 64,
+   "default": 1024,
+   "hint": "推荐 1024：出片短边有多少像素，长边按原图比例跟着放。往上调更清楚，但时间和显存涨得很快；先调小试一版，满意了再放大",
+   "advanced": false,
+   "target": {
+    "node": "1151",
+    "input": "resolution",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "max_resolution",
+   "label": "最长边上限",
+   "type": "slider",
+   "min": 0,
+   "max": 4096,
+   "step": 64,
+   "default": 1920,
+   "hint": "推荐 1920：长边算出来超过这个数，宽高就一起缩回来 —— 也就是说它会盖掉上面的「放大到(短边)」。上面调大了没反应，就是被这条卡住了。0 = 不限（长条形素材容易爆显存）",
+   "advanced": false,
+   "target": {
+    "node": "1151",
+    "input": "max_resolution",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "scale_by",
+   "label": "重画前先缩小",
+   "type": "slider",
+   "min": 0.25,
+   "max": 1,
+   "step": 0.05,
+   "default": 1,
+   "hint": "推荐 1：先把原图缩到这个比例，再照着重新画大。缩一点画得反而更细 —— 不缩的话糊的地方会被照着糊的重画一遍。1 = 不缩",
+   "advanced": true,
+   "target": {
+    "node": "1160",
+    "input": "scale_by",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "force_rate",
+   "label": "帧率",
+   "type": "slider",
+   "min": 8,
+   "max": 60,
+   "step": 1,
+   "default": 16,
+   "hint": "推荐 16：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
+   "advanced": false,
+   "target": {
+    "node": "968",
+    "input": "force_rate",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "force_rate",
+   "label": "帧率",
+   "type": "slider",
+   "min": 8,
+   "max": 60,
+   "step": 1,
+   "default": 16,
+   "hint": "推荐 16：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
+   "advanced": false,
+   "target": {
+    "node": "1082",
+    "input": "frame_rate",
+    "vtype": "FLOAT"
+   },
+   "mirror": true
+  },
+  {
+   "key": "force_rate",
+   "label": "帧率",
+   "type": "slider",
+   "min": 8,
+   "max": 60,
+   "step": 1,
+   "default": 16,
+   "hint": "推荐 16：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
+   "advanced": false,
+   "target": {
+    "node": "1087",
+    "input": "frame_rate",
+    "vtype": "FLOAT"
+   },
+   "mirror": true
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 9527,
+   "target": {
+    "node": "1151",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 4294967295
+  }
+ ],
+ "warnings": []
+}
