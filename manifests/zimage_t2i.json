@@ -1,6 +1,6 @@
 {
  "id": "zimage_t2i",
- "name": "Z-Image 文生图",
+ "name": "文生图",
  "file": "z-Image-标准版文生图",
  "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\4-Z-Image全系列\\z-Image-标准版文生图.json",
  "group": "图片",

@@ -8,8 +8,13 @@
   "modes": [
    {
     "id": "zimage_t2i",
-    "name": "Z-Image 文生图",
+    "name": "文生图",
     "slots": "img0+aud0+vid0"
+   },
+   {
+    "id": "zimage_i2i",
+    "name": "图生图",
+    "slots": "img1+aud0+vid0"
    },
    {
     "id": "flux2_klein_storyboard9",

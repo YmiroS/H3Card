@@ -30,9 +30,12 @@ MISSING = object()          # 「widgets_values 里根本没这一项」，区�
 CONTROL_AFTER = ("randomize", "fixed", "increment", "decrement")
 
 # P0 默认扫描清单：相对 WF_DIR 的路径 -> 固定 id
+# 这里的先后顺序就是画布菜单里模式的排列顺序（同一张卡内按图槽数排，图槽数一样的看这里），
+# 所以「文生图 / 图生图」挨着写，别被分镜插在中间。
 ALIASES = {
-    "3-Flux2-klein全系列/九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json": "flux2_klein_storyboard9",
     "4-Z-Image全系列/z-Image-标准版文生图.json": "zimage_t2i",
+    "4-Z-Image全系列/Z-Image 图生图-反推 .json": "zimage_i2i",
+    "3-Flux2-klein全系列/九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json": "flux2_klein_storyboard9",
     "1-minimax H3/@MinimaxH3：图生视频 (4步加速版).json": "minimax_h3_i2v",
     "1-minimax H3/@MinimaxH3：首尾帧生视频（4步加速版）.json": "minimax_h3_flf2v",
     "1-minimax H3/@MiniMax H3_ 说话唱歌 单人（4步加速版）.json": "minimax_h3_talk1",
@@ -49,7 +52,8 @@ ALIASES = {
 # 画布上的模式名（人工微调）。没写的能力走 short_name() 自动清洗文件名。
 # 要求：一眼看出这个工作流干什么，不带 @ 前缀、不带"4步加速版"这类实现细节。
 DISPLAY = {
-    "zimage_t2i": "Z-Image 文生图",
+    "zimage_t2i": "文生图",
+    "zimage_i2i": "图生图",
     "flux2_klein_storyboard9": "多宫格故事分镜",
     "minimax_h3_i2v": "H3 图生视频",
     "minimax_h3_flf2v": "H3 首尾帧生视频",
@@ -98,13 +102,19 @@ REVIVE = {"minimax_h3_ref4"}
 # 玩法说明，钉在参数面板最上面。只写「不知道就会跑废一轮」的用法。
 # 素材形态的硬要求（宫格拼图那种）是从图里自动认出来的，不用写在这里。
 NOTES = {
+    "zimage_i2i": "先让模型「看懂」你这张图、写成一段话，再照着那段话重画一张 —— "
+                  "所以出图是同一个内容和构图感觉，不是把原图改一改，细节不会一模一样。"
+                  "只放图片、提示词留着不动就能跑。提示词这一格填的是「怎么讲这张图」"
+                  "（默认「详细描述图像内容」），想改画面就在这里加一句，"
+                  "比如「详细描述图像内容，但把背景换成雪山」；写「一只猫」这种跟原图无关的"
+                  "反而会让它照着描述跑偏。出图尺寸跟着原图走，卡上没有画面比例可调。",
     "minimax_h3_ref9": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 "
                        "<Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。",
     "grid4_stitch": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」"
                     "要的素材，拼完直接连线过去。分镜顺序就是这个顺序。"
                     "画面比例和分辨率要跟下游那张卡调成一样，切回来的每格才不会再被裁一刀。",
-    "gimmvfi_interp": "给视频「加中间帧」：每两帧之间补出新的画面，帧率翻倍、时长不变，"
-                      "所以看起来更顺滑，不会变慢也不会变长。"
+    "gimmvfi_interp": "给视频「加中间帧」：在原有画面之间补出新的画面，凑到你要的帧率。"
+                      "时长不变，所以只是更顺滑，不会变慢也不会变长。"
                       "很吃时间和显存 —— 先拿几秒的短片段试，别一上来就丢整段。",
     "seedvr2_image_up": "重画式放大：不是拉大像素，是照着原图重新画一遍，"
                         "所以脸和字可能跟原图有出入，别用在要一模一样的场合。",
@@ -131,6 +141,10 @@ KNOBS = {
     "interpolation_factor": ("补帧倍数", 2, 4, 1,
                              "推荐 {d}：帧率翻 {d} 倍、时长不变，画面更顺滑。"
                              "每加一倍时间和显存都跟着涨，4 倍要跑很久"),
+    "target_fps": ("目标帧率", 24, 120, 2,
+                   "出片每秒多少帧、时长不变，填多少就出多少。60 是常见的「顺滑」档。"
+                   "填源视频帧率的整数倍最干净（源 24 → 48 / 72 / 96）；填别的数也照样出到位，"
+                   "只是会先把源重采样一下，个别帧重复。帧率翻几倍，时间和显存就翻几倍"),
     "resolution": ("放大到(短边)", 512, 2048, 64,
                    "推荐 {d}：出片短边有多少像素，长边按原图比例跟着放。"
                    "往上调更清楚，但时间和显存涨得很快；先调小试一版，满意了再放大"),
@@ -151,8 +165,8 @@ KNOBS = {
 # 上面这些旋钮默认折进「高级」。写在这里的是玩法本身的旋钮，要摆在面板正面。
 # max_resolution 进来不是因为它是玩法旋钮，而是因为它能悄悄盖掉 resolution ——
 # 一个能否决正面旋钮的开关必须也在正面，否则用户拖了「放大到(短边)」却没反应。
-PRIMARY_KNOBS = {"max_rows", "interpolation_factor", "resolution", "max_resolution",
-                 "force_rate"}
+PRIMARY_KNOBS = {"max_rows", "interpolation_factor", "target_fps", "resolution",
+                 "max_resolution", "force_rate", "frame_load_cap"}
 # 表里的上限是硬上限。这类旋钮在图里常写成一个"等于不限"的大数（promptLine 的
 # max_rows=1000），那不是作者调过的设置，照抄成默认值滑条就变成 1000 档没法用。
 HARD_MAX = {"max_rows"}
@@ -583,6 +597,27 @@ def consumers(api, nid):
 def direct_consumer(api, nid):
     cs = consumers(api, nid)
     return cs[0] if cs else (None, None)
+
+
+def prune_dead(api, oi, warns):
+    """摘掉「没人要」的节点：不是输出节点，输出又没有任何人消费。
+
+    ComfyUI 执行时是从输出节点反着往上拉的，这种节点本来就不会跑。留在图里唯一的
+    后果是它的小部件会被当成可调参数暴露出来 —— 图生图那条里有个跟谁都没连的
+    EmptyLatentImage，照它画出来面板上就多了「宽 / 高」两个框，拖了完全没反应
+    （出图尺寸其实是跟着原图走的）。一个能拖但没作用的旋钮比没有这个旋钮更糟。
+
+    判据只看结构，不认节点类名。摘掉一个可能让它的上游也变成孤儿，所以反复摘到不动为止。
+    """
+    while True:
+        dead = [nid for nid, n in api.items()
+                if not oi.get(n["class_type"], {}).get("output_node")
+                and not consumers(api, nid)]
+        if not dead:
+            return
+        for nid in dead:
+            warns.append(f"已摘：#{nid} {api.pop(nid)['class_type']} 的输出没人用，"
+                         f"ComfyUI 不会执行它 —— 它的参数也就不该出现在面板上")
 
 
 def num(v):
@@ -1240,6 +1275,51 @@ def slugify(name):
     return s if len(re.sub(r"[^a-z0-9]", "", s)) >= 3 else ""
 
 
+def to_target_fps(inputs, api, oi, out_node):
+    """把「补帧倍数」这个旋钮换成「目标帧率」。
+
+    用户想的是"我要 60 帧的片子"，不是"补 2.5 倍"。补帧节点只吃整数倍数，成片帧率又是
+    图自己算出来的（源 fps × 倍数），所以源 24 fps 只能出 48 / 72 / 96 —— 填 60 出 48，
+    等于旋钮在骗人。差的那一截由上传节点的 `force_rate` 补：先把输入重采样到
+    `目标 ÷ 倍数`，再补这么多倍，成片就正好是目标帧率，**时长不变**（force_rate 只改
+    每秒取几帧，不改总时长）。倍数和 force_rate 都要按素材的真实 fps 才算得准，
+    那要到提交时才知道，所以这里只把三个写入点记进 `derive`，真正算数在
+    `app.py: derive_target_fps()`。
+
+    认这个形状，不认工作流：有补帧倍数旋钮 + 有视频上传槽（才有 force_rate 可用）+
+    成片帧率是连线算出来的、且算式上游就挂着那个倍数节点。三条都对上才换 ——
+    帧率是死数字的（视频放大那条）本来就有正常的「帧率」旋钮，不该动。
+    """
+    fac = next((s for s in inputs if s["key"] == "interpolation_factor"), None)
+    vid = next((s for s in inputs if s["target"].get("kind") == "upload_video"), None)
+    if not (fac and vid):
+        return
+    vnode = str(vid["target"]["node"])
+    rate = api.get(str(out_node), {}).get("inputs", {}).get(RATE_OUT)
+    if RATE_IN not in api[vnode]["inputs"] or not isinstance(rate, list):
+        return
+    if str(fac["target"]["node"]) not in upstream(api, out_node):
+        return
+    ovt, _oo = spec_of(oi, api[str(out_node)]["class_type"], RATE_OUT)
+    ivt, iopts = spec_of(oi, api[vnode]["class_type"], RATE_IN)
+    label, lo, hi, step, hint = KNOBS["target_fps"]
+    inputs[inputs.index(fac)] = {
+        "key": "target_fps", "label": label, "type": "slider",
+        "min": lo, "max": hi, "step": step, "default": lo * 2,
+        "hint": hint, "advanced": "target_fps" not in PRIMARY_KNOBS,
+        # 目标帧率本身就写在成片节点上（原来那根算式的线被这个数顶掉，
+        # 于是算帧率的那两个节点没人依赖，ComfyUI 不会执行它们）
+        "target": {"node": str(out_node), "input": RATE_OUT, "vtype": ovt or "FLOAT"},
+        "derive": {
+            "kind": "target_fps",
+            "source": vid["key"],                       # 按这个槽里的素材探真实 fps
+            "factor": dict(fac["target"], min=fac["min"], max=fac["max"]),
+            "rateIn": {"node": vnode, "input": RATE_IN, "vtype": ivt or "FLOAT",
+                       "max": iopts.get("max")},        # force_rate 有节点上限（60）
+        },
+    }
+
+
 def scan(path: Path, oi, rel_key=None):
     wf = json.loads(path.read_text(encoding="utf-8"))
     warns = []
@@ -1257,7 +1337,12 @@ def scan(path: Path, oi, rel_key=None):
         api = ui_to_api(wf, oi, warns, revive=wid in REVIVE)
     repair_loop_count(api, oi, warns)
     repair_bool_widgets(api, oi, warns)
+    # 摘孤儿必须排在 repair_* 后面：漫剧那条的「循环次数」量表本来就是没人用的孤儿，
+    # 正等着 repair_loop_count 把它接进 total —— 先摘就把要修的东西摘掉了
+    prune_dead(api, oi, warns)
     inputs, outputs, n_img, n_aud, n_vid, note = derive_inputs(api, oi)
+    if outputs:
+        to_target_fps(inputs, api, oi, outputs[0][0])
     out_type = outputs[0][1] if outputs else "unknown"
     warns += [f"结构错误 {e}" for e in validate_api(api, oi)]
     if not outputs:

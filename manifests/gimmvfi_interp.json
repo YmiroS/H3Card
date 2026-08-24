@@ -15,7 +15,7 @@
  "output": {
   "node": "8"
  },
- "note": "给视频「加中间帧」：每两帧之间补出新的画面，帧率翻倍、时长不变，所以看起来更顺滑，不会变慢也不会变长。很吃时间和显存 —— 先拿几秒的短片段试，别一上来就丢整段。",
+ "note": "给视频「加中间帧」：在原有画面之间补出新的画面，凑到你要的帧率。时长不变，所以只是更顺滑，不会变慢也不会变长。很吃时间和显存 —— 先拿几秒的短片段试，别一上来就丢整段。",
  "inputs": [
   {
    "key": "video[0]",
@@ -37,7 +37,7 @@
    "step": 15,
    "default": 0,
    "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
-   "advanced": true,
+   "advanced": false,
    "target": {
     "node": "7",
     "input": "frame_load_cap",
@@ -45,19 +45,36 @@
    }
   },
   {
-   "key": "interpolation_factor",
-   "label": "补帧倍数",
+   "key": "target_fps",
+   "label": "目标帧率",
    "type": "slider",
-   "min": 2,
-   "max": 4,
-   "step": 1,
-   "default": 2,
-   "hint": "推荐 2：帧率翻 2 倍、时长不变，画面更顺滑。每加一倍时间和显存都跟着涨，4 倍要跑很久",
+   "min": 24,
+   "max": 120,
+   "step": 2,
+   "default": 48,
+   "hint": "出片每秒多少帧、时长不变，填多少就出多少。60 是常见的「顺滑」档。填源视频帧率的整数倍最干净（源 24 → 48 / 72 / 96）；填别的数也照样出到位，只是会先把源重采样一下，个别帧重复。帧率翻几倍，时间和显存就翻几倍",
    "advanced": false,
    "target": {
-    "node": "32",
-    "input": "Number",
-    "vtype": "INT"
+    "node": "8",
+    "input": "frame_rate",
+    "vtype": "FLOAT"
+   },
+   "derive": {
+    "kind": "target_fps",
+    "source": "video[0]",
+    "factor": {
+     "node": "32",
+     "input": "Number",
+     "vtype": "INT",
+     "min": 2,
+     "max": 4
+    },
+    "rateIn": {
+     "node": "7",
+     "input": "force_rate",
+     "vtype": "FLOAT",
+     "max": 60
+    }
    }
   },
   {
