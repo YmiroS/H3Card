@@ -68,9 +68,25 @@ def load_caps():
     CARDS[:] = json.loads(cards_file.read_text(encoding="utf-8")) if cards_file.exists() else []
     # 只保留有可用工作流的模式
     for c in CARDS:
-        c["modes"] = [md for md in c["modes"]
-                      if CAPS.get(md["id"], {}).get("_graph_ok")]
+        c["modes"] = [md for md in c["modes"] if mode_ok(md)]
     return len(CAPS)
+
+
+def graph_ok(wid):
+    return bool(CAPS.get(wid, {}).get("_graph_ok"))
+
+
+def mode_ok(md):
+    """这个模式还有能跑的工作流吗。
+
+    路由卡的模式 id 是卡片 id（`card_enhance`），本身不是能力 —— 得去看它每一路
+    指向的那条。缺哪一路就把那一路删掉，剩一路也照样能用（少一种素材而已）；
+    全缺了才整个模式不要。
+    """
+    if md.get("route"):
+        md["route"] = {k: r for k, r in md["route"].items() if graph_ok(r["cap"])}
+        return bool(md["route"])
+    return graph_ok(md["id"])
 
 
 ZH_NODES = {}              # class_type -> 汉化词条，只用它的 titles[0]
