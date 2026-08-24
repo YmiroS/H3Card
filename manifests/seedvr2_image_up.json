@@ -61,6 +61,22 @@
    }
   },
   {
+   "key": "max_resolution",
+   "label": "最长边上限",
+   "type": "slider",
+   "min": 0,
+   "max": 4096,
+   "step": 64,
+   "default": 4096,
+   "hint": "推荐 4096：长边算出来超过这个数，宽高就一起缩回来 —— 也就是说它会盖掉上面的「放大到(短边)」。上面调大了没反应，就是被这条卡住了。0 = 不限（长条形素材容易爆显存）",
+   "advanced": false,
+   "target": {
+    "node": "3",
+    "input": "max_resolution",
+    "vtype": "INT"
+   }
+  },
+  {
    "key": "seed",
    "label": "种子",
    "type": "seed",

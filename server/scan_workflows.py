@@ -43,6 +43,7 @@ ALIASES = {
     "0-工具箱/四图拼四宫格.json": "grid4_stitch",
     "SeedVR2图片视频高清/视频补帧插针(GIMM-VFI).json": "gimmvfi_interp",
     "SeedVR2图片视频高清/SeedVR2图片高清放大.json": "seedvr2_image_up",
+    "SeedVR2图片视频高清/SeedVR2视频高清修复放大 v2.json": "seedvr2_video_up",
 }
 
 # 画布上的模式名（人工微调）。没写的能力走 short_name() 自动清洗文件名。
@@ -60,6 +61,7 @@ DISPLAY = {
     "grid4_stitch": "四图拼四宫格",
     "gimmvfi_interp": "视频补帧插针(GIMM-VFI)",
     "seedvr2_image_up": "SeedVR2 图片高清放大",
+    "seedvr2_video_up": "SeedVR2 视频高清放大",
 }
 
 # 画布上单独占一张卡的能力。默认按产出类型归并（都出视频就都在「生视频」里当模式），
@@ -69,19 +71,23 @@ DISPLAY = {
 SOLO = {"minimax_h3_ref4", "minimax_h3_ref9", "gimmvfi_interp"}
 
 # 按素材类型路由的合并卡：一张卡，放图片跑一条工作流、放视频跑另一条。
-# 和 ladder（按图片张数路由，见 build_modes）不是一回事 —— 那边是同一件事的不同张数；
-# 这边两条工作流做的本是两件事（重建放大 / 补帧插针），但用户的诉求是同一个：
-# 「手上这份素材，让它更清楚更顺滑」。拆成两张卡的话，用户得先自己判断该找哪张。
+# 和 ladder（按图片张数路由，见 build_modes）不是一回事 —— 那边是同一件事的不同张数、
+# 参数完全一样，能画一张"并集"面板；这边两条工作流做的是同一件事（都是 SeedVR2
+# 重画放大），但一条吃图一条吃视频，参数对不上（视频那条多了帧率、只处理前几帧、
+# 最长边上限），画不出并集面板，所以放素材那一刻就把卡切成对应的能力。
 # 进了这里的能力默认不再单独成卡；想同时保留自己那张卡的写进 SOLO。
 ROUTE_CARDS = {
     "card_enhance": {
         "name": "画质增强", "icon": "✨",
         # 排在前面的那路是卡片的初始状态（图片更常见也更快，所以图片在前）
-        "route": {"image": "seedvr2_image_up", "video": "gimmvfi_interp"},
+        # 视频那一路是 SeedVR2 视频放大，不是补帧 —— 「画质增强」问的是"清不清楚"，
+        # 补帧改的是"顺不顺滑"，是另一件事，它有自己那张卡（gimmvfi_interp 在 SOLO 里）
+        "route": {"image": "seedvr2_image_up", "video": "seedvr2_video_up"},
         # 入口那一格的文案：卡片上只有一格，两种素材都收，所以不能叫「图片」
         "entry": {"label": "素材",
-                  "hint": "放图片就重画放大（更清楚），放视频就补中间帧（更顺滑）。"
-                          "放进来之后下面的参数会自动换成对应的那一套。"},
+                  "hint": "图片和视频都收，放进来就照着原样重画一遍、画得更清楚。"
+                          "参数会自动换成对应的那一套。"
+                          "想让视频更顺滑（补中间帧）请用「视频补帧插针」那张卡。"},
     },
 }
 
@@ -102,6 +108,10 @@ NOTES = {
                       "很吃时间和显存 —— 先拿几秒的短片段试，别一上来就丢整段。",
     "seedvr2_image_up": "重画式放大：不是拉大像素，是照着原图重新画一遍，"
                         "所以脸和字可能跟原图有出入，别用在要一模一样的场合。",
+    "seedvr2_video_up": "把视频一帧一帧重新画清楚。帧数不变、时长不变，所以画面更清楚但"
+                        "不会更顺滑 —— 要更顺滑用「视频补帧插针」那张卡。"
+                        "非常慢（每一帧都要过一遍模型），先把「只处理前几帧」填 60 试一版，"
+                        "确认清晰度和帧率合心意了再改回 0 跑整段。",
 }
 
 # 高级旋钮：这几个 widget 名不管挂在哪个节点上语义都一样，值得开出来给人调。
@@ -124,6 +134,13 @@ KNOBS = {
     "resolution": ("放大到(短边)", 512, 2048, 64,
                    "推荐 {d}：出片短边有多少像素，长边按原图比例跟着放。"
                    "往上调更清楚，但时间和显存涨得很快；先调小试一版，满意了再放大"),
+    "max_resolution": ("最长边上限", 0, 4096, 64,
+                       "推荐 {d}：长边算出来超过这个数，宽高就一起缩回来 —— 也就是说"
+                       "它会盖掉上面的「放大到(短边)」。上面调大了没反应，就是被这条卡住了。"
+                       "0 = 不限（长条形素材容易爆显存）"),
+    "force_rate": ("帧率", 8, 60, 1,
+                   "推荐 {d}：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数"
+                   "成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡"),
     "frame_load_cap": ("只处理前几帧", 0, 300, 15,
                        "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）"
                        "试一版，满意了再改回 0"),
@@ -132,7 +149,10 @@ KNOBS = {
                  "缩一点画得反而更细 —— 不缩的话糊的地方会被照着糊的重画一遍。1 = 不缩"),
 }
 # 上面这些旋钮默认折进「高级」。写在这里的是玩法本身的旋钮，要摆在面板正面。
-PRIMARY_KNOBS = {"max_rows", "interpolation_factor", "resolution"}
+# max_resolution 进来不是因为它是玩法旋钮，而是因为它能悄悄盖掉 resolution ——
+# 一个能否决正面旋钮的开关必须也在正面，否则用户拖了「放大到(短边)」却没反应。
+PRIMARY_KNOBS = {"max_rows", "interpolation_factor", "resolution", "max_resolution",
+                 "force_rate"}
 # 表里的上限是硬上限。这类旋钮在图里常写成一个"等于不限"的大数（promptLine 的
 # max_rows=1000），那不是作者调过的设置，照抄成默认值滑条就变成 1000 档没法用。
 HARD_MAX = {"max_rows"}
@@ -193,6 +213,37 @@ SAVE_TYPES = {
     "SaveAudio": "audio", "SaveAudioMP3": "audio",
 }
 DURATION_HINTS = ("duration", "时长", "秒")
+
+# 「帧率」这个旋钮横跨两个节点：上传节点的 force_rate 把输入重采样成这个帧率，
+# 合成节点的 frame_rate 给成片打上这个帧率。两个必须始终相等 —— 只改一边，成片就
+# 变成快放或慢放。所以归一成同一个 key（force_rate），面板只画一个框、提交时一起写。
+# 两边都是死数字才开出来：补帧那条工作流的 frame_rate 是算出来的（源视频 fps ×
+# 补帧倍数），帧率由图自己管，插一手只会把时长算错。
+RATE_IN, RATE_OUT = "force_rate", "frame_rate"
+
+
+def is_preview(ct, ins):
+    """这个输出节点存的是真产物，还是只给人在 ComfyUI 里瞄一眼的临时预览。
+
+    一条工作流可以有好几个输出节点：SeedVR2 视频放大那条除了成片，还有放大前/放大后
+    的单帧预览、和一条左右对比的临时视频。按节点 id 取第一个会拿到那个 PreviewImage，
+    于是整条能力被判成"出图片"，画布上拿回来的产物是原片的一帧而不是放大好的视频。
+    PreviewImage 天生是临时的；VHS_VideoCombine 这类自己带 save_output 开关，
+    作者关掉它就是明说"这个只是给我自己看的"。
+    """
+    return ct == "PreviewImage" or ins.get("save_output") is False
+
+
+def knob_key(api, nid, field):
+    """这个输入对应哪个旋钮。
+
+    frame_rate 归到 force_rate（同一个「帧率」，见 RATE_IN/RATE_OUT）；名字压根不在
+    KNOBS 里的是数字中转节点，旋钮身份来自它喂给的那个输入。
+    """
+    low = field.lower()
+    if low == RATE_OUT:
+        return RATE_IN
+    return low if low in KNOBS else fed_knob(api, nid)
 
 # 分辨率旋钮。视频工作流几乎没有裸的 width/height：尺寸由「尺寸提供者」节点算出来
 #   ResolutionSelector          -> aspect_ratio + megapixels  -> width/height
@@ -700,7 +751,7 @@ def pick_label(title, generic):
 
 def derive_inputs(api, oi):
     images, audios, texts, params, seeds, outputs, crops, res = [], [], [], [], [], [], [], []
-    videos = []
+    videos, rates = [], []
     for nid, node in sorted(api.items(), key=lambda kv: int(str(kv[0]).split(":")[0])):
         ct, ins = node["class_type"], node["inputs"]
         title = node["_meta"]["title"]
@@ -714,14 +765,22 @@ def derive_inputs(api, oi):
             # 上传节点自己也带旋钮（VHS 的 frame_load_cap = 只读前几帧），
             # 这是补帧这类慢活唯一的"先试一小段"开关，不能跟着上传槽一起跳过
             for f, v in ins.items():
-                if is_literal(v) and f.lower() in KNOBS:
-                    t, _o = spec_of(oi, ct, f)
-                    if t in ("INT", "FLOAT"):
-                        params.append((nid, title, f, v, "knob", t))
+                if not (is_literal(v) and f.lower() in KNOBS):
+                    continue
+                t, _o = spec_of(oi, ct, f)
+                if t not in ("INT", "FLOAT"):
+                    continue
+                if f.lower() == RATE_IN:
+                    rates.append((RATE_IN, nid, title, f, v, t))   # 要跟成片帧率配对
+                else:
+                    params.append((nid, title, f, v, "knob", t))
         elif ct == "AudioCrop":
             crops.append((nid, title))
         elif ct in SAVE_TYPES:
-            outputs.append((nid, SAVE_TYPES[ct], ins.get("filename_prefix")))
+            outputs.append((nid, SAVE_TYPES[ct], is_preview(ct, ins)))
+            if RATE_OUT in ins and is_literal(ins[RATE_OUT]):
+                t, _o = spec_of(oi, ct, RATE_OUT)
+                rates.append((RATE_OUT, nid, title, RATE_OUT, ins[RATE_OUT], t))
         else:
             # 通用规则：按输入的类型 + 名字 + object_info 选项判定角色，
             # 不依赖节点类名白名单，任何插件节点都能识别
@@ -769,6 +828,19 @@ def derive_inputs(api, oi):
                         params.append((nid, low, f, v, "size", t))
                     elif is_primitive:
                         params.append((nid, title, f, v, "int", t))
+
+    # 真产物排前面、临时预览排后面（同类保持节点 id 顺序）。scan() 取 outputs[0]
+    outputs.sort(key=lambda o: o[2])
+
+    # 帧率：上传的 force_rate 和成片的 frame_rate 必须相等，合成一个旋钮一起写
+    # （见 RATE_IN/RATE_OUT）。缺一边就不开 —— 那说明帧率由图自己算。
+    if {r[0] for r in rates} == {RATE_IN, RATE_OUT}:
+        # force_rate=0 是"跟着原视频"，可原视频多少帧要到运行时才知道，而 frame_rate
+        # 不收 0；这种情况以成片那个数为准，两边填成一样的才不会快放/慢放
+        base = next((r[4] for r in rates if r[0] == RATE_IN and r[4]), None) \
+            or next(r[4] for r in rates if r[0] == RATE_OUT)
+        params += [(nid, title, field, base, "knob", vt)
+                   for _role, nid, title, field, _val, vt in rates]
 
     # 用户自己标了数字序号（1/2/3…）就按序号排，否则按节点 id
     if images and all(re.fullmatch(r"\d+", (t or "").strip() or "x") for _n, t in images):
@@ -898,8 +970,7 @@ def derive_inputs(api, oi):
                         "min": 3, "max": 30, "step": 1, "default": val,
                         "target": {"node": nid, "input": field, "vtype": vt}})
         elif kind == "knob":
-            # 输入名不在表里的话，这是个数字中转节点，旋钮身份来自它喂给的那个输入
-            key = field.lower() if field.lower() in KNOBS else fed_knob(api, nid)
+            key = knob_key(api, nid, field)
             label, lo, hi, step, hint = KNOBS[key]
             if key in HARD_MAX:
                 val = min(val, hi)
