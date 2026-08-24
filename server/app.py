@@ -15,8 +15,10 @@ import asyncio
 import copy
 import os
 import json
+import math
 import mimetypes
 import random
+import re
 import subprocess
 import time
 import uuid
@@ -27,6 +29,8 @@ import aiohttp
 from aiohttp import web
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
+PACK = ROOT.parent                                     # 整合包根目录
+COMFY_INPUT = PACK / "ComfyUI" / "input"
 COMFY_HTTP = "http://127.0.0.1:8188"
 COMFY_WS = "ws://127.0.0.1:8188/ws"
 PORT = 8199
@@ -136,6 +140,85 @@ async def comfy_upload(session, field_name, filename, data):
     return f"{sub}/{j['name']}" if sub else j["name"]
 
 
+def ffmpeg_bin():
+    """整合包里的 ffmpeg（imageio_ffmpeg 带的那个，没有独立的 ffmpeg.exe）。
+       按前缀找，免得版本号一升就断。"""
+    d = PACK / "python_embeded/Lib/site-packages/imageio_ffmpeg/binaries"
+    return next(iter(sorted(d.glob("ffmpeg-*.exe"), reverse=True)), None)
+
+
+DUR_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
+FPS_RE = re.compile(r"([\d.]+)\s+fps\b")
+
+
+def probe_video(ref):
+    """这份视频素材：{fps, frames, duration}。探不到返回 {}（调用方必须有兜底）。
+
+    ref 是 ComfyUI input 目录里的相对路径（"chouka/ck_xxx.mp4"），本地
+    data/uploads/ 下有同名副本，先用本地那份。
+    总帧数按 时长 × 帧率 算 —— 跟 VHS 自己用的 `CAP_PROP_FRAME_COUNT` 同一个来源
+    （容器元数据），所以「只处理前几帧」拿它当分母是对的。
+    """
+    if not ref or ".." in str(ref):
+        return {}
+    local = ROOT / "data" / "uploads" / Path(ref).name
+    p = local if local.exists() else COMFY_INPUT / ref
+    exe = ffmpeg_bin()
+    if not (p.exists() and exe):
+        return {}
+    try:
+        # ffmpeg 没有 -i 之外的元数据命令（包里也没有 ffprobe），
+        # 所以就是"只给输入、让它报错退出"，要的信息在 stderr 里
+        r = subprocess.run([str(exe), "-i", str(p)], capture_output=True,
+                           text=True, errors="ignore", timeout=20)
+    except Exception as e:
+        print(f"[抽卡系统] 探视频信息失败 {p.name}：{e}")
+        return {}
+    err = r.stderr or ""
+    fps = FPS_RE.search(err)
+    dur = DUR_RE.search(err)
+    out = {}
+    if fps:
+        out["fps"] = float(fps.group(1))
+    if dur:
+        h, m, s = dur.groups()
+        out["duration"] = round(int(h) * 3600 + int(m) * 60 + float(s), 3)
+    if "fps" in out and "duration" in out:
+        out["frames"] = int(round(out["fps"] * out["duration"]))
+    return out
+
+
+def probe_fps(ref):
+    return probe_video(ref).get("fps")
+
+
+def derive_target_fps(g, spec, tgt, uploaded):
+    """「目标帧率」一个框，写三个节点：成片帧率 / 补帧倍数 / 输入重采样帧率。
+
+    补帧节点只吃整数倍数，所以源 24 fps 直接补只能出 48 / 72 / 96 —— 想要 60 得先把
+    输入重采样：force_rate = 目标 ÷ 倍数，再补这么多倍，成片就正好是目标帧率。
+    时长始终不变（force_rate 只改每秒取几帧）。
+
+    倍数按素材真实 fps 挑（向下取整），这样 force_rate ≥ 源 fps，只会重复帧、不会丢帧；
+    正好整数倍时 force_rate 填 0（= 跟着原视频），连重采样都省了。
+    探不到 fps 就用 2 倍 —— 帧率和时长照样准，只是重采样绕得多一点。
+    """
+    d = spec["derive"]
+    fac, rin = d["factor"], d["rateIn"]
+    lo, hi = int(fac.get("min") or 2), int(fac.get("max") or 4)
+    lo = max(lo, math.ceil(tgt / float(rin.get("max") or 60)))   # force_rate 有节点上限
+    src = probe_fps(uploaded.get(d["source"]))
+    f = max(lo, min(int(tgt // src) if src else 2, max(lo, hi)))
+    rate = tgt / f
+    if src and abs(rate - src) < 0.01:
+        rate = 0                                   # 正好整数倍：不用重采样
+    g[str(fac["node"])]["inputs"][fac["input"]] = f
+    g[str(rin["node"])]["inputs"][rin["input"]] = round(rate, 3)
+    print(f"[抽卡系统] 目标帧率 {tgt:g}：源 {src or '未知'} fps -> 重采样 "
+          f"{rate or '不动'} -> 补 {f} 倍")
+    return tgt
+
+
 def patch_graph(cap, params, uploaded):
     """按 manifest 把用户参数写进 API 工作流模板"""
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
@@ -166,6 +249,10 @@ def patch_graph(cap, params, uploaded):
             if val in (None, "", -1, "-1"):
                 val = params.setdefault("_seed_used", random.randint(0, hi))
             val = min(int(val), hi)
+        elif spec.get("derive", {}).get("kind") == "target_fps":
+            v = params.get(spec["key"])
+            val = derive_target_fps(g, spec, float(spec["default"] if v in (None, "") else v),
+                                    uploaded)
         else:
             pair = spec.get("pairWith")
             if pair and not uploaded.get(pair):
@@ -348,11 +435,22 @@ async def api_upload(request):
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(raw)
         ref = await comfy_upload(session, part.name, safe, raw)
-        saved.append({"ref": ref, "kind": kind_of(safe), "origin": name,
-                      "url": f"/api/upload/{safe}"})
+        item = {"ref": ref, "kind": kind_of(safe), "origin": name,
+                "url": f"/api/upload/{safe}"}
+        if item["kind"] == "video":
+            # 帧率给「目标帧率」反算倍数用，总帧数给「只处理前几帧」当分母。
+            # 上传时探一次存下来，面板就不用每次开都去探文件
+            item.update(probe_video(ref))
+        saved.append(item)
     if not saved:
         raise web.HTTPBadRequest(reason="没有收到文件")
     return web.json_response({"files": saved})
+
+
+async def api_media(request):
+    """现探一份素材的帧率/总帧数。给这条改动之前存下的素材兜底（老项目里的素材
+       记录只有 ref/kind/url，没有 fps/frames）。"""
+    return web.json_response(probe_video(request.query.get("ref") or ""))
 
 
 async def api_generate(request):
@@ -382,7 +480,10 @@ async def api_generate(request):
                  "outputType": cap["outputType"], "status": "queued",
                  "progress": 0.0, "created": time.time(),
                  "seed": params.get("_seed_used", params.get("seed")),
-                 "step": "", "outputs": [], "error": None}
+                 "step": "", "outputs": [], "error": None,
+                 # 任务面板要能说清"这是哪张卡在跑"，还要能点回那张卡
+                 "project": body.get("project"), "card": body.get("card"),
+                 "cardName": body.get("cardName")}
     return web.json_response(JOBS[pid])
 
 
@@ -399,10 +500,15 @@ async def api_jobs(request):
                                              key=lambda j: j["created"], reverse=True)[:60]})
 
 
-async def api_cancel(request):
-    pid = request.match_info["pid"]
-    session = request.app["session"]
+LIVE = ("queued", "running")
+
+
+async def stop_job(session, pid):
+    """让一个还没跑完的任务停下来。正在跑的只能打断（ComfyUI 一次只跑一个），
+       还在排队的从队列里删掉 —— 打断只作用于当前那个，对排队的没用。"""
     job = JOBS.get(pid)
+    if job and job["status"] not in LIVE:
+        return
     if job and job["status"] == "running":
         async with session.post(COMFY_HTTP + "/interrupt") as r:
             await r.read()
@@ -412,7 +518,30 @@ async def api_cancel(request):
             await r.read()
     if job:
         job["status"] = "canceled"
+        job["step"] = ""
+
+
+async def api_cancel(request):
+    await stop_job(request.app["session"], request.match_info["pid"])
     return web.json_response({"ok": True})
+
+
+async def api_job_delete(request):
+    """从任务列表里抹掉一条。还在跑/排队的先停下来，不然记录没了活儿还在跑。"""
+    pid = request.match_info["pid"]
+    await stop_job(request.app["session"], pid)
+    JOBS.pop(pid, None)
+    STEPS.pop(pid, None)
+    return web.json_response({"ok": True})
+
+
+async def api_jobs_clear(request):
+    """一键清掉所有已结束的任务（成功/失败/已取消），还在跑和排队的留着。"""
+    gone = [pid for pid, j in JOBS.items() if j["status"] not in LIVE]
+    for pid in gone:
+        JOBS.pop(pid, None)
+        STEPS.pop(pid, None)
+    return web.json_response({"ok": True, "removed": len(gone)})
 
 
 PROJ_DIR = ROOT / "data" / "projects"
@@ -564,10 +693,13 @@ def make_app():
     app.router.add_get("/api/cards", api_cards)
     app.router.add_post("/api/reload", api_reload)
     app.router.add_post("/api/upload", api_upload)
+    app.router.add_get("/api/media", api_media)
     app.router.add_post("/api/generate", api_generate)
     app.router.add_get("/api/jobs", api_jobs)
+    app.router.add_post("/api/jobs/clear", api_jobs_clear)
     app.router.add_get("/api/job/{pid}", api_job)
     app.router.add_post("/api/job/{pid}/cancel", api_cancel)
+    app.router.add_delete("/api/job/{pid}", api_job_delete)
     app.router.add_get("/api/projects", api_projects)
     app.router.add_post("/api/projects", api_project_create)
     app.router.add_get("/api/projects/{pid}", api_project_get)

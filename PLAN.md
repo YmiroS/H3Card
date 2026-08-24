@@ -198,9 +198,11 @@ ComfyUI（127.0.0.1:8188，不对外）
 | `GET /api/cards` | 画布卡片 + 全部能力清单（前端字段由此生成） |
 | `POST /api/reload` | 改完工作流重扫后热加载，不用重启 |
 | `POST /api/upload` | 上传图/音频，转存进 ComfyUI `input/chouka/`，文件名统一改 ASCII |
-| `POST /api/generate` | `{capability, params, assets, dry_run?}`；`dry_run` 只回参数打点 diff，不排队 |
-| `GET /api/job/{id}` | 状态 / 进度 / 产物；`GET /api/jobs` 列表 |
+| `POST /api/generate` | `{capability, params, assets, dry_run?}`；`dry_run` 只回参数打点 diff，不排队。另收 `project/card/cardName`，只给任务浮窗用（显示"是哪张卡在跑"、能点回去） |
+| `GET /api/job/{id}` | 状态 / 进度 / 产物；`GET /api/jobs` 列表（最近 60 条，右上角「任务(n)」轮询它） |
 | `POST /api/job/{id}/cancel` | 运行中调 `/interrupt`，排队中从队列删除 |
+| `DELETE /api/job/{id}` | 从任务列表抹掉一条；还没跑完的先停下来再删 |
+| `POST /api/jobs/clear` | 清掉所有已结束的任务记录，在跑和排队的留着 |
 | `GET /api/file?...` | 代理 ComfyUI `/view`，8188 不外露 |
 
 ### 实测踩到并已修的两个致命点

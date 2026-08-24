@@ -1,0 +1,87 @@
+{
+ "id": "zimage_i2i",
+ "name": "图生图",
+ "file": "Z-Image 图生图-反推 ",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\4-Z-Image全系列\\Z-Image 图生图-反推 .json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "gen",
+ "card": "image",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "graph": "graphs/zimage_i2i.api.json",
+ "output": {
+  "node": "72"
+ },
+ "note": "先让模型「看懂」你这张图、写成一段话，再照着那段话重画一张 —— 所以出图是同一个内容和构图感觉，不是把原图改一改，细节不会一模一样。只放图片、提示词留着不动就能跑。提示词这一格填的是「怎么讲这张图」（默认「详细描述图像内容」），想改画面就在这里加一句，比如「详细描述图像内容，但把背景换成雪山」；写「一只猫」这种跟原图无关的反而会让它照着描述跑偏。出图尺寸跟着原图走，卡上没有画面比例可调。",
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "66",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "详细描述图像内容",
+   "target": {
+    "node": "81",
+    "input": "custom_prompt"
+   }
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 9,
+   "hint": "推荐 9：模型带加速 LoRA，9 步就到位了。往下调会花，往上调基本白等",
+   "advanced": true,
+   "target": {
+    "node": "70",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 908470704303342,
+   "target": {
+    "node": "70",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 1,
+   "target": {
+    "node": "81",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615,
+   "mirror": true
+  }
+ ],
+ "warnings": [
+  "未知节点类型 Fast Groups Muter (rgthree)（id=78），可能缺插件",
+  "已摘：#37 EmptyLatentImage 的输出没人用，ComfyUI 不会执行它 —— 它的参数也就不该出现在面板上"
+ ]
+}
