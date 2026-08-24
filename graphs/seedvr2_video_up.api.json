@@ -1,0 +1,247 @@
+{
+ "960": {
+  "class_type": "PlaySound|pysssss",
+  "inputs": {
+   "any": [
+    "1151",
+    0
+   ],
+   "mode": "always",
+   "volume": 0.2,
+   "file": "notify.mp3"
+  },
+  "_meta": {
+   "title": "PlaySound 🐍"
+  }
+ },
+ "1157": {
+  "class_type": "ImageFromBatch",
+  "inputs": {
+   "image": [
+    "1151",
+    0
+   ],
+   "batch_index": 0,
+   "length": 1
+  },
+  "_meta": {
+   "title": "Get Image from Batch"
+  }
+ },
+ "1160": {
+  "class_type": "ImageScaleBy",
+  "inputs": {
+   "image": [
+    "968",
+    0
+   ],
+   "upscale_method": "lanczos",
+   "scale_by": 1
+  },
+  "_meta": {
+   "title": "Upscale Image By"
+  }
+ },
+ "1087": {
+  "class_type": "VHS_VideoCombine",
+  "inputs": {
+   "images": [
+    "1088",
+    0
+   ],
+   "audio": [
+    "968",
+    2
+   ],
+   "frame_rate": 16,
+   "loop_count": 0,
+   "filename_prefix": "AnimateDiff",
+   "format": "video/h264-mp4",
+   "pingpong": false,
+   "save_output": false,
+   "pix_fmt": "yuv420p",
+   "crf": 19,
+   "save_metadata": true,
+   "trim_to_audio": false
+  },
+  "_meta": {
+   "title": "Video Combine 🎥🅥🅗🅢"
+  }
+ },
+ "1151": {
+  "class_type": "SeedVR2VideoUpscaler",
+  "inputs": {
+   "image": [
+    "1160",
+    0
+   ],
+   "dit": [
+    "1152",
+    0
+   ],
+   "vae": [
+    "1153",
+    0
+   ],
+   "seed": 9527,
+   "resolution": 1024,
+   "max_resolution": 1920,
+   "batch_size": 33,
+   "uniform_batch_size": false,
+   "color_correction": "lab",
+   "temporal_overlap": 0,
+   "prepend_frames": 0,
+   "input_noise_scale": 0,
+   "latent_noise_scale": 0,
+   "offload_device": "cpu",
+   "enable_debug": true
+  },
+  "_meta": {
+   "title": "SeedVR2 Video Upscaler (v2.5.10)"
+  }
+ },
+ "1156": {
+  "class_type": "ImageFromBatch",
+  "inputs": {
+   "image": [
+    "1160",
+    0
+   ],
+   "batch_index": 0,
+   "length": 1
+  },
+  "_meta": {
+   "title": "Get Image from Batch"
+  }
+ },
+ "962": {
+  "class_type": "PreviewImage",
+  "inputs": {
+   "images": [
+    "1156",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Preview Image"
+  }
+ },
+ "968": {
+  "class_type": "VHS_LoadVideo",
+  "inputs": {
+   "video": "0a1ebe9d558f9f842670a2aec95aae5cf5a3e76bc2b65baf1843fd723d7172a6.mp4",
+   "force_rate": 16,
+   "custom_width": 0,
+   "custom_height": 0,
+   "frame_load_cap": 0,
+   "skip_first_frames": 0,
+   "select_every_nth": 1,
+   "format": "AnimateDiff"
+  },
+  "_meta": {
+   "title": "Load Video (Upload) 🎥🅥🅗🅢"
+  }
+ },
+ "1153": {
+  "class_type": "SeedVR2LoadVAEModel",
+  "inputs": {
+   "model": "ema_vae_fp16.safetensors",
+   "device": "cuda:0",
+   "encode_tiled": true,
+   "encode_tile_size": 512,
+   "encode_tile_overlap": 128,
+   "decode_tiled": true,
+   "decode_tile_size": 512,
+   "decode_tile_overlap": 128,
+   "tile_debug": "false",
+   "offload_device": "cpu",
+   "cache_model": false
+  },
+  "_meta": {
+   "title": "SeedVR2 (Down)Load VAE Model"
+  }
+ },
+ "1099": {
+  "class_type": "easy cleanGpuUsed",
+  "inputs": {
+   "anything": [
+    "1151",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy cleanGpuUsed"
+  }
+ },
+ "1082": {
+  "class_type": "VHS_VideoCombine",
+  "inputs": {
+   "images": [
+    "1099",
+    0
+   ],
+   "audio": [
+    "968",
+    2
+   ],
+   "frame_rate": 16,
+   "loop_count": 0,
+   "filename_prefix": "SeedVR2 修复",
+   "format": "video/h264-mp4",
+   "pingpong": false,
+   "save_output": true,
+   "pix_fmt": "yuv420p",
+   "crf": 19,
+   "save_metadata": true,
+   "trim_to_audio": false
+  },
+  "_meta": {
+   "title": "Video Combine 🎥🅥🅗🅢"
+  }
+ },
+ "1158": {
+  "class_type": "PreviewImage",
+  "inputs": {
+   "images": [
+    "1157",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Preview Image"
+  }
+ },
+ "1088": {
+  "class_type": "ImageConcanate",
+  "inputs": {
+   "image1": [
+    "1151",
+    0
+   ],
+   "image2": [
+    "968",
+    0
+   ],
+   "direction": "right",
+   "match_image_size": true
+  },
+  "_meta": {
+   "title": "ImageConcanate"
+  }
+ },
+ "1152": {
+  "class_type": "SeedVR2LoadDiTModel",
+  "inputs": {
+   "model": "seedvr2_ema_3b_fp8_e4m3fn.safetensors",
+   "device": "cuda:0",
+   "blocks_to_swap": 16,
+   "swap_io_components": false,
+   "offload_device": "cpu",
+   "cache_model": false,
+   "attention_mode": "sdpa"
+  },
+  "_meta": {
+   "title": "SeedVR2 (Down)Load DiT Model"
+  }
+ }
+}
