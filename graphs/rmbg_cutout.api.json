@@ -1,0 +1,45 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "example.png"
+  },
+  "_meta": {
+   "title": "图片"
+  }
+ },
+ "10": {
+  "class_type": "RMBG",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "model": "RMBG-2.0",
+   "sensitivity": 1,
+   "process_res": 1024,
+   "mask_blur": 0,
+   "mask_offset": 0,
+   "invert_output": false,
+   "refine_foreground": true,
+   "background": "Alpha",
+   "background_color": "#222222"
+  },
+  "_meta": {
+   "title": "抠掉背景"
+  }
+ },
+ "20": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "10",
+    0
+   ],
+   "filename_prefix": "cutout"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ }
+}

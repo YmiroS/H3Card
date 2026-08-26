@@ -16,6 +16,10 @@
   "node": "9"
  },
  "note": null,
+ "rewrite": {
+  "regime": "zimage"
+ },
+ "compare": false,
  "inputs": [
   {
    "key": "prompt",

@@ -1,0 +1,127 @@
+{
+ "id": "rmbg_erase",
+ "name": "人物擦除",
+ "file": "人物擦除",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\人物擦除.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "tool",
+ "card": "rmbg_erase",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "graph": "graphs/rmbg_erase.api.json",
+ "output": {
+  "node": "95"
+ },
+ "note": "把画面里的人整个擦掉，并且把空出来的地方按周围环境补上 —— 出来的是一张完整的、没有人的图，不是带洞的。\n全自动，不用手涂遮罩：先自己认出人在哪，把那块涂成纯绿色，再让 Klein 照着周围把绿色那块画回去，最后只把这一块贴回原图 —— 所以没被擦的地方是原图像素，一点没动过。\n卡片上出来那张图可以按住左右拖，往右拖人就长回来，用来看擦得干不干净。\n擦不干净先动「擦除范围」：地上还留着影子、边上还有一道人的轮廓，就往上调（往外多擦几像素）；擦得太狠、周围的东西被一起抹掉了就往下调。人没被完整认出来（少了一条腿、漏了个胳膊）是另一回事，那要动「识别灵敏度」往下调。\n补出来的东西每次都不一样（跟画图一样吃种子）—— 补得不像就换个种子重跑，比调参数管用。背景越规整（墙、地、天空、草地）补得越好；人挡住了复杂的东西（栏杆、文字、另一个人）就别指望它猜对。\n这张卡要过一遍 Klein 9B 大模型，比抠图慢得多，也吃显存。",
+ "rewrite": null,
+ "compare": true,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "sensitivity",
+   "label": "识别灵敏度",
+   "type": "slider",
+   "min": 0.5,
+   "max": 1,
+   "step": 0.05,
+   "default": 1,
+   "hint": "工作流默认 1 = 模型原样输出。人没被完整认出来（少一条腿、漏了个胳膊、举着的东西没算进去）才往下调 —— 它管的是「哪些地方算这个人」，不管擦得多干净（那个是「擦除范围」）",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "sensitivity",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "process_res",
+   "label": "处理精度",
+   "type": "slider",
+   "min": 512,
+   "max": 2048,
+   "step": 128,
+   "default": 1024,
+   "hint": "推荐 1024：模型就是按这个尺寸练的。原图多大都先缩到这个尺寸算蒙版、再放回原尺寸，所以调高只对「细节特别碎」的图（发丝、树枝、栅栏）有用，还会更慢更吃显存。调低更快但边缘会变粗糙",
+   "advanced": true,
+   "target": {
+    "node": "10",
+    "input": "process_res",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "mask_blur",
+   "label": "边缘过渡",
+   "type": "slider",
+   "min": 0,
+   "max": 16,
+   "step": 1,
+   "default": 4,
+   "hint": "默认 4。新画的那块和原图交界处化开几像素，接缝不那么硬。调大了绿色标记的边会变虚，模型对「到哪儿为止要擦」的判断也跟着变模糊",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "mask_blur",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "mask_offset",
+   "label": "擦除范围",
+   "type": "slider",
+   "min": 0,
+   "max": 24,
+   "step": 2,
+   "default": 8,
+   "hint": "默认 8（比人本身往外多擦 8 像素）。地上还留着影子、边上还有一道人的轮廓，就往上调；擦得太狠、把旁边的东西一起抹掉了就往下调",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "mask_offset",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 6,
+   "hint": "推荐 6：模型带加速 LoRA，6 步就到位了。往下调会花，往上调基本白等",
+   "advanced": true,
+   "target": {
+    "node": "70",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 512345678901234,
+   "target": {
+    "node": "70",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  }
+ ],
+ "warnings": []
+}

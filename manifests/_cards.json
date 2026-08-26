@@ -20,6 +20,11 @@
     "id": "flux2_klein_storyboard9",
     "name": "多宫格故事分镜",
     "slots": "img1+aud0+vid0"
+   },
+   {
+    "id": "flux2_klein_edit",
+    "name": "参考图编辑(保人物)",
+    "slots": "img2+aud0+vid0"
    }
   ]
  },
@@ -98,6 +103,48 @@
   ]
  },
  {
+  "id": "rmbg_cutout",
+  "name": "人物提取",
+  "icon": "🧩",
+  "outputType": "image",
+  "kind": "tool",
+  "modes": [
+   {
+    "id": "rmbg_cutout",
+    "name": "人物提取",
+    "slots": "img1+aud0+vid0"
+   }
+  ]
+ },
+ {
+  "id": "rmbg_bgonly",
+  "name": "抠出背景",
+  "icon": "🧩",
+  "outputType": "image",
+  "kind": "tool",
+  "modes": [
+   {
+    "id": "rmbg_bgonly",
+    "name": "抠出背景",
+    "slots": "img1+aud0+vid0"
+   }
+  ]
+ },
+ {
+  "id": "rmbg_erase",
+  "name": "人物擦除",
+  "icon": "🧩",
+  "outputType": "image",
+  "kind": "tool",
+  "modes": [
+   {
+    "id": "rmbg_erase",
+    "name": "人物擦除",
+    "slots": "img1+aud0+vid0"
+   }
+  ]
+ },
+ {
   "id": "gimmvfi_interp",
   "name": "视频补帧插针(GIMM-VFI)",
   "icon": "🧩",
@@ -138,6 +185,20 @@
      "label": "素材",
      "hint": "图片和视频都收，放进来就照着原样重画一遍、画得更清楚。参数会自动换成对应的那一套。想让视频更顺滑（补中间帧）请用「视频补帧插针」那张卡。"
     }
+   }
+  ]
+ },
+ {
+  "id": "card_style",
+  "name": "风格化提示词",
+  "icon": "🎨",
+  "outputType": "text",
+  "kind": "style",
+  "modes": [
+   {
+    "id": "style_text",
+    "name": "风格化提示词",
+    "slots": "img0+aud0+vid0"
    }
   ]
  }

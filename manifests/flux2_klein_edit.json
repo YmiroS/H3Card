@@ -1,0 +1,100 @@
+{
+ "id": "flux2_klein_edit",
+ "name": "参考图编辑(保人物)",
+ "file": "flux-2-klein-单-多图编辑",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\3-Flux2-klein全系列\\flux-2-klein-单-多图编辑.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "gen",
+ "card": "image",
+ "slots": "img2+aud0+vid0",
+ "images": 2,
+ "audios": 0,
+ "videos": 0,
+ "graph": "graphs/flux2_klein_edit.api.json",
+ "output": {
+  "node": "62"
+ },
+ "note": "真正的参考图编辑：原图直接当参考喂进模型，人物长相和画风跟着原图走，提示词只用来说「改什么」。跟「图生图」那条反推重画不是一回事。放 1 张 = 保住这张图的人物和画风，只改你说的那部分（换背景、换动作、换服装、转角度）。放 2 张 = 图1 是要改的画面、图2 是参考素材（换装、合影、换脸、把图2的人物放进图1的场景）。提示词里要点名「图1 / 图2」，并且把要保住的东西明写出来 —— 比如「让图1的人物换上图2的衣服，相貌、发型、光线和画风保持不变」。出图尺寸跟着图1走（长边缩到 1280），卡上没有画面比例可调。",
+ "rewrite": {
+  "regime": "klein"
+ },
+ "compare": false,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "63",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "images[1]",
+   "label": "图片2",
+   "type": "image",
+   "required": false,
+   "target": {
+    "node": "64",
+    "input": "image",
+    "kind": "upload_image"
+   },
+   "dropIfEmpty": [
+    {
+     "node": "86",
+     "input": "latent"
+    },
+    {
+     "node": "85",
+     "input": "latent"
+    }
+   ]
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "让图中两个人物互相搭肩，都拿着啤酒，沙滩背景，近景，半身，相貌表情不变",
+   "target": {
+    "node": "19",
+    "input": "text"
+   }
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 6,
+   "hint": "推荐 6：模型带加速 LoRA，6 步就到位了。往下调会花，往上调基本白等",
+   "advanced": true,
+   "target": {
+    "node": "95",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 898602245421569,
+   "target": {
+    "node": "95",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  }
+ ],
+ "warnings": [
+  "未知节点类型 Fast Groups Bypasser (rgthree)（id=100），可能缺插件",
+  "未知节点类型 Fast Groups Bypasser (rgthree)（id=98），可能缺插件",
+  "未知节点类型 Fast Groups Bypasser (rgthree)（id=99），可能缺插件"
+ ]
+}
