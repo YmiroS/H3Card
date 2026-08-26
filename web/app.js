@@ -54,7 +54,11 @@ function toast(msg) {
   el.toast.textContent = msg;
   el.toast.style.display = "block";
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => (el.toast.style.display = "none"), 2600);
+  // 按字数给时间：2.6 秒够看「已保存」，但看不完一段 API 报错
+  // （「HTTP 401 —— key 不对或者没权限」后面还跟着人家返回的原文）。
+  // 那种一闪而过等于没提示，用户只能来问人
+  toastTimer = setTimeout(() => (el.toast.style.display = "none"),
+    Math.min(2600 + Math.max(0, String(msg).length - 20) * 70, 9000));
 }
 const uid = () => Math.random().toString(36).slice(2, 10);
 /** 卡片属于哪一类。以卡内选中的能力为准，c.type 只是兜底：
@@ -77,11 +81,115 @@ const defOf = (c) => {
 };
 const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHas(m, c.cap)); };
 /** 卡片显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
-    路由卡同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频 */
+    路由卡同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
+    最后兜底用模式名而不是裸 id：风格卡在 CAPS 里根本没有条目（它不是能力）。 */
 const titleOf = (c) => {
   const cap = capOf(c), md = modeOf(c);
-  return c.name || (md && (md.ladder || md.route) ? md.name : cap ? cap.name : c.cap);
+  return c.name || (md && (md.ladder || md.route) ? md.name
+    : cap ? cap.name : md ? md.name : c.cap);
 };
+
+/* ================= 风格卡 =================
+   画布上唯一一张不对应任何能力的卡（`CAPS[c.cap]` 是空的），所以凡是"先取 cap
+   再干活"的地方都要先问一句 isStyle。它自己不跑、不出产物，只把一段风格描述
+   挂给下游的生图/生视频卡，提交时并进那张卡的提示词 —— 一处改，连着的全跟着变。 */
+const isStyle = (c) => !!c && (defOf(c) || {}).kind === "style";
+/** 风格连线走的还是 PROJ.edges，只是 slot 用 `@` 开头 —— 它不是素材槽，
+    所以传产物那一套（importOutput、跑完自动喂下游）必须绕开它。 */
+const STYLE_SLOT = "@style";
+const isTextEdge = (e) => String(e.slot || "").startsWith("@");
+
+/** 这条能力的「提示词」框。作者调好的格式规范（template）和高级里的不算 ——
+    风格是往画面描述里加的，不该混进那份规范。一个都没有的卡（补帧、放大、拼图）
+    接不了风格卡：那些卡根本不写提示词。 */
+const promptSpecs = (cap) => ((cap && cap.inputs) || [])
+  .filter(s => s.type === "textarea" && !s.template && !s.advanced);
+
+const styleTextOf = (s) => String(((s || {}).params || {}).style || "").trim();
+
+/** 直接挂在这张卡上的风格卡，按连线顺序。**还没写字的不算** ——
+    先连线后写字是常事，那一阵子它既不该出现在读数里，更不该把上游的风格挡掉。 */
+const ownStyles = (c) => (PROJ ? PROJ.edges : [])
+  .filter(e => e.to === c.id && e.slot === STYLE_SLOT)
+  .map(e => PROJ.cards.find(x => x.id === e.from))
+  .filter(s => s && isStyle(s) && styleTextOf(s));
+
+/** 从上游继承来的风格卡（不看这张卡自己挂了什么）。
+    走的是普通产物连线，所以中间夹着不写提示词的卡（放大、补帧）也照样往下传 ——
+    那张卡自己用不上风格，但它不该把链子截断。
+    同一张风格卡顺两条路走到这里只算一次（按 id 去重）；seen 兼作环路保险。 */
+function upStyles(c, seen = new Set()) {
+  if (!c || seen.has(c.id)) return [];
+  seen.add(c.id);
+  const out = [], ids = new Set();
+  for (const e of (PROJ ? PROJ.edges : []).filter(e => e.to === c.id && !isTextEdge(e))) {
+    const p = PROJ.cards.find(x => x.id === e.from);
+    if (!p || isStyle(p)) continue;
+    for (const s of styleCards(p, seen)) if (!ids.has(s.id)) { ids.add(s.id); out.push(s); }
+  }
+  return out;
+}
+
+/** 这张卡实际会套用的风格卡。一条链子只该在第一棒挂一次风格：后面每一棒都手动挂太啰嗦，
+    漏一棒风格就断了。所以**风格顺着产物连线往下传**。
+    自己挂了风格就以自己为准，上游那份不再往下传 —— 两段风格叠在一起会互相打架
+    （"哥特暗黑" 撞 "清透日系"），而"这一棒换个风格"是真需求。
+    想两份都要：把上游那张风格卡也拖到这张卡上（一张卡能挂好几张）。
+    返回卡片而不是文字：面板上要能说清哪张是继承来的、点它能跳过去。 */
+function styleCards(c, seen = new Set()) {
+  if (!c) return [];
+  const own = ownStyles(c);
+  return own.length ? own : upStyles(c, seen);
+}
+
+/** 这张卡下游会跟着套用这段风格的卡（不含直接挂的那几张）—— 风格卡面板上要交代清楚
+    「改这一处会连带影响谁」，不然继承是隐形的。 */
+function styleReach(s) {
+  return (PROJ ? PROJ.cards : [])
+    .filter(c => !isStyle(c) && !ownStyles(c).some(x => x.id === s.id)
+      && styleCards(c).some(x => x.id === s.id));
+}
+
+/** 这张卡实际会套用的风格文字，按套用顺序。 */
+const styleTexts = (c) => styleCards(c).map(styleTextOf);
+
+/** 风格卡卡脚上「连带下游 N 张」是顺着产物连线算出来的，所以**产物连线一改就得重刷**
+    （接一根新线、清一格素材、换路由都会改这个数），不然那个数会停在改之前。 */
+const paintStyles = () => (PROJ ? PROJ.cards : []).filter(isStyle).forEach(s => paint(s));
+
+const STYLE_PH = "{提示词}";
+/** 风格和提示词怎么合成一句。风格文字里写了 {提示词} 就替换到那个位置：
+    H3 要总基调在前、镜头约束在后；图生图那条的"提示词"其实是给描述模型的指令，
+    风格得跟在后面 —— 一个占位符全都能表达，不用为每条能力写死一套规则。
+    没写占位符就默认风格在前、空一行再接提示词。 */
+/* ---- 提示词优化：一个提示词框可以有两份词 ----
+   `c.opt[key]`  = 优化后的那份（本地大模型改写出来的，风格已经融进去了）
+   `c.optUse[key]` = 用户在页签上选的是哪一份（true = 优化后）
+   两份都落盘：优化跑一次要十几二十秒，刷新一下就没了说不过去。
+   风格只拼给原词那份 —— 优化后的自带风格，再拼就是两份（见 payloadOf）。 */
+const optOf = (c, key) => {
+  const t = c.opt && c.opt[key];
+  return t && String(t).trim() ? String(t) : null;
+};
+/** 这一格提交时会不会用优化后的那份；会就返回那段文字，不会返回 null */
+const usingOpt = (c, key) => (c.optUse && c.optUse[key]) ? optOf(c, key) : null;
+
+/** H3 的「参考图对到第几秒」那句话。官方规定它必须是提示词的第一行，
+    后面空一行才是正文 —— 风格直接怼在最前面会把它挤到第三行，参考图就对不上位了。
+    所以认出这一行，风格插到它后面去。 */
+const H3_ALIGN = /^(?:For the target video, at [\d.]+ seconds|How the reference pictures align)[^\n]*\n/;
+
+function withStyle(text, styles) {
+  let t = String(text == null ? "" : text);
+  for (const s of styles) {
+    if (s.includes(STYLE_PH)) { t = s.split(STYLE_PH).join(t); continue; }
+    if (!t.trim()) { t = s; continue; }
+    const m = t.match(H3_ALIGN);
+    t = m ? t.slice(0, m[0].length) + "\n" + s + "\n\n" + t.slice(m[0].length).replace(/^\s+/, "")
+      : s + "\n\n" + t;
+  }
+  return t;
+}
 const filledImgs = (c) => Object.keys(c.assets || {})
   .filter(k => k.startsWith("images[") && c.assets[k]).length;
 
@@ -115,7 +223,7 @@ function putAsset(c, s, file) {
     PROJ.edges = PROJ.edges.filter(e => e.to !== c.id);
     s = { key: r.slot };
     paintTitle(c);
-    drawWires();
+    drawWires(); paintStyles();
   }
   c.assets[s.key] = file;
   paintKind(c);            // 路由卡的卡脚徽标从「跟素材」变成真类型
@@ -235,12 +343,34 @@ function briefEl(cap, name) {
   return d;
 }
 
-function tipShow(node, x, y) {
+/** 把浮层摆在 a（锚点的屏幕矩形）旁边。
+ *
+ *  横向夹在**画布**的左右边界里，不是窗口：右边开着历史产物栏时按 innerWidth 夹，
+ *  浮层会滑到栏子底下去；顶栏那 52px 同理。
+ *  竖向先试锚点下方 → 放不下翻到上方 → 上下都放不下就贴着上边、再挪到锚点侧面，
+ *  别糊在卡片自己身上（卡在屏幕最下面、说明又长的时候就是这种情形）。 */
+function tipShow(node, a) {
   el.tip.innerHTML = ""; el.tip.appendChild(node);
   el.tip.style.display = "";
-  el.tip.style.left = Math.max(8, Math.min(x, innerWidth - el.tip.offsetWidth - 8)) + "px";
-  el.tip.style.top = (y + el.tip.offsetHeight > innerHeight - 8
-    ? y - el.tip.offsetHeight - 16 : y) + "px";
+  // 量之前先归位：上一次的落点会把浮层顶到窗口外，宽度被压窄、换行变多，量出来的高度是假的
+  el.tip.style.left = el.tip.style.top = "0px";
+  const GAP = 8, TOP = 52;
+  const s = el.stage.getBoundingClientRect();
+  const L = s.left + GAP, R = s.right - GAP;
+  const w = el.tip.offsetWidth, h = el.tip.offsetHeight;
+  const clampX = (v) => Math.max(L, Math.min(v, R - w));
+  let left = clampX(a.left), top = a.bottom + GAP;
+  if (top + h > innerHeight - GAP) {
+    if (a.top - GAP - h >= TOP) {
+      top = a.top - GAP - h;
+    } else {
+      top = Math.max(TOP, innerHeight - GAP - h);
+      if (R - (a.right + GAP) >= w) left = a.right + GAP;          // 右边有地
+      else if ((a.left - GAP) - L >= w) left = a.left - GAP - w;   // 左边有地
+    }
+  }
+  el.tip.style.left = left + "px";
+  el.tip.style.top = top + "px";
 }
 const tipHide = () => (el.tip.style.display = "none");
 
@@ -248,8 +378,7 @@ const tipHide = () => (el.tip.style.display = "none");
 function hoverBrief(node, capGetter, nameGetter) {
   node.addEventListener("mouseenter", () => {
     const cap = capGetter(); if (!cap) return;
-    const r = node.getBoundingClientRect();
-    tipShow(briefEl(cap, nameGetter && nameGetter()), r.left, r.bottom + 8);
+    tipShow(briefEl(cap, nameGetter && nameGetter()), node.getBoundingClientRect());
   });
   node.addEventListener("mouseleave", tipHide);
 }
@@ -329,6 +458,16 @@ async function openProject(pid) {
   el.empty.style.display = "none";
   el.addcard.style.display = ""; el.fit.style.display = "";
   el.ptitle.textContent = PROJ.name;
+  // 示例上的改动不落盘，这件事必须写在明面上：不然用户在它上面搭了半天，
+  // 刷新一下全没了，只会以为是丢数据了
+  if (PROJ.locked) {
+    const b = document.createElement("span");
+    b.className = "ro";
+    b.textContent = "试玩画布 · 刷新还原";
+    b.title = "这张画布是示例：参数怎么改、卡怎么拖、重跑几遍都随便，"
+      + "改动只在这一次里有效，刷新就回到原样。想留下自己的东西就「＋ 新建项目」";
+    el.ptitle.appendChild(b);
+  }
   // 断线重连后可能有卡片状态是 running，交给轮询自己收尾
   render();
   loadProjects();
@@ -350,6 +489,9 @@ let saveChain = Promise.resolve();
 
 function save() {
   if (!PROJ) return;
+  // 示例是只读的：拖卡、改参数、重跑都随便，但只活在这一次打开里，刷新就回到那份固定的示例。
+  // 这里直接不发请求（服务端也会回 403），否则每动一下就弹一次「保存失败」
+  if (PROJ.locked) return;
   clearTimeout(saveTimer);
   saveTimer = setTimeout(() => { saveChain = saveChain.then(doSave); }, 700);
 }
@@ -409,9 +551,23 @@ const kindUndecided = (c) => {
 
 /** 画面区的空占位：还没出过东西、或者这一轮失败/取消了都用它 */
 function phHTML(c) {
+  if (isStyle(c)) return `<span class="ph">🎨</span>`;
   return `<span class="ph">${kindUndecided(c) ? "🖼🎬"
     : outKindOf(c) === "video" ? "🎬" : "🖼"}</span>`;
 }
+
+/** 卡片上「按住不是要拖卡」的地方。整张卡都能拖，所以这里列的是自己有事要干的那几样：
+ *    button / input / textarea / select  按钮和输入框
+ *    audio                               浏览器自带的播放条，整条都得留给它
+ *    .vprog                              按住是拖播放进度（bindCardVideo）
+ *    .cmp                                按住是拖原图对比线（bindCompare）
+ *    .rz / .port / .inport               改大小、拉连线
+ *  video **不在**里面：画面上按住就是拖卡，单击才是放/停（bindCardVideo 里按位移分辨）。
+ *  拖进度只留给底下那条 .vprog —— 原来在画面上横向拖也能定位，但那把整块画面占死了，
+ *  视频卡就只剩标题栏能拖。
+ *  后三样自己就 stopPropagation 了，压根轮不到卡片这层，列在这儿只是省得以后
+ *  哪次改动把那个 stopPropagation 弄丢了，卡片就跟着一起跑。 */
+const NODRAG = "button,input,textarea,select,audio,.vprog,.cmp,.rz,.port,.inport";
 
 function buildCard(c) {
   const def = defOf(c);
@@ -432,11 +588,16 @@ function buildCard(c) {
   applySize(c);
   paintTitle(c);
   d.querySelector(".ch .x").onclick = (ev) => { ev.stopPropagation(); delCard(c.id); };
-  d.querySelector(".ch").onmousedown = (ev) => startDrag(ev, c, d);
   d.querySelector(".rz.tl").onmousedown = (ev) => startResize(ev, c, d, -1);
   d.querySelector(".rz.br").onmousedown = (ev) => startResize(ev, c, d, 1);
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
-  d.onmousedown = (ev) => { ev.stopPropagation(); pick(c.id); };
+  d.onmousedown = (ev) => {
+    // 整张卡都是拖动把手。以前只有标题栏那一条 26px 能拖 —— 出了图之后卡片九成面积
+    // 是画面，按下去却纹丝不动，每次挪卡都得回去瞄那一条。反过来列例外更省事（NODRAG）
+    if (ev.button === 0 && !ev.target.closest(NODRAG)) return startDrag(ev, c, d);
+    ev.stopPropagation();     // 右键/中键也别漏到画布上去平移
+    pick(c.id);
+  };
   d.oncontextmenu = (ev) => {
     ev.stopPropagation();
     ev.preventDefault();
@@ -444,7 +605,7 @@ function buildCard(c) {
   };
   d.ondblclick = (ev) => {
     const body = ev.target.closest(".body");
-    if (!body) return;
+    if (!body || isStyle(c)) return;      // 风格卡没有产物可看
     if (ev.target.closest(".vprog")) return;   // 在进度条上连点是在定位，别抢它
     // 音频那条播放条是浏览器画在 audio 里的，点它拿到的 target 还是 audio 本身，
     // 没法直接区分，只能按位置判断：落在底部这条里就是在操作播放条，别抢它的双击
@@ -458,6 +619,7 @@ function buildCard(c) {
     openViewer(c, +(ev.target.dataset.i || 0));
   };
   bindCardVideo(d.querySelector(".body"));
+  bindCompare(d.querySelector(".body"), c);
   hoverBrief(d.querySelector(".ch"), () => capOf(c), () => c.name);
   paint(c);
   return d;
@@ -483,10 +645,12 @@ document.addEventListener("mousedown", (ev) => {
   if (!box || !box.contains(ev.target)) NOWPLAYING.pause();
 }, true);
 
-/** 卡片里视频的交互：单击放/停、按住横向拖动定位、进度条可直接拖。
+/** 卡片里视频的交互：画面上单击放/停、按住拖是挪卡；定位进度只在底下那条 .vprog 上。
  *
- *  拖进度必须是「按住」而不是「滑过」：滑过的话一旦暂停，鼠标就停在画面上，
- *  手抖一个像素都会重新定位，画面看着像被鼠标拽着平移。
+ *  以前在画面上横向拖也能定位，代价是整块画面被占死 —— 视频卡就只剩标题栏那一条能拖。
+ *  现在画面区交回给拖卡（NODRAG 里没有 video），这儿只负责分辨「按下又没挪动」= 点了一下。
+ *  阈值跟 startDrag 一样是 4px，两边必须一致：小于 4px 那边不认拖、这边就得认点击，
+ *  不然会出现「既没挪卡、也没放视频」的死角。
  *
  *  绑在 .body 上做事件委托，paint() 换掉里面的 innerHTML 也不用重新绑。 */
 function bindCardVideo(body) {
@@ -498,25 +662,34 @@ function bindCardVideo(body) {
   body.onmousedown = (ev) => {
     if (ev.button !== 0) return;
     const bar = ev.target.closest(".vprog");
-    const v = bar ? body.querySelector("video") : ev.target.closest("video");
+    if (bar) {
+      const v = body.querySelector("video");
+      if (!v) return;
+      // .vprog 在 NODRAG 里，卡片那层不会跟着动，这儿放心 stopPropagation
+      ev.stopPropagation(); ev.preventDefault();
+      const playing = !v.paused;
+      v.pause(); seek(v, ev.clientX, bar);      // 按下即定位，不用先拖出一段
+      const mv = (e) => seek(v, e.clientX, bar);
+      const up = () => {
+        document.removeEventListener("mousemove", mv);
+        document.removeEventListener("mouseup", up);
+        if (playing) v.play().catch(() => {});  // 拖完接着放
+      };
+      document.addEventListener("mousemove", mv);
+      document.addEventListener("mouseup", up);
+      return;
+    }
+    const v = ev.target.closest("video");
     if (!v) return;
-    // 不 stopPropagation：让它冒泡到卡片上去选中这张卡，卡片那层自己会拦住画布平移
-    ev.preventDefault();                 // 顺手掐掉浏览器自带的拖拽幽灵图
-    const x0 = ev.clientX, playing = !v.paused;
-    let dragged = !!bar;                 // 直接按在进度条上就是要定位，不用等位移
-    if (bar) { v.pause(); seek(v, ev.clientX, bar); }
-    const mv = (e) => {
-      if (!dragged && Math.abs(e.clientX - x0) < 3) return;   // 手抖不算拖
-      if (!dragged) { dragged = true; v.pause(); }
-      seek(v, e.clientX, bar || v);
-    };
-    const up = () => {
-      document.removeEventListener("mousemove", mv);
+    // 既不 stopPropagation 也不 preventDefault：这一下要原样交给卡片那层去起拖
+    // （幽灵图那边已经 draggable=false + CSS user-drag 兜住了）
+    const x0 = ev.clientX, y0 = ev.clientY;
+    const up = (e) => {
       document.removeEventListener("mouseup", up);
-      if (!dragged) { if (v.paused) v.play().catch(() => {}); else v.pause(); }
-      else if (playing) v.play().catch(() => {});             // 拖完接着放
+      // 挪过了就是在拖卡，别顺手把视频放起来
+      if (Math.abs(e.clientX - x0) + Math.abs(e.clientY - y0) >= 4) return;
+      if (v.paused) v.play().catch(() => {}); else v.pause();
     };
-    document.addEventListener("mousemove", mv);
     document.addEventListener("mouseup", up);
   };
   // timeupdate 不冒泡，只能挂捕获阶段（捕获照样会经过祖先节点）
@@ -543,10 +716,38 @@ function paint(c) {
   const body = d.querySelector(".body");
   const st = d.querySelector(".st"), meta = d.querySelector(".meta");
   const bar = d.querySelector(".bar i");
+  // 风格卡没有产物，画面区直接摊那段风格文字：画布上一眼能看出这张卡在管什么风格，
+  // 不用点开面板。（这也是它唯一的内容，藏起来这张卡就成了个空盒子）
+  if (isStyle(c)) {
+    const txt = String((c.params || {}).style || "").trim();
+    body.classList.remove("grid");
+    body.classList.add("sbody");
+    applySize(c);
+    body.textContent = "";
+    if (txt) {
+      const p = document.createElement("div"); p.className = "stx";
+      p.textContent = txt;
+      body.appendChild(p);
+    } else body.innerHTML = phHTML(c)
+      + `<div class="sempty">在旁边的面板里写一段风格，再把出口拖到生图/生视频卡上</div>`;
+    const port = d.querySelector(".port");
+    if (port) port.title = "拖到生图/生视频卡上 → 那张卡套用这段风格（拖到空白处会列出所有能挂的玩法）";
+    const n = (PROJ ? PROJ.edges : []).filter(e => e.from === c.id && isTextEdge(e)).length;
+    // 继承的那几张没有连线，卡脚不报数就等于没告诉用户这段风格到底管着几张卡
+    const m = styleReach(c).length;
+    st.className = "st";
+    st.textContent = txt ? "" : "还没写";
+    meta.textContent = n ? `挂了 ${n} 张卡` + (m ? ` · 连带下游 ${m} 张` : "") : "还没挂卡";
+    bar.style.width = "0%";
+    return;
+  }
   const outs = c.outputs || [];
   const out = outs[0];
+  // 抠图这类卡要在画面上叠一张原图做对比（见 cmpSrc）
+  const cmp = cmpSrc(c);
   // sig 而不是单个 url：一张卡可能出一整组图（分镜九宫格），少一张多一张都要重画
-  const sig = outs.map(o => o.url).join("|");
+  // 原图也要进 sig：不重跑只换了输入那张图，画面里叠的那层也得跟着换
+  const sig = outs.map(o => o.url).join("|") + (cmp ? "|<" + cmp : "");
   // dataset.url 同时当"画面区现在装的是什么"的记号，"busy" 是给加载态占的名字
   // （sig 是一串 URL，撞不上）
   const busy = c.status === "queued" || c.status === "running";
@@ -570,7 +771,8 @@ function paint(c) {
     // draggable=false：卡片里的图/视频不该能拖出去（拖出来是浏览器自带的行为，
     // 会拽出一个半透明幽灵图，还容易被当成"拖它去连线"）。CSS 里另有 user-drag 兜底
     // 卡片里的视频一律不给 controls：268px 宽的卡塞一条播放条就挡掉半幅画面。
-    // 单击播放/暂停、暂停时横向滑动拖进度、双击进大窗口看带播放条的完整预览（见 buildCard）
+    // 单击播放/暂停、按住拖是挪卡、拖底下那条 .vprog 定位进度、
+    // 双击进大窗口看带播放条的完整预览（见 buildCard / bindCardVideo）
     if (outs.length > 1) {
       // 一组产物铺成宫格，data-i 供双击时定位到具体哪一张
       body.style.setProperty("--cols", outs.length <= 4 ? 2 : outs.length <= 9 ? 3 : 4);
@@ -581,11 +783,20 @@ function paint(c) {
       // .vprog 是自己画的进度条：不给 controls 就没有任何进度反馈，按住拖也没了准头
       body.innerHTML = out.kind === "video"
         ? `<video src="${out.url}" loop preload="metadata" draggable="false"></video>`
-          + `<div class="vprog" title="拖动定位进度"><i></i></div>`
+          + `<div class="vprog" title="按住左右拖 → 定位进度（画面上按住是挪卡）"><i></i></div>`
         : out.kind === "audio"
           ? `<audio src="${out.url}" controls style="width:92%"></audio>`
-          : `<img src="${out.url}" alt="" draggable="false">`;
+          : cmp
+            // 原图压在结果上面，按 --x 从左边裁开：往右拖 = 原图一点点长回来。
+            // 文案不说"还原背景"：抠出背景那张卡拖回来的是主体，两张卡共用这一段
+            ? `<div class="cmp" title="按住左右拖：跟原图对比，看边缘抠干净了没有">`
+              + `<img class="new" src="${out.url}" alt="" draggable="false" data-i="0">`
+              + `<img class="old" src="${cmp}" alt="" draggable="false">`
+              + `<div class="cmpx"><i>⇔</i></div>`
+              + `<div class="cmptip">按住往右拖 → 回到原图</div></div>`
+            : `<img src="${out.url}" alt="" draggable="false">`;
     }
+    if (cmp) applyCmp(c);
     // seed 不再压在画面上，改由右侧「历史产物」栏单独一行展示
   }
 
@@ -605,13 +816,89 @@ function paint(c) {
   meta.title = c.error || "";
 }
 
+/* ---------- 原图 ↔ 结果 对比线 ----------
+   只有 manifest 里 compare: true 的能力才画（现在是人物提取 / 抠出背景 / 人物擦除 三条）。
+   这几条的成败全在边缘那一圈，透明底的图单看只是一块空白，不跟原图叠着看根本判断不了
+   干净没有。要给别的能力开就在 scan_workflows.py 的 COMPARE 集合里加一个 id。
+   文案保持卡片中立（"回到原图"，不写"还原背景"）：往右拖回来的东西每张卡都不一样，
+   三张卡共用这一段 DOM。 */
+
+/** 这张卡该不该画对比线；该画就返回压在上面那张原图的 url。 */
+function cmpSrc(c) {
+  const md = CAPS[runCap(c)];
+  if (!md || !md.compare) return null;
+  const outs = c.outputs || [];
+  if (outs.length !== 1 || outs[0].kind !== "image") return null;   // 宫格/视频不画
+  const s = (md.inputs || []).find(x => x.type === "image");
+  const a = s && (c.assets || {})[s.key];
+  return a && a.kind === "image" ? a.url : null;
+}
+
+/** 把分割位置写到 DOM 上。位置存百分比而不是像素 —— 卡片能拉宽拉窄，
+    存像素的话一改尺寸那条线就跑偏了。
+    存在 c._cmp：下划线开头的键 plain() 会剥掉，不进存档 —— 这是「我刚看到哪」，
+    不是这张卡的设置，重开项目该回到默认（0 = 只看结果，原图完全收在左边）。 */
+function applyCmp(c) {
+  const box = c._el && c._el.querySelector(".cmp");
+  if (!box) return;
+  const x = c._cmp == null ? 0 : c._cmp;
+  box.style.setProperty("--x", (x * 100) + "%");
+  box.classList.toggle("dragged", c._cmp != null);   // 动过就把提示字撤了
+}
+
+/** 按住 .cmp 左右拖。事件委托在 .body 上，paint() 换 innerHTML 也不用重绑。
+    必须用 addEventListener：.body 的 onmousedown 已经被 bindCardVideo 占了。 */
+function bindCompare(body, c) {
+  body.addEventListener("mousedown", (ev) => {
+    if (ev.button !== 0) return;
+    const box = ev.target.closest(".cmp");
+    if (!box) return;
+    // 不 stopPropagation：照样冒泡上去选中这张卡
+    ev.preventDefault();                 // 掐掉浏览器自带的拖拽幽灵图
+    const at = (clientX) => {
+      const r = box.getBoundingClientRect();
+      c._cmp = Math.min(Math.max((clientX - r.left) / r.width, 0), 1);
+      applyCmp(c);
+    };
+    at(ev.clientX);                      // 按下即定位，不用先拖出一段
+    const mv = (e) => at(e.clientX);
+    const up = () => {
+      document.removeEventListener("mousemove", mv);
+      document.removeEventListener("mouseup", up);
+    };
+    document.addEventListener("mousemove", mv);
+    document.addEventListener("mouseup", up);
+  });
+}
+
 /* ---------- 连线 ---------- */
+const cardOf = (id) => (PROJ ? PROJ.cards : []).find(x => x.id === id) || null;
+
 function cardBox(id) {
-  const c = PROJ.cards.find(x => x.id === id);
+  const c = cardOf(id);
   if (!c) return null;
   const h = c._el ? c._el.offsetHeight : 230;
   return { x: c.x, y: c.y, w: cardW(c), h };
 }
+
+/** 选中的连线。存的是 PROJ.edges 里那条对象本身（不是下标）——
+    删卡、换路由都会重排数组，下标会指到别人身上去。 */
+let selEdge = null;
+
+/** 风格顺着这根产物线往下传吗（见 styleCards）。风格继承**没有自己的连线**，
+    它借的就是这根产物线；不画在线上这件事就是隐形的。 */
+function carriesStyle(e) {
+  if (isTextEdge(e)) return false;
+  const a = cardOf(e.from), b = cardOf(e.to);
+  return !!(a && b && !isStyle(a) && styleCards(a).length && !ownStyles(b).length);
+}
+
+function edgeWord(e) {
+  const a = cardOf(e.from), b = cardOf(e.to);
+  const nm = (c) => c ? titleOf(c) : "?";
+  return isTextEdge(e) ? `风格：${nm(a)} → ${nm(b)}` : `${nm(a)} → ${nm(b)}`;
+}
+
 function drawWires() {
   el.wires.innerHTML = "";
   for (const e of PROJ.edges) {
@@ -619,15 +906,70 @@ function drawWires() {
     if (!a || !b) continue;
     const x1 = a.x + a.w, y1 = a.y + a.h / 2, x2 = b.x, y2 = b.y + b.h / 2;
     const dx = Math.max(50, Math.abs(x2 - x1) * 0.5);
-    const p = document.createElementNS(SVGNS, "path");
-    p.setAttribute("d", `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`);
-    el.wires.appendChild(p);
+    const d = `M${x1},${y1} C${x1 + dx},${y1} ${x2 - dx},${y2} ${x2},${y2}`;
+    const mk = (cls) => {
+      const p = document.createElementNS(SVGNS, "path");
+      if (cls) p.setAttribute("class", cls);
+      p.setAttribute("d", d);
+      el.wires.appendChild(p);
+      return p;
+    };
+    // 底下垫一根透明的粗线专管接鼠标：真正那根只有 1.3~1.6px，画布缩小后点不中
+    const hit = mk("hit");
+    const tt = document.createElementNS(SVGNS, "title");
+    tt.textContent = edgeWord(e) + (carriesStyle(e) ? "（风格也顺着这根线往下传）" : "")
+      + "　点一下选中，Delete 删除";
+    hit.appendChild(tt);
+    hit.addEventListener("mousedown", (ev) => { ev.stopPropagation(); pickEdge(e); });
+    hit.addEventListener("contextmenu", (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      pickEdge(e); edgeMenu(ev.clientX, ev.clientY, e);
+    });
+    // 风格线画成虚线：它传的是文字不是产物，跟"上一张的图接给下一张"是两件事，
+    // 画成同一根实线会让人以为风格卡也出图
+    mk([isTextEdge(e) ? "txt" : "", e === selEdge ? "sel" : ""].filter(Boolean).join(" "));
+    // 再叠一层紫虚线 = 这根产物线上还捎着风格
+    if (carriesStyle(e)) mk("carry");
   }
+}
+
+function pickEdge(e) {
+  selEdge = e; selId = null;
+  closeMenu(); tipHide(); closePanel();
+  for (const c of PROJ.cards) if (c._el) c._el.classList.remove("sel");
+  drawWires();
+  toast(edgeWord(e) + " · Delete 删除");
+}
+
+function edgeMenu(cx, cy, e) {
+  const a = cardOf(e.from), b = cardOf(e.to);
+  showMenu(cx, cy, edgeWord(e), [
+    ...(a ? [{ icon: "◧", text: `选中上游「${titleOf(a)}」`, run: () => pick(a.id) }] : []),
+    ...(b ? [{ icon: "◨", text: `选中下游「${titleOf(b)}」`, run: () => pick(b.id) }] : []),
+    { icon: "✕", text: isTextEdge(e) ? "解除这张风格卡" : "删除连线",
+      danger: true, run: () => delEdge(e) },
+  ]);
+}
+
+/** 删一根线。产物线删掉**不动下游那一格里的素材** —— 那份文件早就搬过去了，
+    删线只是断开"上游重跑一次、下游自动换成新产物"这条关系。
+    素材也想清就右键那一格「清空这一格」，两件事分开。 */
+function delEdge(e) {
+  const b = cardOf(e.to), had = !!(b && (b.assets || {})[e.slot]);
+  PROJ.edges = PROJ.edges.filter(x => x !== e);
+  if (selEdge === e) selEdge = null;
+  drawWires(); paintStyles();
+  if (selId) openPanel(selId);
+  save();
+  toast(isTextEdge(e) ? "已解除风格"
+    : had ? "已删除连线（那一格的素材还在，只是不再跟着上游重跑更新）"
+    : "已删除连线");
 }
 
 /* ================= 交互：拖卡 / 平移 / 缩放 / 连线 ================= */
 function pick(id) {
   selId = id;
+  if (selEdge) { selEdge = null; drawWires(); }      // 选中的线和选中的卡只留一个
   for (const c of PROJ.cards) if (c._el) c._el.classList.toggle("sel", c.id === id);
   openHistory(id);      // 先开栏子再摆面板：面板要按变窄之后的画布找位置
   openPanel(id);
@@ -731,10 +1073,15 @@ function bindGlobal() {
   el.jobsbtn.onclick = toggleJobs;
   addEventListener("resize", () => { placePanel(); placeJobs(); });
 
+  // Ctrl+V 粘在鼠标那儿，所以一直记着鼠标落在世界坐标的哪个位置
+  el.stage.addEventListener("mousemove", (ev) => { mouseW = toWorld(ev.clientX, ev.clientY); });
+  el.stage.addEventListener("mouseleave", () => { mouseW = null; });
+
   el.stage.addEventListener("mousedown", (ev) => {
     if (ev.button !== 0) return;
     closeMenu(); closeJobs();
     selId = null; closePanel();
+    if (selEdge) { selEdge = null; drawWires(); }
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
     const s = { mx: ev.clientX, my: ev.clientY, x: view.x, y: view.y };
     el.stage.classList.add("panning");
@@ -780,12 +1127,30 @@ function bindGlobal() {
     if (el.view.style.display !== "none" && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) {
       ev.preventDefault(); stepViewer(ev.key === "ArrowRight" ? 1 : -1); return;
     }
+    // 画布快捷键：正在框里打字时一概不管（Ctrl+C 得留给复制文字，Delete 得留给删字）
+    const t = ev.target, tag = (t.tagName || "").toLowerCase();
+    const typing = tag === "input" || tag === "textarea" || tag === "select" || t.isContentEditable;
+    if (PROJ && !typing && el.view.style.display === "none") {
+      const c = cardOf(selId);
+      if (ev.key === "Delete" || ev.key === "Backspace") {
+        // 线优先：选中线的那一刻卡片选中就被清了，两个不会同时亮
+        if (selEdge) { ev.preventDefault(); delEdge(selEdge); return; }
+        if (c) { ev.preventDefault(); askDelCard(c); return; }
+      }
+      if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey) {
+        const k = ev.key.toLowerCase();
+        if (k === "c" && c) { ev.preventDefault(); copyCard(c); return; }
+        if (k === "v") { ev.preventDefault(); pasteCard(); return; }
+      }
+    }
     if (ev.key !== "Escape") return;
     // 大图开着时 Esc 只关大图，不该顺手把卡片选中状态和参数面板一起清掉
     if (el.view.style.display !== "none") { closeViewer(); return; }
     // 任务浮窗开着时 Esc 只关它，别顺手把选中的卡和参数面板一起清掉
     if (el.jobs.style.display !== "none") { closeJobs(); return; }
     closeMenu(); tipHide(); selId = null; closePanel();
+    if (selEdge) { selEdge = null; drawWires(); }
+    for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
   });
 }
 
@@ -830,11 +1195,18 @@ function menuGroups() {
       d => d.modes.length && d.kind !== "tool" && d.outputType === out)]);
   }
   gs.push(["工具", CARDS.filter(d => d.modes.length && d.kind === "tool")]);
+  // 风格卡自己一组：它不出产物，混进"生图"里就是在说它也会画画
+  gs.push(["风格", CARDS.filter(d => d.modes.length && d.kind === "style")]);
   return gs;
 }
 
 function openMenu(cx, cy, at) {
   const items = [];
+  // 手上拿着复制的卡就摆在最前面：右键的这个位置就是要粘的位置，比记快捷键直观
+  if (CLIP) items.push({
+    icon: "⧉", text: "粘贴刚复制的卡片（Ctrl+V）",
+    run: () => { mouseW = at; pasteCard(); },
+  });
   for (const [gname, defs] of menuGroups()) {
     if (!defs.length) continue;
     items.push({ group: gname });
@@ -939,6 +1311,21 @@ function fmtDur(s) {
 
 function cardMenu(cx, cy, c) {
   const cap = capOf(c);
+  if (isStyle(c)) {
+    const n = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e)).length;
+    return showMenu(cx, cy, c.name || "风格化提示词", [
+      { icon: "✎", text: "重命名卡片", run: () => renameCard(c) },
+      { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
+      { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
+      // 挂错卡了想全撤掉，比一根根找线点开销小
+      ...(n ? [{ icon: "⊘", text: `解除挂着的 ${n} 张卡`, run: () => {
+        PROJ.edges = PROJ.edges.filter(e => !(e.from === c.id && isTextEdge(e)));
+        drawWires(); paintStyles(); if (selId) openPanel(selId); save();
+      } }] : []),
+      ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
+      { icon: "✕", text: "删除卡片（Delete）", danger: true, run: () => delCard(c.id) },
+    ]);
+  }
   const outs = c.outputs || [];
   const out = outs[0];
   const vword = outs.length > 1 ? `逐张看大图（${outs.length} 张）` : (VIEW_WORD[out && out.kind] || "查看大图");
@@ -946,10 +1333,12 @@ function cardMenu(cx, cy, c) {
     ...(out ? [{ icon: "⛶", text: vword, run: () => openViewer(c) }] : []),
     { icon: "✎", text: "重命名卡片", run: () => renameCard(c) },
     { icon: "↑", text: "运行", run: () => run(c) },
-    { icon: "⧉", text: "复制卡片", run: () => cloneCard(c) },
+    { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
+    // Ctrl+C 是"拿在手上、想粘哪儿粘哪儿"，跟就地复制不是一件事，两条都留
+    { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
     // 拖角改过大小才给这条：没改过的卡摆一个点了没反应的菜单项只会让人以为坏了
     ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
-    { icon: "✕", text: "删除卡片", danger: true, run: () => delCard(c.id) },
+    { icon: "✕", text: "删除卡片（Delete）", danger: true, run: () => delCard(c.id) },
   ]);
 }
 
@@ -972,7 +1361,7 @@ function cloneCard(c) {
     cap: c.cap, name: c.name, params: JSON.parse(JSON.stringify(c.params || {})),
     assets: JSON.parse(JSON.stringify(c.assets || {})),
   });
-  paintTitle(n); openPanel(n.id); save();
+  paintTitle(n); paint(n); openPanel(n.id); save();      // paint：风格卡的正文在画面区
 }
 
 function addCard(type, x, y, cap) {
@@ -988,7 +1377,57 @@ function delCard(id) {
   PROJ.cards = PROJ.cards.filter(c => c.id !== id);
   PROJ.edges = PROJ.edges.filter(e => e.from !== id && e.to !== id);
   if (selId === id) { selId = null; closePanel(); }
+  selEdge = null;                    // 连着它的线跟着没了，选中记号不能留成野指针
   render(); save();
+}
+
+/** Delete 键删卡。菜单里那条不问就删（点菜单是有意的），键盘容易手滑，
+    所以**跑出过东西的卡**要问一句 —— 没有撤销，删掉那几轮的产物记录就找不回来了。 */
+function askDelCard(c) {
+  const n = (c.history || []).length;
+  if ((c.outputs || []).length || n) {
+    if (!confirm(`删除「${titleOf(c)}」？它有 ${n} 轮生成记录，删了找不回来。\n`
+      + "（产物文件本身还在 ComfyUI 的输出目录里）")) return;
+  }
+  delCard(c.id);
+  toast(`已删除「${titleOf(c)}」`);
+}
+
+/** Ctrl+C 存下的那张卡。只活在这一次打开里（不落盘）—— 它是"手上拿着的东西"，
+    不是项目内容；跨项目粘贴也就顺带能用了。 */
+let CLIP = null;
+/** 鼠标最后停在画布世界坐标的哪儿：Ctrl+V 要粘在鼠标那儿，不然连粘 5 张会叠成一坨 */
+let mouseW = null;
+let pasteN = 0;
+
+function copyCard(c) {
+  CLIP = {
+    type: c.type, cap: c.cap, name: c.name || null, w: c.w, h: c.h, x: c.x, y: c.y,
+    params: JSON.parse(JSON.stringify(c.params || {})),
+    assets: JSON.parse(JSON.stringify(c.assets || {})),
+  };
+  pasteN = 0;
+  // 产物和历史故意不带：复制一张卡不该让新卡假装它也跑过（跟"复制卡片"菜单同一个规矩）
+  toast(`已复制「${titleOf(c)}」（不含产物）· Ctrl+V 粘贴`);
+}
+
+function pasteCard() {
+  if (!CLIP) return toast("还没复制东西：先点一张卡，Ctrl+C");
+  // cardDef 找不到会落回第一张卡（生图），照它粘会粘出一张不相干的卡，所以这儿要精确查
+  if (!CARDS.some(d => d.id === CLIP.type)) return toast("这种卡在当前版本里不存在了，粘不了");
+  // 鼠标不在画布上（比如刚在侧边栏点完）就按老位置错开一点，连着粘也不会重叠
+  const at = mouseW || { x: CLIP.x + 24 * ++pasteN, y: CLIP.y + 28 * pasteN };
+  const n = addCard(CLIP.type, at.x - CW / 2, at.y - 40, CLIP.cap);
+  Object.assign(n, {
+    name: CLIP.name,
+    params: JSON.parse(JSON.stringify(CLIP.params)),
+    assets: JSON.parse(JSON.stringify(CLIP.assets)),
+  });
+  if (CLIP.w) n.w = CLIP.w;
+  if (CLIP.h) n.h = CLIP.h;
+  paintTitle(n); applySize(n); paint(n); paintKind(n); paintPort(n);
+  openPanel(n.id); save();
+  toast(`已粘贴「${titleOf(n)}」`);
 }
 
 /* ================= 连线传产物 ================= */
@@ -998,8 +1437,27 @@ function firstFreeSlot(c, kind) {
   return (specs.find(s => !c.assets[s.key]) || specs[0] || null);
 }
 
+/** 把风格卡挂到一张生成卡上。不搬文件、不占素材槽 —— 只记一条 @style 连线，
+    真正的合并发生在提交那一刻（payloadOf），所以改风格卡不用重连、也不用重跑上游。 */
+function linkStyle(from, to) {
+  if (isStyle(to)) return toast("风格卡之间不用连线：一张卡可以挂好几张风格卡");
+  const ps = promptSpecs(capOf(to));
+  if (!ps.length) return toast(`「${titleOf(to)}」不写提示词，挂风格卡没有用`);
+  if (PROJ.edges.some(e => e.from === from.id && e.to === to.id && e.slot === STYLE_SLOT)) {
+    return toast("已经挂上了");
+  }
+  PROJ.edges.push({ from: from.id, to: to.id, slot: STYLE_SLOT });
+  drawWires(); paintStyles();
+  if (selId === to.id) openPanel(to.id);
+  save();
+  const n = styleReach(from).length;
+  toast(`风格已挂给「${titleOf(to)}」` + (n ? `，下游 ${n} 张卡也跟着套` : ""));
+}
+
 async function linkTo(from, to) {
   if (!to) return;
+  if (isStyle(from)) return linkStyle(from, to);
+  if (isStyle(to)) return toast("风格卡不收素材：把它的出口拖到生图/生视频卡上");
   const out = (from.outputs || [])[0];
   if (!out) return toast("上游还没有产物，先运行它");
   // 路由卡先按上游产物的类型切到对应那一路，切完槽位名才对得上（见 routeFor）
@@ -1012,9 +1470,11 @@ async function linkTo(from, to) {
   if (!spec) return toast("下游卡没有可接收的槽位");
   PROJ.edges = PROJ.edges.filter(e => !(e.to === to.id && (r || e.slot === spec.key)));
   PROJ.edges.push({ from: from.id, to: to.id, slot: spec.key });
-  drawWires(); save();
+  drawWires(); paintStyles(); save();
   try {
-    toast(`引用上游产物 → ${spec.label}`);
+    // 风格是顺着这根线传下来的（没有单独的连线），接线那一刻就说一句，不然是隐形的
+    const inh = styleTexts(to).length && promptSpecs(capOf(to)).length;
+    toast(`引用上游产物 → ${spec.label}` + (inh ? "；上游的风格也跟着传下来了" : ""));
     to.assets[spec.key] = await importOutput(out);
     paintKind(to);
     if (selId === to.id) openPanel(to.id);
@@ -1036,6 +1496,26 @@ function modeTakes(md, kind) {
     而且"视频接进生图当参考图"根本跑不通（LoadImage 读不了 mp4）。
     这里只列槽位类型对得上的，选完直接建卡 + 连线。 */
 async function spawnDownstream(from, at, cx, cy) {
+  // 风格卡拖出来：列所有写提示词的玩法（工具卡不写提示词，自动落选）
+  if (isStyle(from)) {
+    const items = [];
+    for (const [gname, defs] of menuGroups()) {
+      const hit = [];
+      for (const def of defs) {
+        for (const md of def.modes) if (promptSpecs(CAPS[modeCap(md)]).length) hit.push([def, md]);
+      }
+      if (!hit.length) continue;
+      items.push({ group: gname });
+      for (const [def, md] of hit) {
+        items.push({
+          icon: def.icon, text: md.name,
+          run: () => linkStyle(from, addCard(def.id, at.x, at.y - 40, modeCap(md))),
+        });
+      }
+    }
+    if (!items.length) return;
+    return showMenu(cx, cy, "把这段风格挂给…", items);
+  }
   const out = (from.outputs || [])[0];
   // 还没跑过就按这条能力"将来会出什么"来列 —— 先把链子搭起来、回头再跑是常见做法，
   // 不能因为上游还空着就什么都不给建（linkTo 那边会提醒去跑上游）
@@ -1103,6 +1583,9 @@ function pushHistory(c) {
   c.history.unshift({
     ts: Date.now(), seed: c.seed != null ? c.seed : null,
     cap: runCap(c), ms: c.ms != null ? c.ms : null, outputs: outs,
+    // 挂了风格卡时，卡上提示词框里的字并不是真发出去的那段（风格是提交那一刻并进去的）。
+    // 只有把当时真提交的整段留下来，这一轮才复现得出来 —— 风格卡后来改了、解除了都不影响它
+    ...(c._sent ? { prompt: c._sent } : {}),
   });
   if (c.history.length > HIST_MAX) c.history.length = HIST_MAX;
 }
@@ -1144,6 +1627,7 @@ function closeHistory() {
 function openHistory(id) {
   const c = PROJ && PROJ.cards.find(x => x.id === id);
   if (!c) return closeHistory();
+  if (isStyle(c)) return closeHistory();   // 风格卡永远没有产物，别摆一个空栏子占地方
   seedHistory(c);
   const list = document.createElement("div"); list.className = "hlist";
   const cap = capOf(c);
@@ -1209,6 +1693,16 @@ function histRun(c, h, cur) {
     rs.appendChild(cp);
   }
   box.appendChild(rs);
+
+  // 套了风格卡的那几轮：把当时真提交的整段提示词收在这儿。卡上那个框里的字
+  // 不等于跑出这一轮的那段话，不放出来的话这一轮等于没法复现
+  if (h.prompt) {
+    const rp = document.createElement("details"); rp.className = "rp";
+    const sm = document.createElement("summary"); sm.textContent = "当时提交的提示词";
+    const tx = document.createElement("div"); tx.textContent = h.prompt;
+    rp.append(sm, tx);
+    box.appendChild(rp);
+  }
   return box;
 }
 
@@ -1266,6 +1760,8 @@ function openPanel(id) {
   el.panel.style.display = "";
   el.panel.style.visibility = "";     // 上一次拖卡片藏起来后没复位的话，这里兜一下
 
+  if (isStyle(c)) return stylePanel(c);
+
   // --- 模式切换 ---
   if (def.modes.length > 1) {
     const m = document.createElement("div"); m.className = "modes";
@@ -1306,12 +1802,10 @@ function openPanel(id) {
   el.panel.appendChild(body);
 
   // --- 玩法说明 ---
-  // 素材有硬性要求（比如每张图必须是四宫格拼图）的工作流，不讲清楚就是白跑一轮
-  if (cap.note) {
-    const n = document.createElement("div"); n.className = "pnote";
-    n.textContent = cap.note;
-    body.appendChild(n);
-  }
+  // 能力本身的介绍（cap.note、吃什么吐什么）不在这儿画：面板一打开就是一大段字，
+  // 把素材槽和参数挤到下面去，而这段话看一遍就够了。改成鼠标停在卡片顶栏上才显示
+  // （buildCard 里的 hoverBrief）。下面这两条留着 —— 它们不是介绍，是"现在会跑哪条"
+  // 的实时反馈，看的时候正需要对着参数看。
   // 路由卡：说清楚放什么会跑什么，并标出现在这一格是哪一路
   if (md && md.route) {
     const filled = Object.keys(md.route).find(k => md.route[k].cap === c.cap
@@ -1409,6 +1903,9 @@ function openPanel(id) {
   const info = document.createElement("span");
   info.style.cssText = "color:#8a8a94;font-size:12px";
   info.textContent = cap.outputType === "video" ? "输出：视频" : "输出：图片";
+  // 说明搬去卡片顶栏悬停了，这儿得留一句指路：素材有硬性要求（比如每张图必须是
+  // 四宫格拼图）的玩法，没看过那段话就是白跑一轮
+  if (cap.note) info.textContent += " · 玩法说明：鼠标停在卡片标题上";
   foot.appendChild(info);
   if (running) {
     const cn = document.createElement("button");
@@ -1429,6 +1926,104 @@ function openPanel(id) {
 }
 
 function errBox(t) { const d = document.createElement("div"); d.className = "err"; d.textContent = t; return d; }
+
+/** 风格卡的面板。它没有能力、没有素材、没有参数，只有一段文字和"挂给了谁"，
+    所以整块单独画，不走上面那套（specs / 旋钮 / 运行按钮一个都用不上）。 */
+function stylePanel(c) {
+  const body = document.createElement("div"); body.className = "pbody";
+  el.panel.appendChild(body);
+
+  const n = document.createElement("div"); n.className = "pnote";
+  n.textContent = "这张卡不生成任何东西。把它的出口（右边那颗点）拖到生图/生视频卡上，"
+    + "提交那一刻这段文字会并进那张卡的提示词里 —— 一张风格卡可以同时挂好几张卡，"
+    + "改一次，挂着的全跟着变。\n"
+    + "挂了一张，它下游整条链都跟着套：产物接给谁，风格就传给谁，"
+    + "不用每一棒都挂一遍（中间夹着放大、补帧这种不写提示词的卡也照样往下传）。"
+    + "下游哪张卡自己挂了风格，那张卡起就以它自己的为准，这一份不再往下传。\n"
+    + `默认是风格在前、空一行再接卡片自己的提示词。想换位置就在下面写上 ${STYLE_PH}，`
+    + "卡片的提示词会填到那个位置去（比如「照下面的内容画一张图：" + STYLE_PH
+    + "。整体是哥特暗黑定格动画风格」）。\n"
+    + "只写风格：画风、色调、光线、镜头质感、画质词。别在这儿写具体画面内容 ——"
+    + "那是每张卡自己的事，写在这儿会让所有卡画同一个东西。";
+  body.appendChild(n);
+
+  const wrap = document.createElement("div"); wrap.className = "pblock";
+  const hd = document.createElement("div"); hd.className = "phd";
+  const nm = document.createElement("span"); nm.textContent = "风格描述";
+  const cnt = document.createElement("span"); cnt.className = "demo";
+  const clr = document.createElement("button"); clr.textContent = "清空";
+  hd.append(nm, cnt, clr);
+  const ta = document.createElement("textarea");
+  ta.placeholder = "例：蒂姆·波顿式哥特暗黑定格动画质感，冷青灰色调，"
+    + "强侧光硬阴影，胶片颗粒，浅景深，电影级构图";
+  ta.value = String((c.params || {}).style || "");
+  ta.style.minHeight = "120px";
+  const sync = () => {
+    const t = ta.value.trim();
+    cnt.style.display = t ? "none" : "";
+    cnt.textContent = "⚠ 还没写，挂着也不起作用";
+  };
+  const commit = () => {
+    c.params = c.params || {};
+    c.params.style = ta.value;
+    sync(); paint(c); save();
+  };
+  ta.oninput = commit;
+  clr.onclick = () => { ta.value = ""; commit(); ta.focus(); };
+  sync();
+  wrap.append(hd, ta);
+  body.appendChild(wrap);
+
+  // --- 挂给了谁 ---
+  const edges = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e));
+  const box = document.createElement("div"); box.className = "slinks";
+  const t = document.createElement("div"); t.className = "atitle";
+  t.textContent = edges.length ? `挂着 ${edges.length} 张卡` : "还没挂给任何卡";
+  box.appendChild(t);
+  if (!edges.length) {
+    const p = document.createElement("div"); p.className = "anote";
+    p.textContent = "把右边那颗点拖到一张生图/生视频卡上；拖到空白处会列出所有写提示词的玩法。";
+    box.appendChild(p);
+  }
+  for (const e of edges) {
+    const to = PROJ.cards.find(x => x.id === e.to);
+    if (!to) continue;
+    const r = document.createElement("div"); r.className = "slink";
+    const a = document.createElement("button"); a.className = "nm";
+    a.textContent = titleOf(to);
+    a.title = "选中这张卡（面板上能看到合并后的提示词）";
+    a.onclick = () => pick(to.id);
+    const x = document.createElement("button"); x.className = "off";
+    x.textContent = "解除"; x.title = "这张卡不再套用本风格";
+    x.onclick = () => {
+      PROJ.edges = PROJ.edges.filter(y => y !== e);
+      drawWires(); paintStyles(); openPanel(c.id); save();
+    };
+    r.append(a, x);
+    box.appendChild(r);
+  }
+  // 继承来的那几张：没有连线、也不能在这儿解除（要断就断产物那根线），
+  // 但不列出来用户就不知道这段风格还在悄悄影响谁
+  const down = styleReach(c);
+  if (down.length) {
+    const t2 = document.createElement("div"); t2.className = "atitle";
+    t2.textContent = `顺着连线连带 ${down.length} 张`;
+    box.appendChild(t2);
+    for (const to of down) {
+      const r = document.createElement("div"); r.className = "slink down";
+      const a = document.createElement("button"); a.className = "nm";
+      a.textContent = titleOf(to);
+      a.title = "选中这张卡（面板上能看到合并后的提示词）";
+      a.onclick = () => pick(to.id);
+      const s = document.createElement("span"); s.className = "off ro";
+      s.textContent = "继承"; s.title = "上游那张卡传下来的，要断就断它们之间那根产物连线";
+      r.append(a, s);
+      box.appendChild(r);
+    }
+  }
+  body.appendChild(box);
+  placePanel();
+}
 
 /** 图 ↔ 提示词是一对一跑的（第 k 张图配第 k 条提示词，见 manifest 的 pairWith），
     所以提示词收成一排 tab、跟着图走：没上传第 k 张图，第 k 条提示词就不存在。
@@ -1465,29 +2060,210 @@ function promptTabs(c, list) {
   return wrap;
 }
 
-/** 提示词块：默认值是工作流作者的演示文案，必须让用户看见并且一键清掉 */
+/** 提示词块：默认值是工作流作者的演示文案，必须让用户看见并且一键清掉。
+    优化过之后这一格有两份词（原词 / 优化后），页签选哪份就提交哪份。 */
 function promptBlock(c, s, label) {
   const wrap = document.createElement("div"); wrap.className = "pblock";
+  const scs = styleCards(c);
+  const styles = scs.map(styleTextOf);
+  const own = ownStyles(c);
+
+  // ✨优化只画在"主提示词"那一格，而且这条能力得在扫描器的 REWRITE 表里登记过
+  // （manifest.rewrite）。分镜那种一图一句的卡本来就没登记
+  const rcap = CAPS[runCap(c)] || capOf(c);
+  const canOpt = !!(rcap && rcap.rewrite
+    && s.key === (promptSpecs(rcap)[0] || {}).key);
+  const opt = canOpt ? optOf(c, s.key) : null;
+  // 有优化结果时页签说话，没有就一直是原词
+  const useOpt = !!(opt && c.optUse && c.optUse[s.key]);
+
   const hd = document.createElement("div"); hd.className = "phd";
   const nm = document.createElement("span"); nm.textContent = label || s.label;
   const tag = document.createElement("span"); tag.className = "demo";
   tag.textContent = "⚠ 这是示例文案，改成你要的内容";
-  const clr = document.createElement("button"); clr.textContent = "清空";
-  hd.append(nm, tag, clr);
+  const clr = document.createElement("button");
+  clr.textContent = useOpt ? "扔掉这份" : "清空";
+  if (useOpt) clr.title = "删掉优化结果，切回你自己写的原词（原词一直没被动过）";
+  hd.append(nm, tag);
+  if (canOpt) hd.appendChild(optBtn(c, s, !!opt));
+  hd.appendChild(clr);
+  wrap.appendChild(hd);
+
+  // 两份词的页签。优化前不画 —— 只有一份词的时候页签是噪音
+  if (opt) wrap.appendChild(optTabs(c, s, useOpt));
 
   const ta = document.createElement("textarea");
   ta.placeholder = `${label || s.label}：描述你想要的画面/动作/镜头`;
-  ta.value = c.params[s.key] != null ? c.params[s.key] : (s.default || "");
+  ta.value = useOpt ? opt
+    : (c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
+  // 优化后那份是给模型看的格式化长文（H3 的六段式能有四五百词），框子要高一点
+  if (useOpt) ta.classList.add("optta");
+  wrap.appendChild(ta);
+
+  // 「实际提交」读数。只有原词那份需要它：风格是提交那一刻才并进去的
+  // （合并结果**不写回 c.params** —— 写回去风格就固化在这张卡上了，改风格卡时下游
+  // 不跟着变，还会一路叠加），所以面板上的框 ≠ 真提交的，必须摆出来。
+  // 优化后那份不需要：风格在优化那一步就融进去了，框里就是原样提交的东西。
+  // 风格可能是从上游顺着连线传下来的（这张卡上没有那根线），不说清来路用户会以为面板串了
+  let pv = null;
+  if (styles.length && !useOpt) {
+    pv = document.createElement("div"); pv.className = "stypv";
+    const ph = document.createElement("div"); ph.className = "hd";
+    ph.textContent = `实际提交（已套用 ${styles.length} 张风格卡`
+      + (own.length ? "" : " · 从上游继承") + "）";
+    // 自己挂了就不继承上游，这件事不摆出来就是"上游那张风格白挂了"
+    const over = own.length ? upStyles(c) : [];
+    ph.title = (own.length ? "这张卡自己挂的：" : "从上游继承：") + scs.map(titleOf).join("、")
+      + (own.length ? "" : "\n要断就断它跟上游那根产物连线")
+      + (over.length ? `\n上游还传了「${over.map(titleOf).join("、")}」，`
+        + "但这张卡自己挂了风格，就以自己的为准；两份都要就把上游那张也拖到这张卡上" : "");
+    const pb = document.createElement("div"); pb.className = "tx";
+    pv.append(ph, pb);
+    pv._tx = pb;
+    wrap.appendChild(pv);
+  }
+
   const sync = () => {
-    const isDemo = !!s.default && ta.value.trim() === String(s.default).trim();
+    // 示例文案警告只对原词有意义：优化后的那份是模型写的，不可能等于作者的演示文案
+    const isDemo = !useOpt && !!s.default && ta.value.trim() === String(s.default).trim();
     tag.style.display = isDemo ? "" : "none";
     ta.classList.toggle("isdemo", isDemo);
+    if (pv) pv._tx.textContent = withStyle(ta.value, styles);
   };
-  ta.oninput = () => { c.params[s.key] = ta.value; sync(); save(); };
-  clr.onclick = () => { ta.value = ""; c.params[s.key] = ""; sync(); ta.focus(); save(); };
+  // 改哪个页签写回哪一份。优化后的也让改 —— 模型偶尔会漏个标签、多写一句，
+  // 让人当场补掉比重跑一轮二十秒划算
+  ta.oninput = () => {
+    if (useOpt) { c.opt[s.key] = ta.value; } else { c.params[s.key] = ta.value; }
+    sync(); save();
+  };
+  clr.onclick = () => {
+    // 在「优化后」页签上，"清空"唯一有意义的解释是"这份不要了" —— 留一个空的
+    // 优化结果在那儿只会让人对着一个空框发愣。原词那份一直没被动过，直接切回去
+    if (useOpt) {
+      delete c.opt[s.key]; delete c.optUse[s.key];
+      if (c.optStyle) delete c.optStyle[s.key];
+      save(); return repanel(c);
+    }
+    ta.value = ""; c.params[s.key] = ""; sync(); ta.focus(); save();
+  };
   sync();
-  wrap.append(hd, ta);
+  if (c._rwErr && c._rwErr.key === s.key) {
+    const e = document.createElement("div"); e.className = "rwerr";
+    e.textContent = "优化没成功：" + c._rwErr.msg;
+    wrap.appendChild(e);
+  }
   return wrap;
+}
+
+/** 「✨优化」按钮。已经优化过就是「重新优化」（换个种子再跑一遍，覆盖旧的那份）。 */
+function optBtn(c, s, done) {
+  const b = document.createElement("button"); b.className = "rwbtn";
+  const busy = !!c._rwBusy;
+  b.textContent = busy ? "优化中…" : (done ? "重新优化" : "✨优化");
+  b.disabled = busy;
+  b.title = busy ? "本地大模型正在优化，第一次要等它加载模型，十几到几十秒"
+    : "把这段话交给本地大模型，改成这个模型认的写法。"
+    + "\n挂了风格卡的话，风格会一起融进优化结果里"
+    + "\n原词不会被动，优化完多一个页签，用哪份你选";
+  b.onclick = () => doRewrite(c, s);
+  return b;
+}
+
+/** 原词 / 优化后 两个页签。选中哪个，生成时就提交哪个。 */
+function optTabs(c, s, useOpt) {
+  const strip = document.createElement("div"); strip.className = "opttabs";
+  const mk = (on, text, title) => {
+    const b = document.createElement("button");
+    b.className = on ? "on" : ""; b.textContent = text; b.title = title;
+    b.onclick = () => {
+      c.optUse = c.optUse || {};
+      c.optUse[s.key] = (text !== "原词");
+      save(); repanel(c);
+    };
+    return b;
+  };
+  // 风格是烙进优化结果里的，不会跟着风格卡变。所以对比一下"优化时挂的"和"现在挂的"
+  const cur = styleTexts(c).join("\n\n");
+  const was = (c.optStyle && c.optStyle[s.key]) || "";
+  const stale = cur !== was;
+  strip.append(
+    mk(!useOpt, "原词", "你自己写的那段。生成时"
+      + (cur ? "会在前面拼上风格卡的文字" : "原样提交")),
+    mk(useOpt, "✨优化后", "本地大模型优化出来的那段，已经是这个模型认的格式。"
+      + (was ? "\n风格已经融在里面了，生成时不再另外拼风格卡" : "")
+      + "\n原样提交"));
+
+  const note = document.createElement("span"); note.className = "note";
+  if (!useOpt) {
+    note.textContent = cur ? "提交时会拼上风格卡" : "";
+  } else if (stale) {
+    // 这三种都是"优化结果里的风格已经不是现在这张风格卡了"，不说出来风格就静悄悄地错了
+    note.className = "note bad";
+    note.textContent = "⚠ " + (!was ? "风格卡是优化之后挂的，这份里没有它"
+      : !cur ? "风格卡摘了，这份里还留着它" : "风格卡换过了，这份里还是旧的")
+      + " —— 点「重新优化」";
+    note.title = "优化结果是一段写死的文字，风格在优化那一刻就烙进去了，"
+      + "之后改风格卡不会让它跟着变。要么重新优化一次，要么切回「原词」。";
+  } else {
+    note.textContent = cur ? "已含风格，提交时不再另拼风格卡" : "按模型认的格式写好了，原样提交";
+  }
+  strip.appendChild(note);
+  return strip;
+}
+
+/** 重画面板，但只在它确实开着这张卡的时候 —— 优化要等好一会儿，
+    这中间用户可能已经关了面板、或去看别的卡了，别硬把面板抢回来。 */
+const repanel = (c) => { if (el.panel._id === c.id) openPanel(c.id); };
+
+/** 优化完那句提示。要说清**走的哪条路** —— 一次几秒（API）和一次几分钟
+    （本地 27B 要把 14 GB 挤进显存）差着两个数量级，不说的话用户只会觉得
+    "这功能时快时慢"，也不知道 llm.json 到底生效了没有。
+    r.fallback 有值 = API 试过没通，那句原因必须露出来（key 填错、余额不足、
+    超时是完全不同的处理），否则他只能来问我。 */
+function rwToast(r) {
+  const t = r.ms >= 60000
+    ? `${Math.floor(r.ms / 60000)} 分 ${Math.round(r.ms % 60000 / 1000)} 秒`
+    : `${(r.ms / 1000).toFixed(1)} 秒`;
+  const how = r.fallback ? `⚠ API 没通（${r.fallback}），本地 27B 兜的`
+    : r.via === "api" ? `✅ API 改的（${r.model || "远程"}）`
+      : "✅ 本地 27B 改的";
+  return `${how}，${t}` + (r.warn ? "\n⚠ " + r.warn : "");
+}
+
+/** 把提示词交给大模型改一遍，结果存成这一格的「优化后」那份。
+    先走 API（几秒），不通再落本地 27B —— 本地那条走 ComfyUI 队列、跟出图抢显存，
+    前面有活儿还得排队，界面上就是按钮一直显示「优化中…」。 */
+async function doRewrite(c, s) {
+  const cap = CAPS[runCap(c)] || capOf(c);
+  if (!cap || !cap.rewrite) return;
+  // 拿的一定是**原词**：优化的输入永远是用户自己写的那段，不是上一轮的优化结果
+  // （拿优化结果再优化会一轮轮越写越长，最后跟用户想要的没关系了）
+  const src = String(c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
+  if (!src.trim()) return toast("先写一句你想要什么，优化才有东西可改");
+  const pl = payloadOf(c);
+  c._rwBusy = true; c._rwErr = null;
+  repanel(c);
+  try {
+    // prompt 是原词，风格另外给 —— 让模型把风格融进输出里。用户选「优化后」时
+    // 提交的就是这份输出原样，系统不再拼风格卡（payloadOf），所以必须融进去
+    const r = await jpost("/api/rewrite", {
+      capability: cap.id, params: pl.params, assets: pl.assets,
+      prompt: src, style: styleTexts(c).join("\n\n"),
+      project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
+    });
+    c.opt = c.opt || {}; c.optUse = c.optUse || {}; c.optStyle = c.optStyle || {};
+    c.opt[s.key] = r.text;
+    c.optUse[s.key] = true;             // 跑完直接切过去，不然还得再点一下才看得见
+    // 记下这份优化是配着哪段风格跑出来的。之后风格卡换了/摘了/新挂了，
+    // 优化结果**不会**跟着变（风格是烙在文字里的），页签那儿要能说出来
+    c.optStyle[s.key] = styleTexts(c).join("\n\n");
+    save();
+    toast(rwToast(r));
+  } catch (e) {
+    c._rwErr = { key: s.key, msg: e.message };
+  }
+  c._rwBusy = false;
+  repanel(c);
 }
 
 /** 作者调好的规范（漫剧那份剧本格式规范就是）：默认折起来。
@@ -1540,6 +2316,15 @@ function paintTitle(c) {
 function paintKind(c) {
   const k = c._el && c._el.querySelector(".cf .kt");
   if (!k) return;
+  // 风格卡不出东西，徽标位上说清它是干什么的 —— 不然它长得跟别的卡一样，
+  // 只是一直"待生成"，会有人反复去点运行
+  if (isStyle(c)) {
+    k.dataset.kind = "style";
+    k.textContent = "🎨 只加提示词";
+    k.title = "这张卡不生成任何东西：把它的出口拖到生图/生视频卡上，"
+      + "提交时这段风格会并进那张卡的提示词";
+    return;
+  }
   const md = modeOf(c);
   const undecided = kindUndecided(c);
   const kind = outKindOf(c);
@@ -1563,10 +2348,14 @@ function paintPort(c) {
   const p = c._el && c._el.querySelector(".inport");
   if (!p) return;
   const md = modeOf(c), cap = capOf(c);
+  // 能接风格卡的也点这颗点：不然用户不知道往哪儿拖那根线
+  const styleOk = !isStyle(c) && promptSpecs(cap).length;
   const kinds = md && md.route ? Object.keys(md.route)
     : [...new Set((cap ? cap.inputs : []).filter(s => MEDIA.includes(s.type)).map(s => s.type))];
-  p.style.display = kinds.length ? "" : "none";
-  p.title = `上游卡的产物拖到这里（收${kinds.map(k => KIND_ZH[k] || k).join(" / ")}）`;
+  p.style.display = (kinds.length || styleOk) ? "" : "none";
+  p.title = kinds.length
+    ? `上游卡的产物拖到这里（收${kinds.map(k => KIND_ZH[k] || k).join(" / ")}${styleOk ? "，也收风格卡" : ""}）`
+    : "风格卡的出口拖到这里";
 }
 
 function slotEl(c, s) {
@@ -1596,7 +2385,7 @@ function slotEl(c, s) {
           delete c.assets[s.key];
           PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.slot === s.key));
           paintKind(c);
-          drawWires(); openPanel(c.id); save();
+          drawWires(); paintStyles(); openPanel(c.id); save();
         },
       },
     ]);
@@ -1876,12 +2665,21 @@ function augRes(c, s, row) {
     图生视频出鼠标广告就是这么来的。 */
 function payloadOf(c) {
   const cap = CAPS[runCap(c)] || capOf(c), params = {}, assets = {};
+  // 风格卡是提交这一刻才并进提示词的（不写回 c.params，见 promptBlock）
+  const styles = styleTexts(c);
+  const pkeys = new Set(promptSpecs(cap).map(s => s.key));
   for (const s of cap.inputs) {
     if (MEDIA.includes(s.type) || s.mirror) continue;
     const v = c.params[s.key];
     if (v != null) params[s.key] = v;
     else if (s.type === "seed") params[s.key] = -1;      // 每次随机
     else if (s.default !== undefined) params[s.key] = s.default;
+    if (!pkeys.has(s.key)) continue;
+    // 用了「优化后」那份：它是整段现成的提示词，风格在优化那一步就已经融进去了，
+    // 这儿再拼一遍就是两份风格。所以优化后的词**原样提交**，不过 withStyle
+    const opt = usingOpt(c, s.key);
+    if (opt != null) params[s.key] = opt;
+    else if (styles.length) params[s.key] = withStyle(params[s.key], styles);
   }
   for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
   // card/cardName 只给任务浮窗用：光有能力名说不清是哪张卡在跑，也没法点回去
@@ -1890,12 +2688,20 @@ function payloadOf(c) {
 }
 
 async function run(c) {
+  if (isStyle(c)) return toast("风格卡不用运行：它只把风格并进挂着的那几张卡的提示词");
   const cap = capOf(c);
   if (!cap) return toast("能力不可用");
   c.error = null; c.progress = 0; c.status = "queued"; c.outputs = []; c.ms = null; c.step = "";
   paint(c); openPanel(c.id);      // status 一进 queued，paint 就把画面区换成加载态
+  const pl = payloadOf(c);
+  // 留一手给历史记录：真提交的那段跟面板上原词那个框不一样时（并了风格卡、或者用的是
+  // 优化后那份），只有把真提交的整段留下来这一轮才复现得出来（见 pushHistory）。
+  // `_` 开头不落盘，真正持久化的是 history 里那一条
+  const pk = promptSpecs(CAPS[runCap(c)] || cap).map(s => s.key);
+  const sent = pk.length ? String(pl.params[pk[0]] || "") : "";
+  c._sent = (pk.length && sent !== String(c.params[pk[0]] || "")) ? sent : null;
   try {
-    const job = await jpost("/api/generate", payloadOf(c));
+    const job = await jpost("/api/generate", pl);
     c.job = job.id; c.seed = job.seed; c.status = job.status;
   } catch (e) {
     c.status = "error"; c.error = e.message; c.job = null;
@@ -1944,8 +2750,8 @@ async function pollJobs() {
         pushHistory(c);
         if (el.hist._id === c.id) openHistory(c.id);
         drawWires();
-        // 下游已连线的卡自动吃掉新产物
-        for (const e of PROJ.edges.filter(e => e.from === c.id)) {
+        // 下游已连线的卡自动吃掉新产物（风格线传的是文字，没有产物可搬，跳过）
+        for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e))) {
           const to = PROJ.cards.find(x => x.id === e.to);
           if (!to) continue;
           try { to.assets[e.slot] = await importOutput(c.outputs[0]); } catch (err) {}
@@ -2061,6 +2867,14 @@ function renderJobs() {
   list.scrollTop = scrolled;
 }
 
+/** 任务是哪个项目的。当前打开的这个直接用 PROJ.name（刚改的名字 projects 里还是旧的），
+    别的项目去 projects 列表里认 id；项目已经被删了就只剩卡片名。 */
+function jobProjName(j) {
+  if (!j.project) return "";
+  if (PROJ && j.project === PROJ.id) return PROJ.name;
+  return (projects.find(p => p.id === j.project) || {}).name || "";
+}
+
 function jobRow(j) {
   const d = document.createElement("div");
   d.className = "jrow " + jobCls(j);
@@ -2068,9 +2882,19 @@ function jobRow(j) {
 
   const r1 = document.createElement("div"); r1.className = "r1";
   const nm = document.createElement("span"); nm.className = "nm";
-  // 卡片名才是用户认得出的那个（"角色图放大"），能力名（"SeedVR2 图片高清放大"）退到第二行
-  nm.textContent = j.cardName || j.name;
-  nm.title = j.cardName && j.cardName !== j.name ? `${j.cardName}（${j.name}）` : j.name;
+  // 卡片名才是用户认得出的那个（"角色图放大"），能力名（"SeedVR2 图片高清放大"）退到第二行。
+  // 前面再挂上项目名：几个项目里都有一张叫"主角图"的卡，光看卡片名分不出是哪个在跑
+  const card = j.cardName || j.name;
+  const pj = jobProjName(j);
+  if (pj) {
+    const p = document.createElement("i"); p.className = "pj";
+    p.textContent = pj + " - ";
+    nm.appendChild(p);
+  }
+  const cn = document.createElement("span"); cn.className = "cn";
+  cn.textContent = card;
+  nm.appendChild(cn);
+  nm.title = (pj ? `${pj} - ` : "") + (card !== j.name ? `${card}（${j.name}）` : j.name);
   d._st = document.createElement("span"); d._st.className = "st";
   r1.append(nm, d._st);
 

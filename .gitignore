@@ -1,6 +1,9 @@
 # 运行时数据（可再生 / 用户产物），不入库
 data/
 
+# 改写用的 API key。模板 llm.json.例子 要入库，填好的这份绝不能
+/llm.json
+
 # Python
 __pycache__/
 *.py[cod]

@@ -16,6 +16,11 @@
   "node": "142"
  },
  "note": null,
+ "rewrite": {
+  "regime": "h3_ref",
+  "audio": true
+ },
+ "compare": false,
  "inputs": [
   {
    "key": "images[0]",
@@ -38,10 +43,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "136",
-    "input": "ref_images.ref_image_0"
-   }
+   "dropIfEmpty": [
+    {
+     "node": "136",
+     "input": "ref_images.ref_image_0"
+    }
+   ]
   },
   {
    "key": "audio[0]",

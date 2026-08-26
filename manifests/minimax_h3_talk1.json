@@ -16,6 +16,11 @@
   "node": "142"
  },
  "note": null,
+ "rewrite": {
+  "regime": "h3_ref",
+  "audio": true
+ },
+ "compare": false,
  "inputs": [
   {
    "key": "images[0]",

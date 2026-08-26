@@ -1,0 +1,296 @@
+{
+ "86": {
+  "class_type": "ReferenceLatent",
+  "inputs": {
+   "conditioning": [
+    "73",
+    0
+   ],
+   "latent": [
+    "87",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Set Reference Latent"
+  }
+ },
+ "74": {
+  "class_type": "ReferenceLatent",
+  "inputs": {
+   "conditioning": [
+    "19",
+    0
+   ],
+   "latent": [
+    "75",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Set Reference Latent"
+  }
+ },
+ "73": {
+  "class_type": "ReferenceLatent",
+  "inputs": {
+   "conditioning": [
+    "11",
+    0
+   ],
+   "latent": [
+    "75",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Set Reference Latent"
+  }
+ },
+ "85": {
+  "class_type": "ReferenceLatent",
+  "inputs": {
+   "conditioning": [
+    "74",
+    0
+   ],
+   "latent": [
+    "87",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Set Reference Latent"
+  }
+ },
+ "87": {
+  "class_type": "VAEEncode",
+  "inputs": {
+   "pixels": [
+    "96",
+    0
+   ],
+   "vae": [
+    "10",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Encode"
+  }
+ },
+ "96": {
+  "class_type": "ImageScaleToTotalPixels",
+  "inputs": {
+   "image": [
+    "64",
+    0
+   ],
+   "upscale_method": "nearest-exact",
+   "megapixels": 1,
+   "resolution_steps": 1
+  },
+  "_meta": {
+   "title": "Scale Image to Total Pixels"
+  }
+ },
+ "75": {
+  "class_type": "VAEEncode",
+  "inputs": {
+   "pixels": [
+    "90",
+    0
+   ],
+   "vae": [
+    "10",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Encode"
+  }
+ },
+ "62": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "17",
+    0
+   ],
+   "filename_prefix": "ComfyUI"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ },
+ "19": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "14",
+    0
+   ],
+   "text": "让图中两个人物互相搭肩，都拿着啤酒，沙滩背景，近景，半身，相貌表情不变"
+  },
+  "_meta": {
+   "title": "CLIP Text Encode (Prompt)"
+  }
+ },
+ "13": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "flux-2-klein-9b-fp8.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "14": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen_3_8b_fp4mixed.safetensors",
+   "type": "flux2",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "10": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "flux2-vae.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "17": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "29",
+    0
+   ],
+   "vae": [
+    "10",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "11": {
+  "class_type": "ConditioningZeroOut",
+  "inputs": {
+   "conditioning": [
+    "19",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Conditioning Zero Out"
+  }
+ },
+ "29": {
+  "class_type": "easy cleanGpuUsed",
+  "inputs": {
+   "anything": [
+    "95",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy cleanGpuUsed"
+  }
+ },
+ "95": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "13",
+    0
+   ],
+   "positive": [
+    "85",
+    0
+   ],
+   "negative": [
+    "86",
+    0
+   ],
+   "latent_image": [
+    "83",
+    0
+   ],
+   "seed": 898602245421569,
+   "steps": 6,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "83": {
+  "class_type": "EmptyFlux2LatentImage",
+  "inputs": {
+   "width": [
+    "90",
+    2
+   ],
+   "height": [
+    "90",
+    3
+   ],
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "Empty Flux 2 Latent"
+  }
+ },
+ "90": {
+  "class_type": "EasySizeSimpleImage",
+  "inputs": {
+   "图像": [
+    "63",
+    0
+   ],
+   "SD1.5": "关",
+   "SDXL": "关",
+   "FLUX": "关",
+   "WAN": "关",
+   "QWEN": "关",
+   "裁剪方式": "中心裁剪",
+   "缩放算法": "lanczos",
+   "启用边长缩放": true,
+   "缩放至边": "最长边",
+   "缩放长度": 1280
+  },
+  "_meta": {
+   "title": "简单图像尺寸"
+  }
+ },
+ "63": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "downloaded-image (2) (2).jpg"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "64": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "ComfyUI_00020_ (1).png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ }
+}

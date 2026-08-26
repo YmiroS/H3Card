@@ -16,6 +16,11 @@
   "node": "92"
  },
  "note": null,
+ "rewrite": {
+  "regime": "h3_base",
+  "mode": "FL2VA"
+ },
+ "compare": false,
  "inputs": [
   {
    "key": "images[0]",
@@ -69,10 +74,11 @@
    "key": "duration",
    "label": "时长(秒)",
    "type": "slider",
-   "min": 3,
-   "max": 30,
+   "min": 5,
+   "max": 15,
    "step": 1,
    "default": 5,
+   "hint": "5~15 秒是这个模型练过的范围。想要更长的片子就分几张卡各出一段再接起来，硬拖长只会让动作发飘。提示词里各镜头的时长加起来要对得上这个数",
    "target": {
     "node": "142",
     "input": "value",
