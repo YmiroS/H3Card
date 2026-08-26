@@ -16,6 +16,8 @@
   "node": "9"
  },
  "note": null,
+ "rewrite": null,
+ "compare": false,
  "inputs": [
   {
    "key": "images[0]",
@@ -97,6 +99,8 @@
   }
  ],
  "warnings": [
-  "子图工作流：使用已导出的 flux2_klein_storyboard9.api.json（本地未重新转换）"
+  "子图工作流：使用已导出的 flux2_klein_storyboard9.api.json（本地未重新转换）",
+  "本地大模型：#183:179.model = Qwen3.5-27B-IQ4_XS.gguf",
+  "本地大模型：#183:179.mmproj = mmproj-F16.gguf"
  ]
 }

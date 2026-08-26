@@ -15,7 +15,11 @@
  "output": {
   "node": "38"
  },
- "note": null,
+ "note": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。\n提示词只写「镜头里看得见、听得见」的东西。这几种写法它一律读不懂，还会把真正的画面描述冲淡：\n· 分镜表格（镜号／景别／运镜 那种带表头的一大片）—— 改成一句句话写；\n· 导演阐述、创作意图（「突出人物的渺小」「为后续做铺垫」）—— 直接删掉，改成写画面上的结果；\n· 「你是导演某某」这类交代身份的话 —— 它不是聊天模型，这句纯占位置，想要某种质感就直接描述质感（胶片颗粒、冷暖对比光）。\n每个镜头写清「第几秒到第几秒 + 景别 + 谁在做什么 + 镜头怎么动」，各镜头时长加起来等于「时长(秒)」那个数；台词直接用引号写在那个镜头里。\n第一人称视角这类「主角不在画面里」的要求跟参考图是矛盾的 —— 参考图会一直把人拉回画面中央，想要主观视角就别放人物参考图。\n画面糊、脸不像先看「分辨率」：调到 1.0 以上再看一遍，参考图也是按这个分辨率缩过之后才喂进模型的，调低了人物细节就一起丢了。",
+ "rewrite": {
+  "regime": "h3_ref"
+ },
+ "compare": false,
  "inputs": [
   {
    "key": "images[0]",
@@ -38,10 +42,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "45",
-    "input": "ref_images.ref_image_1"
-   }
+   "dropIfEmpty": [
+    {
+     "node": "45",
+     "input": "ref_images.ref_image_1"
+    }
+   ]
   },
   {
    "key": "images[2]",
@@ -53,10 +59,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "45",
-    "input": "ref_images.ref_image_2"
-   }
+   "dropIfEmpty": [
+    {
+     "node": "45",
+     "input": "ref_images.ref_image_2"
+    }
+   ]
   },
   {
    "key": "images[3]",
@@ -68,10 +76,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "45",
-    "input": "ref_images.ref_image_3"
-   }
+   "dropIfEmpty": [
+    {
+     "node": "45",
+     "input": "ref_images.ref_image_3"
+    }
+   ]
   },
   {
    "key": "prompt",
@@ -103,10 +113,11 @@
    "key": "duration",
    "label": "时长(秒)",
    "type": "slider",
-   "min": 3,
-   "max": 30,
+   "min": 5,
+   "max": 15,
    "step": 1,
    "default": 10,
+   "hint": "5~15 秒是这个模型练过的范围。想要更长的片子就分几张卡各出一段再接起来，硬拖长只会让动作发飘。提示词里各镜头的时长加起来要对得上这个数",
    "target": {
     "node": "20",
     "input": "value",

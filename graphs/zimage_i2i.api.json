@@ -204,7 +204,7 @@
  "79": {
   "class_type": "llama_cpp_model_loader",
   "inputs": {
-   "model": "Qwen3.5-27B-UD-IQ3_XXS.gguf",
+   "model": "Qwen3.5-27B-IQ4_XS.gguf",
    "mmproj": "mmproj-F16.gguf",
    "chat_handler": "Qwen3.5",
    "n_ctx": 8192,

@@ -318,6 +318,12 @@ set "CUDA_PATH=%~dp0python_embeded\Lib\site-packages\nvidia\cuda_nvrtc"
 set "PATH=%CUDA_PATH%\bin;%PATH%"
 ```
 
+**bat 文件里一个中文都不能写，注释也不行。** cmd.exe 是按字节偏移一行行找过去的，
+UTF-8 的中文一个字三字节，读到下一行时位置就错在字符中间 —— `@rem` 前缀被吃掉，
+剩下半行被当命令执行，一启动就是一串「'xxx' 不是内部或外部命令」。
+（踩过：这两行上面本来加了 5 行中文 `@rem` 说明它们为什么不能省，结果每次启动报三条错。
+现在注释是英文的，中文说明只留在这份 md 里。`chouka\启动抽卡系统.bat` 头上也写着同一条。）
+
 **两行的作用不一样，都不能省**（实测过四种组合）：
 
 | 只设 | 结果 |
@@ -355,3 +361,217 @@ set "PATH=%CUDA_PATH%\bin;%PATH%"
 
 ⚠️ 整合包「升级」或「一键修复」之后，`1_1点击启动comfyui.bat` 那两行可能被覆盖，
 补帧又会报 `CUDA_HOME not set` —— 回来照抄一遍即可（pip 包一般还在）。
+
+---
+
+## 环境补丁：装 Hunyuan3D（3D 模型生成）踩的三个坑（2026-08-25）
+
+节点包 `ComfyUI/custom_nodes/ComfyUI-Hunyuan3DWrapper`，工作流由
+**`tools/gen_3d_workflows.py` 生成**（自带对着 `/object_info` 的校验，别手改生成出来的 json）：
+
+```bash
+./python_embeded/python.exe tools/gen_3d_workflows.py
+```
+
+出片在 `ComfyUI/output/3D/*.glb`。用的是 **2.1**
+（`models/diffusion_models/hy3dgen/hunyuan3d-dit-v2-1-fp16.ckpt`，7.4 GB，来自
+`tencent/Hunyuan3D-2.1`），一个 `Hy3D_2_1SimpleMeshGen` 节点包干抠图+生形状+解网格。
+2.0 那份 safetensors 也还在，但它要 `Hy3DModelLoader/GenerateMesh/VAEDecode` 三节点串。
+
+### 坑一：`msvc-runtime` 把 DLL 倒进 `python_embeded/`，整个包全崩
+
+装 `pymeshlab` 时被一起拖进来的 `msvc-runtime` 会往 **`python_embeded/` 根目录**写
+10 个 DLL（`msvcp140*.dll` / `vcruntime140_threads.dll` / `concrt140.dll` / `vcomp140.dll` …）。
+那个目录是 `python.exe` 所在目录，**DLL 搜索优先级最高**，于是它顶掉系统的运行库，
+毒的不是 3D 这一条，是**包里每一个节点**。症状是一提交任务 ComfyUI 进程直接死，
+`/queue` 连不上，控制台只留一句
+`forrtl: error (200): program aborting due to window-CLOSE event` —— 看不出跟 DLL 有关。
+
+清理：删掉 `msvc_runtime-*.dist-info/RECORD` 里记着的那 10 个文件
+（`python_embeded/` 和 `python_embeded/Scripts/` 各一份）+ `msvc_runtime.cp312-win_amd64.pyd`。
+**`vcruntime140.dll` / `vcruntime140_1.dll` 不在 RECORD 里，是包原装的，别删。**
+`pip uninstall` 会 `PermissionError [WinError 5]`（pip 自己那个 python 正加载着这些 DLL），
+得先停掉 ComfyUI 再用 `Remove-Item` 手删。
+
+**手删完记得把 `Lib/site-packages/~svc_runtime-*.dist-info` 也删掉。** 那是 pip 失败卸载
+留下的备份目录，`importlib.metadata` 照样能枚举到它、但按名字解析不出版本 ——
+`comfyui-liveportraitkj` 会因此起不来（`pykalman` -> `skbase` 会对枚举到的每个包调
+`version()`）：`PackageNotFoundError: No package metadata was found for msvc_runtime`。
+
+判据（都要过）：
+
+```bash
+./python_embeded/python.exe -c "
+import importlib.metadata as m
+print('msvc 残留:', [d.metadata['Name'] for d in m.distributions() if 'msvc' in (d.metadata['Name'] or '').lower()])
+print('查不到版本的包:', [d.metadata['Name'] for d in m.distributions() if not d.version])"
+# 两行都应该是空的
+./python_embeded/python.exe -c "import pymeshlab;pymeshlab.MeshSet();import torch;print(torch.cuda.is_available())"
+```
+
+### 坑二：`TransparentBGSession+` 在 torch 2.10 上直接打死进程
+
+comfyui_essentials 的抠图节点（`image.py:814` -> `transparent_background/Remover.py:107`）
+内部走 `torch.jit.trace`，在这个包的 torch 2.10 上不是报错，是 **abort**。
+所以 3D 链**不要**用它。2.1 的生成节点自带 rembg（首跑会下 176 MB 的
+`u2net.onnx` 到 `C:\Users\<你>\.u2net\`），本来就不需要外挂抠图。
+
+顺带：rembg 会打一句
+`LoadLibrary failed ... onnxruntime_providers_cuda.dll` —— 那是它退回 CPU 跑，
+无害，几百毫秒的事，别去追。
+
+### 图给多清楚才有用：天花板是 512，写死的
+
+`Hy3D_2_1SimpleMeshGen` 内部固定
+`rembg -> ImageProcessorV2.recenter(border_ratio=0.15) -> cv2.resize 到 512 -> DINO 518`
+（`hy3dshape/hy3dshape/preprocessors.py:90-107`，`configs/dit_config_2_1.yaml` 里
+DinoImageEncoder 的 `image_size: 518`）。所以：
+
+- **主体本身超过 512 像素就到顶了**，再大的原图不会更好。
+- 决定清晰度的是**主体占画面的比例**，不是总像素。`recenter` 按 alpha 框裁出主体、
+  再缩放到画幅的 85%；主体只占一小块时那一步是**放大**，糊。
+- 所以工作流里**不要提前缩到 518**。原来那个
+  `ImageResize+ [518,518,'pad','always']` 等于先把主体压小、再让 recenter 放大回来，
+  白糊一次。现在改成 `[2048,2048,'keep proportion','downscale if bigger']` ——
+  只在超大时降一下省内存，不裁不补边，居中和裁主体交给模型内部做（那是 INTER_AREA 下采样）。
+
+**上色那条链例外：必须先补成方图。** `Hy3DDelightImage` 里是
+`common_upscale(image, width, height, "lanczos", "disabled")`（`nodes.py:337`），
+非方图会被直接拉伸变形。所以贴图链里单独加了一个
+`ImageResize+ [518,518,'pad','always',2]`，接在 RMBG **前面** ——
+补边补什么颜色不重要，RMBG 紧接着把背景（含补出来的边）整片换成中灰。
+
+上色链的天花板更低：去光照固定 512×512，六视角每个视角也只画 512（之后才拉到 2048 去烘）。
+
+### 上色链的面数上限 5 万（xatlas 不支持更多）
+
+`Hy3DMeshUVWrap` -> `hy3dgen/texgen/utils/uv_warp_utils.py:33` -> `xatlas.parametrize`：
+
+```python
+if len(mesh.faces) > 50000:
+    #raise ValueError("The mesh has more than 50,000 faces, which is not supported.")
+    print("UV wrap: The mesh has more than 50,000 faces, which is not recommended.")
+```
+
+上游是**直接 raise**，kijai 注释掉换成了一句 print，所以喂多了不会被拦，只有一行警告。
+10 万面实测能跑过（跑通两次，出 5.6 MB 的 glb），但这是原生代码里的「不支持」路径，
+崩起来是 abort、整个进程带着队列一起没。所以按官方示例的 5 万走。
+
+> 顺带记一笔没定位到根因的一次进程死亡：在一个已经跑过 30 万面灰模 + 一整轮贴图、
+> 还下过 14 GB 模型的**长命进程**里再提交一次带贴图，75~90 秒之间（几何阶段）进程没了。
+> 重启之后同一张图、同样参数连跑两次（10 万面 / 5 万面）都过。
+> 所以别急着怪 xatlas —— 那次死在几何阶段，更像是长时间运行后的资源耗尽。
+> **连着跑了很多轮又开始莫名崩的时候，先重启 ComfyUI 再判。**
+
+### 精度：嫌粗糙先看 `max_facenum`，不是先拉 octree
+
+实测（5090 32G，`3D示例_小狐狸.png`，固定 seed 1234）：
+
+| steps / octree | 生成耗时 | 原始面数 | 显存峰值 |
+|---|---|---|---|
+| 30 / 384 | 47 秒 | 31 万 | 7.6 GB |
+| **50 / 512（现在的默认）** | 100 秒 | 56 万 | 8.7 GB |
+| 50 / 768 | 283 秒 | 127 万 | 12.8 GB |
+
+`Hy3DPostprocessMesh.max_facenum` 的**节点默认是 40000**，等于把 56 万面砍掉 93%，
+脸和耳朵上肉眼可见一块块棱面 —— 粗糙九成是这一刀砍的，不是模型不行。
+生成的 json 里已经改成 **300000**（成品 glb 约 5.4 MB）。
+
+octree 768 时间涨 3 倍、耳朵边缘反而起锯齿，不划算，512 是甜点。
+
+**参数拉到顶还嫌糙就不是参数的事了：这条链只出几何、没有贴图。**
+灰模「粗糙」很大一部分是没颜色没材质，要 Hunyuan3D 2.1 的 PBR 贴图得再装
+Delight + Paint，约 10 GB，还没装。
+
+### 坑三：出来是一块「平板」
+
+半身像 / 正面证件照那种「看着像一张照片」的素材，模型有时会理解成**浮雕**，
+出来是一块 2×2、Z 只有 0.01 的板。**实测半身人像三四次中一次**，
+`fp16` 换 `bfloat16` 一样会中 —— 不是精度问题，是素材歧义。
+
+判据别靠眼看，量 extents：
+
+```bash
+./python_embeded/python.exe -c "
+import trimesh;m=trimesh.load('ComfyUI/output/3D/xxx.glb',force='mesh')
+print(len(m.faces),[round(float(x),4) for x in m.extents])"
+# 正常三个数都在 0.5~2.0 量级；有一维是 0.0x 就是废的
+```
+
+排查时**先跳过 `Hy3DPostprocessMesh` 再判**：它经手前后面数差 30 倍，
+很容易冤枉它（实测它和 pymeshlab 那三步都不改厚度）。
+
+`Hy3D_2_1SimpleMeshGen` **没有种子输入**，所以参数不变再点一次运行拿到的是
+ComfyUI 的缓存、跟上次一模一样。要重摇得把 `steps` 改一个数（30 -> 31）。
+治本是换素材：完整一个物体、看得出前后厚度。仓库里放了张示例图
+`ComfyUI/input/3D示例_小狐狸.png`（就是「文生3D」自己画出来的），是稳的那一类。
+
+### 带贴图（2026-08-25 补）
+
+第三个工作流 `图生3D模型_带贴图.json`，出 `3D/Hy3D_图生_带贴图_*.glb`
+（50000 面 + 2048×2048 baseColorTexture，约 4.2 MB）。
+同一条链顺手也存一份 `3D/Hy3D_图生_灰模_*.glb`（同样 5 万面，别跟 30 万面那条的产物拿错）。
+
+耗时：几何 ~100 秒 + 上色 ~100 秒，端到端约 **200 秒**；几何被缓存时只要 **38 秒**。
+
+贴图链是 **2.0 的** delight + paint，但它只吃 TRIMESH，不在乎网格谁生的 ——
+直接接在 2.1 的 `Hy3DPostprocessMesh` 后面。模型自动下到 `ComfyUI/models/diffusers/`：
+
+| 目录 | 大小 | 说明 |
+|---|---|---|
+| `hunyuan3d-delight-v2-0` | 4.1 GB | 去光照 |
+| `hunyuan3d-paint-v2-0` | 5.2 GB | 六视角上色，工作流用的是这个 |
+| `hunyuan3d-paint-v2-0-turbo` | 5.1 GB | **多下的**，见下 |
+
+> 节点里 `allow_patterns=["*hunyuan3d-paint-v2-0*"]` 把 `-turbo` 也匹配上了，
+> 所以一次下了 14.4 GB 而不是 9.2 GB。turbo 是合法的备选（步数更少），留着没坏处，
+> 不想留就删 `hunyuan3d-paint-v2-0-turbo/` 整个目录。
+
+链的形状（照节点包 `example_workflows/hy3d_example_01.json`，只换抠图那步）：
+
+```
+ImageResize+(≤2048, 不裁不补边) ─┬─> Hy3D_2_1SimpleMeshGen -> Hy3DPostprocessMesh(5万) ─> Hy3DExportMesh(灰模)
+                                │                                  └─> Hy3DMeshUVWrap -> Hy3DRenderMultiView(1024, 2048, world)
+                                └─> ImageResize+(518 pad) -> RMBG(Color/#CCCCCC)          │ normal/position/renderer
+                                    -> Hy3DDelightImage(50步) ─┐                          │
+                                                               ├─> Hy3DSampleMultiView(512, 25步, seed)
+                        Hy3DCameraConfig(6 机位) ──────────────┘
+   -> ImageResize+(2048, stretch) -> Hy3DBakeFromMultiview -> Hy3DMeshVerticeInpaintTexture
+   -> CV2InpaintTexture -> Hy3DApplyTexture -> Hy3DExportMesh(带贴图)
+```
+
+三个容易踩的点：
+
+1. **抠图不能用示例里那对节点。** 示例用 `TransparentBGSession+` + `ImageRemoveBackground+`，
+   就是上面「坑二」那个会 abort 进程的。换成本地 `RMBG`（`RMBG-2.0` 权重已在
+   `models/RMBG/`），而且它的 `background='Color'` + `background_color` 一个节点就顶掉了
+   示例里 `SolidMask` + `MaskToImage` + `ImageCompositeMasked` 三个。
+2. **背景必须中灰 `#CCCCCC`**（= 示例 `SolidMask` 的 0.8）。示例自己在注释里写了：
+   纯黑 delight 直接失败、太暗整体发红、纯白过曝。
+3. **上色链的面数是 5 万，不是灰模那条的 30 万**（原因见上一节）。
+
+`Hy3DSampleMultiView` **有 seed**，所以带贴图这条能靠改种子重摇，
+不像灰模那条只能去动 `steps` 骗缓存。
+
+判贴图有没有真上：
+
+```bash
+./python_embeded/python.exe -c "
+import trimesh;s=trimesh.load('ComfyUI/output/3D/Hy3D_图生_带贴图_00001_.glb');m=s.to_geometry()
+print(len(m.faces), m.visual.material.baseColorTexture.size, m.visual.uv.shape)"
+# -> 50000 (2048, 2048) (..., 2)；没贴图的话 visual 是 ColorVisuals、没有 uv
+```
+
+### 生成器里那个 `is_widget` 改过
+
+原来按类型名白名单判（`INT/FLOAT/STRING/BOOLEAN`），`RMBG.background_color` 的
+`COLORCODE` 判成了「只能连线」，`widgets_values` 从它往后全体错位。
+现在改成**看有没有 `default`** —— 只能连线的输入（IMAGE / MODEL / TRIMESH / MESHRENDER…）
+不会带 `default`，`COLORCODE` / `COMBO` / `COLOR` 这些都带。
+
+### 抽卡系统那边不用管
+
+`scan_workflows.py` 的 `main()` 默认只遍历 **`ALIASES` 白名单**，
+不会自动收编 `workflows/` 下的新文件。这两条 3D 工作流的输出节点是
+`PreviewImage`/`SaveImage`，真要登记进去会被判成「出图片」、卡片拿回你自己的输入图 ——
+所以**先别往 `ALIASES` 里加**，等扫描器支持 `.glb` 产物再说。

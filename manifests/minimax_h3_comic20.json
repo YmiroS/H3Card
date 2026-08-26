@@ -16,6 +16,8 @@
   "node": "79"
  },
  "note": "每张图都要是 2×2 的四宫格拼图，上传后自动切成 4 个分镜、连成一段视频。传满 5 张就是 20 宫格，按顺序接成一整条完整视频。",
+ "rewrite": null,
+ "compare": false,
  "inputs": [
   {
    "key": "images[0]",
@@ -42,10 +44,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "296",
-    "input": "image_2"
-   },
+   "dropIfEmpty": [
+    {
+     "node": "296",
+     "input": "image_2"
+    }
+   ],
    "grid": [
     2,
     2
@@ -61,10 +65,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "296",
-    "input": "image_3"
-   },
+   "dropIfEmpty": [
+    {
+     "node": "296",
+     "input": "image_3"
+    }
+   ],
    "grid": [
     2,
     2
@@ -80,10 +86,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "296",
-    "input": "image_4"
-   },
+   "dropIfEmpty": [
+    {
+     "node": "296",
+     "input": "image_4"
+    }
+   ],
    "grid": [
     2,
     2
@@ -99,10 +107,12 @@
     "input": "image",
     "kind": "upload_image"
    },
-   "dropIfEmpty": {
-    "node": "296",
-    "input": "image_5"
-   },
+   "dropIfEmpty": [
+    {
+     "node": "296",
+     "input": "image_5"
+    }
+   ],
    "grid": [
     2,
     2
@@ -195,10 +205,11 @@
    "key": "duration",
    "label": "时长(秒)",
    "type": "slider",
-   "min": 3,
-   "max": 30,
+   "min": 5,
+   "max": 15,
    "step": 1,
    "default": 12,
+   "hint": "5~15 秒是这个模型练过的范围。想要更长的片子就分几张卡各出一段再接起来，硬拖长只会让动作发飘。提示词里各镜头的时长加起来要对得上这个数",
    "target": {
     "node": "343",
     "input": "value",
@@ -298,6 +309,8 @@
   }
  ],
  "warnings": [
-  "已修：#206.total 写死 1，改接 #203 easy lengthAnything（按 #296 的条数循环）"
+  "已修：#206.total 写死 1，改接 #203 easy lengthAnything（按 #296 的条数循环）",
+  "本地大模型：#288.model = Qwen3.5-27B-IQ4_XS.gguf",
+  "本地大模型：#288.mmproj = mmproj-F16.gguf"
  ]
 }

@@ -1,0 +1,99 @@
+{
+ "id": "rmbg_cutout",
+ "name": "人物提取",
+ "file": "人物提取",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\人物提取.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "tool",
+ "card": "rmbg_cutout",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "graph": "graphs/rmbg_cutout.api.json",
+ "output": {
+  "node": "20"
+ },
+ "note": "把画面里的主体抠出来、背景变透明，出的是带透明通道的 PNG。全程在本机跑，不联网、不限次数。几秒钟一张，很快。\n名字叫「人物提取」，但它不是只认人 —— 动物、商品、车、一盆花都能抠，模型认的是「这张图的主角是谁」。\n卡片上出来那张图可以按住左右拖 —— 往右拖就把原来的背景放回来，拖到哪儿就对到哪儿，用来检查边缘抠干净了没有。\n抠得不对先动「抠图灵敏度」：边上留了一圈背景残影就往上调（1 = 模型原样输出），发丝、半透明的地方丢了就往下调。边缘太生硬用「边缘羽化」；整圈都多／少一点用「边界收放」。这三个都不管用再去「高级」里把「处理精度」提到 1536 以上。\n抠完的图直接连给下游卡也可以，但 ComfyUI 读图时会把透明的地方当黑色 —— 要拿它当参考图、当首帧，最好先接一张「参考图编辑」把背景换成实的。\n只要背景不要主体就用旁边那张「抠出背景」，两张卡可以连同一张图各跑一次，出来的正好是能叠回去的两层。",
+ "rewrite": null,
+ "compare": true,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "sensitivity",
+   "label": "抠图灵敏度",
+   "type": "slider",
+   "min": 0.5,
+   "max": 1,
+   "step": 0.05,
+   "default": 1,
+   "hint": "工作流默认 1 = 模型原样输出。往下调会把「模型不太确定」的地方也算成主体：发丝、纱、玻璃这些半透明的地方能保住更多，代价是边上容易留一圈背景残影。边缘干净但细节丢了才往下调",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "sensitivity",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "process_res",
+   "label": "处理精度",
+   "type": "slider",
+   "min": 512,
+   "max": 2048,
+   "step": 128,
+   "default": 1024,
+   "hint": "推荐 1024：模型就是按这个尺寸练的。原图多大都先缩到这个尺寸算蒙版、再放回原尺寸，所以调高只对「细节特别碎」的图（发丝、树枝、栅栏）有用，还会更慢更吃显存。调低更快但边缘会变粗糙",
+   "advanced": true,
+   "target": {
+    "node": "10",
+    "input": "process_res",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "mask_blur",
+   "label": "边缘羽化",
+   "type": "slider",
+   "min": 0,
+   "max": 16,
+   "step": 1,
+   "default": 0,
+   "hint": "默认 0（不羽化）。把抠出来的边缘化开几像素，贴到别的背景上不那么像剪纸。2~4 就够，再大主体边上会发虚",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "mask_blur",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "mask_offset",
+   "label": "边界收放",
+   "type": "slider",
+   "min": -16,
+   "max": 16,
+   "step": 1,
+   "default": 0,
+   "hint": "默认 0。整圈往里收（负数）或往外放（正数）几像素。边上带了一圈原背景的颜色就填 -2 ~ -4；主体自己被削掉了一点就填正数",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "mask_offset",
+    "vtype": "INT"
+   }
+  }
+ ],
+ "warnings": []
+}

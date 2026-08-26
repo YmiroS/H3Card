@@ -16,6 +16,8 @@
   "node": "2"
  },
  "note": "重画式放大：不是拉大像素，是照着原图重新画一遍，所以脸和字可能跟原图有出入，别用在要一模一样的场合。",
+ "rewrite": null,
+ "compare": false,
  "inputs": [
   {
    "key": "images[0]",

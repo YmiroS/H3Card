@@ -1,0 +1,42 @@
+// 把这个文件复制成同目录下的 llm.json（就在 chouka 文件夹里，跟这个文件挨着），
+// 填上 api_key 就生效 —— 不用重启抽卡系统，改一次读一次。
+//
+// 两个坑：
+//   1. 生效的文件名必须正好是 llm.json
+//   2. 里面**不能留这些 // 注释** —— JSON 不认注释，留着会报「读不出来」
+//
+// 填完在浏览器打开 http://127.0.0.1:8199/api/health ，看 llm 那一段：
+// "ok": true 就是配好了。填错了这里会把原因写出来。
+//
+// ---- 各家填什么（都是 OpenAI 兼容接口，只差这两行）----
+//   DeepSeek     base_url: https://api.deepseek.com/v1
+//                model:    deepseek-chat
+//   智谱 GLM      base_url: https://open.bigmodel.cn/api/paas/v4
+//                model:    glm-4.6
+//   通义千问      base_url: https://dashscope.aliyuncs.com/compatible-mode/v1
+//                model:    qwen-plus
+//   Moonshot     base_url: https://api.moonshot.cn/v1
+//                model:    moonshot-v1-8k
+//   硅基流动      base_url: https://api.siliconflow.cn/v1
+//                model:    deepseek-ai/DeepSeek-V3
+//   OpenAI       base_url: https://api.openai.com/v1
+//                model:    gpt-4o        （国内要填下面的 proxy）
+//
+// base_url 要填到 /v1 那一层（或者人家文档里写的那一层），后面的
+// /chat/completions 由程序自己拼。填错了会报 HTTP 404。
+{
+  "enabled": true,
+
+  "base_url": "https://api.deepseek.com/v1",
+  "model": "deepseek-chat",
+  "api_key": "",
+
+  // 多少秒不回话就算失败、转去用本地 27B。
+  // 别填小了：参考图那几张卡的规则有 6.8 KB，模型要写满两大段，自建网关上实测
+  // 60 秒；填 20 就是每次都白等 20 秒再去跑好几分钟的本地。90 秒是留了余量的。
+  // 也别填成十几分钟 —— 那就成了两头的时间都花。
+  "timeout": 90,
+
+  // 要走代理才连得上的时候填（比如 OpenAI）。不用就留空字符串。
+  "proxy": ""
+}

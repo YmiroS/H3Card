@@ -19,7 +19,9 @@ import math
 import mimetypes
 import random
 import re
+import socket
 import subprocess
+import sys
 import time
 import uuid
 from pathlib import Path
@@ -27,6 +29,13 @@ from urllib.parse import urlencode
 
 import aiohttp
 from aiohttp import web
+
+# 整合包那个 python_embeded 带 python312._pth，有这个文件 Python 就**不会**把脚本
+# 自己的目录塞进 sys.path，于是同目录的 rewrite.py 直接 import 不到（报
+# ModuleNotFoundError: No module named 'rewrite'）。自己补上。
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import rewrite as rw
+import llm
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -38,6 +47,7 @@ PORT = 8199
 CLIENT_ID = uuid.uuid4().hex
 JOBS = {}                  # prompt_id -> job dict
 STEPS = {}                 # prompt_id -> {节点 id: 人能看懂的步骤名}
+WEIGHTS = {}               # prompt_id -> {节点 id: 这一步在整体进度里占多重}
 CAPS = {}                  # capability id -> manifest
 CARDS = []
 STATE = {"comfy_online": False}
@@ -70,8 +80,11 @@ def load_caps():
         CAPS[m["id"]] = m
     cards_file = ROOT / "manifests" / "_cards.json"
     CARDS[:] = json.loads(cards_file.read_text(encoding="utf-8")) if cards_file.exists() else []
-    # 只保留有可用工作流的模式
+    # 只保留有可用工作流的模式。风格卡例外：它没有能力、没有工作流（不跑，只把风格
+    # 并进下游卡的提示词），照这条过滤会被清成 modes=[]，于是「新建卡片」菜单里消失。
     for c in CARDS:
+        if c.get("kind") == "style":
+            continue
         c["modes"] = [md for md in c["modes"] if mode_ok(md)]
     return len(CAPS)
 
@@ -109,6 +122,32 @@ def step_labels(graph):
         zh = (ZH_NODES.get(ct) or {}).get("titles") or []
         labels[nid] = zh[0] if zh else ((nd.get("_meta") or {}).get("title") or ct)
     return labels
+
+
+# 一条工作流二三十个节点，但九成时间只花在其中两三个上（去噪、超分、补帧），
+# 剩下的加载、缩放、拼图都是一眨眼。整体进度要是按「节点数」平摊，进度条会先冲到
+# 六成、再在采样那一格上卡三分钟不动，比原来每段各走一遍 100% 还难受。
+# 所以给这几类重活配个权重，让它们占住进度条的大头。数字只是相对比例，不用精确。
+# 从上往下第一个「类名里包含这个词」的算，都没命中就是 1。
+STEP_WEIGHT = (
+    ("SamplerSelect", 1),          # 只是挑一个采样器的名字，不干活
+    ("Sampler", 60),               # 去噪：一次任务里最慢的一段
+    ("SeedVR2VideoUpscaler", 60),  # 超分，按帧/批算
+    ("GIMMVFI_interpolate", 60),   # 补帧，同上
+    ("VAEDecode", 8),              # 解码出画面，视频长了也不便宜
+    ("VideoCombine", 4),           # 编码成 mp4
+    ("CreateVideo", 4),
+    ("SaveVideo", 4),
+)
+
+
+def step_weights(graph):
+    """节点 id -> 权重。给 handle_event 算「整条工作流跑到哪了」用。"""
+    w = {}
+    for nid, nd in graph.items():
+        ct = nd.get("class_type") or ""
+        w[nid] = next((v for k, v in STEP_WEIGHT if k in ct), 1)
+    return w
 
 
 def kind_of(name):
@@ -234,11 +273,11 @@ def patch_graph(cap, params, uploaded):
             if not val:
                 if spec.get("required"):
                     missing.append(spec["label"])
-                drop = spec.get("dropIfEmpty")
-                if drop:
-                    # 编号列表里的空槽要把线整根拔掉，列表才真的变短。
-                    # 光留模板默认值的话，作者自带的演示图会顶上来照跑一轮。
-                    # 拔线后这个 LoadImage 就没人依赖了，ComfyUI 不会执行它。
+                for drop in spec.get("dropIfEmpty") or []:
+                    # 空槽要把线整根拔掉：编号列表才真的变短（光留模板默认值的话，
+                    # 作者自带的演示图会顶上来照跑一轮），参考图那种支线才真的不参与。
+                    # 拔线后这条支线就没人依赖了，ComfyUI 不会执行它。
+                    # 一个槽可能要拔好几根（参考图编辑的正负两条 conditioning 各挂一次）
                     g[str(drop["node"])]["inputs"].pop(drop["input"], None)
                 continue                       # 未填的可选素材：保留模板里的默认值
         elif spec["type"] == "seed":
@@ -359,42 +398,71 @@ async def handle_event(session, ev):
     job = JOBS.get(pid) if pid else None
 
     # 失败 / 取消 / 完成都是终局。ComfyUI 报错之后还会补发 executing(node=None)、
-    # progress 这类收尾事件，放进来会把状态改回 done —— 一次失败在界面上显示成
+    # progress_state 这类收尾事件，放进来会把状态改回 done —— 一次失败在界面上显示成
     # "生成成功"，卡片还挂着上一次的产物，比直接报错更难查。
     if job and job["status"] in ("error", "canceled", "done") and t in (
-            "execution_start", "executing", "progress", "progress_state"):
+            "execution_start", "executing", "progress_state"):
         return
 
     if t == "execution_start" and job:
         job.update(status="running", started=time.time())
+        save_jobs()
     elif t == "executing" and job:
         if d.get("node") is None:
             job["outputs"] = await collect_outputs(session, pid)
             job.update(status="done", progress=1.0, ended=time.time(), step="")
             STEPS.pop(pid, None)
+            WEIGHTS.pop(pid, None)
+            save_jobs()
         else:
             nid = str(d.get("display_node") or d["node"])
             job["node"] = nid
             # 没登记的节点（子图里层）就退回节点号，总比什么都不显示强
             job["step"] = STEPS.get(pid, {}).get(nid) or f"#{nid}"
-    elif t == "progress" and job:
-        mx = d.get("max") or 1
-        job["progress"] = round(d.get("value", 0) / mx, 4)
-        job["status"] = "running"
     elif t == "progress_state" and job:
-        nodes = (d.get("nodes") or {}).values()
-        run = [n for n in nodes if n.get("state") == "running"]
-        if run:
-            n = run[0]
-            mx = n.get("max") or 1
-            job["progress"] = round(n.get("value", 0) / mx, 4)
-            job["status"] = "running"
+        # 这是整条工作流的进度，不是当前节点的。以前直接拿在跑那个节点的
+        # value/max 当进度，于是采样、解码、编码每一段都从 0 走到 100%，
+        # 一次任务看着像跑了四遍。ComfyUI 这版只发 progress_state（老的
+        # progress 事件已经没了），一条消息里带着所有非 pending 节点的状态，
+        # 够算总账：干完的按满权重算，在跑的按它自己那点比例折算。
+        w = WEIGHTS.get(pid) or {}
+        nodes = (d.get("nodes") or {}).items()
+        # 命中缓存的节点 ComfyUI 也会给它发一个 finished，但它一秒都没跑，
+        # 算进去只会让进度条一开始就凭空跳一大截。两头都摘掉，只算真要跑的活儿
+        skip = set(job.get("cached") or ())
+        done = 0.0
+        for nid, n in nodes:
+            nid = str(nid)
+            # 不在图里的节点（子图展开出来的内层）跳过：分母里没有它，
+            # 分子算上就成了超过 100% 的假进度。它外面那层父节点照样在算
+            if nid in skip or nid not in w:
+                continue
+            wt = w[nid]
+            if n.get("state") == "finished":
+                done += wt
+            else:
+                mx = n.get("max") or 1
+                frac = min(max((n.get("value") or 0) / mx, 0.0), 1.0)
+                done += wt * frac
+                # 整体进度里那一格再怎么细也就那么宽，所以当前步骤后面补上
+                # 「5/8」，长采样时才看得出它在动
+                if mx > 1 and STEPS.get(pid, {}).get(nid):
+                    job["step"] = f"{STEPS[pid][nid]} {int(n.get('value') or 0)}/{int(mx)}"
+        total = sum(v for k, v in w.items() if k not in skip)
+        if total:
+            # 只涨不跌（省得权重估偏了往回缩），也不许提前显示 100% ——
+            # 那个只由 executing(node=None) 说，别的都还差一口气
+            job["progress"] = max(job.get("progress") or 0.0,
+                                  min(round(done / total, 4), 0.99))
+        job["status"] = "running"
     elif t == "execution_error" and job:
         job.update(status="error", ended=time.time(), step="",
                    error=f"#{d.get('node_id')} {d.get('node_type')}: {d.get('exception_message')}")
         STEPS.pop(pid, None)
+        WEIGHTS.pop(pid, None)
+        save_jobs()
     elif t == "execution_cached" and job:
-        job["cached"] = d.get("nodes", [])
+        job["cached"] = [str(x) for x in d.get("nodes", [])]
     elif t == "status":
         q = (d.get("status") or {}).get("exec_info", {}).get("queue_remaining")
         if q is not None:
@@ -474,8 +542,10 @@ async def api_generate(request):
                      if k not in graph[n]["inputs"]})
         return web.json_response({"dry_run": True, "changed": diff})
     pid = await comfy_submit(request.app["session"], graph)
-    # 步骤名单独放 STEPS，不塞进 job：job 每次轮询整份回给前端，59 个节点名白传
+    # 步骤名和权重单独放 STEPS / WEIGHTS，不塞进 job：job 每次轮询整份回给前端，
+    # 59 个节点名白传
     STEPS[pid] = step_labels(graph)
+    WEIGHTS[pid] = step_weights(graph)
     JOBS[pid] = {"id": pid, "capability": cid, "name": cap["name"],
                  "outputType": cap["outputType"], "status": "queued",
                  "progress": 0.0, "created": time.time(),
@@ -484,7 +554,129 @@ async def api_generate(request):
                  # 任务面板要能说清"这是哪张卡在跑"，还要能点回那张卡
                  "project": body.get("project"), "card": body.get("card"),
                  "cardName": body.get("cardName")}
+    save_jobs()
     return web.json_response(JOBS[pid])
+
+
+REWRITE_TIMEOUT = 900      # 27B 在 CPU/低显存上第一次加载就要好几分钟，别掐太早
+
+
+async def api_rewrite(request):
+    """「✨优化」：把用户写的大白话，改成这个模型认的提示词。
+
+    **先走 API，不通再落本地 27B。** 两条路只在「文本从哪来」这一步分岔：
+    喂进去的 system（`rw.REGIMES`）和 user（`rw.user_msg`）一字不差，
+    拿回来都过同一个 `rw.clean()`。分岔多一处，同一张卡两条路就会出两种格式，
+    用户没法判断是模型写得不好还是链路串了。
+
+    为什么 API 优先：本地那条要把 14 GB 挤进显存（跟出图抢），第一次好几分钟，
+    还得 `force_offload` 卸掉；而且 `n_ctx` 只有 8192。走 API 不碰显存、不排
+    ComfyUI 的队 —— **ComfyUI 没开着也能优化**。
+    """
+    body = await request.json()
+    cid = body.get("capability")
+    cap = CAPS.get(cid)
+    if not cap:
+        raise web.HTTPBadRequest(reason=f"未知能力 {cid}")
+    spec = cap.get("rewrite")
+    if not spec:
+        raise web.HTTPBadRequest(reason=f"{cap['name']} 这张卡没有改写规则")
+    reg = rw.REGIMES.get(spec.get("regime"))
+    if not reg:
+        raise web.HTTPBadRequest(reason=f"改写规则 {spec.get('regime')} 不存在")
+
+    params = body.get("params") or {}
+    assets = body.get("assets") or {}
+    style = str(body.get("style") or "")
+    user = rw.user_msg(cap, spec, params, assets,
+                       str(body.get("prompt") or ""), style)
+
+    t0 = time.time()
+    via, fell, warns, model, tokens = "local", "", [], "", 0
+    raw = None
+    if llm.ready():
+        try:
+            got = await llm.chat(request.app["session"], reg["system"], user,
+                                 reg["max_tokens"], reg["temperature"])
+            raw, via = got["text"], "api"
+            model, tokens = got["model"], got["tokens"]
+            if got["warn"]:
+                warns.append(got["warn"])
+        except llm.LLMError as e:
+            # 不抛出去：用户选的是「直接兜底」。原因带回前端，让 toast 说得出
+            # 为什么这次转了五分钟圈 —— 静默兜底会让人以为 API 压根没生效
+            fell = str(e)
+    if raw is None:
+        raw = await rewrite_local(request, spec, reg, user, cid, body, t0, fell)
+
+    text, warn = rw.clean(raw, spec, cap, params, assets)
+    if warn:
+        warns.append(warn)
+    return web.json_response({"text": text, "warn": "；".join(warns),
+                              "via": via, "fallback": fell, "model": model,
+                              "tokens": tokens,
+                              "ms": int((time.time() - t0) * 1000)})
+
+
+async def rewrite_local(request, spec, reg, user, cid, body, t0, fell=""):
+    """兜底那条：临时拼一张「27B + 出文本」的小图丢给 ComfyUI 跑，取回文本。
+
+    走的是 ComfyUI 那条队列（本地只有一份显存，另开一路会跟出图抢），所以：
+      - 临时图现搭（server/rewrite.py），不落盘、不进 manifests
+      - 照样登记进 JOBS，任务面板能看见「提示词优化」在跑，也能取消
+      - 请求一直挂着等结果，前端那边就是一个按钮转圈，不用自己轮询
+    """
+    # 两头都不通的时候要把两条原因一起说。只报「连不上 ComfyUI」会让人去查
+    # ComfyUI，而真正该改的是 llm.json
+    if not STATE["comfy_online"]:
+        raise web.HTTPBadGateway(reason=(
+            f"API 没通（{fell}），本地兜底也用不了：ComfyUI 没在运行。"
+            if fell else "改写要用本地 27B，可 ComfyUI 没在运行。")[:400])
+
+    graph = rw.build_graph(spec, reg["system"], user,
+                           random.randint(0, 2 ** 31 - 1))
+    pid = await comfy_submit(request.app["session"], graph)
+    STEPS[pid] = step_labels(graph)
+    WEIGHTS[pid] = step_weights(graph)
+    JOBS[pid] = {"id": pid, "capability": cid, "name": "提示词优化",
+                 "outputType": "text", "status": "queued",
+                 "progress": 0.0, "created": t0, "seed": None,
+                 "step": "", "outputs": [], "error": None,
+                 "project": body.get("project"), "card": body.get("card"),
+                 "cardName": body.get("cardName")}
+
+    job = JOBS[pid]
+    try:
+        while job["status"] in LIVE:
+            if time.time() - t0 > REWRITE_TIMEOUT:
+                await stop_job(request.app["session"], pid)
+                raise web.HTTPGatewayTimeout(
+                    reason=f"改写等了 {REWRITE_TIMEOUT // 60} 分钟还没出结果，已取消")
+            await asyncio.sleep(0.4)
+        if job["status"] == "canceled":
+            raise web.HTTPBadRequest(reason="改写被取消了")
+        if job["status"] == "error":
+            raise web.HTTPBadGateway(reason=f"改写失败：{job['error']}"[:400])
+
+        # ShowText 的产物是文本不是文件，collect_outputs 只认 filename，得自己去 history 取
+        async with request.app["session"].get(f"{COMFY_HTTP}/history/{pid}") as r:
+            hist = await r.json()
+        out = ((hist.get(pid) or {}).get("outputs") or {}).get(rw.TEXT_NODE) or {}
+        val = out.get("text") or out.get("string") or []
+        raw = "\n".join(str(x) for x in val) if isinstance(val, list) else str(val)
+        if not raw.strip():
+            raise web.HTTPBadGateway(
+                reason="改写模型没吐出文本（显存不够时会这样，看看 ComfyUI 的日志）")
+    finally:
+        # 一次性任务：成了失败了都别留在任务面板里。结果和报错都当场回给了前端，
+        # 面板上再挂一排「提示词优化」只会把真正在跑的出图任务挤下去
+        JOBS.pop(pid, None)
+        STEPS.pop(pid, None)
+        WEIGHTS.pop(pid, None)
+        # 落盘时它已经不在 JOBS 里了 —— 正是要的效果：跑的过程中 handle_event 顺手
+        # 把它写进了文件，不擦掉的话重启后面板上会冒出一条早就结束的「提示词优化」
+        save_jobs()
+    return raw
 
 
 async def api_job(request):
@@ -501,6 +693,48 @@ async def api_jobs(request):
 
 
 LIVE = ("queued", "running")
+JOBS_FILE = ROOT / "data" / "jobs.json"
+
+
+def save_jobs():
+    """任务列表落盘。`JOBS` 本来只在内存里，后端重启一次几天的记录就全没了 ——
+    产物还在卡片上，但「什么时候跑的、跑了多久、为什么失败」只有这儿有。
+
+    只在**状态变了**的时候写（新建 / 开跑 / 完成 / 失败 / 取消 / 删除），不跟着进度写：
+    进度每秒十几条，而且重启之后那个数字毫无意义（活儿早断了）。
+    存的条数跟 `/api/jobs` 返回的一样是最近 60 条，不然文件会一直长。
+    """
+    try:
+        JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        keep = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)[:60]
+        JOBS_FILE.write_text(json.dumps(keep, ensure_ascii=False), encoding="utf-8")
+    except OSError as e:
+        print(f"[任务] 记录存盘失败（不影响出图）：{e}")
+
+
+def load_jobs():
+    """启动时读回任务列表。
+
+    当时还在排队 / 运行的一律改成「已取消」+ 一句说明：那个进程已经没了，
+    ComfyUI 那边也早断开，不可能还在跑；留着 running 的话前端会对着一个
+    永远不动的进度条一直轮询。前端认得 canceled，卡片会自己跟着落地。
+    """
+    if not JOBS_FILE.exists():
+        return
+    try:
+        rows = json.loads(JOBS_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        print(f"[任务] 记录读不回来，从空列表开始：{e}")
+        return
+    cut = 0
+    for j in rows:
+        if j.get("status") in LIVE:
+            j.update(status="canceled", step="", ended=j.get("ended") or time.time(),
+                     error="抽卡系统重启了，这一轮没跑完（重启前的进度不留，重跑一次就行）")
+            cut += 1
+        JOBS[j["id"]] = j
+    print(f"[抽卡系统] 读回 {len(rows)} 条任务记录"
+          + (f"，其中 {cut} 条是重启时被打断的" if cut else ""))
 
 
 async def stop_job(session, pid):
@@ -519,6 +753,7 @@ async def stop_job(session, pid):
     if job:
         job["status"] = "canceled"
         job["step"] = ""
+        save_jobs()
 
 
 async def api_cancel(request):
@@ -532,6 +767,8 @@ async def api_job_delete(request):
     await stop_job(request.app["session"], pid)
     JOBS.pop(pid, None)
     STEPS.pop(pid, None)
+    WEIGHTS.pop(pid, None)
+    save_jobs()
     return web.json_response({"ok": True})
 
 
@@ -541,6 +778,8 @@ async def api_jobs_clear(request):
     for pid in gone:
         JOBS.pop(pid, None)
         STEPS.pop(pid, None)
+        WEIGHTS.pop(pid, None)
+    save_jobs()
     return web.json_response({"ok": True, "removed": len(gone)})
 
 
@@ -593,6 +832,12 @@ async def api_project_save(request):
     if not p.exists():
         raise web.HTTPNotFound(reason="项目不存在")
     old = json.loads(p.read_text(encoding="utf-8"))
+    # locked 的项目（示例）是只读的：用户在上面随便改参数、随便重跑都行，但一个字都不落盘 ——
+    # 刷新就回到这份固定的示例。前端 save() 也会直接跳过，这里是最后一道闸
+    # （另一个标签页、或者写歪的脚本照样拦住）。要改示例本身就直接改那份 json 文件，
+    # 记得把 rev 加一，不然开着旧快照的页面下一次写入会撞上 409。
+    if old.get("locked"):
+        raise web.HTTPForbidden(reason="locked project")
     body = await request.json()
     # 前端每次都整份 PUT，没有版本号就是「后写的赢」：一个开着旧快照的标签页随便点一下，
     # 就能把别处刚写进去的产物抹掉。带上打开时拿到的 rev，对不上就让它先重新加载。
@@ -670,6 +915,7 @@ async def api_health(request):
     return web.json_response({
         "ok": True, "comfy_online": STATE["comfy_online"],
         "capabilities": len(CAPS), "jobs": len(JOBS), "client_id": CLIENT_ID,
+        "llm": llm.where(),      # 改写走不走 API（不含 key）
     })
 
 
@@ -685,9 +931,52 @@ async def on_stop(app):
     await app["session"].close()
 
 
+def lan_ips():
+    """本机在局域网里的地址 —— 别人（手机、另一台电脑）要拿哪个网址进来。
+
+    服务本来就监听 0.0.0.0（全部网卡），差的只是"网址是什么"没人告诉用户。
+    UDP connect 不发包，只是让系统按路由表挑出那张出网的网卡，比按主机名反解可靠
+    （多网卡 / 虚拟机网卡的机器上主机名常常解析成一堆 169.254 或者只有回环）。
+    """
+    ips = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("223.5.5.5", 80))
+        ips.append(s.getsockname()[0])
+        s.close()
+    except OSError:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if not ip.startswith(("127.", "169.254.")) and ip not in ips:
+                ips.append(ip)
+    except OSError:
+        pass
+    return ips
+
+
+async def no_cache(request, response):
+    """改完 app.js / style.css，刷新还是旧的 —— 这个坑踩过一次。
+
+    aiohttp 的 add_static 只发 Last-Modified + ETag，不发 Cache-Control，
+    浏览器就自己按启发式规则判新鲜度（大致是"离上次改动过了多久"的 10%），
+    普通刷新根本不回来问，直接用缓存里那份。前端是无构建的裸文件、没有版本号
+    文件名，只能在这儿声明一句 no-cache —— 不是"不缓存"，是"每次都回来问一句"，
+    没改就回 304，几乎不费流量。
+
+    `/api/` 底下不管：产物图和视频（`/api/file`）是真该缓存的，
+    每次重画卡片都重下一遍几十兆的 mp4，局域网上尤其难受。
+    """
+    if not request.path.startswith("/api/"):
+        response.headers.setdefault("Cache-Control", "no-cache")
+
+
 def make_app():
     n = load_caps()
+    load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2)
+    app.on_response_prepare.append(no_cache)
     app.router.add_get("/", index)
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/cards", api_cards)
@@ -695,6 +984,7 @@ def make_app():
     app.router.add_post("/api/upload", api_upload)
     app.router.add_get("/api/media", api_media)
     app.router.add_post("/api/generate", api_generate)
+    app.router.add_post("/api/rewrite", api_rewrite)
     app.router.add_get("/api/jobs", api_jobs)
     app.router.add_post("/api/jobs/clear", api_jobs_clear)
     app.router.add_get("/api/job/{pid}", api_job)
@@ -714,7 +1004,11 @@ def make_app():
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
     print(f"[抽卡系统] 载入 {n} 个能力，{len(CARDS)} 张卡")
-    print(f"[抽卡系统] http://127.0.0.1:{PORT}")
+    print(f"[抽卡系统] 本机   http://127.0.0.1:{PORT}")
+    for ip in lan_ips():
+        print(f"[抽卡系统] 局域网 http://{ip}:{PORT}   ← 手机/别的电脑用这个")
+    print("[抽卡系统] 局域网是敞开的：没有登录，进来的人就能跑任务、删画布、看产物。"
+          "只在信得过的网里开")
     return app
 
 

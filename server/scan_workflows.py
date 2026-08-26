@@ -35,6 +35,7 @@ CONTROL_AFTER = ("randomize", "fixed", "increment", "decrement")
 ALIASES = {
     "4-Z-Image全系列/z-Image-标准版文生图.json": "zimage_t2i",
     "4-Z-Image全系列/Z-Image 图生图-反推 .json": "zimage_i2i",
+    "3-Flux2-klein全系列/flux-2-klein-单-多图编辑.json": "flux2_klein_edit",
     "3-Flux2-klein全系列/九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json": "flux2_klein_storyboard9",
     "1-minimax H3/@MinimaxH3：图生视频 (4步加速版).json": "minimax_h3_i2v",
     "1-minimax H3/@MinimaxH3：首尾帧生视频（4步加速版）.json": "minimax_h3_flf2v",
@@ -44,6 +45,9 @@ ALIASES = {
     "1-minimax H3/MiniMax H3 全能参考(通用) 九图单采.json": "minimax_h3_ref9",
     "1-minimax H3/@minimax-批量化漫剧20宫格-直出1分钟视频V3.json": "minimax_h3_comic20",
     "0-工具箱/四图拼四宫格.json": "grid4_stitch",
+    "0-工具箱/人物提取.json": "rmbg_cutout",
+    "0-工具箱/抠出背景.json": "rmbg_bgonly",
+    "0-工具箱/人物擦除.json": "rmbg_erase",
     "SeedVR2图片视频高清/视频补帧插针(GIMM-VFI).json": "gimmvfi_interp",
     "SeedVR2图片视频高清/SeedVR2图片高清放大.json": "seedvr2_image_up",
     "SeedVR2图片视频高清/SeedVR2视频高清修复放大 v2.json": "seedvr2_video_up",
@@ -54,6 +58,7 @@ ALIASES = {
 DISPLAY = {
     "zimage_t2i": "文生图",
     "zimage_i2i": "图生图",
+    "flux2_klein_edit": "参考图编辑(保人物)",
     "flux2_klein_storyboard9": "多宫格故事分镜",
     "minimax_h3_i2v": "H3 图生视频",
     "minimax_h3_flf2v": "H3 首尾帧生视频",
@@ -63,6 +68,9 @@ DISPLAY = {
     "minimax_h3_ref9": "H3全能参考(通用)",
     "minimax_h3_comic20": "漫剧4宫格",
     "grid4_stitch": "四图拼四宫格",
+    "rmbg_cutout": "人物提取",
+    "rmbg_bgonly": "抠出背景",
+    "rmbg_erase": "人物擦除",
     "gimmvfi_interp": "视频补帧插针(GIMM-VFI)",
     "seedvr2_image_up": "SeedVR2 图片高清放大",
     "seedvr2_video_up": "SeedVR2 视频高清放大",
@@ -95,9 +103,41 @@ ROUTE_CARDS = {
     },
 }
 
+# 风格卡：画布上唯一一张**不对应任何工作流**的卡。它没有 manifest、没有能力，
+# 自己也不跑 —— 只存一段风格描述，连到哪张卡就在提交时并进那张卡的提示词里。
+# 于是"整条链子统一一个风格"变成改一处：风格卡改一次，挂在它下游的卡全跟着变。
+# modes 里那条的 id 不是能力 id（CAPS 里查不到），前端按 kind == "style" 单独走一套。
+# 写在扫描器里而不是前端写死：「新建卡片」菜单是照 _cards.json 画的，
+# 卡片定义只该有一个来源，不然加一张卡要改两个地方。
+STYLE_CARD = {
+    "id": "card_style", "name": "风格化提示词", "icon": "🎨",
+    "outputType": "text", "kind": "style",
+    "modes": [{"id": "style_text", "name": "风格化提示词", "slots": "img0+aud0+vid0"}],
+}
+
 # 要把工作流里「关着的备用素材槽」开出来的能力（见 revive_bypassed）。
 # 四图参考的第 4 个图槽在模板里是绕过状态，名字叫四图、实际只有三格。
 REVIVE = {"minimax_h3_ref4"}
+
+# 参考图生视频那两张卡共用这一条。它比别的说明长，因为这张卡跑废最常见的原因
+# 不是参数不对，而是提示词写成了给人看的分镜表格 —— 模型只认"看得见的画面"。
+REF_PROMPT_NOTE = (
+    "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，"
+    "依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。\n"
+    "提示词只写「镜头里看得见、听得见」的东西。这几种写法它一律读不懂，"
+    "还会把真正的画面描述冲淡：\n"
+    "· 分镜表格（镜号／景别／运镜 那种带表头的一大片）—— 改成一句句话写；\n"
+    "· 导演阐述、创作意图（「突出人物的渺小」「为后续做铺垫」）—— 直接删掉，"
+    "改成写画面上的结果；\n"
+    "· 「你是导演某某」这类交代身份的话 —— 它不是聊天模型，这句纯占位置，"
+    "想要某种质感就直接描述质感（胶片颗粒、冷暖对比光）。\n"
+    "每个镜头写清「第几秒到第几秒 + 景别 + 谁在做什么 + 镜头怎么动」，"
+    "各镜头时长加起来等于「时长(秒)」那个数；台词直接用引号写在那个镜头里。\n"
+    "第一人称视角这类「主角不在画面里」的要求跟参考图是矛盾的 —— "
+    "参考图会一直把人拉回画面中央，想要主观视角就别放人物参考图。\n"
+    "画面糊、脸不像先看「分辨率」：调到 1.0 以上再看一遍，"
+    "参考图也是按这个分辨率缩过之后才喂进模型的，调低了人物细节就一起丢了。"
+)
 
 # 玩法说明，钉在参数面板最上面。只写「不知道就会跑废一轮」的用法。
 # 素材形态的硬要求（宫格拼图那种）是从图里自动认出来的，不用写在这里。
@@ -107,9 +147,19 @@ NOTES = {
                   "只放图片、提示词留着不动就能跑。提示词这一格填的是「怎么讲这张图」"
                   "（默认「详细描述图像内容」），想改画面就在这里加一句，"
                   "比如「详细描述图像内容，但把背景换成雪山」；写「一只猫」这种跟原图无关的"
-                  "反而会让它照着描述跑偏。出图尺寸跟着原图走，卡上没有画面比例可调。",
-    "minimax_h3_ref9": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 "
-                       "<Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。",
+                  "反而会让它照着描述跑偏。出图尺寸跟着原图走，卡上没有画面比例可调。"
+                  "想保住原图的人物和构图，把「重绘幅度」调到 0.4~0.6（1 = 完全重画）；"
+                  "要人物几乎不变、只改指定的地方，用「参考图编辑」那个模式。",
+    "flux2_klein_edit": "真正的参考图编辑：原图直接当参考喂进模型，人物长相和画风跟着原图走，"
+                        "提示词只用来说「改什么」。跟「图生图」那条反推重画不是一回事。"
+                        "放 1 张 = 保住这张图的人物和画风，只改你说的那部分（换背景、换动作、"
+                        "换服装、转角度）。放 2 张 = 图1 是要改的画面、图2 是参考素材"
+                        "（换装、合影、换脸、把图2的人物放进图1的场景）。"
+                        "提示词里要点名「图1 / 图2」，并且把要保住的东西明写出来 —— "
+                        "比如「让图1的人物换上图2的衣服，相貌、发型、光线和画风保持不变」。"
+                        "出图尺寸跟着图1走（长边缩到 1280），卡上没有画面比例可调。",
+    "minimax_h3_ref9": REF_PROMPT_NOTE,
+    "minimax_h3_ref4": REF_PROMPT_NOTE,
     "grid4_stitch": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」"
                     "要的素材，拼完直接连线过去。分镜顺序就是这个顺序。"
                     "画面比例和分辨率要跟下游那张卡调成一样，切回来的每格才不会再被裁一刀。",
@@ -122,7 +172,109 @@ NOTES = {
                         "不会更顺滑 —— 要更顺滑用「视频补帧插针」那张卡。"
                         "非常慢（每一帧都要过一遍模型），先把「只处理前几帧」填 60 试一版，"
                         "确认清晰度和帧率合心意了再改回 0 跑整段。",
+    "rmbg_cutout": "把画面里的主体抠出来、背景变透明，出的是带透明通道的 PNG。全程在本机跑，"
+                   "不联网、不限次数。几秒钟一张，很快。\n"
+                   "名字叫「人物提取」，但它不是只认人 —— 动物、商品、车、一盆花都能抠，"
+                   "模型认的是「这张图的主角是谁」。\n"
+                   "卡片上出来那张图可以按住左右拖 —— 往右拖就把原来的背景放回来，"
+                   "拖到哪儿就对到哪儿，用来检查边缘抠干净了没有。\n"
+                   "抠得不对先动「抠图灵敏度」：边上留了一圈背景残影就往上调（1 = 模型原样输出），"
+                   "发丝、半透明的地方丢了就往下调。边缘太生硬用「边缘羽化」；"
+                   "整圈都多／少一点用「边界收放」。这三个都不管用再去「高级」里把"
+                   "「处理精度」提到 1536 以上。\n"
+                   "抠完的图直接连给下游卡也可以，但 ComfyUI 读图时会把透明的地方当黑色 —— "
+                   "要拿它当参考图、当首帧，最好先接一张「参考图编辑」把背景换成实的。\n"
+                   "只要背景不要主体就用旁边那张「抠出背景」，两张卡可以连同一张图各跑一次，"
+                   "出来的正好是能叠回去的两层。",
+    "rmbg_bgonly": "跟「人物提取」是反过来的一张卡：留背景、把主体挖掉，"
+                   "出的也是带透明通道的 PNG。同一张图两张卡各跑一次，"
+                   "得到的就是能重新叠回原图的两层。本机跑，不联网、不限次数。\n"
+                   "卡片上出来那张图可以按住左右拖 —— 往右拖主体就长回来，"
+                   "用来看主体挖得干不干净、有没有留下一圈人的颜色。\n"
+                   "主体位置是个透明的洞，这张卡不会把洞填上（那是另一件事："
+                   "想要一张完整可用的干净背景，把这层接给「图生图」或「参考图编辑」让它补）。\n"
+                   "洞边上留了一圈主体的颜色（发梢、衣服的亮边）就把「边界收放」往正数调 "
+                   "2~4，等于把洞往外多挖几像素；洞挖过头、背景被啃掉了就填负数。\n"
+                   "想把人直接擦掉、背景连上，用「人物擦除」那张卡。",
+    "rmbg_erase": "把画面里的人整个擦掉，并且把空出来的地方按周围环境补上 —— 出来的是"
+                  "一张完整的、没有人的图，不是带洞的。\n"
+                  "全自动，不用手涂遮罩：先自己认出人在哪，把那块涂成纯绿色，"
+                  "再让 Klein 照着周围把绿色那块画回去，最后只把这一块贴回原图 —— "
+                  "所以没被擦的地方是原图像素，一点没动过。\n"
+                  "卡片上出来那张图可以按住左右拖，往右拖人就长回来，用来看擦得干不干净。\n"
+                  "擦不干净先动「擦除范围」：地上还留着影子、边上还有一道人的轮廓，就往上调"
+                  "（往外多擦几像素）；擦得太狠、周围的东西被一起抹掉了就往下调。"
+                  "人没被完整认出来（少了一条腿、漏了个胳膊）是另一回事，那要动「识别灵敏度」往下调。\n"
+                  "补出来的东西每次都不一样（跟画图一样吃种子）—— 补得不像就换个种子重跑，"
+                  "比调参数管用。背景越规整（墙、地、天空、草地）补得越好；"
+                  "人挡住了复杂的东西（栏杆、文字、另一个人）就别指望它猜对。\n"
+                  "这张卡要过一遍 Klein 9B 大模型，比抠图慢得多，也吃显存。",
 }
+
+# 卡片上给「原图 ↔ 结果」画一条能左右拖的对比线（前端 paint() 认 manifest.compare）。
+# 只给两张抠图卡开：它们的成败全在边缘那一圈，不跟原图叠着看根本判断不了抠干净没有，
+# 而透明底的图单看又只是一块空白（抠出背景那张更是一个洞）。别的能力也画得出来
+#（图片放大、图生图、参考图编辑都是一进一出），要开就往这个集合里加一个 id ——
+# 但那几条看结果本身就够了，一张卡上多一个会动的东西是干扰不是帮助。
+COMPARE = {"rmbg_cutout", "rmbg_bgonly", "rmbg_erase"}
+
+# 这条工作流里的这个文本框是「写死的指令」，不是用户内容 —— 不许开成提示词框。
+# 人物擦除就是这种：图里那句"把绿色标记的区域擦掉、用周围背景补上"是这条能力的
+# 实现方式（Klein 全靠它知道绿色是要抹掉的东西），不是用户想说的话。开出来两种结果
+# 都不好：用户改了它 → 擦除直接失效；用户不改 → 面板上白占一个大文本框，
+# 而且这张卡会因为"有提示词框"从「工具」掉进「生图」组（见 is_tool）。
+# 按 (能力id, 节点id) 点名，不按字段名 —— 同一个 CLIPTextEncode.text
+# 在别的工作流里就是真提示词，按名字关会连带关掉一片。
+FIXED_TEXT = {("rmbg_erase", "40")}
+
+# 「✨优化」按钮：哪条能力能用本地 27B 把大白话改写成这个模型认的提示词，用哪套规矩。
+# regime 指向 server/rewrite.py 里那套 system prompt（规则文本长，不该塞进 manifest
+# 再随 /api/cards 整份传给前端 —— 前端只需要知道"有没有这个按钮"）。
+#   mode  = H3 关键帧模式（I2VA 只有首帧 / FL2VA 首尾帧），差的就是开头那句对齐说明
+#   audio = 台词/歌词来自音频文件，不许模型自己编 <d> 台词
+# 没登记的能力就没有这个按钮。故意不给的三条：图生图、九宫格分镜、漫剧 ——
+# 它们的「提示词」本来就是给图里那个 27B 的指令，再套一层 27B 是脱裤子放屁。
+# 四张工具卡根本没有提示词框（连风格卡都收不了），更不用说。
+REWRITE = {
+    "zimage_t2i": {"regime": "zimage"},
+    "flux2_klein_edit": {"regime": "klein"},
+    "minimax_h3_i2v": {"regime": "h3_base", "mode": "I2VA"},
+    "minimax_h3_flf2v": {"regime": "h3_base", "mode": "FL2VA"},
+    "minimax_h3_ref4": {"regime": "h3_ref"},
+    "minimax_h3_ref9": {"regime": "h3_ref"},
+    "minimax_h3_talk1": {"regime": "h3_ref", "audio": True},
+    "minimax_h3_talk2": {"regime": "h3_ref", "audio": True},
+}
+
+# 换掉工作流里写死的那个本地大模型（旧文件名 -> 新文件名）。
+# 为什么要在扫描器里做、而不是去改工作流文件：graphs/ 是产物，手改下次重扫就没了；
+# 而作者的原始工作流是整合包的东西，不该动。
+# 为什么要跟 server/rewrite.py 的 LOADER 一起改：llama-cpp 那个节点是**按配置缓存**
+# 模型的，两边只要有一个字段不一样，交替用就会各自重新加载十几个 G。
+#
+# 作者的图指着 Qwen3.5-27B 的 3bit 量化（UD-IQ3_XXS，压得很狠），换成同代的 IQ4_XS。
+# 同代=同架构，加载没问题（下完先在 ComfyUI 外单独 llama_cpp.Llama() 验过才切的）。
+# unsloth 那个仓库里 Qwen3.5-27B **没有** UD-IQ4_XS，只有普通 IQ4_XS，别再去找了。
+#
+# 别去试 Qwen3.8-27B：包里的 llama.cpp 加载不了。
+# 原因记在这以免下次再白下 13G —— llama-cpp-python 0.3.35 的 qwen35 架构把「哪几层是
+# 注意力层、哪几层是 SSM 层」写死成每 4 层一个注意力层，llama.dll 里也没有任何按层
+# 描述类型的元数据键（只有 qwen35 / qwen35moe 两个实现）。Qwen3.5-27B 是 64 层
+# （16 注意力 + 48 SSM）刚好对上；Qwen3.8-27B 是 65 层（17 + 48），第 64 层在文件里
+# 是注意力层、loader 按 SSM 去找，直接报 missing tensor 'blk.64.ssm_conv1d.weight'。
+# 跟量化档位、跟谁转的 gguf 都无关，任何 Qwen3.8-27B 的 gguf 都一样；3.8 还多出
+# MTP（blk.N.nextn.*）张量。要用它只能升级 llama-cpp-python，那是整合包核心，不动。
+#
+# 第 2、3 条是给分镜那条擦屁股的：它是子图工作流，本地转不了，扫描器读的是磁盘上
+# **已经导出**的 api.json —— 3.8 的名字曾经写进过那份文件，只靠第 1 条碰不到它。
+#   旧文件名 -> 新文件名
+LLM_SWAP = {
+    "Qwen3.5-27B-UD-IQ3_XXS.gguf": "Qwen3.5-27B-IQ4_XS.gguf",
+    "Qwen3.8-27B-UD-IQ4_XS.gguf": "Qwen3.5-27B-IQ4_XS.gguf",
+    # 视觉塔跟主模型同代就行，3.5 全系列共用这一份，不用换
+    "mmproj-Qwen3.8-F16.gguf": "mmproj-F16.gguf",
+}
+NEW_LLM = frozenset(LLM_SWAP.values())
 
 # 高级旋钮：这几个 widget 名不管挂在哪个节点上语义都一样，值得开出来给人调。
 # 范围只能自己给 —— object_info 的范围是给专业用户的（步数上限 10000、LoRA 强度
@@ -162,11 +314,89 @@ KNOBS = {
                  "推荐 {d}：先把原图缩到这个比例，再照着重新画大。"
                  "缩一点画得反而更细 —— 不缩的话糊的地方会被照着糊的重画一遍。1 = 不缩"),
 }
+# 只对某一条能力开的旋钮：能力 id -> 和 KNOBS 一样的 {widget名: (界面名,最小,最大,步进,说明)}。
+# KNOBS 是按 widget 名全局匹配的，denoise 不能进那张表 —— 文生图和 7 条 H3 视频的图里都有
+# 一个 denoise=1（长在 BasicScheduler 上），那些卡上它不是玩法旋钮，调了只会跑废一轮。
+# 图生图这条不一样：它的采样器本来就吃着原图的 latent（LoadImage → 缩放 → VAEEncode →
+# KSampler.latent_image），只是 denoise 写死 1 把原图整段重噪了，所以这个数在这张卡上
+# 是真·「改多少」的开关。
+# 两张抠图卡共用：这个数跟蒙版反不反没关系，两边说明一字不差，写两遍迟早写歪
+RMBG_RES = ("处理精度", 512, 2048, 128,
+            "推荐 {d}：模型就是按这个尺寸练的。原图多大都先缩到这个尺寸算蒙版、"
+            "再放回原尺寸，所以调高只对「细节特别碎」的图（发丝、树枝、栅栏）"
+            "有用，还会更慢更吃显存。调低更快但边缘会变粗糙")
+
+CAP_KNOBS = {
+    "zimage_i2i": {
+        "denoise": ("重绘幅度", 0.2, 1, 0.05,
+                    "工作流默认 {d}（完全重画，原图只剩尺寸）。"
+                    "调到 0.4~0.6：原图的构图和人物轮廓保住，只换质感和细节 —— "
+                    "想让出图还认得出是同一个人就往这一档调。"
+                    "再往下越来越像原图、提示词越使不上劲"),
+    },
+    # 抠图这四个名字在别的图里也可能出现（blur / offset 到处都有），所以只对这两条开。
+    # 上下限都比节点声明的窄：节点给的 mask_blur 到 64、mask_offset 到 ±64，
+    # 那个量级下主体边缘整圈糊成一团，是"能拖但拖了必坏"的区间；
+    # sensitivity 到 0 是把蒙版整体乘 2，半透明的地方全变实，等于没抠。
+    "rmbg_cutout": {
+        "sensitivity": ("抠图灵敏度", 0.5, 1, 0.05,
+                        "工作流默认 {d} = 模型原样输出。往下调会把「模型不太确定」的地方"
+                        "也算成主体：发丝、纱、玻璃这些半透明的地方能保住更多，"
+                        "代价是边上容易留一圈背景残影。边缘干净但细节丢了才往下调"),
+        "mask_blur": ("边缘羽化", 0, 16, 1,
+                      "默认 {d}（不羽化）。把抠出来的边缘化开几像素，"
+                      "贴到别的背景上不那么像剪纸。2~4 就够，再大主体边上会发虚"),
+        "mask_offset": ("边界收放", -16, 16, 1,
+                        "默认 {d}。整圈往里收（负数）或往外放（正数）几像素。"
+                        "边上带了一圈原背景的颜色就填 -2 ~ -4；"
+                        "主体自己被削掉了一点就填正数"),
+        "process_res": RMBG_RES,
+    },
+    # 「抠出背景」是同一个节点开了 invert_output：蒙版先按下面这几个数算好，最后整张反过来。
+    # 所以四个旋钮的方向全都是反的（灵敏度往下调 = 洞挖得更大、边界收放正数 = 洞更大），
+    # 说明文字必须另写一套 —— 照抄主体那张的话每一句都是反的，比不写更害人。
+    "rmbg_bgonly": {
+        "sensitivity": ("挖除灵敏度", 0.5, 1, 0.05,
+                        "工作流默认 {d} = 模型原样输出。往下调会把「模型不太确定」的地方"
+                        "也当成主体一起挖掉：主体挖得更干净、不容易在洞边上留人的颜色，"
+                        "代价是发丝缝隙里那些背景也跟着被挖走了"),
+        "mask_blur": ("边缘羽化", 0, 16, 1,
+                      "默认 {d}（不羽化）。把洞的边缘化开几像素，"
+                      "回头往洞里补东西时接缝不那么硬。2~4 就够"),
+        "mask_offset": ("边界收放", -16, 16, 1,
+                        "默认 {d}。正数 = 洞往外多挖几像素，负数 = 洞往里收。"
+                        "洞边上留了一圈主体的颜色（发梢、衣服亮边）就填 2 ~ 4；"
+                        "洞挖过头、背景被啃掉了就填负数"),
+        "process_res": RMBG_RES,
+    },
+    # 「人物擦除」用的是同一个 RMBG 节点，但它算出来的蒙版不是用来抠图的，是用来
+    # 标记"这块要擦掉重画"。所以名字和说明都得按"擦"来讲，别再提抠图和透明底。
+    # mask_offset 不给负数：往里收只会让人的轮廓留在画面上，是这张卡最典型的失败样子，
+    # 没有哪种情况需要它。默认值也不是 0 —— 擦除天生要往外多盖一点才能吃掉影子和边缘。
+    "rmbg_erase": {
+        "mask_offset": ("擦除范围", 0, 24, 2,
+                        "默认 {d}（比人本身往外多擦 {d} 像素）。地上还留着影子、"
+                        "边上还有一道人的轮廓，就往上调；擦得太狠、把旁边的东西"
+                        "一起抹掉了就往下调"),
+        "sensitivity": ("识别灵敏度", 0.5, 1, 0.05,
+                        "工作流默认 {d} = 模型原样输出。人没被完整认出来（少一条腿、"
+                        "漏了个胳膊、举着的东西没算进去）才往下调 —— 它管的是"
+                        "「哪些地方算这个人」，不管擦得多干净（那个是「擦除范围」）"),
+        "mask_blur": ("边缘过渡", 0, 16, 1,
+                      "默认 {d}。新画的那块和原图交界处化开几像素，接缝不那么硬。"
+                      "调大了绿色标记的边会变虚，模型对"
+                      "「到哪儿为止要擦」的判断也跟着变模糊"),
+        "process_res": RMBG_RES,
+    },
+}
 # 上面这些旋钮默认折进「高级」。写在这里的是玩法本身的旋钮，要摆在面板正面。
 # max_resolution 进来不是因为它是玩法旋钮，而是因为它能悄悄盖掉 resolution ——
 # 一个能否决正面旋钮的开关必须也在正面，否则用户拖了「放大到(短边)」却没反应。
+# 抠图那三个边缘旋钮也在正面：这张卡除了「放一张图」就只有这几个数，
+# 抠不干净时要调的正是它们，折进「高级」等于把这张卡唯一的玩法藏起来
 PRIMARY_KNOBS = {"max_rows", "interpolation_factor", "target_fps", "resolution",
-                 "max_resolution", "force_rate", "frame_load_cap"}
+                 "max_resolution", "force_rate", "frame_load_cap", "denoise",
+                 "sensitivity", "mask_blur", "mask_offset"}
 # 表里的上限是硬上限。这类旋钮在图里常写成一个"等于不限"的大数（promptLine 的
 # max_rows=1000），那不是作者调过的设置，照抄成默认值滑条就变成 1000 档没法用。
 HARD_MAX = {"max_rows"}
@@ -248,16 +478,16 @@ def is_preview(ct, ins):
     return ct == "PreviewImage" or ins.get("save_output") is False
 
 
-def knob_key(api, nid, field):
+def knob_key(api, nid, field, knobs=None):
     """这个输入对应哪个旋钮。
 
     frame_rate 归到 force_rate（同一个「帧率」，见 RATE_IN/RATE_OUT）；名字压根不在
-    KNOBS 里的是数字中转节点，旋钮身份来自它喂给的那个输入。
+    旋钮表里的是数字中转节点，旋钮身份来自它喂给的那个输入。
     """
     low = field.lower()
     if low == RATE_OUT:
         return RATE_IN
-    return low if low in KNOBS else fed_knob(api, nid)
+    return low if low in (knobs or KNOBS) else fed_knob(api, nid)
 
 # 分辨率旋钮。视频工作流几乎没有裸的 width/height：尺寸由「尺寸提供者」节点算出来
 #   ResolutionSelector          -> aspect_ratio + megapixels  -> width/height
@@ -741,18 +971,80 @@ def sized_pieces(api, nid):
     return 0
 
 
-def slot_optional(api, oi, nid):
-    """这张上传图空着，工作流还跑得动吗 —— 看它接进去的那个输入是不是选填。
+def safe_cut(api, oi, cid, cin):
+    """这根线拔掉之后，收线的那个节点自己还算得出东西吗。
 
-    以前所有图槽都只有第一个算必填。对生成类工作流是对的：首尾帧的尾帧、参考图的
-    第 2~9 张，在节点定义里都声明成 optional，空着就用模板默认值或者干脆断线。
-    但拼图这类工具不一样 —— ImageGridComposite2x2 的 image1~4 全是必填，少一张
-    torch.cat 直接抛异常。判据只查 object_info，不认节点类名。
+    输入声明成 optional **不等于** 少了它还能算：缩放节点（ImageScaleByAspectRatio V2）
+    的 image 就是 optional，真拔了它没东西可缩。两种情况才算能拔：
+
+    - 动态字典的子项（`ref_images.ref_image_3`）：整份字典少一项而已，天生能少；
+    - 拔完还剩一根「跟自己输出同类型」的入线，**且拔掉的这根跟输出不同类型**：
+      这节点退化成原样透传 —— ReferenceLatent 收 conditioning + latent、只出
+      CONDITIONING，少了 latent 就是把 conditioning 原样递出去（见 ComfyUI 的
+      nodes_edit_model.py）。
+
+    第二条后半句是拿首尾帧那条换来的：`ImageScaleByAspectRatio V2.image` 也声明成
+    optional，但它出 `IMAGE/MASK/BOX/INT/INT` —— 「分辨率」那根 INT 线（Primitive 喂
+    `scale_to_length`）跟它自己的 INT 输出同类型，光看"还剩同类型入线"就误判成能拔，
+    可真拔了 image 它没东西可缩。**拔掉的那根跟输出同类型，说明它就是被加工的那个东西**，
+    不能拔；ReferenceLatent 少的是 LATENT、出的是 CONDITIONING，才是真的可有可无。
     """
-    cid, cin = direct_consumer(api, nid)
-    if cid is None:
-        return True                       # 没人用它，空着也无所谓
-    return is_optional(oi, api[cid]["class_type"], cin)
+    if "." in cin:
+        return True
+    ct = api[cid]["class_type"]
+    outs = oi.get(ct, {}).get("output") or []
+    ct_in, _o = spec_of(oi, ct, cin)
+    if ct_in in outs:
+        return False                      # 它就是被加工的那个东西
+    for k, v in api[cid]["inputs"].items():
+        if k == cin or not (isinstance(v, list) and len(v) == 2):
+            continue                      # 不是连线进来的（是个死值）
+        t, _o = spec_of(oi, ct, k)
+        if t in outs:
+            return True
+    return False
+
+
+def slot_cuts(api, oi, nid, seen=None, depth=0):
+    """这张上传图空着，工作流还跑得动吗 —— 顺着数据流往下找「可断点」。
+
+    返回 (可断点列表, 这一槽能空吗, 这些线真能拔吗)。碰到 optional 输入就是一个
+    可断点；碰到必填输入就继续往下问同样的问题；走到输出节点就是断不了。
+    所有叶子都是可断点，这一槽才算能空着。
+
+    「能空」和「能拔线」是两件事：能空 = 不填也不会报结构错误（老逻辑就是这个，
+    不填就照模板里作者自带的演示图跑）；能拔 = 拔完这条支线没人依赖、ComfyUI
+    干脆不执行它（那才是"真的没参与"）。所以只有 safe_cut() 全过才写 dropIfEmpty，
+    一半能拔一半不能拔等于拔了个半残，比不拔更糟。
+
+    以前只看**直接消费者**那一跳。对首尾帧的尾帧、参考图第 2~9 张够用（节点定义里
+    直接就是 optional），但参考图编辑那种「图 → 缩放 → VAEEncode → ReferenceLatent.latent」
+    的支线会被误判成必填：前两跳都是必填输入，真正能断的地方在第三跳。
+    拼图这类工具照旧算必填 —— ImageGridComposite2x2 的 image1~4 全是必填，
+    一路走到 SaveImage 也没有可断点，少一张 torch.cat 直接抛异常。
+    判据只查 object_info 和图的结构，不认节点类名。
+    """
+    seen = set() if seen is None else seen
+    if nid in seen or depth > 8:
+        return [], True, True
+    seen.add(nid)
+    cs = consumers(api, nid)
+    if not cs:
+        return [], True, True             # 没人用它，空着也无所谓
+    pts, ok, safe = [], True, True
+    for cid, cin in cs:
+        ct = api[cid]["class_type"]
+        if is_optional(oi, ct, cin):
+            pts.append({"node": cid, "input": cin})
+            safe = safe and safe_cut(api, oi, cid, cin)
+            continue
+        if ct in SAVE_TYPES or oi.get(ct, {}).get("output_node"):
+            ok = False                    # 产物这条路上没得断
+            continue
+        sub, sub_ok, sub_safe = slot_cuts(api, oi, cid, seen, depth + 1)
+        pts += sub
+        ok, safe = ok and sub_ok, safe and sub_safe
+    return pts, ok, safe
 
 
 def traced_label(api, nid, depth=0, seen=None):
@@ -784,9 +1076,10 @@ def pick_label(title, generic):
     return generic, (t or None)
 
 
-def derive_inputs(api, oi):
+def derive_inputs(api, oi, wid=None):
     images, audios, texts, params, seeds, outputs, crops, res = [], [], [], [], [], [], [], []
     videos, rates = [], []
+    knobs = {**KNOBS, **CAP_KNOBS.get(wid, {})}   # 只对这条能力开的旋钮，见 CAP_KNOBS
     for nid, node in sorted(api.items(), key=lambda kv: int(str(kv[0]).split(":")[0])):
         ct, ins = node["class_type"], node["inputs"]
         title = node["_meta"]["title"]
@@ -800,7 +1093,7 @@ def derive_inputs(api, oi):
             # 上传节点自己也带旋钮（VHS 的 frame_load_cap = 只读前几帧），
             # 这是补帧这类慢活唯一的"先试一小段"开关，不能跟着上传槽一起跳过
             for f, v in ins.items():
-                if not (is_literal(v) and f.lower() in KNOBS):
+                if not (is_literal(v) and f.lower() in knobs):
                     continue
                 t, _o = spec_of(oi, ct, f)
                 if t not in ("INT", "FLOAT"):
@@ -832,7 +1125,7 @@ def derive_inputs(api, oi):
                     # 种子上限各节点不一样（KSampler 是 2^64，SeedVR2 只到 2^32-1），
                     # 随机种子必须按这个上限来，超了 ComfyUI 直接拒收整个任务
                     seeds.append((nid, f, v, t, opts.get("max")))
-                elif low in KNOBS and t in ("INT", "FLOAT"):
+                elif low in knobs and t in ("INT", "FLOAT"):
                     # 这几个旋钮基本都长在采样器/LoRA/加速这类"后台节点"上，
                     # 所以要抢在 HIDDEN_TYPES 之前放行
                     params.append((nid, title, f, v, "knob", t))
@@ -848,6 +1141,8 @@ def derive_inputs(api, oi):
                 elif t == "STRING" and opts.get("multiline") and isinstance(v, str):
                     if any(x in low for x in ("system", "negative", "suffix", "prefix")):
                         continue
+                    if (wid, str(nid)) in FIXED_TEXT:
+                        continue          # 作者写死的指令，不是提示词，见 FIXED_TEXT
                     if formula_node(oi, ct):
                         continue          # 公式不是提示词，开出来只会被人当输入框填坏
                     texts.append((nid, title, f, v))
@@ -895,7 +1190,7 @@ def derive_inputs(api, oi):
         # 顶上来照跑一轮）。只对声明为 optional 的编号槽这么干：required 槽断了
         # 会直接报结构错误。这跟"图配提示词"无关，任何编号图槽都要断。
         ct = api[ic]["class_type"]
-        drop = {i: {"node": ic, "input": cin} for k, (i, cin) in im.items()
+        drop = {i: [{"node": ic, "input": cin}] for k, (i, cin) in im.items()
                 if is_optional(oi, ct, cin)}
         if len(txt_g) == 1:
             _tc, tm = next(iter(txt_g.items()))
@@ -953,13 +1248,16 @@ def derive_inputs(api, oi):
     for i, (nid, title) in enumerate(images):
         gen = traced_label(api, nid) or "图片"
         label, hint = pick_label(None if default_title(oi, "LoadImage", title) else title, gen)
+        cuts, cuttable, cuts_safe = slot_cuts(api, oi, nid)
         item = {"key": f"images[{i}]", "label": uniq(label), "type": "image",
-                "required": i == 0 or not slot_optional(api, oi, nid),
+                "required": i == 0 or not cuttable,
                 "target": {"node": nid, "input": "image", "kind": "upload_image"}}
         if hint:
             item["hint"] = hint
-        if i in drop and not item["required"]:
-            item["dropIfEmpty"] = drop[i]      # 必填槽没得断，空着就直接报错了
+        # 必填槽没得断，空着就直接报错了。编号图槽自己算过一次（顺序纠正过），以它为准
+        lines = drop.get(i) or (cuts if cuts_safe else [])
+        if lines and not item["required"]:
+            item["dropIfEmpty"] = lines
         g = grid_of(api, nid)
         if g:
             item["grid"] = list(g)
@@ -1001,12 +1299,19 @@ def derive_inputs(api, oi):
         out.append(item)
     for nid, title, field, val, kind, vt in params:
         if kind == "duration":
+            # 上下限按模型练过的帧数来：H3 三个视频节点的 length 都写着
+            # 「trained range is ~124-362」，124 帧 = 5 秒、362 帧 = 15 秒。
+            # 节点自己收到 3600 帧（150 秒），但那是没练过的区间 —— 拖出去不是"更长"，
+            # 是画面开始散、动作开始飘。能拖但拖了变坏的范围不该摆在滑条上
             out.append({"key": "duration", "label": "时长(秒)", "type": "slider",
-                        "min": 3, "max": 30, "step": 1, "default": val,
+                        "min": 5, "max": 15, "step": 1, "default": val,
+                        "hint": "5~15 秒是这个模型练过的范围。想要更长的片子就分几张卡各出一段"
+                                "再接起来，硬拖长只会让动作发飘。"
+                                "提示词里各镜头的时长加起来要对得上这个数",
                         "target": {"node": nid, "input": field, "vtype": vt}})
         elif kind == "knob":
-            key = knob_key(api, nid, field)
-            label, lo, hi, step, hint = KNOBS[key]
+            key = knob_key(api, nid, field, knobs)
+            label, lo, hi, step, hint = knobs[key]
             if key in HARD_MAX:
                 val = min(val, hi)
             if isinstance(val, float):
@@ -1178,6 +1483,34 @@ def repair_bool_widgets(api, oi, warns):
             warns.append(f"已修：#{nid}.{f} 的值 {v!r} 不是布尔，按节点默认值 {dv} 送")
 
 
+def swap_llm(api, oi, warns):
+    """把工作流里写死的旧 gguf 换成 LLM_SWAP 指定的新文件。
+
+    只认「这个字段的下拉里确实有新文件」才换 —— 模型没下好就不动，保持能跑的现状，
+    只在警告里说一声。硬换成一个不存在的文件名，ComfyUI 会在提交时直接报错，
+    比慢一点糟得多。
+    """
+    for nid, node in api.items():
+        for f, v in list(node["inputs"].items()):
+            if not isinstance(v, str):
+                continue
+            new = LLM_SWAP.get(v)
+            if new:
+                # 下拉的候选就在 spec 的第一项里（object_info 把 combo 的类型写成选项列表）
+                t, _ = spec_of(oi, node["class_type"], f)
+                if not (isinstance(t, list) and new in t):
+                    warns.append(f"想把 #{nid}.{f} 换成 {new}，但 ComfyUI 的下拉里没有这个"
+                                 f"文件（没下好？没重启 ComfyUI？）—— 仍用 {v}")
+                    continue
+                node["inputs"][f] = new
+            # 记的是**最后用的是哪个**，不是"这一轮换掉了什么"。子图工作流
+            # （分镜那条）复用的是磁盘上已经换好的 api.json，按"这一轮的动作"写
+            # 第二遍就没得可换、这条也跟着消失 —— 重扫两遍结果不一致，就没法再靠
+            # diff 发现真正的意外了。
+            if node["inputs"][f] in NEW_LLM:
+                warns.append(f"本地大模型：#{nid}.{f} = {node['inputs'][f]}")
+
+
 def validate_api(api, oi):
     """提交前的结构自检：必填项是否齐全、连线是否悬空"""
     errs = []
@@ -1337,10 +1670,11 @@ def scan(path: Path, oi, rel_key=None):
         api = ui_to_api(wf, oi, warns, revive=wid in REVIVE)
     repair_loop_count(api, oi, warns)
     repair_bool_widgets(api, oi, warns)
+    swap_llm(api, oi, warns)
     # 摘孤儿必须排在 repair_* 后面：漫剧那条的「循环次数」量表本来就是没人用的孤儿，
     # 正等着 repair_loop_count 把它接进 total —— 先摘就把要修的东西摘掉了
     prune_dead(api, oi, warns)
-    inputs, outputs, n_img, n_aud, n_vid, note = derive_inputs(api, oi)
+    inputs, outputs, n_img, n_aud, n_vid, note = derive_inputs(api, oi, wid)
     if outputs:
         to_target_fps(inputs, api, oi, outputs[0][0])
     out_type = outputs[0][1] if outputs else "unknown"
@@ -1367,6 +1701,8 @@ def scan(path: Path, oi, rel_key=None):
         "graph": f"graphs/{wid}.api.json",
         "output": {"node": outputs[0][0]} if outputs else None,
         "note": note or NOTES.get(wid),
+        "rewrite": REWRITE.get(wid),            # 有这一项才画「✨优化」按钮
+        "compare": wid in COMPARE,              # 卡片上画「原图 ↔ 结果」那条拖动线
         "inputs": inputs,
         "warnings": warns,
     }
@@ -1453,6 +1789,8 @@ def main():
             "kind": kind,                       # 前端菜单按它分「工具」一组
             "modes": build_modes(ms),
         })
+    # 风格卡排最后：它不出产物，是给别的卡加料的（见 STYLE_CARD）
+    cards.append(dict(STYLE_CARD))
     (ROOT / "manifests" / "_cards.json").write_text(
         json.dumps(cards, ensure_ascii=False, indent=1), encoding="utf-8")
     print("\n=== 自动归并：画布上只有这几张卡，工作流退化为卡内「模式」")

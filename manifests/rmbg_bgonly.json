@@ -1,0 +1,99 @@
+{
+ "id": "rmbg_bgonly",
+ "name": "抠出背景",
+ "file": "抠出背景",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\抠出背景.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "tool",
+ "card": "rmbg_bgonly",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "graph": "graphs/rmbg_bgonly.api.json",
+ "output": {
+  "node": "20"
+ },
+ "note": "跟「人物提取」是反过来的一张卡：留背景、把主体挖掉，出的也是带透明通道的 PNG。同一张图两张卡各跑一次，得到的就是能重新叠回原图的两层。本机跑，不联网、不限次数。\n卡片上出来那张图可以按住左右拖 —— 往右拖主体就长回来，用来看主体挖得干不干净、有没有留下一圈人的颜色。\n主体位置是个透明的洞，这张卡不会把洞填上（那是另一件事：想要一张完整可用的干净背景，把这层接给「图生图」或「参考图编辑」让它补）。\n洞边上留了一圈主体的颜色（发梢、衣服的亮边）就把「边界收放」往正数调 2~4，等于把洞往外多挖几像素；洞挖过头、背景被啃掉了就填负数。\n想把人直接擦掉、背景连上，用「人物擦除」那张卡。",
+ "rewrite": null,
+ "compare": true,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "sensitivity",
+   "label": "挖除灵敏度",
+   "type": "slider",
+   "min": 0.5,
+   "max": 1,
+   "step": 0.05,
+   "default": 1,
+   "hint": "工作流默认 1 = 模型原样输出。往下调会把「模型不太确定」的地方也当成主体一起挖掉：主体挖得更干净、不容易在洞边上留人的颜色，代价是发丝缝隙里那些背景也跟着被挖走了",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "sensitivity",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "process_res",
+   "label": "处理精度",
+   "type": "slider",
+   "min": 512,
+   "max": 2048,
+   "step": 128,
+   "default": 1024,
+   "hint": "推荐 1024：模型就是按这个尺寸练的。原图多大都先缩到这个尺寸算蒙版、再放回原尺寸，所以调高只对「细节特别碎」的图（发丝、树枝、栅栏）有用，还会更慢更吃显存。调低更快但边缘会变粗糙",
+   "advanced": true,
+   "target": {
+    "node": "10",
+    "input": "process_res",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "mask_blur",
+   "label": "边缘羽化",
+   "type": "slider",
+   "min": 0,
+   "max": 16,
+   "step": 1,
+   "default": 0,
+   "hint": "默认 0（不羽化）。把洞的边缘化开几像素，回头往洞里补东西时接缝不那么硬。2~4 就够",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "mask_blur",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "mask_offset",
+   "label": "边界收放",
+   "type": "slider",
+   "min": -16,
+   "max": 16,
+   "step": 1,
+   "default": 0,
+   "hint": "默认 0。正数 = 洞往外多挖几像素，负数 = 洞往里收。洞边上留了一圈主体的颜色（发梢、衣服亮边）就填 2 ~ 4；洞挖过头、背景被啃掉了就填负数",
+   "advanced": false,
+   "target": {
+    "node": "10",
+    "input": "mask_offset",
+    "vtype": "INT"
+   }
+  }
+ ],
+ "warnings": []
+}

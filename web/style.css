@@ -5,6 +5,7 @@
   --acc: #00e5ff;            /* 霓虹青：主色 / 连线 / 选中 */
   --acc2: #ff2d95;           /* 霓虹品红：输出端口 / 危险 */
   --ok: #4dff9f; --warn: #ffb000; --err: #ff3b5c;
+  --sty: #b57bff;            /* 紫：风格卡 / 风格连线。它传文字不传产物，要和青/洋红分开 */
   --mono: "JetBrains Mono", Consolas, "Cascadia Mono", monospace;
   color-scheme: dark;   /* 让原生 select 下拉、滚动条跟着走暗色 */
 }
@@ -97,6 +98,12 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 .tbtn:hover { color: var(--acc); border-color: var(--acc); box-shadow: 0 0 10px #00e5ff25; }
 #ptitle { font-weight: 600; letter-spacing: 1px; text-shadow: 0 0 10px #00e5ff40; }
+/* 「试玩画布 · 刷新还原」：示例上的改动不存盘，说清楚但别抢标题的戏 */
+#ptitle .ro {
+  margin-left: 8px; padding: 1px 6px; border-radius: 2px; cursor: help;
+  font-weight: 400; font-size: 11px; letter-spacing: 0; text-shadow: none;
+  color: var(--warn); border: 1px solid #5c4300; background: #ffb00012;
+}
 #hint { color: var(--dim); font-size: 12px; margin-left: auto; font-family: var(--mono); }
 
 /* 右上角「任务(n)」：颜色本身就是状态 —— 青色在跑、橙色在等、灰的没活儿 */
@@ -125,6 +132,24 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   filter: drop-shadow(0 0 4px #00e5ffaa);
 }
 #wires path.tmp { stroke: var(--acc2); stroke-dasharray: 6 4; filter: drop-shadow(0 0 5px #ff2d95aa); }
+/* 风格线：传的是文字不是产物，画成紫色虚线，别让人以为风格卡也出图 */
+#wires path.txt {
+  stroke: var(--sty); stroke-width: 1.3; stroke-dasharray: 2 5; stroke-linecap: round;
+  filter: drop-shadow(0 0 4px #b57bffaa);
+}
+/* 每根线底下垫一根透明粗线专管接鼠标：真正那根只有 1.3~1.6px，
+   画布缩到 0.3 倍时根本点不中 */
+#wires path.hit {
+  stroke: transparent; stroke-width: 14; filter: none; pointer-events: stroke; cursor: pointer;
+}
+/* 选中的线（在 .txt 后面：风格线选中了保留虚线，只把颜色和粗细顶掉） */
+#wires path.sel { stroke: #fff; stroke-width: 2.6; filter: drop-shadow(0 0 7px #ffffffcc); }
+/* 这根产物线上还捎着风格（风格继承没有自己的连线，借的就是这根）：
+   在实线上再叠一层紫虚线 */
+#wires path.carry {
+  stroke: var(--sty); stroke-width: 1.2; stroke-dasharray: 2 6; stroke-linecap: round;
+  filter: drop-shadow(0 0 3px #b57bffaa);
+}
 
 #empty {
   position: absolute; inset: 0; display: flex; flex-direction: column;
@@ -144,10 +169,14 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 
 /* ---------- 卡片 ---------- */
 /* 卡片不能 overflow:hidden，否则右侧凸出的输出圆点会被裁掉一半 */
+/* cursor:move 铺满整张卡：卡片哪儿都能拖（app.js 的 NODRAG 列了例外）。
+   下面几处例外自己会把光标改回去 —— 视频是 pointer（点=放）、对比线是 ew-resize、
+   拖角是 nwse-resize，它们按住干的是别的事，光标得跟着说清楚 */
 .card {
   position: absolute; width: 268px; background: var(--panel);
   border: 1px solid var(--line); border-radius: 3px;
   box-shadow: 0 4px 22px #000b, 0 0 0 1px #00e5ff08;
+  cursor: move;
 }
 /* 四角切角括号 */
 .card::before, .card::after {
@@ -191,14 +220,16 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   justify-content: center; position: relative; overflow: hidden;
 }
 .card .body img, .card .body video { width: 100%; height: 100%; object-fit: contain; }
-/* 视频不给 controls：单击放/停，按住横向拖动定位，双击进大窗口 */
+/* 视频不给 controls：单击放/停，按住是挪卡（整张卡都能拖），双击进大窗口。
+   光标留 pointer 不改成 move：能拖是整张卡的通性，这儿要说的是"它还认单击" */
 .card .body video { cursor: pointer; }
-/* 自己画的进度条：卡片里唯一的进度反馈，也能直接按住拖。鼠标进卡片变粗，好抓 */
+/* 自己画的进度条：卡片里唯一的进度反馈，也是唯一能定位进度的地方（画面让给拖卡了），
+   所以鼠标一进卡片就得变粗 —— 4px 高的条子按不准 */
 .card .body .vprog {
   position: absolute; left: 0; right: 0; bottom: 0; height: 4px;
   background: #ffffff1f; cursor: ew-resize; transition: height .12s;
 }
-.card:hover .body .vprog { height: 7px; }
+.card:hover .body .vprog { height: 10px; }
 .card .body .vprog i {
   display: block; height: 100%; width: 0;
   background: var(--acc); box-shadow: 0 0 8px var(--acc);
@@ -212,13 +243,49 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   animation: spin .9s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+/* 「原图 ↔ 结果」对比线（COMPARE 那几张卡）。--x 是分割位置，百分比，由 applyCmp() 写进来。
+   格子底：卡片画面区本来就近黑，透明的地方不铺格子跟"黑背景"看着一模一样，
+   用户会以为没抠掉。整块都能按住拖，所以光标常驻 ew-resize */
+.card .body .cmp {
+  --x: 0%;
+  position: absolute; inset: 0; cursor: ew-resize;
+  background: #0b0f1c;
+  background-image:
+    linear-gradient(45deg, #18203a 25%, transparent 25%, transparent 75%, #18203a 75%),
+    linear-gradient(45deg, #18203a 25%, transparent 25%, transparent 75%, #18203a 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 8px 8px;
+}
+.card .body .cmp img { position: absolute; inset: 0; }
+/* 原图压在结果上面，从左边裁开：--x 之左是原图（带背景），之右是抠完的 */
+.card .body .cmp .old { clip-path: inset(0 calc(100% - var(--x)) 0 0); }
+.card .body .cmpx {
+  position: absolute; top: 0; bottom: 0; left: var(--x); width: 2px; margin-left: -1px;
+  background: var(--acc); box-shadow: 0 0 8px #00e5ff88; pointer-events: none;
+}
+/* 抓手。x=0 时被画面区的 overflow:hidden 切掉一半，剩半个圆正好当"这儿能拖"的提示 */
+.card .body .cmpx i {
+  position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+  width: 20px; height: 20px; border-radius: 50%;
+  background: #0b0f1cdd; border: 1px solid var(--acc);
+  color: var(--acc); font-size: 11px; font-style: normal;
+  display: flex; align-items: center; justify-content: center;
+}
+.card .body .cmptip {
+  position: absolute; left: 0; right: 0; bottom: 0; padding: 3px 0;
+  background: #050810c9; color: var(--dim); font-size: 10px; text-align: center;
+  pointer-events: none;
+}
+.card .body .cmp.dragged .cmptip { display: none; }   /* 拖过一次就不用再教了 */
 /* 一次出一组产物（分镜九宫格）：铺成网格，高度改成自动撑开，不然 168px 里挤 9 张全糊了 */
 .card .body.grid {
   height: auto; display: grid; gap: 2px; padding: 2px;
   grid-template-columns: repeat(var(--cols, 3), 1fr);
 }
+/* 格子不改光标（还是 move）：整张卡都能拖，唯独这九格显示 zoom-in 就等于说"这儿拖不动"。
+   双击看大图的提示交给悬停高亮那一圈 */
 .card .body.grid img, .card .body.grid video {
-  aspect-ratio: 1; height: auto; object-fit: cover; cursor: zoom-in;
+  aspect-ratio: 1; height: auto; object-fit: cover;
   background: #0b0f1c;
 }
 .card .body.grid img:hover, .card .body.grid video:hover { outline: 1px solid var(--acc); }
@@ -236,6 +303,20 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 .card .cf .kt[data-kind="video"] { color: var(--acc2); background: #ff2d9514; }
 .card .cf .kt[data-kind="both"] { color: var(--dim); background: transparent; }
+.card .cf .kt[data-kind="style"] { color: var(--sty); background: #b57bff14; }
+/* 风格卡的画面区装的是文字：不裁、能滚，字小一点 —— 它是"这张卡在管什么风格"的
+   一眼预览，不是要在这儿读完整段 */
+.card .body.sbody {
+  display: block; padding: 8px 9px; overflow: auto; text-align: left;
+  background: #0a0814; box-shadow: inset 2px 0 0 var(--sty);
+}
+.card .body.sbody .stx {
+  font-size: 11px; line-height: 1.6; color: #cbb6ff; white-space: pre-wrap; word-break: break-word;
+}
+.card .body.sbody .sempty {
+  margin-top: 6px; font-size: 11px; line-height: 1.6; color: var(--dim); opacity: .8;
+}
+.card .body.sbody .ph { display: block; font-size: 22px; color: #33265a; }
 /* 状态字里带了「正在跑哪一步」，长度不定：挤不下就省略号，别把右边的文件名顶出卡外 */
 .card .cf .st { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .card .cf .meta { flex: none; max-width: 50%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -328,6 +409,15 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 .hrun .rs span { flex: 1; color: var(--acc); word-break: break-all; }
 .hrun .rs button { color: var(--dim); padding: 0 3px; }
 .hrun .rs button:hover { color: var(--acc); }
+/* 套了风格卡的那几轮：当时真提交的整段提示词。默认折起来 —— 它可能很长，
+   但没有它这一轮就复现不出来（卡上那个框里的字不是跑出这一轮的那段话） */
+.hrun .rp { border-top: 1px solid var(--line); font-size: 11px; }
+.hrun .rp summary { padding: 5px 8px; color: var(--sty); cursor: pointer; }
+.hrun .rp summary:hover { color: #d7c1ff; }
+.hrun .rp > div {
+  padding: 0 8px 7px; max-height: 150px; overflow: auto; line-height: 1.6;
+  color: var(--dim); white-space: pre-wrap; word-break: break-word;
+}
 
 /* ---------- 参数面板 ---------- */
 #panel {
@@ -386,7 +476,92 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   color: #33405a; border-style: dashed; cursor: not-allowed; background: none;
 }
 #panel .ptabs .pblock { margin: 8px 0 0; }
+
+/* ✨优化：本地大模型把大白话改成这个模型认的提示词。优化完这一格有两份词，
+   页签选哪份就提交哪份 —— 优化后那份自带风格，提交时不再另拼风格卡 */
+#panel .phd button.rwbtn { color: var(--acc); border-color: #16515c; }
+#panel .phd button.rwbtn:hover { box-shadow: 0 0 10px #00e5ff30; }
+#panel .phd button.rwbtn:disabled {
+  color: var(--warn); border-color: #5c4300; cursor: wait; box-shadow: none;
+}
+
+#panel .opttabs {
+  display: flex; align-items: flex-end; gap: 2px; margin-bottom: 4px;
+  border-bottom: 1px solid var(--line);
+}
+
+#panel .opttabs button {
+  padding: 4px 12px; font-size: 12px; color: var(--dim); font-family: var(--mono);
+  border: 1px solid var(--line); border-bottom: none; border-radius: 2px 2px 0 0;
+  margin-bottom: -1px; background: #0a0f1c;
+}
+
+#panel .opttabs button:hover { color: var(--acc); }
+
+#panel .opttabs button.on {
+  color: #bdf1ff; background: #00e5ff1c; border-color: var(--acc);
+  border-bottom: 1px solid #080c17; box-shadow: 0 -2px 10px #00e5ff25;
+}
+
+/* 「已含风格，提交时不再另拼风格卡」这句提示：优化后那份跟原词的提交规则不一样，
+   不写出来用户只会以为风格丢了 */
+#panel .opttabs .note {
+  margin-left: auto; padding-bottom: 4px; font-size: 11px; color: var(--dim);
+  letter-spacing: .3px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+
+/* 风格卡在优化之后被换/摘/新挂了：优化结果里的风格已经不是现在这张了 */
+#panel .opttabs .note.bad { color: var(--warn); }
+
+/* 优化后那份是给模型看的格式化长文（H3 六段式四五百词），框子给高一点 */
+#panel .pblock textarea.optta {
+  min-height: 200px; font-size: 12px; line-height: 1.65; color: #cdeef5;
+  border-color: #16515c;
+}
+
+#panel .rwerr {
+  margin-top: 6px; padding: 5px 8px; font-size: 11px; line-height: 1.6;
+  color: var(--err); border: 1px dashed #5c1526; border-radius: 2px;
+  background: #ff3b5c10;
+}
 #panel .tabempty { padding: 12px 4px; color: var(--dim); font-size: 12px; }
+
+/* ---------- 风格卡 ---------- */
+/* 挂了风格卡时，上面那个框里的字不是真提交的那段。这块是只读的"实际提交"读数，
+   跟分辨率/帧数那两条换算读数是同一个路子：面板上显示什么就提交什么 */
+#panel .stypv {
+  margin-top: 6px; border: 1px dashed #3a2a63; border-left: 2px solid var(--sty);
+  border-radius: 2px; background: #0c0918;
+}
+#panel .stypv .hd {
+  padding: 4px 8px; font-size: 11px; letter-spacing: .5px; color: var(--sty);
+  border-bottom: 1px dashed #2a1f45;
+}
+#panel .stypv .tx {
+  padding: 7px 8px; max-height: 190px; overflow: auto; font-size: 12px; line-height: 1.7;
+  color: #cbb6ff; white-space: pre-wrap; word-break: break-word;
+}
+/* 风格卡面板底部：这段风格现在挂给了哪几张卡 */
+#panel .slinks {
+  margin: 10px 0 0; padding: 8px 9px 9px; border: 1px solid var(--line);
+  border-radius: 2px; background: #0a0f1c;
+}
+#panel .slinks .atitle { font-size: 12px; color: var(--dim); letter-spacing: .5px; }
+#panel .slinks .anote { margin-top: 6px; font-size: 11px; line-height: 1.6; color: var(--dim); opacity: .72; }
+#panel .slink {
+  display: flex; align-items: center; gap: 8px; margin-top: 6px;
+  padding: 4px 6px; border: 1px solid #2a1f45; border-radius: 2px; background: #0c0918;
+}
+#panel .slink .nm { flex: 1; text-align: left; color: #cbb6ff; font-size: 12px; }
+#panel .slink .nm:hover { color: var(--sty); text-decoration: underline; }
+#panel .slink .off { flex: none; padding: 1px 7px; border-radius: 2px; font-size: 11px; color: var(--dim); border: 1px solid var(--line); }
+#panel .slink .off:hover { color: var(--err); border-color: var(--err); }
+/* 顺着产物连线继承的那几张：虚框，「继承」也不是按钮 ——
+   要断得去断那根产物连线，画成能点的会让人点了没反应 */
+#panel .slink.down { border-style: dashed; border-color: #241b3a; background: #0a0813; }
+#panel .slink.down .off.ro { border-style: dashed; cursor: default; }
+#panel .slink.down .off.ro:hover { color: var(--dim); border-color: var(--line); }
+#panel .slink + .atitle { display: block; margin-top: 11px; }
 
 /* 作者预设的规范：折叠态只占一行，别让它长得像"又一条提示词" */
 #panel .tpl { margin: 8px 0; border: 1px dashed var(--line); border-radius: 2px; }
@@ -412,6 +587,8 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 
 /* 玩法说明：素材有硬性要求时钉在参数区最上面，第一眼就能看见 */
 #panel .pnote {
+  /* 说明里的换行要留住：参考图生视频那条是一条条列出来的，挤成一段没人看 */
+  white-space: pre-line;
   margin-bottom: 10px; padding: 7px 9px; font-size: 12px; line-height: 1.7;
   color: #ffd88a; background: #ffb00012;
   border: 1px solid #ffb00040; border-left: 2px solid var(--warn); border-radius: 2px;
@@ -546,6 +723,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   text-shadow: 0 0 10px #00e5ff66;
 }
 #tip .note {
+  white-space: pre-line;
   margin-bottom: 7px; padding-left: 7px; line-height: 1.6;
   border-left: 2px solid var(--warn); color: #ffd88a;
 }
@@ -633,7 +811,14 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 .jrow.bad { border-left-color: var(--err); }
 .jrow.gone { border-left-color: #3a4763; opacity: .72; }
 .jrow .r1 { display: flex; align-items: center; gap: 8px; }
-.jrow .r1 .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jrow .r1 .nm { flex: 1; display: flex; align-items: baseline; min-width: 0; }
+/* 「项目名 - 卡片名」：浮窗只有 356px，挤不下时先截项目名（flex-shrink 给得大得多），
+   卡片名才是必须看得见的那个。min-width:0 不能省，否则 flex 子项不肯缩 */
+.jrow .r1 .nm .pj {
+  flex: 0 8 auto; min-width: 14px; overflow: hidden; text-overflow: ellipsis;
+  white-space: nowrap; font-style: normal; font-size: 11px; color: var(--dim);
+}
+.jrow .r1 .nm .cn { flex: 0 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .jrow .r1 .st { font-size: 11px; font-family: var(--mono); white-space: nowrap; }
 .jrow.run .r1 .st { color: var(--acc); }
 .jrow.wait .r1 .st { color: var(--warn); }
@@ -664,4 +849,6 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   background: #080c17f5; border: 1px solid var(--acc); padding: 9px 16px;
   border-radius: 3px; z-index: 99; display: none; max-width: 70vw;
   box-shadow: 0 0 20px #00e5ff33;
+  /* 提示里会有换行（第一行说走了哪条路，第二行才是警告） */
+  white-space: pre-line;
 }
