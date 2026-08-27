@@ -66,7 +66,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "电影近景镜头，image1的男武侠和iamge2的女子面对面对话，背景是一片竹林，高清",
+   "default": "",
    "target": {
     "node": "138",
     "input": "value"

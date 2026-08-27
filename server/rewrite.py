@@ -242,6 +242,88 @@ H3 = ("h3_base", "h3_ref")
 
 
 # =====================================================================
+# 文本卡片：通用文字加工（润色/优化/扩写/自定义提示词）
+# =====================================================================
+# 这套跟上面 REGIMES 不是一回事：REGIMES 是「给某个底模写提示词」的规矩，
+# 这儿是画布上文本卡片那几种通用加工 —— 输入输出都是给人看的文字，
+# 不绑定任何工作流。key 跟卡片模式 id 一一对应（text_polish -> "polish"）。
+# 翻译那种要等用户选定方案再进来，别先塞占位。
+T_POLISH = """你是中文文字润色器。把用户给的文字改得更通顺、更好读，可以调整语序、
+替换更好的用词、修掉病句和重复，但不许改变意思、不许增删事实、不许改变语气人称。
+
+只输出润色后的文字本身：不要开场白、不要解释、不要 markdown 代码块。
+保持原文的语言（中文的润色成中文，英文的润色成英文）和分段方式。"""
+
+T_OPTIMIZE = """你是文字优化器。把用户给的文字改写得更精炼、更有表现力：
+删掉废话和套话，把含糊的表达换成具体的说法，句子节奏更好，重点更突出。
+不许编造原文没有的事实，不许改变作者的立场和语气。
+
+只输出优化后的文字本身：不要开场白、不要解释、不要 markdown 代码块。
+保持原文的语言和分段方式。长度跟原文相当（最多不超过 1.3 倍）。"""
+
+T_EXPAND = """你是文字扩写器。把用户给的文字扩写得更丰富、更具体：
+补充符合原意的细节、过渡和描写，让画面感和信息量更足。
+不许偏离或改变原意，不许编造跟原文冲突的事实。
+
+只输出扩写后的文字本身：不要开场白、不要解释、不要 markdown 代码块。
+保持原文的语言和分段方式，长度约为原文的 2~3 倍。"""
+
+T_CUSTOM = """你按用户给的指令处理文字。指令说什么就做什么；指令没提到的方面
+（语言、语气、格式）保持原样。指令和文字冲突时，以指令为准。
+
+只输出处理后的文字本身：不要开场白、不要解释、不要 markdown 代码块。"""
+
+T_TRANSLATE = """你是专业翻译。根据输入文字的语言自动判断：
+- 如果是中文，翻译成自然流畅的英文
+- 如果是英文，翻译成自然流畅的中文
+- 其他语言，翻译成英文
+
+只输出翻译结果本身，不要开场白、不要解释、不要 markdown 代码块。
+翻译时保持原文的意境和专业术语准确性。"""
+
+TEXT_OPS = {
+    "polish":   {"name": "润色", "system": T_POLISH,
+                 "max_tokens": 2000, "temperature": 0.5},
+    "optimize": {"name": "优化", "system": T_OPTIMIZE,
+                 "max_tokens": 2000, "temperature": 0.6},
+    "expand":   {"name": "扩写", "system": T_EXPAND,
+                 "max_tokens": 3000, "temperature": 0.8},
+    "custom":   {"name": "自定义提示词", "system": T_CUSTOM,
+                 "max_tokens": 3000, "temperature": 0.7},
+    "translate": {"name": "翻译", "system": T_TRANSLATE,
+                 "max_tokens": 2000, "temperature": 0.3},
+}
+
+
+def text_user_msg(op, params, inputs, extra):
+    """文本卡跑的时候喂给模型的用户消息。输入可能有好几段（一张卡收多根连线），
+    每段标上它是哪张卡来的，模型才分得清哪段是什么。"""
+    cfg = TEXT_OPS[op]
+    blocks = []
+    instr = str(params.get("instr") or "").strip()
+    if op == "custom":
+        blocks.append("【指令】\n" + (instr or "（指令是空的，把文字原样整理一遍）"))
+    for i, (name, text) in enumerate(inputs):
+        blocks.append(f"【文字 {i + 1}】（来自「{name}」）\n{text.strip()}")
+    if not inputs:
+        blocks.append("【文字】\n（没接任何上游，也没有附加文字 —— "
+                      "照" + ("指令" if op == "custom" else "这项操作")
+                      + "的意思自己写一段合适的内容）")
+    if extra.strip():
+        blocks.append("【附加文字】\n" + extra.strip())
+    blocks.append(f"现在对上面的文字做「{cfg['name']}」，只输出结果本身。")
+    return "\n\n".join(blocks)
+
+
+def text_clean(raw):
+    """文本卡的输出不需要 clean() 那套 H3 修补，只掐代码块围栏和交代话。"""
+    t = FENCE.sub("", (raw or "").strip()).strip()
+    # 有些模型会返回 <think>推理过程</think>，这部分不要（DeepSeek R1 / QwQ 等）
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL).strip()
+    return LEADIN.sub("", t, count=1).strip()
+
+
+# =====================================================================
 # 喂给 27B 的那份「用户消息」
 # =====================================================================
 def facts(cap, spec, params, assets):
@@ -359,14 +441,15 @@ def user_msg(cap, spec, params, assets, prompt, style):
 # =====================================================================
 # 临时图：27B + 出文本，没有采样器
 # =====================================================================
-def build_graph(spec, system, user, seed):
-    r = REGIMES[spec["regime"]]
+def build_graph(system, user, max_tokens, temperature, seed):
+    """「本地 27B 跑一段文字」的临时图。提示词改写（REGIMES）和文本卡
+    （TEXT_OPS）共用这一张 —— 只要 system / user / 采样参数，不绑定任何一套规矩。"""
     return {
         "1": {"class_type": "llama_cpp_model_loader", "inputs": dict(LOADER),
               "_meta": {"title": "改写模型"}},
         "2": {"class_type": "llama_cpp_parameters", "inputs": {
-            "max_tokens": r["max_tokens"], "top_k": 30, "top_p": 0.9, "min_p": 0.05,
-            "typical_p": 1, "temperature": r["temperature"], "repeat_penalty": 1,
+            "max_tokens": max_tokens, "top_k": 30, "top_p": 0.9, "min_p": 0.05,
+            "typical_p": 1, "temperature": temperature, "repeat_penalty": 1,
             "frequency_penalty": 0, "presence_penalty": 1, "mirostat_mode": 0,
             "mirostat_eta": 0.1, "mirostat_tau": 5, "state_uid": -1},
             "_meta": {"title": "改写参数"}},

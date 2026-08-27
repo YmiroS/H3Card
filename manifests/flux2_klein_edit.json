@@ -57,7 +57,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "让图中两个人物互相搭肩，都拿着啤酒，沙滩背景，近景，半身，相貌表情不变",
+   "default": "",
    "target": {
     "node": "19",
     "input": "text"

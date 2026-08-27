@@ -6,7 +6,7 @@
  "group": "视频",
  "outputType": "video",
  "kind": "tool",
- "card": "gimmvfi_interp",
+ "card": "card_tools",
  "slots": "img0+aud0+vid1",
  "images": 0,
  "audios": 0,

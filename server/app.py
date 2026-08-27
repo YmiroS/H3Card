@@ -36,6 +36,7 @@ from aiohttp import web
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rewrite as rw
 import llm
+import translate as tr
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -80,10 +81,11 @@ def load_caps():
         CAPS[m["id"]] = m
     cards_file = ROOT / "manifests" / "_cards.json"
     CARDS[:] = json.loads(cards_file.read_text(encoding="utf-8")) if cards_file.exists() else []
-    # 只保留有可用工作流的模式。风格卡例外：它没有能力、没有工作流（不跑，只把风格
-    # 并进下游卡的提示词），照这条过滤会被清成 modes=[]，于是「新建卡片」菜单里消失。
+    # 只保留有可用工作流的模式。风格卡/文本卡/素材卡例外：它们没有能力、没有工作流
+    # （素材卡不跑任何工作流，风格卡/文本卡要么不跑、要么走 /api/text 的 LLM 通路），
+    # 照这条过滤会被清成 modes=[]，于是「新建卡片」菜单里消失。
     for c in CARDS:
-        if c.get("kind") == "style":
+        if c.get("kind") in ("style", "text", "asset"):
             continue
         c["modes"] = [md for md in c["modes"] if mode_ok(md)]
     return len(CAPS)
@@ -591,39 +593,53 @@ async def api_rewrite(request):
     user = rw.user_msg(cap, spec, params, assets,
                        str(body.get("prompt") or ""), style)
 
+    # model：auto（老行为，先 API 不通落本地）/ api / local —— 前端把 API 和
+    # 本地拆成两个可选的模型，用户点哪个就走哪条，选定了就不偷偷换
+    model = body.get("model") or "auto"
     t0 = time.time()
-    via, fell, warns, model, tokens = "local", "", [], "", 0
+    via, fell, warns, mname, tokens = "local", "", [], "", 0
     raw = None
-    if llm.ready():
+    use_api = (model == "api" or (model == "auto" and llm.ready()))
+    if model == "api" and not llm.ready():
+        w = llm.where()
+        raise web.HTTPBadRequest(reason=(
+            f"选的是云端 API，可它没配好（{w.get('error') or 'llm.json 里 base_url / api_key / model 没填全'}）。"
+            f"配置在 {w.get('conf')}，或者把模型切回「本地 27B」")[:400])
+    if use_api:
         try:
             got = await llm.chat(request.app["session"], reg["system"], user,
                                  reg["max_tokens"], reg["temperature"])
             raw, via = got["text"], "api"
-            model, tokens = got["model"], got["tokens"]
+            mname, tokens = got["model"], got["tokens"]
             if got["warn"]:
                 warns.append(got["warn"])
         except llm.LLMError as e:
-            # 不抛出去：用户选的是「直接兜底」。原因带回前端，让 toast 说得出
+            if model == "api":
+                # 用户点名要走 API：失败原样抛出去，别静默换成本地等上几分钟
+                raise web.HTTPBadGateway(reason=f"云端 API 没走通：{e}"[:400])
+            # auto：不抛出去，用户选的是「直接兜底」。原因带回前端，让 toast 说得出
             # 为什么这次转了五分钟圈 —— 静默兜底会让人以为 API 压根没生效
             fell = str(e)
     if raw is None:
-        raw = await rewrite_local(request, spec, reg, user, cid, body, t0, fell)
+        raw = await rewrite_local(request, "提示词优化", reg["system"], user,
+                                  reg, body, t0, fell)
 
     text, warn = rw.clean(raw, spec, cap, params, assets)
     if warn:
         warns.append(warn)
     return web.json_response({"text": text, "warn": "；".join(warns),
-                              "via": via, "fallback": fell, "model": model,
+                              "via": via, "fallback": fell, "model": mname,
                               "tokens": tokens,
                               "ms": int((time.time() - t0) * 1000)})
 
 
-async def rewrite_local(request, spec, reg, user, cid, body, t0, fell=""):
-    """兜底那条：临时拼一张「27B + 出文本」的小图丢给 ComfyUI 跑，取回文本。
+async def rewrite_local(request, job_name, system, user, sampling, body, t0, fell=""):
+    """本地 27B：临时拼一张「27B + 出文本」的小图丢给 ComfyUI 跑，取回文本。
+    提示词改写（REGIMES）和文本卡（TEXT_OPS）都走这一条。
 
     走的是 ComfyUI 那条队列（本地只有一份显存，另开一路会跟出图抢），所以：
       - 临时图现搭（server/rewrite.py），不落盘、不进 manifests
-      - 照样登记进 JOBS，任务面板能看见「提示词优化」在跑，也能取消
+      - 照样登记进 JOBS，任务面板能看见它在跑，也能取消
       - 请求一直挂着等结果，前端那边就是一个按钮转圈，不用自己轮询
     """
     # 两头都不通的时候要把两条原因一起说。只报「连不上 ComfyUI」会让人去查
@@ -631,14 +647,14 @@ async def rewrite_local(request, spec, reg, user, cid, body, t0, fell=""):
     if not STATE["comfy_online"]:
         raise web.HTTPBadGateway(reason=(
             f"API 没通（{fell}），本地兜底也用不了：ComfyUI 没在运行。"
-            if fell else "改写要用本地 27B，可 ComfyUI 没在运行。")[:400])
+            if fell else "这件事要用本地 27B，可 ComfyUI 没在运行。")[:400])
 
-    graph = rw.build_graph(spec, reg["system"], user,
-                           random.randint(0, 2 ** 31 - 1))
+    graph = rw.build_graph(system, user, sampling["max_tokens"],
+                           sampling["temperature"], random.randint(0, 2 ** 31 - 1))
     pid = await comfy_submit(request.app["session"], graph)
     STEPS[pid] = step_labels(graph)
     WEIGHTS[pid] = step_weights(graph)
-    JOBS[pid] = {"id": pid, "capability": cid, "name": "提示词优化",
+    JOBS[pid] = {"id": pid, "capability": "text", "name": job_name,
                  "outputType": "text", "status": "queued",
                  "progress": 0.0, "created": t0, "seed": None,
                  "step": "", "outputs": [], "error": None,
@@ -677,6 +693,76 @@ async def rewrite_local(request, spec, reg, user, cid, body, t0, fell=""):
         # 把它写进了文件，不擦掉的话重启后面板上会冒出一条早就结束的「提示词优化」
         save_jobs()
     return raw
+
+
+async def api_text(request):
+    """文本卡片的运行接口：润色 / 优化 / 扩写 / 自定义提示词。
+
+    跟 /api/rewrite 不是一回事：那边是「给某个底模写提示词」（REGIMES 那套
+    硬规矩），这边是通用的文字加工，输入输出都是给人看的文字。
+
+    model 只认两个值（用户在卡上明确选的，不自动换）：
+      api   云端大模型（llm.json 那家），几秒，不占显存，ComfyUI 不用开
+      local 本地 27B，不花钱，但要占显存、排 ComfyUI 的队，第一次好几分钟
+    """
+    body = await request.json()
+    op = str(body.get("op") or "")
+
+    # 翻译操作走有道 API，不走 LLM
+    if op == "translate":
+        inputs = [(str(i.get("name") or "?"), str(i.get("text") or ""))
+                  for i in body.get("inputs") or [] if str(i.get("text") or "").strip()]
+        if not inputs:
+            raise web.HTTPBadRequest(reason="没有要翻译的文本")
+        src_text = inputs[0][1]  # 取第一条输入
+        t0 = time.time()
+        try:
+            translated = tr.youdao_translate(src_text)
+            return web.json_response({
+                "text": translated, "warn": "",
+                "via": "youdao", "model": "有道翻译", "tokens": 0,
+                "ms": int((time.time() - t0) * 1000)
+            })
+        except tr.TranslateError as e:
+            raise web.HTTPBadGateway(reason=f"有道翻译失败：{e}"[:400])
+
+    cfg = rw.TEXT_OPS.get(op)
+    if not cfg:
+        raise web.HTTPBadRequest(reason=f"未知文本操作 {op}")
+    # inputs: [{name, text}] —— 一张卡可以接好几根文本连线，顺序就是连线顺序
+    inputs = [(str(i.get("name") or "?"), str(i.get("text") or ""))
+              for i in body.get("inputs") or [] if str(i.get("text") or "").strip()]
+    if op != "custom" and not inputs and not str(body.get("extra") or "").strip():
+        raise web.HTTPBadRequest(reason="没有任何输入文字：把一张文本卡的出口连过来，或在卡上写附加文字")
+    user = rw.text_user_msg(op, body.get("params") or {}, inputs,
+                            str(body.get("extra") or ""))
+
+    model = body.get("model") or "api"
+    t0 = time.time()
+    warns = []
+    if model == "local":
+        raw = await rewrite_local(request, f"文本卡 · {cfg['name']}",
+                                  cfg["system"], user, cfg, body, t0)
+        via, mname, tokens = "local", "本地 27B", 0
+    else:
+        if not llm.ready():
+            w = llm.where()
+            raise web.HTTPBadRequest(reason=(
+                f"选的是云端 API，可它没配好（{w.get('error') or 'llm.json 里 base_url / api_key / model 没填全'}）。"
+                f"配置在 {w.get('conf')}，或者把这张卡的模型切回「本地 27B」")[:400])
+        try:
+            got = await llm.chat(request.app["session"], cfg["system"], user,
+                                 cfg["max_tokens"], cfg["temperature"])
+        except llm.LLMError as e:
+            # 选定了 API 就不偷偷换本地：换了他会以为 API 也是这么慢
+            raise web.HTTPBadGateway(reason=f"云端 API 没走通：{e}"[:400])
+        raw, via, mname, tokens = got["text"], "api", got["model"], got["tokens"]
+        if got["warn"]:
+            warns = [got["warn"]]
+    text = rw.text_clean(raw)
+    return web.json_response({"text": text, "warn": "；".join(warns),
+                              "via": via, "model": mname, "tokens": tokens,
+                              "ms": int((time.time() - t0) * 1000)})
 
 
 async def api_job(request):
@@ -846,7 +932,7 @@ async def api_project_save(request):
     if body.get("rev") != rev:
         # reason 走 HTTP 头，只能是 ASCII，中文提示由前端自己出
         raise web.HTTPConflict(reason="stale rev")
-    for k in ("name", "cards", "edges", "view"):
+    for k in ("name", "cards", "edges", "groups", "view"):
         if k in body:
             old[k] = body[k]
     old["rev"] = rev + 1
@@ -985,6 +1071,7 @@ def make_app():
     app.router.add_get("/api/media", api_media)
     app.router.add_post("/api/generate", api_generate)
     app.router.add_post("/api/rewrite", api_rewrite)
+    app.router.add_post("/api/text", api_text)
     app.router.add_get("/api/jobs", api_jobs)
     app.router.add_post("/api/jobs/clear", api_jobs_clear)
     app.router.add_get("/api/job/{pid}", api_job)
