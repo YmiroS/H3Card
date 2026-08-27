@@ -10,8 +10,8 @@ import requests
 
 
 # 有道翻译配置
-YOUDAO_APP_KEY = "53c7a5489d47fded"
-YOUDAO_APP_SECRET = "QG1TRB9LxEbTKE3mRzGVvhKjrpb5z9nr"
+YOUDAO_APP_KEY = "0074aa43445ffab2"
+YOUDAO_APP_SECRET = "TRpq2f9ymGr2ah9y4s8CK1UwFgBv4lV8"
 YOUDAO_API_URL = "https://openapi.youdao.com/api"
 
 
@@ -45,11 +45,11 @@ def youdao_translate(text, from_lang="auto", to_lang="auto"):
         else:
             to_lang = "zh-CHS"
 
-    # 生成签名
+    # 生成签名（v3 版本用 SHA256）
     salt = str(uuid.uuid4())
     curtime = str(int(time.time()))
     sign_str = YOUDAO_APP_KEY + truncate(text) + salt + curtime + YOUDAO_APP_SECRET
-    sign = hashlib.md5(sign_str.encode('utf-8')).hexdigest()
+    sign = hashlib.sha256(sign_str.encode('utf-8')).hexdigest()
 
     # 请求参数
     params = {
