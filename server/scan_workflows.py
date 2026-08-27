@@ -80,7 +80,18 @@ DISPLAY = {
 # 只有玩法差别大、不该藏在别人模式列表里第 N 项的才写进来。
 # 注意：素材形态有要求（比如漫剧要宫格拼图）不是单独成卡的理由 —— 那是这条模式的
 # 用法说明，面板上有 note 提示就够了。
-SOLO = {"minimax_h3_ref4", "minimax_h3_ref9", "gimmvfi_interp"}
+# 现在工具类（拼图/抠图/擦除/补帧/画质增强）合并成一张「工具箱」卡、卡内用模式切换，
+# 所以这里只剩补帧在 SOLO 里那一条已经失效 —— 工具统一归到 card_tools，不再单独成卡。
+SOLO = set()
+
+# 工具箱合并卡：只加工素材、不创作的玩法全部收进这一张卡，卡内用模式切换（同卡影视频）。
+# 这些工作流的输入形态各不相同（有的吃 4 张图、有的吃 1 张、补帧吃视频），参数也对不上，
+# 画不出"并集"面板 —— 所以是模式切换，不是张数阶梯 / 素材路由。
+# card_enhance（画质增强）走 ROUTE_CARDS，是"放图/放视频切到对应那一路"，这里一并收进来当模式。
+TOOLS = {
+    "grid4_stitch", "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "gimmvfi_interp",
+}
+TOOLS_CARD = {"id": "card_tools", "name": "工具箱", "icon": "🧩"}
 
 # 按素材类型路由的合并卡：一张卡，放图片跑一条工作流、放视频跑另一条。
 # 和 ladder（按图片张数路由，见 build_modes）不是一回事 —— 那边是同一件事的不同张数、
@@ -113,6 +124,29 @@ STYLE_CARD = {
     "id": "card_style", "name": "风格化提示词", "icon": "🎨",
     "outputType": "text", "kind": "style",
     "modes": [{"id": "style_text", "name": "风格化提示词", "slots": "img0+aud0+vid0"}],
+}
+
+# 文本卡片：画布上的文字卡，**只有这一种**（用户明确不要多类型）。
+# 跟风格卡一样没有 manifest、不进 CAPS —— 前端按 kind == "text" 单独走一套（isText）。
+# 卡上直接写字；要加工就在参数面板里选「加工方式」（润色/优化/扩写/自定义指令，
+# 对应服务端 TEXT_OPS 的 op 名），收多条文本输入，交给大模型（云端 API 或本地 27B）
+# 加工完**写回这张卡的文字**，再往下连。不加工就是一张纯文本卡。
+# 翻译等用户选定接入方案后再加（加进 TEXT_OPS + 面板的加工方式里），别先塞。
+TEXT_CARD = {
+    "id": "card_text", "name": "文本卡片", "icon": "✍",
+    "outputType": "text", "kind": "text",
+    "modes": [{"id": "text", "name": "文本卡片", "slots": "img0+aud0+vid0"}],
+}
+
+# 素材卡：底部工具条「上传」出来的那张卡。跟文本卡/风格卡一样没有 manifest、不进 CAPS，
+# 前端按 kind == "asset" 单独走一套（isAsset）。它自己不跑、不出产物 —— 只拿着一份
+# 上传上来的图片/视频/音频，把它的出口连到别的卡就等于把这份素材放进那张卡的槽里。
+# 为什么要这张卡：一份素材经常要喂给好几张卡（同一张脸既生视频又抠图），
+# 以前只能在每张卡的格子里各传一次；有了素材卡就是传一次、拉几根线。
+ASSET_CARD = {
+    "id": "card_asset", "name": "素材", "icon": "📎",
+    "outputType": "image", "kind": "asset",
+    "modes": [{"id": "asset", "name": "素材", "slots": "img0+aud0+vid0"}],
 }
 
 # 要把工作流里「关着的备用素材槽」开出来的能力（见 revive_bypassed）。
@@ -1562,6 +1596,36 @@ def route_card_def(cid, spec, by_id):
             "outputType": first["outputType"], "kind": "tool", "modes": [mode]}
 
 
+def build_tools_card(ms, by_id):
+    """「工具箱」合并卡：所有只加工素材的玩法收进一张卡，卡内用模式切换。
+
+    ms 是归到 card_tools 的所有能力（grid4_stitch / rmbg_* / gimmvfi_interp），
+    每个就是一个模式；再加一张「画质增强」（ROUTE_CARDS 的 card_enhance，按素材类型
+    切图/视频两路），也作为一个模式收进来。模式顺序指排顺序就是先声明的先出现。
+    """
+    order = ["rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "grid4_stitch", "gimmvfi_interp"]
+    modes = []
+    for wid in order:
+        m = by_id.get(wid)
+        if m:
+            modes.append({"id": m["id"], "name": m["name"], "slots": m["slots"]})
+    # 画质增强：那张合并卡的 mode 已经带 route，直接复用
+    if "card_enhance" in ROUTE_CARDS:
+        card = route_card_def("card_enhance", ROUTE_CARDS["card_enhance"], by_id)
+        if card:
+            modes.append(card["modes"][0])
+            note = ROUTE_CARDS["card_enhance"].get("note")
+            if note:
+                modes[-1]["note"] = note
+    if not modes:
+        return None
+    # 产出类型以多数工具的为准（工具大多出图）；前端用它做卡片图标的兜底
+    first = by_id.get(modes[0]["id"]) or by_id.get(ms[0]["id"]) if ms else None
+    return {"id": TOOLS_CARD["id"], "name": TOOLS_CARD["name"], "icon": TOOLS_CARD["icon"],
+            "outputType": (first or {}).get("outputType", "image"), "kind": "tool",
+            "modes": modes}
+
+
 def build_modes(ms):
     """把「只差图片张数」的能力合并成一个模式：传几张图，就跑哪条工作流。
 
@@ -1691,9 +1755,9 @@ def scan(path: Path, oi, rel_key=None):
         "group": {"video": "视频", "image": "图片", "audio": "音频"}.get(out_type, "其他"),
         "outputType": out_type,
         "kind": "tool" if tool else "gen",      # 工具（只加工素材）还是创作
-        # 归并到哪张卡：ROUTE_CARDS 点名的进合并卡，SOLO 里点名的和工具自己占一张，
+        # 归并到哪张卡：ROUTE_CARDS 点名的进合并卡，工具统一进「工具箱」，
         # 其余按产出类型并到「生图 / 生视频 / 生音频」里当模式
-        "card": route_card(wid) or (wid if (tool or wid in SOLO) else out_type),
+        "card": route_card(wid) or (TOOLS_CARD["id"] if tool else out_type),
         "slots": f"img{n_img}+aud{n_aud}+vid{n_vid}",   # 槽位指纹
         "images": n_img,
         "audios": n_aud,
@@ -1774,8 +1838,14 @@ def main():
     by_id = {m["id"]: m for m in manifests}
     cards = []
     for key, ms in groups.items():
+        # 工具统一收进「工具箱」卡：模式是各个工具玩法（见 build_tools_card）。
+        # ROUTE_CARDS 的 card_enhance 也作为其中一个模式收进来，所以这里不再单独成卡。
+        if key == TOOLS_CARD["id"]:
+            cards.append(build_tools_card(ms, by_id))
+            continue
+        # card_enhance 自己被归进 card_tools（它的组还在，作为模式复用了），跳过，
+        # 否则它会在「工具箱」之外再冒出一张单独的「画质增强」卡。
         if key in ROUTE_CARDS:
-            cards.append(route_card_def(key, ROUTE_CARDS[key], by_id))
             continue
         ms.sort(key=lambda m: (m["images"], m["audios"]))
         kind = ms[0].get("kind", "gen")
@@ -1789,7 +1859,10 @@ def main():
             "kind": kind,                       # 前端菜单按它分「工具」一组
             "modes": build_modes(ms),
         })
-    # 风格卡排最后：它不出产物，是给别的卡加料的（见 STYLE_CARD）
+    # 素材卡、文本卡、风格卡排最后：它们都不出产物，是给别的卡送料的
+    # （见 ASSET_CARD / TEXT_CARD / STYLE_CARD）
+    cards.append(dict(ASSET_CARD))
+    cards.append(dict(TEXT_CARD))
     cards.append(dict(STYLE_CARD))
     (ROOT / "manifests" / "_cards.json").write_text(
         json.dumps(cards, ensure_ascii=False, indent=1), encoding="utf-8")

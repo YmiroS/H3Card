@@ -49,7 +49,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "image1的女生在说唱",
+   "default": "",
    "target": {
     "node": "138",
     "input": "value"

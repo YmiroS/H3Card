@@ -6,7 +6,7 @@
  "group": "视频",
  "outputType": "video",
  "kind": "gen",
- "card": "minimax_h3_ref9",
+ "card": "video",
  "slots": "img9+aud0+vid0",
  "images": 9,
  "audios": 0,

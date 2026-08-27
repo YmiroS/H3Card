@@ -34,7 +34,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "写实风格，苗疆女孩探险的故事",
+   "default": "",
    "target": {
     "node": "183:182",
     "input": "custom_prompt"

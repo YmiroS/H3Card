@@ -6,7 +6,7 @@
  "group": "图片",
  "outputType": "image",
  "kind": "tool",
- "card": "grid4_stitch",
+ "card": "card_tools",
  "slots": "img4+aud0+vid0",
  "images": 4,
  "audios": 0,
