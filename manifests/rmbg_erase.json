@@ -6,7 +6,7 @@
  "group": "图片",
  "outputType": "image",
  "kind": "tool",
- "card": "rmbg_erase",
+ "card": "card_tools",
  "slots": "img1+aud0+vid0",
  "images": 1,
  "audios": 0,

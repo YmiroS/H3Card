@@ -1,33 +1,35 @@
 /* 抽卡系统 前端 (P0) — 免构建原生 JS
-   画布 = 卡片(产物+配方) + 连线(上游产物喂下游槽位)
-   卡片字段全部由后端 /api/cards 的 manifest 生成，前端不写死任何工作流 */
+   画布 = 节点(产物+配方) + 连线(上游产物喂下游槽位)
+   节点字段全部由后端 /api/cards 的 manifest 生成，前端不写死任何工作流 */
 
 const $ = (s, r = document) => r.querySelector(s);
-const CW = 268;            // 卡片默认宽度，与 style.css 保持一致
+const CW = 268;            // 节点默认宽度，与 style.css 保持一致
 const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
 const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
 
-// 全站不弹浏览器原生右键菜单：想存图/定位文件走卡片和素材格自己的菜单
+// 全站不弹浏览器原生右键菜单：想存图/定位文件走节点和素材格自己的菜单
 document.addEventListener("contextmenu", (ev) => ev.preventDefault());
 
-let CARDS = [];            // 卡种（生图 / 生视频）
+let CARDS = [];            // 节点种类（生图 / 生视频）
 let CAPS = {};             // 能力清单
 let PROJ = null;           // 当前项目
 let projects = [];
 let TASKS = [];            // 服务端所有任务（不限本项目），右上角计数和任务浮窗都看它
 let view = { x: 60, y: 70, k: 1 };
 let selId = null;
+let selIds = new Set();    // 框选出来的多个节点（左键空白处拖一个框；Delete 全删、拖动整体移动）
 let saveTimer = null;
 
 const el = {
   side: $("#side"), plist: $("#plist"), dot: $("#dot"),
-  ptitle: $("#ptitle"), hint: $("#hint"), addcard: $("#addcard"), fit: $("#fit"),
-  stage: $("#stage"), world: $("#world"), wires: $("#wires"),
+  ptitle: $("#ptitle"), hint: $("#hint"), fit: $("#fit"),
+  stage: $("#stage"), world: $("#world"), wires: $("#wires"), groups: $("#groups"),
+  lasso: $("#lasso"), selbar: $("#selbar"), dock: $("#dock"),
   empty: $("#empty"), panel: $("#panel"), hist: $("#hist"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
   jobsbtn: $("#jobsbtn"), jobs: $("#jobs"),
-  view: $("#view"), vbox: $("#view .vbox"),
+  view: $("#view"), vbox: $("#view .vbox"), respop: $("#respop"),
 };
 
 /* ================= 工具 ================= */
@@ -61,101 +63,143 @@ function toast(msg) {
     Math.min(2600 + Math.max(0, String(msg).length - 20) * 70, 9000));
 }
 const uid = () => Math.random().toString(36).slice(2, 10);
-/** 卡片属于哪一类。以卡内选中的能力为准，c.type 只是兜底：
-    能力被拆成独立卡片后（比如漫剧从"生视频"里单独抽出来），老项目里存的
-    c.type 还指着旧卡，按 c.type 找会拿到一个模式列表里根本没有它的卡。 */
+/** 节点属于哪一类。以节点内选中的能力为准，c.type 只是兜底：
+    能力被拆成独立节点后（比如漫剧从"生视频"里单独抽出来），老项目里存的
+    c.type 还指着旧节点，按 c.type 找会拿到一个模式列表里根本没有它的节点。 */
 const cardDef = (t) => CARDS.find(c => c.id === t) || CARDS[0];
 const MEDIA = ["image", "audio", "video"];
 const KIND_ZH = { image: "图片", video: "视频", audio: "音频" };
 const modeHas = (md, cid) => md.id === cid
   || !!(md.ladder && Object.values(md.ladder).includes(cid))
   || !!(md.route && Object.values(md.route).some(r => r.cap === cid));
-/** 一个模式落到画布上时先跑哪条能力。路由卡（route）用排在最前那一路当初始状态 */
-const modeCap = (md) => md.route ? md.route[Object.keys(md.route)[0]].cap : md.id;
-/** 同一条能力可能同时挂在两张卡上（补帧既有自己那张卡，也是「画质增强」的视频那一路），
-    所以先认卡片自己记的 c.type，只有它对不上时才去全局找。 */
+/** 一个模式落到画布上时先跑哪条能力。路由节点（route）用排在最前那一路当初始状态 */
+const modeCap = (md) => md ? (md.route ? md.route[Object.keys(md.route)[0]].cap : md.id) : null;
+/** 同一条能力可能同时挂在两个节点上（补帧既有自己那个节点，也是「画质增强」的视频那一路），
+    所以先认节点自己记的 c.type，只有它对不上时才去全局找。 */
 const defOf = (c) => {
   const own = CARDS.find(d => d.id === c.type);
   if (own && own.modes.some(m => modeHas(m, c.cap))) return own;
   return CARDS.find(d => d.modes.some(m => modeHas(m, c.cap))) || cardDef(c.type);
 };
 const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHas(m, c.cap)); };
-/** 卡片显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
-    路由卡同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
-    最后兜底用模式名而不是裸 id：风格卡在 CAPS 里根本没有条目（它不是能力）。 */
+/** 节点显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
+    路由节点同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
+    最后兜底用模式名而不是裸 id：风格节点在 CAPS 里根本没有条目（它不是能力）。 */
 const titleOf = (c) => {
   const cap = capOf(c), md = modeOf(c);
+  // 素材节点叫全名「素材节点」：上传完画布上多出来的就是它，标题得让人一眼认出
+  // 这是"存着一份素材、等着往别的节点上拖"的那种节点，而不是某个玩法
+  if (isAsset(c)) return c.name || "素材节点";
   return c.name || (md && (md.ladder || md.route) ? md.name
     : cap ? cap.name : md ? md.name : c.cap);
 };
 
-/* ================= 风格卡 =================
-   画布上唯一一张不对应任何能力的卡（`CAPS[c.cap]` 是空的），所以凡是"先取 cap
+/* ================= 风格节点 =================
+   画布上唯一一张不对应任何能力的节点（`CAPS[c.cap]` 是空的），所以凡是"先取 cap
    再干活"的地方都要先问一句 isStyle。它自己不跑、不出产物，只把一段风格描述
-   挂给下游的生图/生视频卡，提交时并进那张卡的提示词 —— 一处改，连着的全跟着变。 */
+   挂给下游的生图/生视频节点，提交时并进那个节点的提示词 —— 一处改，连着的全跟着变。 */
 const isStyle = (c) => !!c && (defOf(c) || {}).kind === "style";
 /** 风格连线走的还是 PROJ.edges，只是 slot 用 `@` 开头 —— 它不是素材槽，
     所以传产物那一套（importOutput、跑完自动喂下游）必须绕开它。 */
-const STYLE_SLOT = "@style";
+const STYLE_SLOT = "@style";   // 连到生成节点：提交那一刻并进主提示词
+const TEXT_SLOT = "@text";     // 连到文本处理节点：作为输入文本之一（一个节点可收多根）
 const isTextEdge = (e) => String(e.slot || "").startsWith("@");
 
+/* ================= 文本节点片 =================
+   风格节点的泛化：画布上所有传文字的节点。
+     kind=style 风格节点 —— 只存一段风格描述，挂到生成节点
+     kind=text  文本节点 —— 只有这一种：节点上直接写字；面板里选「加工方式」
+               （润色/优化/扩写/自定义指令）就能把接进来的文本加工后写回节点上。
+   任何文本节点的出口都能连：生成节点（@style，并进主提示词，可多张）或
+   别的文本节点（@text，当输入文本之一，按连线顺序排列）。 */
+const isText = (c) => !!c && (defOf(c) || {}).kind === "text";
+const isTextCard = (c) => isStyle(c) || isText(c);       // 所有传文字的节点
+
+/* ================= 素材节点 =================
+   底部工具条「上传」出来的那个节点。跟文本节点/风格节点一样不对应任何能力
+   （`CAPS[c.cap]` 是空的），自己不跑、不出产物 —— 手里就拿着一份上传上来的
+   图片/视频/音频，把出口连到别的节点就等于把这份素材放进那个节点的格子里。
+   为什么要它：一份素材经常要喂给好几个节点（同一张脸既生视频又抠图），
+   以前得在每个节点的格子里各传一次，现在传一次、拉几根线。
+   实现上那份素材就存成 c.outputs[0]，画面渲染／查看大图／下载／连线全都
+   照产物那一套走，不用另开一套。 */
+const isAsset = (c) => !!c && (defOf(c) || {}).kind === "asset";
+/** 素材节点手里那份东西（没传过是 null） */
+const assetOf = (c) => (isAsset(c) ? (c.outputs || [])[0] || null : null);
+/** 一个文本节点「现在手里」的文字（节点上那个框里的字）。下游运行时读的都是它 ——
+    上游改了字或重跑过，下游下一次运行自动用新的，这就是文本的继承。 */
+const textOf = (c) => {
+  if (!c) return "";
+  if (isStyle(c)) return String((c.params || {}).style || "").trim();
+  return String((c.params || {}).text || "").trim();
+};
+/** 这个节点选没选加工方式（polish/optimize/expand/custom）。没选就是一个纯文本节点，
+    点运行会提示先选一种。 */
+const textOp = (c) => (((c || {}).params || {}).op) || "";
+/** 挂在这个节点上的文本输入（@text 边，连线顺序 = 输入顺序）。
+    返回 [{card, text}]：面板上要显示每段来自哪个节点，运行时也照这个顺序合并。 */
+const ownTexts = (c) => (PROJ ? PROJ.edges : [])
+  .filter(e => e.to === c.id && e.slot === TEXT_SLOT)
+  .map(e => cardOf(e.from))
+  .filter(s => s && isTextCard(s))
+  .map(s => ({ id: s.id, name: titleOf(s), text: textOf(s) }));
+
 /** 这条能力的「提示词」框。作者调好的格式规范（template）和高级里的不算 ——
-    风格是往画面描述里加的，不该混进那份规范。一个都没有的卡（补帧、放大、拼图）
-    接不了风格卡：那些卡根本不写提示词。 */
+    风格是往画面描述里加的，不该混进那份规范。一个都没有的节点（补帧、放大、拼图）
+    接不了风格节点：那些节点根本不写提示词。 */
 const promptSpecs = (cap) => ((cap && cap.inputs) || [])
   .filter(s => s.type === "textarea" && !s.template && !s.advanced);
 
-const styleTextOf = (s) => String(((s || {}).params || {}).style || "").trim();
-
-/** 直接挂在这张卡上的风格卡，按连线顺序。**还没写字的不算** ——
-    先连线后写字是常事，那一阵子它既不该出现在读数里，更不该把上游的风格挡掉。 */
+/** 直接挂在这个节点上的文本节点（风格节点 / 原始文本 / 处理节点的输出），按连线顺序。
+    **手里还没字的不算** —— 先连线后写字是常事，那一阵子它既不该出现在读数里，
+    更不该把上游的文本挡掉。 */
 const ownStyles = (c) => (PROJ ? PROJ.edges : [])
   .filter(e => e.to === c.id && e.slot === STYLE_SLOT)
   .map(e => PROJ.cards.find(x => x.id === e.from))
-  .filter(s => s && isStyle(s) && styleTextOf(s));
+  .filter(s => s && isTextCard(s) && textOf(s));
 
-/** 从上游继承来的风格卡（不看这张卡自己挂了什么）。
-    走的是普通产物连线，所以中间夹着不写提示词的卡（放大、补帧）也照样往下传 ——
-    那张卡自己用不上风格，但它不该把链子截断。
-    同一张风格卡顺两条路走到这里只算一次（按 id 去重）；seen 兼作环路保险。 */
+/** 从上游继承来的风格节点（不看这个节点自己挂了什么）。
+    走的是普通产物连线，所以中间夹着不写提示词的节点（放大、补帧）也照样往下传 ——
+    那个节点自己用不上风格，但它不该把链子截断。
+    同一个风格节点顺两条路走到这里只算一次（按 id 去重）；seen 兼作环路保险。 */
 function upStyles(c, seen = new Set()) {
   if (!c || seen.has(c.id)) return [];
   seen.add(c.id);
   const out = [], ids = new Set();
   for (const e of (PROJ ? PROJ.edges : []).filter(e => e.to === c.id && !isTextEdge(e))) {
     const p = PROJ.cards.find(x => x.id === e.from);
-    if (!p || isStyle(p)) continue;
+    if (!p || isTextCard(p)) continue;
     for (const s of styleCards(p, seen)) if (!ids.has(s.id)) { ids.add(s.id); out.push(s); }
   }
   return out;
 }
 
-/** 这张卡实际会套用的风格卡。一条链子只该在第一棒挂一次风格：后面每一棒都手动挂太啰嗦，
+/** 这个节点实际会套用的风格节点。一条链子只该在第一棒挂一次风格：后面每一棒都手动挂太啰嗦，
     漏一棒风格就断了。所以**风格顺着产物连线往下传**。
     自己挂了风格就以自己为准，上游那份不再往下传 —— 两段风格叠在一起会互相打架
     （"哥特暗黑" 撞 "清透日系"），而"这一棒换个风格"是真需求。
-    想两份都要：把上游那张风格卡也拖到这张卡上（一张卡能挂好几张）。
-    返回卡片而不是文字：面板上要能说清哪张是继承来的、点它能跳过去。 */
+    想两份都要：把上游那个风格节点也拖到这个节点上（一个节点能挂好几张）。
+    返回节点而不是文字：面板上要能说清哪张是继承来的、点它能跳过去。 */
 function styleCards(c, seen = new Set()) {
   if (!c) return [];
   const own = ownStyles(c);
   return own.length ? own : upStyles(c, seen);
 }
 
-/** 这张卡下游会跟着套用这段风格的卡（不含直接挂的那几张）—— 风格卡面板上要交代清楚
+/** 这个节点下游会跟着套用这段风格的节点（不含直接挂的那几张）—— 风格节点面板上要交代清楚
     「改这一处会连带影响谁」，不然继承是隐形的。 */
 function styleReach(s) {
   return (PROJ ? PROJ.cards : [])
-    .filter(c => !isStyle(c) && !ownStyles(c).some(x => x.id === s.id)
+    .filter(c => !isTextCard(c) && !ownStyles(c).some(x => x.id === s.id)
       && styleCards(c).some(x => x.id === s.id));
 }
 
-/** 这张卡实际会套用的风格文字，按套用顺序。 */
-const styleTexts = (c) => styleCards(c).map(styleTextOf);
+/** 这个节点实际会套用的文本，按套用顺序。 */
+const styleTexts = (c) => styleCards(c).map(textOf);
 
-/** 风格卡卡脚上「连带下游 N 张」是顺着产物连线算出来的，所以**产物连线一改就得重刷**
-    （接一根新线、清一格素材、换路由都会改这个数），不然那个数会停在改之前。 */
-const paintStyles = () => (PROJ ? PROJ.cards : []).filter(isStyle).forEach(s => paint(s));
+/** 文本节点节点脚上的「挂了 N 张 · 连带下游 M 张」是顺着连线算出来的，所以**连线一改
+    就得重刷**（接一根新线、清一格素材、换路由都会改这个数），不然那个数会停在改之前。 */
+const paintStyles = () => (PROJ ? PROJ.cards : []).filter(isTextCard).forEach(s => paint(s));
 
 const STYLE_PH = "{提示词}";
 /** 风格和提示词怎么合成一句。风格文字里写了 {提示词} 就替换到那个位置：
@@ -204,16 +248,16 @@ function runCap(c) {
 }
 const capOf = (c) => CAPS[c.cap] || null;
 
-/** 路由卡上放进这种素材该切到哪一路（已经在那一路上就返回 null）。
+/** 路由节点上放进这种素材该切到哪一路（已经在那一路上就返回 null）。
     和 ladder 不一样，这里两条工作流的参数完全不同，画不出一张"并集"面板，
-    所以是放素材那一刻就把卡切过去，切完面板/参数/产出全都走原来那套。 */
+    所以是放素材那一刻就把节点切过去，切完面板/参数/产出全都走原来那套。 */
 function routeFor(c, kind) {
   const md = modeOf(c);
   const r = md && md.route && md.route[kind];
   return r && r.cap !== c.cap ? r : null;
 }
 
-/** 往某一格放素材。路由卡要先按素材类型换能力 —— 换完槽位名都变了（images[0] →
+/** 往某一格放素材。路由节点要先按素材类型换能力 —— 换完槽位名都变了（images[0] →
     video[0]），所以旧素材和旧连线一起清掉，不然会留下一格对不上任何槽的孤儿。 */
 function putAsset(c, s, file) {
   const r = file && file.kind ? routeFor(c, file.kind) : null;
@@ -226,7 +270,7 @@ function putAsset(c, s, file) {
     drawWires(); paintStyles();
   }
   c.assets[s.key] = file;
-  paintKind(c);            // 路由卡的卡脚徽标从「跟素材」变成真类型
+  paintKind(c);            // 路由节点的节点脚徽标从「跟素材」变成真类型
   return s;
 }
 
@@ -272,6 +316,345 @@ function mpForP(ratio, p) {
   return base;
 }
 const shortOf16x9 = (L) => Math.round(L * 9 / 16 / MULT) * MULT;
+
+/* ================= 清晰度 + 比例（照用户参考图做的选择器） =================
+   两类工作流两种参数体系，选择器负责把「几K + 几比几」翻译回去：
+   · megapixels + aspect_ratio（H3 视频 / 拼图 / 漫剧）—— 比例是节点内置 8 档
+     select，清晰度档从 megapixels 的 min/max 里能选到的档位算
+   · width + height（Z-Image 文生图）—— 任意 16 步进，清晰度按像素面积折 1K/2K */
+/** 清晰度档：这一档的短边像素（按 16:9 折算好跟面板读数同一口径）。
+    K 档按百万像素*1024² 算：1K≈1024²短边、2K≈2048²面积翻倍。 */
+const CLARITY_STEPS = [
+  { id: "0.5K", label: "0.5K", mp: 0.26 },
+  { id: "1K", label: "1K", mp: 0.5 },
+  { id: "1.5K", label: "1.5K", mp: 0.7 },
+  { id: "2K", label: "2K", mp: 1.0 },
+];
+/** 比例网格（照参考图内置的 13 种；映射到工作流那 8 档 select 里的最优近似） */
+const RATIO_GRID = [
+  ["1:1", 1, 1], ["1:2", 1, 2], ["2:1", 2, 1], ["9:16", 9, 16], ["16:9", 16, 9],
+  ["3:4", 3, 4], ["4:3", 4, 3], ["3:2", 3, 2], ["2:3", 2, 3], ["5:4", 5, 4],
+  ["4:5", 4, 5], ["21:9", 21, 9], ["9:21", 9, 21],
+];
+/** 13 种比例 → 工作流 select 那 8 档（挑宽高比最接近的；5:4/4:5/1:2/2:1/9:21 没有
+    完全对应的，折到最近的档） */
+function ratioToOpt(r) {
+  const [w, h] = [r[1], r[2]];
+  let best = null, bd = Infinity;
+  for (const [k, [wr, hr]] of Object.entries(RATIO_WH)) {
+    const d = Math.abs(w / h - wr / hr);
+    if (d < bd - 1e-9) { bd = d; best = k; }
+  }
+  return best;
+}
+const optToRatio = (opt) => {
+  const wh = RATIO_WH[opt];
+  return wh ? RATIO_GRID.find(r => r[1] === wh[0] && r[2] === wh[1]) : null;
+};
+/** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度 + 画面比例 + 常规参数（视频时长等）。
+    照参考图那种浮层：一个小标题、选项网格、点外面/Esc 关。 */
+function openResPop(c, anchor) {
+  const cap = CAPS[runCap(c)] || capOf(c);
+  const has = cap && cap.inputs.some(x =>
+    ["megapixels", "width", "height", "aspect_ratio", "duration", "target_fps", "scale_to_length"].includes(x.key));
+  if (!has) return toast("这个模式没有可调的分辨率参数");
+
+  /** 原位刷新弹窗内容（选中态要变），**不关不重开** —— 重开会按重建过的锚点按钮
+      重新摆位，弹窗就跳位置（这就是"选完参数窗口会跑"的 bug）。
+      位置不动：只换 innerHTML，left/top 留在 style 上。 */
+  const refill = () => {
+    el.respop.innerHTML = "";
+    el.respop.appendChild(clarityPicker(c, cap, refill));
+    // 视频节点的常规参数（duration/target_fps）也收进这个弹窗，不在面板里摊开
+    const specs = cap.inputs;
+    const PARAM_KEYS = ["duration", "target_fps"];
+    const params = specs.filter(s => PARAM_KEYS.includes(s.key) && s.type === "slider");
+    if (params.length) {
+      const pwrap = document.createElement("div"); pwrap.className = "pwrap";
+      pwrap.style.marginTop = "12px";
+      for (const s of params) {
+        const row = document.createElement("div"); row.className = "row";
+        const lb = document.createElement("label"); lb.textContent = s.label; lb.title = s.hint || s.label;
+        row.appendChild(lb);
+        const cur = c.params[s.key] != null ? c.params[s.key] : s.default;
+        const r = document.createElement("input"); r.type = "range";
+        r.min = s.min != null ? s.min : 1; r.max = s.max != null ? s.max : 30; r.step = s.step || 1;
+        const n = document.createElement("input"); n.type = "number";
+        n.min = r.min; n.max = r.max; n.step = r.step; n.style.width = "72px";
+        r.value = n.value = cur != null ? cur : r.min;
+        const set = (v) => {
+          r.value = n.value = v; c.params[s.key] = parseFloat(v); save();
+          // duration 变了要更新胶囊摘要
+          if (s.key === "duration" && el.panel._id === c.id) {
+            const caps = el.panel.querySelectorAll(".foot .tcap");
+            const pb = caps[caps.length - 1];
+            if (pb && pb.textContent.startsWith("⚙")) {
+              const cb = paramsBrief(c, cap);
+              pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
+            }
+          }
+        };
+        r.oninput = () => set(r.value); n.oninput = () => set(n.value);
+        row.appendChild(r); row.appendChild(n);
+        pwrap.appendChild(row);
+      }
+      el.respop.appendChild(pwrap);
+    }
+    const x = document.createElement("button");
+    x.className = "x"; x.textContent = "✕"; x.title = "关闭 (Esc)";
+    x.onclick = closeResPop;
+    el.respop.appendChild(x);
+    // 面板底部 ⚙ 胶囊的摘要跟着新选择变。只改那颗按钮的文案，不 openPanel 整块重建
+    // （重建会把锚点按钮换成新元素，虽然弹窗位置不受影响，但没必要）
+    if (el.panel._id === c.id) {
+      const caps = el.panel.querySelectorAll(".foot .tcap");
+      const pb = caps[caps.length - 1];      // 最后那颗胶囊 = ⚙（生图节点是第二颗）
+      if (pb && pb.textContent.startsWith("⚙")) {
+        const cb = paramsBrief(c, cap);
+        pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
+      }
+    }
+  };
+  refill();
+  el.respop.style.display = "";
+  // 摆在锚点按钮上方居中；上方放不下就放下方；横向夹在窗口里（只在开的那一刻定一次）
+  const r = anchor.getBoundingClientRect();
+  const w = el.respop.offsetWidth, h = el.respop.offsetHeight;
+  let left = Math.max(8, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 8));
+  let top = r.top - h - 8;
+  if (top < 56) top = Math.min(r.bottom + 8, innerHeight - h - 8);
+  el.respop.style.left = left + "px";
+  el.respop.style.top = top + "px";
+}
+const closeResPop = () => (el.respop.style.display = "none");
+
+/** 清晰度+比例选择器。能换的比例/清晰度按这个节点当前能力的参数体系画：
+    有 aspect_ratio+megapixels 的走 H3 那套；width+height 的（文生图）算像素面积折 K 档。
+    onchange：每点一格之后回调（弹窗要刷新胶囊摘要）。 */
+function clarityPicker(c, cap, onchange) {
+  const arSpec = cap.inputs.find(x => x.key === "aspect_ratio");
+  const mpSpec = cap.inputs.find(x => x.key === "megapixels");
+  const wSpec = cap.inputs.find(x => x.key === "width") && cap.inputs.find(x => x.key === "height");
+  const stlSpec = cap.inputs.find(x => x.key === "scale_to_length");
+
+  const wrap = document.createElement("div"); wrap.className = "cpick";
+
+  // scale_to_length 模式（H3 基础视频：图生视频、说话唱歌）：只有一个数字输入框，控制最长边
+  if (stlSpec && !arSpec) {
+    const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "分辨率（最长边）";
+    const inp = document.createElement("input");
+    inp.type = "number";
+    inp.min = stlSpec.min || 512;
+    inp.max = stlSpec.max || 1344;
+    inp.step = stlSpec.step || 32;
+    inp.value = c.params.scale_to_length != null ? c.params.scale_to_length : stlSpec.default;
+    inp.style.cssText = "width:100%;padding:8px;font-size:14px;border:1px solid #3a3a44;border-radius:4px;background:#1a1a22;color:#fff";
+    inp.oninput = () => {
+      const v = parseInt(inp.value, 10);
+      if (isNaN(v)) return;
+      c.params.scale_to_length = Math.max(stlSpec.min || 512, Math.min(stlSpec.max || 1344, v));
+      save(); onchange && onchange();
+    };
+    const hint = document.createElement("div");
+    hint.style.cssText = "font-size:12px;color:#8a8a94;margin-top:4px";
+    hint.textContent = `范围：${stlSpec.min || 512} ~ ${stlSpec.max || 1344}，步进 ${stlSpec.step || 32}`;
+    wrap.append(t, inp, hint);
+    return wrap;
+  }
+
+  // ---- 比例 ----
+  // 两套体系都有比例：select 那套（H3）直接换档；width/height 那套（文生图）
+  // 把比例记在 c.params._ratio，宽高每次照 比例×清晰度 现算（选哪个另一个跟着变）
+  const isWH = !arSpec && wSpec;
+  if (arSpec || isWH) {
+    // 文生图当前比例：记过 _ratio 用它；没记过就从现有宽高反推最接近的档；都没有给默认 3:4
+    const cur = arSpec
+      ? (c.params.aspect_ratio != null ? c.params.aspect_ratio : arSpec.default)
+      : (c.params._ratio || (() => {
+          const w = c.params.width != null ? c.params.width : wSpec.default;
+          const h = c.params.height != null ? c.params.height
+            : (cap.inputs.find(x => x.key === "height") || {}).default;
+          if (w && h) {
+            let best = null, bd = Infinity;
+            for (const r of RATIO_GRID) {
+              const d = Math.abs(w / h - r[1] / r[2]);
+              if (d < bd) { bd = d; best = r[0]; }
+            }
+            return best || "3:4";
+          }
+          return "3:4";
+        })());
+    const g = document.createElement("div"); g.className = "cgrid";
+    // 当前档位对应的那一格才点亮。13 格比例折到工作流的 8 档 select，
+    // 之前 exact 两头验算在 3:4 和 4:5 这种"折到同一档"的格子上都成立，
+    // 一选就同时亮好几格。现在：canonical 那格 on，折到同一档的其余格只画虚线（near）
+    const curGrid = arSpec ? (optToRatio(cur) || null) : null;
+    for (const r of RATIO_GRID) {
+      const b = document.createElement("button");
+      const onWH = isWH && (r[0] === cur
+        || (!c.params._ratio && r[0] === (RATIO_GRID.find(x =>
+          Math.abs((c.params.width / c.params.height) - x[1] / x[2]) < 0.02) || [0, 0, 0])[0]));
+      b.className = arSpec
+        ? (r === curGrid ? "on" : (ratioToOpt(r) === cur ? "near" : ""))
+        : (onWH ? "on" : "");
+      b.innerHTML = `<i style="aspect-ratio:${r[1]}/${r[2]}"></i><span>${r[0]}</span>`;
+      b.title = `画面比例 ${r[0]}`
+        + (arSpec && ratioToOpt(r) !== cur ? `（工作流档位：${ratioToOpt(r)}）` : "（当前）");
+      b.onclick = () => {
+        if (arSpec) {
+          c.params.aspect_ratio = ratioToOpt(r);
+        } else {
+          c.params._ratio = r[0];
+          setWHFrom(r);
+        }
+        save(); onchange && onchange();
+      };
+      g.appendChild(b);
+    }
+    const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "画面比例";
+    wrap.append(t, g);
+  }
+
+  /** 文生图：按比例 + 清晰度档算宽高（16 步进）。清晰度档取当前选中的，
+      没选过按现有宽高折最接近的档。 */
+  function setWHFrom(ratio) {
+    const step = whStep(cap, c) || CLARITY_STEPS[1];
+    const [wr, hr] = [ratio[1], ratio[2]];
+    const isW = wr >= hr;
+    const short = step.val;
+    c.params.width = isW ? Math.round(short * wr / hr / 16) * 16 : short;
+    c.params.height = isW ? short : Math.round(short * hr / wr / 16) * 16;
+  }
+
+  // ---- 清晰度 ----
+  // H3（megapixels）那套的档位按**短边像素**定：480/544/640/768p，跟面板分辨率行的
+  // 快捷键同一套换算（mpForP）。之前用固定 0.5K/1K/1.5K/2K 档，0.5K 那档在 16:9 下
+  // 实际只有 384p，跟工作流默认（说话 0.4MP=480p、漫剧 0.5MP=544p、参考 0.7MP=640p）
+  // 完全对不上号，选中态也亮不出来。
+  const mpRatio = mpSpec
+    ? (c.params.aspect_ratio != null ? c.params.aspect_ratio
+      : (cap.inputs.find(x => x.key === "aspect_ratio") || { default: "16:9 (Widescreen)" }).default)
+    : null;
+  if (mpSpec || wSpec) {
+    const steps = [];
+    if (mpSpec) {
+      const hi = mpSpec.max ?? 1.1;
+      for (const p of H3_P) {
+        const v = mpForP(mpRatio, p);
+        if (v > hi + 0.01) continue;   // 超宽比例下高 p 会顶穿 H3 的画布面积上限
+        steps.push({ id: `${p}p`, label: `${p}p`, val: v, p });
+      }
+    } else {
+      // 文生图那套：K 档按短边像素折（512/724/887/1024），宽高跟着比例算
+      for (const s of CLARITY_STEPS) {
+        const p = Math.round(512 * Math.sqrt(parseFloat(s.id) * 2));
+        steps.push({ ...s, val: p, dis: false });
+      }
+    }
+    const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "清晰度";
+    const g = document.createElement("div"); g.className = "cgrid k";
+    const curStep = whStep(cap, c);
+    for (const s of steps) {
+      const b = document.createElement("button");
+      const curVal = mpSpec
+        ? parseFloat(c.params.megapixels != null ? c.params.megapixels : mpSpec.default)
+        : (curStep ? curStep.val : null);
+      // mp 那套按换算出的短边像素对档（0.4MP 默认正好就是 480p），
+      // 别按 megapixels 原值等值比 —— 换算有 32 像素取整，原值永远差一点
+      const on = mpSpec
+        ? (isFinite(curVal) && Math.min(...resFromMP(mpRatio, curVal)) === s.p)
+        : (curVal != null && Math.abs(curVal - s.val) < 40);
+      b.className = on ? "on" : "";
+      b.textContent = s.label;
+      if (mpSpec) {
+        b.title = resFromMP(mpRatio, s.val).join("×");
+      } else {
+        const r = RATIO_GRID.find(x => x[0] === (c.params._ratio || "3:4")) || [0, 3, 4];
+        const isW = r[1] >= r[2];
+        b.title = isW
+          ? `${Math.round(s.val * r[1] / r[2] / 16) * 16} × ${s.val}`
+          : `${s.val} × ${Math.round(s.val * r[2] / r[1] / 16) * 16}`;
+      }
+      b.onclick = () => {
+        if (mpSpec) { c.params.megapixels = s.val; }
+        else {
+          c.params._clarity = s.id;
+          const r = RATIO_GRID.find(x => x[0] === (c.params._ratio || "3:4")) || [0, 3, 4];
+          setWHFrom(r);
+        }
+        save(); onchange && onchange();
+      };
+      g.appendChild(b);
+    }
+    wrap.append(t, g);
+  }
+  return wrap;
+}
+
+/** 文生图（width/height 体系）当前对应的清晰度档：记过 _clarity 用它，
+    否则按现有短边折最接近的档。 */
+function whStep(cap, c) {
+  if (c.params._clarity) {
+    const s = CLARITY_STEPS.find(x => x.id === c.params._clarity);
+    if (s) return { ...s, val: Math.round(512 * Math.sqrt(parseFloat(s.id) * 2)) };
+  }
+  const w = cap.inputs.find(x => x.key === "width");
+  const h = cap.inputs.find(x => x.key === "height");
+  const cw = c.params.width != null ? c.params.width : (w || {}).default;
+  const ch = c.params.height != null ? c.params.height : (h || {}).default;
+  if (!cw || !ch) return null;
+  const short = Math.min(cw, ch);
+  let best = null, bd = Infinity;
+  for (const s of CLARITY_STEPS) {
+    const p = Math.round(512 * Math.sqrt(parseFloat(s.id) * 2));
+    const d = Math.abs(p - short);
+    if (d < bd) { bd = d; best = { ...s, val: p }; }
+  }
+  return best;
+}
+
+/** 这个节点当前选的「比例 · 清晰度 · 时长」摘要，给「⚙ 参数」胶囊当文案。
+    没有分辨率参数的能力返回 null（胶囊就只写「参数」）。 */
+function paramsBrief(c, cap) {
+  if (!cap) return null;
+  const ar = cap.inputs.find(x => x.key === "aspect_ratio");
+  const mp = cap.inputs.find(x => x.key === "megapixels");
+  const w = cap.inputs.find(x => x.key === "width");
+  const stl = cap.inputs.find(x => x.key === "scale_to_length");
+  const dur = cap.inputs.find(x => x.key === "duration");
+  if (!ar && !mp && !w && !stl && !dur) return null;
+  const parts = [];
+  // scale_to_length 模式：只显示最长边数字
+  if (stl && !ar) {
+    const v = c.params.scale_to_length != null ? c.params.scale_to_length : stl.default;
+    parts.push(`${v}px`);
+    return parts.join(" · ");
+  }
+  if (ar) {
+    const cur = c.params.aspect_ratio != null ? c.params.aspect_ratio : ar.default;
+    const g = optToRatio(cur);
+    parts.push(g ? g[0] : cur.split(" ")[0]);
+  } else if (w && c.params._ratio) {
+    parts.push(c.params._ratio);
+  }
+  if (mp) {
+    const v = parseFloat(c.params.megapixels != null ? c.params.megapixels : mp.default);
+    // 跟 ⚙ 弹窗同一口径：按短边像素报（480p/544p…），不报 MP 原值
+    const ratio = c.params.aspect_ratio != null ? c.params.aspect_ratio
+      : (ar || {}).default || "16:9 (Widescreen)";
+    const p = isFinite(v) ? Math.min(...resFromMP(ratio, v)) : null;
+    parts.push(p ? `${p}p` : "?");
+  } else if (w) {
+    const s = whStep(cap, c);
+    if (s) parts.push(s.label);
+  }
+  // 视频时长
+  if (dur) {
+    const v = c.params.duration != null ? c.params.duration : dur.default;
+    parts.push(`${v}秒`);
+  }
+  return parts.join(" · ");
+}
 
 /* ================= 能力说明浮层 ================= */
 const OUT_TXT = { image: "图片 (png)", video: "视频 (mp4，含音轨)", audio: "音频" };
@@ -348,7 +731,7 @@ function briefEl(cap, name) {
  *  横向夹在**画布**的左右边界里，不是窗口：右边开着历史产物栏时按 innerWidth 夹，
  *  浮层会滑到栏子底下去；顶栏那 52px 同理。
  *  竖向先试锚点下方 → 放不下翻到上方 → 上下都放不下就贴着上边、再挪到锚点侧面，
- *  别糊在卡片自己身上（卡在屏幕最下面、说明又长的时候就是这种情形）。 */
+ *  别糊在节点自己身上（卡在屏幕最下面、说明又长的时候就是这种情形）。 */
 function tipShow(node, a) {
   el.tip.innerHTML = ""; el.tip.appendChild(node);
   el.tip.style.display = "";
@@ -444,19 +827,31 @@ async function openProject(pid) {
   catch (e) { return toast(e.message); }
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
+  PROJ.groups = PROJ.groups || [];
   // 能力被合并/拆分过之后，老项目里存的 cap 可能已经不是模式入口了
   // （图生视频并进了首尾帧那条），统一归到模式入口，参数和素材的 key 是通的
   for (const c of PROJ.cards) {
     const md = modeOf(c);
-    // 路由卡的模式 id 不是能力 id（它就是那张卡），c.cap 已经是两路里的一条，别动
+    // 路由节点的模式 id 不是能力 id（它就是那个节点），c.cap 已经是两路里的一条，别动
     if (md && !md.route && md.id !== c.cap) c.cap = md.id;
     seedHistory(c);
   }
+  // 文本节点曾经分 5 种模式（text_source / text_polish…），后来合成一种。
+  // 老节点：模式 id 归一成 "text"；当时存在 c.out 里的加工结果搬进「节点上的字」
+  for (const c of PROJ.cards) {
+    if (!isText(c)) continue;
+    if (c.cap !== "text") c.cap = "text";
+    if (!String((c.params || {}).text || "").trim() && String(c.out || "").trim()) {
+      c.params = c.params || {};
+      c.params.text = c.out;
+    }
+  }
   view = Object.assign({ x: 60, y: 70, k: 1 }, PROJ.view || {});
   selId = null;
+  selIds.clear();
   closePanel();
   el.empty.style.display = "none";
-  el.addcard.style.display = ""; el.fit.style.display = "";
+  el.dock.style.display = ""; el.fit.style.display = "";
   el.ptitle.textContent = PROJ.name;
   // 示例上的改动不落盘，这件事必须写在明面上：不然用户在它上面搭了半天，
   // 刷新一下全没了，只会以为是丢数据了
@@ -464,11 +859,11 @@ async function openProject(pid) {
     const b = document.createElement("span");
     b.className = "ro";
     b.textContent = "试玩画布 · 刷新还原";
-    b.title = "这张画布是示例：参数怎么改、卡怎么拖、重跑几遍都随便，"
+    b.title = "这张画布是示例：参数怎么改、节点怎么拖、重跑几遍都随便，"
       + "改动只在这一次里有效，刷新就回到原样。想留下自己的东西就「＋ 新建项目」";
     el.ptitle.appendChild(b);
   }
-  // 断线重连后可能有卡片状态是 running，交给轮询自己收尾
+  // 断线重连后可能有节点状态是 running，交给轮询自己收尾
   render();
   loadProjects();
 }
@@ -477,11 +872,11 @@ function showEmpty() {
   el.empty.style.display = "";
   el.world.innerHTML = ""; el.wires.innerHTML = "";
   el.ptitle.textContent = "";
-  el.addcard.style.display = "none"; el.fit.style.display = "none";
+  el.dock.style.display = "none"; el.fit.style.display = "none";
   el.hint.textContent = "";
 }
 
-/** 卡片对象上挂了 _el（DOM），序列化前必须剥掉，否则 JSON 循环引用 */
+/** 节点对象上挂了 _el（DOM），序列化前必须剥掉，否则 JSON 循环引用 */
 const plain = (c) => Object.fromEntries(Object.entries(c).filter(([k]) => k[0] !== "_"));
 
 /** 保存串行化：两次 PUT 撞在一起会带同一个 rev，后一次要被服务端顶掉 */
@@ -489,7 +884,7 @@ let saveChain = Promise.resolve();
 
 function save() {
   if (!PROJ) return;
-  // 示例是只读的：拖卡、改参数、重跑都随便，但只活在这一次打开里，刷新就回到那份固定的示例。
+  // 示例是只读的：拖节点、改参数、重跑都随便，但只活在这一次打开里，刷新就回到那份固定的示例。
   // 这里直接不发请求（服务端也会回 403），否则每动一下就弹一次「保存失败」
   if (PROJ.locked) return;
   clearTimeout(saveTimer);
@@ -503,7 +898,7 @@ async function doSave() {
   try {
     const r = await jput(`/api/projects/${id}`, {
       rev: PROJ.rev || 0, name: PROJ.name,
-      cards: PROJ.cards.map(plain), edges: PROJ.edges, view,
+      cards: PROJ.cards.map(plain), edges: PROJ.edges, groups: PROJ.groups || [], view,
     });
     if (PROJ && PROJ.id === id) PROJ.rev = r.rev;
   } catch (e) {
@@ -521,7 +916,9 @@ async function doSave() {
 function applyView() {
   el.world.style.transform = `translate(${view.x}px,${view.y}px) scale(${view.k})`;
   el.wires.style.transform = el.world.style.transform;
+  el.groups.style.transform = el.world.style.transform;
   el.wires.setAttribute("width", 1); el.wires.setAttribute("height", 1);
+  paintSel();               // 工具条跟着缩放/平移走，不然就飘走了
 }
 
 function toWorld(cx, cy) {
@@ -535,15 +932,16 @@ function render() {
   for (const c of PROJ.cards) el.world.appendChild(buildCard(c));
   applyView();
   drawWires();
-  el.hint.textContent = `${PROJ.cards.length} 张卡`;
+  paintGroups();
+  el.hint.textContent = `${PROJ.cards.length} 个节点`;
 }
 
-/** 这张卡这一轮会出什么：认真正会跑的那条能力，不是卡片定义。
-    路由卡的卡片定义写死是 image（`_cards.json` 取第一路），切到视频那一路后还报"图片"
-    就是在骗人；工具卡的卡片图标（🧩 ✨）本身也不说明出图还是出视频。 */
+/** 这个节点这一轮会出什么：认真正会跑的那条能力，不是节点定义。
+    路由节点的节点定义写死是 image（`_cards.json` 取第一路），切到视频那一路后还报"图片"
+    就是在骗人；工具节点的节点图标（🧩 ✨）本身也不说明出图还是出视频。 */
 const outKindOf = (c) => ((CAPS[runCap(c)] || capOf(c) || defOf(c) || {}).outputType) || "image";
-/** 路由卡还一格素材都没放：出图还是出视频要等放进来那一刻才定，别先报一个。
-    （新建的路由卡 c.cap 是排在最前那一路 = 图片，直接读它会误报"出图片"） */
+/** 路由节点还一格素材都没放：出图还是出视频要等放进来那一刻才定，别先报一个。
+    （新建的路由节点 c.cap 是排在最前那一路 = 图片，直接读它会误报"出图片"） */
 const kindUndecided = (c) => {
   const md = modeOf(c);
   return !!(md && md.route) && !Object.values(c.assets || {}).some(Boolean);
@@ -552,21 +950,23 @@ const kindUndecided = (c) => {
 /** 画面区的空占位：还没出过东西、或者这一轮失败/取消了都用它 */
 function phHTML(c) {
   if (isStyle(c)) return `<span class="ph">🎨</span>`;
+  if (isText(c)) return `<span class="ph">✍</span>`;
+  if (isAsset(c)) return `<span class="ph">📎</span>`;
   return `<span class="ph">${kindUndecided(c) ? "🖼🎬"
     : outKindOf(c) === "video" ? "🎬" : "🖼"}</span>`;
 }
 
-/** 卡片上「按住不是要拖卡」的地方。整张卡都能拖，所以这里列的是自己有事要干的那几样：
+/** 节点上「按住不是要拖节点」的地方。整个节点都能拖，所以这里列的是自己有事要干的那几样：
  *    button / input / textarea / select  按钮和输入框
  *    audio                               浏览器自带的播放条，整条都得留给它
  *    .vprog                              按住是拖播放进度（bindCardVideo）
  *    .cmp                                按住是拖原图对比线（bindCompare）
  *    .rz / .port / .inport               改大小、拉连线
- *  video **不在**里面：画面上按住就是拖卡，单击才是放/停（bindCardVideo 里按位移分辨）。
+ *  video **不在**里面：画面上按住就是拖节点，单击才是放/停（bindCardVideo 里按位移分辨）。
  *  拖进度只留给底下那条 .vprog —— 原来在画面上横向拖也能定位，但那把整块画面占死了，
- *  视频卡就只剩标题栏能拖。
- *  后三样自己就 stopPropagation 了，压根轮不到卡片这层，列在这儿只是省得以后
- *  哪次改动把那个 stopPropagation 弄丢了，卡片就跟着一起跑。 */
+ *  视频节点就只剩标题栏能拖。
+ *  后三样自己就 stopPropagation 了，压根轮不到节点这层，列在这儿只是省得以后
+ *  哪次改动把那个 stopPropagation 弄丢了，节点就跟着一起跑。 */
 const NODRAG = "button,input,textarea,select,audio,.vprog,.cmp,.rz,.port,.inport";
 
 function buildCard(c) {
@@ -583,7 +983,7 @@ function buildCard(c) {
     <div class="rz tl" title="拖动改大小（按住 Shift 只改宽）"></div>
     <div class="rz br" title="拖动改大小（按住 Shift 只改宽）"></div>
     <div class="inport"></div>
-    <div class="port" title="拖到空白处 → 用本卡产物新建下游卡"></div>`;
+    <div class="port" title="${isAsset(c) ? "拖到别的节点上 → 这份素材就进它的格子" : "拖到空白处 → 用本节点产物新建下游节点"}"></div>`;
   c._el = d;
   applySize(c);
   paintTitle(c);
@@ -592,10 +992,12 @@ function buildCard(c) {
   d.querySelector(".rz.br").onmousedown = (ev) => startResize(ev, c, d, 1);
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
   d.onmousedown = (ev) => {
-    // 整张卡都是拖动把手。以前只有标题栏那一条 26px 能拖 —— 出了图之后卡片九成面积
-    // 是画面，按下去却纹丝不动，每次挪卡都得回去瞄那一条。反过来列例外更省事（NODRAG）
+    // 中键留给画布：在节点上按住中键也是拖画布（不平移就会以为卡死了）
+    if (ev.button === 1) return;
+    // 整个节点都是拖动把手。以前只有标题栏那一条 26px 能拖 —— 出了图之后节点九成面积
+    // 是画面，按下去却纹丝不动，每次挪节点都得回去瞄那一条。反过来列例外更省事（NODRAG）
     if (ev.button === 0 && !ev.target.closest(NODRAG)) return startDrag(ev, c, d);
-    ev.stopPropagation();     // 右键/中键也别漏到画布上去平移
+    ev.stopPropagation();     // 右键别漏到画布上去
     pick(c.id);
   };
   d.oncontextmenu = (ev) => {
@@ -605,7 +1007,8 @@ function buildCard(c) {
   };
   d.ondblclick = (ev) => {
     const body = ev.target.closest(".body");
-    if (!body || isStyle(c)) return;      // 风格卡没有产物可看
+    if (!body || isTextCard(c)) return;   // 文本节点/风格节点没有媒体产物可看
+    if (isAsset(c) && !assetOf(c)) return;   // 空素材节点：连点就是连点，别开空的大窗口
     if (ev.target.closest(".vprog")) return;   // 在进度条上连点是在定位，别抢它
     // 音频那条播放条是浏览器画在 audio 里的，点它拿到的 target 还是 audio 本身，
     // 没法直接区分，只能按位置判断：落在底部这条里就是在操作播放条，别抢它的双击
@@ -613,7 +1016,7 @@ function buildCard(c) {
       const r = ev.target.getBoundingClientRect();
       if (ev.clientY > r.bottom - 34 * view.k) return;
     }
-    // 大窗口里那份才是带播放条的，卡里这份别在背后接着响
+    // 大窗口里那份才是带播放条的，节点里这份别在背后接着响
     for (const v of body.querySelectorAll("video")) v.pause();
     // 宫格里双击哪一格就从哪一张开始看
     openViewer(c, +(ev.target.dataset.i || 0));
@@ -621,13 +1024,19 @@ function buildCard(c) {
   bindCardVideo(d.querySelector(".body"));
   bindCompare(d.querySelector(".body"), c);
   hoverBrief(d.querySelector(".ch"), () => capOf(c), () => c.name);
+  // 空素材节点：点一下正文就弹文件选择（节点脚和徽标都写着「点节点选文件」，不接上会落空）
+  d.onclick = (ev) => {
+    if (!isAsset(c) || assetOf(c)) return;
+    if (!ev.target.closest(".body")) return;
+    pickAsset(c);
+  };
   paint(c);
   return d;
 }
 
-/* 全屏幕只许一个东西在响。一屏摊着十几张卡，多开两个视频就分不清声音是哪来的，
+/* 全屏幕只许一个东西在响。一屏摊着十几个节点，多开两个视频就分不清声音是哪来的，
    那个还在放的往往已经被滚出视野，只能听见声音找不着人。
-   统一挂在 document 捕获阶段（play/pause 不冒泡），卡片视频、宫格里的视频、
+   统一挂在 document 捕获阶段（play/pause 不冒泡），节点视频、宫格里的视频、
    大窗口里的视频和音频全走这一条，各处不用自己记着关别人。 */
 let NOWPLAYING = null;
 document.addEventListener("play", (ev) => {
@@ -645,12 +1054,12 @@ document.addEventListener("mousedown", (ev) => {
   if (!box || !box.contains(ev.target)) NOWPLAYING.pause();
 }, true);
 
-/** 卡片里视频的交互：画面上单击放/停、按住拖是挪卡；定位进度只在底下那条 .vprog 上。
+/** 节点里视频的交互：画面上单击放/停、按住拖是挪节点；定位进度只在底下那条 .vprog 上。
  *
- *  以前在画面上横向拖也能定位，代价是整块画面被占死 —— 视频卡就只剩标题栏那一条能拖。
- *  现在画面区交回给拖卡（NODRAG 里没有 video），这儿只负责分辨「按下又没挪动」= 点了一下。
+ *  以前在画面上横向拖也能定位，代价是整块画面被占死 —— 视频节点就只剩标题栏那一条能拖。
+ *  现在画面区交回给拖节点（NODRAG 里没有 video），这儿只负责分辨「按下又没挪动」= 点了一下。
  *  阈值跟 startDrag 一样是 4px，两边必须一致：小于 4px 那边不认拖、这边就得认点击，
- *  不然会出现「既没挪卡、也没放视频」的死角。
+ *  不然会出现「既没挪节点、也没放视频」的死角。
  *
  *  绑在 .body 上做事件委托，paint() 换掉里面的 innerHTML 也不用重新绑。 */
 function bindCardVideo(body) {
@@ -665,7 +1074,7 @@ function bindCardVideo(body) {
     if (bar) {
       const v = body.querySelector("video");
       if (!v) return;
-      // .vprog 在 NODRAG 里，卡片那层不会跟着动，这儿放心 stopPropagation
+      // .vprog 在 NODRAG 里，节点那层不会跟着动，这儿放心 stopPropagation
       ev.stopPropagation(); ev.preventDefault();
       const playing = !v.paused;
       v.pause(); seek(v, ev.clientX, bar);      // 按下即定位，不用先拖出一段
@@ -681,12 +1090,12 @@ function bindCardVideo(body) {
     }
     const v = ev.target.closest("video");
     if (!v) return;
-    // 既不 stopPropagation 也不 preventDefault：这一下要原样交给卡片那层去起拖
+    // 既不 stopPropagation 也不 preventDefault：这一下要原样交给节点那层去起拖
     // （幽灵图那边已经 draggable=false + CSS user-drag 兜住了）
     const x0 = ev.clientX, y0 = ev.clientY;
     const up = (e) => {
       document.removeEventListener("mouseup", up);
-      // 挪过了就是在拖卡，别顺手把视频放起来
+      // 挪过了就是在拖节点，别顺手把视频放起来
       if (Math.abs(e.clientX - x0) + Math.abs(e.clientY - y0) >= 4) return;
       if (v.paused) v.play().catch(() => {}); else v.pause();
     };
@@ -700,8 +1109,8 @@ function bindCardVideo(body) {
   }, true);
 }
 
-/** 把卡片自己的尺寸写到 DOM 上。
- *  宽度改整张卡；高度只改画面区（.body），标题栏和状态栏保持自然高度。
+/** 把节点自己的尺寸写到 DOM 上。
+ *  宽度改整个节点；高度只改画面区（.body），标题栏和状态栏保持自然高度。
  *  出一整组产物时（.body.grid）画面区高度交回 CSS 自动撑开 —— 宫格是靠宽度
  *  等比排的，硬压一个高度只会把后几行裁掉。 */
 function applySize(c) {
@@ -716,8 +1125,8 @@ function paint(c) {
   const body = d.querySelector(".body");
   const st = d.querySelector(".st"), meta = d.querySelector(".meta");
   const bar = d.querySelector(".bar i");
-  // 风格卡没有产物，画面区直接摊那段风格文字：画布上一眼能看出这张卡在管什么风格，
-  // 不用点开面板。（这也是它唯一的内容，藏起来这张卡就成了个空盒子）
+  // 风格节点没有产物，画面区直接摊那段风格文字：画布上一眼能看出这个节点在管什么风格，
+  // 不用点开面板。（这也是它唯一的内容，藏起来这个节点就成了个空盒子）
   if (isStyle(c)) {
     const txt = String((c.params || {}).style || "").trim();
     body.classList.remove("grid");
@@ -729,23 +1138,52 @@ function paint(c) {
       p.textContent = txt;
       body.appendChild(p);
     } else body.innerHTML = phHTML(c)
-      + `<div class="sempty">在旁边的面板里写一段风格，再把出口拖到生图/生视频卡上</div>`;
+      + `<div class="sempty">在旁边的面板里写一段风格，再把出口拖到生图/生视频节点上</div>`;
     const port = d.querySelector(".port");
-    if (port) port.title = "拖到生图/生视频卡上 → 那张卡套用这段风格（拖到空白处会列出所有能挂的玩法）";
+    if (port) port.title = "拖到生图/生视频节点上 → 那个节点套用这段风格（拖到空白处会列出所有能挂的玩法）";
     const n = (PROJ ? PROJ.edges : []).filter(e => e.from === c.id && isTextEdge(e)).length;
-    // 继承的那几张没有连线，卡脚不报数就等于没告诉用户这段风格到底管着几张卡
+    // 继承的那几张没有连线，节点脚不报数就等于没告诉用户这段风格到底管着几个节点
     const m = styleReach(c).length;
     st.className = "st";
     st.textContent = txt ? "" : "还没写";
-    meta.textContent = n ? `挂了 ${n} 张卡` + (m ? ` · 连带下游 ${m} 张` : "") : "还没挂卡";
+    meta.textContent = n ? `挂了 ${n} 个节点` + (m ? ` · 连带下游 ${m} 张` : "") : "还没挂节点";
     bar.style.width = "0%";
+    return;
+  }
+  // 文本节点：内容就长在节点上 —— 自己写的字和加工出来的结果都在这一个框里，
+  // 都可以直接改。面板只管加工方式和输入
+  if (isText(c)) {
+    const busy = c.status === "running";
+    body.classList.remove("grid");
+    body.classList.add("sbody");
+    applySize(c);
+    body.textContent = "";
+    const ta = document.createElement("textarea");
+    ta.className = "ttxt";
+    ta.spellcheck = false;
+    ta.value = String((c.params || {}).text || "");
+    ta.placeholder = busy ? "正在加工，稍等…"
+      : "在这里写字；选好加工方式点「↑ 运行」，加工结果就落在这个框里 —— 可以直接改";
+    ta.disabled = busy;
+    ta.oninput = () => {
+      c.params = c.params || {};
+      c.params.text = ta.value;
+      paintTextFoot(c);          // 只刷节点脚，不重画 body —— 重画会丢输入焦点
+      save();
+    };
+    body.appendChild(ta);
+    if (busy) {
+      const l = document.createElement("div"); l.className = "load cover";
+      body.appendChild(l);
+    }
+    paintTextFoot(c);
     return;
   }
   const outs = c.outputs || [];
   const out = outs[0];
-  // 抠图这类卡要在画面上叠一张原图做对比（见 cmpSrc）
+  // 抠图这类节点要在画面上叠一张原图做对比（见 cmpSrc）
   const cmp = cmpSrc(c);
-  // sig 而不是单个 url：一张卡可能出一整组图（分镜九宫格），少一张多一张都要重画
+  // sig 而不是单个 url：一个节点可能出一整组图（分镜九宫格），少一张多一张都要重画
   // 原图也要进 sig：不重跑只换了输入那张图，画面里叠的那层也得跟着换
   const sig = outs.map(o => o.url).join("|") + (cmp ? "|<" + cmp : "");
   // dataset.url 同时当"画面区现在装的是什么"的记号，"busy" 是给加载态占的名字
@@ -762,16 +1200,21 @@ function paint(c) {
     // 失败/取消：转圈得停下来，不然一直转着像还在跑
     body.dataset.url = "";
     body.innerHTML = phHTML(c);
+  } else if (isAsset(c) && !outs.length && body.dataset.url) {
+    // 素材节点清空：手里那份文件没了，画面区还在演上一条 → 换回占位图标
+    body.dataset.url = "";
+    body.classList.remove("grid");
+    body.innerHTML = phHTML(c);
   }
 
   if (outs.length && body.dataset.url !== sig) {
     body.dataset.url = sig;
     body.classList.toggle("grid", outs.length > 1);
     applySize(c);      // 宫格的画面区是自动高度，进出宫格都要重新决定 c.h 生不生效
-    // draggable=false：卡片里的图/视频不该能拖出去（拖出来是浏览器自带的行为，
+    // draggable=false：节点里的图/视频不该能拖出去（拖出来是浏览器自带的行为，
     // 会拽出一个半透明幽灵图，还容易被当成"拖它去连线"）。CSS 里另有 user-drag 兜底
-    // 卡片里的视频一律不给 controls：268px 宽的卡塞一条播放条就挡掉半幅画面。
-    // 单击播放/暂停、按住拖是挪卡、拖底下那条 .vprog 定位进度、
+    // 节点里的视频一律不给 controls：268px 宽的节点塞一条播放条就挡掉半幅画面。
+    // 单击播放/暂停、按住拖是挪节点、拖底下那条 .vprog 定位进度、
     // 双击进大窗口看带播放条的完整预览（见 buildCard / bindCardVideo）
     if (outs.length > 1) {
       // 一组产物铺成宫格，data-i 供双击时定位到具体哪一张
@@ -783,12 +1226,12 @@ function paint(c) {
       // .vprog 是自己画的进度条：不给 controls 就没有任何进度反馈，按住拖也没了准头
       body.innerHTML = out.kind === "video"
         ? `<video src="${out.url}" loop preload="metadata" draggable="false"></video>`
-          + `<div class="vprog" title="按住左右拖 → 定位进度（画面上按住是挪卡）"><i></i></div>`
+          + `<div class="vprog" title="按住左右拖 → 定位进度（画面上按住是挪节点）"><i></i></div>`
         : out.kind === "audio"
           ? `<audio src="${out.url}" controls style="width:92%"></audio>`
           : cmp
             // 原图压在结果上面，按 --x 从左边裁开：往右拖 = 原图一点点长回来。
-            // 文案不说"还原背景"：抠出背景那张卡拖回来的是主体，两张卡共用这一段
+            // 文案不说"还原背景"：抠出背景那个节点拖回来的是主体，两个节点共用这一段
             ? `<div class="cmp" title="按住左右拖：跟原图对比，看边缘抠干净了没有">`
               + `<img class="new" src="${out.url}" alt="" draggable="false" data-i="0">`
               + `<img class="old" src="${cmp}" alt="" draggable="false">`
@@ -798,6 +1241,46 @@ function paint(c) {
     }
     if (cmp) applyCmp(c);
     // seed 不再压在画面上，改由右侧「历史产物」栏单独一行展示
+    // 探测产物的真实尺寸（图片/视频），存回 outputs 里，paintKind 会读它显示分辨率
+    if (!isTextCard(c) && !isAsset(c)) {
+      for (let i = 0; i < outs.length; i++) {
+        const o = outs[i];
+        if (o.kind === "image" && !o.width) {
+          const img = body.querySelector(`img[data-i="${i}"]`) || body.querySelector("img");
+          if (img && img.complete) {
+            o.width = img.naturalWidth; o.height = img.naturalHeight;
+            paintKind(c); save();
+          } else if (img) {
+            img.onload = () => {
+              o.width = img.naturalWidth; o.height = img.naturalHeight;
+              paintKind(c); save();
+            };
+          }
+        } else if (o.kind === "video" && !o.width) {
+          const v = body.querySelector(`video[data-i="${i}"]`) || body.querySelector("video");
+          if (v && v.readyState >= 1) {
+            o.width = v.videoWidth; o.height = v.videoHeight;
+            paintKind(c); save();
+          } else if (v) {
+            v.onloadedmetadata = () => {
+              o.width = v.videoWidth; o.height = v.videoHeight;
+              paintKind(c); save();
+            };
+          }
+        }
+      }
+    }
+  }
+
+  // 素材节点自己不跑，节点脚不能报"待生成"（它永远等不到）——只说手里有没有东西
+  if (isAsset(c)) {
+    st.className = "st" + (out ? " done" : "");
+    st.textContent = out ? "已就绪" : "点节点选文件";
+    st.title = out ? "把右边的出口拖到别的节点 → 这份素材就进那个节点的格子里" : st.textContent;
+    bar.style.width = "0%";
+    meta.textContent = out ? out.filename.slice(-22) : "";
+    meta.title = out ? (out.origin || "") : "";
+    return;
   }
 
   const s = c.status;
@@ -816,14 +1299,43 @@ function paint(c) {
   meta.title = c.error || "";
 }
 
+/** 文本节点的节点脚：状态字 / 输入段数 / 出口提示 / 进度条。在节点上打字时也要刷它
+    （「还没写」得变掉），但绝不能重画 body —— 重画会丢输入焦点。 */
+function paintTextFoot(c) {
+  const d = c._el; if (!d) return;
+  const st = d.querySelector(".st"), meta = d.querySelector(".meta");
+  const bar = d.querySelector(".bar i");
+  const op = textOp(c);          // 选没选加工方式：没选就是纯文本节点
+  const busy = c.status === "running";
+  const txt = textOf(c);
+  const port = d.querySelector(".port");
+  if (port) port.title = "拖到生成节点上 → 并进它的提示词；拖到另一个文本节点上 → 当那段加工的输入"
+    + "（拖到空白处会列出能接的地方）";
+  const outN = (PROJ ? PROJ.edges : []).filter(e => e.from === c.id && isTextEdge(e)).length;
+  const inN = ownTexts(c).length;
+  st.className = "st" + (busy ? " run" : c.status === "error" ? " err" : op && c.status === "done" ? " done" : "");
+  if (busy) st.textContent = "处理中…";
+  else if (op) st.textContent = c.status === "error" ? "失败"
+    : c.status === "done" ? (fmtEla(c.ms) ? `已完成 · ${fmtEla(c.ms)}` : "已完成")
+    : "待运行";
+  else st.textContent = txt ? "" : "还没写";
+  st.title = st.textContent;
+  const bits = [];
+  if (op) bits.push(`输入 ${inN} 段${String(((c.params || {}).extra) || "").trim() ? "＋附加" : ""}`);
+  if (outN) bits.push(`连 ${outN} 个节点`);
+  meta.textContent = bits.join(" · ");
+  meta.title = c.error || "";
+  bar.style.width = busy ? "40%" : c.status === "done" ? "100%" : "0%";
+}
+
 /* ---------- 原图 ↔ 结果 对比线 ----------
    只有 manifest 里 compare: true 的能力才画（现在是人物提取 / 抠出背景 / 人物擦除 三条）。
    这几条的成败全在边缘那一圈，透明底的图单看只是一块空白，不跟原图叠着看根本判断不了
    干净没有。要给别的能力开就在 scan_workflows.py 的 COMPARE 集合里加一个 id。
-   文案保持卡片中立（"回到原图"，不写"还原背景"）：往右拖回来的东西每张卡都不一样，
-   三张卡共用这一段 DOM。 */
+   文案保持节点中立（"回到原图"，不写"还原背景"）：往右拖回来的东西每个节点都不一样，
+   三个节点共用这一段 DOM。 */
 
-/** 这张卡该不该画对比线；该画就返回压在上面那张原图的 url。 */
+/** 这个节点该不该画对比线；该画就返回压在上面那张原图的 url。 */
 function cmpSrc(c) {
   const md = CAPS[runCap(c)];
   if (!md || !md.compare) return null;
@@ -834,10 +1346,10 @@ function cmpSrc(c) {
   return a && a.kind === "image" ? a.url : null;
 }
 
-/** 把分割位置写到 DOM 上。位置存百分比而不是像素 —— 卡片能拉宽拉窄，
+/** 把分割位置写到 DOM 上。位置存百分比而不是像素 —— 节点能拉宽拉窄，
     存像素的话一改尺寸那条线就跑偏了。
     存在 c._cmp：下划线开头的键 plain() 会剥掉，不进存档 —— 这是「我刚看到哪」，
-    不是这张卡的设置，重开项目该回到默认（0 = 只看结果，原图完全收在左边）。 */
+    不是这个节点的设置，重开项目该回到默认（0 = 只看结果，原图完全收在左边）。 */
 function applyCmp(c) {
   const box = c._el && c._el.querySelector(".cmp");
   if (!box) return;
@@ -853,7 +1365,7 @@ function bindCompare(body, c) {
     if (ev.button !== 0) return;
     const box = ev.target.closest(".cmp");
     if (!box) return;
-    // 不 stopPropagation：照样冒泡上去选中这张卡
+    // 不 stopPropagation：照样冒泡上去选中这个节点
     ev.preventDefault();                 // 掐掉浏览器自带的拖拽幽灵图
     const at = (clientX) => {
       const r = box.getBoundingClientRect();
@@ -882,7 +1394,7 @@ function cardBox(id) {
 }
 
 /** 选中的连线。存的是 PROJ.edges 里那条对象本身（不是下标）——
-    删卡、换路由都会重排数组，下标会指到别人身上去。 */
+    删节点、换路由都会重排数组，下标会指到别人身上去。 */
 let selEdge = null;
 
 /** 风格顺着这根产物线往下传吗（见 styleCards）。风格继承**没有自己的连线**，
@@ -890,13 +1402,15 @@ let selEdge = null;
 function carriesStyle(e) {
   if (isTextEdge(e)) return false;
   const a = cardOf(e.from), b = cardOf(e.to);
-  return !!(a && b && !isStyle(a) && styleCards(a).length && !ownStyles(b).length);
+  return !!(a && b && !isTextCard(a) && styleCards(a).length && !ownStyles(b).length);
 }
 
 function edgeWord(e) {
   const a = cardOf(e.from), b = cardOf(e.to);
   const nm = (c) => c ? titleOf(c) : "?";
-  return isTextEdge(e) ? `风格：${nm(a)} → ${nm(b)}` : `${nm(a)} → ${nm(b)}`;
+  return isTextEdge(e)
+    ? (e.slot === TEXT_SLOT ? `文本：${nm(a)} → ${nm(b)}` : `风格：${nm(a)} → ${nm(b)}`)
+    : `${nm(a)} → ${nm(b)}`;
 }
 
 function drawWires() {
@@ -926,11 +1440,165 @@ function drawWires() {
       pickEdge(e); edgeMenu(ev.clientX, ev.clientY, e);
     });
     // 风格线画成虚线：它传的是文字不是产物，跟"上一张的图接给下一张"是两件事，
-    // 画成同一根实线会让人以为风格卡也出图
+    // 画成同一根实线会让人以为风格节点也出图
     mk([isTextEdge(e) ? "txt" : "", e === selEdge ? "sel" : ""].filter(Boolean).join(" "));
     // 再叠一层紫虚线 = 这根产物线上还捎着风格
     if (carriesStyle(e)) mk("carry");
   }
+  paintSel();               // 框选的虚线框和顶部工具条跟着节点位置走
+  paintGroups();            // 分组框也一样（拖动时每帧重算）
+}
+
+/* ---------- 框选 / 分组 ---------- */
+/** 一个节点在世界坐标里的矩形（高度量 DOM，宫格那种自动高度才准） */
+function cardRect(c) {
+  return { x: c.x, y: c.y, w: cardW(c), h: c._el ? c._el.offsetHeight : 230 };
+}
+
+/** 找一块空地放新节点（世界坐标）。底部工具条建节点不给用户挑位置，所以从**视野正中**
+    开始找：正中空着就放正中，占了就绕着中心一圈圈往外找最近的空位。
+    不从左上角扫 —— 那样节点会落在视野边角上，建完还得去找它。 */
+function blankSpot(w = CW, h = 230) {
+  const r = el.stage.getBoundingClientRect();
+  const mid = toWorld((r.left + r.right) / 2, (r.top + r.bottom) / 2);
+  const cx = mid.x - w / 2, cy = mid.y - h / 2;     // 节点的左上角，让节点中心对准视野中心
+  const gap = 24;
+  const rects = (PROJ ? PROJ.cards : []).map(cardRect);
+  const free = (x, y) => !rects.some(q =>
+    x < q.x + q.w + gap && x + w + gap > q.x && y < q.y + q.h + gap && y + h + gap > q.y);
+  if (free(cx, cy)) return { x: Math.round(cx), y: Math.round(cy) };
+  // 绕着中心一圈圈往外：每圈在 8 个方向上试，先近后远，落点始终离视野中心最近
+  const step = 64;
+  for (let ring = 1; ring <= 24; ring++) {
+    for (const [dx, dy] of [[1, 0], [0, 1], [-1, 0], [0, -1], [1, 1], [-1, 1], [1, -1], [-1, -1]]) {
+      const x = cx + dx * ring * step, y = cy + dy * ring * step;
+      if (free(x, y)) return { x: Math.round(x), y: Math.round(y) };
+    }
+  }
+  return { x: Math.round(cx), y: Math.round(cy) };   // 实在没地方就叠在正中，用户自己拖开
+}
+
+/** 一堆节点的包围盒（世界坐标） */
+function bboxOf(ids) {
+  let x1 = Infinity, y1 = Infinity, x2 = -Infinity, y2 = -Infinity;
+  for (const id of ids) {
+    const c = cardOf(id);
+    if (!c) continue;
+    const r = cardRect(c);
+    x1 = Math.min(x1, r.x); y1 = Math.min(y1, r.y);
+    x2 = Math.max(x2, r.x + r.w); y2 = Math.max(y2, r.y + r.h);
+  }
+  return x1 === Infinity ? null : { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+}
+
+/** 框选状态：选中节点外圈的青色虚线框 + 上方的小工具条（≥2 张才有工具条）。 */
+function paintSel() {
+  if (!el.groups) return;
+  let box = el.groups.querySelector(".selbox");
+  if (!selIds.size) {
+    if (box) box.remove();
+    el.selbar.style.display = "none";
+    return;
+  }
+  const b = bboxOf(selIds);
+  if (!b) { selIds.clear(); return paintSel(); }
+  if (!box) {
+    box = document.createElement("div");
+    box.className = "selbox";
+    el.groups.appendChild(box);
+  }
+  box.style.left = b.x - 8 + "px"; box.style.top = b.y - 8 + "px";
+  box.style.width = b.w + 16 + "px"; box.style.height = b.h + 16 + "px";
+  if (selIds.size < 2) { el.selbar.style.display = "none"; return; }
+  // 工具条摆在包围盒上方（stage 内坐标，跟 #selbar 的定位一致），出界就夹回来
+  el.selbar.style.display = "";
+  const r = el.stage.getBoundingClientRect();
+  const sx = view.x + b.x * view.k, sy = view.y + b.y * view.k;
+  el.selbar.style.left = Math.max(4, Math.min(sx, r.width - el.selbar.offsetWidth - 4)) + "px";
+  el.selbar.style.top = Math.max(50, sy - el.selbar.offsetHeight - 10) + "px";
+}
+
+/** 分组框：打过的组在节点底下画一圈虚线框 + 左上角组名。
+    拖框 = 整组一起动；双击组名改名；右键框 = 重命名 / 删组（节点保留）。 */
+function paintGroups() {
+  if (!el.groups) return;
+  el.groups.querySelectorAll(".ggroup").forEach(g => g.remove());
+  if (!PROJ) return;
+  for (const g of PROJ.groups || []) {
+    const b = bboxOf(g.cards);
+    if (!b) continue;
+    const PAD = 12, TOP = 28;
+    const d = document.createElement("div"); d.className = "ggroup";
+    d.style.left = b.x - PAD + "px"; d.style.top = b.y - TOP + "px";
+    d.style.width = b.w + PAD * 2 + "px"; d.style.height = b.h + PAD + TOP + "px";
+    const lb = document.createElement("div"); lb.className = "gglabel";
+    lb.textContent = `${g.name}（${g.cards.length}）`;
+    d.appendChild(lb);
+    d.onmousedown = (ev) => {
+      if (ev.button !== 0) return;
+      ev.stopPropagation(); ev.preventDefault();
+      // 点分组框 = 选中这组（出虚线框和工具条），再拖着走就是整组一起动
+      selIds = new Set(g.cards);
+      paintSel();
+      beginCardsMove(ev, [...g.cards].map(cardOf).filter(Boolean));
+    };
+    lb.ondblclick = (ev) => { ev.stopPropagation(); renameGroup(g); };
+    d.oncontextmenu = (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      showMenu(ev.clientX, ev.clientY, g.name, [
+        { icon: "✎", text: "重命名", run: () => renameGroup(g) },
+        { icon: "✕", text: "删除组（节点保留）", danger: true, run: () => {
+            PROJ.groups = PROJ.groups.filter(x => x !== g);
+            paintGroups(); save();
+          } },
+      ]);
+    };
+    el.groups.appendChild(d);
+  }
+}
+
+function renameGroup(g) {
+  const n = prompt("组名", g.name);
+  if (n === null) return;
+  g.name = n.trim().slice(0, 30) || g.name;
+  paintGroups(); save();
+}
+
+/** 按住一起拖动几个节点：单节点拖动、框选多张后拖、拖分组框，全走这里。 */
+function beginCardsMove(ev, cards) {
+  if (ev.button !== 0 || !cards.length) return;
+  ev.stopPropagation(); ev.preventDefault();
+  tipHide();
+  const s = { mx: ev.clientX, my: ev.clientY, pos: cards.map(c => ({ c, x: c.x, y: c.y })) };
+  let moved = false;
+  const mv = (e) => {
+    // 4px 阈值：手抖一下不算拖，也就不会白闪一次面板
+    if (!moved && Math.abs(e.clientX - s.mx) + Math.abs(e.clientY - s.my) < 4) return;
+    if (!moved) { moved = true; veilPanel(true); }
+    const dx = (e.clientX - s.mx) / view.k, dy = (e.clientY - s.my) / view.k;
+    for (const p of s.pos) {
+      p.c.x = Math.round(p.x + dx); p.c.y = Math.round(p.y + dy);
+      if (p.c._el) { p.c._el.style.left = p.c.x + "px"; p.c._el.style.top = p.c.y + "px"; }
+    }
+    drawWires();
+  };
+  const up = () => {
+    document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+    if (moved) { veilPanel(false); placePanel(); save(); }
+  };
+  document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+}
+
+/** Delete 删掉框选的一堆节点（会问一句 —— 没有撤销）。 */
+function askDelMany() {
+  const cards = [...selIds].map(cardOf).filter(Boolean);
+  if (!cards.length) return;
+  const n = cards.filter(c => (c.history || []).length || (c.outputs || []).length).length;
+  if (!confirm(`删除选中的 ${cards.length} 个节点？`
+      + (n ? `其中 ${n} 张有生成记录，删了找不回来（产物文件还在 ComfyUI 输出目录）。` : ""))) return;
+  for (const c of cards) delCard(c.id);
+  selIds.clear(); paintSel();
+  toast(`已删除 ${cards.length} 个节点`);
 }
 
 function pickEdge(e) {
@@ -946,7 +1614,7 @@ function edgeMenu(cx, cy, e) {
   showMenu(cx, cy, edgeWord(e), [
     ...(a ? [{ icon: "◧", text: `选中上游「${titleOf(a)}」`, run: () => pick(a.id) }] : []),
     ...(b ? [{ icon: "◨", text: `选中下游「${titleOf(b)}」`, run: () => pick(b.id) }] : []),
-    { icon: "✕", text: isTextEdge(e) ? "解除这张风格卡" : "删除连线",
+    { icon: "✕", text: e.slot === TEXT_SLOT ? "断开这段文本" : isTextEdge(e) ? "解除这个风格节点" : "删除连线",
       danger: true, run: () => delEdge(e) },
   ]);
 }
@@ -961,15 +1629,17 @@ function delEdge(e) {
   drawWires(); paintStyles();
   if (selId) openPanel(selId);
   save();
-  toast(isTextEdge(e) ? "已解除风格"
+  toast(e.slot === TEXT_SLOT ? "已断开这段文本输入"
+    : isTextEdge(e) ? "已解除风格"
     : had ? "已删除连线（那一格的素材还在，只是不再跟着上游重跑更新）"
     : "已删除连线");
 }
 
-/* ================= 交互：拖卡 / 平移 / 缩放 / 连线 ================= */
+/* ================= 交互：拖节点 / 平移 / 缩放 / 连线 ================= */
 function pick(id) {
   selId = id;
-  if (selEdge) { selEdge = null; drawWires(); }      // 选中的线和选中的卡只留一个
+  selIds.clear(); paintSel();                          // 点单个节点 = 放弃框选
+  if (selEdge) { selEdge = null; drawWires(); }      // 选中的线和选中的节点只留一个
   for (const c of PROJ.cards) if (c._el) c._el.classList.toggle("sel", c.id === id);
   openHistory(id);      // 先开栏子再摆面板：面板要按变窄之后的画布找位置
   openPanel(id);
@@ -977,30 +1647,23 @@ function pick(id) {
 
 function startDrag(ev, c, d) {
   if (ev.button !== 0) return;
-  ev.stopPropagation();
-  ev.preventDefault();          // 标题栏是拖动把手，别让它同时被拖成半截高亮
-  tipHide();
+  // 谁跟着这个节点一起动：先看框选（拖选中里的一张 = 整个选择动），
+  // 没框选就看分组（组里的节点拖一张 = 整组动；同时在几个组里就全跟着），
+  // 都没有才单张
+  let ids = (selIds.size > 1 && selIds.has(c.id)) ? [...selIds] : null;
+  if (!ids) {
+    const union = new Set();
+    for (const g of (PROJ.groups || [])) {
+      if (g.cards.includes(c.id)) g.cards.forEach(x => union.add(x));
+    }
+    if (union.size > 1) ids = [...union];
+  }
   pick(c.id);
-  const s = { mx: ev.clientX, my: ev.clientY, x: c.x, y: c.y };
-  let moved = false;
-  const mv = (e) => {
-    // 4px 阈值：手抖一下不算拖，也就不会白闪一次面板
-    if (!moved && Math.abs(e.clientX - s.mx) + Math.abs(e.clientY - s.my) < 4) return;
-    if (!moved) { moved = true; veilPanel(true); }
-    c.x = Math.round(s.x + (e.clientX - s.mx) / view.k);
-    c.y = Math.round(s.y + (e.clientY - s.my) / view.k);
-    d.style.left = c.x + "px"; d.style.top = c.y + "px";
-    drawWires();
-  };
-  const up = () => {
-    document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
-    if (moved) { veilPanel(false); placePanel(); save(); }
-  };
-  document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+  beginCardsMove(ev, ids ? ids.map(cardOf).filter(Boolean) : [c]);
 }
 
 /** 拖角改大小。dir=1 是右下角（左上角钉住），dir=-1 是左上角（右下角钉住，
- *  所以位置要跟着一起变）。按住 Shift 只改宽 —— 宫格的排布只看宽度，调宫格卡时
+ *  所以位置要跟着一起变）。按住 Shift 只改宽 —— 宫格的排布只看宽度，调宫格节点时
  *  往往不想顺手把画面区高度也动了。 */
 function startResize(ev, c, d, dir) {
   if (ev.button !== 0) return;
@@ -1018,8 +1681,8 @@ function startResize(ev, c, d, dir) {
     if (!e.shiftKey) c.h = fit(s.h + (e.clientY - s.my) / view.k * dir, CH_MIN, CH_MAX);
     applySize(c);
     if (dir < 0) {
-      // 右下角钉住：位置补偿要用「真的量出来」的高度。宫格卡的画面区是自动高度，
-      // c.h 根本没生效，照 c.h 算会让卡片凭空往上跳一截
+      // 右下角钉住：位置补偿要用「真的量出来」的高度。宫格节点的画面区是自动高度，
+      // c.h 根本没生效，照 c.h 算会让节点凭空往上跳一截
       c.x = s.x + (s.w - c.w);
       c.y = s.y + (s.ch - d.offsetHeight);
       d.style.left = c.x + "px"; d.style.top = c.y + "px";
@@ -1065,30 +1728,99 @@ function bindGlobal() {
   $("#toggle").onclick = () => document.body.classList.toggle("collapsed");
   $("#newproj").onclick = newProject;
   $("#createHere").onclick = newProject;
-  el.addcard.onclick = () => {
-    const r = el.stage.getBoundingClientRect();
-    openMenu(r.left + 140, r.top + 120, toWorld(r.left + 140, r.top + 120));
-  };
+  // 底部工具条：新建节点的唯一入口。上传直接建素材节点，图片/视频/工具箱摊开各自节点里的玩法
+  buildDock();
   el.fit.onclick = () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); };
   el.jobsbtn.onclick = toggleJobs;
-  addEventListener("resize", () => { placePanel(); placeJobs(); });
+  // 框选后上方工具条里的「打组」：把选中的节点圈成一个组（虚线框，整体拖动）
+  el.selbar.innerHTML = "";
+  const gb = document.createElement("button");
+  gb.className = "mkgroup"; gb.textContent = "▦ 打组";
+  gb.title = "把选中的节点圈成一个组：拖分组框整体移动；双击组名改名，右键框删组（节点保留）";
+  gb.onclick = () => {
+    if (selIds.size < 2) return;
+    PROJ.groups = PROJ.groups || [];
+    const same = PROJ.groups.find(g => g.cards.length === selIds.size
+      && g.cards.every(x => selIds.has(x)));
+    if (same) return toast("这几张已经是同一组了");
+    PROJ.groups.push({ id: uid(), name: `组 ${PROJ.groups.length + 1}`, cards: [...selIds] });
+    // 选中状态保留：外圈虚线框和这条工具条都还在，接着拖就是整组一起动
+    paintSel(); paintGroups(); save();
+    toast("已打组：拖组里的节点或分组框 = 整组一起动；双击组名改名，右键框删组");
+  };
+  el.selbar.appendChild(gb);
+  // 双保险：工具条按下的那一漏到画布去（画布会把它当框选起点）
+  el.selbar.onmousedown = (ev) => ev.stopPropagation();
+  addEventListener("resize", () => { placePanel(); placeJobs(); paintSel(); });
 
   // Ctrl+V 粘在鼠标那儿，所以一直记着鼠标落在世界坐标的哪个位置
   el.stage.addEventListener("mousemove", (ev) => { mouseW = toWorld(ev.clientX, ev.clientY); });
   el.stage.addEventListener("mouseleave", () => { mouseW = null; });
 
   el.stage.addEventListener("mousedown", (ev) => {
+    // 工具条自己管自己（打组这些按钮）：冒泡到画布会被当成"点空白"把选中清掉，
+    // 按钮执行时手里就没节点了 —— 这就是打组点了没反应的原因
+    if (ev.target.closest("#selbar")) return;
+    // 中键 = 拖画布（在哪儿按都行，节点上按中键也放过来了）
+    if (ev.button === 1) {
+      ev.preventDefault();          // 掐掉浏览器中键的自动滚动
+      const s = { mx: ev.clientX, my: ev.clientY, x: view.x, y: view.y };
+      el.stage.classList.add("panning");
+      let moved = false;
+      const mv = (e) => {
+        // 一动就把参数面板藏掉（跟拖节点同一套）：不然面板浮在原地挡住挪过来的节点
+        if (!moved) { moved = true; veilPanel(true); }
+        view.x = s.x + e.clientX - s.mx; view.y = s.y + e.clientY - s.my; applyView();
+      };
+      const up = () => {
+        el.stage.classList.remove("panning");
+        document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+        // 真挪过才要把面板放回来：veilPanel 只解除隐藏，placePanel 才按节点的
+        // 新屏幕位置重新摆板 —— 少这句面板就留在挪之前的旧位置（飘了）
+        if (moved) { veilPanel(false); placePanel(); }
+        save();
+      };
+      document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
+      return;
+    }
     if (ev.button !== 0) return;
+    // 左键点空白：清掉选中；按住拖出去一个框 = 框选节点
     closeMenu(); closeJobs();
     selId = null; closePanel();
     if (selEdge) { selEdge = null; drawWires(); }
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
-    const s = { mx: ev.clientX, my: ev.clientY, x: view.x, y: view.y };
-    el.stage.classList.add("panning");
-    const mv = (e) => { view.x = s.x + e.clientX - s.mx; view.y = s.y + e.clientY - s.my; applyView(); };
+    selIds.clear(); paintSel();
+    const s = { mx: ev.clientX, my: ev.clientY };
+    let moved = false;
+    const mv = (e) => {
+      if (!moved && Math.abs(e.clientX - s.mx) + Math.abs(e.clientY - s.my) < 4) return;
+      moved = true;
+      const x1 = Math.min(s.mx, e.clientX), y1 = Math.min(s.my, e.clientY);
+      const x2 = Math.max(s.mx, e.clientX), y2 = Math.max(s.my, e.clientY);
+      const r = el.stage.getBoundingClientRect();
+      el.lasso.style.display = "";
+      el.lasso.style.left = x1 - r.left + "px"; el.lasso.style.top = y1 - r.top + "px";
+      el.lasso.style.width = x2 - x1 + "px"; el.lasso.style.height = y2 - y1 + "px";
+      const a = toWorld(x1, y1), b = toWorld(x2, y2);
+      selIds.clear();
+      if (PROJ) for (const c of PROJ.cards) {
+        const rc = cardRect(c);
+        if (rc.x < b.x && rc.x + rc.w > a.x && rc.y < b.y && rc.y + rc.h > a.y) selIds.add(c.id);
+      }
+      paintSel();
+    };
     const up = () => {
-      el.stage.classList.remove("panning");
-      document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up); save();
+      document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+      el.lasso.style.display = "none";
+      if (!moved) return;                    // 纯点了一下：上面已经清过选中了
+      if (selIds.size === 1) {               // 只圈到一张就当普通选中（开面板那种）
+        const id = [...selIds][0];
+        selIds.clear();
+        pick(id);
+      } else {
+        paintSel();
+        if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · Delete 全删 · 上方按钮打组`);
+      }
     };
     document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
   });
@@ -1105,16 +1837,50 @@ function bindGlobal() {
     applyView(); placePanel(); save();
   }, { passive: false });
 
-  el.stage.addEventListener("dblclick", (ev) => {
-    if (!PROJ || ev.target.closest(".card")) return;
-    openMenu(ev.clientX, ev.clientY, toWorld(ev.clientX, ev.clientY));
-  });
-
+  // 空白处右键：新建节点改走底部工具条了，这儿只剩"把刚复制的节点粘在这个位置"。
+  // 手上没复制东西就什么都不弹（别为了一条灰按钮开个菜单）
   el.stage.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
     if (!PROJ || ev.target.closest(".card")) return;
     tipHide();
-    openMenu(ev.clientX, ev.clientY, toWorld(ev.clientX, ev.clientY));
+    if (!CLIP) return;
+    const at = toWorld(ev.clientX, ev.clientY);
+    showMenu(ev.clientX, ev.clientY, "画布", [{
+      icon: "⧉", text: "粘贴刚复制的节点（Ctrl+V）",
+      run: () => { mouseW = at; pasteCard(); },
+    }]);
+  });
+
+  // 拖拽文件到画布 → 自动上传并建素材节点（落在鼠标位置）
+  el.stage.addEventListener("dragover", (ev) => {
+    if (!PROJ) return;
+    ev.preventDefault();
+    ev.dataTransfer.dropEffect = "copy";
+  });
+  el.stage.addEventListener("drop", async (ev) => {
+    if (!PROJ) return;
+    ev.preventDefault();
+    const files = [...(ev.dataTransfer?.files || [])];
+    if (!files.length) return;
+    // 只处理图片/视频/音频，其他类型忽略
+    const valid = files.filter(f => f.type.startsWith("image/") || f.type.startsWith("video/") || f.type.startsWith("audio/"));
+    if (!valid.length) return toast("只支持图片、视频、音频文件");
+    const at = toWorld(ev.clientX, ev.clientY);
+    for (const f of valid) {
+      const fd = new FormData(); fd.append("file", f, f.name);
+      try {
+        const r = await api("/api/upload", { method: "POST", body: fd });
+        const item = r.files[0];
+        const p = { x: Math.round(at.x - 134), y: Math.round(at.y - 84) };   // 节点中心对齐鼠标位置
+        const c = addCard("card_asset", p.x, p.y);
+        if (!c) continue;
+        await setAssetItem(c, item);
+        toast(`已建素材节点：${item.origin || f.name}`);
+        at.x += 50; at.y += 50;   // 多个文件时错开位置
+      } catch (e) {
+        toast(`上传失败 ${f.name}：${e.message}`);
+      }
+    }
   });
 
   // 点大图外面的黑底关掉；点到图/视频本身不关，否则想拉进度条一松手窗就没了
@@ -1122,8 +1888,21 @@ function bindGlobal() {
     if (ev.target === el.view) closeViewer();
   });
 
+  // ⚙ 参数弹窗：点弹窗外面关掉（点到弹窗自己不关）
+  addEventListener("mousedown", (ev) => {
+    if (el.respop.style.display === "none") return;
+    if (!el.respop.contains(ev.target)) closeResPop();
+  }, true);
+
+  // 胶囊菜单（模型/加工方式/生图模式）同理：点菜单外面关掉。
+  // 点在打开它的那颗胶囊按钮上不关 —— 那颗的 onclick 会自动重开菜单，关掉反而闪一下。
+  addEventListener("mousedown", (ev) => {
+    if (el.menu.style.display === "none") return;
+    if (!el.menu.contains(ev.target) && !ev.target.closest(".tcap")) closeMenu();
+  }, true);
+
   document.addEventListener("keydown", (ev) => {
-    // 大图开着时左右键翻同一张卡的下一个产物（分镜九宫格）
+    // 大图开着时左右键翻同一个节点的下一个产物（分镜九宫格）
     if (el.view.style.display !== "none" && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) {
       ev.preventDefault(); stepViewer(ev.key === "ArrowRight" ? 1 : -1); return;
     }
@@ -1133,8 +1912,10 @@ function bindGlobal() {
     if (PROJ && !typing && el.view.style.display === "none") {
       const c = cardOf(selId);
       if (ev.key === "Delete" || ev.key === "Backspace") {
-        // 线优先：选中线的那一刻卡片选中就被清了，两个不会同时亮
+        // 线优先：选中线的那一刻节点选中就被清了，两个不会同时亮
         if (selEdge) { ev.preventDefault(); delEdge(selEdge); return; }
+        // 框选了一堆：全删（会问一句）
+        if (selIds.size > 1) { ev.preventDefault(); askDelMany(); return; }
         if (c) { ev.preventDefault(); askDelCard(c); return; }
       }
       if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey) {
@@ -1144,12 +1925,15 @@ function bindGlobal() {
       }
     }
     if (ev.key !== "Escape") return;
-    // 大图开着时 Esc 只关大图，不该顺手把卡片选中状态和参数面板一起清掉
+    // ⚙ 参数弹窗开着时 Esc 先关它
+    if (el.respop.style.display !== "none") { closeResPop(); return; }
+    // 大图开着时 Esc 只关大图，不该顺手把节点选中状态和参数面板一起清掉
     if (el.view.style.display !== "none") { closeViewer(); return; }
-    // 任务浮窗开着时 Esc 只关它，别顺手把选中的卡和参数面板一起清掉
+    // 任务浮窗开着时 Esc 只关它，别顺手把选中的节点和参数面板一起清掉
     if (el.jobs.style.display !== "none") { closeJobs(); return; }
     closeMenu(); tipHide(); selId = null; closePanel();
     if (selEdge) { selEdge = null; drawWires(); }
+    selIds.clear(); paintSel();                  // Esc 也收掉框选
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
   });
 }
@@ -1180,46 +1964,78 @@ function showMenu(cx, cy, title, items) {
 }
 const closeMenu = () => (el.menu.style.display = "none");
 
-/** 新建卡片菜单：按产出分成生图/生视频两类，条目直接是具体玩法。
-    卡片名（"生视频"）和分类名是同一个词，所以列卡片会变成"生视频 > 生视频"，
-    不如把卡内的模式摊出来选，建出来的卡就已经是想要的那个模式。
-
-    工具（拼图/裁切这类只加工素材、不创作的）单独一组放最后：它的产出也是图片，
-    混进"生图"里会让人以为它也在画画，而且真正要找它的时候翻不到。 */
-const OUT_GROUP = { image: "生图", video: "生视频", audio: "生音频" };
-
-function menuGroups() {
-  const gs = [];
-  for (const [out, gname] of Object.entries(OUT_GROUP)) {
-    gs.push([gname, CARDS.filter(
-      d => d.modes.length && d.kind !== "tool" && d.outputType === out)]);
-  }
-  gs.push(["工具", CARDS.filter(d => d.modes.length && d.kind === "tool")]);
-  // 风格卡自己一组：它不出产物，混进"生图"里就是在说它也会画画
-  gs.push(["风格", CARDS.filter(d => d.modes.length && d.kind === "style")]);
-  return gs;
+/** 面板底部工具条的胶囊按钮（文本节点的模型/加工方式、生图节点的模式都是它）：
+    名字+▾，点开一个小菜单换。菜单往**上方**弹 —— 按钮都在面板最底一排，
+    往下弹会盖住整排工具条（点完想再点旁边的就被菜单挡住了）。 */
+function capBtn(label, title, items) {
+  const b = document.createElement("button");
+  b.className = "tcap";
+  const s = document.createElement("span"); s.textContent = label;
+  const i = document.createElement("i"); i.textContent = "▴";
+  b.append(s, i);
+  b.title = title + " —— 点击换";
+  b.onclick = (ev) => {
+    ev.stopPropagation();
+    const r = b.getBoundingClientRect();
+    showMenu(r.left, r.bottom + 4, title, items());
+    const menu = el.menu;
+    // 默认往下弹；会盖到屏幕底（也就盖住按钮自己那排）就翻到按钮上方
+    if (r.bottom + menu.offsetHeight + 12 > innerHeight) {
+      menu.style.top = Math.max(48, r.top - menu.offsetHeight - 8) + "px";
+    }
+  };
+  return b;
 }
 
-function openMenu(cx, cy, at) {
-  const items = [];
-  // 手上拿着复制的卡就摆在最前面：右键的这个位置就是要粘的位置，比记快捷键直观
-  if (CLIP) items.push({
-    icon: "⧉", text: "粘贴刚复制的卡片（Ctrl+V）",
-    run: () => { mouseW = at; pasteCard(); },
-  });
-  for (const [gname, defs] of menuGroups()) {
-    if (!defs.length) continue;
-    items.push({ group: gname });
-    for (const def of defs) {
-      for (const md of def.modes) {
-        items.push({
-          icon: def.icon, text: md.name,
-          run: () => addCard(def.id, at.x - CW / 2, at.y - 40, modeCap(md)),
-        });
-      }
+
+/* ---------- 底部工具条（新建节点的唯一入口） ---------- */
+/** 节点都建在视野正中（blankSpot），建完就在眼前，不用去找。
+    文本/图片/视频点一下直接建，用该节点的第一个模式，玩法进参数面板左下角的胶囊换；
+    工具箱例外 —— 它那几样（抠图/拼图/补帧/画质增强）互相不搭，
+    默认给哪个都是错的，所以弹一份清单让用户挑。 */
+function buildDock() {
+  const mk = (icon, label, title, run) => {
+    const b = document.createElement("button");
+    b.className = "dockb";
+    b.title = title;
+    const i = document.createElement("span"); i.textContent = icon;
+    const t = document.createElement("span"); t.textContent = label;
+    b.append(i, t);
+    b.onmousedown = (ev) => ev.stopPropagation();   // 别漏到画布的"点空白"上去
+    b.onclick = (ev) => { ev.stopPropagation(); run(b); };
+    return b;
+  };
+  const spawn = (tid) => () => {
+    if (!PROJ) return;
+    const p = blankSpot();
+    addCard(tid, p.x, p.y);
+  };
+  // 工具箱：列出所有工具节点的每一样，选中才建节点。菜单往上弹（按钮贴着屏幕底沿）
+  const tools = (b) => {
+    if (!PROJ) return;
+    const items = [];
+    for (const def of CARDS.filter(d => d.kind === "tool" && d.modes.length)) {
+      for (const md of def.modes) items.push({
+        icon: def.icon, text: md.name,
+        run: () => { const p = blankSpot(); addCard(def.id, p.x, p.y, modeCap(md)); },
+      });
     }
-  }
-  showMenu(cx, cy, "新建卡片", items);
+    if (!items.length) return toast("没有可用的工具节点");
+    const r = b.getBoundingClientRect();
+    showMenu(r.left, r.top, "工具箱 · 选一样", items);
+    el.menu.style.top = Math.max(48, r.top - el.menu.offsetHeight - 8) + "px";
+  };
+  const sep = () => { const s = document.createElement("div"); s.className = "sep"; return s; };
+  el.dock.innerHTML = "";
+  el.dock.append(
+    mk("📎", "上传", "选一个图片/视频文件，放进一个素材节点 —— 再把它的出口拖到别的节点上就能反复用",
+      addAssetCard),
+    sep(),
+    mk("✍", "文本", "新建一个文本节点：存一段字，连到生成节点就并进提示词", spawn("card_text")),
+    mk("🖼", "图片", "新建一个生图节点（默认文生图，玩法在参数面板左下角换）", spawn("card_image")),
+    mk("🎬", "视频", "新建一个生视频节点（默认图生视频，玩法在参数面板左下角换）", spawn("card_video")),
+    mk("🧩", "工具箱", "抠图 / 拼图 / 补帧 / 画质增强 —— 点开选一样", tools),
+  );
 }
 
 /* ================= 产物大图 / 详情 ================= */
@@ -1227,7 +2043,7 @@ const VIEW_WORD = { video: "放大播放", audio: "放大播放" };
 
 // 大图正在看哪一组产物的第几张：{ outs, idx, seed }
 // outs 显式传进来而不是每次读 c.outputs：历史产物栏里点的是过去某一轮，
-// 那一组产物已经不是卡片当前的 outputs 了
+// 那一组产物已经不是节点当前的 outputs 了
 let VIEW = null;
 
 function closeViewer() {
@@ -1238,7 +2054,7 @@ function closeViewer() {
 
 function openViewer(c, i = 0, outs = null, seed = undefined) {
   const list = outs || c.outputs || [];
-  if (!list.length) { toast("这张卡还没有产物，先运行一次"); return; }
+  if (!list.length) { toast("这个节点还没有产物，先运行一次"); return; }
   VIEW = {
     outs: list, idx: Math.min(Math.max(i, 0), list.length - 1),
     seed: seed !== undefined ? seed : (c ? c.seed : null),
@@ -1314,42 +2130,81 @@ function cardMenu(cx, cy, c) {
   if (isStyle(c)) {
     const n = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e)).length;
     return showMenu(cx, cy, c.name || "风格化提示词", [
-      { icon: "✎", text: "重命名卡片", run: () => renameCard(c) },
+      { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
       { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
       { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
-      // 挂错卡了想全撤掉，比一根根找线点开销小
-      ...(n ? [{ icon: "⊘", text: `解除挂着的 ${n} 张卡`, run: () => {
+      // 挂错节点了想全撤掉，比一根根找线点开销小
+      ...(n ? [{ icon: "⊘", text: `解除挂着的 ${n} 个节点`, run: () => {
         PROJ.edges = PROJ.edges.filter(e => !(e.from === c.id && isTextEdge(e)));
         drawWires(); paintStyles(); if (selId) openPanel(selId); save();
       } }] : []),
       ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
-      { icon: "✕", text: "删除卡片（Delete）", danger: true, run: () => delCard(c.id) },
+      { icon: "✕", text: "删除节点（Delete）", danger: true, run: () => delCard(c.id) },
+    ]);
+  }
+  if (isText(c)) {
+    return showMenu(cx, cy, c.name || titleOf(c), [
+      ...(textOp(c) ? [{ icon: "↑", text: "运行（加工文本）", run: () => run(c) }] : []),
+      { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
+      { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
+      { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
+      ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
+      { icon: "✕", text: "删除节点（Delete）", danger: true, run: () => delCard(c.id) },
+    ]);
+  }
+  if (isAsset(c)) {
+    const a = assetOf(c);
+    return showMenu(cx, cy, c.name || titleOf(c), [
+      ...(a ? [{ icon: "⛶", text: VIEW_WORD[a.kind] || "查看大图", run: () => openAsset(a) }] : []),
+      ...(a ? [{ icon: "⬇", text: `下载${KIND_ZH[a.kind] || "文件"}`, run: () => downloadOut(a) }] : []),
+      { icon: "📁", text: "选择 / 换文件", run: () => pickAsset(c) },
+      ...(a ? [{ icon: "⌕", text: "定位文件", run: () => revealAsset(a) }] : []),
+      { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
+      { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
+      { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
+      ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
+      { icon: "✕", text: "删除节点（Delete）", danger: true, run: () => delCard(c.id) },
     ]);
   }
   const outs = c.outputs || [];
   const out = outs[0];
   const vword = outs.length > 1 ? `逐张看大图（${outs.length} 张）` : (VIEW_WORD[out && out.kind] || "查看大图");
-  showMenu(cx, cy, c.name || (cap ? cap.name : "卡片"), [
+  const dlWord = outs.length > 1
+    ? `下载全部 ${outs.length} 张${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`
+    : `下载${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`;
+  showMenu(cx, cy, c.name || (cap ? cap.name : "节点"), [
     ...(out ? [{ icon: "⛶", text: vword, run: () => openViewer(c) }] : []),
-    { icon: "✎", text: "重命名卡片", run: () => renameCard(c) },
+    ...(out ? [{ icon: "⬇", text: dlWord, run: () => outs.forEach(o => downloadOut(o)) }] : []),
+    { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
     { icon: "↑", text: "运行", run: () => run(c) },
     { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
     // Ctrl+C 是"拿在手上、想粘哪儿粘哪儿"，跟就地复制不是一件事，两条都留
     { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
-    // 拖角改过大小才给这条：没改过的卡摆一个点了没反应的菜单项只会让人以为坏了
+    // 拖角改过大小才给这条：没改过的节点摆一个点了没反应的菜单项只会让人以为坏了
     ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
-    { icon: "✕", text: "删除卡片（Delete）", danger: true, run: () => delCard(c.id) },
+    { icon: "✕", text: "删除节点（Delete）", danger: true, run: () => delCard(c.id) },
   ]);
 }
 
+/** 把一份产物下载到本地（浏览器下载）。跨源的同名问题不用管 —— 产物都走
+    本服务的 /api/file，URL 就是自己的源。 */
+function downloadOut(o) {
+  const a = document.createElement("a");
+  a.href = o.url;
+  a.download = o.filename.split(/[\\/]/).pop() || "download";
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
 function resetSize(c) {
-  delete c.w; delete c.h;      // 删掉而不是写回 268/168：默认值将来改了，老卡也跟着走
+  delete c.w; delete c.h;      // 删掉而不是写回 268/168：默认值将来改了，老节点也跟着走
   applySize(c); drawWires(); placePanel(); save();
 }
 
 function renameCard(c) {
   const cap = capOf(c);
-  const n = prompt("卡片名字（留空恢复成工作流名）", c.name || (cap ? cap.name : ""));
+  const n = prompt("节点名字（留空恢复成工作流名）", c.name || (cap ? cap.name : ""));
   if (n === null) return;
   c.name = n.trim().slice(0, 40) || null;
   paintTitle(c); save();
@@ -1360,12 +2215,18 @@ function cloneCard(c) {
   Object.assign(n, {
     cap: c.cap, name: c.name, params: JSON.parse(JSON.stringify(c.params || {})),
     assets: JSON.parse(JSON.stringify(c.assets || {})),
+    // 素材节点手里那份文件在 outputs[0]，就地复制得连着一起抄，不然复制出来是张空节点
+    ...(isAsset(c) ? { outputs: JSON.parse(JSON.stringify(c.outputs || [])) } : {}),
   });
-  paintTitle(n); paint(n); openPanel(n.id); save();      // paint：风格卡的正文在画面区
+  paintTitle(n); paint(n); openPanel(n.id); save();      // paint：风格节点的正文在画面区
 }
 
 function addCard(type, x, y, cap) {
   const def = cardDef(type);
+  if (!def || !def.modes || !def.modes.length) {
+    toast(`节点类型 ${type} 不可用：找不到定义或没有模式`);
+    return null;
+  }
   const c = { id: uid(), type, cap: cap || modeCap(def.modes[0]), x: Math.round(x), y: Math.round(y), params: {}, assets: {}, status: null, progress: 0, outputs: [] };
   PROJ.cards.push(c);
   el.world.appendChild(buildCard(c));
@@ -1376,13 +2237,23 @@ function addCard(type, x, y, cap) {
 function delCard(id) {
   PROJ.cards = PROJ.cards.filter(c => c.id !== id);
   PROJ.edges = PROJ.edges.filter(e => e.from !== id && e.to !== id);
+  // 组里少一张；空组直接散掉
+  selIds.delete(id);
+  if (PROJ.groups) {
+    for (const g of PROJ.groups) g.cards = g.cards.filter(x => x !== id);
+    PROJ.groups = PROJ.groups.filter(g => g.cards.length);
+  }
   if (selId === id) { selId = null; closePanel(); }
+  // 介绍浮层（悬停标题出的那段说明）和历史产物栏可能正开着这个节点：
+  // 元素一删 mouseleave 永远不会来，不手动收掉就一直浮在那儿
+  tipHide();
+  if (el.hist._id === id) closeHistory();
   selEdge = null;                    // 连着它的线跟着没了，选中记号不能留成野指针
   render(); save();
 }
 
-/** Delete 键删卡。菜单里那条不问就删（点菜单是有意的），键盘容易手滑，
-    所以**跑出过东西的卡**要问一句 —— 没有撤销，删掉那几轮的产物记录就找不回来了。 */
+/** Delete 键删节点。菜单里那条不问就删（点菜单是有意的），键盘容易手滑，
+    所以**跑出过东西的节点**要问一句 —— 没有撤销，删掉那几轮的产物记录就找不回来了。 */
 function askDelCard(c) {
   const n = (c.history || []).length;
   if ((c.outputs || []).length || n) {
@@ -1393,7 +2264,7 @@ function askDelCard(c) {
   toast(`已删除「${titleOf(c)}」`);
 }
 
-/** Ctrl+C 存下的那张卡。只活在这一次打开里（不落盘）—— 它是"手上拿着的东西"，
+/** Ctrl+C 存下的那个节点。只活在这一次打开里（不落盘）—— 它是"手上拿着的东西"，
     不是项目内容；跨项目粘贴也就顺带能用了。 */
 let CLIP = null;
 /** 鼠标最后停在画布世界坐标的哪儿：Ctrl+V 要粘在鼠标那儿，不然连粘 5 张会叠成一坨 */
@@ -1407,14 +2278,14 @@ function copyCard(c) {
     assets: JSON.parse(JSON.stringify(c.assets || {})),
   };
   pasteN = 0;
-  // 产物和历史故意不带：复制一张卡不该让新卡假装它也跑过（跟"复制卡片"菜单同一个规矩）
+  // 产物和历史故意不带：复制一个节点不该让新节点假装它也跑过（跟"复制节点"菜单同一个规矩）
   toast(`已复制「${titleOf(c)}」（不含产物）· Ctrl+V 粘贴`);
 }
 
 function pasteCard() {
-  if (!CLIP) return toast("还没复制东西：先点一张卡，Ctrl+C");
-  // cardDef 找不到会落回第一张卡（生图），照它粘会粘出一张不相干的卡，所以这儿要精确查
-  if (!CARDS.some(d => d.id === CLIP.type)) return toast("这种卡在当前版本里不存在了，粘不了");
+  if (!CLIP) return toast("还没复制东西：先点一个节点，Ctrl+C");
+  // cardDef 找不到会落回第一个节点（生图），照它粘会粘出一张不相干的节点，所以这儿要精确查
+  if (!CARDS.some(d => d.id === CLIP.type)) return toast("这种节点在当前版本里不存在了，粘不了");
   // 鼠标不在画布上（比如刚在侧边栏点完）就按老位置错开一点，连着粘也不会重叠
   const at = mouseW || { x: CLIP.x + 24 * ++pasteN, y: CLIP.y + 28 * pasteN };
   const n = addCard(CLIP.type, at.x - CW / 2, at.y - 40, CLIP.cap);
@@ -1437,12 +2308,30 @@ function firstFreeSlot(c, kind) {
   return (specs.find(s => !c.assets[s.key]) || specs[0] || null);
 }
 
-/** 把风格卡挂到一张生成卡上。不搬文件、不占素材槽 —— 只记一条 @style 连线，
-    真正的合并发生在提交那一刻（payloadOf），所以改风格卡不用重连、也不用重跑上游。 */
-function linkStyle(from, to) {
-  if (isStyle(to)) return toast("风格卡之间不用连线：一张卡可以挂好几张风格卡");
+/** 把一个文本节点接到别的节点上。不搬文件、不占素材槽 ——
+    只记一条 @ 开头的连线：连生成节点就是提交那一刻并进提示词（payloadOf），
+    连另一个文本节点就是运行那一刻当输入。所以改上游的字不用重连、也不用重跑下游。 */
+function linkText(from, to) {
+  if (from.id === to.id) return;
+  if (isText(to)) {
+    // 文本节点：@text 边，一张能收好几根（多个文本输入），同一根不重复接
+    if (!textOf(from)) return toast(`「${titleOf(from)}」手里还没有字：先写一段，或先运行它`);
+    if (PROJ.edges.some(e => e.from === from.id && e.to === to.id && e.slot === TEXT_SLOT)) {
+      return toast("已经接过了");
+    }
+    PROJ.edges.push({ from: from.id, to: to.id, slot: TEXT_SLOT });
+    drawWires(); paintStyles();
+    if (selId === to.id) openPanel(to.id);
+    save();
+    const n = ownTexts(to).length;
+    toast(`已把「${titleOf(from)}」的文本接给「${titleOf(to)}」（第 ${n} 段输入）`);
+    return;
+  }
+  if (isStyle(to)) return toast("风格节点不收输入：它把字写给生成节点用");
+  // 生成节点：@style 边（老机制），同样一张能挂好几个文本节点
   const ps = promptSpecs(capOf(to));
-  if (!ps.length) return toast(`「${titleOf(to)}」不写提示词，挂风格卡没有用`);
+  if (!ps.length) return toast(`「${titleOf(to)}」不写提示词，接文本节点没有用`);
+  if (!textOf(from)) return toast(`「${titleOf(from)}」手里还没有字：先写一段，或先运行它`);
   if (PROJ.edges.some(e => e.from === from.id && e.to === to.id && e.slot === STYLE_SLOT)) {
     return toast("已经挂上了");
   }
@@ -1451,23 +2340,24 @@ function linkStyle(from, to) {
   if (selId === to.id) openPanel(to.id);
   save();
   const n = styleReach(from).length;
-  toast(`风格已挂给「${titleOf(to)}」` + (n ? `，下游 ${n} 张卡也跟着套` : ""));
+  toast(`文本已挂给「${titleOf(to)}」` + (n ? `，下游 ${n} 个节点也跟着带` : ""));
 }
 
 async function linkTo(from, to) {
   if (!to) return;
-  if (isStyle(from)) return linkStyle(from, to);
-  if (isStyle(to)) return toast("风格卡不收素材：把它的出口拖到生图/生视频卡上");
+  if (isTextCard(from)) return linkText(from, to);
+  if (isTextCard(to)) return toast("文本节点不收图片/视频素材：把文本节点的出口拖过来才是接文本");
+  if (isAsset(to)) return toast("素材节点不收输入：它是把手里那份素材送给别的节点的");
   const out = (from.outputs || [])[0];
-  if (!out) return toast("上游还没有产物，先运行它");
-  // 路由卡先按上游产物的类型切到对应那一路，切完槽位名才对得上（见 routeFor）
+  if (!out) return toast(isAsset(from) ? "这个素材节点还是空的：先点它选个文件" : "上游还没有产物，先运行它");
+  // 路由节点先按上游产物的类型切到对应那一路，切完槽位名才对得上（见 routeFor）
   const r = routeFor(to, out.kind);
   if (r) { to.cap = r.cap; to.assets = {}; paintTitle(to); }
   const spec = r ? { key: r.slot, label: KIND_ZH[out.kind] || "素材" }
     // 同类型的槽优先（视频产物接进视频槽）；没有就沿用老规矩，当参考图使
     : (firstFreeSlot(to, out.kind)
       || firstFreeSlot(to, out.kind === "audio" ? "audio" : "image"));
-  if (!spec) return toast("下游卡没有可接收的槽位");
+  if (!spec) return toast("下游节点没有可接收的槽位");
   PROJ.edges = PROJ.edges.filter(e => !(e.to === to.id && (r || e.slot === spec.key)));
   PROJ.edges.push({ from: from.id, to: to.id, slot: spec.key });
   drawWires(); paintStyles(); save();
@@ -1475,7 +2365,10 @@ async function linkTo(from, to) {
     // 风格是顺着这根线传下来的（没有单独的连线），接线那一刻就说一句，不然是隐形的
     const inh = styleTexts(to).length && promptSpecs(capOf(to)).length;
     toast(`引用上游产物 → ${spec.label}` + (inh ? "；上游的风格也跟着传下来了" : ""));
-    to.assets[spec.key] = await importOutput(out);
+    // 素材节点手里那份本来就是上传上来的（已经在 input 目录里、ref 是现成的），
+    // 再走一遍 importOutput 就是把同一个文件下载下来重新传一次，纯粹白等
+    to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
+      : await importOutput(out);
     paintKind(to);
     if (selId === to.id) openPanel(to.id);
     save();
@@ -1483,7 +2376,7 @@ async function linkTo(from, to) {
 }
 
 /** 这个模式收得下 kind 类型的素材吗。
-    路由卡看它有没有那一路；阶梯模式的 md.id 是张数最多那条（超集），
+    路由节点看它有没有那一路；阶梯模式的 md.id 是张数最多那条（超集），
     它有的槽少张数那条都有，所以只看超集就够。 */
 function modeTakes(md, kind) {
   if (md.route) return !!md.route[kind];
@@ -1494,53 +2387,66 @@ function modeTakes(md, kind) {
 /** 从出口拖到空白处：列出真收得下这份产物的玩法让人自己挑。
     以前是按产出类型猜一张（图→生视频、视频→生图），猜错的概率不低，
     而且"视频接进生图当参考图"根本跑不通（LoadImage 读不了 mp4）。
-    这里只列槽位类型对得上的，选完直接建卡 + 连线。 */
+    这里只列槽位类型对得上的，选完直接建节点 + 连线。 */
 async function spawnDownstream(from, at, cx, cy) {
-  // 风格卡拖出来：列所有写提示词的玩法（工具卡不写提示词，自动落选）
-  if (isStyle(from)) {
+  // 一个节点一条，收口成跟底部工具条一样的几样（文本/图片/视频/工具箱），不再按玩法摊开。
+  // 建节点用的是**第一个收得下这份素材的模式**——拖一张图给「图片」建出来就是图生图，
+  // 不是文生图，不然线接上去发现没有格子可进。
+  const ORDER = [
+    ["card_text", "文本"], ["card_image", "图片"], ["card_video", "视频"], ["card_tools", "工具箱"],
+  ];
+  const list = (pred) => {
     const items = [];
-    for (const [gname, defs] of menuGroups()) {
-      const hit = [];
-      for (const def of defs) {
-        for (const md of def.modes) if (promptSpecs(CAPS[modeCap(md)]).length) hit.push([def, md]);
-      }
-      if (!hit.length) continue;
-      items.push({ group: gname });
-      for (const [def, md] of hit) {
-        items.push({
-          icon: def.icon, text: md.name,
-          run: () => linkStyle(from, addCard(def.id, at.x, at.y - 40, modeCap(md))),
-        });
-      }
+    for (const [tid, label] of ORDER) {
+      const def = CARDS.find(d => d.id === tid);
+      if (!def || !def.modes.length) continue;
+      const md = def.modes.find(pred);
+      if (!md) continue;
+      items.push({
+        icon: def.icon, text: label,
+        run: async () => {
+          const c = addCard(def.id, at.x, at.y - 40, modeCap(md));
+          if (!c) return;
+          if (isTextCard(from)) await linkText(from, c);
+          else await linkTo(from, c);
+        },
+      });
     }
+    return items;
+  };
+  // 文本节点拖出来：文本节点（当这段文字的输入）+ 写提示词的生成节点。文本节点自己没有
+  // promptSpecs（它不是能力），走 pred 会漏掉，单独补一条
+  if (isTextCard(from)) {
+    const tdef = CARDS.find(d => d.id === "card_text");
+    const items = [];
+    if (tdef && tdef.modes.length) items.push({
+      icon: tdef.icon, text: "文本节点（接住这段字当输入）",
+      run: async () => {
+        const c = addCard(tdef.id, at.x, at.y - 40, modeCap(tdef.modes[0]));
+        if (c) await linkText(from, c);
+      },
+    });
+    items.push(...list(md => promptSpecs(CAPS[modeCap(md)]).length));
     if (!items.length) return;
-    return showMenu(cx, cy, "把这段风格挂给…", items);
+    return showMenu(cx, cy, "把这段文本接给…", items);
+  }
+  if (isAsset(from)) {
+    const a = assetOf(from);
+    if (!a) return toast("这个素材节点还是空的：先点它选个文件");   // 没东西可往外送
+    // 素材节点手里那份就是它的"产物"：按它真实的类型列收得下的节点
+    const items = list(md => modeTakes(md, a.kind));
+    const zh = KIND_ZH[a.kind] || a.kind;
+    return items.length ? showMenu(cx, cy, `把这个${zh}接给…`, items)
+      : toast(`没有节点收${zh}素材`);
   }
   const out = (from.outputs || [])[0];
   // 还没跑过就按这条能力"将来会出什么"来列 —— 先把链子搭起来、回头再跑是常见做法，
   // 不能因为上游还空着就什么都不给建（linkTo 那边会提醒去跑上游）
   const kind = out ? out.kind : (capOf(from) || defOf(from) || {}).outputType;
   if (!kind) return;
-  const items = [];
-  for (const [gname, defs] of menuGroups()) {
-    const hit = [];
-    for (const def of defs) {
-      for (const md of def.modes) if (modeTakes(md, kind)) hit.push([def, md]);
-    }
-    if (!hit.length) continue;
-    items.push({ group: gname });
-    for (const [def, md] of hit) {
-      items.push({
-        icon: def.icon, text: md.name,
-        run: async () => {
-          const c = addCard(def.id, at.x, at.y - 40, modeCap(md));
-          await linkTo(from, c);
-        },
-      });
-    }
-  }
+  const items = list(md => modeTakes(md, kind));
   const zh = KIND_ZH[kind] || kind;
-  if (!items.length) return toast(`没有卡片收${zh}素材`);
+  if (!items.length) return toast(`没有节点收${zh}素材`);
   showMenu(cx, cy, `把这个${zh}接给…`, items);
 }
 
@@ -1568,12 +2474,12 @@ async function revealAsset(a) {
 }
 
 /* ================= 右侧历史产物栏 ================= */
-const HIST_MAX = 20;               // 每张卡留 20 轮；再往前的去 ComfyUI 的 output 目录里找
+const HIST_MAX = 20;               // 每个节点留 20 轮；再往前的去 ComfyUI 的 output 目录里找
 
 /** 一轮产物的签名，用来判重：轮询会反复读到同一轮，不能记成好多条 */
 const runSig = (outs) => (outs || []).map(o => o.url).join("|");
 
-/** 把卡片刚出的这一轮记进历史（最新的在最前面） */
+/** 把节点刚出的这一轮记进历史（最新的在最前面） */
 function pushHistory(c) {
   const outs = c.outputs || [];
   if (!outs.length) return;
@@ -1583,14 +2489,14 @@ function pushHistory(c) {
   c.history.unshift({
     ts: Date.now(), seed: c.seed != null ? c.seed : null,
     cap: runCap(c), ms: c.ms != null ? c.ms : null, outputs: outs,
-    // 挂了风格卡时，卡上提示词框里的字并不是真发出去的那段（风格是提交那一刻并进去的）。
-    // 只有把当时真提交的整段留下来，这一轮才复现得出来 —— 风格卡后来改了、解除了都不影响它
+    // 挂了风格节点时，节点上提示词框里的字并不是真发出去的那段（风格是提交那一刻并进去的）。
+    // 只有把当时真提交的整段留下来，这一轮才复现得出来 —— 风格节点后来改了、解除了都不影响它
     ...(c._sent ? { prompt: c._sent } : {}),
   });
   if (c.history.length > HIST_MAX) c.history.length = HIST_MAX;
 }
 
-/** 老项目里的卡只有 outputs 没有 history，补一条占位，别让人以为产物丢了。
+/** 老项目里的节点只有 outputs 没有 history，补一条占位，别让人以为产物丢了。
  *  ts 记 null：那一轮的时间我们确实不知道，显示成"早前"，不编一个假时间 */
 function seedHistory(c) {
   if (c.history) return;
@@ -1627,7 +2533,7 @@ function closeHistory() {
 function openHistory(id) {
   const c = PROJ && PROJ.cards.find(x => x.id === id);
   if (!c) return closeHistory();
-  if (isStyle(c)) return closeHistory();   // 风格卡永远没有产物，别摆一个空栏子占地方
+  if (isTextCard(c)) return closeHistory();   // 文本节点/风格节点没有媒体产物，别摆一个空栏子占地方
   seedHistory(c);
   const list = document.createElement("div"); list.className = "hlist";
   const cap = capOf(c);
@@ -1639,7 +2545,7 @@ function openHistory(id) {
 
   if (!c.history.length) {
     const e = document.createElement("div"); e.className = "hempty";
-    e.textContent = "这张卡还没出过东西。\n运行一次，每一轮的产物和 seed 都会留在这里。";
+    e.textContent = "这个节点还没出过东西。\n运行一次，每一轮的产物和 seed 都会留在这里。";
     e.style.whiteSpace = "pre-line";
     list.appendChild(e);
   }
@@ -1694,7 +2600,7 @@ function histRun(c, h, cur) {
   }
   box.appendChild(rs);
 
-  // 套了风格卡的那几轮：把当时真提交的整段提示词收在这儿。卡上那个框里的字
+  // 套了风格节点的那几轮：把当时真提交的整段提示词收在这儿。节点上那个框里的字
   // 不等于跑出这一轮的那段话，不放出来的话这一轮等于没法复现
   if (h.prompt) {
     const rp = document.createElement("details"); rp.className = "rp";
@@ -1712,7 +2618,7 @@ function closePanel() {
   closeHistory();
 }
 
-/** 拖卡片时把面板藏起来（用 visibility 而不是 display：还能量到宽高，松手好复位） */
+/** 拖节点时把面板藏起来（用 visibility 而不是 display：还能量到宽高，松手好复位） */
 function veilPanel(on) {
   if (el.panel.style.display === "none") return;
   el.panel.style.visibility = on ? "hidden" : "";
@@ -1728,7 +2634,7 @@ function placePanel() {
   el.panel.style.maxHeight = (innerHeight - TOP - GAP) + "px";
   const r = el.stage.getBoundingClientRect();
   const w = el.panel.offsetWidth, h = el.panel.offsetHeight;
-  // 卡片在屏幕上的矩形（offsetHeight 是世界坐标，要乘缩放）
+  // 节点在屏幕上的矩形（offsetHeight 是世界坐标，要乘缩放）
   const cx = r.left + view.x + c.x * view.k, cy = r.top + view.y + c.y * view.k;
   const cw = cardW(c) * view.k, ch = c._el.offsetHeight * view.k;
   // 横向按画布自己的左右边界夹，而不是整个窗口：右边开着历史产物栏时，
@@ -1752,18 +2658,23 @@ function openPanel(id) {
   const c = PROJ.cards.find(x => x.id === id);
   if (!c) return closePanel();
   const def = defOf(c), cap = capOf(c);
-  // 切 tab / 传图都会整块重画，同一张卡要留住滚动位置，不然每次都弹回顶部
+  // 切 tab / 传图都会整块重画，同一个节点要留住滚动位置，不然每次都弹回顶部
   const old = el.panel.querySelector(".pbody");
   const scrolled = (old && el.panel._id === id) ? old.scrollTop : 0;
   el.panel._id = id;
   el.panel.innerHTML = "";
   el.panel.style.display = "";
-  el.panel.style.visibility = "";     // 上一次拖卡片藏起来后没复位的话，这里兜一下
+  el.panel.style.visibility = "";     // 上一次拖节点藏起来后没复位的话，这里兜一下
 
   if (isStyle(c)) return stylePanel(c);
+  if (isText(c)) return textPanel(c);
+  if (isAsset(c)) return assetPanel(c);
 
   // --- 模式切换 ---
-  if (def.modes.length > 1) {
+  // 生图节点和生视频节点的模式挪到底部工具条的胶囊里（面板只留素材引用和提示词，见底部 foot）；
+  // 别的多模式节点暂时还是顶部条
+  const compact = (def.id === "card_image" || def.id === "card_video") && def.modes.length > 1;
+  if (def.modes.length > 1 && !compact) {
     const m = document.createElement("div"); m.className = "modes";
     for (const md of def.modes) {
       const b = document.createElement("button");
@@ -1788,7 +2699,7 @@ function openPanel(id) {
     })
     : cap.inputs;
   const md = modeOf(c);
-  // 路由卡的入口只有一格、两种素材都收，所以空着的时候不能叫「图片」（见 ROUTE_CARDS.entry）。
+  // 路由节点的入口只有一格、两种素材都收，所以空着的时候不能叫「图片」（见 ROUTE_CARDS.entry）。
   // 一旦放进去了就露出真名（图片/视频），那正好是"路由到哪一路了"的反馈
   if (md && md.entry) {
     const i = specs.findIndex(x => MEDIA.includes(x.type));
@@ -1803,10 +2714,10 @@ function openPanel(id) {
 
   // --- 玩法说明 ---
   // 能力本身的介绍（cap.note、吃什么吐什么）不在这儿画：面板一打开就是一大段字，
-  // 把素材槽和参数挤到下面去，而这段话看一遍就够了。改成鼠标停在卡片顶栏上才显示
+  // 把素材槽和参数挤到下面去，而这段话看一遍就够了。改成鼠标停在节点顶栏上才显示
   // （buildCard 里的 hoverBrief）。下面这两条留着 —— 它们不是介绍，是"现在会跑哪条"
   // 的实时反馈，看的时候正需要对着参数看。
-  // 路由卡：说清楚放什么会跑什么，并标出现在这一格是哪一路
+  // 路由节点：说清楚放什么会跑什么，并标出现在这一格是哪一路
   if (md && md.route) {
     const filled = Object.keys(md.route).find(k => md.route[k].cap === c.cap
       && c.assets[md.route[k].slot]);
@@ -1863,6 +2774,7 @@ function openPanel(id) {
   // mirror = 多个节点共用同一个参数框（如两个采样器共用种子），只画一次
   // ranged = 已经画成上面那条选区了，别在这儿再出一对文本框
   const rows = specs.filter(x => !MEDIA.includes(x.type) && x.type !== "textarea"
+    && x.type !== "seed"            // 种子不进面板：永远默认 -1（每次随机），想复现去历史栏复制 seed
     && !x.advanced && !x.mirror && !ranged.has(x.key));
   // 旋钮下面那行小字：光靠 label 说不清的（"分辨率"是每格的还是整张的）必须摆在
   // 明面上。以前只有「高级」里的旋钮画它，常规旋钮的 hint 只当 tooltip，不悬停看不见
@@ -1874,38 +2786,45 @@ function openPanel(id) {
       box.appendChild(nt);
     }
   };
-  for (const s of rows) addRow(body, s);
-
-  // --- 高级 ---
-  const adv = specs.filter(x => x.advanced && !x.mirror && !ranged.has(x.key));
-  if (adv.length) {
-    const box = document.createElement("div"); box.className = "adv";
-    const t = document.createElement("button");
-    t.textContent = `▸ 高级 (${adv.length})`;
-    const items = document.createElement("div"); items.className = "items"; items.style.display = "none";
-    // 高级参数默认值都是调好的，不写清楚推荐多少、为什么，用户只能瞎拉滑条
-    for (const s of adv) addRow(items, s);
-    t.onclick = () => {
-      const open = items.style.display === "none";
-      items.style.display = open ? "" : "none";
-      t.textContent = (open ? "▾" : "▸") + ` 高级 (${adv.length})`;
-      placePanel();
-    };
-    box.appendChild(t); box.appendChild(items);
-    body.appendChild(box);
-  }
+  // 生图节点的分辨率/比例不在面板里摊开了：点「⚙」胶囊弹独立小窗（openResPop）。
+  // 别的节点照旧摊开剩余旋钮；高级参数整个不画（用户定的：基本上不动）
+  // **compact 模式：分辨率参数 + 常规参数（duration/target_fps）收进 ⚙ 弹窗**
+  const pwrap = document.createElement("div"); pwrap.className = "pwrap";
+  const COMPACT_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "scale_to_length",
+    "duration", "target_fps"]);
+  for (const s of rows) if (!(compact && COMPACT_KEYS.has(s.key))) addRow(pwrap, s);
+  body.appendChild(pwrap);
 
   if (c.error) body.appendChild(errBox(c.error));
 
   // --- 底部 ---
   const foot = document.createElement("div"); foot.className = "foot";
+  // 生图节点和生视频节点：左下「模式」胶囊（换玩法）+「⚙ 参数」（清晰度/比例弹窗），跟文本节点同一套
+  if (compact) {
+    const isVideo = def.id === "card_video";
+    foot.appendChild(capBtn(`${def.icon} ${(modeOf(c) || def.modes[0]).name}`, isVideo ? "生视频模式" : "生图模式",
+      () => def.modes.map(mo => ({
+        icon: def.icon,
+        text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),
+        run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo); openPanel(id); paintTitle(c); save(); },
+      }))));
+    const pb = document.createElement("button");
+    pb.className = "tcap";
+    const cb = paramsBrief(c, cap);
+    pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
+    pb.title = "点开弹窗：清晰度、画面比例、时长等参数";
+    pb.onclick = (ev) => { ev.stopPropagation(); openResPop(c, pb); };
+    foot.appendChild(pb);
+  }
   const running = c.status === "queued" || c.status === "running";
   const info = document.createElement("span");
   info.style.cssText = "color:#8a8a94;font-size:12px";
   info.textContent = cap.outputType === "video" ? "输出：视频" : "输出：图片";
-  // 说明搬去卡片顶栏悬停了，这儿得留一句指路：素材有硬性要求（比如每张图必须是
+  // 上一轮跑了多久：视频一轮动辄几分钟，这个数得在面板里也报一声（节点脚上一直有）
+  if (c.status === "done" && c.ms > 0) info.textContent += ` · 上次 ${fmtEla(c.ms)}`;
+  // 说明搬去节点顶栏悬停了，这儿得留一句指路：素材有硬性要求（比如每张图必须是
   // 四宫格拼图）的玩法，没看过那段话就是白跑一轮
-  if (cap.note) info.textContent += " · 玩法说明：鼠标停在卡片标题上";
+  if (cap.note) info.textContent += " · 玩法说明：鼠标停在节点标题上";
   foot.appendChild(info);
   if (running) {
     const cn = document.createElement("button");
@@ -1927,24 +2846,24 @@ function openPanel(id) {
 
 function errBox(t) { const d = document.createElement("div"); d.className = "err"; d.textContent = t; return d; }
 
-/** 风格卡的面板。它没有能力、没有素材、没有参数，只有一段文字和"挂给了谁"，
+/** 风格节点的面板。它没有能力、没有素材、没有参数，只有一段文字和"挂给了谁"，
     所以整块单独画，不走上面那套（specs / 旋钮 / 运行按钮一个都用不上）。 */
 function stylePanel(c) {
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
 
   const n = document.createElement("div"); n.className = "pnote";
-  n.textContent = "这张卡不生成任何东西。把它的出口（右边那颗点）拖到生图/生视频卡上，"
-    + "提交那一刻这段文字会并进那张卡的提示词里 —— 一张风格卡可以同时挂好几张卡，"
+  n.textContent = "这个节点不生成任何东西。把它的出口（右边那颗点）拖到生图/生视频节点上，"
+    + "提交那一刻这段文字会并进那个节点的提示词里 —— 一个风格节点可以同时挂好几个节点，"
     + "改一次，挂着的全跟着变。\n"
     + "挂了一张，它下游整条链都跟着套：产物接给谁，风格就传给谁，"
-    + "不用每一棒都挂一遍（中间夹着放大、补帧这种不写提示词的卡也照样往下传）。"
-    + "下游哪张卡自己挂了风格，那张卡起就以它自己的为准，这一份不再往下传。\n"
-    + `默认是风格在前、空一行再接卡片自己的提示词。想换位置就在下面写上 ${STYLE_PH}，`
-    + "卡片的提示词会填到那个位置去（比如「照下面的内容画一张图：" + STYLE_PH
+    + "不用每一棒都挂一遍（中间夹着放大、补帧这种不写提示词的节点也照样往下传）。"
+    + "下游哪个节点自己挂了风格，那个节点起就以它自己的为准，这一份不再往下传。\n"
+    + `默认是风格在前、空一行再接节点自己的提示词。想换位置就在下面写上 ${STYLE_PH}，`
+    + "节点的提示词会填到那个位置去（比如「照下面的内容画一张图：" + STYLE_PH
     + "。整体是哥特暗黑定格动画风格」）。\n"
     + "只写风格：画风、色调、光线、镜头质感、画质词。别在这儿写具体画面内容 ——"
-    + "那是每张卡自己的事，写在这儿会让所有卡画同一个东西。";
+    + "那是每个节点自己的事，写在这儿会让所有节点画同一个东西。";
   body.appendChild(n);
 
   const wrap = document.createElement("div"); wrap.className = "pblock";
@@ -1978,11 +2897,11 @@ function stylePanel(c) {
   const edges = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e));
   const box = document.createElement("div"); box.className = "slinks";
   const t = document.createElement("div"); t.className = "atitle";
-  t.textContent = edges.length ? `挂着 ${edges.length} 张卡` : "还没挂给任何卡";
+  t.textContent = edges.length ? `挂着 ${edges.length} 个节点` : "还没挂给任何节点";
   box.appendChild(t);
   if (!edges.length) {
     const p = document.createElement("div"); p.className = "anote";
-    p.textContent = "把右边那颗点拖到一张生图/生视频卡上；拖到空白处会列出所有写提示词的玩法。";
+    p.textContent = "把右边那颗点拖到一张生图/生视频节点上；拖到空白处会列出所有写提示词的玩法。";
     box.appendChild(p);
   }
   for (const e of edges) {
@@ -1991,10 +2910,10 @@ function stylePanel(c) {
     const r = document.createElement("div"); r.className = "slink";
     const a = document.createElement("button"); a.className = "nm";
     a.textContent = titleOf(to);
-    a.title = "选中这张卡（面板上能看到合并后的提示词）";
+    a.title = "选中这个节点（面板上能看到合并后的提示词）";
     a.onclick = () => pick(to.id);
     const x = document.createElement("button"); x.className = "off";
-    x.textContent = "解除"; x.title = "这张卡不再套用本风格";
+    x.textContent = "解除"; x.title = "这个节点不再套用本风格";
     x.onclick = () => {
       PROJ.edges = PROJ.edges.filter(y => y !== e);
       drawWires(); paintStyles(); openPanel(c.id); save();
@@ -2013,16 +2932,344 @@ function stylePanel(c) {
       const r = document.createElement("div"); r.className = "slink down";
       const a = document.createElement("button"); a.className = "nm";
       a.textContent = titleOf(to);
-      a.title = "选中这张卡（面板上能看到合并后的提示词）";
+      a.title = "选中这个节点（面板上能看到合并后的提示词）";
       a.onclick = () => pick(to.id);
       const s = document.createElement("span"); s.className = "off ro";
-      s.textContent = "继承"; s.title = "上游那张卡传下来的，要断就断它们之间那根产物连线";
+      s.textContent = "继承"; s.title = "上游那个节点传下来的，要断就断它们之间那根产物连线";
       r.append(a, s);
       box.appendChild(r);
     }
   }
   body.appendChild(box);
   placePanel();
+}
+
+/* ================= 素材节点面板 ================= */
+/** 素材节点的手里就一份上传上来的文件，不生成、没参数。面板里干三件事：
+    换文件、看大图/定位、看这份素材现在喂给了哪几个节点（跟风格节点的「挂给了谁」一个道理，
+    只是那是文本、这份是文件）。 */
+function assetPanel(c) {
+  const body = document.createElement("div"); body.className = "pbody";
+  el.panel.appendChild(body);
+  const a = assetOf(c);
+
+  const n = document.createElement("div"); n.className = "pnote";
+  n.textContent = "这个节点不生成任何东西，手里就拿着一份上传上来的素材。"
+    + "把它的出口（右边那颗点）拖到别的节点上，这份素材就进那个节点的格子里 —— "
+    + "同一张脸想既生视频又抠图，传一次、拉两根线就行，不用在两边的格子里各传一遍。\n"
+    + "图片、视频、音频都收；收进来的就是原文件，不做任何处理。";
+  body.appendChild(n);
+
+  const wrap = document.createElement("div"); wrap.className = "pblock";
+  const hd = document.createElement("div"); hd.className = "phd";
+  const nm = document.createElement("span"); nm.textContent = "手里的素材";
+  const cnt = document.createElement("span"); cnt.className = "demo";
+  hd.append(nm, cnt);
+  wrap.appendChild(hd);
+
+  // 有文件就放一个预览（图片来源/视频/音频各走各的），没文件就放一块空位
+  const pv = document.createElement("div"); pv.className = "asset";
+  if (a) {
+    const fn = document.createElement("div"); fn.className = "aname";
+    fn.textContent = (a.origin || a.url).split(/[\\/]/).pop();
+    fn.title = a.origin || "";
+    pv.appendChild(fn);
+    if (a.kind === "video") {
+      const v = document.createElement("video"); v.src = a.url; v.controls = true; v.loop = true;
+      pv.appendChild(v);
+    } else if (a.kind === "audio") {
+      const au = document.createElement("audio"); au.src = a.url; au.controls = true;
+      pv.appendChild(au);
+    } else {
+      const img = document.createElement("img"); img.src = a.url;
+      pv.appendChild(img);
+    }
+  } else {
+    pv.classList.add("empty");
+    pv.textContent = "还没有文件";
+  }
+  wrap.appendChild(pv);
+
+  // 操作行：换 / 看 / 找，只在有文件时给「看」和「找」
+  const ops = document.createElement("div"); ops.className = "prow";
+  const chg = document.createElement("button"); chg.textContent = a ? "换一个文件" : "选择文件";
+  chg.onclick = () => pickAsset(c);
+  ops.appendChild(chg);
+  if (a) {
+    const vw = document.createElement("button"); vw.textContent = "查看大图";
+    vw.onclick = () => openAsset(a);
+    const rv = document.createElement("button"); rv.textContent = "定位文件";
+    rv.onclick = () => revealAsset(a);
+    ops.appendChild(vw); ops.appendChild(rv);
+  }
+  const clr = document.createElement("button"); clr.textContent = "清空";
+  clr.title = "把这份素材扔掉，节点变回空（不会删文件本身）";
+  clr.onclick = () => { c.outputs = []; paint(c); paintKind(c); openPanel(c.id); save(); };
+  ops.appendChild(clr);
+  cnt.textContent = a ? (a.filename || "").split(/[\\/]/).pop() : "";
+  wrap.appendChild(ops);
+  body.appendChild(wrap);
+
+  // --- 喂给了谁 ---
+  const edges = PROJ.edges.filter(e => e.from === c.id);
+  const box = document.createElement("div"); box.className = "slinks";
+  const t = document.createElement("div"); t.className = "atitle";
+  t.textContent = edges.length ? `喂给 ${edges.length} 个节点` : "还没喂给任何节点";
+  box.appendChild(t);
+  if (!edges.length) {
+    const p = document.createElement("div"); p.className = "anote";
+    p.textContent = a
+      ? "把右边那颗点拖到一个节点上，这份素材就进它的格子。"
+      : "先在上面选一个文件，再把出口拖到别的节点上。";
+    box.appendChild(p);
+  }
+  for (const e of edges) {
+    const to = PROJ.cards.find(x => x.id === e.to);
+    if (!to) continue;
+    const r = document.createElement("div"); r.className = "slink";
+    const b = document.createElement("button"); b.className = "nm";
+    b.textContent = titleOf(to);
+    b.title = "选中这个节点";
+    b.onclick = () => pick(to.id);
+    const x = document.createElement("button"); x.className = "off";
+    x.textContent = "解除"; x.title = "这个节点不再收这份素材";
+    x.onclick = () => {
+      PROJ.edges = PROJ.edges.filter(y => y !== e);
+      drawWires(); paintStyles(); openPanel(c.id); save();
+    };
+    r.append(b, x);
+    box.appendChild(r);
+  }
+  body.appendChild(box);
+  placePanel();
+}
+
+/* ================= 文本节点面板 ================= */
+/** 加工方式：不选 = 纯文本节点（只存字）；选了哪个，运行就按哪个规矩加工。
+    「自定义」用下面那个指令框；三种预设是调好的规矩，指令框对它们无效。 */
+const TEXT_OPS_UI = [
+  ["polish", "润色", "改得更通顺好读，不加料不改意思"],
+  ["optimize", "优化", "删废话、换具体说法，更精炼有表现力"],
+  ["expand", "扩写", "补细节补过渡，写到 2~3 倍长"],
+  ["custom", "自定义", "按下面写的指令处理文字"],
+];
+
+/** 文本节点的面板：字在节点上（那个框直接写直接改），这里管加工 ——
+    指令 + 输入列表 + 附加文字 + 连给了谁；底部一条工具条：
+    左下角「模型」胶囊、右边一颗「加工方式」胶囊、最右圆形「↑ 运行」。 */
+function textPanel(c) {
+  const body = document.createElement("div"); body.className = "pbody";
+  el.panel.appendChild(body);
+  const busy = c.status === "running";
+  c.params = c.params || {};
+
+  // --- 指令（自定义加工方式才用） ---
+  if (c.params.op === "custom") {
+    const wrap = document.createElement("div"); wrap.className = "pblock";
+    const hd = document.createElement("div"); hd.className = "phd";
+    hd.innerHTML = `<span>指令</span>`;
+    const ta = document.createElement("textarea");
+    ta.placeholder = "例：把接进来的几段整理成一条朋友圈文案，口语一点，带两个 emoji";
+    ta.value = String(c.params.instr || "");
+    ta.oninput = () => { c.params.instr = ta.value; save(); };
+    wrap.append(hd, ta);
+    body.appendChild(wrap);
+  }
+
+  // --- 输入列表：按连线顺序，就是喂给模型的顺序；节点上自己写的字也算一段 ---
+  const ins = ownTexts(c);
+  const own = textOf(c);
+  const box = document.createElement("div"); box.className = "slinks";
+  const t = document.createElement("div"); t.className = "atitle";
+  t.textContent = c.params.op
+    ? `输入（${ins.length + (own ? 1 : 0)} 段${ins.length || own ? " · 节点上的字排第一，连线顺序跟在后面" : "）"}` : "还没选加工方式";
+  box.appendChild(t);
+  if (c.params.op) {
+    if (own) {
+      const r = document.createElement("div"); r.className = "slink";
+      r.title = own;
+      const no = document.createElement("span"); no.className = "no"; no.textContent = "1";
+      const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = "这个节点节点上的字";
+      const pv = document.createElement("span"); pv.className = "pv";
+      pv.textContent = own.slice(0, 60) + (own.length > 60 ? "…" : "");
+      r.append(no, nm, pv);
+      box.appendChild(r);
+    }
+    if (!ins.length) {
+      const p = document.createElement("div"); p.className = "anote";
+      p.textContent = "把别的文本节点出口拖到左边那颗绿点上，接进来的文字会跟在节点上的字后面一起加工"
+        + "（没接也行：节点上有字、或下面写了附加文字就能跑）。";
+      box.appendChild(p);
+    }
+    ins.forEach((x, i) => {
+      const r = document.createElement("div"); r.className = "slink";
+      r.title = x.text;
+      const no = document.createElement("span"); no.className = "no";
+      no.textContent = String(i + 2);
+      const a = document.createElement("button"); a.className = "nm";
+      a.textContent = x.name;
+      a.title = "选中这张上游节点（手里没字时先去写/运行它）";
+      a.onclick = () => pick(x.id);
+      const pv = document.createElement("span"); pv.className = "pv";
+      pv.textContent = x.text.slice(0, 60) + (x.text.length > 60 ? "…" : "");
+      pv.title = x.text;
+      const off = document.createElement("button"); off.className = "off";
+      off.textContent = "断开"; off.title = "这段不再作为输入";
+      off.onclick = () => {
+        PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.from === x.id && e.slot === TEXT_SLOT));
+        drawWires(); paintStyles(); openPanel(c.id); save();
+      };
+      r.append(no, a, pv, off);
+      box.appendChild(r);
+    });
+  }
+  body.appendChild(box);
+
+  // --- 附加文字（排在所有输入的最后面） ---
+  const wrap = document.createElement("div"); wrap.className = "pblock";
+  const hd = document.createElement("div"); hd.className = "phd";
+  const nm = document.createElement("span"); nm.textContent = "附加文字（可选）";
+  const clr = document.createElement("button"); clr.textContent = "清空";
+  hd.append(nm, clr);
+  const ta = document.createElement("textarea");
+  ta.placeholder = "接进来的几段之外还想补一句，写在这儿（排在它们后面）";
+  ta.value = String(c.params.extra || "");
+  ta.style.minHeight = "54px";
+  ta.oninput = () => { c.params.extra = ta.value; paintTextFoot(c); save(); };
+  clr.onclick = () => { ta.value = ""; c.params.extra = ""; paintTextFoot(c); save(); };
+  wrap.append(hd, ta);
+  body.appendChild(wrap);
+
+  // --- 连给了谁（@style 挂的生成节点 + @text 接的文本节点） ---
+  const edges = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e));
+  const sbox = document.createElement("div"); sbox.className = "slinks";
+  const st = document.createElement("div"); st.className = "atitle";
+  st.textContent = edges.length ? `连着 ${edges.length} 个节点` : "还没连给任何节点";
+  sbox.appendChild(st);
+  if (!edges.length) {
+    const p = document.createElement("div"); p.className = "anote";
+    p.textContent = "把右边那颗点拖到生成节点（并进提示词）或别的文本节点（当输入）上；"
+      + "拖到空白处会列出所有能接的地方。";
+    sbox.appendChild(p);
+  }
+  for (const e of edges) {
+    const to = PROJ.cards.find(x => x.id === e.to);
+    if (!to) continue;
+    const r = document.createElement("div"); r.className = "slink";
+    const a = document.createElement("button"); a.className = "nm";
+    a.textContent = titleOf(to);
+    a.title = "选中这个节点";
+    a.onclick = () => pick(to.id);
+    const x = document.createElement("button"); x.className = "off";
+    x.textContent = "解除"; x.title = "这个节点不再用这段文本";
+    x.onclick = () => {
+      PROJ.edges = PROJ.edges.filter(y => y !== e);
+      drawWires(); paintStyles(); openPanel(c.id); save();
+    };
+    r.append(a, x);
+    sbox.appendChild(r);
+  }
+  body.appendChild(sbox);
+
+  if (c.error) body.appendChild(errBox(c.error));
+
+  // --- 底部工具条：左下「模型」胶囊 · 右边「加工方式」胶囊 · 中间信息 · 最右「↑」圆钮 ---
+  const foot = document.createElement("div"); foot.className = "foot";
+  foot.appendChild(capBtn(
+    (c.params.model || "api") === "local" ? "🖥 本地 27B" : "☁ 云端 API",
+    "模型",
+    () => [
+      { icon: "☁", text: "云端 API —— 几秒就回，要配好 llm.json",
+        run: () => { c.params.model = "api"; openPanel(c.id); save(); } },
+      { icon: "🖥", text: "本地 27B —— 不花钱，占显存，第一次慢",
+        run: () => { c.params.model = "local"; openPanel(c.id); save(); } },
+    ]));
+  const opName = (id) => id ? (TEXT_OPS_UI.find(x => x[0] === id) || [0, id])[1] : "不加工";
+  foot.appendChild(capBtn(
+    opName(c.params.op),
+    "加工方式",
+    () => [
+      { icon: "✍", text: "不加工 —— 就当一个纯文本节点，只存字",
+        run: () => { c.params.op = ""; paint(c); openPanel(c.id); save(); } },
+      ...TEXT_OPS_UI.map(([id, name, tip]) => ({
+        icon: "✎", text: `${name} —— ${tip}`,
+        run: () => { c.params.op = id; paint(c); openPanel(c.id); save(); },
+      })),
+    ]));
+
+  const info = document.createElement("span");
+  info.style.cssText = "color:#8a8a94;font-size:12px;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap";
+  if (c._lastRun) {
+    info.textContent = (c._lastRun.via === "api" ? "上次 ☁" : "上次 🖥")
+      + (c._lastRun.ms ? ` · ${(c._lastRun.ms / 1000).toFixed(1)} 秒` : "");
+  } else if (!c.params.op) {
+    info.textContent = "没选加工方式：这个节点只存字";
+  } else {
+    info.textContent = "结果写回节点 · 上游改了字，重跑一次就用新的";
+  }
+  info.title = info.textContent;
+  foot.appendChild(info);
+  if (typeof c.params._prev === "string" && c.params._prev !== c.params.text) {
+    const undo = document.createElement("button");
+    undo.className = "cancel"; undo.textContent = "↩ 恢复运行前的字";
+    undo.title = "上一次运行之前的节点上原文（只留这一步）";
+    undo.onclick = () => {
+      c.params.text = c.params._prev;
+      delete c.params._prev;
+      paint(c); openPanel(c.id); save();
+    };
+    foot.appendChild(undo);
+  }
+  const go = document.createElement("button");
+  go.className = "go"; go.textContent = "↑"; go.title = "运行";
+  go.disabled = busy || !c.params.op;
+  go.onclick = () => run(c);
+  foot.appendChild(go);
+  el.panel.appendChild(foot);
+  placePanel();
+}
+
+/** 文本节点的运行：节点上的字 + 接进来的几段（连线顺序）+ 附加文字，交给选定的模型
+    按选定的加工方式处理，结果**写回节点上**（运行前的字留一步可恢复）。
+    上游改了字或重跑过，这里读到的就是新的 —— 继承是实时的，不用重新连线。 */
+async function runText(c) {
+  const op = textOp(c);
+  if (!op) return toast("先在上面选一种加工方式（润色 / 优化 / 扩写 / 自定义）");
+  c.error = null; c.status = "running"; c.ms = null;
+  paint(c);
+  if (el.panel._id === c.id) openPanel(c.id);
+  try {
+    const inputs = ownTexts(c).map(x => ({ name: x.name, text: x.text }));
+    const own = textOf(c);
+    if (own) inputs.unshift({ name: "节点上的原文", text: own });   // 节点上排第一
+    const r = await jpost("/api/text", {
+      op, model: (c.params || {}).model || "api",
+      inputs, extra: String((c.params || {}).extra || ""),
+      params: { instr: String((c.params || {}).instr || "") },
+      project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
+    });
+    c.params._prev = String((c.params || {}).text || "");   // 留一步可恢复
+    c.params.text = r.text;
+    c.status = "done"; c.ms = r.ms; c._lastRun = r;
+    save(); paint(c);
+    if (el.panel._id === c.id) openPanel(c.id);
+    const downs = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e)).length;
+    toast(textRunToast(r) + (downs ? `\n已连给 ${downs} 个节点，它们下次运行会用这份新文本` : ""));
+  } catch (e) {
+    c.status = "error"; c.error = e.message;
+    paint(c);
+    if (el.panel._id === c.id) openPanel(c.id);
+    toast(e.message);
+  }
+  save();
+}
+
+function textRunToast(r) {
+  const t = r.ms >= 60000
+    ? `${Math.floor(r.ms / 60000)} 分 ${Math.round(r.ms % 60000 / 1000)} 秒`
+    : `${(r.ms / 1000).toFixed(1)} 秒`;
+  return `${r.via === "api" ? "✅ 云端 API" : "✅ 本地 27B"}，${t}`
+    + (r.warn ? `\n⚠ ${r.warn}` : "");
 }
 
 /** 图 ↔ 提示词是一对一跑的（第 k 张图配第 k 条提示词，见 manifest 的 pairWith），
@@ -2065,11 +3312,11 @@ function promptTabs(c, list) {
 function promptBlock(c, s, label) {
   const wrap = document.createElement("div"); wrap.className = "pblock";
   const scs = styleCards(c);
-  const styles = scs.map(styleTextOf);
+  const styles = scs.map(textOf);
   const own = ownStyles(c);
 
   // ✨优化只画在"主提示词"那一格，而且这条能力得在扫描器的 REWRITE 表里登记过
-  // （manifest.rewrite）。分镜那种一图一句的卡本来就没登记
+  // （manifest.rewrite）。分镜那种一图一句的节点本来就没登记
   const rcap = CAPS[runCap(c)] || capOf(c);
   const canOpt = !!(rcap && rcap.rewrite
     && s.key === (promptSpecs(rcap)[0] || {}).key);
@@ -2085,7 +3332,7 @@ function promptBlock(c, s, label) {
   clr.textContent = useOpt ? "扔掉这份" : "清空";
   if (useOpt) clr.title = "删掉优化结果，切回你自己写的原词（原词一直没被动过）";
   hd.append(nm, tag);
-  if (canOpt) hd.appendChild(optBtn(c, s, !!opt));
+  // 标题右侧的按钮去掉（optBtn、rwModelBtn），挪到输入框底部
   hd.appendChild(clr);
   wrap.appendChild(hd);
 
@@ -2101,22 +3348,22 @@ function promptBlock(c, s, label) {
   wrap.appendChild(ta);
 
   // 「实际提交」读数。只有原词那份需要它：风格是提交那一刻才并进去的
-  // （合并结果**不写回 c.params** —— 写回去风格就固化在这张卡上了，改风格卡时下游
+  // （合并结果**不写回 c.params** —— 写回去风格就固化在这个节点上了，改风格节点时下游
   // 不跟着变，还会一路叠加），所以面板上的框 ≠ 真提交的，必须摆出来。
   // 优化后那份不需要：风格在优化那一步就融进去了，框里就是原样提交的东西。
-  // 风格可能是从上游顺着连线传下来的（这张卡上没有那根线），不说清来路用户会以为面板串了
+  // 风格可能是从上游顺着连线传下来的（这个节点上没有那根线），不说清来路用户会以为面板串了
   let pv = null;
   if (styles.length && !useOpt) {
     pv = document.createElement("div"); pv.className = "stypv";
     const ph = document.createElement("div"); ph.className = "hd";
-    ph.textContent = `实际提交（已套用 ${styles.length} 张风格卡`
+    ph.textContent = `实际提交（已并入 ${styles.length} 段文本`
       + (own.length ? "" : " · 从上游继承") + "）";
     // 自己挂了就不继承上游，这件事不摆出来就是"上游那张风格白挂了"
     const over = own.length ? upStyles(c) : [];
-    ph.title = (own.length ? "这张卡自己挂的：" : "从上游继承：") + scs.map(titleOf).join("、")
+    ph.title = (own.length ? "这个节点自己挂的：" : "从上游继承：") + scs.map(titleOf).join("、")
       + (own.length ? "" : "\n要断就断它跟上游那根产物连线")
       + (over.length ? `\n上游还传了「${over.map(titleOf).join("、")}」，`
-        + "但这张卡自己挂了风格，就以自己的为准；两份都要就把上游那张也拖到这张卡上" : "");
+        + "但这个节点自己挂了风格，就以自己的为准；两份都要就把上游那张也拖到这个节点上" : "");
     const pb = document.createElement("div"); pb.className = "tx";
     pv.append(ph, pb);
     pv._tx = pb;
@@ -2147,26 +3394,85 @@ function promptBlock(c, s, label) {
     ta.value = ""; c.params[s.key] = ""; sync(); ta.focus(); save();
   };
   sync();
+
+  // 提示词底部工具条：模型选择 + 翻译 + 优化（左→右）
+  if (canOpt || !useOpt) {
+    const toolbar = document.createElement("div"); toolbar.className = "ptoolbar";
+    const busy = !!c._rwBusy;
+
+    // 左：模型选择（存在 c.params._promptModel，默认 api）
+    const curModel = c.params._promptModel || "api";
+    const modelBtn = document.createElement("button");
+    modelBtn.className = "tbtool model";
+    modelBtn.textContent = curModel === "local" ? "🖥 本地" : "☁ 云端";
+    modelBtn.title = "切换模型：云端 API（快）/ 本地 27B（免费但慢）";
+    modelBtn.onclick = () => {
+      const opts = [
+        { icon: "☁", text: "云端 API —— 几秒就回，要配好 llm.json",
+          run: () => { c.params._promptModel = "api"; repanel(c); save(); } },
+        { icon: "🖥", text: "本地 27B —— 不花钱，占显存，第一次慢",
+          run: () => { c.params._promptModel = "local"; repanel(c); save(); } },
+      ];
+      tipMenu(opts, modelBtn);
+    };
+    toolbar.appendChild(modelBtn);
+
+    // 中：翻译按钮（走有道 API，不需要模型参数）
+    const trBtn = document.createElement("button");
+    trBtn.className = "tbtool";
+    trBtn.textContent = "🌐 翻译";
+    trBtn.disabled = busy;
+    trBtn.title = "中→英 / 英→中 自动判断（有道翻译）";
+    trBtn.onclick = () => doTranslate(c, s);
+    toolbar.appendChild(trBtn);
+
+    // 右：优化按钮（只在可优化时显示）
+    if (canOpt) {
+      const optBtn = document.createElement("button");
+      optBtn.className = "tbtool opt";
+      optBtn.textContent = busy ? "⏳ 优化中…" : "✨ 优化";
+      optBtn.disabled = busy;
+      optBtn.title = "优化提示词：融入风格、补充细节"
+        + (opt ? "\n已有优化结果，再点会覆盖" : "")
+        + "\n接入的文本节点会一起融进结果";
+      optBtn.onclick = () => doRewrite(c, s, curModel);
+      toolbar.appendChild(optBtn);
+    }
+
+    wrap.appendChild(toolbar);
+  }
+
   if (c._rwErr && c._rwErr.key === s.key) {
     const e = document.createElement("div"); e.className = "rwerr";
-    e.textContent = "优化没成功：" + c._rwErr.msg;
+    e.textContent = "操作失败：" + c._rwErr.msg;
     wrap.appendChild(e);
   }
   return wrap;
 }
 
-/** 「✨优化」按钮。已经优化过就是「重新优化」（换个种子再跑一遍，覆盖旧的那份）。 */
+/** 「优化」按钮：云端 API 和本地 27B 拆成两个，点哪个用哪个，不自动换。
+    已经优化过再点就是「重新优化」（换个种子再跑一遍，覆盖旧的那份）。 */
 function optBtn(c, s, done) {
-  const b = document.createElement("button"); b.className = "rwbtn";
+  const wrap = document.createElement("span");
+  wrap.style.cssText = "display:flex;gap:2px";
   const busy = !!c._rwBusy;
-  b.textContent = busy ? "优化中…" : (done ? "重新优化" : "✨优化");
-  b.disabled = busy;
-  b.title = busy ? "本地大模型正在优化，第一次要等它加载模型，十几到几十秒"
-    : "把这段话交给本地大模型，改成这个模型认的写法。"
-    + "\n挂了风格卡的话，风格会一起融进优化结果里"
-    + "\n原词不会被动，优化完多一个页签，用哪份你选";
-  b.onclick = () => doRewrite(c, s);
-  return b;
+  for (const [model, label, tip] of [
+    ["api", "☁ 优化", "云端 API（llm.json 里配的那家）：几秒就回、不占显存、ComfyUI 不用开。"
+      + "没配好会直接报错，不会偷偷换本地"],
+    ["local", "🖥 优化", "本地 27B：不花钱，但要占显存、排 ComfyUI 的队，"
+      + "第一次加载好几分钟"],
+  ]) {
+    const b = document.createElement("button"); b.className = "rwbtn";
+    b.textContent = busy ? "优化中…" : label;
+    b.disabled = busy;
+    b.title = tip
+      + (done ? "\n已经有优化结果了：再点一次是重新优化，覆盖旧的那份" : "")
+      + "\n接入的文本节点会一起融进优化结果里"
+      + "\n原词不会被动，优化完多一个页签，用哪份你选";
+    b.onclick = () => doRewrite(c, s, model);
+    wrap.appendChild(b);
+  }
+  return wrap;
 }
 
 /** 原词 / 优化后 两个页签。选中哪个，生成时就提交哪个。 */
@@ -2182,37 +3488,37 @@ function optTabs(c, s, useOpt) {
     };
     return b;
   };
-  // 风格是烙进优化结果里的，不会跟着风格卡变。所以对比一下"优化时挂的"和"现在挂的"
+  // 风格是烙进优化结果里的，不会跟着风格节点变。所以对比一下"优化时挂的"和"现在挂的"
   const cur = styleTexts(c).join("\n\n");
   const was = (c.optStyle && c.optStyle[s.key]) || "";
   const stale = cur !== was;
   strip.append(
     mk(!useOpt, "原词", "你自己写的那段。生成时"
-      + (cur ? "会在前面拼上风格卡的文字" : "原样提交")),
-    mk(useOpt, "✨优化后", "本地大模型优化出来的那段，已经是这个模型认的格式。"
-      + (was ? "\n风格已经融在里面了，生成时不再另外拼风格卡" : "")
+      + (cur ? "会在前面拼上接入的文本节点" : "原样提交")),
+    mk(useOpt, "✨优化后", "大模型优化出来的那段，已经是这个模型认的格式。"
+      + (was ? "\n接入的文本已经融在里面了，生成时不再另外拼" : "")
       + "\n原样提交"));
 
   const note = document.createElement("span"); note.className = "note";
   if (!useOpt) {
-    note.textContent = cur ? "提交时会拼上风格卡" : "";
+    note.textContent = cur ? "提交时会拼上接入的文本" : "";
   } else if (stale) {
-    // 这三种都是"优化结果里的风格已经不是现在这张风格卡了"，不说出来风格就静悄悄地错了
+    // 这三种都是"优化结果里的风格已经不是现在这个风格节点了"，不说出来风格就静悄悄地错了
     note.className = "note bad";
-    note.textContent = "⚠ " + (!was ? "风格卡是优化之后挂的，这份里没有它"
-      : !cur ? "风格卡摘了，这份里还留着它" : "风格卡换过了，这份里还是旧的")
+    note.textContent = "⚠ " + (!was ? "风格节点是优化之后挂的，这份里没有它"
+      : !cur ? "风格节点摘了，这份里还留着它" : "风格节点换过了，这份里还是旧的")
       + " —— 点「重新优化」";
     note.title = "优化结果是一段写死的文字，风格在优化那一刻就烙进去了，"
-      + "之后改风格卡不会让它跟着变。要么重新优化一次，要么切回「原词」。";
+      + "之后改风格节点不会让它跟着变。要么重新优化一次，要么切回「原词」。";
   } else {
-    note.textContent = cur ? "已含风格，提交时不再另拼风格卡" : "按模型认的格式写好了，原样提交";
+    note.textContent = cur ? "已含接入的文本，提交时不再另拼" : "按模型认的格式写好了，原样提交";
   }
   strip.appendChild(note);
   return strip;
 }
 
-/** 重画面板，但只在它确实开着这张卡的时候 —— 优化要等好一会儿，
-    这中间用户可能已经关了面板、或去看别的卡了，别硬把面板抢回来。 */
+/** 重画面板，但只在它确实开着这个节点的时候 —— 优化要等好一会儿，
+    这中间用户可能已经关了面板、或去看别的节点了，别硬把面板抢回来。 */
 const repanel = (c) => { if (el.panel._id === c.id) openPanel(c.id); };
 
 /** 优化完那句提示。要说清**走的哪条路** —— 一次几秒（API）和一次几分钟
@@ -2233,7 +3539,32 @@ function rwToast(r) {
 /** 把提示词交给大模型改一遍，结果存成这一格的「优化后」那份。
     先走 API（几秒），不通再落本地 27B —— 本地那条走 ComfyUI 队列、跟出图抢显存，
     前面有活儿还得排队，界面上就是按钮一直显示「优化中…」。 */
-async function doRewrite(c, s) {
+/** 翻译提示词（中→英 / 英→中），调用有道翻译 API */
+async function doTranslate(c, s) {
+  const src = String(c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
+  if (!src.trim()) return toast("先写点内容再翻译");
+  c._rwBusy = true; c._rwErr = null;
+  repanel(c);
+  try {
+    const r = await jpost("/api/text", {
+      op: "translate", model: "youdao",
+      inputs: [{ name: "原文", text: src }], extra: "", params: {},
+      project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
+    });
+    c.params[s.key] = r.text;
+    save();
+    c._rwBusy = false; repanel(c);
+    toast(`翻译完成 · ${(r.ms / 1000).toFixed(1)} 秒 · 有道翻译`
+      + (r.warn ? `\n${r.warn}` : ""));
+  } catch (e) {
+    c._rwBusy = false;
+    c._rwErr = { key: s.key, msg: e.message };
+    repanel(c);
+    toast("翻译失败：" + e.message);
+  }
+}
+
+async function doRewrite(c, s, model) {
   const cap = CAPS[runCap(c)] || capOf(c);
   if (!cap || !cap.rewrite) return;
   // 拿的一定是**原词**：优化的输入永远是用户自己写的那段，不是上一轮的优化结果
@@ -2244,17 +3575,17 @@ async function doRewrite(c, s) {
   c._rwBusy = true; c._rwErr = null;
   repanel(c);
   try {
-    // prompt 是原词，风格另外给 —— 让模型把风格融进输出里。用户选「优化后」时
-    // 提交的就是这份输出原样，系统不再拼风格卡（payloadOf），所以必须融进去
+    // prompt 是原词，接入的文本另外给 —— 让模型把文本融进输出里。用户选「优化后」时
+    // 提交的就是这份输出原样，系统不再拼文本节点（payloadOf），所以必须融进去
     const r = await jpost("/api/rewrite", {
       capability: cap.id, params: pl.params, assets: pl.assets,
-      prompt: src, style: styleTexts(c).join("\n\n"),
+      prompt: src, style: styleTexts(c).join("\n\n"), model: model || "auto",
       project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
     });
     c.opt = c.opt || {}; c.optUse = c.optUse || {}; c.optStyle = c.optStyle || {};
     c.opt[s.key] = r.text;
     c.optUse[s.key] = true;             // 跑完直接切过去，不然还得再点一下才看得见
-    // 记下这份优化是配着哪段风格跑出来的。之后风格卡换了/摘了/新挂了，
+    // 记下这份优化是配着哪段风格跑出来的。之后风格节点换了/摘了/新挂了，
     // 优化结果**不会**跟着变（风格是烙在文字里的），页签那儿要能说出来
     c.optStyle[s.key] = styleTexts(c).join("\n\n");
     save();
@@ -2308,54 +3639,89 @@ function paintTitle(c) {
   paintPort(c);
 }
 
-/** 卡脚最左边那枚徽标：这张卡出图还是出视频。
-    卡片图标（🧩 工具、✨ 画质增强）和用户自己改的卡名都可能完全看不出类型，
+/** 节点脚最左边那枚徽标：这个节点出图还是出视频。
+    节点图标（🧩 工具、✨ 画质增强）和用户自己改的节点名都可能完全看不出类型，
     产物出来之前画面区又是空的 —— 所以类型要有个固定位置常驻，不靠猜。
-    路由卡还没放素材时两路都可能，标「跟素材」；放进去那一刻 paintTitle 会重刷。
+    路由节点还没放素材时两路都可能，标「跟素材」；放进去那一刻 paintTitle 会重刷。
     跟着 paintTitle 一起刷：换模式、换路由、按张数换能力都会改产出类型。 */
 function paintKind(c) {
   const k = c._el && c._el.querySelector(".cf .kt");
   if (!k) return;
-  // 风格卡不出东西，徽标位上说清它是干什么的 —— 不然它长得跟别的卡一样，
+  // 风格节点不出东西，徽标位上说清它是干什么的 —— 不然它长得跟别的节点一样，
   // 只是一直"待生成"，会有人反复去点运行
   if (isStyle(c)) {
     k.dataset.kind = "style";
     k.textContent = "🎨 只加提示词";
-    k.title = "这张卡不生成任何东西：把它的出口拖到生图/生视频卡上，"
-      + "提交时这段风格会并进那张卡的提示词";
+    k.title = "这个节点不生成任何东西：把它的出口拖到生图/生视频节点上，"
+      + "提交时这段风格会并进那个节点的提示词";
+    return;
+  }
+  if (isText(c)) {
+    k.style.display = "";
+    k.dataset.kind = "text";
+    k.textContent = "✍ 文本";
+    k.title = textOp(c)
+      ? "选了加工方式：点「↑ 运行」把接进来的文本加工后写回这个节点"
+      : "存一段文字：连到生成节点就并进提示词，连到别的文本节点就当它的输入；"
+        + "在面板里选加工方式可以让大模型来加工";
+    return;
+  }
+  // 素材节点报的是「手里这份是什么」，不是「会出什么」——它不生成东西。
+  // 节点定义里写死 outputType: image，照 outKindOf 读会把一段视频说成图片
+  if (isAsset(c)) {
+    const a = assetOf(c);
+    k.style.display = "";
+    k.dataset.kind = a ? a.kind : "both";
+    // 徽标文字：类型 + 原始分辨率（有的话）
+    const res = (a && a.width && a.height) ? ` ${a.width}×${a.height}` : "";
+    k.textContent = a ? `📎 ${KIND_ZH[a.kind] || a.kind}${res}` : "📎 空的";
+    k.title = a ? `${a.origin || ""}\n把右边的出口拖到别的节点 → 这份素材就进那个节点的格子里`
+      : "点这个节点选一个文件（图片 / 视频 / 音频都收）";
+    const body0 = c._el.querySelector(".body");
+    if (!a && body0 && body0.querySelector(".ph")) body0.innerHTML = phHTML(c);
     return;
   }
   const md = modeOf(c);
   const undecided = kindUndecided(c);
   const kind = outKindOf(c);
   k.dataset.kind = undecided ? "both" : kind;
-  k.textContent = undecided ? "🖼🎬 跟素材" : kind === "video" ? "🎬 视频" : "🖼 图片";
+  // 徽标文字：类型 + 分辨率（有产物且是图片/视频时显示）
+  const out = (c.outputs || [])[0];
+  const res = (out && (out.width && out.height)) ? ` ${out.width}×${out.height}` : "";
+  k.textContent = undecided ? "🖼🎬 跟素材" : kind === "video" ? `🎬 视频${res}` : `🖼 图片${res}`;
   const ins = md && md.route ? Object.keys(md.route)
     : [...new Set(((capOf(c) || {}).inputs || [])
         .filter(s => MEDIA.includes(s.type)).map(s => s.type))];
-  k.title = (undecided ? "放图片就出图片、放视频就出视频" : `这张卡出${KIND_ZH[kind]}`)
+  k.title = (undecided ? "放图片就出图片、放视频就出视频" : `这个节点出${KIND_ZH[kind]}`)
     + (ins.length ? `；要${ins.map(x => KIND_ZH[x] || x).join(" / ")}素材` : "；不用素材");
-  // 还没出过产物时画面区那个大图标也是同一个信息，一起换掉（有产物就别动它）
+  // 还没出过产物时画面区那个大图标也是同一个信息，一起换掉（有产物就别动它）。
+  // 文本节点的空态是一整块提示（图标＋引导字），交给 paint() 画，这里别只换图标
   const body = c._el.querySelector(".body");
-  if (body && body.querySelector(".ph")) body.innerHTML = phHTML(c);
+  if (!isTextCard(c) && body && body.querySelector(".ph")) body.innerHTML = phHTML(c);
 }
 
-/** 左边那颗绿点：这张卡收得下上游产物。纯文生图没有素材槽，不画点 ——
+/** 左边那颗绿点：这个节点收得下上游产物。纯文生图没有素材槽，不画点 ——
     画了就是在说"往这儿接"，接过去只会弹"没有可接收的槽位"。
-    路由卡按它两路的类型报（图片/视频都收），不管当前切到了哪一路。
+    路由节点按它两路的类型报（图片/视频都收），不管当前切到了哪一路。
     跟着 paintTitle 一起刷，因为换模式、换路由都会改能力，能收什么也跟着变。 */
 function paintPort(c) {
   const p = c._el && c._el.querySelector(".inport");
   if (!p) return;
   const md = modeOf(c), cap = capOf(c);
-  // 能接风格卡的也点这颗点：不然用户不知道往哪儿拖那根线
-  const styleOk = !isStyle(c) && promptSpecs(cap).length;
+  // 素材节点不收任何输入：左边那颗绿点不画，不然会有人去拖线进来（linkTo 会拒绝）
+  if (isAsset(c)) { p.style.display = "none"; return; }
+  // 能接文本节点的也点这颗点：不然用户不知道往哪儿拖那根线
+  const styleOk = !isTextCard(c) && promptSpecs(cap).length;
+  // 文本节点收 @text（多根，当加工输入）；风格节点不收任何输入
+  const textIn = isText(c);
   const kinds = md && md.route ? Object.keys(md.route)
     : [...new Set((cap ? cap.inputs : []).filter(s => MEDIA.includes(s.type)).map(s => s.type))];
-  p.style.display = (kinds.length || styleOk) ? "" : "none";
-  p.title = kinds.length
-    ? `上游卡的产物拖到这里（收${kinds.map(k => KIND_ZH[k] || k).join(" / ")}${styleOk ? "，也收风格卡" : ""}）`
-    : "风格卡的出口拖到这里";
+  p.style.display = (kinds.length || styleOk || textIn) ? "" : "none";
+  p.title = textIn
+    ? "文本节点的出口拖到这里：接进来的文字都是这段加工的输入（按连线顺序）"
+    : kinds.length
+      ? `上游节点的产物拖到这里（收${kinds.map(k => KIND_ZH[k] || k).join(" / ")}${styleOk ? "，也收文本节点" : ""}）`
+      : "文本节点的出口拖到这里";
 }
 
 function slotEl(c, s) {
@@ -2507,7 +3873,7 @@ function audioRange(c, slot, sSpec, eSpec) {
 }
 
 function pickFile(c, s) {
-  // 路由卡那一格两种都收，accept 不能只写一种，否则选视频时文件对话框里根本看不到
+  // 路由节点那一格两种都收，accept 不能只写一种，否则选视频时文件对话框里根本看不到
   const r = modeOf(c), both = r && r.route && Object.keys(r.route).length > 1
     && Object.values(r.route).some(x => x.slot === s.key);
   el.picker.accept = both ? Object.keys(r.route).map(k => `${k}/*`).join(",")
@@ -2523,6 +3889,76 @@ function pickFile(c, s) {
     } catch (e) { toast("上传失败：" + e.message); }
   };
   el.picker.click();
+}
+
+/** 给素材节点选文件：跟普通节点格的 pickFile 几乎一样，只是不吃 slot ——
+    素材节点不往格子里放，收进 c.outputs[0]。
+    第二个参数传函数时当"上传成功后拿这一份去建节点"用（底部工具条的「上传」走这条）。 */
+function pickAsset(c, onItem) {
+  el.picker.accept = "image/*,video/*,audio/*";   // 三种都收，别只写一种
+  el.picker.onchange = async () => {
+    const f = el.picker.files[0]; el.picker.value = "";
+    if (!f) return;
+    const fd = new FormData(); fd.append("file", f, f.name);
+    try {
+      const r = await api("/api/upload", { method: "POST", body: fd });
+      if (onItem) onItem(r.files[0]);
+      else setAssetItem(c, r.files[0]);
+    } catch (e) { toast("上传失败：" + e.message); }
+  };
+  el.picker.click();
+}
+
+/** 把上传接口回来的那一份（无 filename 键）抄进素材节点的 outputs[0]，
+    并补一个 filename —— 画面区 meta 行、下载都按产物那套读它。
+    图片/视频加载完后按原始比例缩小一半显示。 */
+async function setAssetItem(c, item) {
+  c.outputs = [{ ...item, filename: (item.origin || item.url).split(/[\\/]/).pop() }];
+  paint(c); paintTitle(c); openPanel(c.id); save();
+
+  // 加载媒体获取原始尺寸，缩小一半显示
+  if (item.kind === "image") {
+    const img = new Image();
+    img.onload = () => {
+      const w0 = img.naturalWidth, h0 = img.naturalHeight;
+      c.w = Math.round(w0 / 2);
+      c.h = Math.round(h0 / 2);
+      c.outputs[0].width = w0;   // 存原始尺寸，paintKind 会读它
+      c.outputs[0].height = h0;
+      applySize(c); paintKind(c); save();
+    };
+    img.src = item.url;
+  } else if (item.kind === "video") {
+    const v = document.createElement("video");
+    v.onloadedmetadata = () => {
+      const w0 = v.videoWidth, h0 = v.videoHeight;
+      c.w = Math.round(w0 / 2);
+      c.h = Math.round(h0 / 2);
+      c.outputs[0].width = w0;
+      c.outputs[0].height = h0;
+      applySize(c); paintKind(c); save();
+    };
+    v.src = item.url;
+  }
+  // 音频不调整尺寸，用默认的
+}
+
+/** 底部工具条「上传」：先弹文件选择器，选中之后才建素材节点。
+    顺序不能反 —— 先建节点会走 addCard→pick→openPanel 一串同步渲染，
+    浏览器就不再把随后那次 picker.click() 当"用户点出来的"，对话框会被静默拦掉。
+    取消选择就什么都不建，画布上不留空节点。 */
+function addAssetCard() {
+  if (!PROJ) return;
+  pickAsset(null, (item) => {
+    const p = blankSpot();
+    const c = addCard("card_asset", p.x, p.y);
+    if (!c) return;   // 建节点失败（节点定义不可用）
+    setAssetItem(c, item);
+    // 说清画布上多出来的这张是什么、接下来能拿它干什么 —— 光冒一个节点，
+    // 新手不知道它跟"上传到某个格子里"有什么区别
+    toast(`已放进一个素材节点（${KIND_ZH[item.kind] || item.kind}）：`
+      + "把它右边那颗点拖到生图/生视频/工具节点上，这份素材就进那个节点的格子");
+  });
 }
 
 function rowEl(c, s) {
@@ -2665,12 +4101,13 @@ function augRes(c, s, row) {
     图生视频出鼠标广告就是这么来的。 */
 function payloadOf(c) {
   const cap = CAPS[runCap(c)] || capOf(c), params = {}, assets = {};
-  // 风格卡是提交这一刻才并进提示词的（不写回 c.params，见 promptBlock）
+  // 风格节点是提交这一刻才并进提示词的（不写回 c.params，见 promptBlock）
   const styles = styleTexts(c);
   const pkeys = new Set(promptSpecs(cap).map(s => s.key));
   for (const s of cap.inputs) {
     if (MEDIA.includes(s.type) || s.mirror) continue;
-    const v = c.params[s.key];
+    // 种子永远默认 -1（每次随机）：面板里没有这个旋钮了，老节点里存过的固定值也不再生效
+    const v = s.type === "seed" ? undefined : c.params[s.key];
     if (v != null) params[s.key] = v;
     else if (s.type === "seed") params[s.key] = -1;      // 每次随机
     else if (s.default !== undefined) params[s.key] = s.default;
@@ -2682,19 +4119,20 @@ function payloadOf(c) {
     else if (styles.length) params[s.key] = withStyle(params[s.key], styles);
   }
   for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
-  // card/cardName 只给任务浮窗用：光有能力名说不清是哪张卡在跑，也没法点回去
+  // card/cardName 只给任务浮窗用：光有能力名说不清是哪个节点在跑，也没法点回去
   return { capability: cap.id, params, assets,
            project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c) };
 }
 
 async function run(c) {
-  if (isStyle(c)) return toast("风格卡不用运行：它只把风格并进挂着的那几张卡的提示词");
+  if (isStyle(c)) return toast("风格节点不用运行：它只把风格并进挂着的那几个节点的提示词");
+  if (isText(c)) return runText(c);
   const cap = capOf(c);
   if (!cap) return toast("能力不可用");
   c.error = null; c.progress = 0; c.status = "queued"; c.outputs = []; c.ms = null; c.step = "";
   paint(c); openPanel(c.id);      // status 一进 queued，paint 就把画面区换成加载态
   const pl = payloadOf(c);
-  // 留一手给历史记录：真提交的那段跟面板上原词那个框不一样时（并了风格卡、或者用的是
+  // 留一手给历史记录：真提交的那段跟面板上原词那个框不一样时（并了风格节点、或者用的是
   // 优化后那份），只有把真提交的整段留下来这一轮才复现得出来（见 pushHistory）。
   // `_` 开头不落盘，真正持久化的是 history 里那一条
   const pk = promptSpecs(CAPS[runCap(c)] || cap).map(s => s.key);
@@ -2717,7 +4155,7 @@ async function cancel(c) {
 }
 
 /** 一次把所有任务捞回来：右上角的计数要算上别的项目/别处提交的活儿，
-    所以不能只按当前项目的卡片一张张问。 */
+    所以不能只按当前项目的节点一张张问。 */
 async function pollJobs() {
   try { TASKS = (await api("/api/jobs")).jobs || []; } catch (e) { return; }
   paintJobsBtn();
@@ -2729,7 +4167,7 @@ async function pollJobs() {
   for (const c of live) {
     const j = TASKS.find(x => x.id === c.job);
     // 任务被从列表里删掉了（在浮窗里删的）。服务端删之前已经把活儿停了，
-    // 这里必须跟着落地，不然卡片会一直转圈等一个不存在的任务
+    // 这里必须跟着落地，不然节点会一直转圈等一个不存在的任务
     if (!j) {
       c.status = "canceled"; c.step = ""; c.job = null; paint(c); dirty = true;
       if (el.panel._id === c.id) openPanel(c.id);
@@ -2750,7 +4188,7 @@ async function pollJobs() {
         pushHistory(c);
         if (el.hist._id === c.id) openHistory(c.id);
         drawWires();
-        // 下游已连线的卡自动吃掉新产物（风格线传的是文字，没有产物可搬，跳过）
+        // 下游已连线的节点自动吃掉新产物（风格线传的是文字，没有产物可搬，跳过）
         for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e))) {
           const to = PROJ.cards.find(x => x.id === e.to);
           if (!to) continue;
@@ -2847,7 +4285,7 @@ function renderJobs() {
   if (TASKS.some(j => !jobLive(j))) {
     const clr = document.createElement("button");
     clr.className = "lnk"; clr.textContent = "清空已结束";
-    clr.title = "只清列表里的记录，已经出好的产物还在卡片上";
+    clr.title = "只清列表里的记录，已经出好的产物还在节点上";
     clr.onclick = clearDoneJobs;
     hd.appendChild(clr);
   }
@@ -2858,7 +4296,7 @@ function renderJobs() {
   const list = document.createElement("div"); list.className = "jlist";
   if (!TASKS.length) {
     const e = document.createElement("div"); e.className = "jempty";
-    e.textContent = "还没有任务。在卡片上点「生成」，任务就会出现在这里。";
+    e.textContent = "还没有任务。在节点上点「生成」，任务就会出现在这里。";
     list.appendChild(e);
   }
   for (const j of TASKS) list.appendChild(jobRow(j));
@@ -2868,7 +4306,7 @@ function renderJobs() {
 }
 
 /** 任务是哪个项目的。当前打开的这个直接用 PROJ.name（刚改的名字 projects 里还是旧的），
-    别的项目去 projects 列表里认 id；项目已经被删了就只剩卡片名。 */
+    别的项目去 projects 列表里认 id；项目已经被删了就只剩节点名。 */
 function jobProjName(j) {
   if (!j.project) return "";
   if (PROJ && j.project === PROJ.id) return PROJ.name;
@@ -2882,8 +4320,8 @@ function jobRow(j) {
 
   const r1 = document.createElement("div"); r1.className = "r1";
   const nm = document.createElement("span"); nm.className = "nm";
-  // 卡片名才是用户认得出的那个（"角色图放大"），能力名（"SeedVR2 图片高清放大"）退到第二行。
-  // 前面再挂上项目名：几个项目里都有一张叫"主角图"的卡，光看卡片名分不出是哪个在跑
+  // 节点名才是用户认得出的那个（"角色图放大"），能力名（"SeedVR2 图片高清放大"）退到第二行。
+  // 前面再挂上项目名：几个项目里都有一张叫"主角图"的节点，光看节点名分不出是哪个在跑
   const card = j.cardName || j.name;
   const pj = jobProjName(j);
   if (pj) {
@@ -2917,7 +4355,7 @@ function jobRow(j) {
   const acts = document.createElement("div"); acts.className = "acts";
   if (jobLive(j)) acts.appendChild(actBtn("停止", () => stopTask(j)));
   acts.appendChild(actBtn("删除", () => delTask(j), true));
-  if (j.project && j.card) acts.appendChild(actBtn("看卡片", () => focusTask(j)));
+  if (j.project && j.card) acts.appendChild(actBtn("看节点", () => focusTask(j)));
   d.appendChild(acts);
 
   fillJobRow(d, j);
@@ -2962,14 +4400,14 @@ async function clearDoneJobs() {
   pollJobs();
 }
 
-/** 从任务跳回它对应的那张卡：不在当前画布就先把那张画布打开 */
+/** 从任务跳回它对应的那个节点：不在当前画布就先把那张画布打开 */
 async function focusTask(j) {
   if (!PROJ || PROJ.id !== j.project) {
     if (!projects.some(p => p.id === j.project)) return toast("这个任务所在的画布已经不在了");
     await openProject(j.project);
   }
   const c = PROJ.cards.find(x => x.id === j.card);
-  if (!c) return toast("这张卡片已经从画布上删掉了");
+  if (!c) return toast("这个节点片已经从画布上删掉了");
   const r = el.stage.getBoundingClientRect();
   view.x = r.width / 2 - (c.x + cardW(c) / 2) * view.k;
   view.y = r.height / 3 - c.y * view.k;
