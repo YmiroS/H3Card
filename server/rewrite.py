@@ -332,7 +332,7 @@ def text_clean(raw):
 # =====================================================================
 # 喂给 27B 的那份「用户消息」
 # =====================================================================
-def facts(cap, spec, params, assets):
+def facts(cap, spec, params, assets, card_info=None):
     """硬性事实：模型自己看不见的那些（有几张参考图、多长、音频在不在）。
 
     编号规则跟 ComfyUI 那边**必须**对齐：`comfy/text_encoders/minimax.py` 是按
@@ -345,6 +345,7 @@ def facts(cap, spec, params, assets):
     auds = [k for k in keys("audio") if assets.get(k)]
     vids = [k for k in keys("video") if assets.get(k)]
     labels = {s["key"]: s.get("label") or s["key"] for s in cap.get("inputs") or []}
+    card_info = card_info or {}  # 默认为空字典
 
     if spec.get("regime") in H3:
         out.append(f"- Target duration: {duration(cap, params):.2f} seconds. "
@@ -367,11 +368,20 @@ def facts(cap, spec, params, assets):
         # 括号里是这个槽在卡上的名字（「场景」「角色」…），它说明这张图是干什么用的。
         # 用户嘴里的「第 2 张图 / 图2」就是 <Picture 2>，两边对不上时以槽位名为准 ——
         # 图是插在槽里的，槽位名才是它真正的角色。
+        # 如果有卡片名信息，追加到槽位说明中
+        pic_labels = []
+        for i, k in enumerate(pics):
+            slot_label = labels[k]
+            if k in card_info and card_info[k]:
+                slot_label = f"{slot_label} - {card_info[k]}"
+            pic_labels.append(f"<Picture {i + 1}>（{slot_label}）")
+
         out.append("- Reference images, in order: "
-                   + "、".join(f"<Picture {i + 1}>（{labels[k]}）" for i, k in enumerate(pics))
+                   + "、".join(pic_labels)
                    + ". The name in brackets is what that slot is for. When the user says "
-                     "\"the Nth image\" / \"图N\", they mean `<Picture N>`; if their wording "
-                     "contradicts the slot name, trust the slot name.")
+                     "\"the Nth image\" / \"图N\" or mentions \"@CardName\", they mean the "
+                     "corresponding `<Picture N>`; if their wording contradicts the slot name, "
+                     "trust the slot name.")
     if not pics:
         out.append("- No reference image is attached, so do not mention `<Picture N>` at all."
                    + (" This capability normally needs one, so the user simply has not put it in "
@@ -413,7 +423,7 @@ def secs(t):
     return int(m.group(1) or 0) * 60 + float(m.group(2)) if m else None
 
 
-def user_msg(cap, spec, params, assets, prompt, style):
+def user_msg(cap, spec, params, assets, card_info, prompt, style):
     zh = spec["regime"] not in H3
     head = "【用户想要的】" if zh else "# What the user asked for"
     blocks = [f"{head}\n{prompt.strip() or '（用户什么都没写，按下面的素材和事实自己定一个合理的内容）'}"]
@@ -435,7 +445,7 @@ def user_msg(cap, spec, params, assets, prompt, style):
                          "consistent with it - if it says stop-motion clay, do not write "
                          "live-action. The system will NOT append that text separately, so a style "
                          "you leave out is a style that is lost."))
-    f = facts(cap, spec, params, assets)
+    f = facts(cap, spec, params, assets, card_info)
     if f:
         blocks.append(("【硬性事实，必须照做】\n" if zh else "# Hard facts you must honour\n")
                       + "\n".join(f))

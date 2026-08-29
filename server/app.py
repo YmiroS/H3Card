@@ -590,7 +590,8 @@ async def api_rewrite(request):
     params = body.get("params") or {}
     assets = body.get("assets") or {}
     style = str(body.get("style") or "")
-    user = rw.user_msg(cap, spec, params, assets,
+    card_info = body.get("cardInfo") or {}  # 接收前端传来的卡片信息映射
+    user = rw.user_msg(cap, spec, params, assets, card_info,
                        str(body.get("prompt") or ""), style)
 
     # model：auto（老行为，先 API 不通落本地）/ api / local —— 前端把 API 和
