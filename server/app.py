@@ -732,10 +732,9 @@ async def api_text(request):
     # inputs: [{name, text}] —— 一张卡可以接好几根文本连线，顺序就是连线顺序
     inputs = [(str(i.get("name") or "?"), str(i.get("text") or ""))
               for i in body.get("inputs") or [] if str(i.get("text") or "").strip()]
-    if op != "custom" and not inputs and not str(body.get("extra") or "").strip():
-        raise web.HTTPBadRequest(reason="没有任何输入文字：把一张文本卡的出口连过来，或在卡上写附加文字")
-    user = rw.text_user_msg(op, body.get("params") or {}, inputs,
-                            str(body.get("extra") or ""))
+    if op != "custom" and not inputs:
+        raise web.HTTPBadRequest(reason="没有任何输入文字：把一张文本卡的出口连过来")
+    user = rw.text_user_msg(op, body.get("params") or {}, inputs)
 
     model = body.get("model") or "api"
     t0 = time.time()

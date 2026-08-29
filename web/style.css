@@ -122,6 +122,63 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   background-size: 40px 40px;
 }
 #stage.panning { cursor: grabbing; }
+
+/* ---------- 画布工具条 ---------- */
+#canvas-toolbar {
+  position: absolute; bottom: 16px; left: 16px; z-index: 20;
+  display: flex; gap: 8px; pointer-events: auto;
+}
+.toolbar-btn {
+  width: 40px; height: 40px;
+  background: #0c121fee; border: 1px solid var(--line);
+  border-radius: 6px; font-size: 18px;
+  backdrop-filter: blur(8px);
+  box-shadow: 0 4px 12px #00000050;
+  transition: all .15s ease;
+}
+#zoom-menu {
+  width: auto;
+  padding: 0 12px;
+  font-size: 13px;
+  font-family: var(--mono);
+  letter-spacing: 0.5px;
+}
+.toolbar-btn:hover {
+  border-color: var(--acc);
+  box-shadow: 0 0 14px #00e5ff35, 0 4px 12px #00000050;
+  transform: translateY(-1px);
+}
+.toolbar-btn:active {
+  transform: translateY(0);
+}
+.toolbar-btn.active {
+  background: #00e5ff1f;
+  border-color: var(--acc);
+  box-shadow: 0 0 18px #00e5ff40 inset, 0 4px 12px #00000050;
+}
+
+/* ---------- 小地图 ---------- */
+#minimap {
+  position: absolute; bottom: 72px; left: 16px; z-index: 20;
+  width: 200px; height: 150px;
+  background: #0c121fee; border: 1px solid var(--line);
+  border-radius: 6px; backdrop-filter: blur(8px);
+  box-shadow: 0 4px 12px #00000050;
+  overflow: hidden;
+}
+#minimap-canvas {
+  width: 100%; height: 100%;
+  display: block;
+}
+#minimap-viewport {
+  position: absolute; top: 0; left: 0;
+  border: 1.5px solid var(--acc);
+  background: #00e5ff15;
+  box-shadow: 0 0 8px #00e5ff40;
+  cursor: move;
+  pointer-events: auto;
+}
+
 #world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
 
 /* ---------- 分组 / 框选 ---------- */
@@ -622,7 +679,11 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   color: var(--acc); border-color: var(--acc);
 }
 #panel .ptoolbar .tbtool.model {
-  /* 模型选择按钮：最左侧 */
+  /* 模型选择按钮：最左侧，带下拉箭头 */
+  display: flex; align-items: center; gap: 4px;
+}
+#panel .ptoolbar .tbtool.model i {
+  font-style: normal; opacity: 0.6; font-size: 11px;
 }
 #panel .ptoolbar .tbtool.opt {
   /* 优化按钮：最右侧，青色高亮 */
