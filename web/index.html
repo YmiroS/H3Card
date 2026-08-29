@@ -38,7 +38,17 @@
     <div id="world"></div>
     <div id="lasso" style="display:none"></div>
     <div id="selbar" style="display:none"></div>
+    <div id="panel" style="display:none"></div>
     <div id="dock" style="display:none"></div>
+    <div id="canvas-toolbar">
+      <button id="minimap-btn" class="toolbar-btn" title="小地图">🗺</button>
+      <button id="wires-toggle" class="toolbar-btn" title="显示/隐藏连线">🔗</button>
+      <button id="zoom-menu" class="toolbar-btn" title="缩放"><span id="zoom-percent">100%</span></button>
+    </div>
+    <div id="minimap" style="display:none">
+      <canvas id="minimap-canvas"></canvas>
+      <div id="minimap-viewport"></div>
+    </div>
   </div>
 
   <div id="empty">
@@ -54,7 +64,6 @@
 <aside id="hist" style="display:none"></aside>
 
 <div id="jobs" style="display:none"></div>
-<div id="panel" style="display:none"></div>
 <div id="respop" style="display:none"></div>
 <div id="view" style="display:none"><div class="vbox"></div></div>
 <div id="menu" style="display:none"></div>

@@ -93,7 +93,7 @@ COMMON = """You rewrite prompts for the MiniMax H3 video model. The user writes 
 idea, usually in Chinese. You return ONE finished H3 prompt.
 
 Output the prompt and nothing else: no preamble, no explanation, no markdown fences,
-no headings that are not part of the format below.
+no headings that are not part of the format below, no thinking process tags like <think> or <thinking>.
 
 Language: write the rewrite in English. Keep dialogue, lyrics and text that is visible
 on screen in their ORIGINAL language, verbatim, with their punctuation.
@@ -191,7 +191,7 @@ When a defined subject speaks, keep both labels: `<Subject 2> (S1) says, <d>[Chi
 
 ZIMAGE = """你是 Z-Image 文生图模型的提示词改写器。用户给一句大白话，你还它一段这个模型认的提示词。
 
-只输出改写后的提示词本身：不要开场白、不要解释、不要 markdown 代码块、不要分点。
+只输出改写后的提示词本身：不要开场白、不要解释、不要 markdown 代码块、不要分点、不要思考过程标签（如 <think> 或 <thinking>）。
 
 用中文写（这个模型的文本编码器是 Qwen3 4B，中文描述最准）。写成**一段连贯的话**，
 不要写成逗号分隔的标签串。
@@ -215,7 +215,7 @@ ZIMAGE = """你是 Z-Image 文生图模型的提示词改写器。用户给一�
 KLEIN = """你是 Flux.2 Klein「参考图编辑」的提示词改写器。用户给一句大白话，
 你还他一句这个模型认的**编辑指令**。
 
-只输出改写后的提示词本身：不要开场白、不要解释、不要 markdown 代码块。用中文写。
+只输出改写后的提示词本身：不要开场白、不要解释、不要 markdown 代码块、不要思考过程标签（如 <think> 或 <thinking>）。用中文写。
 
 这条能力的机制：参考图被直接编码成 latent 挂进条件里，人物长相和画风由原图约束住，
 提示词**只用来说「改什么」**。所以：
@@ -251,35 +251,38 @@ H3 = ("h3_base", "h3_ref")
 T_POLISH = """你是中文文字润色器。把用户给的文字改得更通顺、更好读，可以调整语序、
 替换更好的用词、修掉病句和重复，但不许改变意思、不许增删事实、不许改变语气人称。
 
-只输出润色后的文字本身：不要开场白、不要解释、不要 markdown 代码块。
+只输出润色后的文字本身：不要开场白、不要解释、不要 markdown 代码块、不要思考过程标签（如 <think> 或 <thinking>）。
 保持原文的语言（中文的润色成中文，英文的润色成英文）和分段方式。"""
 
 T_OPTIMIZE = """你是文字优化器。把用户给的文字改写得更精炼、更有表现力：
 删掉废话和套话，把含糊的表达换成具体的说法，句子节奏更好，重点更突出。
 不许编造原文没有的事实，不许改变作者的立场和语气。
 
-只输出优化后的文字本身：不要开场白、不要解释、不要 markdown 代码块。
+只输出优化后的文字本身：不要开场白、不要解释、不要 markdown 代码块、不要思考过程标签（如 <think> 或 <thinking>）。
 保持原文的语言和分段方式。长度跟原文相当（最多不超过 1.3 倍）。"""
 
 T_EXPAND = """你是文字扩写器。把用户给的文字扩写得更丰富、更具体：
 补充符合原意的细节、过渡和描写，让画面感和信息量更足。
 不许偏离或改变原意，不许编造跟原文冲突的事实。
 
-只输出扩写后的文字本身：不要开场白、不要解释、不要 markdown 代码块。
+只输出扩写后的文字本身：不要开场白、不要解释、不要 markdown 代码块、不要思考过程标签（如 <think> 或 <thinking>）。
 保持原文的语言和分段方式，长度约为原文的 2~3 倍。"""
 
 T_CUSTOM = """你按用户给的指令处理文字。指令说什么就做什么；指令没提到的方面
 （语言、语气、格式）保持原样。指令和文字冲突时，以指令为准。
 
-只输出处理后的文字本身：不要开场白、不要解释、不要 markdown 代码块。"""
+只输出处理后的文字本身：不要开场白、不要解释、不要 markdown 代码块、不要思考过程标签（如 <think> 或 <thinking>）。"""
 
 T_TRANSLATE = """你是专业翻译。根据输入文字的语言自动判断：
 - 如果是中文，翻译成自然流畅的英文
 - 如果是英文，翻译成自然流畅的中文
 - 其他语言，翻译成英文
 
-只输出翻译结果本身，不要开场白、不要解释、不要 markdown 代码块。
+只输出翻译结果本身，不要开场白、不要解释、不要 markdown 代码块、不要思考过程标签（如 <think> 或 <thinking>）。
 翻译时保持原文的意境和专业术语准确性。"""
+
+# 反推提示词的 system prompt 直接留空，因为工作流中已经包含了完整的提示词
+T_REVERSE_PROMPT = ""
 
 TEXT_OPS = {
     "polish":   {"name": "润色", "system": T_POLISH,
@@ -292,10 +295,13 @@ TEXT_OPS = {
                  "max_tokens": 3000, "temperature": 0.7},
     "translate": {"name": "翻译", "system": T_TRANSLATE,
                  "max_tokens": 2000, "temperature": 0.3},
+    "reverse_prompt": {"name": "反推提示词", "system": T_REVERSE_PROMPT,
+                 "max_tokens": 2000, "temperature": 0.8,
+                 "uses_workflow": True},  # 标记这个操作使用工作流而非直接LLM
 }
 
 
-def text_user_msg(op, params, inputs, extra):
+def text_user_msg(op, params, inputs):
     """文本卡跑的时候喂给模型的用户消息。输入可能有好几段（一张卡收多根连线），
     每段标上它是哪张卡来的，模型才分得清哪段是什么。"""
     cfg = TEXT_OPS[op]
@@ -309,8 +315,6 @@ def text_user_msg(op, params, inputs, extra):
         blocks.append("【文字】\n（没接任何上游，也没有附加文字 —— "
                       "照" + ("指令" if op == "custom" else "这项操作")
                       + "的意思自己写一段合适的内容）")
-    if extra.strip():
-        blocks.append("【附加文字】\n" + extra.strip())
     blocks.append(f"现在对上面的文字做「{cfg['name']}」，只输出结果本身。")
     return "\n\n".join(blocks)
 
@@ -319,7 +323,9 @@ def text_clean(raw):
     """文本卡的输出不需要 clean() 那套 H3 修补，只掐代码块围栏和交代话。"""
     t = FENCE.sub("", (raw or "").strip()).strip()
     # 有些模型会返回 <think>推理过程</think>，这部分不要（DeepSeek R1 / QwQ 等）
-    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL).strip()
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
+    t = re.sub(r"<thinking>.*?</thinking>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
+    t = re.sub(r"<thought>.*?</thought>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
     return LEADIN.sub("", t, count=1).strip()
 
 
@@ -497,6 +503,11 @@ SUMMARY = re.compile(r"(^summary:\s*\n?[ \t]*)(%s)(?:\s*\+\s*(?:%s))*"
 def clean(text, spec, cap, params, assets):
     """返回 (提示词, 提醒)。提醒是给人看的一句话，不改文本。"""
     t = FENCE.sub("", (text or "").strip()).strip()
+    # 过滤 <think> 标签（DeepSeek R1 / QwQ 等推理模型）
+    # 支持多种格式：<think>...</think>、<Think>...</Think>、<thinking>...</thinking>
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
+    t = re.sub(r"<thinking>.*?</thinking>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
+    t = re.sub(r"<thought>.*?</thought>", "", t, flags=re.DOTALL | re.IGNORECASE).strip()
     reg = spec["regime"]
     warn = []
 

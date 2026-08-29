@@ -30,6 +30,9 @@ const el = {
   toast: $("#toast"), picker: $("#picker"),
   jobsbtn: $("#jobsbtn"), jobs: $("#jobs"),
   view: $("#view"), vbox: $("#view .vbox"), respop: $("#respop"),
+  minimapBtn: $("#minimap-btn"), wiresToggle: $("#wires-toggle"), zoomMenu: $("#zoom-menu"),
+  minimap: $("#minimap"), minimapCanvas: $("#minimap-canvas"), minimapViewport: $("#minimap-viewport"),
+  zoomPercent: $("#zoom-percent"),
 };
 
 /* ================= 工具 ================= */
@@ -322,13 +325,12 @@ const shortOf16x9 = (L) => Math.round(L * 9 / 16 / MULT) * MULT;
    · megapixels + aspect_ratio（H3 视频 / 拼图 / 漫剧）—— 比例是节点内置 8 档
      select，清晰度档从 megapixels 的 min/max 里能选到的档位算
    · width + height（Z-Image 文生图）—— 任意 16 步进，清晰度按像素面积折 1K/2K */
-/** 清晰度档：这一档的短边像素（按 16:9 折算好跟面板读数同一口径）。
-    K 档按百万像素*1024² 算：1K≈1024²短边、2K≈2048²面积翻倍。 */
+/** 清晰度档：按标准分辨率档位（短边像素）定义 */
 const CLARITY_STEPS = [
-  { id: "0.5K", label: "0.5K", mp: 0.26 },
-  { id: "1K", label: "1K", mp: 0.5 },
-  { id: "1.5K", label: "1.5K", mp: 0.7 },
-  { id: "2K", label: "2K", mp: 1.0 },
+  { id: "480P", label: "480P", val: 480 },
+  { id: "720P", label: "720P", val: 720 },
+  { id: "1080P", label: "1080P", val: 1080 },
+  { id: "1440P", label: "1440P", val: 1440 },
 ];
 /** 比例网格（照参考图内置的 13 种；映射到工作流那 8 档 select 里的最优近似） */
 const RATIO_GRID = [
@@ -545,10 +547,9 @@ function clarityPicker(c, cap, onchange) {
         steps.push({ id: `${p}p`, label: `${p}p`, val: v, p });
       }
     } else {
-      // 文生图那套：K 档按短边像素折（512/724/887/1024），宽高跟着比例算
+      // 文生图那套：按标准分辨率档位（短边像素）
       for (const s of CLARITY_STEPS) {
-        const p = Math.round(512 * Math.sqrt(parseFloat(s.id) * 2));
-        steps.push({ ...s, val: p, dis: false });
+        steps.push({ ...s, dis: false });
       }
     }
     const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "清晰度";
@@ -579,7 +580,25 @@ function clarityPicker(c, cap, onchange) {
         if (mpSpec) { c.params.megapixels = s.val; }
         else {
           c.params._clarity = s.id;
-          const r = RATIO_GRID.find(x => x[0] === (c.params._ratio || "3:4")) || [0, 3, 4];
+          // 从当前宽高反推比例，没有记录过就按现有宽高推算
+          let ratio = c.params._ratio;
+          if (!ratio) {
+            const cw = c.params.width != null ? c.params.width : wSpec.default;
+            const ch = c.params.height != null ? c.params.height
+              : (cap.inputs.find(x => x.key === "height") || {}).default;
+            if (cw && ch) {
+              let best = null, bd = Infinity;
+              for (const r of RATIO_GRID) {
+                const d = Math.abs(cw / ch - r[1] / r[2]);
+                if (d < bd) { bd = d; best = r[0]; }
+              }
+              ratio = best || "3:4";
+              c.params._ratio = ratio; // 记录下来
+            } else {
+              ratio = "3:4";
+            }
+          }
+          const r = RATIO_GRID.find(x => x[0] === ratio) || [0, 3, 4];
           setWHFrom(r);
         }
         save(); onchange && onchange();
@@ -596,7 +615,7 @@ function clarityPicker(c, cap, onchange) {
 function whStep(cap, c) {
   if (c.params._clarity) {
     const s = CLARITY_STEPS.find(x => x.id === c.params._clarity);
-    if (s) return { ...s, val: Math.round(512 * Math.sqrt(parseFloat(s.id) * 2)) };
+    if (s) return s;
   }
   const w = cap.inputs.find(x => x.key === "width");
   const h = cap.inputs.find(x => x.key === "height");
@@ -606,9 +625,8 @@ function whStep(cap, c) {
   const short = Math.min(cw, ch);
   let best = null, bd = Infinity;
   for (const s of CLARITY_STEPS) {
-    const p = Math.round(512 * Math.sqrt(parseFloat(s.id) * 2));
-    const d = Math.abs(p - short);
-    if (d < bd) { bd = d; best = { ...s, val: p }; }
+    const d = Math.abs(s.val - short);
+    if (d < bd) { bd = d; best = s; }
   }
   return best;
 }
@@ -919,11 +937,139 @@ function applyView() {
   el.groups.style.transform = el.world.style.transform;
   el.wires.setAttribute("width", 1); el.wires.setAttribute("height", 1);
   paintSel();               // 工具条跟着缩放/平移走，不然就飘走了
+  updateMinimap();
+  updateZoomPercent();
+}
+
+function updateZoomPercent() {
+  if (el.zoomPercent) {
+    el.zoomPercent.textContent = Math.round(view.k * 100) + "%";
+  }
 }
 
 function toWorld(cx, cy) {
   const r = el.stage.getBoundingClientRect();
   return { x: (cx - r.left - view.x) / view.k, y: (cy - r.top - view.y) / view.k };
+}
+
+/* ================= 小地图 ================= */
+let minimapVisible = false;
+
+function updateMinimap() {
+  if (!minimapVisible || !PROJ || !PROJ.cards.length) return;
+
+  const canvas = el.minimapCanvas;
+  const ctx = canvas.getContext("2d");
+  const MAP_W = 200, MAP_H = 150;
+
+  // 设置 canvas 实际分辨率
+  canvas.width = MAP_W;
+  canvas.height = MAP_H;
+
+  // 计算所有节点的包围盒
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  for (const c of PROJ.cards) {
+    const w = cardW(c), h = c._el ? c._el.offsetHeight : 200;
+    minX = Math.min(minX, c.x);
+    minY = Math.min(minY, c.y);
+    maxX = Math.max(maxX, c.x + w);
+    maxY = Math.max(maxY, c.y + h);
+  }
+
+  // 添加边距
+  const padding = 50;
+  minX -= padding; minY -= padding;
+  maxX += padding; maxY += padding;
+
+  const worldW = maxX - minX, worldH = maxY - minY;
+  const scale = Math.min(MAP_W / worldW, MAP_H / worldH);
+
+  // 清空画布
+  ctx.fillStyle = "#05060d";
+  ctx.fillRect(0, 0, MAP_W, MAP_H);
+
+  // 绘制节点
+  ctx.fillStyle = "#1e2a44";
+  ctx.strokeStyle = "#2b3d63";
+  ctx.lineWidth = 1;
+  for (const c of PROJ.cards) {
+    const x = (c.x - minX) * scale;
+    const y = (c.y - minY) * scale;
+    const w = cardW(c) * scale;
+    const h = (c._el ? c._el.offsetHeight : 200) * scale;
+    ctx.fillRect(x, y, w, h);
+    ctx.strokeRect(x, y, w, h);
+  }
+
+  // 绘制当前视口
+  const stageRect = el.stage.getBoundingClientRect();
+  const vpX = (-view.x / view.k - minX) * scale;
+  const vpY = (-view.y / view.k - minY) * scale;
+  const vpW = (stageRect.width / view.k) * scale;
+  const vpH = (stageRect.height / view.k) * scale;
+
+  el.minimapViewport.style.left = vpX + "px";
+  el.minimapViewport.style.top = vpY + "px";
+  el.minimapViewport.style.width = vpW + "px";
+  el.minimapViewport.style.height = vpH + "px";
+
+  // 保存缩放信息供拖动使用
+  el.minimap._scale = scale;
+  el.minimap._minX = minX;
+  el.minimap._minY = minY;
+}
+
+function toggleMinimap() {
+  minimapVisible = !minimapVisible;
+  el.minimap.style.display = minimapVisible ? "" : "none";
+  el.minimapBtn.classList.toggle("active", minimapVisible);
+  if (minimapVisible) updateMinimap();
+}
+
+function bindMinimapDrag() {
+  let dragging = false;
+
+  const move = (ex, ey) => {
+    if (!dragging) return;
+    const rect = el.minimap.getBoundingClientRect();
+    const mx = ex - rect.left;
+    const my = ey - rect.top;
+
+    const scale = el.minimap._scale || 1;
+    const minX = el.minimap._minX || 0;
+    const minY = el.minimap._minY || 0;
+
+    const worldX = mx / scale + minX;
+    const worldY = my / scale + minY;
+
+    const stageRect = el.stage.getBoundingClientRect();
+    view.x = -worldX * view.k + stageRect.width / 2;
+    view.y = -worldY * view.k + stageRect.height / 2;
+
+    applyView();
+    placePanel();
+    save();
+  };
+
+  el.minimapViewport.addEventListener("mousedown", (ev) => {
+    ev.preventDefault();
+    dragging = true;
+  });
+
+  el.minimap.addEventListener("mousedown", (ev) => {
+    if (ev.target === el.minimapViewport) return;
+    ev.preventDefault();
+    dragging = true;
+    move(ev.clientX, ev.clientY);
+  });
+
+  addEventListener("mousemove", (ev) => {
+    if (dragging) move(ev.clientX, ev.clientY);
+  });
+
+  addEventListener("mouseup", () => {
+    dragging = false;
+  });
 }
 
 /* ================= 渲染 ================= */
@@ -934,6 +1080,7 @@ function render() {
   drawWires();
   paintGroups();
   el.hint.textContent = `${PROJ.cards.length} 个节点`;
+  updateMinimap();
 }
 
 /** 这个节点这一轮会出什么：认真正会跑的那条能力，不是节点定义。
@@ -1168,6 +1315,12 @@ function paint(c) {
     ta.oninput = () => {
       c.params = c.params || {};
       c.params.text = ta.value;
+      // 同步更新参数面板中的 textarea
+      const panel = document.querySelector("#panel");
+      const panelTa = panel ? panel.querySelector("textarea") : null;
+      if (panelTa && panelTa.placeholder === "在这里写字或直接在节点上写") {
+        panelTa.value = ta.value;
+      }
       paintTextFoot(c);          // 只刷节点脚，不重画 body —— 重画会丢输入焦点
       save();
     };
@@ -1321,7 +1474,7 @@ function paintTextFoot(c) {
   else st.textContent = txt ? "" : "还没写";
   st.title = st.textContent;
   const bits = [];
-  if (op) bits.push(`输入 ${inN} 段${String(((c.params || {}).extra) || "").trim() ? "＋附加" : ""}`);
+  if (op) bits.push(`输入 ${inN} 段`);
   if (outN) bits.push(`连 ${outN} 个节点`);
   meta.textContent = bits.join(" · ");
   meta.title = c.error || "";
@@ -1574,17 +1727,19 @@ function beginCardsMove(ev, cards) {
   const mv = (e) => {
     // 4px 阈值：手抖一下不算拖，也就不会白闪一次面板
     if (!moved && Math.abs(e.clientX - s.mx) + Math.abs(e.clientY - s.my) < 4) return;
-    if (!moved) { moved = true; veilPanel(true); }
+    if (!moved) { moved = true; }
     const dx = (e.clientX - s.mx) / view.k, dy = (e.clientY - s.my) / view.k;
     for (const p of s.pos) {
       p.c.x = Math.round(p.x + dx); p.c.y = Math.round(p.y + dy);
       if (p.c._el) { p.c._el.style.left = p.c.x + "px"; p.c._el.style.top = p.c.y + "px"; }
     }
     drawWires();
+    // 拖动过程中实时更新参数面板位置，让它一直吸附在卡片下方
+    placePanel();
   };
   const up = () => {
     document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
-    if (moved) { veilPanel(false); placePanel(); save(); }
+    if (moved) { placePanel(); save(); }
   };
   document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
 }
@@ -1676,7 +1831,7 @@ function startResize(ev, c, d, dir) {
   let moved = false;
   const mv = (e) => {
     if (!moved && Math.abs(e.clientX - s.mx) + Math.abs(e.clientY - s.my) < 3) return;
-    if (!moved) { moved = true; veilPanel(true); }
+    if (!moved) { moved = true; }
     c.w = fit(s.w + (e.clientX - s.mx) / view.k * dir, CW_MIN, CW_MAX);
     if (!e.shiftKey) c.h = fit(s.h + (e.clientY - s.my) / view.k * dir, CH_MIN, CH_MAX);
     applySize(c);
@@ -1688,10 +1843,12 @@ function startResize(ev, c, d, dir) {
       d.style.left = c.x + "px"; d.style.top = c.y + "px";
     }
     drawWires();
+    // 改变卡片大小时也实时更新参数面板位置
+    placePanel();
   };
   const up = () => {
     document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
-    if (moved) { veilPanel(false); placePanel(); save(); }
+    if (moved) { placePanel(); save(); }
   };
   document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
 }
@@ -1760,7 +1917,8 @@ function bindGlobal() {
   el.stage.addEventListener("mousedown", (ev) => {
     // 工具条自己管自己（打组这些按钮）：冒泡到画布会被当成"点空白"把选中清掉，
     // 按钮执行时手里就没节点了 —— 这就是打组点了没反应的原因
-    if (ev.target.closest("#selbar")) return;
+    // 参数面板也同理：点面板上的按钮不能关掉面板
+    if (ev.target.closest("#selbar") || ev.target.closest("#panel")) return;
     // 中键 = 拖画布（在哪儿按都行，节点上按中键也放过来了）
     if (ev.button === 1) {
       ev.preventDefault();          // 掐掉浏览器中键的自动滚动
@@ -1775,8 +1933,7 @@ function bindGlobal() {
       const up = () => {
         el.stage.classList.remove("panning");
         document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
-        // 真挪过才要把面板放回来：veilPanel 只解除隐藏，placePanel 才按节点的
-        // 新屏幕位置重新摆板 —— 少这句面板就留在挪之前的旧位置（飘了）
+        // 拖动画布结束后恢复面板显示，并重新定位到节点下方
         if (moved) { veilPanel(false); placePanel(); }
         save();
       };
@@ -1834,7 +1991,7 @@ function bindGlobal() {
     view.x = ev.clientX - r.left - w.x * k;
     view.y = ev.clientY - r.top - w.y * k;
     view.k = k;
-    applyView(); placePanel(); save();
+    applyView(); save();
   }, { passive: false });
 
   // 空白处右键：新建节点改走底部工具条了，这儿只剩"把刚复制的节点粘在这个位置"。
@@ -1936,6 +2093,32 @@ function bindGlobal() {
     selIds.clear(); paintSel();                  // Esc 也收掉框选
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
   });
+
+  // 画布工具条按钮事件
+  el.minimapBtn.onclick = toggleMinimap;
+  bindMinimapDrag();
+
+  let wiresVisible = true;
+  el.wiresToggle.onclick = () => {
+    wiresVisible = !wiresVisible;
+    el.wires.style.display = wiresVisible ? "" : "none";
+    el.wiresToggle.classList.toggle("active", !wiresVisible);
+    // 同时控制节点上的连接点显示/隐藏
+    document.querySelectorAll(".card .inp, .card .out").forEach(dot => {
+      dot.style.display = wiresVisible ? "" : "none";
+    });
+  };
+
+  el.zoomMenu.onclick = (ev) => {
+    const items = [
+      { icon: "🔍", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); save(); } },
+      { icon: "⊙", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); save(); } },
+      { icon: "🔍", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); save(); } },
+      { icon: "🔍", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); save(); } },
+      { icon: "📐", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); } },
+    ];
+    showMenu(ev.clientX, ev.clientY - 200, "缩放", items);
+  };
 }
 
 /* ================= 右键菜单 ================= */
@@ -2228,6 +2411,17 @@ function addCard(type, x, y, cap) {
     return null;
   }
   const c = { id: uid(), type, cap: cap || modeCap(def.modes[0]), x: Math.round(x), y: Math.round(y), params: {}, assets: {}, status: null, progress: 0, outputs: [] };
+
+  // 自动分配序号名称
+  const sameDef = PROJ.cards.filter(x => defOf(x) === def);
+  const maxNum = sameDef.reduce((max, x) => {
+    if (!x.name) return max;
+    const m = x.name.match(/^(.+?)(\d+)$/);
+    return m ? Math.max(max, parseInt(m[2], 10)) : max;
+  }, 0);
+  const baseLabel = def.name || def.modes[0].name;
+  c.name = `${baseLabel}${maxNum + 1}`;
+
   PROJ.cards.push(c);
   el.world.appendChild(buildCard(c));
   pick(c.id); drawWires(); save();
@@ -2348,7 +2542,8 @@ async function linkTo(from, to) {
   if (isTextCard(from)) return linkText(from, to);
   if (isTextCard(to)) return toast("文本节点不收图片/视频素材：把文本节点的出口拖过来才是接文本");
   if (isAsset(to)) return toast("素材节点不收输入：它是把手里那份素材送给别的节点的");
-  const out = (from.outputs || [])[0];
+  const outputs = from.outputs || [];
+  const out = outputs[0];
   if (!out) return toast(isAsset(from) ? "这个素材节点还是空的：先点它选个文件" : "上游还没有产物，先运行它");
   // 路由节点先按上游产物的类型切到对应那一路，切完槽位名才对得上（见 routeFor）
   const r = routeFor(to, out.kind);
@@ -2367,8 +2562,42 @@ async function linkTo(from, to) {
     toast(`引用上游产物 → ${spec.label}` + (inh ? "；上游的风格也跟着传下来了" : ""));
     // 素材节点手里那份本来就是上传上来的（已经在 input 目录里、ref 是现成的），
     // 再走一遍 importOutput 就是把同一个文件下载下来重新传一次，纯粹白等
-    to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
-      : await importOutput(out);
+
+    // 如果有多个产物，尝试填充所有对应的槽位
+    if (outputs.length > 1) {
+      const cap = CAPS[to.cap];
+      if (cap) {
+        // 找到所有相同类型的槽位（如 images[0], images[1], ...）
+        const match = /^(\w+)\[(\d+)\]$/.exec(spec.key);
+        if (match) {
+          const [_, slotType, startIdx] = match;
+          const allSlots = (cap.inputs || [])
+            .filter(s => s.key.startsWith(slotType + "[") && s.type === out.kind)
+            .sort((a, b) => {
+              const aIdx = parseInt(/\[(\d+)\]/.exec(a.key)[1]);
+              const bIdx = parseInt(/\[(\d+)\]/.exec(b.key)[1]);
+              return aIdx - bIdx;
+            });
+          console.log('[linkTo] 多产物填充:', { outputs: outputs.length, slots: allSlots.length });
+          for (let i = 0; i < Math.min(outputs.length, allSlots.length); i++) {
+            to.assets[allSlots[i].key] = isAsset(from) ? JSON.parse(JSON.stringify(outputs[i]))
+              : await importOutput(outputs[i]);
+          }
+        } else {
+          // 槽位名不是数组格式，只填第一个
+          to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
+            : await importOutput(out);
+        }
+      } else {
+        to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
+          : await importOutput(out);
+      }
+    } else {
+      // 单产物，原逻辑
+      to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
+        : await importOutput(out);
+    }
+
     paintKind(to);
     if (selId === to.id) openPanel(to.id);
     save();
@@ -2395,12 +2624,51 @@ async function spawnDownstream(from, at, cx, cy) {
   const ORDER = [
     ["card_text", "文本"], ["card_image", "图片"], ["card_video", "视频"], ["card_tools", "工具箱"],
   ];
+
+  // 获取上游产物数量和类型
+  const outputCount = (from.outputs || []).length;
+  const outputKind = (from.outputs || [])[0]?.kind || (capOf(from) || defOf(from) || {}).outputType;
+
+  console.log('[spawnDownstream] 上游产物:', { outputCount, outputKind, fromId: from.id });
+
   const list = (pred) => {
     const items = [];
     for (const [tid, label] of ORDER) {
       const def = CARDS.find(d => d.id === tid);
       if (!def || !def.modes.length) continue;
-      const md = def.modes.find(pred);
+      // 根据产物数量筛选模式：
+      // - 如果有多个产物，优先匹配 images/videos/audios 数量相同的模式
+      // - 如果没有匹配的，降级到支持单个素材的模式
+      let md = null;
+      if (outputCount > 1 && outputKind) {
+        // 多产物：找支持对应数量的模式
+        md = def.modes.find(m => {
+          if (!pred(m)) return false;
+          const capId = modeCap(m);
+          const cap = CAPS[capId];
+          if (!cap) return false;
+          const imgCount = cap.images || 0;
+          const vidCount = cap.videos || 0;
+          const audCount = cap.audios || 0;
+          console.log('[spawnDownstream] 检查模式:', { mode: m, capId, imgCount, vidCount, audCount, outputCount, outputKind });
+          // 匹配产物类型和数量
+          if (outputKind === "image" && imgCount === outputCount) {
+            console.log('[spawnDownstream] ✓ 找到匹配的图片模式:', capId);
+            return true;
+          }
+          if (outputKind === "video" && vidCount === outputCount) {
+            console.log('[spawnDownstream] ✓ 找到匹配的视频模式:', capId);
+            return true;
+          }
+          if (outputKind === "audio" && audCount === outputCount) {
+            console.log('[spawnDownstream] ✓ 找到匹配的音频模式:', capId);
+            return true;
+          }
+          return false;
+        });
+      }
+      // 如果没找到匹配的，或者只有单产物，用原逻辑
+      if (!md) md = def.modes.find(pred);
       if (!md) continue;
       items.push({
         icon: def.icon, text: label,
@@ -2628,30 +2896,46 @@ function placePanel() {
   if (el.panel.style.display === "none") return;
   const c = PROJ && PROJ.cards.find(x => x.id === el.panel._id);
   if (!c || !c._el) return closePanel();
-  const GAP = 8, TOP = 52;                 // TOP 给顶栏让位
-  // 先限高再量高：漫剧20宫格那种 6 个提示词的面板不封顶会直接长到屏幕外，
-  // 量出来的 offsetHeight 就没法用来做"放不下就换边"的判断了
-  el.panel.style.maxHeight = (innerHeight - TOP - GAP) + "px";
+
+  const GAP = 8;
+
+  // 节点的世界坐标
+  const cx = c.x, cy = c.y;
+  const cw = c._el.offsetWidth, ch = c._el.offsetHeight;
+
+  // 将世界坐标转换为屏幕坐标：应用 view 的平移和缩放
+  const screenX = cx * view.k + view.x;
+  const screenY = cy * view.k + view.y;
+  const screenW = cw * view.k;
+  const screenH = ch * view.k;
+
+  // 获取 stage 的边界
   const r = el.stage.getBoundingClientRect();
+
+  // 检查节点是否在可视区域内，如果完全不在就隐藏面板
+  const nodeRight = screenX + screenW;
+  const nodeBottom = screenY + screenH;
+  const isVisible = nodeRight > r.left && screenX < r.right &&
+                    nodeBottom > r.top && screenY < r.bottom;
+
+  if (!isVisible) {
+    el.panel.style.visibility = "hidden";
+    return;
+  }
+
+  el.panel.style.visibility = "";
+
+  // 先限高再量高
+  const TOP = 52;
+  el.panel.style.maxHeight = (innerHeight - TOP - GAP) + "px";
   const w = el.panel.offsetWidth, h = el.panel.offsetHeight;
-  // 节点在屏幕上的矩形（offsetHeight 是世界坐标，要乘缩放）
-  const cx = r.left + view.x + c.x * view.k, cy = r.top + view.y + c.y * view.k;
-  const cw = cardW(c) * view.k, ch = c._el.offsetHeight * view.k;
-  // 横向按画布自己的左右边界夹，而不是整个窗口：右边开着历史产物栏时，
-  // 按 innerWidth 夹会让面板滑到栏子底下去
-  const clampX = (v) => Math.max(r.left + GAP, Math.min(v, r.right - w - GAP));
-  const clampY = (v) => Math.max(TOP, Math.min(v, innerHeight - h - GAP));
-  const midX = clampX(cx + cw / 2 - w / 2), midY = clampY(cy + ch / 2 - h / 2);
-  // 下 → 右 → 上 → 左，取第一个放得下的；四边都放不下就挑那边空地最宽的
-  const sides = [
-    { room: innerHeight - GAP - (cy + ch + GAP), left: midX, top: cy + ch + GAP, need: h },
-    { room: r.right - GAP - (cx + cw + GAP), left: cx + cw + GAP, top: midY, need: w },
-    { room: (cy - GAP) - TOP, left: midX, top: cy - GAP - h, need: h },
-    { room: (cx - GAP) - (r.left + GAP), left: cx - GAP - w, top: midY, need: w },
-  ];
-  const p = sides.find(s => s.room >= s.need) || sides.reduce((a, b) => (b.room > a.room ? b : a));
-  el.panel.style.left = clampX(p.left) + "px";
-  el.panel.style.top = clampY(p.top) + "px";
+
+  // 面板位置：节点中心下方
+  const panelX = screenX + screenW / 2 - w / 2;
+  const panelY = screenY + screenH + GAP;
+
+  el.panel.style.left = panelX + "px";
+  el.panel.style.top = panelY + "px";
 }
 
 function openPanel(id) {
@@ -3063,6 +3347,26 @@ function textPanel(c) {
   const busy = c.status === "running";
   c.params = c.params || {};
 
+  // --- 内容 ---
+  const textWrap = document.createElement("div"); textWrap.className = "pblock";
+  const textHd = document.createElement("div"); textHd.className = "phd";
+  textHd.innerHTML = `<span>内容</span>`;
+  const textTa = document.createElement("textarea");
+  textTa.placeholder = "在这里写字或直接在节点上写";
+  textTa.value = String(c.params.text || "");
+  textTa.disabled = busy;
+  textTa.oninput = () => {
+    c.params.text = textTa.value;
+    // 同步更新卡片上的 textarea
+    const body = c._el ? c._el.querySelector(".body") : null;
+    const cardTa = body ? body.querySelector("textarea.ttxt") : null;
+    if (cardTa) cardTa.value = textTa.value;
+    paintTextFoot(c);
+    save();
+  };
+  textWrap.append(textHd, textTa);
+  body.appendChild(textWrap);
+
   // --- 指令（自定义加工方式才用） ---
   if (c.params.op === "custom") {
     const wrap = document.createElement("div"); wrap.className = "pblock";
@@ -3075,70 +3379,6 @@ function textPanel(c) {
     wrap.append(hd, ta);
     body.appendChild(wrap);
   }
-
-  // --- 输入列表：按连线顺序，就是喂给模型的顺序；节点上自己写的字也算一段 ---
-  const ins = ownTexts(c);
-  const own = textOf(c);
-  const box = document.createElement("div"); box.className = "slinks";
-  const t = document.createElement("div"); t.className = "atitle";
-  t.textContent = c.params.op
-    ? `输入（${ins.length + (own ? 1 : 0)} 段${ins.length || own ? " · 节点上的字排第一，连线顺序跟在后面" : "）"}` : "还没选加工方式";
-  box.appendChild(t);
-  if (c.params.op) {
-    if (own) {
-      const r = document.createElement("div"); r.className = "slink";
-      r.title = own;
-      const no = document.createElement("span"); no.className = "no"; no.textContent = "1";
-      const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = "这个节点节点上的字";
-      const pv = document.createElement("span"); pv.className = "pv";
-      pv.textContent = own.slice(0, 60) + (own.length > 60 ? "…" : "");
-      r.append(no, nm, pv);
-      box.appendChild(r);
-    }
-    if (!ins.length) {
-      const p = document.createElement("div"); p.className = "anote";
-      p.textContent = "把别的文本节点出口拖到左边那颗绿点上，接进来的文字会跟在节点上的字后面一起加工"
-        + "（没接也行：节点上有字、或下面写了附加文字就能跑）。";
-      box.appendChild(p);
-    }
-    ins.forEach((x, i) => {
-      const r = document.createElement("div"); r.className = "slink";
-      r.title = x.text;
-      const no = document.createElement("span"); no.className = "no";
-      no.textContent = String(i + 2);
-      const a = document.createElement("button"); a.className = "nm";
-      a.textContent = x.name;
-      a.title = "选中这张上游节点（手里没字时先去写/运行它）";
-      a.onclick = () => pick(x.id);
-      const pv = document.createElement("span"); pv.className = "pv";
-      pv.textContent = x.text.slice(0, 60) + (x.text.length > 60 ? "…" : "");
-      pv.title = x.text;
-      const off = document.createElement("button"); off.className = "off";
-      off.textContent = "断开"; off.title = "这段不再作为输入";
-      off.onclick = () => {
-        PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.from === x.id && e.slot === TEXT_SLOT));
-        drawWires(); paintStyles(); openPanel(c.id); save();
-      };
-      r.append(no, a, pv, off);
-      box.appendChild(r);
-    });
-  }
-  body.appendChild(box);
-
-  // --- 附加文字（排在所有输入的最后面） ---
-  const wrap = document.createElement("div"); wrap.className = "pblock";
-  const hd = document.createElement("div"); hd.className = "phd";
-  const nm = document.createElement("span"); nm.textContent = "附加文字（可选）";
-  const clr = document.createElement("button"); clr.textContent = "清空";
-  hd.append(nm, clr);
-  const ta = document.createElement("textarea");
-  ta.placeholder = "接进来的几段之外还想补一句，写在这儿（排在它们后面）";
-  ta.value = String(c.params.extra || "");
-  ta.style.minHeight = "54px";
-  ta.oninput = () => { c.params.extra = ta.value; paintTextFoot(c); save(); };
-  clr.onclick = () => { ta.value = ""; c.params.extra = ""; paintTextFoot(c); save(); };
-  wrap.append(hd, ta);
-  body.appendChild(wrap);
 
   // --- 连给了谁（@style 挂的生成节点 + @text 接的文本节点） ---
   const edges = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e));
@@ -3244,7 +3484,7 @@ async function runText(c) {
     if (own) inputs.unshift({ name: "节点上的原文", text: own });   // 节点上排第一
     const r = await jpost("/api/text", {
       op, model: (c.params || {}).model || "api",
-      inputs, extra: String((c.params || {}).extra || ""),
+      inputs,
       params: { instr: String((c.params || {}).instr || "") },
       project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
     });
@@ -3314,6 +3554,8 @@ function promptBlock(c, s, label) {
   const scs = styleCards(c);
   const styles = scs.map(textOf);
   const own = ownStyles(c);
+  // 获取引用的文本节点
+  const texts = ownTexts(c);
 
   // ✨优化只画在"主提示词"那一格，而且这条能力得在扫描器的 REWRITE 表里登记过
   // （manifest.rewrite）。分镜那种一图一句的节点本来就没登记
@@ -3325,15 +3567,13 @@ function promptBlock(c, s, label) {
   const useOpt = !!(opt && c.optUse && c.optUse[s.key]);
 
   const hd = document.createElement("div"); hd.className = "phd";
-  const nm = document.createElement("span"); nm.textContent = label || s.label;
+  const nm = document.createElement("span");
+  // 标题：如果有引用文本节点，添加说明
+  const totalTexts = styles.length + texts.length;
+  nm.textContent = (label || s.label) + (totalTexts && !useOpt ? `（已并入 ${totalTexts} 段文本）` : "");
   const tag = document.createElement("span"); tag.className = "demo";
   tag.textContent = "⚠ 这是示例文案，改成你要的内容";
-  const clr = document.createElement("button");
-  clr.textContent = useOpt ? "扔掉这份" : "清空";
-  if (useOpt) clr.title = "删掉优化结果，切回你自己写的原词（原词一直没被动过）";
   hd.append(nm, tag);
-  // 标题右侧的按钮去掉（optBtn、rwModelBtn），挪到输入框底部
-  hd.appendChild(clr);
   wrap.appendChild(hd);
 
   // 两份词的页签。优化前不画 —— 只有一份词的时候页签是噪音
@@ -3341,61 +3581,93 @@ function promptBlock(c, s, label) {
 
   const ta = document.createElement("textarea");
   ta.placeholder = `${label || s.label}：描述你想要的画面/动作/镜头`;
-  ta.value = useOpt ? opt
-    : (c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
-  // 优化后那份是给模型看的格式化长文（H3 的六段式能有四五百词），框子要高一点
-  if (useOpt) ta.classList.add("optta");
-  wrap.appendChild(ta);
 
-  // 「实际提交」读数。只有原词那份需要它：风格是提交那一刻才并进去的
-  // （合并结果**不写回 c.params** —— 写回去风格就固化在这个节点上了，改风格节点时下游
-  // 不跟着变，还会一路叠加），所以面板上的框 ≠ 真提交的，必须摆出来。
-  // 优化后那份不需要：风格在优化那一步就融进去了，框里就是原样提交的东西。
-  // 风格可能是从上游顺着连线传下来的（这个节点上没有那根线），不说清来路用户会以为面板串了
-  let pv = null;
-  if (styles.length && !useOpt) {
-    pv = document.createElement("div"); pv.className = "stypv";
-    const ph = document.createElement("div"); ph.className = "hd";
-    ph.textContent = `实际提交（已并入 ${styles.length} 段文本`
-      + (own.length ? "" : " · 从上游继承") + "）";
-    // 自己挂了就不继承上游，这件事不摆出来就是"上游那张风格白挂了"
-    const over = own.length ? upStyles(c) : [];
-    ph.title = (own.length ? "这个节点自己挂的：" : "从上游继承：") + scs.map(titleOf).join("、")
-      + (own.length ? "" : "\n要断就断它跟上游那根产物连线")
-      + (over.length ? `\n上游还传了「${over.map(titleOf).join("、")}」，`
-        + "但这个节点自己挂了风格，就以自己的为准；两份都要就把上游那张也拖到这个节点上" : "");
-    const pb = document.createElement("div"); pb.className = "tx";
-    pv.append(ph, pb);
-    pv._tx = pb;
-    wrap.appendChild(pv);
+  // 构建输入框内容：引用内容在上方 + 用户文本在下方
+  let baseValue = useOpt ? opt
+    : (c.params[s.key] != null ? c.params[s.key] : "");
+
+  // 如果不是优化后的版本，在输入框内显示引用内容（不带标签）在上方
+  if (!useOpt && totalTexts > 0) {
+    const parts = [];
+    // 风格节点：只显示内容（在最上方）
+    if (styles.length > 0) {
+      styles.forEach(st => {
+        parts.push(st);
+      });
+    }
+    // 文本节点：只显示内容
+    if (texts.length > 0) {
+      texts.forEach(t => {
+        parts.push(t.text);
+      });
+    }
+    // 引用内容在前，空两行，用户文本在后
+    const refContent = parts.join('\n\n');
+    ta.value = refContent + (baseValue ? '\n\n' + baseValue : '\n\n');
+  } else {
+    ta.value = baseValue;
   }
 
+  // 优化后那份是给模型看的格式化长文（H3 的六段式能有四五百词），框子要高一点
+  if (useOpt) ta.classList.add("optta");
+
+  // 阻止滚动事件冒泡到画布
+  ta.addEventListener('wheel', (ev) => {
+    ev.stopPropagation();
+  }, { passive: true });
+
+  wrap.appendChild(ta);
+
   const sync = () => {
-    // 示例文案警告只对原词有意义：优化后的那份是模型写的，不可能等于作者的演示文案
+    // 示例文案警告：清空了默认文案才算
     const isDemo = !useOpt && !!s.default && ta.value.trim() === String(s.default).trim();
     tag.style.display = isDemo ? "" : "none";
     ta.classList.toggle("isdemo", isDemo);
-    if (pv) pv._tx.textContent = withStyle(ta.value, styles);
   };
+
+  // 从输入框内容中提取用户自己的文本
+  // 引用内容在上方，用户文本在所有引用内容之后
+  // 通过计算引用内容的总长度来分离
+  const extractUserText = (text) => {
+    if (!text) return '';
+    if (!totalTexts) return text.trim(); // 没有引用，全是用户文本
+
+    // 计算引用部分的完整内容
+    const refParts = [];
+    if (styles.length > 0) {
+      styles.forEach(st => refParts.push(st));
+    }
+    if (texts.length > 0) {
+      texts.forEach(t => refParts.push(t.text));
+    }
+    const refContent = refParts.join('\n\n');
+
+    // 如果文本以引用内容开头，提取后面的用户文本
+    if (text.startsWith(refContent)) {
+      const userText = text.substring(refContent.length).trim();
+      // 去掉开头的换行
+      return userText.replace(/^\n+/, '');
+    }
+
+    // 如果文本不是以引用内容开头（用户可能修改了引用部分），
+    // 则尝试找到引用内容的结束位置
+    return text.trim();
+  };
+
   // 改哪个页签写回哪一份。优化后的也让改 —— 模型偶尔会漏个标签、多写一句，
   // 让人当场补掉比重跑一轮二十秒划算
   ta.oninput = () => {
-    if (useOpt) { c.opt[s.key] = ta.value; } else { c.params[s.key] = ta.value; }
-    sync(); save();
-  };
-  clr.onclick = () => {
-    // 在「优化后」页签上，"清空"唯一有意义的解释是"这份不要了" —— 留一个空的
-    // 优化结果在那儿只会让人对着一个空框发愣。原词那份一直没被动过，直接切回去
     if (useOpt) {
-      delete c.opt[s.key]; delete c.optUse[s.key];
-      if (c.optStyle) delete c.optStyle[s.key];
-      save(); return repanel(c);
+      c.opt[s.key] = ta.value;
+    } else {
+      // 只保存用户自己的文本，引用内容不保存（提交时会通过 withStyle 自动合并）
+      c.params[s.key] = extractUserText(ta.value);
     }
-    ta.value = ""; c.params[s.key] = ""; sync(); ta.focus(); save();
+    sync(); save();
   };
   sync();
 
-  // 提示词底部工具条：模型选择 + 翻译 + 优化（左→右）
+  // 提示词底部工具条：模型选择 + 翻译 + 清空 + 优化（左→右）
   if (canOpt || !useOpt) {
     const toolbar = document.createElement("div"); toolbar.className = "ptoolbar";
     const busy = !!c._rwBusy;
@@ -3404,16 +3676,21 @@ function promptBlock(c, s, label) {
     const curModel = c.params._promptModel || "api";
     const modelBtn = document.createElement("button");
     modelBtn.className = "tbtool model";
-    modelBtn.textContent = curModel === "local" ? "🖥 本地" : "☁ 云端";
-    modelBtn.title = "切换模型：云端 API（快）/ 本地 27B（免费但慢）";
-    modelBtn.onclick = () => {
-      const opts = [
+    const modelLabel = document.createElement("span");
+    modelLabel.textContent = curModel === "local" ? "🖥 本地" : "☁ 云端";
+    const modelArrow = document.createElement("i");
+    modelArrow.textContent = "▾";
+    modelBtn.append(modelLabel, modelArrow);
+    modelBtn.title = "模型 —— 点击换";
+    modelBtn.onclick = (ev) => {
+      ev.stopPropagation();
+      const r = modelBtn.getBoundingClientRect();
+      showMenu(r.left, r.bottom + 4, "模型", [
         { icon: "☁", text: "云端 API —— 几秒就回，要配好 llm.json",
-          run: () => { c.params._promptModel = "api"; repanel(c); save(); } },
+          run: () => { c.params._promptModel = "api"; save(); repanel(c); } },
         { icon: "🖥", text: "本地 27B —— 不花钱，占显存，第一次慢",
-          run: () => { c.params._promptModel = "local"; repanel(c); save(); } },
-      ];
-      tipMenu(opts, modelBtn);
+          run: () => { c.params._promptModel = "local"; save(); repanel(c); } },
+      ]);
     };
     toolbar.appendChild(modelBtn);
 
@@ -3426,7 +3703,48 @@ function promptBlock(c, s, label) {
     trBtn.onclick = () => doTranslate(c, s);
     toolbar.appendChild(trBtn);
 
-    // 右：优化按钮（只在可优化时显示）
+    // 右侧区域：清空 + 优化（紧贴在一起）
+    // 创建一个包裹右侧按钮的容器
+    const rightGroup = document.createElement("div");
+    rightGroup.style.cssText = "display: flex; gap: 4px; margin-left: auto;";
+
+    // 清空按钮
+    const clr = document.createElement("button");
+    clr.className = "tbtool";
+    clr.textContent = useOpt ? "扔掉这份" : "清空";
+    clr.title = useOpt ? "删掉优化结果，切回你自己写的原词（原词一直没被动过）" : "清空提示词";
+    clr.onclick = () => {
+      // 在「优化后」页签上，"清空"唯一有意义的解释是"这份不要了" —— 留一个空的
+      // 优化结果在那儿只会让人对着一个空框发愣。原词那份一直没被动过，直接切回去
+      if (useOpt) {
+        delete c.opt[s.key]; delete c.optUse[s.key];
+        if (c.optStyle) delete c.optStyle[s.key];
+        save(); return repanel(c);
+      }
+      // 清空用户文本，但保留引用内容（不带标签）
+      c.params[s.key] = "";
+      if (!useOpt && totalTexts > 0) {
+        const parts = [];
+        // 重新构建引用部分（只有内容）
+        if (styles.length > 0) {
+          styles.forEach(st => {
+            parts.push(st);
+          });
+        }
+        if (texts.length > 0) {
+          texts.forEach(t => {
+            parts.push(t.text);
+          });
+        }
+        ta.value = parts.join('\n\n');
+      } else {
+        ta.value = "";
+      }
+      sync(); ta.focus(); save();
+    };
+    rightGroup.appendChild(clr);
+
+    // 优化按钮（只在可优化时显示）
     if (canOpt) {
       const optBtn = document.createElement("button");
       optBtn.className = "tbtool opt";
@@ -3436,9 +3754,10 @@ function promptBlock(c, s, label) {
         + (opt ? "\n已有优化结果，再点会覆盖" : "")
         + "\n接入的文本节点会一起融进结果";
       optBtn.onclick = () => doRewrite(c, s, curModel);
-      toolbar.appendChild(optBtn);
+      rightGroup.appendChild(optBtn);
     }
 
+    toolbar.appendChild(rightGroup);
     wrap.appendChild(toolbar);
   }
 
@@ -3541,17 +3860,27 @@ function rwToast(r) {
     前面有活儿还得排队，界面上就是按钮一直显示「优化中…」。 */
 /** 翻译提示词（中→英 / 英→中），调用有道翻译 API */
 async function doTranslate(c, s) {
-  const src = String(c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
+  // 根据当前选中的 tab 决定翻译哪个版本：优化后 or 原文
+  const useOpt = !!(c.optUse && c.optUse[s.key]);
+  const src = useOpt && c.opt && c.opt[s.key]
+    ? String(c.opt[s.key])
+    : String(c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
   if (!src.trim()) return toast("先写点内容再翻译");
   c._rwBusy = true; c._rwErr = null;
   repanel(c);
   try {
     const r = await jpost("/api/text", {
       op: "translate", model: "youdao",
-      inputs: [{ name: "原文", text: src }], extra: "", params: {},
+      inputs: [{ name: "原文", text: src }], params: {},
       project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
     });
-    c.params[s.key] = r.text;
+    // 翻译结果写回当前选中的版本
+    if (useOpt) {
+      c.opt = c.opt || {};
+      c.opt[s.key] = r.text;
+    } else {
+      c.params[s.key] = r.text;
+    }
     save();
     c._rwBusy = false; repanel(c);
     toast(`翻译完成 · ${(r.ms / 1000).toFixed(1)} 秒 · 有道翻译`
@@ -3570,7 +3899,9 @@ async function doRewrite(c, s, model) {
   // 拿的一定是**原词**：优化的输入永远是用户自己写的那段，不是上一轮的优化结果
   // （拿优化结果再优化会一轮轮越写越长，最后跟用户想要的没关系了）
   const src = String(c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
-  if (!src.trim()) return toast("先写一句你想要什么，优化才有东西可改");
+  const styles = styleTexts(c);
+  // 只要有用户文本或引用内容，就可以优化
+  if (!src.trim() && !styles.length) return toast("先写一句你想要什么，优化才有东西可改");
   const pl = payloadOf(c);
   c._rwBusy = true; c._rwErr = null;
   repanel(c);
@@ -3579,15 +3910,29 @@ async function doRewrite(c, s, model) {
     // 提交的就是这份输出原样，系统不再拼文本节点（payloadOf），所以必须融进去
     const r = await jpost("/api/rewrite", {
       capability: cap.id, params: pl.params, assets: pl.assets,
-      prompt: src, style: styleTexts(c).join("\n\n"), model: model || "auto",
+      prompt: src, style: styles.join("\n\n"), model: model || "auto",
       project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
     });
+    // 调试：打印完整的返回数据
+    console.log("=== /api/rewrite 返回数据 ===");
+    console.log(JSON.stringify(r, null, 2));
+    console.log("=== r.text 内容 ===");
+    console.log(r.text);
+    console.log("=========================");
+
+    // 过滤掉思考标签及其之前的所有内容
+    let cleanedText = r.text || '';
+    cleanedText = cleanedText.replace(/^[\s\S]*?<\/think>/i, '');
+    cleanedText = cleanedText.replace(/^[\s\S]*?<\/thinking>/i, '');
+    cleanedText = cleanedText.replace(/^[\s\S]*?<\/thought>/i, '');
+    cleanedText = cleanedText.trim();
+
     c.opt = c.opt || {}; c.optUse = c.optUse || {}; c.optStyle = c.optStyle || {};
-    c.opt[s.key] = r.text;
+    c.opt[s.key] = cleanedText;
     c.optUse[s.key] = true;             // 跑完直接切过去，不然还得再点一下才看得见
     // 记下这份优化是配着哪段风格跑出来的。之后风格节点换了/摘了/新挂了，
     // 优化结果**不会**跟着变（风格是烙在文字里的），页签那儿要能说出来
-    c.optStyle[s.key] = styleTexts(c).join("\n\n");
+    c.optStyle[s.key] = styles.join("\n\n");
     save();
     toast(rwToast(r));
   } catch (e) {
@@ -4192,7 +4537,41 @@ async function pollJobs() {
         for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e))) {
           const to = PROJ.cards.find(x => x.id === e.to);
           if (!to) continue;
-          try { to.assets[e.slot] = await importOutput(c.outputs[0]); } catch (err) {}
+
+          // 如果上游有多个产物，尝试填充到下游的多个槽位
+          const outputs = c.outputs || [];
+          if (outputs.length > 1) {
+            // 多产物：找出下游同类型的所有槽位
+            const cap = defOf(to);
+            const baseSlot = e.slot; // 连线指向的槽位，如 "images[0]"
+            const match = /^(\w+)\[(\d+)\]$/.exec(baseSlot);
+            if (match) {
+              const [_, slotType, startIdx] = match;
+              // 找出所有同类型槽位，按索引排序
+              const allSlots = (cap.inputs || [])
+                .filter(s => s.key.startsWith(slotType + "["))
+                .sort((a, b) => {
+                  const aIdx = parseInt(/\[(\d+)\]/.exec(a.key)[1]);
+                  const bIdx = parseInt(/\[(\d+)\]/.exec(b.key)[1]);
+                  return aIdx - bIdx;
+                });
+              // 从第一个槽位开始，依次填充所有产物
+              for (let i = 0; i < Math.min(outputs.length, allSlots.length); i++) {
+                try {
+                  to.assets[allSlots[i].key] = await importOutput(outputs[i]);
+                } catch (err) {
+                  console.error('导入产物失败:', err);
+                }
+              }
+            } else {
+              // 非数组槽位，只填第一个
+              try { to.assets[e.slot] = await importOutput(outputs[0]); } catch (err) {}
+            }
+          } else {
+            // 单产物：原逻辑
+            try { to.assets[e.slot] = await importOutput(outputs[0]); } catch (err) {}
+          }
+
           if (el.panel._id === to.id) openPanel(to.id);
         }
       }
