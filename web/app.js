@@ -3581,6 +3581,22 @@ function promptBlock(c, s, label) {
 
   const ta = document.createElement("textarea");
   ta.placeholder = `${label || s.label}：描述你想要的画面/动作/镜头`;
+  ta.className = "prompt-input"; // 添加类名用于定位
+
+  // 创建高亮层容器
+  const highlightWrapper = document.createElement("div");
+  highlightWrapper.className = "prompt-highlight-wrapper";
+  highlightWrapper.style.cssText = "position: relative;";
+
+  // 创建高亮层（与 textarea 重叠，显示 @标签高亮）
+  const highlightLayer = document.createElement("div");
+  highlightLayer.className = "prompt-highlight-layer";
+  highlightLayer.style.cssText = `
+    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+    padding: 6px 8px; border: 1px solid transparent;
+    font: inherit; color: transparent; white-space: pre-wrap; word-wrap: break-word;
+    pointer-events: none; overflow: hidden; line-height: inherit;
+  `;
 
   // 构建输入框内容：引用内容在上方 + 用户文本在下方
   let baseValue = useOpt ? opt
@@ -3608,8 +3624,34 @@ function promptBlock(c, s, label) {
     ta.value = baseValue;
   }
 
+  // 更新高亮层内容
+  function updateHighlight() {
+    const text = ta.value;
+    // 将 @关键字 替换为带样式的 span
+    const highlighted = text.replace(/@([\u4e00-\u9fa5\w]+)/g, (match, name) => {
+      return `<mark class="at-mention" data-name="${name}">${match}</mark>`;
+    });
+    // 其余文本用透明色占位
+    highlightLayer.innerHTML = highlighted.replace(/[^\n]/g, match =>
+      match === '<' || match === '>' || match === '"' || match === 'a' || match === 't' ||
+      match === '-' || match === 'm' || match === 'e' || match === 'n' || match === 'i' ||
+      match === 'o' || match === 'r' || match === 'k' || match === 'c' || match === 'l' ||
+      match === 's' || match === '=' || match === ' ' ? match : match
+    );
+    // 重新计算，保持格式
+    highlightLayer.innerHTML = highlighted;
+    highlightLayer.scrollTop = ta.scrollTop;
+    highlightLayer.scrollLeft = ta.scrollLeft;
+  }
+
   // 优化后那份是给模型看的格式化长文（H3 的六段式能有四五百词），框子要高一点
   if (useOpt) ta.classList.add("optta");
+
+  // 同步滚动
+  ta.addEventListener('scroll', () => {
+    highlightLayer.scrollTop = ta.scrollTop;
+    highlightLayer.scrollLeft = ta.scrollLeft;
+  });
 
   // 阻止滚动事件冒泡到画布
   ta.addEventListener('wheel', (ev) => {
@@ -3621,6 +3663,9 @@ function promptBlock(c, s, label) {
   let atMenuStart = -1; // @ 开始的位置
 
   ta.addEventListener('input', () => {
+    // 更新高亮层
+    updateHighlight();
+
     const cursorPos = ta.selectionStart;
     const textBefore = ta.value.substring(0, cursorPos);
     // 匹配 @ 后面的文字（可以是中文、英文、数字）
@@ -3759,7 +3804,131 @@ function promptBlock(c, s, label) {
     }
   }
 
-  wrap.appendChild(ta);
+  // 组装：高亮层 + textarea
+  highlightWrapper.appendChild(highlightLayer);
+  highlightWrapper.appendChild(ta);
+  wrap.appendChild(highlightWrapper);
+
+  // 初始化高亮
+  updateHighlight();
+
+  // 悬停预览功能：鼠标移到高亮层的 @标签上时显示预览
+  highlightLayer.style.pointerEvents = "auto"; // 允许高亮层接收鼠标事件
+  let previewEl = null;
+
+  highlightLayer.addEventListener('mouseover', (ev) => {
+    const mark = ev.target.closest('.at-mention');
+    if (!mark) return;
+
+    const name = mark.dataset.name;
+    if (!name) return;
+
+    // 查找对应的卡片或槽位
+    let previewData = null;
+
+    // 1. 查找卡片
+    const targetCard = PROJ.cards.find(card => titleOf(card) === name);
+    if (targetCard) {
+      const outputs = targetCard.outputs || [];
+      if (outputs.length > 0) {
+        const out = outputs[0];
+        previewData = {
+          type: out.kind,
+          url: out.url,
+          name: titleOf(targetCard),
+        };
+      } else if (isTextCard(targetCard) || isStyle(targetCard)) {
+        previewData = {
+          type: 'text',
+          text: textOf(targetCard) || '(空)',
+          name: titleOf(targetCard),
+        };
+      }
+    }
+
+    // 2. 查找当前节点的输入槽位
+    if (!previewData) {
+      const cap = CAPS[runCap(c)] || capOf(c);
+      if (cap && cap.inputs) {
+        const slot = cap.inputs.find(s => (s.label || s.key) === name);
+        if (slot && c.assets[slot.key]) {
+          const asset = c.assets[slot.key];
+          previewData = {
+            type: slot.type,
+            url: asset.url,
+            name: name,
+          };
+        }
+      }
+    }
+
+    if (!previewData) return;
+
+    // 显示预览
+    showPreview(mark, previewData);
+  });
+
+  highlightLayer.addEventListener('mouseout', (ev) => {
+    if (!ev.relatedTarget || !ev.relatedTarget.closest('.at-mention-preview')) {
+      hidePreview();
+    }
+  });
+
+  function showPreview(anchor, data) {
+    hidePreview();
+
+    previewEl = document.createElement("div");
+    previewEl.className = "at-mention-preview";
+    previewEl.style.cssText = `
+      position: fixed; z-index: 100; background: #060a14f7; border: 1px solid var(--acc);
+      border-radius: 3px; padding: 8px; box-shadow: 0 12px 36px #000d, 0 0 18px #00e5ff2e;
+      backdrop-filter: blur(6px); max-width: 320px; pointer-events: none;
+    `;
+
+    const title = document.createElement("div");
+    title.style.cssText = "font-size: 11px; color: var(--acc); margin-bottom: 6px; letter-spacing: 1px;";
+    title.textContent = data.name;
+    previewEl.appendChild(title);
+
+    if (data.type === 'image') {
+      const img = document.createElement("img");
+      img.src = data.url;
+      img.style.cssText = "max-width: 300px; max-height: 200px; display: block; border-radius: 2px;";
+      previewEl.appendChild(img);
+    } else if (data.type === 'video') {
+      const video = document.createElement("video");
+      video.src = data.url;
+      video.style.cssText = "max-width: 300px; max-height: 200px; display: block; border-radius: 2px;";
+      video.muted = true;
+      video.autoplay = true;
+      video.loop = true;
+      previewEl.appendChild(video);
+    } else if (data.type === 'audio') {
+      const audio = document.createElement("div");
+      audio.textContent = "🎵 " + data.name;
+      audio.style.cssText = "padding: 12px; color: var(--txt); text-align: center;";
+      previewEl.appendChild(audio);
+    } else if (data.type === 'text') {
+      const text = document.createElement("div");
+      text.textContent = data.text.substring(0, 200) + (data.text.length > 200 ? '...' : '');
+      text.style.cssText = "color: var(--txt); font-size: 12px; line-height: 1.6; max-height: 150px; overflow: hidden;";
+      previewEl.appendChild(text);
+    }
+
+    // 定位：在 mark 下方
+    const rect = anchor.getBoundingClientRect();
+    previewEl.style.left = rect.left + "px";
+    previewEl.style.top = (rect.bottom + 4) + "px";
+
+    document.body.appendChild(previewEl);
+  }
+
+  function hidePreview() {
+    if (previewEl) {
+      previewEl.remove();
+      previewEl = null;
+    }
+  }
 
   const sync = () => {
     // 示例文案警告：清空了默认文案才算
