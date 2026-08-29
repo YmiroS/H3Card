@@ -3616,6 +3616,117 @@ function promptBlock(c, s, label) {
     ev.stopPropagation();
   }, { passive: true });
 
+  // @ 提及功能：输入 @ 时弹出卡片选择菜单
+  let atMenuEl = null;
+  let atMenuStart = -1; // @ 开始的位置
+
+  ta.addEventListener('input', () => {
+    const cursorPos = ta.selectionStart;
+    const textBefore = ta.value.substring(0, cursorPos);
+    // 匹配 @ 后面的文字（可以是中文、英文、数字）
+    const match = textBefore.match(/@([\u4e00-\u9fa5\w]*)$/);
+
+    if (match && !useOpt) {
+      const query = match[1].toLowerCase();
+      atMenuStart = cursorPos - match[0].length;
+
+      // 筛选可引用的卡片：素材、文本卡、风格卡（排除当前节点）
+      const cards = PROJ.cards.filter(x => {
+        if (x.id === c.id) return false;
+        const isReferable = isAsset(x) || isTextCard(x) || isStyle(x);
+        if (!isReferable) return false;
+        const name = titleOf(x).toLowerCase();
+        return name.includes(query);
+      });
+
+      if (cards.length > 0) {
+        showAtMenu(ta, cards);
+      } else {
+        hideAtMenu();
+      }
+    } else {
+      hideAtMenu();
+    }
+  });
+
+  function showAtMenu(textarea, cards) {
+    hideAtMenu();
+
+    atMenuEl = document.createElement("div");
+    atMenuEl.className = "at-menu";
+    atMenuEl.style.cssText = "position: absolute; background: white; border: 1px solid #ccc; " +
+      "border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); max-height: 200px; " +
+      "overflow-y: auto; z-index: 1000; min-width: 200px;";
+
+    cards.forEach((card, idx) => {
+      const item = document.createElement("div");
+      item.style.cssText = "padding: 6px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px;";
+      item.onmouseenter = () => item.style.background = "#f0f0f0";
+      item.onmouseleave = () => item.style.background = "";
+
+      const def = defOf(card);
+      const icon = document.createElement("span");
+      icon.textContent = def.icon || "◻";
+      icon.style.fontSize = "14px";
+
+      const name = document.createElement("span");
+      name.textContent = titleOf(card);
+      name.style.flex = "1";
+
+      const type = document.createElement("span");
+      type.textContent = isAsset(card) ? "素材" : isTextCard(card) ? "文本" : "风格";
+      type.style.fontSize = "11px";
+      type.style.color = "#999";
+
+      item.append(icon, name, type);
+
+      item.onclick = () => {
+        // 插入卡片名
+        const cardName = titleOf(card);
+        const before = textarea.value.substring(0, atMenuStart);
+        const after = textarea.value.substring(textarea.selectionStart);
+        textarea.value = before + `@${cardName} ` + after;
+        textarea.selectionStart = textarea.selectionEnd = before.length + cardName.length + 2;
+
+        // 触发 oninput 保存
+        if (useOpt) {
+          c.opt[s.key] = textarea.value;
+        } else {
+          c.params[s.key] = extractUserText(textarea.value);
+        }
+        sync(); save();
+
+        hideAtMenu();
+        textarea.focus();
+      };
+
+      atMenuEl.appendChild(item);
+    });
+
+    // 计算菜单位置：在 textarea 下方
+    const rect = textarea.getBoundingClientRect();
+    atMenuEl.style.left = rect.left + "px";
+    atMenuEl.style.top = (rect.bottom + 4) + "px";
+
+    document.body.appendChild(atMenuEl);
+
+    // 点击外部关闭菜单
+    const closeOnOutside = (e) => {
+      if (!atMenuEl.contains(e.target) && e.target !== textarea) {
+        hideAtMenu();
+        document.removeEventListener("mousedown", closeOnOutside);
+      }
+    };
+    setTimeout(() => document.addEventListener("mousedown", closeOnOutside), 0);
+  }
+
+  function hideAtMenu() {
+    if (atMenuEl) {
+      atMenuEl.remove();
+      atMenuEl = null;
+    }
+  }
+
   wrap.appendChild(ta);
 
   const sync = () => {
@@ -3893,6 +4004,90 @@ async function doTranslate(c, s) {
   }
 }
 
+/** 解析提示词中的 @卡片名，替换为模型能理解的标签
+    @素材节点1 → <Picture 1>
+    @文本卡1 → 文本卡的内容
+    @风格卡1 → 风格卡的内容 */
+function resolveCardMentions(prompt, card) {
+  if (!prompt || !PROJ) return prompt;
+
+  const cap = CAPS[runCap(card)] || capOf(card);
+  if (!cap) return prompt;
+
+  // 构建映射：卡片名 → 槽位标签（<Picture N> / <Audio N> / <Video N>）
+  const slotMap = new Map();
+  let picIdx = 1, audIdx = 1, vidIdx = 1;
+
+  for (const s of (cap.inputs || [])) {
+    const asset = card.assets[s.key];
+    if (!asset || !asset.ref) continue;
+
+    // 找到这个素材来自哪个卡片（通过 URL 或文件名匹配）
+    const sourceCard = PROJ.cards.find(c =>
+      (c.outputs || []).some(o =>
+        (o.url && asset.url && o.url === asset.url) ||
+        (o.filename && asset.filename && o.filename === asset.filename)
+      )
+    );
+
+    if (sourceCard) {
+      const cardName = titleOf(sourceCard);
+      if (s.type === 'image') {
+        slotMap.set(cardName, `<Picture ${picIdx}>`);
+        picIdx++;
+      } else if (s.type === 'audio') {
+        slotMap.set(cardName, `<Audio ${audIdx}>`);
+        audIdx++;
+      } else if (s.type === 'video') {
+        slotMap.set(cardName, `<Video ${vidIdx}>`);
+        vidIdx++;
+      }
+    }
+  }
+
+  // 替换 @卡片名
+  return prompt.replace(/@([\u4e00-\u9fa5\w]+)/g, (match, name) => {
+    // 先检查是否是素材槽位
+    const slotTag = slotMap.get(name);
+    if (slotTag) return slotTag;
+
+    // 检查是否是文本卡或风格卡（直接展开内容）
+    const targetCard = PROJ.cards.find(c => titleOf(c) === name);
+    if (targetCard && (isTextCard(targetCard) || isStyle(targetCard))) {
+      const text = textOf(targetCard);
+      return text || match; // 有内容就展开，没有保持原样
+    }
+
+    // 找不到就保持原样（可能用户还没创建这个卡片）
+    return match;
+  });
+}
+
+/** 构建卡片信息映射，用于传递给后端（让后端知道 <Picture N> 对应哪个卡片名）*/
+function buildCardInfo(card) {
+  const info = {};
+  const cap = CAPS[runCap(card)] || capOf(card);
+  if (!cap) return info;
+
+  for (const s of (cap.inputs || [])) {
+    const asset = card.assets[s.key];
+    if (!asset || !asset.ref) continue;
+
+    const sourceCard = PROJ.cards.find(c =>
+      (c.outputs || []).some(o =>
+        (o.url && asset.url && o.url === asset.url) ||
+        (o.filename && asset.filename && o.filename === asset.filename)
+      )
+    );
+
+    if (sourceCard) {
+      info[s.key] = titleOf(sourceCard);
+    }
+  }
+
+  return info;
+}
+
 async function doRewrite(c, s, model) {
   const cap = CAPS[runCap(c)] || capOf(c);
   if (!cap || !cap.rewrite) return;
@@ -3902,15 +4097,21 @@ async function doRewrite(c, s, model) {
   const styles = styleTexts(c);
   // 只要有用户文本或引用内容，就可以优化
   if (!src.trim() && !styles.length) return toast("先写一句你想要什么，优化才有东西可改");
+
+  // **解析 @引用**：将 @卡片名 替换为 <Picture N> 等标签
+  const resolvedPrompt = resolveCardMentions(src, c);
+
   const pl = payloadOf(c);
   c._rwBusy = true; c._rwErr = null;
   repanel(c);
   try {
-    // prompt 是原词，接入的文本另外给 —— 让模型把文本融进输出里。用户选「优化后」时
+    // prompt 是解析后的词，接入的文本另外给 —— 让模型把文本融进输出里。用户选「优化后」时
     // 提交的就是这份输出原样，系统不再拼文本节点（payloadOf），所以必须融进去
     const r = await jpost("/api/rewrite", {
       capability: cap.id, params: pl.params, assets: pl.assets,
-      prompt: src, style: styles.join("\n\n"), model: model || "auto",
+      prompt: resolvedPrompt,  // 使用解析后的提示词
+      style: styles.join("\n\n"), model: model || "auto",
+      cardInfo: buildCardInfo(c),  // 传递卡片信息映射
       project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
     });
     // 调试：打印完整的返回数据
