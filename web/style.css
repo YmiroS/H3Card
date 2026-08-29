@@ -565,21 +565,21 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #panel .pblock textarea { min-height: 88px; }
 #panel .pblock textarea.isdemo { border-color: var(--warn); color: #ffd88a; }
 
-/* @ 提及功能：高亮层 */
+/* @ 提及功能：textarea 上面盖一层纯视觉高亮层（文字透明、标签上色）。
+   层不接鼠标事件，hover 检测在 textarea 上做（app.js mentionAt） */
 #panel .prompt-highlight-wrapper { position: relative; }
-#panel .prompt-highlight-wrapper textarea {
-  position: relative; z-index: 1; background: transparent;
-}
 #panel .prompt-highlight-layer {
-  font-family: inherit; font-size: inherit; line-height: inherit;
-  background: #0a0f1c; /* 与 textarea 背景一致 */
+  position: absolute; top: 0; left: 0; right: 0; bottom: 0;
+  z-index: 2; pointer-events: none; overflow: hidden;
+  color: transparent; background: none;
+  border: 0 solid transparent;
 }
 #panel .prompt-highlight-layer .at-mention {
-  background: #00e5ff22; color: var(--acc); padding: 1px 3px; border-radius: 2px;
-  border: 1px solid #00e5ff44; cursor: pointer; font-weight: 500;
+  background: #00e5ff26; color: var(--acc);
+  border-radius: 2px; box-decoration-break: clone;
 }
-#panel .prompt-highlight-layer .at-mention:hover {
-  background: #00e5ff33; border-color: var(--acc);
+#panel .prompt-highlight-layer .at-mention.mhover {
+  background: #00e5ff40;
 }
 
 #panel .phd {
