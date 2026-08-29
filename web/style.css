@@ -564,6 +564,24 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #panel .pblock { margin-bottom: 8px; }
 #panel .pblock textarea { min-height: 88px; }
 #panel .pblock textarea.isdemo { border-color: var(--warn); color: #ffd88a; }
+
+/* @ 提及功能：高亮层 */
+#panel .prompt-highlight-wrapper { position: relative; }
+#panel .prompt-highlight-wrapper textarea {
+  position: relative; z-index: 1; background: transparent;
+}
+#panel .prompt-highlight-layer {
+  font-family: inherit; font-size: inherit; line-height: inherit;
+  background: #0a0f1c; /* 与 textarea 背景一致 */
+}
+#panel .prompt-highlight-layer .at-mention {
+  background: #00e5ff22; color: var(--acc); padding: 1px 3px; border-radius: 2px;
+  border: 1px solid #00e5ff44; cursor: pointer; font-weight: 500;
+}
+#panel .prompt-highlight-layer .at-mention:hover {
+  background: #00e5ff33; border-color: var(--acc);
+}
+
 #panel .phd {
   display: flex; align-items: center; gap: 8px; margin-bottom: 4px;
   font-size: 12px; color: var(--dim); letter-spacing: .5px;
