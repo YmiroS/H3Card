@@ -3630,17 +3630,51 @@ function promptBlock(c, s, label) {
       const query = match[1].toLowerCase();
       atMenuStart = cursorPos - match[0].length;
 
-      // 筛选可引用的卡片：素材、文本卡、风格卡（排除当前节点）
-      const cards = PROJ.cards.filter(x => {
-        if (x.id === c.id) return false;
-        const isReferable = isAsset(x) || isTextCard(x) || isStyle(x);
-        if (!isReferable) return false;
-        const name = titleOf(x).toLowerCase();
-        return name.includes(query);
+      // 构建可引用项列表：卡片 + 卡片的输入素材
+      const items = [];
+
+      // 1. 添加所有卡片（素材、文本、风格）
+      PROJ.cards.forEach(card => {
+        if (card.id === c.id) return; // 排除当前节点
+        const isReferable = isAsset(card) || isTextCard(card) || isStyle(card);
+        if (!isReferable) return;
+
+        const name = titleOf(card);
+        if (!name.toLowerCase().includes(query)) return;
+
+        const def = defOf(card);
+        items.push({
+          type: 'card',
+          card: card,
+          name: name,
+          icon: def.icon || "◻",
+          label: isAsset(card) ? "素材" : isTextCard(card) ? "文本" : "风格",
+        });
       });
 
-      if (cards.length > 0) {
-        showAtMenu(ta, cards);
+      // 2. 添加当前卡片的所有输入素材（槽位中的图片/音频/视频）
+      const cap = CAPS[runCap(c)] || capOf(c);
+      if (cap && cap.inputs) {
+        cap.inputs.forEach(s => {
+          if (!['image', 'audio', 'video'].includes(s.type)) return;
+          const asset = c.assets[s.key];
+          if (!asset || !asset.ref) return;
+
+          const slotLabel = s.label || s.key;
+          if (!slotLabel.toLowerCase().includes(query)) return;
+
+          items.push({
+            type: 'slot',
+            key: s.key,
+            name: slotLabel,
+            icon: s.type === 'image' ? "🖼" : s.type === 'audio' ? "🎵" : "🎬",
+            label: "当前素材",
+          });
+        });
+      }
+
+      if (items.length > 0) {
+        showAtMenu(ta, items);
       } else {
         hideAtMenu();
       }
@@ -3649,44 +3683,42 @@ function promptBlock(c, s, label) {
     }
   });
 
-  function showAtMenu(textarea, cards) {
+  function showAtMenu(textarea, items) {
     hideAtMenu();
 
     atMenuEl = document.createElement("div");
-    atMenuEl.className = "at-menu";
-    atMenuEl.style.cssText = "position: absolute; background: white; border: 1px solid #ccc; " +
-      "border-radius: 4px; box-shadow: 0 2px 8px rgba(0,0,0,0.15); max-height: 200px; " +
-      "overflow-y: auto; z-index: 1000; min-width: 200px;";
+    atMenuEl.id = "menu"; // 使用现有的菜单样式
+    atMenuEl.style.position = "absolute";
+    atMenuEl.style.maxHeight = "280px";
+    atMenuEl.style.overflowY = "auto";
 
-    cards.forEach((card, idx) => {
-      const item = document.createElement("div");
-      item.style.cssText = "padding: 6px 12px; cursor: pointer; display: flex; align-items: center; gap: 8px;";
-      item.onmouseenter = () => item.style.background = "#f0f0f0";
-      item.onmouseleave = () => item.style.background = "";
+    items.forEach(item => {
+      const btn = document.createElement("button");
+      btn.style.cssText = "display: flex; align-items: center; gap: 9px; width: 100%; " +
+        "padding: 8px 10px; border-radius: 2px; text-align: left;";
 
-      const def = defOf(card);
       const icon = document.createElement("span");
-      icon.textContent = def.icon || "◻";
+      icon.textContent = item.icon;
       icon.style.fontSize = "14px";
 
-      const name = document.createElement("span");
-      name.textContent = titleOf(card);
-      name.style.flex = "1";
+      const nameSpan = document.createElement("span");
+      nameSpan.textContent = item.name;
+      nameSpan.style.flex = "1";
 
-      const type = document.createElement("span");
-      type.textContent = isAsset(card) ? "素材" : isTextCard(card) ? "文本" : "风格";
-      type.style.fontSize = "11px";
-      type.style.color = "#999";
+      const typeSpan = document.createElement("span");
+      typeSpan.textContent = item.label;
+      typeSpan.style.fontSize = "11px";
+      typeSpan.style.color = "var(--dim)";
 
-      item.append(icon, name, type);
+      btn.append(icon, nameSpan, typeSpan);
 
-      item.onclick = () => {
-        // 插入卡片名
-        const cardName = titleOf(card);
+      btn.onclick = () => {
+        // 插入引用名称
+        const refName = item.name;
         const before = textarea.value.substring(0, atMenuStart);
         const after = textarea.value.substring(textarea.selectionStart);
-        textarea.value = before + `@${cardName} ` + after;
-        textarea.selectionStart = textarea.selectionEnd = before.length + cardName.length + 2;
+        textarea.value = before + `@${refName} ` + after;
+        textarea.selectionStart = textarea.selectionEnd = before.length + refName.length + 2;
 
         // 触发 oninput 保存
         if (useOpt) {
@@ -3700,10 +3732,10 @@ function promptBlock(c, s, label) {
         textarea.focus();
       };
 
-      atMenuEl.appendChild(item);
+      atMenuEl.appendChild(btn);
     });
 
-    // 计算菜单位置：在 textarea 下方
+    // 计算菜单位置：在 textarea 光标位置下方
     const rect = textarea.getBoundingClientRect();
     atMenuEl.style.left = rect.left + "px";
     atMenuEl.style.top = (rect.bottom + 4) + "px";
@@ -4007,22 +4039,34 @@ async function doTranslate(c, s) {
 /** 解析提示词中的 @卡片名，替换为模型能理解的标签
     @素材节点1 → <Picture 1>
     @文本卡1 → 文本卡的内容
-    @风格卡1 → 风格卡的内容 */
+    @风格卡1 → 风格卡的内容
+    @图片 → <Picture N>（当前节点的输入槽位） */
 function resolveCardMentions(prompt, card) {
   if (!prompt || !PROJ) return prompt;
 
   const cap = CAPS[runCap(card)] || capOf(card);
   if (!cap) return prompt;
 
-  // 构建映射：卡片名 → 槽位标签（<Picture N> / <Audio N> / <Video N>）
+  // 构建映射：卡片名/槽位名 → 槽位标签（<Picture N> / <Audio N> / <Video N>）
   const slotMap = new Map();
   let picIdx = 1, audIdx = 1, vidIdx = 1;
 
+  // 遍历所有输入槽位
   for (const s of (cap.inputs || [])) {
     const asset = card.assets[s.key];
     if (!asset || !asset.ref) continue;
 
-    // 找到这个素材来自哪个卡片（通过 URL 或文件名匹配）
+    // 1. 如果槽位有素材，先按槽位标签映射（图片、场景等）
+    const slotLabel = s.label || s.key;
+    if (s.type === 'image') {
+      slotMap.set(slotLabel, `<Picture ${picIdx}>`);
+    } else if (s.type === 'audio') {
+      slotMap.set(slotLabel, `<Audio ${audIdx}>`);
+    } else if (s.type === 'video') {
+      slotMap.set(slotLabel, `<Video ${vidIdx}>`);
+    }
+
+    // 2. 找到这个素材来自哪个卡片（通过 URL 或文件名匹配）
     const sourceCard = PROJ.cards.find(c =>
       (c.outputs || []).some(o =>
         (o.url && asset.url && o.url === asset.url) ||
@@ -4042,12 +4086,17 @@ function resolveCardMentions(prompt, card) {
         slotMap.set(cardName, `<Video ${vidIdx}>`);
         vidIdx++;
       }
+    } else {
+      // 如果找不到来源卡片，仅按类型递增索引
+      if (s.type === 'image') picIdx++;
+      else if (s.type === 'audio') audIdx++;
+      else if (s.type === 'video') vidIdx++;
     }
   }
 
-  // 替换 @卡片名
+  // 替换 @引用
   return prompt.replace(/@([\u4e00-\u9fa5\w]+)/g, (match, name) => {
-    // 先检查是否是素材槽位
+    // 先检查是否是槽位标签或素材来源卡片
     const slotTag = slotMap.get(name);
     if (slotTag) return slotTag;
 
@@ -4073,6 +4122,7 @@ function buildCardInfo(card) {
     const asset = card.assets[s.key];
     if (!asset || !asset.ref) continue;
 
+    // 尝试找到素材来源卡片
     const sourceCard = PROJ.cards.find(c =>
       (c.outputs || []).some(o =>
         (o.url && asset.url && o.url === asset.url) ||
@@ -4080,8 +4130,11 @@ function buildCardInfo(card) {
       )
     );
 
+    // 如果找到来源卡片，记录卡片名；否则记录槽位标签
     if (sourceCard) {
       info[s.key] = titleOf(sourceCard);
+    } else {
+      info[s.key] = s.label || s.key;
     }
   }
 
