@@ -3581,22 +3581,30 @@ function promptBlock(c, s, label) {
 
   const ta = document.createElement("textarea");
   ta.placeholder = `${label || s.label}：描述你想要的画面/动作/镜头`;
-  ta.className = "prompt-input"; // 添加类名用于定位
 
-  // 创建高亮层容器
+  // @ 标签高亮：textarea 底下垫一层排版完全一致的 div（文字透明、标签上色），
+  // textarea 盖在上面接所有鼠标事件 —— 高亮层纯视觉，pointer-events: none
   const highlightWrapper = document.createElement("div");
   highlightWrapper.className = "prompt-highlight-wrapper";
-  highlightWrapper.style.cssText = "position: relative;";
-
-  // 创建高亮层（与 textarea 重叠，显示 @标签高亮）
   const highlightLayer = document.createElement("div");
   highlightLayer.className = "prompt-highlight-layer";
-  highlightLayer.style.cssText = `
-    position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-    padding: 6px 8px; border: 1px solid transparent;
-    font: inherit; color: transparent; white-space: pre-wrap; word-wrap: break-word;
-    pointer-events: none; overflow: hidden; line-height: inherit;
-  `;
+  highlightWrapper.appendChild(highlightLayer);
+  highlightWrapper.appendChild(ta);
+
+  /** 把 textarea 的排版度量逐项抄给高亮层，差一个像素标签框就会和文字错位 */
+  function syncMetrics() {
+    const cs = getComputedStyle(ta);
+    for (const p of ["fontFamily", "fontSize", "fontWeight", "lineHeight", "letterSpacing",
+                     "wordSpacing", "textIndent", "paddingTop", "paddingRight",
+                     "paddingBottom", "paddingLeft", "borderTopWidth", "borderRightWidth",
+                     "borderBottomWidth", "borderLeftWidth", "boxSizing"]) {
+      highlightLayer.style[p] = cs[p];
+    }
+    highlightLayer.style.borderStyle = "solid";
+    highlightLayer.style.borderColor = "transparent";
+    highlightLayer.style.whiteSpace = "pre-wrap";
+    highlightLayer.style.overflowWrap = cs.overflowWrap;
+  }
 
   // 构建输入框内容：引用内容在上方 + 用户文本在下方
   let baseValue = useOpt ? opt
@@ -3624,24 +3632,21 @@ function promptBlock(c, s, label) {
     ta.value = baseValue;
   }
 
-  // 更新高亮层内容
+  // 更新高亮层内容：普通文字转义后透明占位，@标签 上色成 <mark>
   function updateHighlight() {
+    const esc = (t) => t.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
     const text = ta.value;
-    // 将 @关键字 替换为带样式的 span
-    const highlighted = text.replace(/@([\u4e00-\u9fa5\w]+)/g, (match, name) => {
-      return `<mark class="at-mention" data-name="${name}">${match}</mark>`;
-    });
-    // 其余文本用透明色占位
-    highlightLayer.innerHTML = highlighted.replace(/[^\n]/g, match =>
-      match === '<' || match === '>' || match === '"' || match === 'a' || match === 't' ||
-      match === '-' || match === 'm' || match === 'e' || match === 'n' || match === 'i' ||
-      match === 'o' || match === 'r' || match === 'k' || match === 'c' || match === 'l' ||
-      match === 's' || match === '=' || match === ' ' ? match : match
-    );
-    // 重新计算，保持格式
-    highlightLayer.innerHTML = highlighted;
+    let html = "", last = 0;
+    const re = /@([\u4e00-\u9fa5\w]+)/g;
+    let m;
+    while ((m = re.exec(text))) {
+      html += esc(text.slice(last, m.index));
+      html += `<mark class="at-mention" data-name="${esc(m[1])}">${esc(m[0])}</mark>`;
+      last = m.index + m[0].length;
+    }
+    html += esc(text.slice(last));
+    highlightLayer.innerHTML = html + "\n";   // 结尾补一个换行，末行折行时高度才对
     highlightLayer.scrollTop = ta.scrollTop;
-    highlightLayer.scrollLeft = ta.scrollLeft;
   }
 
   // 优化后那份是给模型看的格式化长文（H3 的六段式能有四五百词），框子要高一点
@@ -3650,7 +3655,6 @@ function promptBlock(c, s, label) {
   // 同步滚动
   ta.addEventListener('scroll', () => {
     highlightLayer.scrollTop = ta.scrollTop;
-    highlightLayer.scrollLeft = ta.scrollLeft;
   });
 
   // 阻止滚动事件冒泡到画布
@@ -3804,21 +3808,48 @@ function promptBlock(c, s, label) {
     }
   }
 
-  // 组装：高亮层 + textarea
-  highlightWrapper.appendChild(highlightLayer);
-  highlightWrapper.appendChild(ta);
+  // 组装：wrapper 里已经装好 高亮层 + textarea
   wrap.appendChild(highlightWrapper);
-
-  // 初始化高亮
+  syncMetrics();          // 进了 DOM 才拿得到 computed style
   updateHighlight();
 
-  // 悬停预览功能：鼠标移到高亮层的 @标签上时显示预览
-  highlightLayer.style.pointerEvents = "auto"; // 允许高亮层接收鼠标事件
+  // 悬停预览：textarea 盖在高亮层上面，标签收不到鼠标事件，
+  // 所以在 textarea 上用光标坐标反算字符偏移，判断停没停在某个 @标签 里
   let previewEl = null;
 
-  highlightLayer.addEventListener('mouseover', (ev) => {
-    const mark = ev.target.closest('.at-mention');
-    if (!mark) return;
+  /** 光标位置对应的 @标签：返回它的 DOM 元素（从高亮层里数出来的第 n 个 mark） */
+  function mentionAt(x, y) {
+    let offset = null;
+    if (document.caretRangeFromPoint) {          // Chrome / Edge
+      const r = document.caretRangeFromPoint(x, y);
+      if (r && r.startContainer === ta) offset = r.startOffset;
+    } else if (document.caretPositionFromPoint) { // Firefox
+      const p = document.caretPositionFromPoint(x, y);
+      if (p && p.offsetNode === ta) offset = p.offset;
+    }
+    if (offset == null) return null;
+
+    // 光标偏移落在第几个 @标签 的 [start, end] 里
+    const re = /@([\u4e00-\u9fa5\w]+)/g;
+    const marks = highlightLayer.querySelectorAll(".at-mention");
+    let idx = 0, m;
+    while ((m = re.exec(ta.value))) {
+      if (offset >= m.index && offset <= m.index + m[0].length) {
+        return marks[idx] || null;
+      }
+      idx++;
+    }
+    return null;
+  }
+
+  ta.addEventListener('mousemove', (ev) => {
+    const mark = mentionAt(ev.clientX, ev.clientY);
+    ta.style.cursor = mark ? "pointer" : "";
+    // 悬停的那个标签加深，其余还原
+    highlightLayer.querySelectorAll(".at-mention.mhover")
+      .forEach(x => x.classList.remove("mhover"));
+    if (mark) mark.classList.add("mhover");
+    if (!mark) return hidePreview();
 
     const name = mark.dataset.name;
     if (!name) return;
@@ -3831,18 +3862,9 @@ function promptBlock(c, s, label) {
     if (targetCard) {
       const outputs = targetCard.outputs || [];
       if (outputs.length > 0) {
-        const out = outputs[0];
-        previewData = {
-          type: out.kind,
-          url: out.url,
-          name: titleOf(targetCard),
-        };
+        previewData = { type: outputs[0].kind, url: outputs[0].url, name: titleOf(targetCard) };
       } else if (isTextCard(targetCard) || isStyle(targetCard)) {
-        previewData = {
-          type: 'text',
-          text: textOf(targetCard) || '(空)',
-          name: titleOf(targetCard),
-        };
+        previewData = { type: 'text', text: textOf(targetCard) || '(空)', name: titleOf(targetCard) };
       }
     }
 
@@ -3852,27 +3874,17 @@ function promptBlock(c, s, label) {
       if (cap && cap.inputs) {
         const slot = cap.inputs.find(s => (s.label || s.key) === name);
         if (slot && c.assets[slot.key]) {
-          const asset = c.assets[slot.key];
-          previewData = {
-            type: slot.type,
-            url: asset.url,
-            name: name,
-          };
+          previewData = { type: slot.type, url: c.assets[slot.key].url, name };
         }
       }
     }
 
-    if (!previewData) return;
-
-    // 显示预览
-    showPreview(mark, previewData);
+    if (previewData) showPreview(mark, previewData);
+    else hidePreview();
   });
 
-  highlightLayer.addEventListener('mouseout', (ev) => {
-    if (!ev.relatedTarget || !ev.relatedTarget.closest('.at-mention-preview')) {
-      hidePreview();
-    }
-  });
+  ta.addEventListener('mouseleave', hidePreview);
+  ta.addEventListener('scroll', () => hidePreview());
 
   function showPreview(anchor, data) {
     hidePreview();
