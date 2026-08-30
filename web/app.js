@@ -3776,6 +3776,7 @@ function promptBlock(c, s, label) {
           c.params[s.key] = extractUserText(textarea.value);
         }
         sync(); save();
+        updateHighlight();   // 程序改 value 不触发 input 事件，高亮层要手动刷
 
         hideAtMenu();
         textarea.focus();
@@ -3784,12 +3785,21 @@ function promptBlock(c, s, label) {
       atMenuEl.appendChild(btn);
     });
 
-    // 计算菜单位置：在 textarea 光标位置下方
-    const rect = textarea.getBoundingClientRect();
-    atMenuEl.style.left = rect.left + "px";
-    atMenuEl.style.top = (rect.bottom + 4) + "px";
-
-    document.body.appendChild(atMenuEl);
+    // 菜单位置：贴着 @ 字符、往**上**弹（跟参考图那种 mention 交互一致）。
+    // @ 的屏幕坐标借高亮层当镜子算 —— 层里排版和 textarea 逐像素一致，
+    // 在 offset 处立一个 range 就能拿到那个字的方框
+    const cr = caretRect(atMenuStart) || (() => {
+      const r = textarea.getBoundingClientRect();
+      return { left: r.left + 8, top: r.top + 8, bottom: r.top + 28 };
+    })();
+    document.body.appendChild(atMenuEl);       // 先进 DOM 才量得到高度
+    const mw = atMenuEl.offsetWidth, mh = atMenuEl.offsetHeight;
+    let mx = cr.left - 6, my = cr.top - mh - 6;  // 6 = 菜单内边距，让选项首字对齐 @
+    if (my < 8) my = cr.bottom + 4;              // 顶上放不下才往下弹
+    if (mx + mw > innerWidth - 8) mx = innerWidth - 8 - mw;
+    if (mx < 8) mx = 8;
+    atMenuEl.style.left = mx + "px";
+    atMenuEl.style.top = my + "px";
 
     // 点击外部关闭菜单
     const closeOnOutside = (e) => {
@@ -3842,6 +3852,28 @@ function promptBlock(c, s, label) {
     return null;
   }
 
+  /** 某个字符偏移的屏幕坐标：在高亮层（textarea 的像素级镜像）里立 range 量出来 */
+  function caretRect(pos) {
+    const texts = [];
+    const walker = document.createTreeWalker(highlightLayer, NodeFilter.SHOW_TEXT);
+    while (walker.nextNode()) texts.push(walker.currentNode);
+    let acc = 0, node = null, off = 0;
+    for (const t of texts) {
+      if (acc + t.length > pos) { node = t; off = pos - acc; break; }
+      acc += t.length;
+    }
+    if (!node) {
+      const last = texts[texts.length - 1];
+      if (!last) return null;
+      node = last; off = last.length;
+    }
+    const r = document.createRange();
+    r.setStart(node, off);
+    r.setEnd(node, Math.min(off + 1, node.length));   // 一个字宽，collapsed range 拿不到高度
+    const rect = r.getClientRects()[0] || r.getBoundingClientRect();
+    return rect.width === 0 && rect.height === 0 ? null : rect;
+  }
+
   ta.addEventListener('mousemove', (ev) => {
     const mark = mentionAt(ev.clientX, ev.clientY);
     ta.style.cursor = mark ? "pointer" : "";
@@ -3886,8 +3918,11 @@ function promptBlock(c, s, label) {
   ta.addEventListener('mouseleave', hidePreview);
   ta.addEventListener('scroll', () => hidePreview());
 
+  let previewName = null;   // 正在显示的标签名：同名不重建，鼠标滑动才不闪
   function showPreview(anchor, data) {
+    if (previewEl && previewName === data.name) return;
     hidePreview();
+    previewName = data.name;
 
     previewEl = document.createElement("div");
     previewEl.className = "at-mention-preview";
@@ -3936,6 +3971,7 @@ function promptBlock(c, s, label) {
   }
 
   function hidePreview() {
+    previewName = null;
     if (previewEl) {
       previewEl.remove();
       previewEl = null;

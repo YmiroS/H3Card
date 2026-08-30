@@ -575,11 +575,10 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   border: 0 solid transparent;
 }
 #panel .prompt-highlight-layer .at-mention {
-  background: #00e5ff26; color: var(--acc);
-  border-radius: 2px; box-decoration-break: clone;
+  background: #00e5ff45; border-radius: 2px; box-decoration-break: clone;
 }
 #panel .prompt-highlight-layer .at-mention.mhover {
-  background: #00e5ff40;
+  background: #00e5ff70;
 }
 
 #panel .phd {
