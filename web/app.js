@@ -3597,13 +3597,27 @@ function promptBlock(c, s, label) {
     for (const p of ["fontFamily", "fontSize", "fontWeight", "lineHeight", "letterSpacing",
                      "wordSpacing", "textIndent", "paddingTop", "paddingRight",
                      "paddingBottom", "paddingLeft", "borderTopWidth", "borderRightWidth",
-                     "borderBottomWidth", "borderLeftWidth", "boxSizing"]) {
+                     "borderBottomWidth", "borderLeftWidth", "boxSizing", "width", "height"]) {
       highlightLayer.style[p] = cs[p];
     }
     highlightLayer.style.borderStyle = "solid";
     highlightLayer.style.borderColor = "transparent";
     highlightLayer.style.whiteSpace = "pre-wrap";
     highlightLayer.style.overflowWrap = cs.overflowWrap;
+    highlightLayer.style.wordBreak = cs.wordBreak || "break-word";
+
+    // 层的边框宽度也从 textarea 抄了过来（透明、宽度一致），
+    // 所以边框盒直接对齐 wrapper（= textarea 的边框盒）就是重合，
+    // 再按边框偏移一次等于偏两次，文字会错位 1px
+    highlightLayer.style.top = "0px";
+    highlightLayer.style.left = "0px";
+
+    // textarea 出滚动条后文字区变窄，高亮层没有滚动条还占全宽 —— 换行位置就岔开了。
+    // 把滚动条宽度补进高亮层的右内边距，两边换行宽度一致
+    const sbw = ta.offsetWidth - ta.clientWidth;
+    if (sbw > 0) {
+      highlightLayer.style.paddingRight = (parseFloat(cs.paddingRight) + sbw) + "px";
+    }
   }
 
   // 构建输入框内容：引用内容在上方 + 用户文本在下方
@@ -3652,15 +3666,32 @@ function promptBlock(c, s, label) {
   // 优化后那份是给模型看的格式化长文（H3 的六段式能有四五百词），框子要高一点
   if (useOpt) ta.classList.add("optta");
 
-  // 同步滚动
-  ta.addEventListener('scroll', () => {
-    highlightLayer.scrollTop = ta.scrollTop;
-  });
-
   // 阻止滚动事件冒泡到画布
   ta.addEventListener('wheel', (ev) => {
     ev.stopPropagation();
   }, { passive: true });
+
+  // @标签 是一个整体：退格/删除键只要落在标签范围内（含紧贴标签前后沿），
+  // 一次删掉整个标签，不会删出半个来
+  ta.addEventListener("keydown", (ev) => {
+    if (ev.isComposing) return;                        // 输入法组字中不插手
+    if (ev.key !== "Backspace" && ev.key !== "Delete") return;
+    if (ta.selectionStart !== ta.selectionEnd) return; // 有选区时按默认行为删
+    const pos = ta.selectionStart;
+    const re = /@([\u4e00-\u9fa5\w]+)/g;               // 与高亮层同一条标签规则
+    let m;
+    while ((m = re.exec(ta.value))) {
+      const hit = ev.key === "Backspace"
+        ? pos > m.index && pos <= m.index + m[0].length   // 要删的左边那个字属于标签
+        : pos >= m.index && pos < m.index + m[0].length;  // 要删的右边那个字属于标签
+      if (hit) {
+        ev.preventDefault();
+        ta.setSelectionRange(m.index, m.index + m[0].length);
+        document.execCommand("delete"); // 走原生编辑：input 事件照常触发、Ctrl+Z 还能撤销
+        return;
+      }
+    }
+  });
 
   // @ 提及功能：输入 @ 时弹出卡片选择菜单
   let atMenuEl = null;
@@ -3820,8 +3851,19 @@ function promptBlock(c, s, label) {
 
   // 组装：wrapper 里已经装好 高亮层 + textarea
   wrap.appendChild(highlightWrapper);
-  syncMetrics();          // 进了 DOM 才拿得到 computed style
   updateHighlight();
+  // wrap 这会儿还没进文档 —— promptBlock 的返回值要等调用方去 appendChild。
+  // 离屏元素 getComputedStyle 拿到的是初始值（16px 默认字号、零内边距），
+  // 现在抄会把高亮层抄岔，行高逐行偏移，文字就糊出边框了。
+  // ResizeObserver 挂上就会先触发一次（那时已在文档里、量的是真值），
+  // 之后拖输入框右下角改尺寸也会跟着重抄
+  const ro = new ResizeObserver(() => {
+    syncMetrics();
+    highlightLayer.scrollTop = ta.scrollTop;
+  });
+  ro.observe(ta);
+  // textarea 滚动时高亮层跟着滚（overflow:hidden 的层用 scrollTop 程序滚动）
+  ta.addEventListener("scroll", () => { highlightLayer.scrollTop = ta.scrollTop; });
 
   // 悬停预览：textarea 盖在高亮层上面，标签收不到鼠标事件，
   // 所以在 textarea 上用光标坐标反算字符偏移，判断停没停在某个 @标签 里
@@ -3829,25 +3871,16 @@ function promptBlock(c, s, label) {
 
   /** 光标位置对应的 @标签：返回它的 DOM 元素（从高亮层里数出来的第 n 个 mark） */
   function mentionAt(x, y) {
-    let offset = null;
-    if (document.caretRangeFromPoint) {          // Chrome / Edge
-      const r = document.caretRangeFromPoint(x, y);
-      if (r && r.startContainer === ta) offset = r.startOffset;
-    } else if (document.caretPositionFromPoint) { // Firefox
-      const p = document.caretPositionFromPoint(x, y);
-      if (p && p.offsetNode === ta) offset = p.offset;
-    }
-    if (offset == null) return null;
-
-    // 光标偏移落在第几个 @标签 的 [start, end] 里
-    const re = /@([\u4e00-\u9fa5\w]+)/g;
+    // textarea 文字透明时，caretRangeFromPoint 可能检测不到或返回高亮层节点
+    // 改用更直接的方法：检测鼠标下是否有高亮层的 mark 元素
     const marks = highlightLayer.querySelectorAll(".at-mention");
-    let idx = 0, m;
-    while ((m = re.exec(ta.value))) {
-      if (offset >= m.index && offset <= m.index + m[0].length) {
-        return marks[idx] || null;
+    for (const mark of marks) {
+      const rects = mark.getClientRects();
+      for (const rect of rects) {
+        if (x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom) {
+          return mark;
+        }
       }
-      idx++;
     }
     return null;
   }
@@ -3916,7 +3949,13 @@ function promptBlock(c, s, label) {
   });
 
   ta.addEventListener('mouseleave', hidePreview);
-  ta.addEventListener('scroll', () => hidePreview());
+  // textarea 滚了高亮层必须跟着滚（overflow:hidden 也能程序滚动），
+  // 不然文字滚走了标签还停在顶上 —— 看起来就是标签和文本错位、两个都看得见
+  ta.addEventListener('scroll', () => {
+    highlightLayer.scrollTop = ta.scrollTop;
+    highlightLayer.scrollLeft = ta.scrollLeft;
+    hidePreview();
+  });
 
   let previewName = null;   // 正在显示的标签名：同名不重建，鼠标滑动才不闪
   function showPreview(anchor, data) {
@@ -4931,8 +4970,14 @@ function payloadOf(c) {
     // 用了「优化后」那份：它是整段现成的提示词，风格在优化那一步就已经融进去了，
     // 这儿再拼一遍就是两份风格。所以优化后的词**原样提交**，不过 withStyle
     const opt = usingOpt(c, s.key);
-    if (opt != null) params[s.key] = opt;
-    else if (styles.length) params[s.key] = withStyle(params[s.key], styles);
+    if (opt != null) {
+      params[s.key] = opt;
+    } else {
+      // 先展开 @标签（@文本卡 → 原文、@素材卡 → <Picture 1>），再拼风格
+      let resolved = resolveCardMentions(params[s.key], c);
+      if (styles.length) resolved = withStyle(resolved, styles);
+      params[s.key] = resolved;
+    }
   }
   for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
   // card/cardName 只给任务浮窗用：光有能力名说不清是哪个节点在跑，也没法点回去

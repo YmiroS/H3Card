@@ -565,20 +565,37 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 #panel .pblock textarea { min-height: 88px; }
 #panel .pblock textarea.isdemo { border-color: var(--warn); color: #ffd88a; }
 
-/* @ 提及功能：textarea 上面盖一层纯视觉高亮层（文字透明、标签上色）。
-   层不接鼠标事件，hover 检测在 textarea 上做（app.js mentionAt） */
+/* @ 提及功能：textarea 文字全透明，可见文字由高亮层显示（@ 标签上色、其他文字白色）。
+   高亮层不接鼠标事件，所有交互在 textarea 上做 */
 #panel .prompt-highlight-wrapper { position: relative; }
+#panel .prompt-highlight-wrapper textarea {
+  position: relative; z-index: 1;
+  color: transparent; caret-color: var(--acc);
+}
+#panel .prompt-highlight-wrapper textarea::selection {
+  background: #00e5ff33;
+}
 #panel .prompt-highlight-layer {
   position: absolute; top: 0; left: 0; right: 0; bottom: 0;
-  z-index: 2; pointer-events: none; overflow: hidden;
-  color: transparent; background: none;
+  z-index: 2; pointer-events: none;
+  overflow: hidden; overflow-wrap: break-word; word-wrap: break-word;
+  color: var(--txt); background: none;
   border: 0 solid transparent;
 }
 #panel .prompt-highlight-layer .at-mention {
-  background: #00e5ff45; border-radius: 2px; box-decoration-break: clone;
+  /* padding/border 会改变文字布局，导致光标和内容错位
+     改用 box-shadow/outline 画视觉效果，不占布局空间 */
+  background: #00e5ff18; color: #bdf1ff;
+  padding: 0; margin: 0; border: 0;
+  border-radius: 2px;
+  outline: 1px solid #00e5ff55; outline-offset: -1px;
+  box-shadow: 0 0 0 2px #00e5ff08;
+  font-weight: 500;
+  box-decoration-break: clone;
 }
 #panel .prompt-highlight-layer .at-mention.mhover {
-  background: #00e5ff70;
+  background: #00e5ff28; outline-color: #00e5ff88;
+  box-shadow: 0 0 0 2px #00e5ff15;
 }
 
 #panel .phd {
@@ -685,7 +702,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 
 /* 提示词底部工具条：模型选择 + 翻译 + 优化 */
 #panel .ptoolbar {
-  display: flex; gap: 6px; align-items: center; margin-top: 6px;
+  display: flex; gap: 6px; align-items: center; margin-top: 10px;
 }
 #panel .ptoolbar .tbtool {
   padding: 4px 10px; font-size: 13px; border-radius: 2px;
