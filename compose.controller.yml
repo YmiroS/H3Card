@@ -1,0 +1,17 @@
+services:
+  controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.controller
+    restart: unless-stopped
+    environment:
+      CHOUKA_EXECUTION_MODE: controller
+      CHOUKA_PORT: 8199
+      CHOUKA_ENROLLMENT_TOKEN: ${CHOUKA_ENROLLMENT_TOKEN:?set CHOUKA_ENROLLMENT_TOKEN}
+      YOUDAO_APP_KEY: ${YOUDAO_APP_KEY:-}
+      YOUDAO_APP_SECRET: ${YOUDAO_APP_SECRET:-}
+    ports:
+      # Secure default: expose only to a same-host HTTPS reverse proxy.
+      - "${CHOUKA_BIND_ADDRESS:-127.0.0.1}:${CHOUKA_PORT:-8199}:8199"
+    volumes:
+      - ./data:/app/data

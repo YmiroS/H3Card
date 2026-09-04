@@ -13,6 +13,7 @@
 """
 import asyncio
 import copy
+import hmac
 import os
 import json
 import math
@@ -37,13 +38,20 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rewrite as rw
 import llm
 import translate as tr
+from distributed import DistributedStore
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
 COMFY_INPUT = PACK / "ComfyUI" / "input"
-COMFY_HTTP = "http://127.0.0.1:8188"
-COMFY_WS = "ws://127.0.0.1:8188/ws"
-PORT = 8199
+COMFY_HTTP = os.environ.get("CHOUKA_COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
+COMFY_WS = COMFY_HTTP.replace("http://", "ws://", 1).replace("https://", "wss://", 1) + "/ws"
+PORT = int(os.environ.get("CHOUKA_PORT", "8199"))
+EXECUTION_MODE = os.environ.get("CHOUKA_EXECUTION_MODE", "local").strip().lower()
+if EXECUTION_MODE not in ("local", "controller"):
+    raise RuntimeError("CHOUKA_EXECUTION_MODE 只能是 local 或 controller")
+CONTROLLER_MODE = EXECUTION_MODE == "controller"
+ENROLLMENT_TOKEN = os.environ.get("CHOUKA_ENROLLMENT_TOKEN", "")
+ARTIFACT_DIR = ROOT / "data" / "artifacts"
 
 CLIENT_ID = uuid.uuid4().hex
 JOBS = {}                  # prompt_id -> job dict
@@ -53,6 +61,20 @@ CAPS = {}                  # capability id -> manifest
 CARDS = []
 STATE = {"comfy_online": False}
 DEBUG = bool(os.environ.get("CHOUKA_DEBUG"))
+
+
+def distributed_store(app):
+    store = app.get("distributed")
+    if store is None:
+        raise web.HTTPServiceUnavailable(reason="分布式控制层未启用")
+    return store
+
+
+def controller_comfy_online(app):
+    if not CONTROLLER_MODE:
+        return STATE["comfy_online"]
+    return any(w["state"] in ("idle", "busy") for w in distributed_store(app).list_workers())
+
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VID_EXT = {".mp4", ".webm", ".mkv", ".mov", ".avi"}
@@ -401,7 +423,7 @@ async def ws_loop(app):
             await asyncio.sleep(3)
 
 
-async def handle_event(session, ev):
+async def handle_event(session, ev, remote=False):
     t, d = ev.get("type"), ev.get("data") or {}
     if DEBUG:
         print(f"[ev] {t} {json.dumps(d, ensure_ascii=False)[:220]}", flush=True)
@@ -420,6 +442,10 @@ async def handle_event(session, ev):
         save_jobs()
     elif t == "executing" and job:
         if d.get("node") is None:
+            # 远端 Worker 还要归集、上传产物；由 complete 接口宣布最终完成。
+            if remote:
+                job.update(progress=max(job.get("progress") or 0.0, 0.99), step="正在归集产物")
+                return
             job["outputs"] = await collect_outputs(session, pid)
             job.update(status="done", progress=1.0, ended=time.time(), step="")
             STEPS.pop(pid, None)
@@ -490,7 +516,7 @@ async def api_cards(request):
         "cards": CARDS,
         "capabilities": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
                          for k, v in CAPS.items()},
-        "comfy_online": STATE["comfy_online"],
+        "comfy_online": controller_comfy_online(request.app),
     })
 
 
@@ -513,7 +539,11 @@ async def api_upload(request):
         local = ROOT / "data" / "uploads" / safe
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(raw)
-        ref = await comfy_upload(session, part.name, safe, raw)
+        # 控制层只保存一份中心素材；领取任务的 Worker 会下载到自己的
+        # ComfyUI/input/chouka/，所以工作流里的相对引用保持一致。
+        ref = f"chouka/{safe}" if CONTROLLER_MODE else await comfy_upload(
+            session, part.name, safe, raw
+        )
         item = {"ref": ref, "kind": kind_of(safe), "origin": name,
                 "url": f"/api/upload/{safe}"}
         if item["kind"] == "video":
@@ -552,7 +582,9 @@ async def api_generate(request):
                      for n, nd in tpl.items() for k, v in nd["inputs"].items()
                      if k not in graph[n]["inputs"]})
         return web.json_response({"dry_run": True, "changed": diff})
-    pid = await comfy_submit(request.app["session"], graph)
+    pid = str(uuid.uuid4()) if CONTROLLER_MODE else await comfy_submit(
+        request.app["session"], graph
+    )
     # 步骤名和权重单独放 STEPS / WEIGHTS，不塞进 job：job 每次轮询整份回给前端，
     # 59 个节点名白传
     STEPS[pid] = step_labels(graph)
@@ -565,6 +597,16 @@ async def api_generate(request):
                  # 任务面板要能说清"这是哪张卡在跑"，还要能点回那张卡
                  "project": body.get("project"), "card": body.get("card"),
                  "cardName": body.get("cardName")}
+    if CONTROLLER_MODE:
+        required_nodes = {
+            nd.get("class_type") for nd in graph.values()
+            if isinstance(nd, dict) and nd.get("class_type")
+        }
+        distributed_store(request.app).enqueue(
+            pid,
+            {"graph": graph, "assets": uploaded, "capability": cid},
+            required_nodes,
+        )
     save_jobs()
     return web.json_response(JOBS[pid])
 
@@ -800,17 +842,206 @@ async def api_status(request):
     response = web.json_response({
         "ok": True,
         "service": "chouka",
+        "mode": EXECUTION_MODE,
         "state": "busy" if busy else "idle",
         "idle": not busy,
         "busy": busy,
         "running_count": running_count,
         "queued_count": queued_count,
         "active_count": active_count,
-        "comfy_online": STATE["comfy_online"],
+        "comfy_online": controller_comfy_online(request.app),
     })
     # 状态不能被浏览器或中间代理缓存；只读 GET 允许局域网页面跨域查询。
     response.headers["Cache-Control"] = "no-store"
     response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
+def require_agent(request):
+    worker_id = request.headers.get("X-Worker-ID", "")
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:] if auth.startswith("Bearer ") else ""
+    if not distributed_store(request.app).authenticate(worker_id, token):
+        raise web.HTTPUnauthorized(reason="Worker 凭据无效")
+    return worker_id
+
+
+def require_lease(request, worker_id):
+    pid = request.match_info["pid"]
+    lease_token = request.headers.get("X-Lease-Token", "")
+    if not distributed_store(request.app).validate_lease(pid, worker_id, lease_token):
+        raise web.HTTPConflict(reason="任务租约已失效")
+    return pid, lease_token
+
+
+async def api_agent_register(request):
+    if not ENROLLMENT_TOKEN:
+        raise web.HTTPServiceUnavailable(reason="服务端未配置 CHOUKA_ENROLLMENT_TOKEN")
+    body = await request.json()
+    supplied = str(body.get("enrollment_token") or "")
+    if not hmac.compare_digest(supplied, ENROLLMENT_TOKEN):
+        raise web.HTTPUnauthorized(reason="注册码无效")
+    name = str(body.get("name") or "").strip()[:100]
+    if not name:
+        raise web.HTTPBadRequest(reason="缺少 Worker 名称")
+    result = distributed_store(request.app).register_worker(
+        name, body.get("capabilities") if isinstance(body.get("capabilities"), dict) else {}
+    )
+    return web.json_response(result, status=201)
+
+
+async def api_agent_heartbeat(request):
+    worker_id = require_agent(request)
+    body = await request.json()
+    result = distributed_store(request.app).heartbeat(
+        worker_id,
+        capabilities=body.get("capabilities") if isinstance(body.get("capabilities"), dict) else None,
+        comfy_online=bool(body.get("comfy_online")),
+        busy=bool(body.get("busy")),
+        current_job_id=body.get("current_job_id"),
+    )
+    if result is None:
+        raise web.HTTPNotFound(reason="Worker 不存在")
+    return web.json_response(result)
+
+
+async def api_agent_acquire(request):
+    worker_id = require_agent(request)
+    assignment = distributed_store(request.app).acquire(worker_id)
+    if assignment is None:
+        return web.Response(status=204)
+    pid = assignment["job_id"]
+    graph = assignment["payload"].get("graph") or {}
+    STEPS.setdefault(pid, step_labels(graph))
+    WEIGHTS.setdefault(pid, step_weights(graph))
+    job = JOBS.get(pid)
+    if job:
+        job["worker_id"] = worker_id
+        job["queue_remaining"] = 1
+        save_jobs()
+    return web.json_response(assignment)
+
+
+async def api_agent_start(request):
+    worker_id = require_agent(request)
+    pid, lease_token = require_lease(request, worker_id)
+    if not distributed_store(request.app).mark_running(pid, worker_id, lease_token):
+        raise web.HTTPConflict(reason="任务无法进入运行状态")
+    job = JOBS.get(pid)
+    if job:
+        job.update(status="running", started=job.get("started") or time.time(),
+                   worker_id=worker_id)
+        save_jobs()
+    return web.json_response({"ok": True})
+
+
+async def api_agent_event(request):
+    worker_id = require_agent(request)
+    pid, _lease_token = require_lease(request, worker_id)
+    event = await request.json()
+    if not isinstance(event, dict):
+        raise web.HTTPBadRequest(reason="事件必须是 JSON 对象")
+    data = event.setdefault("data", {})
+    if not isinstance(data, dict):
+        raise web.HTTPBadRequest(reason="事件 data 必须是 JSON 对象")
+    data["prompt_id"] = pid
+    await handle_event(None, event, remote=True)
+    return web.json_response({"ok": True})
+
+
+async def api_agent_artifact(request):
+    worker_id = require_agent(request)
+    pid, _lease_token = require_lease(request, worker_id)
+    reader = await request.multipart()
+    part = await reader.next()
+    if part is None or part.name != "file":
+        raise web.HTTPBadRequest(reason="缺少产物文件")
+    original = Path(part.filename or "output.bin").name
+    suffix = Path(original).suffix.lower()
+    if not re.fullmatch(r"\.[a-z0-9]{1,10}", suffix):
+        suffix = ".bin"
+    stored_name = f"{uuid.uuid4().hex}{suffix}"
+    target_dir = ARTIFACT_DIR / pid
+    target_dir.mkdir(parents=True, exist_ok=True)
+    target = target_dir / stored_name
+    with target.open("wb") as fp:
+        while True:
+            chunk = await part.read_chunk(1024 * 1024)
+            if not chunk:
+                break
+            fp.write(chunk)
+    output = {
+        "kind": request.query.get("kind") or kind_of(original),
+        "filename": original,
+        "type": "output",
+        "subfolder": "",
+        "url": f"/api/artifact/{pid}/{stored_name}",
+    }
+    return web.json_response(output, status=201)
+
+
+async def api_agent_complete(request):
+    worker_id = require_agent(request)
+    pid, lease_token = require_lease(request, worker_id)
+    body = await request.json()
+    outputs = body.get("outputs") if isinstance(body.get("outputs"), list) else []
+    if not distributed_store(request.app).finish(pid, worker_id, lease_token, "done"):
+        raise web.HTTPConflict(reason="任务无法完成")
+    job = JOBS.get(pid)
+    if job:
+        job.update(status="done", progress=1.0, outputs=outputs, step="",
+                   ended=time.time(), worker_id=worker_id, error=None)
+        STEPS.pop(pid, None)
+        WEIGHTS.pop(pid, None)
+        save_jobs()
+    return web.json_response({"ok": True})
+
+
+async def api_agent_failed(request):
+    worker_id = require_agent(request)
+    pid, lease_token = require_lease(request, worker_id)
+    body = await request.json()
+    canceled = bool(body.get("canceled"))
+    dispatch_status = "canceled" if canceled else "error"
+    if not distributed_store(request.app).finish(
+            pid, worker_id, lease_token, dispatch_status):
+        raise web.HTTPConflict(reason="任务无法结束")
+    job = JOBS.get(pid)
+    if job:
+        job.update(status="canceled" if canceled else "error", step="", ended=time.time(),
+                   worker_id=worker_id, error=None if canceled else str(body.get("error") or "Worker 执行失败")[:2000])
+        STEPS.pop(pid, None)
+        WEIGHTS.pop(pid, None)
+        save_jobs()
+    return web.json_response({"ok": True})
+
+
+async def api_workers(request):
+    return web.json_response({"workers": distributed_store(request.app).list_workers()})
+
+
+async def api_worker_enabled(request):
+    body = await request.json()
+    enabled = bool(body.get("enabled"))
+    if not distributed_store(request.app).set_worker_enabled(
+            request.match_info["worker_id"], enabled):
+        raise web.HTTPNotFound(reason="Worker 不存在")
+    return web.json_response({"ok": True, "enabled": enabled})
+
+
+async def api_artifact(request):
+    pid = request.match_info["pid"]
+    name = request.match_info["name"]
+    if Path(pid).name != pid or Path(name).name != name:
+        raise web.HTTPNotFound()
+    path = ARTIFACT_DIR / pid / name
+    if not path.is_file():
+        raise web.HTTPNotFound(reason="产物不存在")
+    response = web.FileResponse(path)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    if path.suffix.lower() not in IMG_EXT | VID_EXT | AUD_EXT:
+        response.headers["Content-Type"] = "application/octet-stream"
+        response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
     return response
 
 
@@ -846,7 +1077,7 @@ def load_jobs():
         return
     cut = 0
     for j in rows:
-        if j.get("status") in LIVE:
+        if j.get("status") in LIVE and not CONTROLLER_MODE:
             j.update(status="canceled", step="", ended=j.get("ended") or time.time(),
                      error="抽卡系统重启了，这一轮没跑完（重启前的进度不留，重跑一次就行）")
             cut += 1
@@ -855,12 +1086,18 @@ def load_jobs():
           + (f"，其中 {cut} 条是重启时被打断的" if cut else ""))
 
 
-async def stop_job(session, pid):
-    """让一个还没跑完的任务停下来。正在跑的只能打断（ComfyUI 一次只跑一个），
-       还在排队的从队列里删掉 —— 打断只作用于当前那个，对排队的没用。"""
+async def stop_job(app, pid):
+    """停止本地任务，或向远端 Worker 发出取消请求。"""
     job = JOBS.get(pid)
     if job and job["status"] not in LIVE:
-        return
+        return "finished"
+    if CONTROLLER_MODE:
+        state = distributed_store(app).request_cancel(pid)
+        if state == "canceled" and job:
+            job.update(status="canceled", step="", ended=time.time())
+            save_jobs()
+        return state
+    session = app["session"]
     if job and job["status"] == "running":
         async with session.post(COMFY_HTTP + "/interrupt") as r:
             await r.read()
@@ -872,20 +1109,25 @@ async def stop_job(session, pid):
         job["status"] = "canceled"
         job["step"] = ""
         save_jobs()
+    return "canceled"
 
 
 async def api_cancel(request):
-    await stop_job(request.app["session"], request.match_info["pid"])
-    return web.json_response({"ok": True})
+    state = await stop_job(request.app, request.match_info["pid"])
+    return web.json_response({"ok": True, "state": state})
 
 
 async def api_job_delete(request):
-    """从任务列表里抹掉一条。还在跑/排队的先停下来，不然记录没了活儿还在跑。"""
+    """从任务列表里抹掉一条；远端运行中的任务需先等待 Worker 确认取消。"""
     pid = request.match_info["pid"]
-    await stop_job(request.app["session"], pid)
+    state = await stop_job(request.app, pid)
+    if CONTROLLER_MODE and state == "cancel_requested":
+        return web.json_response({"ok": True, "pending": True})
     JOBS.pop(pid, None)
     STEPS.pop(pid, None)
     WEIGHTS.pop(pid, None)
+    if CONTROLLER_MODE:
+        distributed_store(request.app).remove_job(pid)
     save_jobs()
     return web.json_response({"ok": True})
 
@@ -897,6 +1139,8 @@ async def api_jobs_clear(request):
         JOBS.pop(pid, None)
         STEPS.pop(pid, None)
         WEIGHTS.pop(pid, None)
+    if CONTROLLER_MODE:
+        distributed_store(request.app).clear_finished()
     save_jobs()
     return web.json_response({"ok": True, "removed": len(gone)})
 
@@ -1030,9 +1274,13 @@ async def index(request):
 
 
 async def api_health(request):
+    workers = distributed_store(request.app).list_workers() if CONTROLLER_MODE else []
     return web.json_response({
-        "ok": True, "comfy_online": STATE["comfy_online"],
+        "ok": True, "mode": EXECUTION_MODE,
+        "comfy_online": controller_comfy_online(request.app),
         "capabilities": len(CAPS), "jobs": len(JOBS), "client_id": CLIENT_ID,
+        "workers": len(workers),
+        "online_workers": sum(w["state"] != "offline" for w in workers),
         "llm": llm.where(),      # 改写走不走 API（不含 key）
     })
 
@@ -1041,12 +1289,18 @@ async def api_health(request):
 async def on_start(app):
     app["session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
-    app["ws_task"] = asyncio.create_task(ws_loop(app))
+    if not CONTROLLER_MODE:
+        app["ws_task"] = asyncio.create_task(ws_loop(app))
 
 
 async def on_stop(app):
-    app["ws_task"].cancel()
+    task = app.get("ws_task")
+    if task:
+        task.cancel()
     await app["session"].close()
+    store = app.get("distributed")
+    if store:
+        store.close()
 
 
 def lan_ips():
@@ -1094,6 +1348,8 @@ def make_app():
     n = load_caps()
     load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2)
+    if CONTROLLER_MODE:
+        app["distributed"] = DistributedStore(ROOT / "data" / "control.db")
     app.on_response_prepare.append(no_cache)
     app.router.add_get("/", index)
     app.router.add_get("/api/health", api_health)
@@ -1116,7 +1372,19 @@ def make_app():
     app.router.add_put("/api/projects/{pid}", api_project_save)
     app.router.add_delete("/api/projects/{pid}", api_project_delete)
     app.router.add_get("/api/file", api_file)
+    app.router.add_get("/api/artifact/{pid}/{name}", api_artifact)
     app.router.add_post("/api/reveal", api_reveal)
+    if CONTROLLER_MODE:
+        app.router.add_get("/api/workers", api_workers)
+        app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
+        app.router.add_post("/agent/v1/register", api_agent_register)
+        app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)
+        app.router.add_post("/agent/v1/jobs/acquire", api_agent_acquire)
+        app.router.add_post("/agent/v1/jobs/{pid}/start", api_agent_start)
+        app.router.add_post("/agent/v1/jobs/{pid}/event", api_agent_event)
+        app.router.add_post("/agent/v1/jobs/{pid}/artifact", api_agent_artifact)
+        app.router.add_post("/agent/v1/jobs/{pid}/complete", api_agent_complete)
+        app.router.add_post("/agent/v1/jobs/{pid}/failed", api_agent_failed)
     up = ROOT / "data" / "uploads"
     up.mkdir(parents=True, exist_ok=True)
     app.router.add_static("/api/upload/", up)
@@ -1124,6 +1392,9 @@ def make_app():
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
     print(f"[抽卡系统] 载入 {n} 个能力，{len(CARDS)} 张卡")
+    print(f"[抽卡系统] 执行模式：{EXECUTION_MODE}")
+    if CONTROLLER_MODE and not ENROLLMENT_TOKEN:
+        print("[抽卡系统] 警告：未配置 CHOUKA_ENROLLMENT_TOKEN，Worker 注册已禁用")
     print(f"[抽卡系统] 本机   http://127.0.0.1:{PORT}")
     for ip in lan_ips():
         print(f"[抽卡系统] 局域网 http://{ip}:{PORT}   ← 手机/别的电脑用这个")

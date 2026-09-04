@@ -4,14 +4,15 @@
 用于提示词的中英互译。比 LLM 快、便宜、稳定。
 """
 import hashlib
+import os
 import time
 import uuid
 import requests
 
 
-# 有道翻译配置
-YOUDAO_APP_KEY = "0074aa43445ffab2"
-YOUDAO_APP_SECRET = "TRpq2f9ymGr2ah9y4s8CK1UwFgBv4lV8"
+# 凭据只从部署环境读取，不能跟随源码和容器镜像分发。
+YOUDAO_APP_KEY = os.environ.get("YOUDAO_APP_KEY", "")
+YOUDAO_APP_SECRET = os.environ.get("YOUDAO_APP_SECRET", "")
 YOUDAO_API_URL = "https://openapi.youdao.com/api"
 
 
@@ -36,6 +37,8 @@ def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers")
     """
     if not text or not text.strip():
         return text
+    if not YOUDAO_APP_KEY or not YOUDAO_APP_SECRET:
+        raise TranslateError("服务端未配置 YOUDAO_APP_KEY / YOUDAO_APP_SECRET")
 
     # 自动判断目标语言：如果源文本主要是中文 → 英文，否则 → 中文
     if to_lang == "auto":
