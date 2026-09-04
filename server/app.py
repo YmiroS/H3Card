@@ -54,6 +54,7 @@ ENROLLMENT_TOKEN = os.environ.get("CHOUKA_ENROLLMENT_TOKEN", "")
 ARTIFACT_DIR = ROOT / "data" / "artifacts"
 
 CLIENT_ID = uuid.uuid4().hex
+STARTED_AT = time.time()
 JOBS = {}                  # prompt_id -> job dict
 STEPS = {}                 # prompt_id -> {节点 id: 人能看懂的步骤名}
 WEIGHTS = {}               # prompt_id -> {节点 id: 这一步在整体进度里占多重}
@@ -1314,10 +1315,17 @@ async def index(request):
     return web.FileResponse(ROOT / "web" / "index.html")
 
 
+async def controller_index(request):
+    if not CONTROLLER_MODE:
+        raise web.HTTPNotFound(reason="中间层运行面板只在 controller 模式提供")
+    return web.FileResponse(ROOT / "web" / "controller.html")
+
+
 async def api_health(request):
     workers = distributed_store(request.app).list_workers() if CONTROLLER_MODE else []
     return web.json_response({
         "ok": True, "mode": EXECUTION_MODE,
+        "server_time": time.time(), "started_at": STARTED_AT,
         "comfy_online": controller_comfy_online(request.app),
         "capabilities": len(CAPS), "jobs": len(JOBS), "client_id": CLIENT_ID,
         "workers": len(workers),
@@ -1393,6 +1401,7 @@ def make_app():
         app["distributed"] = DistributedStore(ROOT / "data" / "control.db")
     app.on_response_prepare.append(no_cache)
     app.router.add_get("/", index)
+    app.router.add_get("/controller", controller_index)
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/cards", api_cards)

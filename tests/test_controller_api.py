@@ -41,7 +41,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.store = DistributedStore(Path(self.temp.name) / "control.db")
         self.old_token = controller_app.ENROLLMENT_TOKEN
         self.old_save_jobs = controller_app.save_jobs
+        self.old_controller_mode = controller_app.CONTROLLER_MODE
         controller_app.ENROLLMENT_TOKEN = "controller-test-enrollment-token"
+        controller_app.CONTROLLER_MODE = True
         controller_app.save_jobs = lambda: None
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
@@ -49,6 +51,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
 
         application = web.Application()
         application["distributed"] = self.store
+        application.router.add_get("/controller", controller_app.controller_index)
+        application.router.add_get("/api/health", controller_app.api_health)
         application.router.add_post("/agent/v1/register", controller_app.api_agent_register)
         application.router.add_post("/agent/v1/heartbeat", controller_app.api_agent_heartbeat)
         application.router.add_post("/agent/v1/jobs/acquire", controller_app.api_agent_acquire)
@@ -66,9 +70,22 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.temp.cleanup()
         controller_app.ENROLLMENT_TOKEN = self.old_token
         controller_app.save_jobs = self.old_save_jobs
+        controller_app.CONTROLLER_MODE = self.old_controller_mode
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
         controller_app.WEIGHTS.clear()
+
+    async def test_controller_dashboard_and_health_metadata(self):
+        response = await self.client.get("/controller")
+        self.assertEqual(response.status, 200)
+        self.assertIn("中间层运行面板", await response.text())
+
+        response = await self.client.get("/api/health")
+        self.assertEqual(response.status, 200)
+        health = await response.json()
+        self.assertEqual(health["mode"], controller_app.EXECUTION_MODE)
+        self.assertIn("server_time", health)
+        self.assertIn("started_at", health)
 
     async def test_register_heartbeat_acquire_and_complete(self):
         denied = await self.client.post("/agent/v1/register", json={

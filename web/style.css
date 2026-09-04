@@ -89,7 +89,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 .tbtn {
   padding: 6px 11px; border-radius: 3px;
   background: #0c121f; border: 1px solid var(--line); color: var(--dim);
-  letter-spacing: .5px;
+  letter-spacing: .5px; text-decoration: none;
 }
 .tbtn:hover { color: var(--acc); border-color: var(--acc); box-shadow: 0 0 10px #00e5ff25; }
 #ptitle { font-weight: 600; letter-spacing: 1px; text-shadow: 0 0 10px #00e5ff40; }

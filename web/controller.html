@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>中间层运行面板</title>
+<style>
+:root { color-scheme: dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --muted:#8b949e; --text:#e6edf3; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --blue:#58a6ff; }
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui,"Microsoft YaHei",sans-serif; }
+header { position:sticky; top:0; z-index:2; display:flex; align-items:center; gap:16px; padding:14px 24px; background:rgba(13,17,23,.95); border-bottom:1px solid var(--line); backdrop-filter:blur(10px); }
+header h1 { margin:0; font-size:18px; }
+header .state { margin-right:auto; color:var(--muted); }
+a,button { color:var(--text); border:1px solid var(--line); background:var(--panel); border-radius:7px; padding:7px 12px; text-decoration:none; cursor:pointer; }
+a:hover,button:hover { border-color:var(--blue); }
+main { max-width:1440px; margin:auto; padding:22px; }
+.summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; margin-bottom:18px; }
+.metric,.section { background:var(--panel); border:1px solid var(--line); border-radius:10px; }
+.metric { padding:15px; }
+.metric span { display:block; color:var(--muted); font-size:12px; }
+.metric strong { display:block; margin-top:4px; font-size:21px; }
+.section { margin-top:14px; overflow:hidden; }
+.section h2 { margin:0; padding:13px 16px; border-bottom:1px solid var(--line); font-size:15px; }
+.scroll { overflow:auto; }
+table { width:100%; border-collapse:collapse; white-space:nowrap; }
+th,td { padding:10px 14px; border-bottom:1px solid var(--line); text-align:left; font-weight:400; }
+th { color:var(--muted); font-size:12px; }
+tr:last-child td { border-bottom:0; }
+.muted { color:var(--muted); }
+.ok { color:var(--ok); }
+.warn { color:var(--warn); }
+.bad { color:var(--bad); }
+.progress { min-width:190px; }
+.bar { height:5px; margin-top:5px; background:#21262d; border-radius:5px; overflow:hidden; }
+.bar i { display:block; height:100%; background:var(--blue); }
+.empty { padding:20px; color:var(--muted); text-align:center; }
+.error { margin-bottom:12px; padding:10px 12px; color:#ffb4ae; background:#3b1517; border:1px solid #7d282d; border-radius:8px; display:none; }
+@media (max-width:700px) { header { padding:12px; flex-wrap:wrap; } main { padding:12px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>中间层运行面板</h1>
+  <span id="refresh-state" class="state">正在读取...</span>
+  <a href="/">打开 Chouka Web</a>
+  <button id="refresh">立即刷新</button>
+</header>
+<main>
+  <div id="error" class="error"></div>
+  <section class="summary">
+    <div class="metric"><span>中间层服务</span><strong id="service">--</strong></div>
+    <div class="metric"><span>在线执行端</span><strong id="workers">--</strong></div>
+    <div class="metric"><span>正在运行</span><strong id="running">--</strong></div>
+    <div class="metric"><span>排队任务</span><strong id="queued">--</strong></div>
+    <div class="metric"><span>ComfyUI</span><strong id="comfy">--</strong></div>
+    <div class="metric"><span>服务运行时间</span><strong id="uptime">--</strong></div>
+  </section>
+
+  <section class="section">
+    <h2>Windows 执行端</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>机器</th><th>状态</th><th>ComfyUI</th><th>当前任务</th><th>设备</th><th>节点能力</th><th>最后心跳</th></tr></thead>
+      <tbody id="worker-rows"></tbody>
+    </table></div>
+    <div id="worker-empty" class="empty" hidden>还没有注册执行端</div>
+  </section>
+
+  <section class="section">
+    <h2>最近任务</h2>
+    <div class="scroll"><table>
+      <thead><tr><th>状态</th><th>项目 / 卡片</th><th>过程进度</th><th>执行端</th><th>创建时间</th><th>耗时 / 错误</th></tr></thead>
+      <tbody id="job-rows"></tbody>
+    </table></div>
+    <div id="job-empty" class="empty" hidden>还没有任务</div>
+  </section>
+
+  <section class="section">
+    <h2>服务配置摘要</h2>
+    <div class="scroll"><table><tbody id="config-rows"></tbody></table></div>
+  </section>
+</main>
+<script>
+const STATUS = {idle:"空闲",busy:"忙碌",offline:"离线",disabled:"已禁用",error:"异常",queued:"排队中",assigned:"已分配",running:"运行中",done:"已完成",canceled:"已取消",cancel_requested:"正在取消"};
+const $ = id => document.getElementById(id);
+const text = (id,value) => { $(id).textContent = value; };
+
+async function get(path) {
+  const response = await fetch(path,{cache:"no-store"});
+  if (!response.ok) throw new Error(`${path} 返回 HTTP ${response.status}`);
+  return response.json();
+}
+function cls(state) { return ["idle","done"].includes(state) ? "ok" : ["busy","running","queued","assigned","cancel_requested"].includes(state) ? "warn" : ["offline","disabled","error","canceled"].includes(state) ? "bad" : ""; }
+function when(value) { return value ? new Date(value*1000).toLocaleString("zh-CN",{hour12:false}) : "--"; }
+function ago(value) {
+  if (!value) return "--";
+  const sec=Math.max(0,Math.round(Date.now()/1000-value));
+  return sec<60 ? `${sec} 秒前` : sec<3600 ? `${Math.floor(sec/60)} 分钟前` : `${Math.floor(sec/3600)} 小时前`;
+}
+function duration(sec) {
+  if (!Number.isFinite(sec) || sec<0) return "--";
+  if (sec<60) return `${Math.round(sec)} 秒`;
+  if (sec<3600) return `${Math.floor(sec/60)} 分 ${Math.round(sec%60)} 秒`;
+  return `${Math.floor(sec/3600)} 小时 ${Math.floor(sec%3600/60)} 分`;
+}
+function td(row,value,className,title) {
+  const cell=document.createElement("td");
+  cell.textContent=value == null || value === "" ? "--" : String(value);
+  if (className) cell.className=className;
+  if (title) cell.title=title;
+  row.appendChild(cell);
+  return cell;
+}
+function renderWorkers(items) {
+  const body=$("worker-rows"); body.replaceChildren(); $("worker-empty").hidden=items.length>0;
+  for (const worker of items) {
+    const row=document.createElement("tr");
+    td(row,worker.name);
+    td(row,STATUS[worker.state]||worker.state,cls(worker.state));
+    td(row,worker.comfy_online?"在线":"不可用",worker.comfy_online?"ok":"bad");
+    td(row,worker.current_job_id||"--","muted",worker.current_job_id);
+    const caps=worker.capabilities||{};
+    const devices=(caps.devices||[]).map(d=>d.name||d.type||d.device_name).filter(Boolean).join("、");
+    td(row,devices||"未上报",devices?"":"muted",devices);
+    td(row,`${(caps.node_classes||[]).length} 个`);
+    td(row,ago(worker.last_seen),"muted",when(worker.last_seen));
+    body.appendChild(row);
+  }
+}
+function renderJobs(items) {
+  const body=$("job-rows"); body.replaceChildren(); $("job-empty").hidden=items.length>0;
+  for (const job of items.slice(0,30)) {
+    const row=document.createElement("tr");
+    td(row,STATUS[job.status]||job.status,cls(job.status));
+    td(row,[job.projectName,job.cardName||job.name].filter(Boolean).join(" / ")||job.name);
+    const pct=Math.round((job.progress||0)*100);
+    const progress=td(row,`${pct}%${job.step?` · ${job.step}`:""}`,"progress",job.step);
+    const bar=document.createElement("div"); bar.className="bar";
+    const fill=document.createElement("i"); fill.style.width=`${pct}%`; bar.appendChild(fill); progress.appendChild(bar);
+    td(row,job.worker_id||"--","muted",job.worker_id);
+    td(row,when(job.created),"muted");
+    const elapsed=job.started ? duration((job.ended||Date.now()/1000)-job.started) : "--";
+    td(row,job.error||elapsed,job.error?"bad":"muted",job.error);
+    body.appendChild(row);
+  }
+}
+function renderConfig(health) {
+  const rows=$("config-rows"); rows.replaceChildren();
+  const values=[
+    ["运行模式",health.mode==="controller"?"Linux 中间层":"Windows 单机"],
+    ["可用能力",`${health.capabilities||0} 个`],
+    ["任务记录",`${health.jobs||0} 条`],
+    ["大模型接口",health.llm&&health.llm.ok?`已配置 · ${health.llm.model||""}`:"未配置"],
+    ["页面地址",location.origin+"/controller"],
+    ["Chouka Web",location.origin+"/"],
+  ];
+  for (const [name,value] of values) { const row=document.createElement("tr"); td(row,name,"muted"); td(row,value); rows.appendChild(row); }
+}
+async function refresh() {
+  try {
+    const [health,status,workers,jobs]=await Promise.all([get("/api/health"),get("/api/status"),get("/api/workers"),get("/api/jobs")]);
+    text("service",health.ok?"运行正常":"异常"); $("service").className=health.ok?"ok":"bad";
+    text("workers",`${health.online_workers||0} / ${health.workers||0}`);
+    text("running",status.running_count||0); text("queued",status.queued_count||0);
+    text("comfy",health.comfy_online?"可用":"不可用"); $("comfy").className=health.comfy_online?"ok":"bad";
+    text("uptime",health.started_at?duration(health.server_time-health.started_at):"--");
+    renderWorkers(workers.workers||[]); renderJobs(jobs.jobs||[]); renderConfig(health);
+    $("error").style.display="none";
+    text("refresh-state",`最后刷新：${new Date().toLocaleTimeString("zh-CN",{hour12:false})}`);
+  } catch (error) {
+    $("error").textContent=`读取中间层信息失败：${error.message}`; $("error").style.display="block";
+    text("refresh-state","连接失败");
+  }
+}
+$("refresh").onclick=refresh;
+refresh();
+setInterval(refresh,5000);
+</script>
+</body>
+</html>
