@@ -131,6 +131,23 @@ class WorkerInputPathTest(unittest.TestCase):
             with self.subTest(ref=ref), self.assertRaises(JobFailed):
                 self.agent._input_target(ref)
 
+    def test_removes_only_silent_video_audio_links(self):
+        graph = {
+            "45": {"inputs": {
+                "ref_video": ["78", 0],
+                "ref_audio": ["78", 2],
+                "other_audio": ["79", 2],
+            }},
+            "78": {"class_type": "VHS_LoadVideo", "inputs": {
+                "video": "chouka/silent.mov"
+            }},
+        }
+        removed = self.agent._remove_output_links(graph, "78", 2)
+        self.assertEqual(removed, 1)
+        self.assertEqual(graph["45"]["inputs"]["ref_video"], ["78", 0])
+        self.assertEqual(graph["45"]["inputs"]["other_audio"], ["79", 2])
+        self.assertNotIn("ref_audio", graph["45"]["inputs"])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,7 +5,9 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import ssl
+import subprocess
 import tempfile
 import time
 import uuid
@@ -232,6 +234,76 @@ class WorkerAgent:
                         fp.write(chunk)
             os.replace(tmp, target)
 
+    def _ffmpeg_bin(self):
+        configured = self.config.get("ffmpeg_path")
+        if configured and Path(configured).is_file():
+            return Path(configured)
+        pack = self.comfy_input.parent.parent
+        directory = pack / "python_embeded/Lib/site-packages/imageio_ffmpeg/binaries"
+        return next(iter(sorted(directory.glob("ffmpeg-*.exe"), reverse=True)), None)
+
+    @staticmethod
+    def _remove_output_links(graph, source_node, output_index):
+        removed = 0
+        for node in graph.values():
+            inputs = node.get("inputs") if isinstance(node, dict) else None
+            if not isinstance(inputs, dict):
+                continue
+            for key, value in list(inputs.items()):
+                if (isinstance(value, list) and len(value) == 2
+                        and str(value[0]) == str(source_node)
+                        and value[1] == output_index):
+                    inputs.pop(key)
+                    removed += 1
+        return removed
+
+    def _probe_has_audio(self, path):
+        ffmpeg = self._ffmpeg_bin()
+        if ffmpeg is None:
+            return None
+        try:
+            result = subprocess.run(
+                [str(ffmpeg), "-i", str(path)], capture_output=True,
+                text=True, errors="ignore", timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return bool(re.search(r"^\s*Stream #\d+:\d+.*:\s*Audio:",
+                              result.stderr or "", re.MULTILINE))
+
+    async def patch_silent_video_audio(self, assignment):
+        graph = assignment["payload"].get("graph") or {}
+        video_nodes = [
+            (str(node_id), node) for node_id, node in graph.items()
+            if isinstance(node, dict) and node.get("class_type") == "VHS_LoadVideo"
+        ]
+        if not video_nodes:
+            return
+        try:
+            info = await self._json_request(
+                "GET", self.comfy + "/object_info/VHS_LoadVideo"
+            )
+            output_types = (info.get("VHS_LoadVideo") or {}).get("output") or []
+            audio_index = output_types.index("AUDIO")
+        except (AgentError, ValueError):
+            return
+        for node_id, node in video_nodes:
+            ref = (node.get("inputs") or {}).get("video")
+            if not isinstance(ref, str):
+                continue
+            try:
+                path, _filename = self._input_target(ref)
+            except JobFailed:
+                continue
+            has_audio = await asyncio.to_thread(self._probe_has_audio, path)
+            if has_audio is False:
+                removed = self._remove_output_links(graph, node_id, audio_index)
+                if removed:
+                    print(
+                        f"[Worker] 视频 {path.name} 没有音轨，已断开 {removed} 条音频引用",
+                        flush=True,
+                    )
+
     async def report_event(self, assignment, event):
         await self._json_request(
             "POST",
@@ -363,6 +435,7 @@ class WorkerAgent:
         print(f"[Worker] 领取任务 {job_id}")
         try:
             await self.prepare_inputs(assignment)
+            await self.patch_silent_video_audio(assignment)
             await self.execute_comfy(assignment)
             outputs = await self.collect_outputs(assignment)
             await self._json_request(
