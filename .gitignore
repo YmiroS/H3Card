@@ -11,7 +11,7 @@ __pycache__/
 # Controller and worker credentials
 /.env.controller
 /worker/config.json
-/worker/worker-state.json
+/worker/worker-state*.json
 
 # 软删除的项目文件
 *.deleted
