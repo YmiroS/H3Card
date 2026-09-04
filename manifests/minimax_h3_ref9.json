@@ -1,40 +1,87 @@
 {
  "id": "minimax_h3_ref9",
- "name": "H3全能参考(通用)",
- "file": "MiniMax H3 全能参考(通用) 九图单采",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3 全能参考(通用) 九图单采.json",
+ "name": "H3全能参考",
+ "file": "MiniMax H3 全能参考(通用) 九图+视频",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3 全能参考(通用) 九图+视频.json",
  "group": "视频",
  "outputType": "video",
  "kind": "gen",
  "card": "video",
- "slots": "img9+aud0+vid0",
+ "slots": "img9+aud0+vid1",
  "images": 9,
  "audios": 0,
- "videos": 0,
+ "videos": 1,
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 9
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 1
+  }
+ },
  "graph": "graphs/minimax_h3_ref9.api.json",
  "output": {
   "node": "38"
  },
- "note": "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。\n提示词只写「镜头里看得见、听得见」的东西。这几种写法它一律读不懂，还会把真正的画面描述冲淡：\n· 分镜表格（镜号／景别／运镜 那种带表头的一大片）—— 改成一句句话写；\n· 导演阐述、创作意图（「突出人物的渺小」「为后续做铺垫」）—— 直接删掉，改成写画面上的结果；\n· 「你是导演某某」这类交代身份的话 —— 它不是聊天模型，这句纯占位置，想要某种质感就直接描述质感（胶片颗粒、冷暖对比光）。\n每个镜头写清「第几秒到第几秒 + 景别 + 谁在做什么 + 镜头怎么动」，各镜头时长加起来等于「时长(秒)」那个数；台词直接用引号写在那个镜头里。\n第一人称视角这类「主角不在画面里」的要求跟参考图是矛盾的 —— 参考图会一直把人拉回画面中央，想要主观视角就别放人物参考图。\n画面糊、脸不像先看「分辨率」：调到 1.0 以上再看一遍，参考图也是按这个分辨率缩过之后才喂进模型的，调低了人物细节就一起丢了。",
+ "note": "视频引用在提示词里按顺序对应 <Video 1>；图片引用按顺序对应 <Picture 1>、<Picture 2>……。所有素材都可选，视频可参考动作和镜头节奏，图片可补人物、场景、服装等外观。\n多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。\n提示词只写「镜头里看得见、听得见」的东西。这几种写法它一律读不懂，还会把真正的画面描述冲淡：\n· 分镜表格（镜号／景别／运镜 那种带表头的一大片）—— 改成一句句话写；\n· 导演阐述、创作意图（「突出人物的渺小」「为后续做铺垫」）—— 直接删掉，改成写画面上的结果；\n· 「你是导演某某」这类交代身份的话 —— 它不是聊天模型，这句纯占位置，想要某种质感就直接描述质感（胶片颗粒、冷暖对比光）。\n每个镜头写清「第几秒到第几秒 + 景别 + 谁在做什么 + 镜头怎么动」，各镜头时长加起来等于「时长(秒)」那个数；台词直接用引号写在那个镜头里。\n第一人称视角这类「主角不在画面里」的要求跟参考图是矛盾的 —— 参考图会一直把人拉回画面中央，想要主观视角就别放人物参考图。\n画面糊、脸不像先看「分辨率」：调到 1.0 以上再看一遍，参考图也是按这个分辨率缩过之后才喂进模型的，调低了人物细节就一起丢了。",
  "rewrite": {
   "regime": "h3_ref"
  },
  "compare": false,
  "inputs": [
   {
+   "key": "video[0]",
+   "label": "视频1",
+   "type": "video",
+   "required": false,
+   "target": {
+    "node": "78",
+    "input": "video",
+    "kind": "upload_video"
+   },
+   "dropIfEmpty": [
+    {
+     "node": "45",
+     "input": "ref_videos.ref_video_0"
+    },
+    {
+     "node": "45",
+     "input": "ref_video_audios.ref_video_audio_0"
+    }
+   ],
+   "dropIfNoAudio": [
+    {
+     "node": "45",
+     "input": "ref_video_audios.ref_video_audio_0"
+    }
+   ]
+  },
+  {
    "key": "images[0]",
-   "label": "参考图1",
+   "label": "图片1",
    "type": "image",
-   "required": true,
+   "required": false,
    "target": {
     "node": "47",
     "input": "image",
     "kind": "upload_image"
-   }
+   },
+   "dropIfEmpty": [
+    {
+     "node": "45",
+     "input": "ref_images.ref_image_0"
+    }
+   ]
   },
   {
    "key": "images[1]",
-   "label": "参考图2",
+   "label": "图片2",
    "type": "image",
    "required": false,
    "target": {
@@ -51,7 +98,7 @@
   },
   {
    "key": "images[2]",
-   "label": "参考图3",
+   "label": "图片3",
    "type": "image",
    "required": false,
    "target": {
@@ -68,7 +115,7 @@
   },
   {
    "key": "images[3]",
-   "label": "参考图4",
+   "label": "图片4",
    "type": "image",
    "required": false,
    "target": {
@@ -85,7 +132,7 @@
   },
   {
    "key": "images[4]",
-   "label": "参考图5",
+   "label": "图片5",
    "type": "image",
    "required": false,
    "target": {
@@ -102,7 +149,7 @@
   },
   {
    "key": "images[5]",
-   "label": "参考图6",
+   "label": "图片6",
    "type": "image",
    "required": false,
    "target": {
@@ -119,7 +166,7 @@
   },
   {
    "key": "images[6]",
-   "label": "参考图7",
+   "label": "图片7",
    "type": "image",
    "required": false,
    "target": {
@@ -136,7 +183,7 @@
   },
   {
    "key": "images[7]",
-   "label": "参考图8",
+   "label": "图片8",
    "type": "image",
    "required": false,
    "target": {
@@ -153,7 +200,7 @@
   },
   {
    "key": "images[8]",
-   "label": "参考图9",
+   "label": "图片9",
    "type": "image",
    "required": false,
    "target": {
@@ -240,6 +287,55 @@
     "input": "processing_control_value",
     "vtype": "FLOAT"
    }
+  },
+  {
+   "key": "frame_load_cap",
+   "label": "只处理前几帧",
+   "type": "slider",
+   "min": 0,
+   "max": 300,
+   "step": 15,
+   "default": 0,
+   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
+   "advanced": false,
+   "target": {
+    "node": "78",
+    "input": "frame_load_cap",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "force_rate",
+   "label": "帧率",
+   "type": "slider",
+   "min": 8,
+   "max": 60,
+   "step": 1,
+   "default": 24,
+   "hint": "推荐 24：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
+   "advanced": false,
+   "target": {
+    "node": "38",
+    "input": "frame_rate",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "force_rate",
+   "label": "帧率",
+   "type": "slider",
+   "min": 8,
+   "max": 60,
+   "step": 1,
+   "default": 24,
+   "hint": "推荐 24：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
+   "advanced": false,
+   "target": {
+    "node": "78",
+    "input": "force_rate",
+    "vtype": "FLOAT"
+   },
+   "mirror": true
   },
   {
    "key": "aspect_ratio",

@@ -1,0 +1,90 @@
+{
+ "id": "qwen_video_reverse",
+ "name": "Qwen 视频反推提示词",
+ "file": "qwen3.5-视频反推提示词-修改版",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\Qwen3.5VL大语言模型全套\\qwen3.5-视频反推提示词-修改版.json",
+ "group": "其他",
+ "outputType": "unknown",
+ "kind": "gen",
+ "card": "unknown",
+ "slots": "img0+aud0+vid1",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 0
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 1
+  }
+ },
+ "graph": "graphs/qwen_video_reverse.api.json",
+ "output": null,
+ "note": null,
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "video[0]",
+   "label": "视频",
+   "type": "video",
+   "required": false,
+   "target": {
+    "node": "32",
+    "input": "video",
+    "kind": "upload_video"
+   },
+   "dropIfEmpty": []
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "",
+   "target": {
+    "node": "15",
+    "input": "custom_prompt"
+   }
+  },
+  {
+   "key": "frame_load_cap",
+   "label": "只处理前几帧",
+   "type": "slider",
+   "min": 0,
+   "max": 300,
+   "step": 15,
+   "default": 0,
+   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
+   "advanced": false,
+   "target": {
+    "node": "32",
+    "input": "frame_load_cap",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 1,
+   "target": {
+    "node": "15",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  }
+ ],
+ "warnings": [
+  "本地大模型：#12.model = Qwen3.5-27B-IQ4_XS.gguf",
+  "本地大模型：#12.mmproj = mmproj-F16.gguf",
+  "找不到输出节点（SaveImage/SaveVideo/…），无法取回产物"
+ ]
+}

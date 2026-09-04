@@ -2,7 +2,7 @@
  "id": "minimax_h3_comic20",
  "name": "漫剧4宫格",
  "file": "@minimax-批量化漫剧20宫格-直出1分钟视频V3",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@minimax-批量化漫剧20宫格-直出1分钟视频V3.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@minimax-批量化漫剧20宫格-直出1分钟视频V3.json",
  "group": "视频",
  "outputType": "video",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 5,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 5
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/minimax_h3_comic20.api.json",
  "output": {
   "node": "79"

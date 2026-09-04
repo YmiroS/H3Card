@@ -35,6 +35,7 @@ CONTROL_AFTER = ("randomize", "fixed", "increment", "decrement")
 ALIASES = {
     "4-Z-Image全系列/z-Image-标准版文生图.json": "zimage_t2i",
     "4-Z-Image全系列/Z-Image 图生图-反推 .json": "zimage_i2i",
+    "7-kear2全系列/全自动krea2文生图.json": "krea2_t2i",
     "3-Flux2-klein全系列/flux-2-klein-单-多图编辑.json": "flux2_klein_edit",
     "3-Flux2-klein全系列/九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json": "flux2_klein_storyboard9",
     "1-minimax H3/@MinimaxH3：图生视频 (4步加速版).json": "minimax_h3_i2v",
@@ -42,7 +43,8 @@ ALIASES = {
     "1-minimax H3/@MiniMax H3_ 说话唱歌 单人（4步加速版）.json": "minimax_h3_talk1",
     "1-minimax H3/@MiniMax H3_ 说话唱歌 双人（4步加速版）.json": "minimax_h3_talk2",
     "1-minimax H3/MiniMax H3  四图全能参考单采.json": "minimax_h3_ref4",
-    "1-minimax H3/MiniMax H3 全能参考(通用) 九图单采.json": "minimax_h3_ref9",
+    "1-minimax H3/MiniMax H3 全能参考(通用) 九图+视频.json": "minimax_h3_ref9",
+    "1-minimax H3/Minimax H3 多图全能二采-V2.json": "minimax_h3_ref_2pass",
     "1-minimax H3/@minimax-批量化漫剧20宫格-直出1分钟视频V3.json": "minimax_h3_comic20",
     "0-工具箱/四图拼四宫格.json": "grid4_stitch",
     "0-工具箱/人物提取.json": "rmbg_cutout",
@@ -51,6 +53,8 @@ ALIASES = {
     "SeedVR2图片视频高清/视频补帧插针(GIMM-VFI).json": "gimmvfi_interp",
     "SeedVR2图片视频高清/SeedVR2图片高清放大.json": "seedvr2_image_up",
     "SeedVR2图片视频高清/SeedVR2视频高清修复放大 v2.json": "seedvr2_video_up",
+    "Qwen3.5VL大语言模型全套/qwen3.5-单图反推提示词.json": "qwen_image_reverse",
+    "Qwen3.5VL大语言模型全套/qwen3.5-视频反推提示词-修改版.json": "qwen_video_reverse",
 }
 
 # 画布上的模式名（人工微调）。没写的能力走 short_name() 自动清洗文件名。
@@ -58,14 +62,16 @@ ALIASES = {
 DISPLAY = {
     "zimage_t2i": "文生图",
     "zimage_i2i": "图生图",
+    "krea2_t2i": "文生图",
     "flux2_klein_edit": "参考图编辑(保人物)",
     "flux2_klein_storyboard9": "多宫格故事分镜",
     "minimax_h3_i2v": "H3 图生视频",
     "minimax_h3_flf2v": "H3 首尾帧生视频",
     "minimax_h3_talk1": "H3 说话唱歌·单人",
     "minimax_h3_talk2": "H3 说话唱歌·双人",
-    "minimax_h3_ref4": "H3 四图参考生视频",
-    "minimax_h3_ref9": "H3全能参考(通用)",
+    "minimax_h3_ref4": "H3图片参考",
+    "minimax_h3_ref9": "H3全能参考",
+    "minimax_h3_ref_2pass": "H3全能参考(高质量)",
     "minimax_h3_comic20": "漫剧4宫格",
     "grid4_stitch": "四图拼四宫格",
     "rmbg_cutout": "人物提取",
@@ -74,6 +80,8 @@ DISPLAY = {
     "gimmvfi_interp": "视频补帧插针(GIMM-VFI)",
     "seedvr2_image_up": "SeedVR2 图片高清放大",
     "seedvr2_video_up": "SeedVR2 视频高清放大",
+    "qwen_image_reverse": "Qwen 单图反推提示词",
+    "qwen_video_reverse": "Qwen 视频反推提示词",
 }
 
 # 画布上单独占一张卡的能力。默认按产出类型归并（都出视频就都在「生视频」里当模式），
@@ -151,10 +159,22 @@ ASSET_CARD = {
 
 # 要把工作流里「关着的备用素材槽」开出来的能力（见 revive_bypassed）。
 # 四图参考的第 4 个图槽在模板里是绕过状态，名字叫四图、实际只有三格。
-REVIVE = {"minimax_h3_ref4"}
+# 多图全能二采：9图+1视频+3音频，默认只开2图，其他都是备用槽
+# ref9 和 ref4：虽然槽位都是激活的，但加入 REVIVE 是为了统一处理槽位标签
+REVIVE = {"minimax_h3_ref4", "minimax_h3_ref9", "minimax_h3_ref_2pass"}
+
+# 这两条工作流按「视频、图片、音频」排列引用类型，但全部素材都可选；空槽会断开
+# 模板里的对应支线，不能让 example.mp4 / 演示图在用户没引用素材时悄悄参与运行。
+VIDEO_REFERENCE_FIRST = {"minimax_h3_ref9", "minimax_h3_ref_2pass"}
 
 # 参考图生视频那两张卡共用这一条。它比别的说明长，因为这张卡跑废最常见的原因
 # 不是参数不对，而是提示词写成了给人看的分镜表格 —— 模型只认"看得见的画面"。
+VIDEO_REF_NOTE = (
+    "视频引用在提示词里按顺序对应 <Video 1>；图片引用按顺序对应 <Picture 1>、"
+    "<Picture 2>……。所有素材都可选，视频可参考动作和镜头节奏，图片可补人物、场景、"
+    "服装等外观。\n"
+)
+
 REF_PROMPT_NOTE = (
     "多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，"
     "依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。\n"
@@ -192,8 +212,15 @@ NOTES = {
                         "提示词里要点名「图1 / 图2」，并且把要保住的东西明写出来 —— "
                         "比如「让图1的人物换上图2的衣服，相貌、发型、光线和画风保持不变」。"
                         "出图尺寸跟着图1走（长边缩到 1280），卡上没有画面比例可调。",
-    "minimax_h3_ref9": REF_PROMPT_NOTE,
+    "minimax_h3_ref9": VIDEO_REF_NOTE + REF_PROMPT_NOTE,
     "minimax_h3_ref4": REF_PROMPT_NOTE,
+    "minimax_h3_ref_2pass": (
+        VIDEO_REF_NOTE + REF_PROMPT_NOTE + "\n\n"
+        "这个工作流是二次采样版本：先生成基础画面，再通过潜空间放大 1.5 倍并精修细节。"
+        "相比单采版本质量更高、分辨率更大，但速度慢一倍（20 步分两阶段）。\n"
+        "最多支持 1 个视频 + 9 张图片 + 3 段音频，全部按需引用，没有必填素材。\n"
+        "适合最终交付作品；快速预览用单采版本（H3全能参考）。"
+    ),
     "grid4_stitch": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」"
                     "要的素材，拼完直接连线过去。分镜顺序就是这个顺序。"
                     "画面比例和分辨率要跟下游那张卡调成一样，切回来的每格才不会再被裁一刀。",
@@ -276,6 +303,7 @@ REWRITE = {
     "minimax_h3_flf2v": {"regime": "h3_base", "mode": "FL2VA"},
     "minimax_h3_ref4": {"regime": "h3_ref"},
     "minimax_h3_ref9": {"regime": "h3_ref"},
+    "minimax_h3_ref_2pass": {"regime": "h3_ref"},
     "minimax_h3_talk1": {"regime": "h3_ref", "audio": True},
     "minimax_h3_talk2": {"regime": "h3_ref", "audio": True},
 }
@@ -461,10 +489,17 @@ VIRTUAL_TYPES = {
 SLOT_SPECIFIC = {
     "first_frame": "首帧", "last_frame": "尾帧",
     "start_image": "首帧", "end_image": "尾帧",
-    "ref_images": "参考图", "ref_image": "参考图",
-    "reference_image": "参考图", "control_image": "控制图",
+    "ref_images": "图片", "ref_image": "图片",
+    "reference_image": "图片", "control_image": "控制图",
 }
 SLOT_GENERIC = {"image": "图片", "images": "图片", "pixels": "图片"}
+# 槽位标签替换：把工作流中的旧标签统一替换成新标签（用于统一命名）
+SLOT_LABEL_REPLACE = {
+    r"^参考图(\d+)$": r"图片\1",  # 参考图1 -> 图片1
+    r"^参考图$": "图片",           # 参考图 -> 图片
+    r"^场景$": "图片",             # 场景 -> 图片
+    r"^角色$": "图片",             # 角色 -> 图片（uniq会自动编号）
+}
 HIDDEN_TYPES = {  # 后台节点，永不暴露
     "UNETLoader", "CLIPLoader", "VAELoader", "CheckpointLoaderSimple",
     "LoraLoaderModelOnly", "LoraLoader", "KSampler", "KSamplerSelect",
@@ -484,6 +519,7 @@ TEXT_TYPES = {
 VIDEO_LOADERS = {  # 上传视频的节点 -> 收文件名的那个输入名
     "VHS_LoadVideo": "video",
     "VHS_LoadVideoPath": "video",
+    "VHS_LoadVideoFFmpeg": "video",
 }
 SAVE_TYPES = {
     "SaveImage": "image", "PreviewImage": "image", "SaveAnimatedWEBP": "image",
@@ -722,8 +758,10 @@ def revive_bypassed(wf, warns):
     for node in wf.get("nodes", []):
         if node.get("mode") != 4:
             continue
-        if node.get("type") in ("LoadImage", "LoadAudio") and not any(
-                i.get("link") is not None for i in node.get("inputs", [])):
+        if (node.get("type") in ("LoadImage", "LoadAudio")
+                or node.get("type") in VIDEO_LOADERS) and not any(
+                i.get("link") is not None for i in node.get("inputs", [])
+                if "widget" not in i):
             node["mode"] = 0
             n += 1
         elif node.get("type") in VIRTUAL_TYPES or node.get("type") in (
@@ -1105,6 +1143,9 @@ def has_cjk(s):
 def pick_label(title, generic):
     """用户自己写的中文标题或短标签优先；英文长标题一律换成通用中文标签"""
     t = (title or "").strip()
+    # 应用标签替换规则
+    for pattern, replacement in SLOT_LABEL_REPLACE.items():
+        t = re.sub(pattern, replacement, t)
     if t and (has_cjk(t) or len(t) <= 4):
         return t, None
     return generic, (t or None)
@@ -1299,19 +1340,28 @@ def derive_inputs(api, oi, wid=None):
     for i, (nid, field, title) in enumerate(videos):
         ct = api[nid]["class_type"]
         label, hint = pick_label(None if default_title(oi, ct, title) else title, "视频")
+        # 视频槽也需要检查是否可断，避免把可选槽位标记为必填
+        cuts, cuttable, cuts_safe = slot_cuts(api, oi, nid)
         item = {"key": f"video[{i}]", "label": uniq(label), "type": "video",
-                "required": i == 0,
+                "required": i == 0 and not cuttable,  # 第一个视频且不可断才必填
                 "target": {"node": nid, "input": field, "kind": "upload_video"}}
         if hint:
             item["hint"] = hint
+        # 为可选视频槽添加 dropIfEmpty，空着时断开下游连接
+        if cuts and not item["required"]:
+            item["dropIfEmpty"] = cuts if cuts_safe else []
         out.append(item)
     for i, (nid, title) in enumerate(audios):
         label, hint = pick_label(None if default_title(oi, "LoadAudio", title) else title, "音频")
+        cuts, cuttable, cuts_safe = slot_cuts(api, oi, nid)
         item = {"key": f"audio[{i}]", "label": uniq(label), "type": "audio",
-                "required": i == 0,
+                "required": i == 0 and not cuttable,  # 第一个音频且不可断才必填
                 "target": {"node": nid, "input": "audio", "kind": "upload_audio"}}
         if hint:
             item["hint"] = hint
+        # 为可选音频槽添加 dropIfEmpty，空着时断开下游连接
+        if cuts and not item["required"]:
+            item["dropIfEmpty"] = cuts if cuts_safe else []
         out.append(item)
     for i, (nid, title, field, val) in enumerate(texts):
         ct = api[nid]["class_type"]
@@ -1413,6 +1463,30 @@ def derive_inputs(api, oi, wid=None):
         if i:
             item["mirror"] = True          # 多个采样器共用同一个种子输入框
         out.append(item)
+
+    # H3 全能参考的素材全部可选。空图片/视频都要把模板支线断开；显示顺序仍是
+    # 视频在前、图片随后、音频最后，但前端只展示真正已经引用的素材。
+    if wid in VIDEO_REFERENCE_FIRST:
+        for item in out:
+            if item["type"] == "video":
+                idx = int(item["key"][6:-1])
+                item["label"] = f"视频{idx + 1}"
+                item["required"] = False
+                cuts, _cuttable, cuts_safe = slot_cuts(api, oi, item["target"]["node"])
+                if cuts and cuts_safe:
+                    item["dropIfEmpty"] = cuts
+                    no_audio = [c for c in cuts if c["input"].startswith("ref_video_audios.")]
+                    if no_audio:
+                        item["dropIfNoAudio"] = no_audio
+            elif item["type"] == "image":
+                idx = int(item["key"][7:-1])
+                item["label"] = f"图片{idx + 1}"
+                item["required"] = False
+                cuts, _cuttable, cuts_safe = slot_cuts(api, oi, item["target"]["node"])
+                if cuts and cuts_safe:
+                    item["dropIfEmpty"] = cuts
+        order = {"video": 0, "image": 1, "audio": 2}
+        out.sort(key=lambda item: order.get(item["type"], 3))
 
     # 切格子的工作流：这是用户唯一会踩的坑，写成卡片说明摆在最上面
     note = None
@@ -1762,6 +1836,21 @@ def scan(path: Path, oi, rel_key=None):
         "images": n_img,
         "audios": n_aud,
         "videos": n_vid,
+        # 槽位动态配置：前端可根据此元数据实现"按需添加素材"交互
+        "slotLimits": {
+            "image": {
+                "min": 1 if n_img > 0 and any(inp.get("required") and inp["key"].startswith("images[") for inp in inputs) else 0,
+                "max": n_img
+            },
+            "audio": {
+                "min": 1 if n_aud > 0 and any(inp.get("required") and inp["key"].startswith("audio[") for inp in inputs) else 0,
+                "max": n_aud
+            },
+            "video": {
+                "min": 1 if n_vid > 0 and any(inp.get("required") and inp["key"].startswith("video[") for inp in inputs) else 0,
+                "max": n_vid
+            },
+        },
         "graph": f"graphs/{wid}.api.json",
         "output": {"node": outputs[0][0]} if outputs else None,
         "note": note or NOTES.get(wid),

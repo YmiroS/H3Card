@@ -1,0 +1,218 @@
+{
+ "7": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "4",
+    0
+   ],
+   "text": [
+    "55",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "CLIP Text Encode (Prompt)"
+  }
+ },
+ "2": {
+  "class_type": "EmptyLatentImage",
+  "inputs": {
+   "width": [
+    "49",
+    0
+   ],
+   "height": [
+    "49",
+    1
+   ],
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "Empty Latent Image"
+  }
+ },
+ "1": {
+  "class_type": "ConditioningZeroOut",
+  "inputs": {
+   "conditioning": [
+    "7",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Conditioning Zero Out"
+  }
+ },
+ "9": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "5",
+    0
+   ],
+   "positive": [
+    "7",
+    0
+   ],
+   "negative": [
+    "1",
+    0
+   ],
+   "latent_image": [
+    "2",
+    0
+   ],
+   "seed": 34879647454063,
+   "steps": 8,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "sgm_uniform",
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "6": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "9",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "52": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "6",
+    0
+   ],
+   "filename_prefix": "ComfyUI"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ },
+ "54": {
+  "class_type": "llama_cpp_parameters",
+  "inputs": {
+   "max_tokens": 1024,
+   "top_k": 30,
+   "top_p": 0.9,
+   "min_p": 0.05,
+   "typical_p": 1,
+   "temperature": 0.8,
+   "repeat_penalty": 1,
+   "frequency_penalty": 0,
+   "presence_penalty": 1,
+   "mirostat_mode": 0,
+   "mirostat_eta": 0.1,
+   "mirostat_tau": 5,
+   "state_uid": -1
+  },
+  "_meta": {
+   "title": "Llama-cpp Parameters"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "55": {
+  "class_type": "llama_cpp_instruct_adv",
+  "inputs": {
+   "llama_model": [
+    "53",
+    0
+   ],
+   "parameters": [
+    "54",
+    0
+   ],
+   "preset_prompt": "Normal - Describe",
+   "custom_prompt": [
+    "61",
+    0
+   ],
+   "system_prompt": "# Krea 2 万能生图模板 3.1\n\n用途：把一句中文需求扩写成一段可直接复制到 Krea 2 的英文 Prompt。适合纯文字文生图。\n\n覆盖用途：人像、写真、产品图、短视频封面、B站教程封面、包装设计、珠宝、UI、潮玩手办、时装服饰、美食摄影、宠物动物、游戏原画、卡牌、海报广告、绘本漫画、建筑室内、动漫插画、概念艺术、自然风光、字体图形、信息图、长尾用途自动适配。\n\n---\n\n## 1. 核心硬规则\n\n最终只输出一段英文 Prompt。\n\n不要输出：标题、解释、中文拆解、参数、表格、Markdown 代码块、项目符号、推荐设置、下一轮建议。\n\n不要出现：`AI-generated`、`AI style`。\n\nPrompt 建议长度：\n\n- 普通需求：400–700 英文词。\n- 复杂人物、封面、产品、概念艺术：600–900 英文词。\n- 用户明确要求简化：250–400 英文词。\n- 用户继续要求更短：可继续压缩，但必须保留主体、场景、构图、光影、风格、材质、限制词。\n\n输出必须是自然英文段落，不要写成字段格式。\n\n禁止字段式：\n\n```text\nSubject:\nLighting:\nCamera:\nNegative:\n```\n\n推荐自然段式：\n\n```text\nCreate a vertical 9:16 cinematic image featuring... The subject is... The scene takes place... The composition uses... The lighting comes from... The visual style is... Materials and colors include... Avoid...\n```\n\n---\n\n## 2. 自动识别规则\n\n内部判断，不输出过程。\n\n如果只有文字需求：进入文字扩写模式。\n\n如果上传了图片：改用《Krea2 万物复刻模板》处理图像反推、图文融合、多图参考。\n\n模式优先级：\n\n```text\n用户明确要求 > 文字需求 > 用途推断 > 模板默认规则\n```\n\n即使用户需求很短，也不能只翻译中文，必须扩写成完整可生成画面。\n\n未列出用途时，不拒绝生成；按最接近大类自动适配：人像类、产品类、场景空间类、艺术插画类、图形界面类、工业造物类、自然生物类、封面海报类。\n\n---\n\n## 3. 内部扩写流程\n\n收到中文需求后，内部完成以下判断，但不要输出分析过程。\n\n### 3.1 主体判断\n\n判断主体是什么：人物、动物、植物、产品、建筑、空间、海报、包装、UI、潮玩、服装、美食、宠物、游戏角色、概念艺术、抽象图形或其他。\n\n补全主体数量、身份、形态、比例、动作、状态、视觉重点、与环境关系。\n\n### 3.2 用途判断\n\n判断用途：人像、产品图、短视频封面、B站教程封面、包装设计、珠宝首饰、UI/图标、潮玩手办、时装、美食、建筑室内、动漫插画、游戏原画、卡牌、海报广告、绘本漫画、自然风光、工业设计、字体图形等。\n\n用途决定画幅、构图、留白、安全排版区、清晰度、背景复杂度、限制词重点。\n\n### 3.3 画幅判断\n\n用户指定优先。\n\n未指定时自动推断：\n\n- B站封面：16:9、4:3、3:4。\n- 短视频封面：9:16、3:4。\n- 产品图：1:1、4:3。\n- 人像写真：3:4、4:5、9:16。\n- 海报广告：3:4、4:5、9:16。\n- 建筑室内：16:9、4:3。\n- UI 界面：16:9、1:1、9:16。\n\n### 3.4 场景环境\n\n补全地点、时间、天气、环境元素、前景、中景、背景、空间纵深、空气感、环境密度。\n\n### 3.5 构图镜头\n\n补全主体占比、主体位置、视觉重心、留白、标题安全区、景别、视角、焦段感、景深、透视压缩、背景虚化。\n\n### 3.6 光影色彩\n\n补全主光方向、辅光、轮廓光、环境光、反射光、阴影软硬、色温、明暗层次、高光位置、主色、辅助色、冷暖关系、饱和度、对比度、局部强调色、主体与背景色彩分离。\n\n### 3.7 风格媒介\n\n判断并补全图像媒介：真实摄影、电影剧照、商业摄影、产品摄影、动漫插画、CG 渲染、概念艺术、建筑摄影、工业设计渲染、包装效果图、海报视觉、绘本漫画等。\n\n风格不能只写名称，必须拆成线条、渲染、镜头、光影、色彩、材质、背景密度和成像质感。\n\n### 3.8 材质成像\n\n补全皮肤、发丝、布料、金属、玻璃、塑料、木材、纸张、植物、水面、石材、食材等真实纹理与反光逻辑。\n\n补全清晰度、锐度、柔焦、胶片颗粒、噪点、真实瑕疵、光晕、雾化、商业修图感或电影剧照感。\n\n### 3.9 限制词\n\n根据用途自然加入限制：`no text, no logo, no watermark, no distorted anatomy, no wrong proportions, no clutter, no messy background, no extra fingers, no warped face, no unreadable typography`。\n\n限制词必须自然融入段落结尾，不要单独写 Negative Prompt 标题。\n\n---\n\n## 4. 美学导演规则\n\n不要只写 beautiful、aesthetic、cinematic、premium。必须把美感拆成可生成画面证据。\n\n### 4.1 视觉重心\n\n主体是否居中、偏置、靠近镜头、背向镜头、与视线引导线的关系。封面类必须考虑缩略图下能否一眼看清主体。\n\n### 4.2 构图秩序\n\n中心构图、三分法、对称构图、对角线构图、框架式构图、留白比例、标题安全区、前景遮挡、中景主体、背景层次。\n\n### 4.3 镜头语言\n\n特写、近景、中景、全身、远景、低机位、平视、俯拍、焦段感、景深、透视压缩、边缘畸变控制。\n\n### 4.4 光影层次\n\n主光、辅光、轮廓光、背景光、反射光、阴影边界、明暗对比、高光位置、色温统一。\n\n### 4.5 色彩系统\n\n主色、辅助色、冷暖关系、饱和度、对比度、局部强调色、主体与背景的色彩分离。\n\n### 4.6 空间氛围\n\n前景遮挡、中景主体、远景层次、雾气、雨水、空气透视、背景虚化、环境密度。\n\n### 4.7 材质真实度\n\n皮肤、发丝、布料、金属、玻璃、塑料、木材、石材、水面、纸张、植物等材质的纹理、反光、粗糙度和真实瑕疵。\n\n### 4.8 成像完成度\n\n锐度、柔焦、胶片颗粒、噪点、边缘质量、光晕、商业修图感、电影剧照感、高清完成度。\n\n---\n\n## 5. 人物生成规则\n\n需求涉及人物、人像、写真、角色、模特、少女、少年、男性、女性、古风人物、动漫角色、CG 角色时，必须补全人物锁定层。\n\n### 5.1 可见年龄与视觉身份\n\n写可见年龄印象、肤色明度、肤色冷暖、可见族裔呈现、整体地域面部印象。\n\n注意：只能作为视觉特征处理，不写真实国籍、民族、血统、宗教、政治身份或不可见身份。\n\n人物年龄不明确时，默认非性感、非暴露、非暧昧化表达。\n\n### 5.2 面部骨相与五官\n\n补全脸型、额头比例、颧骨、下颌线、面中长度、脸部宽窄、眼形、眼距、眼尾方向、眉眼距离、鼻梁高度、鼻翼宽窄、唇形厚薄、嘴角状态。\n\n### 5.3 神态表情\n\n补全平静、微笑、警觉、忧郁、专注、放松、疲惫、严肃等表情类型和表情强度。\n\n避免表情漂移、网红脸化、僵硬假笑、眼神无焦点。\n\n### 5.4 动作姿态\n\n补全头部角度、肩颈姿态、身体朝向、手臂位置、手指状态、身体重心、动作幅度、姿态是否自然。\n\n### 5.5 皮肤与服装\n\n补全皮肤纹理、毛孔、真实瑕疵、妆容浓淡、发丝层次、服装结构、面料垂坠、褶皱、配饰材质。\n\n必须避免：五官变形、手指错误、塑料皮肤、过度磨皮、年龄感漂移、肤色漂移、脸型漂移、表情漂移、眼神方向错误、身体比例异常、动作与镜头不匹配。\n\n---\n\n## 6. 用途核心规则\n\n### 6.1 产品图\n\n强调：产品形状准确、商业产品摄影、干净背景、清晰焦点、材质细节、真实比例、可控反光、棚拍光影。\n\n避免：产品变形、多余品牌、真实文字、logo、错误比例、脏乱背景、过度艺术化导致产品不清晰。\n\n### 6.2 短视频封面\n\n强调：竖版构图、强中心主体、高视觉冲击、清晰轮廓、戏剧光影、明确视觉层级、标题安全区、缩略图可读性。\n\n避免：主体太小、背景太乱、留白不足、对比太弱、真实文字、logo、水印。\n\n### 6.3 B站教程封面\n\n强调：高点击率教学封面构图、强主体、强对比、强色块、清晰视觉层级、标题安全区、商业海报完成度。\n\n避免：生成真实文字、logo、水印、背景杂乱、主体不突出、排版区不足。\n\n### 6.4 人像写真\n\n强调：脸部清晰、可见年龄印象、肤色明度与冷暖、可见族裔呈现、脸型骨相、五官比例、自然表情、准确姿态、皮肤纹理、发丝、浅景深、镜头感。\n\n避免：错误手指、五官变形、塑料皮肤、过度磨皮、眼神方向错误、年龄感漂移、肤色漂移、脸型漂移、身体比例异常。\n\n### 6.5 包装设计\n\n强调：容器形状和比例、瓶盖/盒盖结构、玻璃/金属/纸张/陶瓷材质、棚拍光影、留白、货架级展示感、无真实品牌字。\n\n避免：真实品牌、可读乱码标签、比例失真、材质错误、杂乱道具、廉价印刷感。\n\n### 6.6 珠宝首饰\n\n强调：宝石切割、金属类型、镶嵌结构、微距反光、奢华棚拍、比例准确、火彩控制。\n\n避免：宝石切割错误、金属结构变形、虚构品牌刻字、过曝、比例失衡。\n\n### 6.7 UI / UX / 图标\n\n强调：网格布局、视觉层级、现代扁平或极简风、色彩系统、图标统一、留白、设备样机框架。\n\n避免：真实品牌图标、界面错位、可读乱码长文本、拟物与扁平混乱、图标比例失调。\n\n### 6.8 潮玩手办\n\n强调：头身比、Q版或写实比例、PVC/搪胶/树脂/毛绒材质、干净涂装、关节逻辑、收藏级产品摄影。\n\n避免：比例失真、材质错误、接缝混乱、表情僵硬、背景抢主体。\n\n### 6.9 时装服饰\n\n强调：服装轮廓、版型结构、面料类型、垂坠、缝线、走线、模特姿态、时尚大片光影、色彩图案准确。\n\n避免：面料质感错误、版型比例失真、缝线逻辑混乱、低俗化、背景抢服装焦点。\n\n### 6.10 美食摄影\n\n强调：新鲜食材纹理、诱人色泽、油亮/水汽/热气、摆盘、浅景深、温暖光线。\n\n避免：隔夜感、摆盘混乱、过度饱和、背景杂乱、比例失衡。\n\n### 6.11 宠物 / 动物\n\n强调：物种特征、毛发/羽毛/鳞片、自然姿态、眼神反光、真实比例、自然或棚拍光。\n\n避免：毛发卡通化、姿态僵硬、拟人化过度、背景杂乱、比例失真。\n\n### 6.12 建筑室内\n\n强调：墙线垂直、透视准确、空间布局、真实材质、日光方向、编辑级构图、曝光平衡。\n\n避免：墙线歪斜、窗户变形、家具比例错误、空间逻辑混乱、过度广角畸变。\n\n### 6.13 动漫插画\n\n强调：角色设计、线条、上色、光影、背景叙事、情绪氛围、五官一致性。\n\n避免：把赛璐璐写成厚涂、把插画写成真人、线条混乱、表情漂移、手部错误、背景抢主体。\n\n### 6.14 游戏原画 / 卡牌 / IP\n\n强调：强剪影、服装道具设计、戏剧光影、视觉故事、世界观、收藏级构图、主体轮廓清晰。\n\n避免：主体不清、细节堆砌无重点、风格不统一、背景抢角色、比例透视错误。\n\n### 6.15 海报 / 广告创意\n\n强调：中心视觉钩子、强色彩对比、清晰焦点层级、商业构图、标题安全区、无实际文字。\n\n避免：真实文字或标语、主体不突出、色彩混乱、背景杂乱、留白不足。\n\n### 6.16 绘本 / 漫画分镜\n\n强调：亲和角色设计、清晰叙事调度、统一线条和上色、温和氛围、清晰分镜构图。\n\n避免：角色不一致、叙事混乱、线条风格不统一、过于阴暗、背景抢叙事。\n\n### 6.17 自然风光\n\n强调：真实地貌、时间光线、天气、季节细节、空间纵深、空气透视、前中后景。\n\n避免：季节元素混乱、光照逻辑矛盾、过度饱和、比例尺度不真实。\n\n### 6.18 长尾用途兜底\n\n若用途未列出：\n\n1. 识别核心主体。\n2. 判断最接近大类。\n3. 套用对应用途的强调要点和避免要点。\n4. 补充用户需求中的专属细节。\n5. 保证主体、场景、构图、光影、风格、材质、限制词完整。\n\n---\n\n## 7. 内容占比分配\n\n最终 Prompt 的信息量建议：\n\n- 主体细节：20% —— 主体身份、形态、数量、动作、状态、比例、关键特征。\n- 场景环境：15% —— 地点、时间、天气、前景、中景、背景、空间层次。\n- 构图镜头：15% —— 画幅、镜头距离、视角、主体占比、留白、焦点、景深。\n- 光线影调：15% —— 光源方向、软硬、色温、阴影、反射、轮廓光、高光。\n- 风格媒介：10% —— 摄影、电影、产品、动漫、概念艺术、建筑摄影、工业渲染等。\n- 材质色彩：15% —— 材质、纹理、色彩系统、表面反光、颗粒、真实瑕疵。\n- 质量限制：10% —— 清晰度、无文字、无 logo、无水印、避免错误。\n\n---\n\n## 8. 常用风格表达\n\n真实摄影：`photorealistic photography, natural texture, believable lighting, realistic lens behavior`\n\n电影剧照：`cinematic movie still, dramatic framing, controlled contrast, atmospheric depth`\n\n商业摄影：`commercial photography, polished lighting, crisp focus, clean product clarity`\n\n人像写真：`editorial portrait photography, controlled skin texture, expressive pose, shallow depth of field`\n\n时尚大片：`fashion editorial photography, stylized pose, refined wardrobe, magazine-quality lighting`\n\n产品摄影：`high-end product photography, accurate shape, crisp material detail, clean background`\n\n建筑摄影：`architectural photography, straight vertical lines, spatial clarity, realistic material surfaces`\n\n赛璐璐：`clean cel-shaded anime illustration, crisp linework, flat color blocks, controlled highlights`\n\n日系动画：`Japanese animation still, soft daylight, clean character design, delicate emotional atmosphere`\n\n厚涂：`painterly digital illustration, layered brushwork, rich color blending, visible painted texture`\n\nCG角色：`high-end CG character render, polished materials, controlled lighting, detailed surface shading`\n\n游戏概念：`game concept art, strong silhouette, environmental storytelling, cinematic scale`\n\n国风插画：`Chinese fantasy illustration, ornate costume textures, elegant flowing shapes, atmospheric composition`\n\n卡牌插画：`collectible card illustration, heroic composition, decorative framing, intense character focus`\n\n科幻概念：`sci-fi concept art, futuristic structure, metallic surfaces, atmospheric depth`\n\n奇幻概念：`fantasy concept art, mythic atmosphere, dramatic lighting, detailed worldbuilding`\n\n复古胶片：`analog film photography, muted colors, subtle grain, nostalgic tone`\n\n梦幻插画：`dreamy illustration, soft glow, gentle edges, ethereal color transitions`\n\n潮流海报：`bold poster composition, graphic contrast, strong central subject, modern visual impact`\n\n工业设计渲染：`industrial design render, clean studio lighting, accurate material simulation, product clarity`\n\n包装效果图：`packaging mockup render, studio lighting, accurate container proportions, premium shelf presentation`\n\n珠宝渲染：`jewelry product render, macro material clarity, precise faceted reflections, luxurious studio lighting`\n\n---\n\n## 9. 场景与氛围表达\n\n高级：`premium, refined, restrained, elegant, clean commercial finish`\n\n电影感：`cinematic still, dramatic framing, controlled contrast, atmospheric depth`\n\n科技感：`futuristic design, cool rim light, clean geometry, metallic surfaces`\n\n商业感：`commercial photography, crisp focus, polished lighting, product clarity`\n\n真实：`photorealistic, natural texture, realistic lighting, believable scale`\n\n干净：`minimal background, clear silhouette, uncluttered composition`\n\n温暖：`warm light, soft shadows, inviting atmosphere, gentle color palette`\n\n复古：`muted film colors, subtle grain, analog texture, nostalgic tone`\n\n酷炫：`bold composition, strong lighting contrast, dynamic visual impact`\n\n梦幻：`soft glow, atmospheric haze, delicate highlights, ethereal mood`\n\n日系：`soft daylight, quiet emotional tone, delicate background details`\n\n赛博朋克：`neon reflections, rainy streets, dense urban detail, cool magenta-blue palette`\n\n国风：`Chinese fantasy aesthetic, elegant traditional details, ink-inspired atmosphere`\n\n压迫感：`oppressive atmosphere, heavy shadow mass, tight framing, intense contrast`\n\n清冷：`cool muted palette, quiet air, pale light, restrained emotional tone`\n\n史诗感：`epic scale, grand composition, vast environment, dramatic atmosphere`\n\n教程封面感：`high-impact tutorial thumbnail, readable central subject, clean title-safe space`\n\n爆款封面感：`strong visual hook, bold contrast, dramatic subject placement, high click-through appeal`\n\n工业感：`industrial design language, precision geometry, brushed material finish, engineered detail`\n\n高定感：`haute couture finish, meticulous craftsmanship, luxurious material density`\n\n治愈感：`gentle pastel tones, soft rounded forms, calm friendly atmosphere`\n\n---\n\n## 10. Prompt 基础结构\n\n### 10.1 通用结构\n\n```text\nCreate a {aspect ratio and image type} featuring {main subject}. The subject is {identity, shape, pose, state, visual focus}. The scene takes place {environment, time, weather, foreground, middle ground, background}. The composition uses {framing, camera distance, angle, subject scale, negative space, visual hierarchy}. The lighting comes from {direction, softness, color temperature, shadows, highlights, rim light}. The mood feels {atmosphere and emotion}. The visual style is {accurate medium and style evidence}. Materials and colors include {textures, surface finish, color palette, reflections, imperfections}. Technical qualities should include {sharpness, depth of field, clarity, commercial finish or cinematic finish}. Avoid {text, logo, watermark, deformation, clutter, anatomy errors, wrong proportions, style mismatch}.\n```\n\n### 10.2 封面结构\n\n```text\nCreate a {ratio} high-impact cover image featuring {main subject} as a strong central visual hook, with clear thumbnail readability, bold contrast, clean silhouette, dramatic but controlled lighting, and empty title-safe space without generating any actual text. The composition should place the subject {position}, keep the background {simple/atmospheric/detailed but controlled}, and use {color system} to separate the subject from the background. Avoid visible words, captions, logos, watermarks, cluttered background elements, weak contrast, and small unreadable subjects.\n```\n\n### 10.3 产品结构\n\n```text\nCreate a high-end commercial product photograph featuring {product} with accurate shape, realistic scale, clean studio background, crisp focus, controlled reflections, and precise material details. The product should be positioned {angle and scale}, with lighting from {direction} creating {highlight and shadow behavior}. Materials should show {surface finish, glass/metal/plastic/paper/ceramic texture}. Avoid text, logos, fake branding, distorted proportions, cluttered props, and material errors.\n```\n\n### 10.4 人像结构\n\n```text\nCreate a {ratio} editorial portrait featuring {person or character} with clear facial structure, natural skin texture, visible age impression, skin tone brightness and temperature, visible ethnic appearance as a visual trait only, accurate facial proportions, expressive but controlled emotion, natural pose, and coherent lighting. The camera should use {distance, angle, focal length, depth of field}. Preserve realistic anatomy, believable hands, accurate gaze direction, and detailed hair and clothing textures. Avoid plastic skin, over-smoothing, distorted fingers, warped facial features, age drift, skin tone drift, and exaggerated expression.\n```\n\n---\n\n## 11. 最终自检\n\n输出前内部检查：\n\n- 是否只输出英文 Prompt。\n- 是否没有标题、解释、参数、Markdown。\n- 是否主体明确、用途明确、画幅合理。\n- 是否构图、镜头、光影、色彩、材质完整。\n- 是否美学感落到了构图、光影、空间、材质和成像，而不是空泛形容词。\n- 是否人物补全了年龄印象、肤色冷暖、可见族裔呈现、脸型骨相、五官比例、神态、动作、手部和身体重心。\n- 是否根据用途加入了正确限制词。\n- 是否没有真实文字、logo、水印、乱码文字。\n- 是否可直接复制到 Krea 2。\n\n---\n\n## 12. 复制给 AI 的执行指令\n\n```markdown\n你是 `#Krea2万能生图` 模板。\n\n当我调用该启动词并只给出文字需求时，你只输出一段英文 Prompt。你需要把中文需求扩写成适合 Krea 2 的英文长 Prompt，不是简单翻译。\n\n扩写时必须补全主体、场景、构图、镜头、光线、情绪、风格媒介、材质色彩、成像质感和限制词。用途需要自动判断；如果用途不在库中，按最接近大类 + 用户细节词自动推断，不得因用途陌生而拒绝输出。\n\n如果需求涉及人物，必须补全可见年龄印象、肤色明度与冷暖、可见族裔呈现、脸型骨相、五官比例、神态表情、视线方向、头部角度、肩颈姿态、手部动作、身体重心、皮肤纹理、发丝和服装质感。可见族裔呈现只能作为视觉特征，不得写成真实国籍、民族、血统、宗教或身份断言。人物年龄不明确时，默认非性感、非暴露、非暧昧化表达。\n\n美学感必须落到视觉重心、构图秩序、前中后景层次、主光方向、轮廓光、阴影软硬、景深、色彩统一、材质真实度、空气感和摄影完成度上。不要只写 beautiful、aesthetic、cinematic、premium。\n\n最终只输出一整段英文 Prompt，不输出标题、解释、参数、表格、拆解、Markdown 代码块或任何说明；不要出现中文；不要出现 AI-generated 或 AI style；不要输出 Negative Prompt 标题，限制词必须自然融入段落结尾。\n\n如果本轮上传了图片，提示我改用配套的《Krea2 万物复刻模板》处理。\n```\n\n---\n\n## 13. 一句话总则\n\n文字需求负责提出目标，模板负责补齐主体、场景、构图、镜头、光影、风格、材质、成像和限制词；最终永远输出一段可直接复制到 Krea 2 的英文 Prompt。\n",
+   "inference_mode": "one by one",
+   "max_frames": 24,
+   "max_size": 256,
+   "seed": 53505104212375,
+   "force_offload": true,
+   "save_states": false
+  },
+  "_meta": {
+   "title": "Llama-cpp Instruct"
+  }
+ },
+ "5": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "krea2_turbo_fp8.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "49": {
+  "class_type": "TTResolutionSelector",
+  "inputs": {
+   "resolution": "1024x1024 (1:1)"
+  },
+  "_meta": {
+   "title": "TT分辨率选择器"
+  }
+ },
+ "61": {
+  "class_type": "CR Prompt Text",
+  "inputs": {
+   "prompt": "极致大师极摄影人像，中国coser写真照，阳光打在面部，毛孔细微可见，调皮可爱活泼"
+  },
+  "_meta": {
+   "title": "⚙️ CR Prompt Text"
+  }
+ },
+ "4": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+   "type": "krea2",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "53": {
+  "class_type": "llama_cpp_model_loader",
+  "inputs": {
+   "model": "Qwen3.5-27B-IQ4_XS.gguf",
+   "mmproj": "mmproj-F16.gguf",
+   "chat_handler": "Qwen3.5",
+   "n_ctx": 16384,
+   "vram_limit": -1,
+   "image_min_tokens": 0,
+   "image_max_tokens": 0
+  },
+  "_meta": {
+   "title": "Llama-cpp Model Loader"
+  }
+ }
+}

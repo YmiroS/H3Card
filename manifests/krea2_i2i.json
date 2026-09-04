@@ -1,0 +1,123 @@
+{
+ "id": "krea2_i2i",
+ "name": "图生图",
+ "file": "全自动krea2万物迁移_万物复刻",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\7-kear2全系列\\全自动krea2万物迁移_万物复刻.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "gen",
+ "card": "image",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/krea2_i2i.api.json",
+ "output": {
+  "node": "52"
+ },
+ "note": null,
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "input_image",
+   "label": "参考图片",
+   "type": "image",
+   "target": {
+    "node": "63",
+    "input": "image"
+   }
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "",
+   "target": {
+    "node": "61",
+    "input": "prompt"
+   }
+  },
+  {
+   "key": "width",
+   "label": "宽",
+   "type": "number",
+   "default": 1024,
+   "target": {
+    "node": "2",
+    "input": "width",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "height",
+   "label": "高",
+   "type": "number",
+   "default": 1024,
+   "target": {
+    "node": "2",
+    "input": "height",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 8,
+   "hint": "推荐 8：模型带加速 LoRA，8 步就到位了。往下调会花，往上调基本白等",
+   "advanced": true,
+   "target": {
+    "node": "9",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 593065671907525,
+   "target": {
+    "node": "9",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 879568424201984,
+   "target": {
+    "node": "55",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615,
+   "mirror": true
+  }
+ ],
+ "warnings": [
+  "本地大模型：#53.model = Qwen3.5-27B-UD-IQ3_XXS.gguf",
+  "本地大模型：#53.mmproj = mmproj-F16.gguf"
+ ]
+}

@@ -2,7 +2,7 @@
  "id": "minimax_h3_i2v",
  "name": "H3 图生视频",
  "file": "@MinimaxH3：图生视频 (4步加速版)",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@MinimaxH3：图生视频 (4步加速版).json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@MinimaxH3：图生视频 (4步加速版).json",
  "group": "视频",
  "outputType": "video",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 1,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/minimax_h3_i2v.api.json",
  "output": {
   "node": "92"
