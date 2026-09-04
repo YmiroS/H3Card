@@ -88,6 +88,29 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertIsNone(self.store.acquire(self.worker_id))
         self.assertEqual(self.store.list_workers()[0]["state"], "disabled")
 
+    def test_terminal_job_heartbeat_cannot_make_worker_busy_again(self):
+        self.store.enqueue("job-1", {"graph": {}}, [])
+        assignment = self.store.acquire(self.worker_id)
+        self.assertTrue(self.store.mark_running(
+            "job-1", self.worker_id, assignment["lease_token"]
+        ))
+        self.assertTrue(self.store.finish(
+            "job-1", self.worker_id, assignment["lease_token"], "error"
+        ))
+
+        heartbeat = self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=True, local_busy=False,
+            current_job_id="job-1",
+        )
+
+        self.assertEqual(heartbeat["commands"], [
+            {"type": "abort_job", "job_id": "job-1"}
+        ])
+        worker = self.store.list_workers()[0]
+        self.assertEqual(worker["state"], "idle")
+        self.assertIsNone(worker["current_job_id"])
+        self.assertEqual(self.store.dispatch_status("job-1", self.worker_id), "error")
+
 
 class WorkerInputPathTest(unittest.TestCase):
     def setUp(self):

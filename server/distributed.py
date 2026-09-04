@@ -112,7 +112,7 @@ class DistributedStore:
         return cur.rowcount > 0
 
     def heartbeat(self, worker_id, *, capabilities=None, comfy_online=False,
-                  busy=False, current_job_id=None):
+                  busy=False, local_busy=None, current_job_id=None):
         now = time.time()
         with self.lock, self.db:
             self._requeue_expired_locked(now)
@@ -121,17 +121,38 @@ class DistributedStore:
             ).fetchone()
             if not row:
                 return None
+
+            commands = []
+            lease_ttl_seconds = None
+            active_job_id = None
             if current_job_id:
-                self.db.execute(
-                    """UPDATE dispatch_jobs SET lease_expires_at = ?, updated_at = ?
-                       WHERE job_id = ? AND worker_id = ? AND status IN ('assigned','running','cancel_requested')""",
-                    (now + self.lease_seconds, now, current_job_id, worker_id),
-                )
+                job = self.db.execute(
+                    """SELECT status, cancel_requested FROM dispatch_jobs
+                       WHERE job_id = ? AND worker_id = ?""",
+                    (current_job_id, worker_id),
+                ).fetchone()
+                if job and job["status"] in LIVE_DISPATCH:
+                    active_job_id = current_job_id
+                    lease_ttl_seconds = self.lease_seconds
+                    self.db.execute(
+                        """UPDATE dispatch_jobs SET lease_expires_at = ?, updated_at = ?
+                           WHERE job_id = ? AND worker_id = ?""",
+                        (now + self.lease_seconds, now, current_job_id, worker_id),
+                    )
+                    if job["cancel_requested"]:
+                        commands.append({"type": "cancel_job", "job_id": current_job_id})
+                else:
+                    # Worker 仍在报告一个已经结束或失效的租约。不能让这条迟到的
+                    # 心跳把机器重新写成 busy，更不能续租后重复执行。
+                    commands.append({"type": "abort_job", "job_id": current_job_id})
+
+            reported_local_busy = bool(busy) if local_busy is None else bool(local_busy)
+            effective_busy = reported_local_busy or active_job_id is not None
             fields = [
                 "last_seen = ?", "comfy_online = ?", "busy = ?",
                 "current_job_id = ?", "updated_at = ?",
             ]
-            values = [now, int(bool(comfy_online)), int(bool(busy)), current_job_id, now]
+            values = [now, int(bool(comfy_online)), int(effective_busy), active_job_id, now]
             if capabilities is not None:
                 fields.append("capabilities_json = ?")
                 values.append(_json(capabilities))
@@ -139,18 +160,6 @@ class DistributedStore:
             self.db.execute(
                 f"UPDATE workers SET {', '.join(fields)} WHERE id = ?", values
             )
-            commands = []
-            lease_ttl_seconds = None
-            if current_job_id:
-                job = self.db.execute(
-                    """SELECT cancel_requested, lease_expires_at FROM dispatch_jobs
-                       WHERE job_id = ? AND worker_id = ?""",
-                    (current_job_id, worker_id),
-                ).fetchone()
-                if job and job["cancel_requested"]:
-                    commands.append({"type": "cancel_job", "job_id": current_job_id})
-                if job and job["lease_expires_at"]:
-                    lease_ttl_seconds = max(job["lease_expires_at"] - now, 0.0)
             return {
                 "commands": commands,
                 "server_time": now,
@@ -293,6 +302,16 @@ class DistributedStore:
                 (now, worker_id, job_id),
             )
         return cur.rowcount == 1
+
+    def dispatch_status(self, job_id, worker_id=None):
+        query = "SELECT status FROM dispatch_jobs WHERE job_id = ?"
+        values = [job_id]
+        if worker_id is not None:
+            query += " AND worker_id = ?"
+            values.append(worker_id)
+        with self.lock:
+            row = self.db.execute(query, values).fetchone()
+        return row["status"] if row else None
 
     def request_cancel(self, job_id):
         now = time.time()
