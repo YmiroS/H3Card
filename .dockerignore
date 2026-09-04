@@ -1,0 +1,7 @@
+.git/
+data/
+llm.json
+worker/config.json
+worker/worker-state.json
+__pycache__/
+*.py[cod]
