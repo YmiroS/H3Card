@@ -28,7 +28,7 @@ const el = {
   lasso: $("#lasso"), selbar: $("#selbar"), dock: $("#dock"),
   empty: $("#empty"), panel: $("#panel"), hist: $("#hist"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
-  jobsbtn: $("#jobsbtn"), jobs: $("#jobs"),
+  jobsbtn: $("#jobsbtn"), jobs: $("#jobs"), controllerLink: $("#controller-link"),
   view: $("#view"), vbox: $("#view .vbox"), respop: $("#respop"),
   minimapBtn: $("#minimap-btn"), wiresToggle: $("#wires-toggle"), zoomMenu: $("#zoom-menu"),
   minimap: $("#minimap"), minimapCanvas: $("#minimap-canvas"), minimapViewport: $("#minimap-viewport"),
@@ -845,6 +845,7 @@ function hoverBrief(node, capGetter, nameGetter) {
   // 一进来就打开示例（locked 那个），新用户不用先面对一张空画布
   const demo = projects.find(p => p.locked);
   if (demo) await openProject(demo.id);
+  await health();
   setInterval(health, 5000);
   pollJobs();
   setInterval(pollJobs, 700);
@@ -854,7 +855,11 @@ async function health() {
   try {
     const h = await api("/api/health");
     el.dot.classList.toggle("on", !!h.comfy_online);
-  } catch (e) { el.dot.classList.remove("on"); }
+    el.controllerLink.style.display = h.mode === "controller" ? "" : "none";
+  } catch (e) {
+    el.dot.classList.remove("on");
+    el.controllerLink.style.display = "none";
+  }
 }
 
 /* ================= 项目栏 ================= */

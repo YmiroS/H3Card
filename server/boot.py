@@ -9,23 +9,28 @@
 退出码 0 = 继续开抽卡系统（ComfyUI 起不来也照样开，它后起来网页会自己连上）；
 退出码 3 = 抽卡系统已经在跑了，别再开一个（8199 会撞端口）。
 """
+import os
 import socket
 import subprocess
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parent.parent      # chouka/
 PACK = ROOT.parent                                 # 整合包根目录
 COMFY_BAT = PACK / "1_1点击启动comfyui.bat"        # 整合包原来的启动脚本，不改它
-PORT = 8188
-CHOUKA_PORT = 8199
+COMFY_URL = os.environ.get("CHOUKA_COMFY_URL", "http://127.0.0.1:8188")
+COMFY_TARGET = urlsplit(COMFY_URL)
+COMFY_HOST = COMFY_TARGET.hostname or "127.0.0.1"
+COMFY_PORT = COMFY_TARGET.port or (443 if COMFY_TARGET.scheme == "https" else 80)
+CHOUKA_PORT = int(os.environ.get("CHOUKA_PORT", "8199"))
 WAIT_SEC = 300                                     # 首次载模型/装节点可能要几分钟
 
 
-def up(port=PORT):
+def up(host, port):
     try:
-        socket.create_connection(("127.0.0.1", port), 1).close()
+        socket.create_connection((host, port), 1).close()
         return True
     except OSError:
         return False
@@ -37,14 +42,14 @@ def main():
     except Exception:
         pass
 
-    if up(CHOUKA_PORT):
+    if up("127.0.0.1", CHOUKA_PORT):
         print(f"[抽卡系统] 已经在跑了 -> http://127.0.0.1:{CHOUKA_PORT}")
         print("           直接用浏览器打开上面这个地址就行，不用再开一个。")
         print("           要重启（比如刚加了新能力）先关掉那个黑窗口。")
         sys.exit(3)
 
-    if up():
-        print(f"[抽卡系统] ComfyUI 已在运行 (127.0.0.1:{PORT})")
+    if up(COMFY_HOST, COMFY_PORT):
+        print(f"[抽卡系统] ComfyUI 已在运行 ({COMFY_HOST}:{COMFY_PORT})")
         return
     if not COMFY_BAT.exists():
         print(f"[抽卡系统] 找不到 {COMFY_BAT.name}，请先自己把 ComfyUI 开起来")
@@ -56,7 +61,7 @@ def main():
 
     deadline = time.time() + WAIT_SEC
     while time.time() < deadline:
-        if up():
+        if up(COMFY_HOST, COMFY_PORT):
             print("\n[抽卡系统] ComfyUI 就绪")
             return
         print(".", end="", flush=True)
