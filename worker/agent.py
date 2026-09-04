@@ -71,6 +71,7 @@ class WorkerAgent:
         return headers
 
     async def _json_request(self, method, url, *, expected=(200,), **kwargs):
+        kwargs.setdefault("timeout", aiohttp.ClientTimeout(total=30, sock_connect=15))
         async with self.session.request(method, url, **kwargs) as response:
             text = await response.text()
             if response.status not in expected:
@@ -143,6 +144,7 @@ class WorkerAgent:
                 body = {
                     "comfy_online": self.comfy_online,
                     "busy": bool(self.current) or self.local_busy,
+                    "local_busy": self.local_busy,
                     "current_job_id": self.current["job_id"] if self.current else None,
                 }
                 if include_caps and self.capabilities:
@@ -156,7 +158,7 @@ class WorkerAgent:
                         time.monotonic() + float(reply["lease_ttl_seconds"])
                     )
                 for command in (reply or {}).get("commands", []):
-                    if command.get("type") == "cancel_job":
+                    if command.get("type") in ("cancel_job", "abort_job"):
                         await self.cancel_current(command.get("job_id"))
             except asyncio.CancelledError:
                 raise
@@ -175,19 +177,26 @@ class WorkerAgent:
     async def cancel_current(self, job_id):
         if not self.current or self.current["job_id"] != job_id:
             return
-        print(f"[Worker] 正在取消任务 {job_id}")
-        try:
-            await self._json_request(
-                "POST", self.comfy + f"/api/jobs/{job_id}/cancel", json={}
-            )
-        except Exception:
+        already_requested = bool(self.current.get("cancel_requested"))
+        self.current["cancel_requested"] = True
+        if not already_requested:
+            print(f"[Worker] 正在取消任务 {job_id}", flush=True)
             try:
                 await self._json_request(
-                    "POST", self.comfy + "/interrupt", json={"prompt_id": job_id}
+                    "POST", self.comfy + f"/api/jobs/{job_id}/cancel", json={}
                 )
-            except Exception as exc:
-                print(f"[Worker] 取消 ComfyUI 任务失败：{exc}")
-        self.current["cancel_requested"] = True
+            except Exception:
+                try:
+                    await self._json_request(
+                        "POST", self.comfy + "/interrupt", json={"prompt_id": job_id}
+                    )
+                except Exception as exc:
+                    print(f"[Worker] 取消 ComfyUI 任务失败：{exc}", flush=True)
+        # ComfyUI 已经报错或完成时不会再发事件；主动关闭连接才能让
+        # execute_comfy 退出，随后释放 self.current。
+        ws = self.current.get("_ws")
+        if ws is not None and not ws.closed:
+            await ws.close()
 
     async def acquire(self):
         if not self.comfy_online or self.local_busy or self.current:
@@ -242,6 +251,7 @@ class WorkerAgent:
         last_progress = 0.0
         async with self.session.ws_connect(
                 f"{self.comfy_ws}?clientId={client_id}", heartbeat=20) as ws:
+            assignment["_ws"] = ws
             result = await self._json_request(
                 "POST", self.comfy + "/prompt",
                 json={
@@ -329,6 +339,7 @@ class WorkerAgent:
                         self.server + f"/agent/v1/jobs/{assignment['job_id']}/artifact",
                         headers=self._agent_headers(assignment["lease_token"]),
                         params={"kind": kind}, data=form, expected=(201,),
+                        timeout=aiohttp.ClientTimeout(total=None, sock_connect=15),
                     )
                 outputs.append(output)
         return outputs
