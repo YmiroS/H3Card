@@ -1,3 +1,4 @@
+import asyncio
 import sys
 import tempfile
 import time
@@ -147,6 +148,59 @@ class WorkerInputPathTest(unittest.TestCase):
         self.assertEqual(graph["45"]["inputs"]["ref_video"], ["78", 0])
         self.assertEqual(graph["45"]["inputs"]["other_audio"], ["79", 2])
         self.assertNotIn("ref_audio", graph["45"]["inputs"])
+
+
+class WorkerExecutionEventTest(unittest.IsolatedAsyncioTestCase):
+    async def test_history_success_finishes_silent_websocket_without_heartbeat(self):
+        class FakeWebSocket:
+            closed = False
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def receive(self, timeout=None):
+                self.timeout = timeout
+                raise asyncio.TimeoutError
+
+        class FakeSession:
+            def __init__(self):
+                self.kwargs = None
+
+            def ws_connect(self, _url, **kwargs):
+                self.kwargs = kwargs
+                return FakeWebSocket()
+
+        agent = WorkerAgent.__new__(WorkerAgent)
+        agent.server = "http://controller"
+        agent.comfy = "http://comfy"
+        agent.comfy_ws = "ws://comfy/ws"
+        agent.session = FakeSession()
+        agent.state = {"worker_id": "worker", "worker_token": "token"}
+
+        async def json_request(_method, url, **_kwargs):
+            if url.endswith("/prompt"):
+                return {"prompt_id": "job-1"}
+            if url.endswith("/history/job-1"):
+                return {"job-1": {
+                    "status": {"status_str": "success", "completed": True}
+                }}
+            return {}
+
+        async def report_event(_assignment, _event):
+            return None
+
+        agent._json_request = json_request
+        agent.report_event = report_event
+        await agent.execute_comfy({
+            "job_id": "job-1",
+            "lease_token": "lease",
+            "payload": {"graph": {}},
+        })
+
+        self.assertNotIn("heartbeat", agent.session.kwargs)
 
 
 if __name__ == "__main__":

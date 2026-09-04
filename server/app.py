@@ -84,15 +84,24 @@ AUD_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
 # =====================================================================
 # 能力清单
 # =====================================================================
+ZH_NODES = {}              # class_type -> 扫描器生成的汉化词条
+STEP_ZH = {}               # class_type -> 随服务发布的卡片底部步骤名
+
+
 def load_caps():
-    # 汉化词条（扫描器生成的缓存）：只用来把「现在在跑哪个节点」翻成人话，缺了不影响跑
+    # 卡片底部的过程进度不能依赖 data/ 下的运行时缓存；控制层单独部署时也要有中文。
+    bundled = ROOT / "manifests" / "_steps.json"
+    STEP_ZH.clear()
+    STEP_ZH.update(json.loads(bundled.read_text(encoding="utf-8")))
+
+    # 扫描器生成的完整汉化缓存仍可补充新节点，缺失不影响服务启动。
     zh = ROOT / "data" / "zh_nodes.json"
     ZH_NODES.clear()
     if zh.exists():
         try:
             ZH_NODES.update(json.loads(zh.read_text(encoding="utf-8")))
         except Exception as e:
-            print(f"[抽卡系统] 读不了 {zh.name}（步骤名会显示英文类名）：{e}")
+            print(f"[抽卡系统] 读不了 {zh.name}：{e}")
     CAPS.clear()
     for f in (ROOT / "manifests").glob("*.json"):
         if f.name.startswith("_"):
@@ -130,21 +139,22 @@ def mode_ok(md):
     return graph_ok(md["id"])
 
 
-ZH_NODES = {}              # class_type -> 汉化词条，只用它的 titles[0]
-
-
 def step_labels(graph):
-    """节点 id -> 「现在在干什么」。
-
-    取节点类型的中文名（"K采样器""图像缩放"），一看就懂。工作流里的节点标题
-    反而经常是 "1"、"Video Combine 🎥🅥🅗🅢" 这种，没法当步骤名，只在没有
-    汉化词条时才退回去用。
-    """
+    """节点 id -> 卡片底部显示的中文过程名称。"""
     labels = {}
     for nid, nd in graph.items():
         ct = nd.get("class_type") or ""
-        zh = (ZH_NODES.get(ct) or {}).get("titles") or []
-        labels[nid] = zh[0] if zh else ((nd.get("_meta") or {}).get("title") or ct)
+        scanned = (ZH_NODES.get(ct) or {}).get("titles") or []
+        candidates = [
+            STEP_ZH.get(ct),
+            scanned[0] if scanned else None,
+            (nd.get("_meta") or {}).get("title"),
+        ]
+        labels[nid] = next(
+            (label for label in candidates
+             if label and re.search(r"[\u3400-\u9fff]", label)),
+            "处理中",
+        )
     return labels
 
 
@@ -434,14 +444,14 @@ async def handle_event(session, ev, remote=False):
     # progress_state 这类收尾事件，放进来会把状态改回 done —— 一次失败在界面上显示成
     # "生成成功"，卡片还挂着上一次的产物，比直接报错更难查。
     if job and job["status"] in ("error", "canceled", "done") and t in (
-            "execution_start", "executing", "progress_state"):
+            "execution_start", "executing", "execution_success", "progress_state"):
         return
 
     if t == "execution_start" and job:
         job.update(status="running", started=time.time())
         save_jobs()
-    elif t == "executing" and job:
-        if d.get("node") is None:
+    elif t in ("executing", "execution_success") and job:
+        if t == "execution_success" or d.get("node") is None:
             # 远端 Worker 还要归集、上传产物；由 complete 接口宣布最终完成。
             if remote:
                 job.update(progress=max(job.get("progress") or 0.0, 0.99), step="正在归集产物")
