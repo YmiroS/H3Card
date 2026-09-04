@@ -13,6 +13,28 @@ import app as controller_app
 from distributed import DistributedStore
 
 
+class CardProgressLabelTest(unittest.TestCase):
+    def test_bundled_step_names_are_chinese(self):
+        controller_app.load_caps()
+        graph = {
+            "1": {
+                "class_type": "SamplerCustomAdvanced",
+                "_meta": {"title": "SamplerCustomAdvanced"},
+            },
+            "2": {
+                "class_type": "MiniMaxH3ReferenceToVideo",
+                "_meta": {"title": "MiniMax H3 Reference to Video"},
+            },
+            "3": {"class_type": "UnknownEnglishNode"},
+        }
+
+        self.assertEqual(controller_app.step_labels(graph), {
+            "1": "高级自定义采样器",
+            "2": "MiniMax H3参考生成视频",
+            "3": "处理中",
+        })
+
+
 class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -91,6 +113,15 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(response.status, 200)
         self.assertEqual(controller_app.JOBS["job-1"]["status"], "running")
+
+        response = await self.client.post(
+            "/agent/v1/jobs/job-1/event", headers=lease_headers,
+            json={"type": "execution_success", "data": {"prompt_id": "job-1"}},
+        )
+        self.assertEqual(response.status, 200)
+        self.assertEqual(controller_app.JOBS["job-1"]["status"], "running")
+        self.assertEqual(controller_app.JOBS["job-1"]["progress"], 0.99)
+        self.assertEqual(controller_app.JOBS["job-1"]["step"], "正在归集产物")
 
         response = await self.client.post(
             "/agent/v1/jobs/job-1/complete", headers=lease_headers,

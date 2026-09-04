@@ -107,7 +107,10 @@ class WorkerAgent:
 
     async def local_status(self):
         try:
-            queue = await self._json_request("GET", self.comfy + "/queue")
+            queue = await self._json_request(
+                "GET", self.comfy + "/queue",
+                timeout=aiohttp.ClientTimeout(total=5, sock_connect=3),
+            )
         except Exception:
             self.comfy_online = False
             self.local_busy = False
@@ -140,7 +143,10 @@ class WorkerAgent:
         while not self.stop_event.is_set():
             try:
                 await self.local_status()
-                include_caps = time.time() - self.last_capability_scan >= capability_interval
+                include_caps = (
+                    not self.current
+                    and time.time() - self.last_capability_scan >= capability_interval
+                )
                 if include_caps:
                     await self.scan_capabilities()
                 body = {
@@ -312,6 +318,24 @@ class WorkerAgent:
             json=event,
         )
 
+    async def history_finished(self, job_id):
+        history = await self._json_request(
+            "GET", self.comfy + f"/history/{job_id}",
+            timeout=aiohttp.ClientTimeout(total=5, sock_connect=3),
+        )
+        entry = history.get(job_id) or {}
+        status = entry.get("status") or {}
+        if not status.get("completed"):
+            return False
+        if status.get("status_str") == "success":
+            return True
+        for event_type, data in reversed(status.get("messages") or []):
+            if event_type == "execution_interrupted":
+                raise JobFailed("任务已取消", canceled=True)
+            if event_type == "execution_error":
+                raise JobFailed(data.get("exception_message") or "ComfyUI 执行失败")
+        raise JobFailed("ComfyUI 执行失败")
+
     async def execute_comfy(self, assignment):
         job_id = assignment["job_id"]
         lease = assignment["lease_token"]
@@ -322,7 +346,7 @@ class WorkerAgent:
         )
         last_progress = 0.0
         async with self.session.ws_connect(
-                f"{self.comfy_ws}?clientId={client_id}", heartbeat=20) as ws:
+                f"{self.comfy_ws}?clientId={client_id}") as ws:
             assignment["_ws"] = ws
             result = await self._json_request(
                 "POST", self.comfy + "/prompt",
@@ -334,8 +358,22 @@ class WorkerAgent:
             )
             if result.get("prompt_id") != job_id:
                 raise JobFailed("ComfyUI 返回了不同的 prompt_id")
+            next_history_check = time.monotonic() + 5
             while True:
-                msg = await ws.receive()
+                timeout = max(next_history_check - time.monotonic(), 0.1)
+                try:
+                    msg = await ws.receive(timeout=timeout)
+                except asyncio.TimeoutError:
+                    msg = None
+                if time.monotonic() >= next_history_check:
+                    next_history_check = time.monotonic() + 5
+                    try:
+                        if await self.history_finished(job_id):
+                            return
+                    except (aiohttp.ClientError, asyncio.TimeoutError, AgentError):
+                        pass
+                if msg is None:
+                    continue
                 if msg.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
                     raise JobFailed("ComfyUI WebSocket 已断开")
                 if msg.type != aiohttp.WSMsgType.TEXT:
@@ -358,7 +396,8 @@ class WorkerAgent:
                     raise JobFailed(message)
                 if event_type == "execution_interrupted":
                     raise JobFailed("任务已取消", canceled=True)
-                if event_type == "executing" and data.get("node") is None:
+                if event_type == "execution_success" or (
+                        event_type == "executing" and data.get("node") is None):
                     return
 
     async def collect_outputs(self, assignment):
