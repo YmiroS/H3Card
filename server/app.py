@@ -898,6 +898,7 @@ async def api_agent_heartbeat(request):
         capabilities=body.get("capabilities") if isinstance(body.get("capabilities"), dict) else None,
         comfy_online=bool(body.get("comfy_online")),
         busy=bool(body.get("busy")),
+        local_busy=body.get("local_busy") if "local_busy" in body else None,
         current_job_id=body.get("current_job_id"),
     )
     if result is None:
@@ -929,15 +930,15 @@ async def api_agent_start(request):
         raise web.HTTPConflict(reason="任务无法进入运行状态")
     job = JOBS.get(pid)
     if job:
-        job.update(status="running", started=job.get("started") or time.time(),
-                   worker_id=worker_id)
+        job.update(status="running", progress=0.0, step="", error=None,
+                   started=time.time(), ended=None, worker_id=worker_id)
         save_jobs()
     return web.json_response({"ok": True})
 
 
 async def api_agent_event(request):
     worker_id = require_agent(request)
-    pid, _lease_token = require_lease(request, worker_id)
+    pid, lease_token = require_lease(request, worker_id)
     event = await request.json()
     if not isinstance(event, dict):
         raise web.HTTPBadRequest(reason="事件必须是 JSON 对象")
@@ -945,6 +946,30 @@ async def api_agent_event(request):
     if not isinstance(data, dict):
         raise web.HTTPBadRequest(reason="事件 data 必须是 JSON 对象")
     data["prompt_id"] = pid
+    event_type = event.get("type")
+
+    # 错误事件本身就是可信终态。必须在同一次请求里结束租约并释放 Worker，
+    # 不能依赖 Agent 再补一次 /failed；补报一旦断线，心跳就会把失败任务续租成 running。
+    if event_type in ("execution_error", "execution_interrupted"):
+        terminal = "error" if event_type == "execution_error" else "canceled"
+        store = distributed_store(request.app)
+        if not store.finish(pid, worker_id, lease_token, terminal):
+            if store.dispatch_status(pid, worker_id) != terminal:
+                raise web.HTTPConflict(reason="任务无法结束")
+        job = JOBS.get(pid)
+        if job:
+            if terminal == "error":
+                error = (f"#{data.get('node_id')} {data.get('node_type')}: "
+                         f"{data.get('exception_message') or 'ComfyUI 执行失败'}")[:12000]
+            else:
+                error = None
+            job.update(status=terminal, step="", ended=time.time(),
+                       worker_id=worker_id, error=error)
+            STEPS.pop(pid, None)
+            WEIGHTS.pop(pid, None)
+            save_jobs()
+        return web.json_response({"ok": True, "terminal": terminal})
+
     await handle_event(None, event, remote=True)
     return web.json_response({"ok": True})
 
@@ -999,15 +1024,21 @@ async def api_agent_complete(request):
 
 async def api_agent_failed(request):
     worker_id = require_agent(request)
-    pid, lease_token = require_lease(request, worker_id)
+    pid = request.match_info["pid"]
+    lease_token = request.headers.get("X-Lease-Token", "")
     body = await request.json()
     canceled = bool(body.get("canceled"))
     dispatch_status = "canceled" if canceled else "error"
-    if not distributed_store(request.app).finish(
-            pid, worker_id, lease_token, dispatch_status):
-        raise web.HTTPConflict(reason="任务无法结束")
+    store = distributed_store(request.app)
+    current_status = store.dispatch_status(pid, worker_id)
+    already_terminal = current_status == dispatch_status
+    if not already_terminal:
+        if not store.validate_lease(pid, worker_id, lease_token):
+            raise web.HTTPConflict(reason="任务租约已失效")
+        if not store.finish(pid, worker_id, lease_token, dispatch_status):
+            raise web.HTTPConflict(reason="任务无法结束")
     job = JOBS.get(pid)
-    if job:
+    if job and not already_terminal:
         job.update(status="canceled" if canceled else "error", step="", ended=time.time(),
                    worker_id=worker_id, error=None if canceled else str(body.get("error") or "Worker 执行失败")[:2000])
         STEPS.pop(pid, None)
