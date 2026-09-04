@@ -2,7 +2,7 @@
  "id": "flux2_klein_storyboard9",
  "name": "多宫格故事分镜",
  "file": "九宫格Qwen3.5-Flux2-Kelin一键故事分镜",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\3-Flux2-klein全系列\\九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\3-Flux2-klein全系列\\九宫格Qwen3.5-Flux2-Kelin一键故事分镜.json",
  "group": "图片",
  "outputType": "image",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 1,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/flux2_klein_storyboard9.api.json",
  "output": {
   "node": "9"

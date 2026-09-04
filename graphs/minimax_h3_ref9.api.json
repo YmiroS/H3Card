@@ -177,6 +177,14 @@
     "76",
     0
    ],
+   "ref_videos.ref_video_0": [
+    "78",
+    0
+   ],
+   "ref_video_audios.ref_video_audio_0": [
+    "78",
+    2
+   ],
    "prompt": [
     "68",
     0
@@ -412,6 +420,22 @@
   },
   "_meta": {
    "title": "参考图9"
+  }
+ },
+ "78": {
+  "class_type": "VHS_LoadVideo",
+  "inputs": {
+   "video": "example.mp4",
+   "force_rate": 0,
+   "custom_width": 0,
+   "custom_height": 0,
+   "frame_load_cap": 0,
+   "skip_first_frames": 0,
+   "select_every_nth": 1,
+   "format": "AnimateDiff"
+  },
+  "_meta": {
+   "title": "Load Video (Upload) 🎥🅥🅗🅢"
   }
  }
 }

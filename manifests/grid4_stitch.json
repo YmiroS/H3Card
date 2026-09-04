@@ -2,7 +2,7 @@
  "id": "grid4_stitch",
  "name": "四图拼四宫格",
  "file": "四图拼四宫格",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\四图拼四宫格.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\四图拼四宫格.json",
  "group": "图片",
  "outputType": "image",
  "kind": "tool",
@@ -11,6 +11,20 @@
  "images": 4,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 4
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/grid4_stitch.api.json",
  "output": {
   "node": "40"

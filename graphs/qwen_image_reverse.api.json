@@ -1,0 +1,88 @@
+{
+ "1": {
+  "class_type": "llama_cpp_parameters",
+  "inputs": {
+   "max_tokens": 1024,
+   "top_k": 30,
+   "top_p": 0.9,
+   "min_p": 0.05,
+   "typical_p": 1,
+   "temperature": 0.8,
+   "repeat_penalty": 1,
+   "frequency_penalty": 0,
+   "presence_penalty": 1,
+   "mirostat_mode": 0,
+   "mirostat_eta": 0.1,
+   "mirostat_tau": 5,
+   "state_uid": -1
+  },
+  "_meta": {
+   "title": "Llama-cpp Parameters"
+  }
+ },
+ "2": {
+  "class_type": "ShowText|pysssss",
+  "inputs": {
+   "text": [
+    "4",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Show Text 🐍"
+  }
+ },
+ "4": {
+  "class_type": "llama_cpp_instruct_adv",
+  "inputs": {
+   "llama_model": [
+    "3",
+    0
+   ],
+   "parameters": [
+    "1",
+    0
+   ],
+   "images": [
+    "5",
+    0
+   ],
+   "preset_prompt": "Normal - Describe",
+   "custom_prompt": "详细描述图像内容",
+   "system_prompt": "你是一个专业的图像描述专家，用简洁、专业的语言描述提示词的内容。",
+   "inference_mode": "video",
+   "max_frames": 24,
+   "max_size": 256,
+   "seed": 1,
+   "force_offload": false,
+   "save_states": false
+  },
+  "_meta": {
+   "title": "Llama-cpp Instruct"
+  }
+ },
+ "5": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "ea59c4cc3ccad358c54503fd2f613d0347fa9effaefde00f03e250d0de9076fe.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "3": {
+  "class_type": "llama_cpp_model_loader",
+  "inputs": {
+   "model": "Qwen3.5-27B-IQ4_XS.gguf",
+   "mmproj": "mmproj-F16.gguf",
+   "chat_handler": "Qwen3.5",
+   "n_ctx": 8192,
+   "vram_limit": -1,
+   "image_min_tokens": 0,
+   "image_max_tokens": 0
+  },
+  "_meta": {
+   "title": "Llama-cpp Model Loader"
+  }
+ }
+}

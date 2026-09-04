@@ -1,0 +1,670 @@
+{
+ "170": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "mecha_dragon_lightning.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "155": {
+  "class_type": "LoadAudio",
+  "inputs": {
+   "audio": "None"
+  },
+  "_meta": {
+   "title": "Load Audio"
+  }
+ },
+ "147": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "mecha_dragon_lightning.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "148": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "mecha_dragon_lightning.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "149": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "mecha_dragon_lightning.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "150": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "mecha_dragon_lightning.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "151": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "mecha_dragon_lightning.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "211": {
+  "class_type": "VRAM_Debug",
+  "inputs": {
+   "any_input": [
+    "209",
+    0
+   ],
+   "image_pass": [
+    "122",
+    0
+   ],
+   "empty_cache": true,
+   "gc_collect": true,
+   "unload_all_models": false
+  },
+  "_meta": {
+   "title": "VRAM Debug"
+  }
+ },
+ "162": {
+  "class_type": "easy clearCacheAll",
+  "inputs": {
+   "anything": [
+    "186",
+    1
+   ]
+  },
+  "_meta": {
+   "title": "easy clearCacheAll"
+  }
+ },
+ "212": {
+  "class_type": "VRAM_Debug",
+  "inputs": {
+   "any_input": [
+    "162",
+    0
+   ],
+   "empty_cache": true,
+   "gc_collect": true,
+   "unload_all_models": true
+  },
+  "_meta": {
+   "title": "VRAM Debug"
+  }
+ },
+ "131": {
+  "class_type": "ComfyMathExpression",
+  "inputs": {
+   "values.a": [
+    "132",
+    0
+   ],
+   "expression": "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17"
+  },
+  "_meta": {
+   "title": "Math Expression"
+  }
+ },
+ "122": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "209",
+    0
+   ],
+   "vae": [
+    "119",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "164": {
+  "class_type": "LoadAudio",
+  "inputs": {
+   "audio": "None"
+  },
+  "_meta": {
+   "title": "Load Audio"
+  }
+ },
+ "202": {
+  "class_type": "ConditioningZeroOut",
+  "inputs": {
+   "conditioning": [
+    "186",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Conditioning Zero Out"
+  }
+ },
+ "126": {
+  "class_type": "BasicGuider",
+  "inputs": {
+   "model": [
+    "232",
+    0
+   ],
+   "conditioning": [
+    "186",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Basic Guider"
+  }
+ },
+ "204": {
+  "class_type": "BasicGuider",
+  "inputs": {
+   "model": [
+    "232",
+    0
+   ],
+   "conditioning": [
+    "199",
+    1
+   ]
+  },
+  "_meta": {
+   "title": "Basic Guider"
+  }
+ },
+ "163": {
+  "class_type": "LoadAudio",
+  "inputs": {
+   "audio": "None"
+  },
+  "_meta": {
+   "title": "Load Audio"
+  }
+ },
+ "119": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_video_vae_fp16.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "128": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_32b_minimax_h3_int8_convrot.safetensors",
+   "type": "minimax",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "120": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "minimax_h3_audio_vae_fp32.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "199": {
+  "class_type": "MiniMaxH3LatentUpscaleCombined",
+  "inputs": {
+   "samples": [
+    "125",
+    1
+   ],
+   "model": [
+    "232",
+    0
+   ],
+   "noise": [
+    "129",
+    0
+   ],
+   "sigmas": [
+    "203",
+    1
+   ],
+   "positive": [
+    "186",
+    0
+   ],
+   "negative": [
+    "202",
+    0
+   ],
+   "scale_by": 1.5,
+   "method": "bicubic",
+   "audio_denoise": 0.7
+  },
+  "_meta": {
+   "title": "MiniMax H3 Latent Upscale Combined"
+  }
+ },
+ "205": {
+  "class_type": "DisableNoise",
+  "inputs": {},
+  "_meta": {
+   "title": "DisableNoise"
+  }
+ },
+ "125": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "129",
+    0
+   ],
+   "guider": [
+    "126",
+    0
+   ],
+   "sampler": [
+    "123",
+    0
+   ],
+   "sigmas": [
+    "203",
+    0
+   ],
+   "latent_image": [
+    "212",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "SamplerCustomAdvanced"
+  }
+ },
+ "221": {
+  "class_type": "VHS_LoadVideoFFmpeg",
+  "inputs": {
+   "video": "17.mp4",
+   "force_rate": 0,
+   "custom_width": 0,
+   "custom_height": 0,
+   "frame_load_cap": 0,
+   "start_time": 0,
+   "format": "AnimateDiff"
+  },
+  "_meta": {
+   "title": "Load Video FFmpeg (Upload) 🎥🅥🅗🅢"
+  }
+ },
+ "129": {
+  "class_type": "RandomNoise",
+  "inputs": {
+   "noise_seed": 171985890830580
+  },
+  "_meta": {
+   "title": "RandomNoise"
+  }
+ },
+ "200": {
+  "class_type": "SamplerCustomAdvanced",
+  "inputs": {
+   "noise": [
+    "205",
+    0
+   ],
+   "guider": [
+    "204",
+    0
+   ],
+   "sampler": [
+    "123",
+    0
+   ],
+   "sigmas": [
+    "203",
+    1
+   ],
+   "latent_image": [
+    "199",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "SamplerCustomAdvanced"
+  }
+ },
+ "123": {
+  "class_type": "KSamplerSelect",
+  "inputs": {
+   "sampler_name": "euler"
+  },
+  "_meta": {
+   "title": "KSamplerSelect"
+  }
+ },
+ "186": {
+  "class_type": "MiniMaxH3ReferenceToVideo",
+  "inputs": {
+   "clip": [
+    "128",
+    0
+   ],
+   "vae": [
+    "119",
+    0
+   ],
+   "audio_vae": [
+    "120",
+    0
+   ],
+   "ref_images.ref_image_0": [
+    "137",
+    0
+   ],
+   "ref_images.ref_image_1": [
+    "139",
+    0
+   ],
+   "ref_images.ref_image_2": [
+    "146",
+    0
+   ],
+   "ref_images.ref_image_3": [
+    "147",
+    0
+   ],
+   "ref_images.ref_image_4": [
+    "148",
+    0
+   ],
+   "ref_images.ref_image_5": [
+    "149",
+    0
+   ],
+   "ref_images.ref_image_6": [
+    "150",
+    0
+   ],
+   "ref_images.ref_image_7": [
+    "151",
+    0
+   ],
+   "ref_images.ref_image_8": [
+    "170",
+    0
+   ],
+   "ref_videos.ref_video_0": [
+    "221",
+    0
+   ],
+   "ref_video_audios.ref_video_audio_0": [
+    "221",
+    2
+   ],
+   "ref_audios.ref_audio_0": [
+    "155",
+    0
+   ],
+   "ref_audios.ref_audio_1": [
+    "163",
+    0
+   ],
+   "ref_audios.ref_audio_2": [
+    "164",
+    0
+   ],
+   "prompt": [
+    "138",
+    0
+   ],
+   "width": [
+    "115",
+    0
+   ],
+   "height": [
+    "115",
+    1
+   ],
+   "length": [
+    "131",
+    1
+   ],
+   "ref_image_size": "match"
+  },
+  "_meta": {
+   "title": "MiniMax H3 Reference to Video"
+  }
+ },
+ "124": {
+  "class_type": "BasicScheduler",
+  "inputs": {
+   "model": [
+    "232",
+    0
+   ],
+   "scheduler": "beta",
+   "steps": 20,
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "BasicScheduler"
+  }
+ },
+ "203": {
+  "class_type": "SplitSigmas",
+  "inputs": {
+   "sigmas": [
+    "124",
+    0
+   ],
+   "step": 10
+  },
+  "_meta": {
+   "title": "SplitSigmas"
+  }
+ },
+ "115": {
+  "class_type": "ResolutionSelector",
+  "inputs": {
+   "aspect_ratio": "16:9 (Widescreen)",
+   "megapixels": 0.4,
+   "multiple": 32
+  },
+  "_meta": {
+   "title": "Resolution Selector (Size)"
+  }
+ },
+ "132": {
+  "class_type": "PrimitiveFloat",
+  "inputs": {
+   "value": 5
+  },
+  "_meta": {
+   "title": "Float (Duration)"
+  }
+ },
+ "137": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "ComfyUI_00171_.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "139": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "ComfyUI_00172_.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "146": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "S3.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "138": {
+  "class_type": "PrimitiveStringMultiline",
+  "inputs": {
+   "value": "Bold comic-book ink style, heavy linework, red and blue-black palette, night city. Use <Picture 2> and <Picture 1> as reference frames and <Audio 1> exactly as it is.\nCUT 1: top-down view of the little boy superhero on the rooftop — red cape fluttering in the wind, hands planted on his hips, freckles and a cocky grin as he looks straight up into the camera. The camera slowly descends toward him as he delivers his line — as he speaks, comic-book graphic overlay text word by word in sync with his voice: \"GET READY TO\" - \"MEET\" — \"YOUR\" — \"MAKER\" — huge jagged comic lettering, white with heavy black outlines and red drop shadows, tilted at scrappy angles, until the three words hang stacked in the air above him between his face and the lens.\nTRANSITION: a violent WHIP PAN off the rooftop that SMEARS the floating words away with it, motion-streaked —\nCUT 2: low hero angle on the colossal black mech-kaiju towering over the skyline as it rears back and unleashes a GIANT terrifying ROAR — jaws wide with fangs, red eyes and chest-core flaring blinding bright, blue lightning arcing off its head, the roar's shockwave rippling dust and rattling windows down the buildings, comic-style speed-lines and ink splatter bursting from the impact of the sound. It leans INTO the camera as the roar peaks. Hold on the roar."
+  },
+  "_meta": {
+   "title": "提示词"
+  }
+ },
+ "209": {
+  "class_type": "VRAM_Debug",
+  "inputs": {
+   "any_input": [
+    "200",
+    0
+   ],
+   "empty_cache": true,
+   "gc_collect": true,
+   "unload_all_models": true
+  },
+  "_meta": {
+   "title": "VRAM Debug"
+  }
+ },
+ "225": {
+  "class_type": "VHS_VideoCombine",
+  "inputs": {
+   "images": [
+    "210",
+    1
+   ],
+   "audio": [
+    "210",
+    0
+   ],
+   "frame_rate": 24,
+   "loop_count": 0,
+   "filename_prefix": "AnimateDiff",
+   "format": "video/h264-mp4",
+   "pingpong": false,
+   "save_output": true,
+   "pix_fmt": "yuv420p",
+   "crf": 19,
+   "save_metadata": true,
+   "trim_to_audio": false
+  },
+  "_meta": {
+   "title": "Video Combine 🎥🅥🅗🅢"
+  }
+ },
+ "210": {
+  "class_type": "VRAM_Debug",
+  "inputs": {
+   "any_input": [
+    "121",
+    0
+   ],
+   "image_pass": [
+    "211",
+    1
+   ],
+   "empty_cache": true,
+   "gc_collect": true,
+   "unload_all_models": false
+  },
+  "_meta": {
+   "title": "VRAM Debug"
+  }
+ },
+ "121": {
+  "class_type": "VAEDecodeAudio",
+  "inputs": {
+   "samples": [
+    "211",
+    0
+   ],
+   "vae": [
+    "120",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode Audio"
+  }
+ },
+ "127": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "minimax_h3_ref2va_pruned_int8_convrot.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "230": {
+  "class_type": "LoraLoaderModelOnly",
+  "inputs": {
+   "model": [
+    "127",
+    0
+   ],
+   "lora_name": "minimax_h3_turbo_4step_comfyui_pruned.safetensors",
+   "strength_model": 1
+  },
+  "_meta": {
+   "title": "Load LoRA"
+  }
+ },
+ "231": {
+  "class_type": "PathchSageAttentionKJ",
+  "inputs": {
+   "model": [
+    "230",
+    0
+   ],
+   "sage_attention": "auto",
+   "allow_compile": false
+  },
+  "_meta": {
+   "title": "Patch Sage Attention KJ"
+  }
+ },
+ "232": {
+  "class_type": "TESpeedMiniMaxH3",
+  "inputs": {
+   "model": [
+    "231",
+    0
+   ],
+   "processing_control_value": 0.12,
+   "processing_percent_1": 0.1,
+   "processing_percent_2": 0.9,
+   "mcs": 2,
+   "device": "auto"
+  },
+  "_meta": {
+   "title": "TE-Speed-MiniMaxH3"
+  }
+ }
+}
