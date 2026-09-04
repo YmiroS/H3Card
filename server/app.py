@@ -190,10 +190,11 @@ def ffmpeg_bin():
 
 DUR_RE = re.compile(r"Duration:\s*(\d+):(\d\d):(\d\d(?:\.\d+)?)")
 FPS_RE = re.compile(r"([\d.]+)\s+fps\b")
+AUDIO_STREAM_RE = re.compile(r"^\s*Stream #\d+:\d+.*:\s*Audio:", re.MULTILINE)
 
 
 def probe_video(ref):
-    """这份视频素材：{fps, frames, duration}。探不到返回 {}（调用方必须有兜底）。
+    """这份视频素材：{fps, frames, duration, has_audio}。探不到返回 {}（调用方必须有兜底）。
 
     ref 是 ComfyUI input 目录里的相对路径（"chouka/ck_xxx.mp4"），本地
     data/uploads/ 下有同名副本，先用本地那份。
@@ -218,7 +219,7 @@ def probe_video(ref):
     err = r.stderr or ""
     fps = FPS_RE.search(err)
     dur = DUR_RE.search(err)
-    out = {}
+    out = {"has_audio": bool(AUDIO_STREAM_RE.search(err))}
     if fps:
         out["fps"] = float(fps.group(1))
     if dur:
@@ -282,6 +283,14 @@ def patch_graph(cap, params, uploaded):
                     # 一个槽可能要拔好几根（参考图编辑的正负两条 conditioning 各挂一次）
                     g[str(drop["node"])]["inputs"].pop(drop["input"], None)
                 continue                       # 未填的可选素材：保留模板里的默认值
+            if spec["type"] == "video" and spec.get("dropIfNoAudio"):
+                # VHS 的音频输出是惰性读取：只要 H3 的视频音频引用仍连着，它就会让
+                # ffmpeg 提取音轨。静音视频根本没有音频流，必须只拔掉这条音频引用，
+                # 视频输出本身仍正常作为动作和镜头参考。
+                info = probe_video(val)
+                if info.get("has_audio") is False:
+                    for drop in spec["dropIfNoAudio"]:
+                        g[str(drop["node"])]["inputs"].pop(drop["input"], None)
         elif spec["type"] == "seed":
             val = params.get("seed")
             # 上限按 manifest 里那个节点自己声明的来：SeedVR2 只收到 2^32-1，
@@ -782,6 +791,29 @@ LIVE = ("queued", "running")
 JOBS_FILE = ROOT / "data" / "jobs.json"
 
 
+async def api_status(request):
+    """给局域网内其他软件读取的轻量占用状态。"""
+    running_count = sum(j.get("status") == "running" for j in JOBS.values())
+    queued_count = sum(j.get("status") == "queued" for j in JOBS.values())
+    active_count = running_count + queued_count
+    busy = active_count > 0
+    response = web.json_response({
+        "ok": True,
+        "service": "chouka",
+        "state": "busy" if busy else "idle",
+        "idle": not busy,
+        "busy": busy,
+        "running_count": running_count,
+        "queued_count": queued_count,
+        "active_count": active_count,
+        "comfy_online": STATE["comfy_online"],
+    })
+    # 状态不能被浏览器或中间代理缓存；只读 GET 允许局域网页面跨域查询。
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    return response
+
+
 def save_jobs():
     """任务列表落盘。`JOBS` 本来只在内存里，后端重启一次几天的记录就全没了 ——
     产物还在卡片上，但「什么时候跑的、跑了多久、为什么失败」只有这儿有。
@@ -1065,6 +1097,7 @@ def make_app():
     app.on_response_prepare.append(no_cache)
     app.router.add_get("/", index)
     app.router.add_get("/api/health", api_health)
+    app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/cards", api_cards)
     app.router.add_post("/api/reload", api_reload)
     app.router.add_post("/api/upload", api_upload)
@@ -1105,4 +1138,10 @@ if __name__ == "__main__":
         sys.stdout.reconfigure(encoding="utf-8")
     except Exception:
         pass
+
+    # 屏蔽 asyncio 底层的 ConnectionResetError traceback
+    # 这个错误在用户刷新页面、关闭浏览器、网络中断时都会出现，是正常现象
+    import logging
+    logging.getLogger('asyncio').setLevel(logging.ERROR)
+
     web.run_app(make_app(), host="0.0.0.0", port=PORT, print=None)

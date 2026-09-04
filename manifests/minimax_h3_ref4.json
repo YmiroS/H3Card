@@ -1,8 +1,8 @@
 {
  "id": "minimax_h3_ref4",
- "name": "H3 全能参考",
+ "name": "H3图片参考",
  "file": "MiniMax H3  四图全能参考单采",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3  四图全能参考单采.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3  四图全能参考单采.json",
  "group": "视频",
  "outputType": "video",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 4,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 4
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/minimax_h3_ref4.api.json",
  "output": {
   "node": "38"
@@ -23,7 +37,7 @@
  "inputs": [
   {
    "key": "images[0]",
-   "label": "场景",
+   "label": "图片",
    "type": "image",
    "required": true,
    "target": {
@@ -34,7 +48,7 @@
   },
   {
    "key": "images[1]",
-   "label": "角色",
+   "label": "图片2",
    "type": "image",
    "required": false,
    "target": {
@@ -51,7 +65,7 @@
   },
   {
    "key": "images[2]",
-   "label": "图片",
+   "label": "图片3",
    "type": "image",
    "required": false,
    "target": {
@@ -68,7 +82,7 @@
   },
   {
    "key": "images[3]",
-   "label": "图片2",
+   "label": "图片4",
    "type": "image",
    "required": false,
    "target": {

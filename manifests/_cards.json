@@ -12,6 +12,11 @@
     "slots": "img0+aud0+vid0"
    },
    {
+    "id": "krea2_t2i",
+    "name": "文生图",
+    "slots": "img0+aud0+vid0"
+   },
+   {
     "id": "zimage_i2i",
     "name": "图生图",
     "slots": "img1+aud0+vid0"
@@ -54,18 +59,24 @@
     }
    },
    {
+    "id": "minimax_h3_ref4",
+    "name": "H3图片参考",
+    "slots": "img4+aud0+vid0"
+   },
+   {
     "id": "minimax_h3_comic20",
     "name": "漫剧4宫格",
     "slots": "img5+aud0+vid0"
    },
    {
     "id": "minimax_h3_ref9",
-    "name": "H3 全能参考",
-    "slots": "img9+aud0+vid0",
-    "ladder": {
-     "4": "minimax_h3_ref4",
-     "9": "minimax_h3_ref9"
-    }
+    "name": "H3全能参考",
+    "slots": "img9+aud0+vid1"
+   },
+   {
+    "id": "minimax_h3_ref_2pass",
+    "name": "H3全能参考(高质量)",
+    "slots": "img9+aud3+vid1"
    }
   ]
  },
@@ -121,6 +132,25 @@
      "label": "素材",
      "hint": "图片和视频都收，放进来就照着原样重画一遍、画得更清楚。参数会自动换成对应的那一套。想让视频更顺滑（补中间帧）请用「视频补帧插针」那张卡。"
     }
+   }
+  ]
+ },
+ {
+  "id": "unknown",
+  "name": "Qwen 视频反推提示词",
+  "icon": "◻",
+  "outputType": "unknown",
+  "kind": "gen",
+  "modes": [
+   {
+    "id": "qwen_video_reverse",
+    "name": "Qwen 视频反推提示词",
+    "slots": "img0+aud0+vid1"
+   },
+   {
+    "id": "qwen_image_reverse",
+    "name": "Qwen 单图反推提示词",
+    "slots": "img1+aud0+vid0"
    }
   ]
  },

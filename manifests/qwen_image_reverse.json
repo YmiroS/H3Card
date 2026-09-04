@@ -1,0 +1,73 @@
+{
+ "id": "qwen_image_reverse",
+ "name": "Qwen 单图反推提示词",
+ "file": "qwen3.5-单图反推提示词",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\Qwen3.5VL大语言模型全套\\qwen3.5-单图反推提示词.json",
+ "group": "其他",
+ "outputType": "unknown",
+ "kind": "gen",
+ "card": "unknown",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/qwen_image_reverse.api.json",
+ "output": null,
+ "note": null,
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "5",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "",
+   "target": {
+    "node": "4",
+    "input": "custom_prompt"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 1,
+   "target": {
+    "node": "4",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  }
+ ],
+ "warnings": [
+  "本地大模型：#3.model = Qwen3.5-27B-IQ4_XS.gguf",
+  "本地大模型：#3.mmproj = mmproj-F16.gguf",
+  "找不到输出节点（SaveImage/SaveVideo/…），无法取回产物"
+ ]
+}

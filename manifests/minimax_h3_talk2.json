@@ -2,7 +2,7 @@
  "id": "minimax_h3_talk2",
  "name": "H3 说话唱歌·双人",
  "file": "@MiniMax H3_ 说话唱歌 双人（4步加速版）",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@MiniMax H3_ 说话唱歌 双人（4步加速版）.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\@MiniMax H3_ 说话唱歌 双人（4步加速版）.json",
  "group": "视频",
  "outputType": "video",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 2,
  "audios": 1,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 2
+  },
+  "audio": {
+   "min": 1,
+   "max": 1
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/minimax_h3_talk2.api.json",
  "output": {
   "node": "142"

@@ -74,7 +74,10 @@ const MEDIA = ["image", "audio", "video"];
 const KIND_ZH = { image: "图片", video: "视频", audio: "音频" };
 const modeHas = (md, cid) => md.id === cid
   || !!(md.ladder && Object.values(md.ladder).includes(cid))
-  || !!(md.route && Object.values(md.route).some(r => r.cap === cid));
+  || !!(md.route && Object.values(md.route).some(r => r.cap === cid))
+  // modelSwitch：同一模式换模型跑的另一条能力（图生图的 zimage_i2i ↔ krea2_i2i）。
+  // 不认它的话 modeOf 对 krea 的 cap 返回空，面板模式胶囊会兜底显示 modes[0]「文生图」
+  || !!(md.modelSwitch && Object.values(md.modelSwitch).includes(cid));
 /** 一个模式落到画布上时先跑哪条能力。路由节点（route）用排在最前那一路当初始状态 */
 const modeCap = (md) => md ? (md.route ? md.route[Object.keys(md.route)[0]].cap : md.id) : null;
 /** 同一条能力可能同时挂在两个节点上（补帧既有自己那个节点，也是「画质增强」的视频那一路），
@@ -265,11 +268,41 @@ function routeFor(c, kind) {
 function putAsset(c, s, file) {
   const r = file && file.kind ? routeFor(c, file.kind) : null;
   if (r) {
+    // 路由换边时原来的素材格全部失效，连线和它们带来的引用一起清掉。
+    removeEdges(PROJ.edges.filter(e => e.to === c.id));
     c.cap = r.cap;
     c.assets = {};
-    PROJ.edges = PROJ.edges.filter(e => e.to !== c.id);
     s = { key: r.slot };
     paintTitle(c);
+    drawWires(); paintStyles();
+  }
+
+  // 自动切换：文生图模式收到图片 → 切换到图生图模式
+  const def = defOf(c);
+  let modeSwitched = false;
+  if (def && def.id === "card_image" && file && file.kind === "image") {
+    if (c.cap === "zimage_t2i") {
+      c.cap = "zimage_i2i";
+      if (!c._model) c._model = "zimage";
+      modeSwitched = true;
+    } else if (c.cap === "krea2_t2i") {
+      c.cap = "krea2_i2i";
+      if (!c._model) c._model = "krea2";
+      modeSwitched = true;
+    }
+
+    // 如果切换了模式，需要更新标题、重绘连线，并重新打开面板以显示新的参数
+    if (modeSwitched) {
+      paintTitle(c);
+      drawWires();
+      paintStyles();
+      // 延迟打开面板，确保DOM更新完成
+      setTimeout(() => openPanel(c.id), 50);
+    }
+  }
+
+  // 手动上传表示这一格从此由用户自己管；否则上游下次重跑还会把它覆盖回来。
+  if (!r && detachSlotEdges(c.id, s.key)) {
     drawWires(); paintStyles();
   }
   c.assets[s.key] = file;
@@ -688,29 +721,45 @@ function gridWord(s) {
 
 /** 槽位显示名。原始标签只有序号时补个词；要拼图的直接写成"四宫格3"，
     让人在点上传之前就知道该找什么样的图 */
-function slotName(s) {
-  const t = String(s.label || "").trim(), w = gridWord(s);
-  if (/^\d+$/.test(t)) return (w || (s.type === "image" ? "图" : KIND_ZH[s.type] || "")) + t;
+function slotName(s, c = null) {
+  const w = gridWord(s);
+  if (MEDIA.includes(s.type)) {
+    const cap = c && capOf(c);
+    const filled = cap ? cap.inputs.filter(x => x.type === s.type && (c.assets || {})[x.key]) : [];
+    const activeIndex = filled.findIndex(x => x.key === s.key);
+    const keyIndex = +(String(s.key).match(/\[(\d+)\]/) || [0, 0])[1];
+    const n = activeIndex >= 0 ? activeIndex + 1 : keyIndex + 1;
+    const name = `${KIND_ZH[s.type] || s.type}${n}`;
+    return w ? `${name}（${w}）` : name;
+  }
+  const t = String(s.label || "").trim();
   return w ? `${t}（${w}）` : t;
 }
 
 /** 从 manifest 反推这个工作流吃什么、吐什么 —— 不写死任何工作流 */
 function capBrief(cap) {
   const by = (t) => cap.inputs.filter(s => s.type === t);
-  const imgs = by("image"), auds = by("audio"), vids = by("video"), txts = by("textarea");
+  const mediaKinds = [...new Set(cap.inputs.filter(s => MEDIA.includes(s.type)).map(s => s.type))];
+  const txts = by("textarea");
   const dur = cap.inputs.find(s => s.key === "duration");
   const size = cap.inputs.filter(s => s.key === "width" || s.key === "height");
   const ratio = cap.inputs.find(s => s.key === "aspect_ratio");
   const mp = cap.inputs.find(s => s.key === "megapixels");
   const side = cap.inputs.find(s => s.key === "scale_to_length");
   const need = [], opt = [];
-  if (imgs.length) {
-    (imgs.every(s => s.required) ? need : opt).push(
-      `图片 ×${imgs.length}：${imgs.map(s => slotName(s) + (s.required ? "" : "?")).join(" / ")}`);
+  for (const kind of mediaKinds) {
+    const list = by(kind);
+    const required = list.filter(s => s.required);
+    const optional = list.filter(s => !s.required);
+    const label = KIND_ZH[kind] || kind;
+    if (required.length) {
+      need.push(`${label} ×${required.length}：${required.map(s => slotName(s)).join(" / ")}`);
+    }
+    if (optional.length) {
+      opt.push(`可引用${label}（上限 ${mediaLimit(cap, kind)}）`);
+    }
   }
-  if (auds.length) need.push(`音频 ×${auds.length}：${auds.map(s => s.label).join(" / ")}`);
-  if (vids.length) need.push(`视频 ×${vids.length}：${vids.map(s => s.label).join(" / ")}`);
-  if (!imgs.length && !auds.length && !vids.length) need.push("不需要素材，纯提示词驱动");
+  if (!mediaKinds.length) need.push("不需要素材，纯提示词驱动");
   if (txts.length) need.push(txts.length > 1 ? `提示词 ×${txts.length}` : "提示词");
   if (dur) opt.push(`时长 ${dur.min}–${dur.max} 秒`);
   if (size.length) opt.push("画面宽高");
@@ -850,8 +899,10 @@ async function openProject(pid) {
   // （图生视频并进了首尾帧那条），统一归到模式入口，参数和素材的 key 是通的
   for (const c of PROJ.cards) {
     const md = modeOf(c);
-    // 路由节点的模式 id 不是能力 id（它就是那个节点），c.cap 已经是两路里的一条，别动
-    if (md && !md.route && md.id !== c.cap) c.cap = md.id;
+    // 路由节点的模式 id 不是能力 id（它就是那个节点），c.cap 已经是两路里的一条，别动。
+    // modelSwitch 命中的也别归一：krea2_i2i 归回 zimage_i2i 等于把用户选的模型换了
+    if (md && !md.route && md.id !== c.cap
+      && !(md.modelSwitch && Object.values(md.modelSwitch).includes(c.cap))) c.cap = md.id;
     seedHistory(c);
   }
   // 文本节点曾经分 5 种模式（text_source / text_polish…），后来合成一种。
@@ -1539,6 +1590,79 @@ function bindCompare(body, c) {
 /* ---------- 连线 ---------- */
 const cardOf = (id) => (PROJ ? PROJ.cards : []).find(x => x.id === id) || null;
 
+/** 一根产物线实际占用的素材格。新线会把完整列表存进 edge.slots；老项目只有
+    edge.slot，就按上游当前产物数量补算一次，保证升级后第一次断线也能清干净。 */
+function mediaSlotsForOutputs(to, baseSlot, outputs, freeOnly = true) {
+  if (!baseSlot || !outputs || outputs.length <= 1) return baseSlot ? [baseSlot] : [];
+  const match = /^(\w+)\[(\d+)\]$/.exec(baseSlot);
+  const cap = to && capOf(to);
+  if (!match || !cap) return [baseSlot];
+  const slotType = match[1], start = +match[2], kind = outputs[0] && outputs[0].kind;
+  const slots = (cap.inputs || [])
+    .filter(s => {
+      const sm = new RegExp(`^${slotType}\\[(\\d+)\\]$`).exec(s.key);
+      return sm && +sm[1] >= start && (!kind || s.type === kind)
+        && (!freeOnly || !(to.assets || {})[s.key]);
+    })
+    .sort((a, b) => parseInt(/\[(\d+)\]/.exec(a.key)[1], 10)
+      - parseInt(/\[(\d+)\]/.exec(b.key)[1], 10))
+    .slice(0, outputs.length)
+    .map(s => s.key);
+  return slots.length ? slots : [baseSlot];
+}
+
+function edgeSlots(e) {
+  if (!e || isTextEdge(e)) return [];
+  if (Array.isArray(e.slots)) return [...new Set(e.slots.filter(Boolean))];
+  const from = cardOf(e.from), to = cardOf(e.to);
+  const current = (from && from.outputs) || [];
+  const previous = (from && from.history && from.history[0] && from.history[0].outputs) || [];
+  return mediaSlotsForOutputs(to, e.slot, current.length ? current : previous, false);
+}
+
+/** 删除产物线时同步删掉它写进下游的素材引用。这里只动线拥有的格，手动上传的
+    其他格、别的连线，以及节点自己的提示词都不受影响。 */
+function clearEdgeAssets(e) {
+  const to = cardOf(e && e.to);
+  if (!to || !to.assets) return false;
+  let changed = false;
+  for (const key of edgeSlots(e)) {
+    if (!(key in to.assets)) continue;
+    delete to.assets[key];
+    changed = true;
+  }
+  if (changed) paintKind(to);
+  return changed;
+}
+
+function removeEdges(edges, clearAssets = true) {
+  const gone = new Set(edges || []);
+  if (!gone.size) return false;
+  if (clearAssets) for (const e of gone) clearEdgeAssets(e);
+  PROJ.edges = PROJ.edges.filter(e => !gone.has(e));
+  return true;
+}
+
+/** 用户手动换掉某一格时，只解除这格与上游的绑定；一根多产物线还占着其他格时保留。 */
+function detachSlotEdges(cardId, slot) {
+  const gone = [];
+  let changed = false;
+  for (const e of PROJ.edges) {
+    if (e.to !== cardId || isTextEdge(e)) continue;
+    const slots = edgeSlots(e);
+    if (!slots.includes(slot)) continue;
+    const keep = slots.filter(key => key !== slot);
+    changed = true;
+    if (!keep.length) gone.push(e);
+    else {
+      e.slots = keep;
+      if (e.slot === slot) e.slot = keep[0];
+    }
+  }
+  removeEdges(gone, false);
+  return changed;
+}
+
 function cardBox(id) {
   const c = cardOf(id);
   if (!c) return null;
@@ -1774,19 +1898,18 @@ function edgeMenu(cx, cy, e) {
   ]);
 }
 
-/** 删一根线。产物线删掉**不动下游那一格里的素材** —— 那份文件早就搬过去了，
-    删线只是断开"上游重跑一次、下游自动换成新产物"这条关系。
-    素材也想清就右键那一格「清空这一格」，两件事分开。 */
+/** 删一根线。文本/风格引用是实时从 edges 读取的；产物线还要把它写进下游
+    assets 的一格或多格一起删掉，否则画面上虽然断线，运行时仍会继续引用旧产物。 */
 function delEdge(e) {
-  const b = cardOf(e.to), had = !!(b && (b.assets || {})[e.slot]);
-  PROJ.edges = PROJ.edges.filter(x => x !== e);
+  const cleared = !isTextEdge(e) && clearEdgeAssets(e);
+  removeEdges([e], false);
   if (selEdge === e) selEdge = null;
   drawWires(); paintStyles();
   if (selId) openPanel(selId);
   save();
   toast(e.slot === TEXT_SLOT ? "已断开这段文本输入"
     : isTextEdge(e) ? "已解除风格"
-    : had ? "已删除连线（那一格的素材还在，只是不再跟着上游重跑更新）"
+    : cleared ? "已删除连线，并清除下游引用"
     : "已删除连线");
 }
 
@@ -1994,18 +2117,110 @@ function bindGlobal() {
     applyView(); save();
   }, { passive: false });
 
-  // 空白处右键：新建节点改走底部工具条了，这儿只剩"把刚复制的节点粘在这个位置"。
-  // 手上没复制东西就什么都不弹（别为了一条灰按钮开个菜单）
+  // 空白处右键：新建节点、上传、粘贴
   el.stage.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
     if (!PROJ || ev.target.closest(".card")) return;
     tipHide();
-    if (!CLIP) return;
     const at = toWorld(ev.clientX, ev.clientY);
-    showMenu(ev.clientX, ev.clientY, "画布", [{
-      icon: "⧉", text: "粘贴刚复制的节点（Ctrl+V）",
-      run: () => { mouseW = at; pasteCard(); },
-    }]);
+    const menu = [];
+
+    // 新建生成节点（包括文本节点）
+    menu.push({ group: "生成节点" });
+
+    // 文本节点
+    const textCard = CARDS.find(d => d.kind === "text");
+    if (textCard) {
+      menu.push({
+        icon: textCard.icon || "✍",
+        text: "文本",
+        run: () => {
+          addCard(textCard.id, at.x, at.y, textCard.modes[0] ? modeCap(textCard.modes[0]) : null);
+        }
+      });
+    }
+
+    // 其他生成节点
+    const genCards = CARDS.filter(d => d.kind === "gen");
+    genCards.forEach(d => {
+      let name = d.name;
+      if (name === "生图") name = "图片";
+      else if (name === "生视频") name = "视频";
+
+      menu.push({
+        icon: d.icon || "◻",
+        text: name,
+        run: () => {
+          addCard(d.id, at.x, at.y, d.modes[0] ? modeCap(d.modes[0]) : null);
+        }
+      });
+    });
+
+    // 新建工具节点 - 展开显示每个模式
+    const toolCards = CARDS.filter(d => d.kind === "tool");
+    if (toolCards.length > 0) {
+      menu.push({ group: "工具" });
+      toolCards.forEach(def => {
+        def.modes.forEach(md => {
+          menu.push({
+            icon: def.icon || "◻",
+            text: md.name,
+            run: () => {
+              addCard(def.id, at.x, at.y, modeCap(md));
+            }
+          });
+        });
+      });
+    }
+
+    // 上传素材
+    menu.push({ group: "其他" });
+    menu.push({
+      icon: "📎",
+      text: "上传素材",
+      run: () => {
+        const input = document.createElement("input");
+        input.type = "file";
+        input.accept = "image/*,video/*,audio/*";
+        input.onchange = async (e) => {
+          const file = e.target.files[0];
+          if (!file) return;
+          const fd = new FormData();
+          fd.append("file", file, file.name);
+          try {
+            const r = await fetch("/api/upload", { method: "POST", body: fd });
+            if (!r.ok) throw new Error(await r.text());
+            const asset = await r.json();
+            const assetCard = CARDS.find(d => d.kind === "asset");
+            if (!assetCard) return toast("找不到素材节点定义");
+            const c = addCard(assetCard.id, at.x, at.y, assetCard.modes[0].id);
+            c.outputs = [asset];
+            paintCard(c);
+            save();
+            toast("已上传：" + asset.filename);
+          } catch (err) {
+            toast("上传失败：" + err.message);
+          }
+        };
+        input.click();
+      }
+    });
+
+    // 粘贴复制的节点
+    if (CLIP) {
+      menu.push({
+        icon: "⧉",
+        text: "粘贴刚复制的节点（Ctrl+V）",
+        run: () => {
+          mouseW = at;
+          pasteCard();
+        }
+      });
+    }
+
+    if (menu.length > 0) {
+      showMenu(ev.clientX, ev.clientY, "画布", menu);
+    }
   });
 
   // 拖拽文件到画布 → 自动上传并建素材节点（落在鼠标位置）
@@ -2079,6 +2294,25 @@ function bindGlobal() {
         const k = ev.key.toLowerCase();
         if (k === "c" && c) { ev.preventDefault(); copyCard(c); return; }
         if (k === "v") { ev.preventDefault(); pasteCard(); return; }
+      }
+      // H键：将选中的节点定位到屏幕中上方
+      if (ev.key.toLowerCase() === "h" && c && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey && !ev.altKey) {
+        ev.preventDefault();
+        // 将节点移动到屏幕中上方（上方1/3处）
+        const stageRect = el.stage.getBoundingClientRect();
+        const targetScreenY = stageRect.top + stageRect.height * 0.3; // 屏幕上方30%处
+        const targetScreenX = stageRect.left + stageRect.width * 0.5;  // 屏幕中央
+
+        // 节点中心点在世界坐标中的位置
+        const cardCenterX = c.x + (c._el ? c._el.offsetWidth / 2 : CW / 2);
+        const cardCenterY = c.y + (c._el ? c._el.offsetHeight / 2 : 168 / 2);
+
+        // 计算需要的view偏移，让节点中心点显示在目标位置
+        view.x = targetScreenX - cardCenterX * view.k;
+        view.y = targetScreenY - cardCenterY * view.k;
+
+        applyView(); placePanel(); save();
+        return;
       }
     }
     if (ev.key !== "Escape") return;
@@ -2355,6 +2589,7 @@ function cardMenu(cx, cy, c) {
   const dlWord = outs.length > 1
     ? `下载全部 ${outs.length} 张${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`
     : `下载${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`;
+
   showMenu(cx, cy, c.name || (cap ? cap.name : "节点"), [
     ...(out ? [{ icon: "⛶", text: vword, run: () => openViewer(c) }] : []),
     ...(out ? [{ icon: "⬇", text: dlWord, run: () => outs.forEach(o => downloadOut(o)) }] : []),
@@ -2387,10 +2622,44 @@ function resetSize(c) {
 
 function renameCard(c) {
   const cap = capOf(c);
+  const oldName = titleOf(c);
   const n = prompt("节点名字（留空恢复成工作流名）", c.name || (cap ? cap.name : ""));
   if (n === null) return;
-  c.name = n.trim().slice(0, 40) || null;
-  paintTitle(c); save();
+  const newName = n.trim().slice(0, 40) || null;
+
+  // 旧名改新名：遍历所有节点的提示词，把 @旧名 替换成 @新名
+  if (oldName !== titleOf({ ...c, name: newName })) {
+    const oldTag = `@${oldName}`;
+    const newTag = newName ? `@${newName}` : `@${cap ? cap.name : ""}`;
+    const re = new RegExp(`@${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\u4e00-\\u9fa5\\w])`, 'g');
+
+    for (const card of PROJ.cards) {
+      const pcap = capOf(card);
+      if (!pcap) continue;
+      const specs = promptSpecs(pcap);
+      for (const s of specs) {
+        const v = card.params[s.key];
+        if (typeof v === 'string' && v.includes(oldTag)) {
+          card.params[s.key] = v.replace(re, newTag);
+        }
+      }
+      // 优化后的词也要替换
+      if (card.opt) {
+        for (const key in card.opt) {
+          if (typeof card.opt[key] === 'string' && card.opt[key].includes(oldTag)) {
+            card.opt[key] = card.opt[key].replace(re, newTag);
+          }
+        }
+      }
+    }
+  }
+
+  c.name = newName;
+  paintTitle(c);
+  // 重命名可能影响其他节点的面板显示（提示词里的 @标签文字变了），
+  // 如果当前打开的面板里有引用这个节点，需要刷新
+  if (selId) repanel(selId);
+  save();
 }
 
 function cloneCard(c) {
@@ -2429,8 +2698,10 @@ function addCard(type, x, y, cap) {
 }
 
 function delCard(id) {
+  // 删上游节点等同于删掉它的所有出口线：下游里由这些线带入的引用也必须清掉。
+  removeEdges(PROJ.edges.filter(e => e.from === id));
   PROJ.cards = PROJ.cards.filter(c => c.id !== id);
-  PROJ.edges = PROJ.edges.filter(e => e.from !== id && e.to !== id);
+  PROJ.edges = PROJ.edges.filter(e => e.to !== id);
   // 组里少一张；空组直接散掉
   selIds.delete(id);
   if (PROJ.groups) {
@@ -2496,10 +2767,20 @@ function pasteCard() {
 }
 
 /* ================= 连线传产物 ================= */
+function mediaLimit(cap, kind) {
+  if (!cap) return 0;
+  const declared = cap.slotLimits && cap.slotLimits[kind] && cap.slotLimits[kind].max;
+  return declared != null ? declared : cap.inputs.filter(s => s.type === kind).length;
+}
+
+function mediaCount(c, kind) {
+  const cap = capOf(c);
+  return cap ? cap.inputs.filter(s => s.type === kind && (c.assets || {})[s.key]).length : 0;
+}
+
 function firstFreeSlot(c, kind) {
   const cap = capOf(c); if (!cap) return null;
-  const specs = cap.inputs.filter(s => s.type === kind);
-  return (specs.find(s => !c.assets[s.key]) || specs[0] || null);
+  return cap.inputs.find(s => s.type === kind && !c.assets[s.key]) || null;
 }
 
 /** 把一个文本节点接到别的节点上。不搬文件、不占素材槽 ——
@@ -2545,63 +2826,90 @@ async function linkTo(from, to) {
   const outputs = from.outputs || [];
   const out = outputs[0];
   if (!out) return toast(isAsset(from) ? "这个素材节点还是空的：先点它选个文件" : "上游还没有产物，先运行它");
+
+  // 自动切换：文生图模式接收图片 → 切换到图生图模式（在查找槽位之前）
+  const toDef = defOf(to);
+  let modeSwitched = false;
+  if (toDef && toDef.id === "card_image" && out.kind === "image") {
+    if (to.cap === "zimage_t2i") {
+      to.cap = "zimage_i2i";
+      if (!to._model) to._model = "zimage";
+      paintTitle(to);
+      modeSwitched = true;
+    } else if (to.cap === "krea2_t2i") {
+      to.cap = "krea2_i2i";
+      if (!to._model) to._model = "krea2";
+      paintTitle(to);
+      modeSwitched = true;
+    }
+  }
+
+  // 普通「生视频」节点默认是图生视频。给它接视频时自动切到第一个真正收视频的模式
+  //（现在就是 H3 全能参考），不能再把 mp4 假装成参考图塞进 LoadImage。
+  const currentCap = capOf(to);
+  if (toDef && toDef.id === "card_video" && out.kind === "video"
+      && !(currentCap && currentCap.inputs.some(s => s.type === "video"))) {
+    const videoMode = toDef.modes.find(md => modeTakes(md, "video"));
+    if (videoMode) {
+      removeEdges(PROJ.edges.filter(e => e.to === to.id && !isTextEdge(e)));
+      to.assets = {};
+      to.cap = modeCap(videoMode);
+      paintTitle(to);
+      modeSwitched = true;
+    }
+  }
+
   // 路由节点先按上游产物的类型切到对应那一路，切完槽位名才对得上（见 routeFor）
   const r = routeFor(to, out.kind);
-  if (r) { to.cap = r.cap; to.assets = {}; paintTitle(to); }
+  if (r) {
+    removeEdges(PROJ.edges.filter(e => e.to === to.id));
+    to.cap = r.cap; to.assets = {}; paintTitle(to);
+  }
   const spec = r ? { key: r.slot, label: KIND_ZH[out.kind] || "素材" }
-    // 同类型的槽优先（视频产物接进视频槽）；没有就沿用老规矩，当参考图使
-    : (firstFreeSlot(to, out.kind)
-      || firstFreeSlot(to, out.kind === "audio" ? "audio" : "image"));
-  if (!spec) return toast("下游节点没有可接收的槽位");
-  PROJ.edges = PROJ.edges.filter(e => !(e.to === to.id && (r || e.slot === spec.key)));
-  PROJ.edges.push({ from: from.id, to: to.id, slot: spec.key });
-  drawWires(); paintStyles(); save();
+    // 素材类型必须和槽位一致。视频不能降级塞进图片格：界面虽然能预览，提交时却会
+    // 把 mp4 文件名写给 LoadImage，既显示成“图片素材”，运行也一定失败。
+    : firstFreeSlot(to, out.kind);
+  if (!spec) {
+    const limit = mediaLimit(capOf(to), out.kind);
+    return toast(limit && mediaCount(to, out.kind) >= limit
+      ? `${KIND_ZH[out.kind] || out.kind}引用已达上限 ${limit}`
+      : `下游节点没有可接收的${KIND_ZH[out.kind] || out.kind}槽位`);
+  }
+
+  // 同一格换接别的上游时，先清掉旧线拥有的全部引用；多产物线可能不止占 spec.key 一格。
+  if (!r) removeEdges(PROJ.edges.filter(e => e.to === to.id && edgeSlots(e).includes(spec.key)));
+  const edge = {
+    from: from.id, to: to.id, slot: spec.key,
+    slots: mediaSlotsForOutputs(to, spec.key, outputs),
+  };
+  PROJ.edges.push(edge);
+  drawWires(); paintStyles();
   try {
     // 风格是顺着这根线传下来的（没有单独的连线），接线那一刻就说一句，不然是隐形的
     const inh = styleTexts(to).length && promptSpecs(capOf(to)).length;
-    toast(`引用上游产物 → ${spec.label}` + (inh ? "；上游的风格也跟着传下来了" : ""));
+    const limit = mediaLimit(capOf(to), out.kind);
+    toast(`引用上游产物 → ${slotName(spec, to)}` + (limit ? `（上限 ${limit}）` : "")
+      + (inh ? "；上游的风格也跟着传下来了" : ""));
     // 素材节点手里那份本来就是上传上来的（已经在 input 目录里、ref 是现成的），
-    // 再走一遍 importOutput 就是把同一个文件下载下来重新传一次，纯粹白等
-
-    // 如果有多个产物，尝试填充所有对应的槽位
-    if (outputs.length > 1) {
-      const cap = CAPS[to.cap];
-      if (cap) {
-        // 找到所有相同类型的槽位（如 images[0], images[1], ...）
-        const match = /^(\w+)\[(\d+)\]$/.exec(spec.key);
-        if (match) {
-          const [_, slotType, startIdx] = match;
-          const allSlots = (cap.inputs || [])
-            .filter(s => s.key.startsWith(slotType + "[") && s.type === out.kind)
-            .sort((a, b) => {
-              const aIdx = parseInt(/\[(\d+)\]/.exec(a.key)[1]);
-              const bIdx = parseInt(/\[(\d+)\]/.exec(b.key)[1]);
-              return aIdx - bIdx;
-            });
-          console.log('[linkTo] 多产物填充:', { outputs: outputs.length, slots: allSlots.length });
-          for (let i = 0; i < Math.min(outputs.length, allSlots.length); i++) {
-            to.assets[allSlots[i].key] = isAsset(from) ? JSON.parse(JSON.stringify(outputs[i]))
-              : await importOutput(outputs[i]);
-          }
-        } else {
-          // 槽位名不是数组格式，只填第一个
-          to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
-            : await importOutput(out);
-        }
-      } else {
-        to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
-          : await importOutput(out);
-      }
-    } else {
-      // 单产物，原逻辑
-      to.assets[spec.key] = isAsset(from) ? JSON.parse(JSON.stringify(out))
-        : await importOutput(out);
+    // 再走一遍 importOutput 就是把同一个文件下载下来重新传一次，纯粹白等。
+    for (let i = 0; i < edge.slots.length; i++) {
+      const output = outputs[i];
+      if (!output) break;
+      const imported = isAsset(from) ? JSON.parse(JSON.stringify(output))
+        : await importOutput(output);
+      // 导入期间用户可能已经删线；异步返回后不能把刚清掉的引用重新塞回来。
+      if (!PROJ || !PROJ.edges.includes(edge)) return;
+      to.assets[edge.slots[i]] = imported;
     }
 
     paintKind(to);
-    if (selId === to.id) openPanel(to.id);
+    // 如果切换了模式，强制重新打开面板以显示新的槽位和参数
+    if (modeSwitched || selId === to.id) openPanel(to.id);
     save();
-  } catch (e) { toast("引用失败：" + e.message); }
+  } catch (e) {
+    save();
+    toast("引用失败：" + e.message);
+  }
 }
 
 /** 这个模式收得下 kind 类型的素材吗。
@@ -2760,6 +3068,11 @@ function pushHistory(c) {
     // 挂了风格节点时，节点上提示词框里的字并不是真发出去的那段（风格是提交那一刻并进去的）。
     // 只有把当时真提交的整段留下来，这一轮才复现得出来 —— 风格节点后来改了、解除了都不影响它
     ...(c._sent ? { prompt: c._sent } : {}),
+    // 生图节点：记录提示词和负面提示词
+    ...((c.cap === "zimage_t2i" || c.cap === "krea2_t2i") && c.params ? {
+      user_prompt: c.params.prompt || "",
+      negative_prompt: c.params.negative_prompt || ""
+    } : {}),
   });
   if (c.history.length > HIST_MAX) c.history.length = HIST_MAX;
 }
@@ -2852,6 +3165,34 @@ function histRun(c, h, cur) {
     const t = ev.target.closest("[data-i]");
     if (t) openViewer(c, +t.dataset.i, outs, h.seed);
   };
+  // 历史记录右键菜单：下载
+  rg.oncontextmenu = (ev) => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    const t = ev.target.closest("[data-i]");
+    if (!t) return;
+    const idx = +t.dataset.i;
+    const out = outs[idx];
+    if (!out) return;
+
+    const menu = [];
+    // 单张下载
+    menu.push({
+      icon: "⬇",
+      text: `下载${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`,
+      run: () => downloadOut(out)
+    });
+    // 全部下载（如果有多张）
+    if (outs.length > 1) {
+      menu.push({
+        icon: "⬇",
+        text: `下载全部 ${outs.length} 张${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`,
+        run: () => outs.forEach(o => downloadOut(o))
+      });
+    }
+
+    showMenu(ev.clientX, ev.clientY, "历史记录", menu);
+  };
 
   box.append(rh, rg);
 
@@ -2868,11 +3209,77 @@ function histRun(c, h, cur) {
   }
   box.appendChild(rs);
 
+  // 生图节点：显示提示词和负面提示词
+  if (h.user_prompt || h.negative_prompt) {
+    const rp = document.createElement("details"); rp.className = "rp";
+    const sm = document.createElement("summary"); sm.textContent = "提示词";
+    const tx = document.createElement("div");
+    if (h.user_prompt) {
+      const row = document.createElement("div");
+      row.style.display = "flex";
+      row.style.justifyContent = "space-between";
+      row.style.alignItems = "center";
+      row.style.marginBottom = "4px";
+      const label = document.createElement("div");
+      label.style.fontWeight = "bold";
+      label.textContent = "正面提示词：";
+      const cpBtn = document.createElement("button");
+      cpBtn.textContent = "复制";
+      cpBtn.style.fontSize = "12px";
+      cpBtn.style.padding = "2px 8px";
+      cpBtn.onclick = () => navigator.clipboard.writeText(h.user_prompt)
+        .then(() => toast("已复制正面提示词"), () => toast("复制失败"));
+      row.append(label, cpBtn);
+      const content = document.createElement("div");
+      content.style.marginBottom = h.negative_prompt ? "8px" : "0";
+      content.textContent = h.user_prompt;
+      tx.append(row, content);
+    }
+    if (h.negative_prompt) {
+      const row = document.createElement("div");
+      row.style.display = "flex";
+      row.style.justifyContent = "space-between";
+      row.style.alignItems = "center";
+      row.style.marginBottom = "4px";
+      const label = document.createElement("div");
+      label.style.fontWeight = "bold";
+      label.textContent = "负面提示词：";
+      const cpBtn = document.createElement("button");
+      cpBtn.textContent = "复制";
+      cpBtn.style.fontSize = "12px";
+      cpBtn.style.padding = "2px 8px";
+      cpBtn.onclick = () => navigator.clipboard.writeText(h.negative_prompt)
+        .then(() => toast("已复制负面提示词"), () => toast("复制失败"));
+      row.append(label, cpBtn);
+      const content = document.createElement("div");
+      content.textContent = h.negative_prompt;
+      tx.append(row, content);
+    }
+    rp.append(sm, tx);
+    box.appendChild(rp);
+  }
+
   // 套了风格节点的那几轮：把当时真提交的整段提示词收在这儿。节点上那个框里的字
   // 不等于跑出这一轮的那段话，不放出来的话这一轮等于没法复现
   if (h.prompt) {
     const rp = document.createElement("details"); rp.className = "rp";
+    const smRow = document.createElement("div");
+    smRow.style.display = "flex";
+    smRow.style.justifyContent = "space-between";
+    smRow.style.alignItems = "center";
     const sm = document.createElement("summary"); sm.textContent = "当时提交的提示词";
+    const cpBtn = document.createElement("button");
+    cpBtn.textContent = "复制";
+    cpBtn.style.fontSize = "12px";
+    cpBtn.style.padding = "2px 8px";
+    cpBtn.style.marginLeft = "8px";
+    cpBtn.onclick = (ev) => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      navigator.clipboard.writeText(h.prompt)
+        .then(() => toast("已复制提示词"), () => toast("复制失败"));
+    };
+    sm.appendChild(cpBtn);
     const tx = document.createElement("div"); tx.textContent = h.prompt;
     rp.append(sm, tx);
     box.appendChild(rp);
@@ -3026,17 +3433,14 @@ function openPanel(id) {
   // 放在提示词前面：漫剧那种一图一提示词的工作流，tab 是跟着图长出来的，
   // 先看到图槽才讲得通
   const media = specs.filter(x => MEDIA.includes(x.type));
-  if (media.length) {
-    const wrap = document.createElement("div"); wrap.className = "slots";
-    for (const s of media) wrap.appendChild(slotEl(c, s));
-    body.appendChild(wrap);
-  }
+  if (media.length) body.appendChild(referenceSlots(c, media, md));
 
   // --- 音频选区 ---
   // 起止点不画成两个文本框：要裁哪一段全靠听（第几秒开始唱），手打 "0:05" 得先知道
-  // 这音频哪一秒在唱什么，只能反复试跑。manifest 里的 rangeOf 指向它裁的那个音频槽
+  // 这音频哪一秒在唱什么，只能反复试跑。manifest 里的 rangeOf 指向它裁的那个音频槽。
+  // 没引用音频时连素材卡都不显示，选区自然也不能先占一块位置。
   const ranged = new Set();
-  for (const s of media) {
+  for (const s of media.filter(s => (c.assets || {})[s.key])) {
     const rg = specs.filter(x => x.rangeOf === s.key);
     if (rg.length !== 2) continue;      // 不是成对的起止点，还是交给普通旋钮画
     body.appendChild(audioRange(c, s, rg[0], rg[1]));
@@ -3050,6 +3454,11 @@ function openPanel(id) {
   const paired = norm.filter(x => x.pairWith && specs.some(y => y.key === x.pairWith));
   if (paired.length > 1) body.appendChild(promptTabs(c, paired));
   for (const s of norm) {
+    // 负面提示词只在文生图模式下显示（Z-Image和Krea2都支持）
+    if (s.key === "negative_prompt") {
+      const isT2I = c.cap === "zimage_t2i" || c.cap === "krea2_t2i";
+      if (!isT2I) continue;
+    }
     if (!paired.includes(s) || paired.length < 2) body.appendChild(promptBlock(c, s));
   }
   for (const s of tpl) body.appendChild(templateBlock(c, s));
@@ -3092,6 +3501,46 @@ function openPanel(id) {
         text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),
         run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo); openPanel(id); paintTitle(c); save(); },
       }))));
+
+    // 模型选择按钮（文生图和图生图模式显示，用于在Z-Image和Krea2之间切换）
+    if (def.id === "card_image" && c.cap && (c.cap === "zimage_t2i" || c.cap === "krea2_t2i" || c.cap === "zimage_i2i" || c.cap === "krea2_i2i")) {
+      // 保存当前选择的模型到卡片对象
+      if (!c._model) c._model = (c.cap === "krea2_t2i" || c.cap === "krea2_i2i") ? "krea2" : "zimage";
+      const curModel = c._model || "zimage";
+
+      const modelBtn = capBtn(
+        curModel === "krea2" ? "🎨 Krea2" : "🖼 Z-Image",
+        "生图模型",
+        () => [
+          {
+            icon: "🖼",
+            text: "Z-Image" + (curModel === "zimage" ? "（当前）" : ""),
+            run: () => {
+              tipHide(); closeResPop();
+              c._model = "zimage";
+              // 实时判断当前是否为图生图模式（检查后缀而不是具体值，更robust）
+              const isCurrentI2I = c.cap && c.cap.endsWith("_i2i");
+              c.cap = isCurrentI2I ? "zimage_i2i" : "zimage_t2i";
+              openPanel(id); paintTitle(c); save();
+            }
+          },
+          {
+            icon: "🎨",
+            text: "Krea2" + (curModel === "krea2" ? "（当前）" : ""),
+            run: () => {
+              tipHide(); closeResPop();
+              c._model = "krea2";
+              // 实时判断当前是否为图生图模式（检查后缀而不是具体值，更robust）
+              const isCurrentI2I = c.cap && c.cap.endsWith("_i2i");
+              c.cap = isCurrentI2I ? "krea2_i2i" : "krea2_t2i";
+              openPanel(id); paintTitle(c); save();
+            }
+          }
+        ]
+      );
+      foot.appendChild(modelBtn);
+    }
+
     const pb = document.createElement("button");
     pb.className = "tcap";
     const cb = paramsBrief(c, cap);
@@ -3198,10 +3647,7 @@ function stylePanel(c) {
     a.onclick = () => pick(to.id);
     const x = document.createElement("button"); x.className = "off";
     x.textContent = "解除"; x.title = "这个节点不再套用本风格";
-    x.onclick = () => {
-      PROJ.edges = PROJ.edges.filter(y => y !== e);
-      drawWires(); paintStyles(); openPanel(c.id); save();
-    };
+    x.onclick = () => delEdge(e);
     r.append(a, x);
     box.appendChild(r);
   }
@@ -3288,7 +3734,12 @@ function assetPanel(c) {
   }
   const clr = document.createElement("button"); clr.textContent = "清空";
   clr.title = "把这份素材扔掉，节点变回空（不会删文件本身）";
-  clr.onclick = () => { c.outputs = []; paint(c); paintKind(c); openPanel(c.id); save(); };
+  clr.onclick = () => {
+    c.outputs = [];
+    // 连线保留，方便之后重新选文件；但下游不能继续拿已经清空的旧素材运行。
+    for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e))) clearEdgeAssets(e);
+    paint(c); paintKind(c); openPanel(c.id); save();
+  };
   ops.appendChild(clr);
   cnt.textContent = a ? (a.filename || "").split(/[\\/]/).pop() : "";
   wrap.appendChild(ops);
@@ -3317,10 +3768,7 @@ function assetPanel(c) {
     b.onclick = () => pick(to.id);
     const x = document.createElement("button"); x.className = "off";
     x.textContent = "解除"; x.title = "这个节点不再收这份素材";
-    x.onclick = () => {
-      PROJ.edges = PROJ.edges.filter(y => y !== e);
-      drawWires(); paintStyles(); openPanel(c.id); save();
-    };
+    x.onclick = () => delEdge(e);
     r.append(b, x);
     box.appendChild(r);
   }
@@ -3402,10 +3850,7 @@ function textPanel(c) {
     a.onclick = () => pick(to.id);
     const x = document.createElement("button"); x.className = "off";
     x.textContent = "解除"; x.title = "这个节点不再用这段文本";
-    x.onclick = () => {
-      PROJ.edges = PROJ.edges.filter(y => y !== e);
-      drawWires(); paintStyles(); openPanel(c.id); save();
-    };
+    x.onclick = () => delEdge(e);
     r.append(a, x);
     sbox.appendChild(r);
   }
@@ -3475,6 +3920,8 @@ function textPanel(c) {
 async function runText(c) {
   const op = textOp(c);
   if (!op) return toast("先在上面选一种加工方式（润色 / 优化 / 扩写 / 自定义）");
+  // 防止重复点击：已经在运行就不要再发请求
+  if (c.status === "running") return toast("文本加工正在进行中，请稍候");
   c.error = null; c.status = "running"; c.ms = null;
   paint(c);
   if (el.panel._id === c.id) openPanel(c.id);
@@ -3517,31 +3964,27 @@ function textRunToast(r) {
     后端也照这个关系清空未配对的提示词，两边的列表长度才对得上。 */
 function promptTabs(c, list) {
   const cap = capOf(c);
-  // tab 名跟着素材槽走：槽叫"四宫格3"，这条就是"四宫格3 的提示词"
-  const name = (s) => slotName(cap.inputs.find(x => x.key === s.pairWith) || s);
+  const active = list.filter(s => (c.assets || {})[s.pairWith]);
+  // tab 名只按当前真正引用的图片顺序编号；删掉图片1后，原图片2会自然显示成图片1。
+  const name = (s) => slotName(cap.inputs.find(x => x.key === s.pairWith) || s, c);
   const wrap = document.createElement("div"); wrap.className = "ptabs";
-  const strip = document.createElement("div"); strip.className = "tabs";
-  const on = list.map(s => !!c.assets[s.pairWith]);
-  if (c._tab == null || !on[c._tab]) c._tab = on.indexOf(true);
+  if (c._tab == null || c._tab < 0 || c._tab >= active.length) c._tab = active.length ? 0 : -1;
 
-  list.forEach((s, i) => {
-    const b = document.createElement("button");
-    const txt = String(c.params[s.key] != null ? c.params[s.key] : s.default || "").trim();
-    b.textContent = name(s) + (on[i] && txt ? " ●" : "");
-    if (!on[i]) {
-      b.className = "off";
-      b.title = `上传「${name(s)}」后启用 —— 提示词是一张图配一条`;
-    } else {
+  if (active.length) {
+    const strip = document.createElement("div"); strip.className = "tabs";
+    active.forEach((s, i) => {
+      const b = document.createElement("button");
+      const txt = String(c.params[s.key] != null ? c.params[s.key] : s.default || "").trim();
+      b.textContent = name(s) + (txt ? " ●" : "");
       b.className = i === c._tab ? "on" : "";
       b.onclick = () => { c._tab = i; openPanel(c.id); };
-    }
-    strip.appendChild(b);
-  });
-  wrap.appendChild(strip);
-  if (c._tab >= 0) wrap.appendChild(promptBlock(c, list[c._tab], name(list[c._tab]) + " 的提示词"));
-  else {
+      strip.appendChild(b);
+    });
+    wrap.appendChild(strip);
+    wrap.appendChild(promptBlock(c, active[c._tab], name(active[c._tab]) + " 的提示词"));
+  } else {
     const p = document.createElement("div"); p.className = "tabempty";
-    p.textContent = "先上传图片。每加一张图，这里就多一条它专属的提示词。";
+    p.textContent = "还没有图片引用。添加图片后，这里才显示对应提示词。";
     wrap.appendChild(p);
   }
   return wrap;
@@ -3604,7 +4047,7 @@ function promptBlock(c, s, label) {
     highlightLayer.style.borderColor = "transparent";
     highlightLayer.style.whiteSpace = "pre-wrap";
     highlightLayer.style.overflowWrap = cs.overflowWrap;
-    highlightLayer.style.wordBreak = cs.wordBreak || "break-word";
+    highlightLayer.style.wordBreak = cs.wordBreak || "normal";
 
     // 层的边框宽度也从 textarea 抄了过来（透明、宽度一致），
     // 所以边框盒直接对齐 wrapper（= textarea 的边框盒）就是重合，
@@ -3664,7 +4107,7 @@ function promptBlock(c, s, label) {
   }
 
   // 优化后那份是给模型看的格式化长文（H3 的六段式能有四五百词），框子要高一点
-  if (useOpt) ta.classList.add("optta");
+  if (useOpt) { ta.classList.add("optta"); highlightLayer.classList.add("opt"); }
 
   // 阻止滚动事件冒泡到画布
   ta.addEventListener('wheel', (ev) => {
@@ -3740,7 +4183,7 @@ function promptBlock(c, s, label) {
           const asset = c.assets[s.key];
           if (!asset || !asset.ref) return;
 
-          const slotLabel = s.label || s.key;
+          const slotLabel = slotName(s, c);
           if (!slotLabel.toLowerCase().includes(query)) return;
 
           items.push({
@@ -3937,7 +4380,7 @@ function promptBlock(c, s, label) {
     if (!previewData) {
       const cap = CAPS[runCap(c)] || capOf(c);
       if (cap && cap.inputs) {
-        const slot = cap.inputs.find(s => (s.label || s.key) === name);
+        const slot = cap.inputs.find(s => slotName(s, c) === name);
         if (slot && c.assets[slot.key]) {
           previewData = { type: slot.type, url: c.assets[slot.key].url, name };
         }
@@ -4022,6 +4465,7 @@ function promptBlock(c, s, label) {
     const isDemo = !useOpt && !!s.default && ta.value.trim() === String(s.default).trim();
     tag.style.display = isDemo ? "" : "none";
     ta.classList.toggle("isdemo", isDemo);
+    highlightLayer.classList.toggle("demo", isDemo);   // 文字色由高亮层出，同步打给层
   };
 
   // 从输入框内容中提取用户自己的文本
@@ -4259,6 +4703,8 @@ function rwToast(r) {
     前面有活儿还得排队，界面上就是按钮一直显示「优化中…」。 */
 /** 翻译提示词（中→英 / 英→中），调用有道翻译 API */
 async function doTranslate(c, s) {
+  // 防止重复点击：已经在跑就不要再发请求
+  if (c._rwBusy) return toast("翻译正在进行中，请稍候");
   // 根据当前选中的 tab 决定翻译哪个版本：优化后 or 原文
   const useOpt = !!(c.optUse && c.optUse[s.key]);
   const src = useOpt && c.opt && c.opt[s.key]
@@ -4313,7 +4759,7 @@ function resolveCardMentions(prompt, card) {
     if (!asset || !asset.ref) continue;
 
     // 1. 如果槽位有素材，先按槽位标签映射（图片、场景等）
-    const slotLabel = s.label || s.key;
+    const slotLabel = slotName(s, card);
     if (s.type === 'image') {
       slotMap.set(slotLabel, `<Picture ${picIdx}>`);
     } else if (s.type === 'audio') {
@@ -4390,7 +4836,7 @@ function buildCardInfo(card) {
     if (sourceCard) {
       info[s.key] = titleOf(sourceCard);
     } else {
-      info[s.key] = s.label || s.key;
+      info[s.key] = slotName(s, card);
     }
   }
 
@@ -4400,6 +4846,8 @@ function buildCardInfo(card) {
 async function doRewrite(c, s, model) {
   const cap = CAPS[runCap(c)] || capOf(c);
   if (!cap || !cap.rewrite) return;
+  // 防止重复点击：已经在跑就不要再发请求
+  if (c._rwBusy) return toast("优化正在进行中，请稍候");
   // 拿的一定是**原词**：优化的输入永远是用户自己写的那段，不是上一轮的优化结果
   // （拿优化结果再优化会一轮轮越写越长，最后跟用户想要的没关系了）
   const src = String(c.params[s.key] != null ? c.params[s.key] : (s.default || ""));
@@ -4544,11 +4992,12 @@ function paintKind(c) {
   const out = (c.outputs || [])[0];
   const res = (out && (out.width && out.height)) ? ` ${out.width}×${out.height}` : "";
   k.textContent = undecided ? "🖼🎬 跟素材" : kind === "video" ? `🎬 视频${res}` : `🖼 图片${res}`;
-  const ins = md && md.route ? Object.keys(md.route)
-    : [...new Set(((capOf(c) || {}).inputs || [])
-        .filter(s => MEDIA.includes(s.type)).map(s => s.type))];
+  const inputs = ((capOf(c) || {}).inputs || []).filter(s => MEDIA.includes(s.type));
+  const ins = md && md.route ? Object.keys(md.route) : [...new Set(inputs.map(s => s.type))];
+  const required = [...new Set(inputs.filter(s => s.required).map(s => s.type))];
   k.title = (undecided ? "放图片就出图片、放视频就出视频" : `这个节点出${KIND_ZH[kind]}`)
-    + (ins.length ? `；要${ins.map(x => KIND_ZH[x] || x).join(" / ")}素材` : "；不用素材");
+    + (required.length ? `；必需${required.map(x => KIND_ZH[x] || x).join(" / ")}素材`
+      : ins.length ? `；可引用${ins.map(x => KIND_ZH[x] || x).join(" / ")}素材` : "；不用素材");
   // 还没出过产物时画面区那个大图标也是同一个信息，一起换掉（有产物就别动它）。
   // 文本节点的空态是一整块提示（图标＋引导字），交给 paint() 画，这里别只换图标
   const body = c._el.querySelector(".body");
@@ -4579,13 +5028,62 @@ function paintPort(c) {
       : "文本节点的出口拖到这里";
 }
 
+/** 素材引用按需显示：只有已经引用的素材才画卡片；下面的添加按钮直接打开文件选择，
+    取消选择不会留下空槽。每种类型同时标出上限，连线和手动上传共用同一套限制。 */
+function referenceSlots(c, specs, md) {
+  const cap = capOf(c);
+  const wrap = document.createElement("div"); wrap.className = "slots refs";
+  const filled = specs.filter(s => (c.assets || {})[s.key]);
+  const route = md && md.route;
+  const kinds = [...new Set(specs.map(s => s.type))];
+
+  const head = document.createElement("div"); head.className = "refhead";
+  if (route) {
+    head.textContent = "引用上限：素材 1 个";
+  } else {
+    const limits = [];
+    for (const kind of kinds) {
+      const max = mediaLimit(cap, kind);
+      if (max) limits.push(`${KIND_ZH[kind] || kind} ${max}`);
+    }
+    head.textContent = `引用上限：${limits.join(" · ")}`;
+  }
+  wrap.appendChild(head);
+  for (const s of filled) wrap.appendChild(slotEl(c, s));
+
+  const adds = document.createElement("div"); adds.className = "refadds";
+  if (route) {
+    if (!filled.length && specs.length) {
+      const b = document.createElement("button"); b.className = "refadd";
+      b.textContent = "＋ 添加素材（0/1）";
+      b.title = "可引用图片或视频，上限 1 个";
+      b.onclick = () => pickFile(c, specs[0]);
+      adds.appendChild(b);
+    }
+  } else {
+    for (const kind of kinds) {
+      const max = mediaLimit(cap, kind);
+      const count = filled.filter(s => s.type === kind).length;
+      const next = specs.find(s => s.type === kind && !(c.assets || {})[s.key]);
+      if (!max || count >= max || !next) continue;
+      const b = document.createElement("button"); b.className = "refadd";
+      b.textContent = `＋ 添加${KIND_ZH[kind] || kind}（${count}/${max}）`;
+      b.title = `${KIND_ZH[kind] || kind}引用上限 ${max}`;
+      b.onclick = () => pickFile(c, next);
+      adds.appendChild(b);
+    }
+  }
+  if (adds.childElementCount) wrap.appendChild(adds);
+  return wrap;
+}
+
 function slotEl(c, s) {
   const a = c.assets[s.key];
   const d = document.createElement("div");
   d.className = "slot" + (a ? " filled" : s.required ? " req" : "");
-  d.title = (s.hint || slotName(s)) + (s.required ? "（必填）" : "");
+  d.title = (s.hint || slotName(s, c)) + (s.required ? "（必填）" : "");
   d.innerHTML = `<div class="box"></div><span class="lbl"></span>`;
-  d.querySelector(".lbl").textContent = slotName(s);
+  d.querySelector(".lbl").textContent = slotName(s, c);
   const box = d.querySelector(".box");
   if (a) {
     box.innerHTML = a.kind === "image" ? `<img src="${a.url}" draggable="false">`
@@ -4598,13 +5096,13 @@ function slotEl(c, s) {
     ev.preventDefault();
     if (!a) return;
     // 以前右键直接就把这一格清了，手滑一下素材就没了，还跟"右键=看菜单"的直觉相反
-    showMenu(ev.clientX, ev.clientY, a.origin || slotName(s), [
+    showMenu(ev.clientX, ev.clientY, a.origin || slotName(s, c), [
       { icon: "⛶", text: a.kind === "image" ? "查看大图" : "放大播放", run: () => openAsset(a) },
       { icon: "📁", text: "定位文件", run: () => revealAsset(a) },
       {
         icon: "✕", text: "清空这一格", danger: true, run: () => {
           delete c.assets[s.key];
-          PROJ.edges = PROJ.edges.filter(e => !(e.to === c.id && e.slot === s.key));
+          detachSlotEdges(c.id, s.key);
           paintKind(c);
           drawWires(); paintStyles(); openPanel(c.id); save();
         },
@@ -4636,7 +5134,7 @@ function audioRange(c, slot, sSpec, eSpec) {
   const a = c.assets[slot.key];
   if (!a) {
     const n = document.createElement("div"); n.className = "anote";
-    n.textContent = `先在上面的「${slotName(slot)}」传一段音频，这里就能试听、拖着选要用的一段。`;
+    n.textContent = `先在上面的「${slotName(slot, c)}」传一段音频，这里就能试听、拖着选要用的一段。`;
     d.appendChild(n);
     return d;
   }
@@ -4770,6 +5268,18 @@ function pickAsset(c, onItem) {
 async function setAssetItem(c, item) {
   c.outputs = [{ ...item, filename: (item.origin || item.url).split(/[\\/]/).pop() }];
   paint(c); paintTitle(c); openPanel(c.id); save();
+
+  // 同步更新所有引用这个素材节点的下游节点。上游曾清空过时下游格也会是空的，
+  // 不能拿“当前有值”当条件，否则重新选择文件后连线还在、引用却恢复不了。
+  const edges = PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e));
+  for (const e of edges) {
+    const to = PROJ.cards.find(x => x.id === e.to);
+    if (!to || !to.assets) continue;
+    for (const key of edgeSlots(e)) {
+      to.assets[key] = JSON.parse(JSON.stringify(c.outputs[0]));
+    }
+    paintKind(to);
+  }
 
   // 加载媒体获取原始尺寸，缩小一半显示
   if (item.kind === "image") {
@@ -5054,40 +5564,26 @@ async function pollJobs() {
           const to = PROJ.cards.find(x => x.id === e.to);
           if (!to) continue;
 
-          // 如果上游有多个产物，尝试填充到下游的多个槽位
+          // 只更新这根线实际绑定的格。这样用户手动换掉其中一格后，上游重跑不会再抢回来；
+          // 上游这轮少产物时，多出来的旧引用也同步清掉。
           const outputs = c.outputs || [];
-          if (outputs.length > 1) {
-            // 多产物：找出下游同类型的所有槽位
-            const cap = defOf(to);
-            const baseSlot = e.slot; // 连线指向的槽位，如 "images[0]"
-            const match = /^(\w+)\[(\d+)\]$/.exec(baseSlot);
-            if (match) {
-              const [_, slotType, startIdx] = match;
-              // 找出所有同类型槽位，按索引排序
-              const allSlots = (cap.inputs || [])
-                .filter(s => s.key.startsWith(slotType + "["))
-                .sort((a, b) => {
-                  const aIdx = parseInt(/\[(\d+)\]/.exec(a.key)[1]);
-                  const bIdx = parseInt(/\[(\d+)\]/.exec(b.key)[1]);
-                  return aIdx - bIdx;
-                });
-              // 从第一个槽位开始，依次填充所有产物
-              for (let i = 0; i < Math.min(outputs.length, allSlots.length); i++) {
-                try {
-                  to.assets[allSlots[i].key] = await importOutput(outputs[i]);
-                } catch (err) {
-                  console.error('导入产物失败:', err);
-                }
-              }
-            } else {
-              // 非数组槽位，只填第一个
-              try { to.assets[e.slot] = await importOutput(outputs[0]); } catch (err) {}
+          const slots = edgeSlots(e);
+          e.slots = slots;              // 老项目第一次跑到这里时顺便升级绑定记录
+          for (let i = 0; i < slots.length; i++) {
+            if (!outputs[i]) {
+              delete to.assets[slots[i]];
+              continue;
             }
-          } else {
-            // 单产物：原逻辑
-            try { to.assets[e.slot] = await importOutput(outputs[0]); } catch (err) {}
+            try {
+              const imported = await importOutput(outputs[i]);
+              // 导入期间删线/删节点后，这份迟到的结果不能把引用复活。
+              if (PROJ && PROJ.edges.includes(e) && cardOf(to.id)) to.assets[slots[i]] = imported;
+            } catch (err) {
+              console.error('导入产物失败:', err);
+            }
           }
 
+          paintKind(to);
           if (el.panel._id === to.id) openPanel(to.id);
         }
       }

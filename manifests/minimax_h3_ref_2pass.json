@@ -1,15 +1,15 @@
 {
- "id": "minimax_h3_ref9",
- "name": "H3全能参考",
- "file": "MiniMax H3 全能参考(通用) 九图+视频",
- "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MiniMax H3 全能参考(通用) 九图+视频.json",
+ "id": "minimax_h3_ref_2pass",
+ "name": "H3全能参考(高质量)",
+ "file": "Minimax H3 多图全能二采-V2",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\Minimax H3 多图全能二采-V2.json",
  "group": "视频",
  "outputType": "video",
  "kind": "gen",
  "card": "video",
- "slots": "img9+aud0+vid1",
+ "slots": "img9+aud3+vid1",
  "images": 9,
- "audios": 0,
+ "audios": 3,
  "videos": 1,
  "slotLimits": {
   "image": {
@@ -18,18 +18,18 @@
   },
   "audio": {
    "min": 0,
-   "max": 0
+   "max": 3
   },
   "video": {
    "min": 0,
    "max": 1
   }
  },
- "graph": "graphs/minimax_h3_ref9.api.json",
+ "graph": "graphs/minimax_h3_ref_2pass.api.json",
  "output": {
-  "node": "38"
+  "node": "225"
  },
- "note": "视频引用在提示词里按顺序对应 <Video 1>；图片引用按顺序对应 <Picture 1>、<Picture 2>……。所有素材都可选，视频可参考动作和镜头节奏，图片可补人物、场景、服装等外观。\n多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。\n提示词只写「镜头里看得见、听得见」的东西。这几种写法它一律读不懂，还会把真正的画面描述冲淡：\n· 分镜表格（镜号／景别／运镜 那种带表头的一大片）—— 改成一句句话写；\n· 导演阐述、创作意图（「突出人物的渺小」「为后续做铺垫」）—— 直接删掉，改成写画面上的结果；\n· 「你是导演某某」这类交代身份的话 —— 它不是聊天模型，这句纯占位置，想要某种质感就直接描述质感（胶片颗粒、冷暖对比光）。\n每个镜头写清「第几秒到第几秒 + 景别 + 谁在做什么 + 镜头怎么动」，各镜头时长加起来等于「时长(秒)」那个数；台词直接用引号写在那个镜头里。\n第一人称视角这类「主角不在画面里」的要求跟参考图是矛盾的 —— 参考图会一直把人拉回画面中央，想要主观视角就别放人物参考图。\n画面糊、脸不像先看「分辨率」：调到 1.0 以上再看一遍，参考图也是按这个分辨率缩过之后才喂进模型的，调低了人物细节就一起丢了。",
+ "note": "视频引用在提示词里按顺序对应 <Video 1>；图片引用按顺序对应 <Picture 1>、<Picture 2>……。所有素材都可选，视频可参考动作和镜头节奏，图片可补人物、场景、服装等外观。\n多张参考图要在提示词里点名才不串：第 1 张是 <Picture 1>，第 2 张是 <Picture 2>，依次往下。图从第一格开始按顺序填，中间空格会让后面的图顺位提前。\n提示词只写「镜头里看得见、听得见」的东西。这几种写法它一律读不懂，还会把真正的画面描述冲淡：\n· 分镜表格（镜号／景别／运镜 那种带表头的一大片）—— 改成一句句话写；\n· 导演阐述、创作意图（「突出人物的渺小」「为后续做铺垫」）—— 直接删掉，改成写画面上的结果；\n· 「你是导演某某」这类交代身份的话 —— 它不是聊天模型，这句纯占位置，想要某种质感就直接描述质感（胶片颗粒、冷暖对比光）。\n每个镜头写清「第几秒到第几秒 + 景别 + 谁在做什么 + 镜头怎么动」，各镜头时长加起来等于「时长(秒)」那个数；台词直接用引号写在那个镜头里。\n第一人称视角这类「主角不在画面里」的要求跟参考图是矛盾的 —— 参考图会一直把人拉回画面中央，想要主观视角就别放人物参考图。\n画面糊、脸不像先看「分辨率」：调到 1.0 以上再看一遍，参考图也是按这个分辨率缩过之后才喂进模型的，调低了人物细节就一起丢了。\n\n这个工作流是二次采样版本：先生成基础画面，再通过潜空间放大 1.5 倍并精修细节。相比单采版本质量更高、分辨率更大，但速度慢一倍（20 步分两阶段）。\n最多支持 1 个视频 + 9 张图片 + 3 段音频，全部按需引用，没有必填素材。\n适合最终交付作品；快速预览用单采版本（H3全能参考）。",
  "rewrite": {
   "regime": "h3_ref"
  },
@@ -41,23 +41,23 @@
    "type": "video",
    "required": false,
    "target": {
-    "node": "78",
+    "node": "221",
     "input": "video",
     "kind": "upload_video"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_videos.ref_video_0"
     },
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_video_audios.ref_video_audio_0"
     }
    ],
    "dropIfNoAudio": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_video_audios.ref_video_audio_0"
     }
    ]
@@ -68,13 +68,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "47",
+    "node": "137",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_0"
     }
    ]
@@ -85,13 +85,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "48",
+    "node": "139",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_1"
     }
    ]
@@ -102,13 +102,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "49",
+    "node": "146",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_2"
     }
    ]
@@ -119,13 +119,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "66",
+    "node": "147",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_3"
     }
    ]
@@ -136,13 +136,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "72",
+    "node": "148",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_4"
     }
    ]
@@ -153,13 +153,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "73",
+    "node": "149",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_5"
     }
    ]
@@ -170,13 +170,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "74",
+    "node": "150",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_6"
     }
    ]
@@ -187,13 +187,13 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "75",
+    "node": "151",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_7"
     }
    ]
@@ -204,14 +204,65 @@
    "type": "image",
    "required": false,
    "target": {
-    "node": "76",
+    "node": "170",
     "input": "image",
     "kind": "upload_image"
    },
    "dropIfEmpty": [
     {
-     "node": "45",
+     "node": "186",
      "input": "ref_images.ref_image_8"
+    }
+   ]
+  },
+  {
+   "key": "audio[0]",
+   "label": "音频",
+   "type": "audio",
+   "required": false,
+   "target": {
+    "node": "155",
+    "input": "audio",
+    "kind": "upload_audio"
+   },
+   "dropIfEmpty": [
+    {
+     "node": "186",
+     "input": "ref_audios.ref_audio_0"
+    }
+   ]
+  },
+  {
+   "key": "audio[1]",
+   "label": "音频2",
+   "type": "audio",
+   "required": false,
+   "target": {
+    "node": "163",
+    "input": "audio",
+    "kind": "upload_audio"
+   },
+   "dropIfEmpty": [
+    {
+     "node": "186",
+     "input": "ref_audios.ref_audio_1"
+    }
+   ]
+  },
+  {
+   "key": "audio[2]",
+   "label": "音频3",
+   "type": "audio",
+   "required": false,
+   "target": {
+    "node": "164",
+    "input": "audio",
+    "kind": "upload_audio"
+   },
+   "dropIfEmpty": [
+    {
+     "node": "186",
+     "input": "ref_audios.ref_audio_2"
     }
    ]
   },
@@ -221,8 +272,8 @@
    "type": "textarea",
    "default": "",
    "target": {
-    "node": "68",
-    "input": "text"
+    "node": "138",
+    "input": "value"
    }
   },
   {
@@ -232,11 +283,11 @@
    "min": 1,
    "max": 40,
    "step": 1,
-   "default": 8,
-   "hint": "推荐 8：模型带加速 LoRA，8 步就到位了。往下调会花，往上调基本白等",
+   "default": 20,
+   "hint": "推荐 20：模型带加速 LoRA，20 步就到位了。往下调会花，往上调基本白等",
    "advanced": true,
    "target": {
-    "node": "1",
+    "node": "124",
     "input": "steps",
     "vtype": "INT"
    }
@@ -248,12 +299,44 @@
    "min": 5,
    "max": 15,
    "step": 1,
-   "default": 10,
+   "default": 5,
    "hint": "5~15 秒是这个模型练过的范围。想要更长的片子就分几张卡各出一段再接起来，硬拖长只会让动作发飘。提示词里各镜头的时长加起来要对得上这个数",
    "target": {
-    "node": "20",
+    "node": "132",
     "input": "value",
     "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "scale_by",
+   "label": "重画前先缩小",
+   "type": "slider",
+   "min": 0.25,
+   "max": 1.5,
+   "step": 0.05,
+   "default": 1.5,
+   "hint": "推荐 1.5：先把原图缩到这个比例，再照着重新画大。缩一点画得反而更细 —— 不缩的话糊的地方会被照着糊的重画一遍。1 = 不缩",
+   "advanced": true,
+   "target": {
+    "node": "199",
+    "input": "scale_by",
+    "vtype": "FLOAT"
+   }
+  },
+  {
+   "key": "frame_load_cap",
+   "label": "只处理前几帧",
+   "type": "slider",
+   "min": 0,
+   "max": 300,
+   "step": 15,
+   "default": 0,
+   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
+   "advanced": false,
+   "target": {
+    "node": "221",
+    "input": "frame_load_cap",
+    "vtype": "INT"
    }
   },
   {
@@ -267,7 +350,7 @@
    "hint": "推荐 1（全开）：省时间全靠它。往下调画质略好但慢很多，0 = 不加速、慢好几倍",
    "advanced": true,
    "target": {
-    "node": "69",
+    "node": "230",
     "input": "strength_model",
     "vtype": "FLOAT"
    }
@@ -283,28 +366,12 @@
    "hint": "推荐 0.12：再快画面就开始糊、动作发飘，这一档是不掉画质的上限。0 = 不提速",
    "advanced": true,
    "target": {
-    "node": "71",
+    "node": "232",
     "input": "processing_control_value",
     "vtype": "FLOAT"
    }
   },
   {
-   "key": "frame_load_cap",
-   "label": "只处理前几帧",
-   "type": "slider",
-   "min": 0,
-   "max": 300,
-   "step": 15,
-   "default": 0,
-   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
-   "advanced": false,
-   "target": {
-    "node": "78",
-    "input": "frame_load_cap",
-    "vtype": "INT"
-   }
-  },
-  {
    "key": "force_rate",
    "label": "帧率",
    "type": "slider",
@@ -315,8 +382,8 @@
    "hint": "推荐 24：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
    "advanced": false,
    "target": {
-    "node": "38",
-    "input": "frame_rate",
+    "node": "221",
+    "input": "force_rate",
     "vtype": "FLOAT"
    }
   },
@@ -331,8 +398,8 @@
    "hint": "推荐 24：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
    "advanced": false,
    "target": {
-    "node": "78",
-    "input": "force_rate",
+    "node": "225",
+    "input": "frame_rate",
     "vtype": "FLOAT"
    },
    "mirror": true
@@ -343,7 +410,7 @@
    "type": "select",
    "default": "16:9 (Widescreen)",
    "target": {
-    "node": "44",
+    "node": "115",
     "input": "aspect_ratio"
    },
    "options": [
@@ -361,9 +428,9 @@
    "key": "megapixels",
    "label": "分辨率",
    "type": "slider",
-   "default": 0.7,
+   "default": 0.4,
    "target": {
-    "node": "44",
+    "node": "115",
     "input": "megapixels",
     "vtype": "FLOAT"
    },
@@ -375,14 +442,18 @@
    "key": "seed",
    "label": "种子",
    "type": "seed",
-   "default": 911243928847175,
+   "default": 171985890830580,
    "target": {
-    "node": "3",
+    "node": "129",
     "input": "noise_seed",
     "vtype": "INT"
    },
    "max": 18446744073709551615
   }
  ],
- "warnings": []
+ "warnings": [
+  "已启用 11 个原本关着的备用素材槽",
+  "已摘：#178 EasyCache 的输出没人用，ComfyUI 不会执行它 —— 它的参数也就不该出现在面板上",
+  "已摘：#192 PathchSageAttentionKJ 的输出没人用，ComfyUI 不会执行它 —— 它的参数也就不该出现在面板上"
+ ]
 }

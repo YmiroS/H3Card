@@ -2,7 +2,7 @@
  "id": "flux2_klein_edit",
  "name": "参考图编辑(保人物)",
  "file": "flux-2-klein-单-多图编辑",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\3-Flux2-klein全系列\\flux-2-klein-单-多图编辑.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\3-Flux2-klein全系列\\flux-2-klein-单-多图编辑.json",
  "group": "图片",
  "outputType": "image",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 2,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 2
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/flux2_klein_edit.api.json",
  "output": {
   "node": "62"

@@ -2,7 +2,7 @@
  "id": "seedvr2_video_up",
  "name": "SeedVR2 视频高清放大",
  "file": "SeedVR2视频高清修复放大 v2",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\SeedVR2图片视频高清\\SeedVR2视频高清修复放大 v2.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\SeedVR2图片视频高清\\SeedVR2视频高清修复放大 v2.json",
  "group": "视频",
  "outputType": "video",
  "kind": "tool",
@@ -11,6 +11,20 @@
  "images": 0,
  "audios": 0,
  "videos": 1,
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 0
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 1,
+   "max": 1
+  }
+ },
  "graph": "graphs/seedvr2_video_up.api.json",
  "output": {
   "node": "1082"

@@ -2,7 +2,7 @@
  "id": "rmbg_erase",
  "name": "人物擦除",
  "file": "人物擦除",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\人物擦除.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\人物擦除.json",
  "group": "图片",
  "outputType": "image",
  "kind": "tool",
@@ -11,6 +11,20 @@
  "images": 1,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/rmbg_erase.api.json",
  "output": {
   "node": "95"

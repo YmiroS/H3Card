@@ -1,0 +1,92 @@
+{
+ "id": "krea2_t2i",
+ "name": "文生图",
+ "file": "全自动krea2文生图",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\7-kear2全系列\\全自动krea2文生图.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "gen",
+ "card": "image",
+ "slots": "img0+aud0+vid0",
+ "images": 0,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 0
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/krea2_t2i.api.json",
+ "output": {
+  "node": "52"
+ },
+ "note": null,
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "prompt",
+   "label": "提示词",
+   "type": "textarea",
+   "default": "",
+   "target": {
+    "node": "61",
+    "input": "prompt"
+   }
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 8,
+   "hint": "推荐 8：模型带加速 LoRA，8 步就到位了。往下调会花，往上调基本白等",
+   "advanced": true,
+   "target": {
+    "node": "9",
+    "input": "steps",
+    "vtype": "INT"
+   }
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 34879647454063,
+   "target": {
+    "node": "9",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 53505104212375,
+   "target": {
+    "node": "55",
+    "input": "seed",
+    "vtype": "INT"
+   },
+   "max": 18446744073709551615,
+   "mirror": true
+  }
+ ],
+ "warnings": [
+  "本地大模型：#53.model = Qwen3.5-27B-IQ4_XS.gguf",
+  "本地大模型：#53.mmproj = mmproj-F16.gguf"
+ ]
+}

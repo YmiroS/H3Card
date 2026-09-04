@@ -2,7 +2,7 @@
  "id": "zimage_i2i",
  "name": "图生图",
  "file": "Z-Image 图生图-反推 ",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\4-Z-Image全系列\\Z-Image 图生图-反推 .json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\4-Z-Image全系列\\Z-Image 图生图-反推 .json",
  "group": "图片",
  "outputType": "image",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 1,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/zimage_i2i.api.json",
  "output": {
   "node": "72"

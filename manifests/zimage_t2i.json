@@ -2,7 +2,7 @@
  "id": "zimage_t2i",
  "name": "文生图",
  "file": "z-Image-标准版文生图",
- "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\4-Z-Image全系列\\z-Image-标准版文生图.json",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\4-Z-Image全系列\\z-Image-标准版文生图.json",
  "group": "图片",
  "outputType": "image",
  "kind": "gen",
@@ -11,6 +11,20 @@
  "images": 0,
  "audios": 0,
  "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 0
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
  "graph": "graphs/zimage_t2i.api.json",
  "output": {
   "node": "9"

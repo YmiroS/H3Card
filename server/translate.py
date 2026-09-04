@@ -20,13 +20,14 @@ class TranslateError(Exception):
     pass
 
 
-def youdao_translate(text, from_lang="auto", to_lang="auto"):
+def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers"):
     """调用有道翻译 API。
 
     Args:
         text: 要翻译的文本
         from_lang: 源语言（auto=自动检测）
         to_lang: 目标语言（auto=自动检测，会根据源语言自动选择）
+        domain: 领域化翻译（computers=计算机领域）
 
     Returns:
         翻译后的文本
@@ -62,6 +63,10 @@ def youdao_translate(text, from_lang="auto", to_lang="auto"):
         "signType": "v3",
         "curtime": curtime,
     }
+
+    # 添加领域化翻译参数
+    if domain:
+        params["domain"] = domain
 
     try:
         resp = requests.post(YOUDAO_API_URL, data=params, timeout=10)

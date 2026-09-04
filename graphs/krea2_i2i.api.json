@@ -1,0 +1,231 @@
+{
+ "7": {
+  "class_type": "CLIPTextEncode",
+  "inputs": {
+   "clip": [
+    "4",
+    0
+   ],
+   "text": [
+    "55",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "CLIP Text Encode (Prompt)"
+  }
+ },
+ "2": {
+  "class_type": "EmptyLatentImage",
+  "inputs": {
+   "width": [
+    "49",
+    0
+   ],
+   "height": [
+    "49",
+    1
+   ],
+   "batch_size": 1
+  },
+  "_meta": {
+   "title": "Empty Latent Image"
+  }
+ },
+ "1": {
+  "class_type": "ConditioningZeroOut",
+  "inputs": {
+   "conditioning": [
+    "7",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Conditioning Zero Out"
+  }
+ },
+ "9": {
+  "class_type": "KSampler",
+  "inputs": {
+   "model": [
+    "5",
+    0
+   ],
+   "positive": [
+    "7",
+    0
+   ],
+   "negative": [
+    "1",
+    0
+   ],
+   "latent_image": [
+    "2",
+    0
+   ],
+   "seed": 593065671907525,
+   "steps": 8,
+   "cfg": 1,
+   "sampler_name": "euler",
+   "scheduler": "simple",
+   "denoise": 1
+  },
+  "_meta": {
+   "title": "KSampler"
+  }
+ },
+ "6": {
+  "class_type": "VAEDecode",
+  "inputs": {
+   "samples": [
+    "9",
+    0
+   ],
+   "vae": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "VAE Decode"
+  }
+ },
+ "52": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "6",
+    0
+   ],
+   "filename_prefix": "ComfyUI"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ },
+ "54": {
+  "class_type": "llama_cpp_parameters",
+  "inputs": {
+   "max_tokens": 1024,
+   "top_k": 30,
+   "top_p": 0.9,
+   "min_p": 0.05,
+   "typical_p": 1,
+   "temperature": 0.8,
+   "repeat_penalty": 1,
+   "frequency_penalty": 0,
+   "presence_penalty": 1,
+   "mirostat_mode": 0,
+   "mirostat_eta": 0.1,
+   "mirostat_tau": 5,
+   "state_uid": -1
+  },
+  "_meta": {
+   "title": "Llama-cpp Parameters"
+  }
+ },
+ "3": {
+  "class_type": "VAELoader",
+  "inputs": {
+   "vae_name": "qwen_image_vae.safetensors"
+  },
+  "_meta": {
+   "title": "Load VAE"
+  }
+ },
+ "61": {
+  "class_type": "CR Prompt Text",
+  "inputs": {
+   "prompt": "只迁移图片的风格层，不迁移图片的主体、人物、场景、动作和具体物体。\n\n重构一个夏日沙滩少女写真图"
+  },
+  "_meta": {
+   "title": "⚙️ CR Prompt Text"
+  }
+ },
+ "4": {
+  "class_type": "CLIPLoader",
+  "inputs": {
+   "clip_name": "qwen3vl_4b_fp8_scaled.safetensors",
+   "type": "krea2",
+   "device": "default"
+  },
+  "_meta": {
+   "title": "Load CLIP"
+  }
+ },
+ "49": {
+  "class_type": "TTResolutionSelector",
+  "inputs": {
+   "resolution": "1024x1024 (1:1)"
+  },
+  "_meta": {
+   "title": "TT分辨率选择器"
+  }
+ },
+ "63": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "input_image.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ },
+ "5": {
+  "class_type": "UNETLoader",
+  "inputs": {
+   "unet_name": "krea2_turbo_fp8.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Diffusion Model"
+  }
+ },
+ "53": {
+  "class_type": "llama_cpp_model_loader",
+  "inputs": {
+   "model": "Qwen3.5-27B-UD-IQ3_XXS.gguf",
+   "mmproj": "mmproj-F16.gguf",
+   "chat_handler": "Qwen3.5",
+   "n_ctx": 16384,
+   "vram_limit": -1,
+   "image_min_tokens": 0,
+   "image_max_tokens": 0
+  },
+  "_meta": {
+   "title": "Llama-cpp Model Loader"
+  }
+ },
+ "55": {
+  "class_type": "llama_cpp_instruct_adv",
+  "inputs": {
+   "llama_model": [
+    "53",
+    0
+   ],
+   "parameters": [
+    "54",
+    0
+   ],
+   "images": [
+    "63",
+    0
+   ],
+   "preset_prompt": "Normal - Describe",
+   "custom_prompt": [
+    "61",
+    0
+   ],
+   "system_prompt": "# Krea 2 万物复刻模板 3.1 \n用途：根据上传图片进行图像反推、图文融合、多图参考，把图片中的主体、风格、构图、光影、镜头、材质、氛围和成像质感转换成一段可直接复制到 Krea 2 的英文 Prompt。\n\n适用对象不限：人物、动物、植物、产品、美食、建筑、室内、自然风光、艺术品、图案纹理、包装、UI 截图、玩具手办、服饰鞋包、珠宝文玩、车辆机械等。\n\n---\n\n## 1. 核心硬规则\n\n最终只输出一段英文 Prompt。\n\n不要输出：标题、解释、中文拆解、图片分析、参数、表格、Markdown 代码块、项目符号、推荐设置、下一轮建议。\n\n不要出现：`uploaded image`、`reference image`、`based on the image`、`first image`、`second image`、`AI-generated`、`AI style`。\n\nPrompt 建议长度：\n\n- 普通反推：400–700 英文词。\n- 复杂人像、复杂产品、多图参考：600–900 英文词。\n- 用户明确要求简化：250–400 英文词。\n- 用户继续要求更短：可继续压缩，但必须保留主体、构图、光影、风格、材质、限制词。\n\n输出必须是自然英文段落，不要写成字段格式。\n\n禁止字段式：\n\n```text\nSubject:\nLighting:\nCamera:\nNegative:\n```\n\n推荐自然段式：\n\n```text\nCreate a highly detailed image featuring... The subject is positioned... The composition keeps... The lighting comes from... The visual style remains... Materials and textures include... Preserve... Avoid...\n```\n\n---\n\n## 2. 模式判断\n\n内部判断，不输出过程。\n\n### 2.1 图像反推\n\n有图片，没有额外修改要求：严格反推原图。\n\n必须保留：主体类别、主体数量、结构比例、动作姿态、构图裁切、镜头距离、光源方向、色彩关系、材质质感、风格媒介、成像效果。\n\n### 2.2 图文融合\n\n有图片，也有文字修改要求：保留图片的风格、构图、光影、镜头、成像质感，只改用户明确要求修改的部分。\n\n例：\n\n- 只说换主体：只换主体，构图、镜头、光影、背景结构尽量不变。\n- 只说换衣服/材质/包装：只改对应部分，姿态、结构、光影不乱改。\n- 只说换背景：保留主体、动作、表情、镜头、光影逻辑，只换环境。\n- 只说保留风格生成新画面：保留画风、光影、色彩、成像质感，允许重组主体和场景。\n- 说严格反推：不要新增原图没有的重要道具、动作、情绪、背景或风格。\n\n### 2.3 多图参考\n\n多张图片时按用户指定分配用途：主体、动作、风格、构图、光影、场景、材质。\n\n如果用户未说明：默认第一张为主参考，其余图片只做辅助参考。\n\n多图冲突时：\n\n- 风格冲突：优先主参考图风格。\n- 主体冲突：优先用户指定主体。\n- 构图冲突：优先用户指定构图；未指定则保留主参考构图。\n- 光影冲突：优先主参考光影；用户指定光影图则按指定图。\n- 色彩冲突：优先主参考色彩，不要混成杂乱色调。\n\n最终 Prompt 中不要说明哪张图负责什么，只写融合后的最终画面。\n\n---\n\n## 3. 图像反推观察维度\n\n内部必须观察，但不要输出分析过程。\n\n### 3.1 主体\n\n识别主体类别、数量、身份/种类、形态、比例、结构、姿态、摆放、动作、受力状态、与环境关系。\n\n人物额外观察：可见年龄印象、肤色明度与冷暖、可见族裔呈现、脸型骨相、五官比例、发型发质、神态、表情强度、视线方向、头部角度、肩颈姿态、身体朝向、手臂位置、手指状态、身体重心、服装结构。\n\n非人物额外观察：结构比例、关键部件、材质工艺、表面新旧、摆放角度、受光面、反光逻辑。\n\n### 3.2 风格\n\n准确判断图片媒介，不要乱套风格。\n\n常见风格：真实摄影、电影剧照、商业摄影、人像写真、产品摄影、建筑摄影、静物摄影、动漫赛璐璐、日系动画、厚涂、CG 渲染、游戏概念、国风插画、卡牌插画、潮流海报、科幻概念、奇幻概念、复古胶片、水墨、版画、像素、工业设计渲染、包装效果图、珠宝渲染、文物纪实摄影。\n\n防误判：\n\n- 不要看到人像就默认真人摄影。\n- 不要看到 2D 就默认厚涂。\n- 不要看到精致角色就默认卡牌。\n- 不要看到产品就默认 3D 渲染。\n- 不要把真人摄影改成动漫。\n- 不要把插画改成真人。\n- 不要把产品摄影改成工业渲染。\n\n### 3.3 构图\n\n识别画幅、景别、视角、主体位置、主体占比、裁切、留白、前景遮挡、中景主体、背景层次、视觉重心、画面秩序。\n\n### 3.4 镜头\n\n识别镜头距离、焦段感、透视压缩、景深、背景虚化、运动感、静态感、边缘畸变、近大远小关系。\n\n### 3.5 光影\n\n识别主光方向、辅光、轮廓光、环境光、反射光、阴影软硬、色温、明暗对比、高光位置、逆光/侧光/顶光/窗光/棚拍光/霓虹光等。\n\n### 3.6 色彩\n\n提取主色、辅助色、冷暖关系、饱和度、对比度、色彩层次、局部强调色、主体与背景的色彩分离。\n\n### 3.7 材质\n\n识别皮肤、毛发、布料、金属、玻璃、木材、石材、水面、雾气、纸张、塑料、陶瓷、釉面、宝石、植物、食材、建筑表面等纹理与反光逻辑。\n\n### 3.8 氛围与成像\n\n识别画面情绪：安静、梦幻、压迫、史诗、温暖、孤独、神秘、商业、高级、清冷、复古、未来感、故事感。\n\n识别成像质感：高清、锐利、柔焦、浅景深、胶片颗粒、噪点、光晕、雾化、真实瑕疵、商业修图感、电影剧照感、数字绘画感。",
+   "inference_mode": "one by one",
+   "max_frames": 24,
+   "max_size": 256,
+   "seed": 879568424201984,
+   "force_offload": true,
+   "save_states": false
+  },
+  "_meta": {
+   "title": "Llama-cpp Instruct"
+  }
+ }
+}
