@@ -324,22 +324,6 @@
    }
   },
   {
-   "key": "frame_load_cap",
-   "label": "只处理前几帧",
-   "type": "slider",
-   "min": 0,
-   "max": 300,
-   "step": 15,
-   "default": 0,
-   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
-   "advanced": false,
-   "target": {
-    "node": "221",
-    "input": "frame_load_cap",
-    "vtype": "INT"
-   }
-  },
-  {
    "key": "strength_model",
    "label": "加速模型强度",
    "type": "slider",
@@ -370,39 +354,6 @@
     "input": "processing_control_value",
     "vtype": "FLOAT"
    }
-  },
-  {
-   "key": "force_rate",
-   "label": "帧率",
-   "type": "slider",
-   "min": 8,
-   "max": 60,
-   "step": 1,
-   "default": 24,
-   "hint": "推荐 24：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
-   "advanced": false,
-   "target": {
-    "node": "221",
-    "input": "force_rate",
-    "vtype": "FLOAT"
-   }
-  },
-  {
-   "key": "force_rate",
-   "label": "帧率",
-   "type": "slider",
-   "min": 8,
-   "max": 60,
-   "step": 1,
-   "default": 24,
-   "hint": "推荐 24：成片每秒多少帧，时长不变。调高更流畅，但要重画的帧数成正比变多、时间和显存跟着涨。想更流畅又不想多等，用「视频补帧插针」那张卡",
-   "advanced": false,
-   "target": {
-    "node": "225",
-    "input": "frame_rate",
-    "vtype": "FLOAT"
-   },
-   "mirror": true
   },
   {
    "key": "aspect_ratio",

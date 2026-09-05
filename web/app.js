@@ -2669,11 +2669,11 @@ function renameCard(c) {
 
 function cloneCard(c) {
   const n = addCard(c.type, c.x + 24, c.y + 28);
+  const outputs = JSON.parse(JSON.stringify(c.outputs || []));
   Object.assign(n, {
     cap: c.cap, name: c.name, params: JSON.parse(JSON.stringify(c.params || {})),
-    assets: JSON.parse(JSON.stringify(c.assets || {})),
-    // 素材节点手里那份文件在 outputs[0]，就地复制得连着一起抄，不然复制出来是张空节点
-    ...(isAsset(c) ? { outputs: JSON.parse(JSON.stringify(c.outputs || [])) } : {}),
+    assets: JSON.parse(JSON.stringify(c.assets || {})), outputs,
+    status: outputs.length ? "done" : null,
   });
   paintTitle(n); paint(n); openPanel(n.id); save();      // paint：风格节点的正文在画面区
 }
@@ -2746,10 +2746,10 @@ function copyCard(c) {
     type: c.type, cap: c.cap, name: c.name || null, w: c.w, h: c.h, x: c.x, y: c.y,
     params: JSON.parse(JSON.stringify(c.params || {})),
     assets: JSON.parse(JSON.stringify(c.assets || {})),
+    outputs: JSON.parse(JSON.stringify(c.outputs || [])),
   };
   pasteN = 0;
-  // 产物和历史故意不带：复制一个节点不该让新节点假装它也跑过（跟"复制节点"菜单同一个规矩）
-  toast(`已复制「${titleOf(c)}」（不含产物）· Ctrl+V 粘贴`);
+  toast(`已复制「${titleOf(c)}」${CLIP.outputs.length ? "（包含当前产物）" : ""} · Ctrl+V 粘贴`);
 }
 
 function pasteCard() {
@@ -2759,10 +2759,13 @@ function pasteCard() {
   // 鼠标不在画布上（比如刚在侧边栏点完）就按老位置错开一点，连着粘也不会重叠
   const at = mouseW || { x: CLIP.x + 24 * ++pasteN, y: CLIP.y + 28 * pasteN };
   const n = addCard(CLIP.type, at.x - CW / 2, at.y - 40, CLIP.cap);
+  const outputs = JSON.parse(JSON.stringify(CLIP.outputs || []));
   Object.assign(n, {
     name: CLIP.name,
     params: JSON.parse(JSON.stringify(CLIP.params)),
     assets: JSON.parse(JSON.stringify(CLIP.assets)),
+    outputs,
+    status: outputs.length ? "done" : null,
   });
   if (CLIP.w) n.w = CLIP.w;
   if (CLIP.h) n.h = CLIP.h;

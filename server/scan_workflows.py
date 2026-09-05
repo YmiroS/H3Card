@@ -451,6 +451,11 @@ CAP_KNOBS = {
         "process_res": RMBG_RES,
     },
 }
+# 这些能力保留工作流里的固定值，但不把对应旋钮放到 Web 参数面板。
+CAP_HIDDEN_INPUT_KEYS = {
+    "minimax_h3_ref9": {"frame_load_cap", "force_rate"},
+    "minimax_h3_ref_2pass": {"frame_load_cap", "force_rate"},
+}
 # 上面这些旋钮默认折进「高级」。写在这里的是玩法本身的旋钮，要摆在面板正面。
 # max_resolution 进来不是因为它是玩法旋钮，而是因为它能悄悄盖掉 resolution ——
 # 一个能否决正面旋钮的开关必须也在正面，否则用户拖了「放大到(短边)」却没反应。
@@ -1463,6 +1468,10 @@ def derive_inputs(api, oi, wid=None):
         if i:
             item["mirror"] = True          # 多个采样器共用同一个种子输入框
         out.append(item)
+
+    hidden_keys = CAP_HIDDEN_INPUT_KEYS.get(wid, set())
+    if hidden_keys:
+        out = [item for item in out if item.get("key") not in hidden_keys]
 
     # H3 全能参考的素材全部可选。空图片/视频都要把模板支线断开；显示顺序仍是
     # 视频在前、图片随后、音频最后，但前端只展示真正已经引用的素材。
