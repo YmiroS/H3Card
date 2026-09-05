@@ -610,22 +610,6 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   color: var(--dim); border: 1px solid var(--line);
 }
 #panel .phd button:hover { color: var(--acc); border-color: var(--acc); }
-/* 素材卡面板：放一份文件的预览。图片/视频/音频各走各的 */
-#panel .asset {
-  position: relative; border: 1px solid var(--line); border-radius: 2px;
-  background: #0a0f1c; margin-bottom: 8px; overflow: hidden;
-}
-#panel .asset img, #panel .asset video { display: block; width: 100%; max-height: 280px; object-fit: contain; }
-#panel .asset audio { width: 100%; }
-#panel .asset.empty {
-  height: 96px; display: flex; align-items: center; justify-content: center;
-  color: var(--dim); font-size: 13px; border-style: dashed;
-}
-#panel .asset .aname {
-  position: absolute; left: 0; right: 0; bottom: 0; padding: 10px 9px 6px;
-  font-size: 12px; color: var(--dim); background: linear-gradient(transparent, #080c17 80%);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-}
 #panel .prow { display: flex; gap: 6px; flex-wrap: wrap; }
 #panel .prow button {
   padding: 3px 9px; border-radius: 2px; font-size: 13px; color: var(--dim);
@@ -1390,8 +1374,6 @@ input:focus, textarea:focus, select:focus {
 #panel .phd { color: #9499a3; letter-spacing: 0; }
 #panel .phd button, #panel .prow button { border-color: var(--line); border-radius: 6px; }
 #panel .phd button:hover, #panel .prow button:hover { color: #fff; background: rgba(255,255,255,.06); border-color: var(--line-strong); }
-#panel .asset { background: #0b0d10; border-color: var(--line); border-radius: 8px; }
-#panel .asset.empty { border-style: dashed; }
 #panel .tabs, #panel .opttabs { gap: 4px; border-bottom-color: var(--line); }
 #panel .tabs button, #panel .opttabs button { color: #858a94; background: transparent; border-color: transparent; border-radius: 7px 7px 0 0; }
 #panel .tabs button:hover, #panel .opttabs button:hover { color: #fff; }
