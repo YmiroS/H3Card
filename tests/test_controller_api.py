@@ -35,6 +35,15 @@ class CardProgressLabelTest(unittest.TestCase):
         })
 
 
+class ModelFamilyTest(unittest.TestCase):
+    def test_related_workflows_share_model_family(self):
+        self.assertEqual(controller_app.model_family("minimax_h3_ref9"), "minimax_h3")
+        self.assertEqual(controller_app.model_family("minimax_h3_i2v"), "minimax_h3")
+        self.assertEqual(controller_app.model_family("seedvr2_image_up"), "seedvr2")
+        self.assertEqual(controller_app.model_family("seedvr2_video_up"), "seedvr2")
+        self.assertEqual(controller_app.model_family("unknown_workflow"), "unknown_workflow")
+
+
 class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()

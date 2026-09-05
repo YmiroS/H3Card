@@ -1,4 +1,5 @@
 import asyncio
+import sqlite3
 import sys
 import tempfile
 import time
@@ -111,6 +112,85 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(worker["state"], "idle")
         self.assertIsNone(worker["current_job_id"])
         self.assertEqual(self.store.dispatch_status("job-1", self.worker_id), "error")
+
+    def _finish_success(self, job_id, capability, model_family):
+        self.store.enqueue(job_id, {
+            "graph": {}, "capability": capability, "model_family": model_family,
+        }, [])
+        assignment = self.store.acquire(self.worker_id)
+        self.assertEqual(assignment["job_id"], job_id)
+        self.assertTrue(self.store.mark_running(
+            job_id, self.worker_id, assignment["lease_token"]
+        ))
+        self.assertTrue(self.store.finish(
+            job_id, self.worker_id, assignment["lease_token"], "done"
+        ))
+
+    def test_acquire_prefers_same_workflow(self):
+        self._finish_success("warm", "minimax_h3_ref9", "minimax_h3")
+        worker = self.store.list_workers()[0]
+        self.assertEqual(worker["last_capability_id"], "minimax_h3_ref9")
+        self.assertEqual(worker["last_model_family"], "minimax_h3")
+
+        self.store.enqueue("older-same-family", {
+            "graph": {}, "capability": "minimax_h3_i2v", "model_family": "minimax_h3",
+        }, [])
+        self.store.enqueue("same-workflow", {
+            "graph": {}, "capability": "minimax_h3_ref9", "model_family": "minimax_h3",
+        }, [])
+
+        assignment = self.store.acquire(self.worker_id)
+        self.assertEqual(assignment["job_id"], "same-workflow")
+
+    def test_acquire_falls_back_to_same_model_family(self):
+        self._finish_success("warm", "minimax_h3_ref9", "minimax_h3")
+        self.store.enqueue("older-other", {
+            "graph": {}, "capability": "zimage_t2i", "model_family": "zimage",
+        }, [])
+        self.store.enqueue("same-family", {
+            "graph": {}, "capability": "minimax_h3_i2v", "model_family": "minimax_h3",
+        }, [])
+
+        assignment = self.store.acquire(self.worker_id)
+        self.assertEqual(assignment["job_id"], "same-family")
+
+    def test_affinity_does_not_bypass_fifo_after_wait_limit(self):
+        self._finish_success("warm", "minimax_h3_ref9", "minimax_h3")
+        self.store.enqueue("oldest", {
+            "graph": {}, "capability": "zimage_t2i", "model_family": "zimage",
+        }, [])
+        self.store.enqueue("same-workflow", {
+            "graph": {}, "capability": "minimax_h3_ref9", "model_family": "minimax_h3",
+        }, [])
+        self.store.affinity_max_wait_seconds = 0
+
+        assignment = self.store.acquire(self.worker_id)
+        self.assertEqual(assignment["job_id"], "oldest")
+
+
+class DistributedStoreMigrationTest(unittest.TestCase):
+    def test_existing_worker_table_gains_affinity_columns(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "control.db"
+            db = sqlite3.connect(path)
+            try:
+                db.execute("""CREATE TABLE workers (
+                    id TEXT PRIMARY KEY, name TEXT NOT NULL, token_hash TEXT NOT NULL,
+                    enabled INTEGER NOT NULL DEFAULT 1, last_seen REAL NOT NULL,
+                    comfy_online INTEGER NOT NULL DEFAULT 0, busy INTEGER NOT NULL DEFAULT 0,
+                    current_job_id TEXT, capabilities_json TEXT NOT NULL DEFAULT '{}',
+                    created_at REAL NOT NULL, updated_at REAL NOT NULL
+                )""")
+                db.commit()
+            finally:
+                db.close()
+            store = DistributedStore(path)
+            try:
+                columns = {row[1] for row in store.db.execute("PRAGMA table_info(workers)")}
+                self.assertIn("last_capability_id", columns)
+                self.assertIn("last_model_family", columns)
+            finally:
+                store.close()
 
 
 class WorkerInputPathTest(unittest.TestCase):

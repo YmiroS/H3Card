@@ -24,11 +24,13 @@ def _json(value):
 
 
 class DistributedStore:
-    def __init__(self, path, lease_seconds=45, offline_seconds=30):
+    def __init__(self, path, lease_seconds=45, offline_seconds=30,
+                 affinity_max_wait_seconds=60):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lease_seconds = lease_seconds
         self.offline_seconds = offline_seconds
+        self.affinity_max_wait_seconds = affinity_max_wait_seconds
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -54,6 +56,8 @@ class DistributedStore:
                     busy INTEGER NOT NULL DEFAULT 0,
                     current_job_id TEXT,
                     capabilities_json TEXT NOT NULL DEFAULT '{}',
+                    last_capability_id TEXT,
+                    last_model_family TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -78,6 +82,11 @@ class DistributedStore:
                     ON dispatch_jobs(worker_id, status);
                 """
             )
+            columns = {row[1] for row in self.db.execute("PRAGMA table_info(workers)")}
+            if "last_capability_id" not in columns:
+                self.db.execute("ALTER TABLE workers ADD COLUMN last_capability_id TEXT")
+            if "last_model_family" not in columns:
+                self.db.execute("ALTER TABLE workers ADD COLUMN last_model_family TEXT")
 
     def register_worker(self, name, capabilities=None):
         now = time.time()
@@ -222,14 +231,33 @@ class DistributedStore:
             rows = self.db.execute(
                 "SELECT * FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
             ).fetchall()
-            selected = None
+            eligible = []
             for row in rows:
                 required = set(json.loads(row["required_nodes_json"] or "[]"))
                 if required.issubset(available_nodes):
-                    selected = row
-                    break
-            if selected is None:
+                    eligible.append((row, json.loads(row["payload_json"])))
+            if not eligible:
                 return None
+
+            selected, selected_payload = eligible[0]
+            oldest_wait = now - selected["created_at"]
+            can_prefer_cache = (
+                self.affinity_max_wait_seconds > 0
+                and oldest_wait < self.affinity_max_wait_seconds
+            )
+            matched_exact = False
+            if can_prefer_cache and worker["last_capability_id"]:
+                exact = next((item for item in eligible
+                              if item[1].get("capability") == worker["last_capability_id"]), None)
+                if exact:
+                    selected, selected_payload = exact
+                    matched_exact = True
+            if can_prefer_cache and not matched_exact and worker["last_model_family"]:
+                family = next((item for item in eligible
+                               if item[1].get("model_family") == worker["last_model_family"]), None)
+                if family:
+                    selected, selected_payload = family
+
             lease_token = secrets.token_urlsafe(32)
             expires = now + self.lease_seconds
             cur = self.db.execute(
@@ -249,7 +277,7 @@ class DistributedStore:
                 "job_id": selected["job_id"],
                 "lease_token": lease_token,
                 "lease_expires_at": expires,
-                "payload": json.loads(selected["payload_json"]),
+                "payload": selected_payload,
             }
 
     def mark_running(self, job_id, worker_id, lease_token):
@@ -289,6 +317,17 @@ class DistributedStore:
             return False
         now = time.time()
         with self.lock, self.db:
+            affinity = None
+            if status == "done":
+                row = self.db.execute(
+                    "SELECT payload_json FROM dispatch_jobs WHERE job_id = ? AND worker_id = ?",
+                    (job_id, worker_id),
+                ).fetchone()
+                if row:
+                    payload = json.loads(row["payload_json"])
+                    capability = payload.get("capability")
+                    if capability:
+                        affinity = (capability, payload.get("model_family") or capability)
             cur = self.db.execute(
                 """UPDATE dispatch_jobs
                    SET status = ?, lease_expires_at = NULL, lease_token_hash = NULL,
@@ -296,11 +335,20 @@ class DistributedStore:
                    WHERE job_id = ? AND worker_id = ?""",
                 (status, now, job_id, worker_id),
             )
-            self.db.execute(
-                """UPDATE workers SET busy = 0, current_job_id = NULL, updated_at = ?
-                   WHERE id = ? AND current_job_id = ?""",
-                (now, worker_id, job_id),
-            )
+            if affinity:
+                self.db.execute(
+                    """UPDATE workers
+                       SET busy = 0, current_job_id = NULL, updated_at = ?,
+                           last_capability_id = ?, last_model_family = ?
+                       WHERE id = ? AND current_job_id = ?""",
+                    (now, affinity[0], affinity[1], worker_id, job_id),
+                )
+            else:
+                self.db.execute(
+                    """UPDATE workers SET busy = 0, current_job_id = NULL, updated_at = ?
+                       WHERE id = ? AND current_job_id = ?""",
+                    (now, worker_id, job_id),
+                )
         return cur.rowcount == 1
 
     def dispatch_status(self, job_id, worker_id=None):
