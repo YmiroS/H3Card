@@ -3702,9 +3702,7 @@ function stylePanel(c) {
 }
 
 /* ================= 素材节点面板 ================= */
-/** 素材节点的手里就一份上传上来的文件，不生成、没参数。面板里干三件事：
-    换文件、看大图/定位、看这份素材现在喂给了哪几个节点（跟风格节点的「挂给了谁」一个道理，
-    只是那是文本、这份是文件）。 */
+/** 素材节点的参数面板只保留文件操作和连接关系；素材本身直接在画布节点上看。 */
 function assetPanel(c) {
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
@@ -3716,29 +3714,6 @@ function assetPanel(c) {
   const cnt = document.createElement("span"); cnt.className = "demo";
   hd.append(nm, cnt);
   wrap.appendChild(hd);
-
-  // 有文件就放一个预览（图片来源/视频/音频各走各的），没文件就放一块空位
-  const pv = document.createElement("div"); pv.className = "asset";
-  if (a) {
-    const fn = document.createElement("div"); fn.className = "aname";
-    fn.textContent = (a.origin || a.url).split(/[\\/]/).pop();
-    fn.title = a.origin || "";
-    pv.appendChild(fn);
-    if (a.kind === "video") {
-      const v = document.createElement("video"); v.src = a.url; v.controls = true; v.loop = true;
-      pv.appendChild(v);
-    } else if (a.kind === "audio") {
-      const au = document.createElement("audio"); au.src = a.url; au.controls = true;
-      pv.appendChild(au);
-    } else {
-      const img = document.createElement("img"); img.src = a.url;
-      pv.appendChild(img);
-    }
-  } else {
-    pv.classList.add("empty");
-    pv.textContent = "还没有文件";
-  }
-  wrap.appendChild(pv);
 
   // 操作行：换 / 看 / 找，只在有文件时给「看」和「找」
   const ops = document.createElement("div"); ops.className = "prow";
@@ -3761,7 +3736,8 @@ function assetPanel(c) {
     paint(c); paintKind(c); openPanel(c.id); save();
   };
   ops.appendChild(clr);
-  cnt.textContent = a ? (a.filename || "").split(/[\\/]/).pop() : "";
+  cnt.textContent = a ? (a.origin || a.filename || a.url || "").split(/[\\/]/).pop() : "还没有文件";
+  cnt.title = a ? (a.origin || a.filename || a.url || "") : "";
   wrap.appendChild(ops);
   body.appendChild(wrap);
 
