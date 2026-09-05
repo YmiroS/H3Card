@@ -9,27 +9,30 @@
 <link rel="apple-touch-icon" href="icon.png">
 <link rel="stylesheet" href="style.css">
 </head>
-<body>
+<body class="canvas-studio">
 
 <!-- ---------- 左侧项目栏 ---------- -->
-<aside id="side">
+<aside id="side" aria-label="画布项目">
   <div class="head">
-    <img src="icon.png" alt="" class="logo" draggable="false">
-    <b>抽卡系统</b>
+    <span class="brand-mark" aria-hidden="true"><img src="icon.png" alt="" class="logo" draggable="false"></span>
+    <span class="brand-copy"><b>Chouka</b><small>CREATIVE CANVAS</small></span>
     <span class="dot" id="dot" title="ComfyUI 连接状态"></span>
   </div>
-  <button id="newproj">＋ 新建项目</button>
+  <button id="newproj"><span aria-hidden="true">＋</span><span>新建项目</span></button>
+  <div class="section-label">我的画布</div>
   <div id="plist"></div>
+  <div class="side-foot"><span class="side-foot-dot"></span>本地工作区</div>
 </aside>
 
 <!-- ---------- 主区 ---------- -->
 <main id="main">
-  <div id="topbar">
-    <button class="tbtn" id="toggle" title="收起/展开项目栏">☰</button>
+  <div id="topbar" aria-label="画布工具栏">
+    <button class="tbtn icon-btn" id="toggle" title="收起/展开项目栏" aria-label="收起或展开项目栏">☰</button>
+    <span class="crumb">画布</span><span class="crumb-sep">/</span>
     <span id="ptitle"></span>
-    <button class="tbtn" id="fit" style="display:none">复位视图</button>
+    <button class="tbtn" id="fit" style="display:none">适应视图</button>
     <span id="hint"></span>
-    <a class="tbtn" id="controller-link" href="/controller" title="查看中间层、执行端和任务信息" style="display:none">中间层</a>
+    <a class="tbtn" id="controller-link" href="/controller" title="查看中间层、执行端和任务信息" style="display:none">运行面板</a>
     <button class="tbtn" id="jobsbtn" title="查看所有任务">任务</button>
   </div>
 
@@ -41,9 +44,9 @@
     <div id="selbar" style="display:none"></div>
     <div id="panel" style="display:none"></div>
     <div id="dock" style="display:none"></div>
-    <div id="canvas-toolbar">
-      <button id="minimap-btn" class="toolbar-btn" title="小地图">🗺</button>
-      <button id="wires-toggle" class="toolbar-btn" title="显示/隐藏连线">🔗</button>
+    <div id="canvas-toolbar" aria-label="视图控制">
+      <button id="minimap-btn" class="toolbar-btn" title="小地图" aria-label="打开小地图">▦</button>
+      <button id="wires-toggle" class="toolbar-btn" title="显示/隐藏连线" aria-label="显示或隐藏连线">⌁</button>
       <button id="zoom-menu" class="toolbar-btn" title="缩放"><span id="zoom-percent">100%</span></button>
     </div>
     <div id="minimap" style="display:none">
@@ -53,11 +56,13 @@
   </div>
 
   <div id="empty">
-    <div class="big">还没有打开画布</div>
+    <div class="empty-icon" aria-hidden="true">◇</div>
+    <div class="big">开始一张新的创作画布</div>
+    <div class="empty-copy">组合图片、视频与文本节点，把每一次生成变成可复用的工作流。</div>
     <div class="cta">
-      <button id="createHere">＋ 新建画布创作</button>
+      <button id="createHere"><span aria-hidden="true">＋</span> 新建画布</button>
     </div>
-    <div style="font-size:12px">新建节点用底部「上传 / 文本 / 图片 / 视频 / 工具箱」那条，节点建在视野正中 · 左键拖空白框选节点（选中后可打组）· 鼠标中键拖动画布 · 滚轮缩放 · 双击节点产物看大图 · 拖右侧圆点连线传产物</div>
+    <div class="empty-shortcuts"><span>中键拖动画布</span><span>滚轮缩放</span><span>拖动端口连接节点</span></div>
   </div>
 </main>
 

@@ -793,6 +793,58 @@ function briefEl(cap, name) {
   return d;
 }
 
+function plainBriefEl(name, note, rows) {
+  const d = document.createElement("div");
+  const h = document.createElement("b"); h.textContent = name;
+  const n = document.createElement("div"); n.className = "note"; n.textContent = note;
+  d.append(h, n);
+  for (const [key, value] of rows) {
+    const r = document.createElement("div"); r.className = "io";
+    const i = document.createElement("i"); i.textContent = key;
+    const s = document.createElement("span"); s.textContent = value;
+    r.append(i, s); d.appendChild(r);
+  }
+  return d;
+}
+
+function modeBriefEl(c, md, name) {
+  if (!md) return null;
+  const active = modeHas(md, c.cap);
+  const capId = active ? (md.ladder ? runCap(c) : c.cap) : modeCap(md);
+  const cap = CAPS[capId] || CAPS[modeCap(md)];
+  if (!cap) return plainBriefEl(name || md.name, "这个模式当前不可用。", []);
+  const d = briefEl(cap, name || md.name);
+  let note = "";
+  if (md.route) {
+    note = (md.entry && md.entry.hint ? md.entry.hint : "根据放入的素材类型自动选择工作流。")
+      + (active ? `当前会运行「${cap.name}」。` : "");
+  } else if (md.ladder) {
+    note = "按图片数量自动选择："
+      + Object.keys(md.ladder).map(Number).sort((a, b) => a - b)
+        .map(k => `${k} 张 → ${(CAPS[md.ladder[k]] || {}).name || md.ladder[k]}`).join("；")
+      + (active ? `。当前 ${filledImgs(c)} 张，会运行「${cap.name}」。` : "。");
+  }
+  if (note) {
+    const n = document.createElement("div"); n.className = "note"; n.textContent = note;
+    d.insertBefore(n, d.children[1] || null);
+  }
+  return d;
+}
+
+function nodeBriefEl(c) {
+  const def = defOf(c);
+  if (isStyle(c)) return plainBriefEl(titleOf(c),
+    `这个节点保存一段可复用的风格描述，不会单独生成产物。连接到生成节点后会并入提示词，并沿产物连线向下游继承；下游节点自己挂风格时会从那里开始覆盖继承。使用 ${STYLE_PH} 可以指定原提示词插入位置。这里只写画风、色调、光线和镜头质感，具体画面内容留在生成节点。`,
+    [["输入", "风格、色调、光线和镜头质感"], ["产出", "可复用的风格文字"]]);
+  if (isText(c)) return plainBriefEl(titleOf(c),
+    "这个节点保存和加工文字。可以连接到生成节点并入提示词，也可以连接到其他文本节点作为加工输入；加工结果会写回节点。",
+    [["输入", "节点文字或上游文本"], ["产出", "可继续连接的文字"]]);
+  if (isAsset(c)) return plainBriefEl(titleOf(c),
+    "这个节点保存一份上传素材，不会单独运行。它可以同时连接到多个节点，让同一份图片、视频或音频重复使用；原文件不会被处理。",
+    [["输入", "图片、视频或音频"], ["产出", "可复用的原始素材"]]);
+  return modeBriefEl(c, modeOf(c), titleOf(c) || (def && def.name));
+}
+
 /** 把浮层摆在 a（锚点的屏幕矩形）旁边。
  *
  *  横向夹在**画布**的左右边界里，不是窗口：右边开着历史产物栏时按 innerWidth 夹，
@@ -824,13 +876,18 @@ function tipShow(node, a) {
 }
 const tipHide = () => (el.tip.style.display = "none");
 
-/** 给元素挂"悬停显示能力说明" */
-function hoverBrief(node, capGetter, nameGetter) {
+/** 给元素挂延迟悬停说明，避免鼠标经过整张节点时提示层闪烁。 */
+function hoverTip(node, contentGetter) {
+  let timer = null;
   node.addEventListener("mouseenter", () => {
-    const cap = capGetter(); if (!cap) return;
-    tipShow(briefEl(cap, nameGetter && nameGetter()), node.getBoundingClientRect());
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      const content = contentGetter();
+      if (content && node.matches(":hover")) tipShow(content, node.getBoundingClientRect());
+    }, 280);
   });
-  node.addEventListener("mouseleave", tipHide);
+  node.addEventListener("mouseleave", () => { clearTimeout(timer); tipHide(); });
+  node.addEventListener("mousedown", () => { clearTimeout(timer); tipHide(); });
 }
 
 /* ================= 启动 ================= */
@@ -1041,12 +1098,12 @@ function updateMinimap() {
   const scale = Math.min(MAP_W / worldW, MAP_H / worldH);
 
   // 清空画布
-  ctx.fillStyle = "#05060d";
+  ctx.fillStyle = "#070707";
   ctx.fillRect(0, 0, MAP_W, MAP_H);
 
   // 绘制节点
-  ctx.fillStyle = "#1e2a44";
-  ctx.strokeStyle = "#2b3d63";
+  ctx.fillStyle = "#f3f4f6";
+  ctx.strokeStyle = "#f3f4f6";
   ctx.lineWidth = 1;
   for (const c of PROJ.cards) {
     const x = (c.x - minX) * scale;
@@ -1226,7 +1283,7 @@ function buildCard(c) {
   };
   bindCardVideo(d.querySelector(".body"));
   bindCompare(d.querySelector(".body"), c);
-  hoverBrief(d.querySelector(".ch"), () => capOf(c), () => c.name);
+  hoverTip(d, () => nodeBriefEl(c));
   // 空素材节点：点一下正文就弹文件选择（节点脚和徽标都写着「点节点选文件」，不接上会落空）
   d.onclick = (ev) => {
     if (!isAsset(c) || assetOf(c)) return;
@@ -2350,11 +2407,11 @@ function bindGlobal() {
 
   el.zoomMenu.onclick = (ev) => {
     const items = [
-      { icon: "🔍", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); save(); } },
-      { icon: "⊙", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); save(); } },
-      { icon: "🔍", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); save(); } },
-      { icon: "🔍", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); save(); } },
-      { icon: "📐", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); } },
+      { icon: "+", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); save(); } },
+      { icon: "1:1", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); save(); } },
+      { icon: "−", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); save(); } },
+      { icon: "−", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); save(); } },
+      { icon: "□", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); } },
     ];
     showMenu(ev.clientX, ev.clientY - 200, "缩放", items);
   };
@@ -2377,7 +2434,8 @@ function showMenu(cx, cy, title, items) {
     const i = document.createElement("span"); i.textContent = it.icon || "▸";
     const t = document.createElement("span"); t.textContent = it.text;
     b.append(i, t);
-    b.onclick = () => { closeMenu(); it.run(); };
+    b.onclick = () => { closeMenu(); tipHide(); it.run(); };
+    if (it.tip) hoverTip(b, it.tip);
     el.menu.appendChild(b);
   }
   el.menu.style.display = "";
@@ -2450,13 +2508,13 @@ function buildDock() {
   const sep = () => { const s = document.createElement("div"); s.className = "sep"; return s; };
   el.dock.innerHTML = "";
   el.dock.append(
-    mk("📎", "上传", "选一个图片/视频文件，放进一个素材节点 —— 再把它的出口拖到别的节点上就能反复用",
+    mk("↥", "上传", "选一个图片/视频文件，放进一个素材节点 —— 再把它的出口拖到别的节点上就能反复用",
       addAssetCard),
     sep(),
-    mk("✍", "文本", "新建一个文本节点：存一段字，连到生成节点就并进提示词", spawn("card_text")),
-    mk("🖼", "图片", "新建一个生图节点（默认文生图，玩法在参数面板左下角换）", spawn("card_image")),
-    mk("🎬", "视频", "新建一个生视频节点（默认图生视频，玩法在参数面板左下角换）", spawn("card_video")),
-    mk("🧩", "工具箱", "抠图 / 拼图 / 补帧 / 画质增强 —— 点开选一样", tools),
+    mk("T", "文本", "新建一个文本节点：存一段字，连到生成节点就并进提示词", spawn("card_text")),
+    mk("▧", "图片", "新建一个生图节点（默认文生图，玩法在参数面板左下角换）", spawn("card_image")),
+    mk("▷", "视频", "新建一个生视频节点（默认图生视频，玩法在参数面板左下角换）", spawn("card_video")),
+    mk("◇", "工具箱", "抠图 / 拼图 / 补帧 / 画质增强 —— 点开选一样", tools),
   );
 }
 
@@ -3379,7 +3437,7 @@ function openPanel(id) {
       const b = document.createElement("button");
       b.className = modeHas(md, c.cap) ? "on" : "";
       b.textContent = md.name;
-      hoverBrief(b, () => CAPS[modeCap(md)], () => md.name);
+      hoverTip(b, () => modeBriefEl(c, md, md.name));
       b.onclick = () => { tipHide(); c.cap = modeCap(md); openPanel(id); paintTitle(c); save(); };
       m.appendChild(b);
     }
@@ -3410,32 +3468,6 @@ function openPanel(id) {
   // 中间这坨才滚动：模式切换留在顶部、运行按钮留在底部，参数再多也不会被推出屏幕
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
-
-  // --- 玩法说明 ---
-  // 能力本身的介绍（cap.note、吃什么吐什么）不在这儿画：面板一打开就是一大段字，
-  // 把素材槽和参数挤到下面去，而这段话看一遍就够了。改成鼠标停在节点顶栏上才显示
-  // （buildCard 里的 hoverBrief）。下面这两条留着 —— 它们不是介绍，是"现在会跑哪条"
-  // 的实时反馈，看的时候正需要对着参数看。
-  // 路由节点：说清楚放什么会跑什么，并标出现在这一格是哪一路
-  if (md && md.route) {
-    const filled = Object.keys(md.route).find(k => md.route[k].cap === c.cap
-      && c.assets[md.route[k].slot]);
-    const n = document.createElement("div"); n.className = "pnote";
-    n.textContent = md.entry.hint
-      + (filled ? `现在放的是${KIND_ZH[filled] || filled}，会跑「${cap.name}」。`
-        : "现在还没放素材。");
-    body.appendChild(n);
-  }
-  // 合并模式：把"传几张跑哪条"摊开写，并标出现在会跑哪条
-  if (md && md.ladder) {
-    const now = runCap(c);
-    const n = document.createElement("div"); n.className = "pnote";
-    n.textContent = "看图片张数决定跑哪条工作流："
-      + Object.keys(md.ladder).map(Number).sort((a, b) => a - b)
-        .map(k => `${k} 张 → ${(CAPS[md.ladder[k]] || {}).name || md.ladder[k]}`).join("；")
-      + `。当前 ${filledImgs(c)} 张，会跑「${(CAPS[now] || {}).name || now}」。`;
-    body.appendChild(n);
-  }
 
   // --- 素材槽 ---
   // 放在提示词前面：漫剧那种一图一提示词的工作流，tab 是跟着图长出来的，
@@ -3503,12 +3535,16 @@ function openPanel(id) {
   // 生图节点和生视频节点：左下「模式」胶囊（换玩法）+「⚙ 参数」（清晰度/比例弹窗），跟文本节点同一套
   if (compact) {
     const isVideo = def.id === "card_video";
-    foot.appendChild(capBtn(`${def.icon} ${(modeOf(c) || def.modes[0]).name}`, isVideo ? "生视频模式" : "生图模式",
+    const currentMode = modeOf(c) || def.modes[0];
+    const modeButton = capBtn(`${def.icon} ${currentMode.name}`, isVideo ? "生视频模式" : "生图模式",
       () => def.modes.map(mo => ({
         icon: def.icon,
         text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),
+        tip: () => modeBriefEl(c, mo, mo.name),
         run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo); openPanel(id); paintTitle(c); save(); },
-      }))));
+      })));
+    hoverTip(modeButton, () => modeBriefEl(c, currentMode, currentMode.name));
+    foot.appendChild(modeButton);
 
     // 模型选择按钮（文生图和图生图模式显示，用于在Z-Image和Krea2之间切换）
     if (def.id === "card_image" && c.cap && (c.cap === "zimage_t2i" || c.cap === "krea2_t2i" || c.cap === "zimage_i2i" || c.cap === "krea2_i2i")) {
@@ -3563,9 +3599,6 @@ function openPanel(id) {
   info.textContent = cap.outputType === "video" ? "输出：视频" : "输出：图片";
   // 上一轮跑了多久：视频一轮动辄几分钟，这个数得在面板里也报一声（节点脚上一直有）
   if (c.status === "done" && c.ms > 0) info.textContent += ` · 上次 ${fmtEla(c.ms)}`;
-  // 说明搬去节点顶栏悬停了，这儿得留一句指路：素材有硬性要求（比如每张图必须是
-  // 四宫格拼图）的玩法，没看过那段话就是白跑一轮
-  if (cap.note) info.textContent += " · 玩法说明：鼠标停在节点标题上";
   foot.appendChild(info);
   if (running) {
     const cn = document.createElement("button");
@@ -3592,20 +3625,6 @@ function errBox(t) { const d = document.createElement("div"); d.className = "err
 function stylePanel(c) {
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
-
-  const n = document.createElement("div"); n.className = "pnote";
-  n.textContent = "这个节点不生成任何东西。把它的出口（右边那颗点）拖到生图/生视频节点上，"
-    + "提交那一刻这段文字会并进那个节点的提示词里 —— 一个风格节点可以同时挂好几个节点，"
-    + "改一次，挂着的全跟着变。\n"
-    + "挂了一张，它下游整条链都跟着套：产物接给谁，风格就传给谁，"
-    + "不用每一棒都挂一遍（中间夹着放大、补帧这种不写提示词的节点也照样往下传）。"
-    + "下游哪个节点自己挂了风格，那个节点起就以它自己的为准，这一份不再往下传。\n"
-    + `默认是风格在前、空一行再接节点自己的提示词。想换位置就在下面写上 ${STYLE_PH}，`
-    + "节点的提示词会填到那个位置去（比如「照下面的内容画一张图：" + STYLE_PH
-    + "。整体是哥特暗黑定格动画风格」）。\n"
-    + "只写风格：画风、色调、光线、镜头质感、画质词。别在这儿写具体画面内容 ——"
-    + "那是每个节点自己的事，写在这儿会让所有节点画同一个东西。";
-  body.appendChild(n);
 
   const wrap = document.createElement("div"); wrap.className = "pblock";
   const hd = document.createElement("div"); hd.className = "phd";
@@ -3690,13 +3709,6 @@ function assetPanel(c) {
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
   const a = assetOf(c);
-
-  const n = document.createElement("div"); n.className = "pnote";
-  n.textContent = "这个节点不生成任何东西，手里就拿着一份上传上来的素材。"
-    + "把它的出口（右边那颗点）拖到别的节点上，这份素材就进那个节点的格子里 —— "
-    + "同一张脸想既生视频又抠图，传一次、拉两根线就行，不用在两边的格子里各传一遍。\n"
-    + "图片、视频、音频都收；收进来的就是原文件，不做任何处理。";
-  body.appendChild(n);
 
   const wrap = document.createElement("div"); wrap.className = "pblock";
   const hd = document.createElement("div"); hd.className = "phd";
