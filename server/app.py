@@ -53,6 +53,32 @@ CONTROLLER_MODE = EXECUTION_MODE == "controller"
 ENROLLMENT_TOKEN = os.environ.get("CHOUKA_ENROLLMENT_TOKEN", "")
 ARTIFACT_DIR = ROOT / "data" / "artifacts"
 
+MODEL_FAMILY = {
+    **{cap: "minimax_h3" for cap in (
+        "minimax_h3_i2v", "minimax_h3_flf2v", "minimax_h3_talk1",
+        "minimax_h3_talk2", "minimax_h3_ref4", "minimax_h3_ref9",
+        "minimax_h3_ref_2pass", "minimax_h3_comic20",
+    )},
+    "flux2_klein_edit": "flux2_klein",
+    "flux2_klein_storyboard9": "flux2_klein",
+    "rmbg_erase": "flux2_klein",
+    "krea2_t2i": "krea2",
+    "krea2_i2i": "krea2",
+    "zimage_t2i": "zimage",
+    "zimage_i2i": "zimage",
+    "qwen_image_reverse": "qwen35_27b",
+    "qwen_video_reverse": "qwen35_27b",
+    "rmbg_cutout": "rmbg2",
+    "rmbg_bgonly": "rmbg2",
+    "seedvr2_image_up": "seedvr2",
+    "seedvr2_video_up": "seedvr2",
+}
+
+
+def model_family(capability_id):
+    return MODEL_FAMILY.get(capability_id, capability_id)
+
+
 CLIENT_ID = uuid.uuid4().hex
 STARTED_AT = time.time()
 JOBS = {}                  # prompt_id -> job dict
@@ -615,7 +641,8 @@ async def api_generate(request):
         }
         distributed_store(request.app).enqueue(
             pid,
-            {"graph": graph, "assets": uploaded, "capability": cid},
+            {"graph": graph, "assets": uploaded, "capability": cid,
+             "model_family": model_family(cid)},
             required_nodes,
         )
     save_jobs()
