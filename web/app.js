@@ -28,7 +28,7 @@ const el = {
   lasso: $("#lasso"), selbar: $("#selbar"), dock: $("#dock"),
   empty: $("#empty"), panel: $("#panel"), hist: $("#hist"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
-  jobsbtn: $("#jobsbtn"), jobs: $("#jobs"), controllerLink: $("#controller-link"),
+  jobsbtn: $("#jobsbtn"), jobs: $("#jobs"),
   view: $("#view"), vbox: $("#view .vbox"), respop: $("#respop"),
   minimapBtn: $("#minimap-btn"), wiresToggle: $("#wires-toggle"), zoomMenu: $("#zoom-menu"),
   minimap: $("#minimap"), minimapCanvas: $("#minimap-canvas"), minimapViewport: $("#minimap-viewport"),
@@ -912,10 +912,17 @@ async function health() {
   try {
     const h = await api("/api/health");
     el.dot.classList.toggle("on", !!h.comfy_online);
-    el.controllerLink.style.display = h.mode === "controller" ? "" : "none";
+    if (h.mode === "controller") {
+      el.dot.href = "/controller";
+      el.dot.title = "打开运行面板";
+      el.dot.setAttribute("aria-label", "打开运行面板");
+    } else {
+      el.dot.removeAttribute("href");
+      el.dot.title = "ComfyUI 连接状态";
+      el.dot.setAttribute("aria-label", "ComfyUI 连接状态");
+    }
   } catch (e) {
     el.dot.classList.remove("on");
-    el.controllerLink.style.display = "none";
   }
 }
 
