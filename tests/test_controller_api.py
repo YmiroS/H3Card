@@ -87,7 +87,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_controller_dashboard_and_health_metadata(self):
         response = await self.client.get("/controller")
         self.assertEqual(response.status, 200)
-        self.assertIn("中间层运行面板", await response.text())
+        self.assertIn("<title>运行面板</title>", await response.text())
 
         response = await self.client.get("/api/health")
         self.assertEqual(response.status, 200)
