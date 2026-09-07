@@ -1,6 +1,7 @@
 import json
 import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -47,6 +48,18 @@ class ModelFamilyTest(unittest.TestCase):
         self.assertEqual(controller_app.model_family("seedvr2_image_up"), "seedvr2")
         self.assertEqual(controller_app.model_family("seedvr2_video_up"), "seedvr2")
         self.assertEqual(controller_app.model_family("unknown_workflow"), "unknown_workflow")
+
+
+class FfmpegDiscoveryTest(unittest.TestCase):
+    def test_uses_imageio_ffmpeg_binary_outside_windows_bundle(self):
+        with tempfile.TemporaryDirectory() as directory:
+            executable = Path(directory) / "ffmpeg"
+            executable.touch()
+            fake_module = types.SimpleNamespace(
+                get_ffmpeg_exe=lambda: str(executable)
+            )
+            with mock.patch.dict(sys.modules, {"imageio_ffmpeg": fake_module}):
+                self.assertEqual(controller_app.ffmpeg_bin(), executable)
 
 
 class H3CharacterTransferPatchTest(unittest.TestCase):
