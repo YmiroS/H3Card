@@ -77,6 +77,11 @@
     "id": "minimax_h3_ref_2pass",
     "name": "H3全能参考(高质量)",
     "slots": "img9+aud3+vid1"
+   },
+   {
+    "id": "minimax_h3_character_transfer",
+    "name": "H3人物迁移",
+    "slots": "img1+aud0+vid1"
    }
   ]
  },
