@@ -5,6 +5,7 @@
 """
 import hashlib
 import os
+import re
 import time
 import uuid
 import requests
@@ -14,6 +15,41 @@ import requests
 YOUDAO_APP_KEY = os.environ.get("YOUDAO_APP_KEY", "")
 YOUDAO_APP_SECRET = os.environ.get("YOUDAO_APP_SECRET", "")
 YOUDAO_API_URL = "https://openapi.youdao.com/api"
+
+# 模型提示词中的结构化语法必须原样保留，否则翻译后不能再直接用于生成。
+_PROMPT_TOKEN_RE = re.compile(
+    r"<[^<>\r\n]+>"                         # <Subject 1>、<Picture 1>、<d> 等
+    r"|\[[^\[\]\r\n]+\]"                 # [Shot 1]、[Chinese]、任务类型等
+    r"|\((?:S\d+)(?:,S\d+)*\)"            # (S1)、(S1,S2)
+    r"|^(?:subject_definitions|summary|retention_analysis|"
+    r"detailed_description|overall_soundscape|non_diegetic_music):"
+    r"|\b(?:fully_preserved|partially_preserved|attribute_transfer|"
+    r"weak_reference|fully_copy|partially_copy|reference)\b",
+    re.MULTILINE,
+)
+
+
+def _protect_prompt_tokens(text):
+    """用不会被翻译的占位符保护提示词标签和结构化关键词。"""
+    protected = []
+
+    def replace(match):
+        index = len(protected)
+        token = f"__CK_KEEP_{index:04d}__"
+        while token in text:
+            token = "_" + token
+        protected.append((token, match.group(0)))
+        return token
+
+    return _PROMPT_TOKEN_RE.sub(replace, text), protected
+
+
+def _restore_prompt_tokens(text, protected):
+    for token, original in protected:
+        if text.count(token) != 1:
+            raise TranslateError("翻译服务改动了受保护的提示词标签或关键词")
+        text = text.replace(token, original)
+    return text
 
 
 class TranslateError(Exception):
@@ -40,6 +76,8 @@ def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers")
     if not YOUDAO_APP_KEY or not YOUDAO_APP_SECRET:
         raise TranslateError("服务端未配置 YOUDAO_APP_KEY / YOUDAO_APP_SECRET")
 
+    query, protected = _protect_prompt_tokens(text)
+
     # 自动判断目标语言：如果源文本主要是中文 → 英文，否则 → 中文
     if to_lang == "auto":
         # 简单判断：中文字符占比超过 30% 就认为是中文
@@ -52,12 +90,12 @@ def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers")
     # 生成签名（v3 版本用 SHA256）
     salt = str(uuid.uuid4())
     curtime = str(int(time.time()))
-    sign_str = YOUDAO_APP_KEY + truncate(text) + salt + curtime + YOUDAO_APP_SECRET
+    sign_str = YOUDAO_APP_KEY + truncate(query) + salt + curtime + YOUDAO_APP_SECRET
     sign = hashlib.sha256(sign_str.encode('utf-8')).hexdigest()
 
     # 请求参数
     params = {
-        "q": text,
+        "q": query,
         "from": from_lang,
         "to": to_lang,
         "appKey": YOUDAO_APP_KEY,
@@ -87,7 +125,8 @@ def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers")
         if not translation:
             raise TranslateError("有道 API 返回结果为空")
 
-        return "\n".join(translation) if isinstance(translation, list) else str(translation)
+        translated = "\n".join(translation) if isinstance(translation, list) else str(translation)
+        return _restore_prompt_tokens(translated, protected)
 
     except requests.RequestException as e:
         raise TranslateError(f"网络请求失败：{e}")
