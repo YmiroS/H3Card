@@ -46,6 +46,7 @@ ALIASES = {
     "1-minimax H3/MiniMax H3 全能参考(通用) 九图+视频.json": "minimax_h3_ref9",
     "1-minimax H3/Minimax H3 多图全能二采-V2.json": "minimax_h3_ref_2pass",
     "1-minimax H3/@minimax-批量化漫剧20宫格-直出1分钟视频V3.json": "minimax_h3_comic20",
+    "1-minimax H3/MinimaxH3长视频动作迁移人物替换+长视频数字人工作流.json": "minimax_h3_character_transfer",
     "0-工具箱/四图拼四宫格.json": "grid4_stitch",
     "0-工具箱/人物提取.json": "rmbg_cutout",
     "0-工具箱/抠出背景.json": "rmbg_bgonly",
@@ -73,6 +74,7 @@ DISPLAY = {
     "minimax_h3_ref9": "H3全能参考",
     "minimax_h3_ref_2pass": "H3全能参考(高质量)",
     "minimax_h3_comic20": "漫剧4宫格",
+    "minimax_h3_character_transfer": "H3人物迁移",
     "grid4_stitch": "四图拼四宫格",
     "rmbg_cutout": "人物提取",
     "rmbg_bgonly": "抠出背景",
@@ -163,6 +165,11 @@ ASSET_CARD = {
 # ref9 和 ref4：虽然槽位都是激活的，但加入 REVIVE 是为了统一处理槽位标签
 REVIVE = {"minimax_h3_ref4", "minimax_h3_ref9", "minimax_h3_ref_2pass"}
 
+# 这个工作流把视频和人物图封在 TimelineDirector 的 timeline_data 字符串中，普通扫描器
+# 看不到素材槽。API 图和素材槽由下面的专用规则维护，避免重扫时把模式扫成“无素材”。
+H3_CHARACTER_TRANSFER = "minimax_h3_character_transfer"
+MANUAL_API = {H3_CHARACTER_TRANSFER}
+
 # 这两条工作流按「视频、图片、音频」排列引用类型，但全部素材都可选；空槽会断开
 # 模板里的对应支线，不能让 example.mp4 / 演示图在用户没引用素材时悄悄参与运行。
 VIDEO_REFERENCE_FIRST = {"minimax_h3_ref9", "minimax_h3_ref_2pass"}
@@ -220,6 +227,11 @@ NOTES = {
         "相比单采版本质量更高、分辨率更大，但速度慢一倍（20 步分两阶段）。\n"
         "最多支持 1 个视频 + 9 张图片 + 3 段音频，全部按需引用，没有必填素材。\n"
         "适合最终交付作品；快速预览用单采版本（H3全能参考）。"
+    ),
+    H3_CHARACTER_TRANSFER: (
+        "放入一段动作来源视频和一张人物参考图，自动把视频里的主要表演者替换成参考人物，"
+        "并保留原动作、镜头、场景和音轨。长视频会按“单段时长”自动切段并连续生成，"
+        "最终重新拼成与来源视频等长的成片。建议先用 5~10 秒短视频确认效果，再处理完整长视频。"
     ),
     "grid4_stitch": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」"
                     "要的素材，拼完直接连线过去。分镜顺序就是这个顺序。"
@@ -304,6 +316,7 @@ REWRITE = {
     "minimax_h3_ref4": {"regime": "h3_ref"},
     "minimax_h3_ref9": {"regime": "h3_ref"},
     "minimax_h3_ref_2pass": {"regime": "h3_ref"},
+    H3_CHARACTER_TRANSFER: {"regime": "h3_ref"},
     "minimax_h3_talk1": {"regime": "h3_ref", "audio": True},
     "minimax_h3_talk2": {"regime": "h3_ref", "audio": True},
 }
@@ -1800,6 +1813,42 @@ def to_target_fps(inputs, api, oi, out_node):
     }
 
 
+def h3_character_transfer_inputs(api):
+    """TimelineDirector 把素材藏在 JSON 中；为抽卡面板显式声明可复用的输入槽。"""
+    timeline = api["11"]["inputs"]
+    segment = api["43"]["inputs"]
+    sampler = api["30"]["inputs"]
+    return [
+        {"key": "video[0]", "label": "动作来源视频", "type": "video", "required": True,
+         "target": {"node": "11", "input": "timeline_data", "kind": "timeline_asset"}},
+        {"key": "images[0]", "label": "替换人物参考图", "type": "image", "required": True,
+         "target": {"node": "11", "input": "timeline_data", "kind": "timeline_asset"}},
+        {"key": "prompt", "label": "迁移要求", "type": "textarea",
+         "default": segment["prompt"], "target": {"node": "43", "input": "prompt"}},
+        {"key": "width", "label": "宽", "type": "number", "default": timeline["width"],
+         "min": 256, "max": 1344, "step": 32,
+         "target": {"node": "11", "input": "width", "vtype": "INT"}},
+        {"key": "height", "label": "高", "type": "number", "default": timeline["height"],
+         "min": 256, "max": 1344, "step": 32,
+         "target": {"node": "11", "input": "height", "vtype": "INT"}},
+        {"key": "duration", "label": "单段时长(秒)", "type": "slider",
+         "min": 5, "max": 15, "step": 1, "default": timeline["generation_seconds"],
+         "hint": "长视频会按这个长度自动切段。10 秒兼顾连贯性和显存；调短会增加分段数量和总耗时。",
+         "target": {"node": "11", "input": "generation_seconds", "vtype": "FLOAT"}},
+        {"key": "steps", "label": "采样步数", "type": "slider",
+         "min": 1, "max": 40, "step": 1, "default": api["9"]["inputs"]["steps"],
+         "hint": "原始融合模型按 8 步工作。", "advanced": True,
+         "target": {"node": "9", "input": "steps", "vtype": "INT"}},
+        {"key": "overlap_frames", "label": "分段重叠帧", "type": "slider",
+         "min": 1, "max": 192, "step": 1, "default": segment["overlap_frames"],
+         "hint": "相邻分段用于动作和音频续接的重叠长度，推荐保持 48。", "advanced": True,
+         "target": {"node": "43", "input": "overlap_frames", "vtype": "INT"}},
+        {"key": "seed", "label": "种子", "type": "seed", "default": sampler["seed"],
+         "max": 18446744073709551615,
+         "target": {"node": "30", "input": "seed", "vtype": "INT"}},
+    ]
+
+
 def scan(path: Path, oi, rel_key=None):
     wf = json.loads(path.read_text(encoding="utf-8"))
     warns = []
@@ -1810,8 +1859,9 @@ def scan(path: Path, oi, rel_key=None):
     wid = ALIASES.get(rel_key) or slugify(path.stem) or "wf_" + hashlib.md5(
         path.stem.encode("utf-8")).hexdigest()[:8]
     api_path = ROOT / "graphs" / f"{wid}.api.json"
-    if subs and api_path.exists():
-        warns = [f"子图工作流：使用已导出的 {api_path.name}（本地未重新转换）"]
+    if (subs or wid in MANUAL_API) and api_path.exists():
+        reason = "子图工作流" if subs else "时间线素材工作流"
+        warns = [f"{reason}：使用已维护的 {api_path.name}"]
         api = json.loads(api_path.read_text(encoding="utf-8"))
     else:
         api = ui_to_api(wf, oi, warns, revive=wid in REVIVE)
@@ -1822,6 +1872,9 @@ def scan(path: Path, oi, rel_key=None):
     # 正等着 repair_loop_count 把它接进 total —— 先摘就把要修的东西摘掉了
     prune_dead(api, oi, warns)
     inputs, outputs, n_img, n_aud, n_vid, note = derive_inputs(api, oi, wid)
+    if wid == H3_CHARACTER_TRANSFER:
+        inputs = h3_character_transfer_inputs(api)
+        n_img, n_aud, n_vid = 1, 0, 1
     if outputs:
         to_target_fps(inputs, api, oi, outputs[0][0])
     out_type = outputs[0][1] if outputs else "unknown"
@@ -1868,6 +1921,11 @@ def scan(path: Path, oi, rel_key=None):
         "inputs": inputs,
         "warnings": warns,
     }
+    if wid == H3_CHARACTER_TRANSFER:
+        manifest["patch"] = {
+            "kind": "h3_character_transfer", "timelineNode": "11",
+            "video": "video[0]", "image": "images[0]",
+        }
     # 子图工作流也要写回：它的输入就是这份已导出的 api.json，上面那些 repair_* 只改了
     # 内存，不写回去的话真正提交给 ComfyUI 的还是没修的图。重扫一次是幂等的，
     # 从 ComfyUI 重新「导出(API)」覆盖后再扫，照样会把修补重新打上。

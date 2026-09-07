@@ -58,6 +58,7 @@ MODEL_FAMILY = {
         "minimax_h3_i2v", "minimax_h3_flf2v", "minimax_h3_talk1",
         "minimax_h3_talk2", "minimax_h3_ref4", "minimax_h3_ref9",
         "minimax_h3_ref_2pass", "minimax_h3_comic20",
+        "minimax_h3_character_transfer",
     )},
     "flux2_klein_edit": "flux2_klein",
     "flux2_klein_storyboard9": "flux2_klein",
@@ -320,6 +321,52 @@ def derive_target_fps(g, spec, tgt, uploaded):
     return tgt
 
 
+def patch_h3_character_transfer(g, cap, uploaded):
+    """把抽卡面板里的动作视频和人物图封装成 TimelineDirector 素材时间线。"""
+    spec = cap.get("patch") or {}
+    if spec.get("kind") != "h3_character_transfer":
+        return
+    video = uploaded.get(spec.get("video", "video[0]"))
+    image = uploaded.get(spec.get("image", "images[0]"))
+    if not video or not image:
+        return
+    info = probe_video(video)
+    source_duration = float(info.get("duration") or 0)
+    if not source_duration:
+        raise web.HTTPBadRequest(reason="无法读取动作来源视频时长")
+    if source_duration < 5:
+        raise web.HTTPBadRequest(reason="动作来源视频不能短于 5 秒")
+    node = str(spec.get("timelineNode", "11"))
+    segment_seconds = float(g[node]["inputs"].get("generation_seconds") or 10)
+    timeline = {
+        "version": 4,
+        "fps": 24,
+        "selection": {"start": 0, "duration": segment_seconds},
+        "videoAudioEnabled": True,
+        "videoClips": [{
+            "id": "chouka-character-transfer-video",
+            "file": video,
+            "name": Path(video).name,
+            "start": 0,
+            "duration": source_duration,
+            "trimStart": 0,
+            "sourceDuration": source_duration,
+            "hasAudio": bool(info.get("has_audio")),
+            "referenceMode": "edit",
+        }],
+        "images": [{
+            "id": "chouka-character-transfer-identity",
+            "file": image,
+            "name": Path(image).name,
+        }],
+        "audios": [],
+        "segmentConfig": {"count": 0, "segments": []},
+    }
+    g[node]["inputs"]["timeline_data"] = json.dumps(
+        timeline, ensure_ascii=False, separators=(",", ":")
+    )
+
+
 def patch_graph(cap, params, uploaded):
     """按 manifest 把用户参数写进 API 工作流模板"""
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
@@ -380,12 +427,15 @@ def patch_graph(cap, params, uploaded):
                     blank.append(f"{labels.get(pair, pair)}")
                 # 注意：文本清空后必须写入 ""，不能当"没给"跳过，
                 # 否则模板里作者自带的演示提示词会悄悄生效（出片跑偏）
+        if tgt.get("kind") == "timeline_asset":
+            continue
         g[node]["inputs"][field] = val
     if missing:
         raise web.HTTPBadRequest(reason="必填素材未提供：" + "、".join(missing))
     if blank:
         raise web.HTTPBadRequest(
             reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
+    patch_h3_character_transfer(g, cap, uploaded)
     return g
 
 

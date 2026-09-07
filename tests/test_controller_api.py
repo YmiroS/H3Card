@@ -1,7 +1,9 @@
+import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -26,12 +28,14 @@ class CardProgressLabelTest(unittest.TestCase):
                 "_meta": {"title": "MiniMax H3 Reference to Video"},
             },
             "3": {"class_type": "UnknownEnglishNode"},
+            "4": {"class_type": "MiniMaxH3FiniteSegmentSampler"},
         }
 
         self.assertEqual(controller_app.step_labels(graph), {
             "1": "高级自定义采样器",
             "2": "MiniMax H3参考生成视频",
             "3": "处理中",
+            "4": "长视频分段采样",
         })
 
 
@@ -39,9 +43,51 @@ class ModelFamilyTest(unittest.TestCase):
     def test_related_workflows_share_model_family(self):
         self.assertEqual(controller_app.model_family("minimax_h3_ref9"), "minimax_h3")
         self.assertEqual(controller_app.model_family("minimax_h3_i2v"), "minimax_h3")
+        self.assertEqual(controller_app.model_family("minimax_h3_character_transfer"), "minimax_h3")
         self.assertEqual(controller_app.model_family("seedvr2_image_up"), "seedvr2")
         self.assertEqual(controller_app.model_family("seedvr2_video_up"), "seedvr2")
         self.assertEqual(controller_app.model_family("unknown_workflow"), "unknown_workflow")
+
+
+class H3CharacterTransferPatchTest(unittest.TestCase):
+    def setUp(self):
+        controller_app.load_caps()
+        self.cap = controller_app.CAPS["minimax_h3_character_transfer"]
+
+    @mock.patch.object(controller_app, "probe_video", return_value={
+        "duration": 67.033, "fps": 29.97, "frames": 2009, "has_audio": True,
+    })
+    def test_builds_timeline_from_existing_video_panel_assets(self, _probe):
+        graph = controller_app.patch_graph(
+            self.cap,
+            {"width": 544, "height": 960, "duration": 10, "steps": 8,
+             "overlap_frames": 48, "seed": 123},
+            {"video[0]": "chouka/dance.mp4", "images[0]": "chouka/person.png"},
+        )
+        timeline = json.loads(graph["11"]["inputs"]["timeline_data"])
+        self.assertEqual(graph["11"]["inputs"]["width"], 544)
+        self.assertEqual(graph["11"]["inputs"]["height"], 960)
+        self.assertEqual(graph["9"]["inputs"]["steps"], 8)
+        self.assertEqual(graph["30"]["inputs"]["seed"], 123)
+        self.assertEqual(timeline["selection"], {"start": 0, "duration": 10.0})
+        self.assertEqual(timeline["videoClips"][0]["file"], "chouka/dance.mp4")
+        self.assertEqual(timeline["videoClips"][0]["sourceDuration"], 67.033)
+        self.assertTrue(timeline["videoClips"][0]["hasAudio"])
+        self.assertEqual(timeline["videoClips"][0]["referenceMode"], "edit")
+        self.assertEqual(timeline["images"][0]["file"], "chouka/person.png")
+
+    def test_requires_both_video_and_identity_image(self):
+        with self.assertRaisesRegex(web.HTTPBadRequest, "替换人物参考图"):
+            controller_app.patch_graph(
+                self.cap, {}, {"video[0]": "chouka/dance.mp4"}
+            )
+
+    def test_video_card_exposes_character_transfer_mode(self):
+        video_card = next(card for card in controller_app.CARDS if card["id"] == "card_video")
+        self.assertIn(
+            "minimax_h3_character_transfer",
+            {mode["id"] for mode in video_card["modes"]},
+        )
 
 
 class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
