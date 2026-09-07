@@ -242,8 +242,14 @@ async def comfy_upload(session, field_name, filename, data):
 
 
 def ffmpeg_bin():
-    """整合包里的 ffmpeg（imageio_ffmpeg 带的那个，没有独立的 ffmpeg.exe）。
-       按前缀找，免得版本号一升就断。"""
+    """返回当前平台可用的 imageio-ffmpeg；兼容旧版 Windows 整合包目录。"""
+    try:
+        import imageio_ffmpeg
+        exe = Path(imageio_ffmpeg.get_ffmpeg_exe())
+        if exe.is_file():
+            return exe
+    except (ImportError, RuntimeError):
+        pass
     d = PACK / "python_embeded/Lib/site-packages/imageio_ffmpeg/binaries"
     return next(iter(sorted(d.glob("ffmpeg-*.exe"), reverse=True)), None)
 
