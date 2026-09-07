@@ -14,7 +14,44 @@ sys.path.insert(0, str(ROOT / "server"))
 
 import app as controller_app
 import rewrite
+import translate as prompt_translate
 from distributed import DistributedStore
+
+
+class PromptTranslationProtectionTest(unittest.TestCase):
+    @mock.patch.object(prompt_translate, "YOUDAO_APP_SECRET", "secret")
+    @mock.patch.object(prompt_translate, "YOUDAO_APP_KEY", "key")
+    def test_preserves_prompt_tags_and_optimization_keywords(self):
+        source = (
+            "subject_definitions:\n"
+            "<Subject 1> is a gray cat.\n"
+            "retention_analysis:\n"
+            "<Subject 1> (appears in [Shot 1]): fully_preserved - gray fur.\n"
+            "<Audio 1>: reference - quiet ambience."
+        )
+
+        def post(_url, data, timeout):
+            self.assertEqual(timeout, 10)
+            response = mock.Mock()
+            response.raise_for_status.return_value = None
+            response.json.return_value = {
+                "errorCode": "0",
+                "translation": [data["q"].replace("is a gray cat", "是一只灰猫")
+                                          .replace("gray fur", "灰色毛发")],
+            }
+            return response
+
+        with mock.patch.object(prompt_translate.requests, "post", side_effect=post):
+            result = prompt_translate.youdao_translate(source)
+
+        self.assertIn("subject_definitions:", result)
+        self.assertIn("retention_analysis:", result)
+        self.assertEqual(result.count("<Subject 1>"), 2)
+        self.assertIn("[Shot 1]", result)
+        self.assertIn("fully_preserved", result)
+        self.assertIn("reference", result)
+        self.assertIn("是一只灰猫", result)
+        self.assertIn("灰色毛发", result)
 
 
 class H3ReferenceRewriteRulesTest(unittest.TestCase):
