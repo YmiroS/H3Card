@@ -1,0 +1,117 @@
+{
+ "id": "minimax_h3_character_transfer",
+ "name": "H3人物迁移",
+ "file": "MinimaxH3长视频动作迁移人物替换+长视频数字人工作流",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\MinimaxH3长视频动作迁移人物替换+长视频数字人工作流.json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "gen",
+ "card": "video",
+ "slots": "img1+aud0+vid1",
+ "images": 1,
+ "audios": 0,
+ "videos": 1,
+ "slotLimits": {
+  "image": {"min": 1, "max": 1},
+  "audio": {"min": 0, "max": 0},
+  "video": {"min": 1, "max": 1}
+ },
+ "graph": "graphs/minimax_h3_character_transfer.api.json",
+ "output": {"node": "29"},
+ "note": "放入一段动作来源视频和一张人物参考图，自动把视频里的主要表演者替换成参考人物，并保留原动作、镜头、场景和音轨。长视频会按“单段时长”自动切段并连续生成，最终重新拼成与来源视频等长的成片。建议先用 5~10 秒短视频确认人物和动作效果，再处理完整长视频。",
+ "rewrite": {"regime": "h3_ref"},
+ "compare": false,
+ "patch": {
+  "kind": "h3_character_transfer",
+  "timelineNode": "11",
+  "video": "video[0]",
+  "image": "images[0]"
+ },
+ "inputs": [
+  {
+   "key": "video[0]",
+   "label": "动作来源视频",
+   "type": "video",
+   "required": true,
+   "target": {"node": "11", "input": "timeline_data", "kind": "timeline_asset"}
+  },
+  {
+   "key": "images[0]",
+   "label": "替换人物参考图",
+   "type": "image",
+   "required": true,
+   "target": {"node": "11", "input": "timeline_data", "kind": "timeline_asset"}
+  },
+  {
+   "key": "prompt",
+   "label": "迁移要求",
+   "type": "textarea",
+   "default": "subject_definitions:\n<Subject 1> is the person depicted in <Picture 1>. Preserve the same facial identity, hairstyle, clothing, body proportions, and realistic appearance throughout the video.\n<Picture 1> is the identity and appearance reference for <Subject 1>.\n<Video 1> is the source performance video. It defines the original shot order, timing, camera movement, framing, environment, lighting, props, and the performer's complete motion.\n\nsummary:\n[video editing + reference generation] Replace the primary performing person in <Video 1> with <Subject 1> from <Picture 1>. Transfer the source person's actions, poses, gestures, timing, blocking, and performance while preserving the original scene and camera work.\n\nretention_analysis:\n<Subject 1>: attribute_transfer - the identity and appearance from <Picture 1> are transferred onto the source performance.\n<Video 1>: fully_preserved - preserve its timing, camera movement, background, lighting, scene structure, props, secondary characters, and motion choreography.\n\ndetailed_description:\nCreate a clean character-replacement edit based on <Video 1>.\n[Shot 1] Replace the primary performing person visible in <Video 1> with <Subject 1>. Keep the source person's exact position, scale, body orientation, movement path, action rhythm, gestures, head movement, facial performance, and interactions. <Subject 1> remains visually consistent across wide shots, close-ups, profile views, rear views, occlusion, and fast motion. Preserve every non-target element from <Video 1>, including the original background, camera movement, framing, lighting, props, secondary people, reflections, and environmental motion. The result should look like the original video with only its primary performer naturally replaced by <Subject 1>.\n\noverall_soundscape:\nPreserve the source video's original synchronized ambience, dialogue timing, physical action sounds, and environmental audio.\n\nnon_diegetic_music:\nPreserve the original music and its timing when present.",
+   "target": {"node": "43", "input": "prompt"}
+  },
+  {
+   "key": "width",
+   "label": "宽",
+   "type": "number",
+   "default": 352,
+   "min": 256,
+   "max": 1344,
+   "step": 32,
+   "target": {"node": "11", "input": "width", "vtype": "INT"}
+  },
+  {
+   "key": "height",
+   "label": "高",
+   "type": "number",
+   "default": 640,
+   "min": 256,
+   "max": 1344,
+   "step": 32,
+   "target": {"node": "11", "input": "height", "vtype": "INT"}
+  },
+  {
+   "key": "duration",
+   "label": "单段时长(秒)",
+   "type": "slider",
+   "min": 5,
+   "max": 15,
+   "step": 1,
+   "default": 10,
+   "hint": "长视频会按这个长度自动切段。10 秒兼顾连贯性和显存；调短会增加分段数量和总耗时。",
+   "target": {"node": "11", "input": "generation_seconds", "vtype": "FLOAT"}
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 8,
+   "hint": "原始融合模型按 8 步工作。",
+   "advanced": true,
+   "target": {"node": "9", "input": "steps", "vtype": "INT"}
+  },
+  {
+   "key": "overlap_frames",
+   "label": "分段重叠帧",
+   "type": "slider",
+   "min": 1,
+   "max": 192,
+   "step": 1,
+   "default": 48,
+   "hint": "相邻分段用于动作和音频续接的重叠长度，推荐保持 48。",
+   "advanced": true,
+   "target": {"node": "43", "input": "overlap_frames", "vtype": "INT"}
+  },
+  {
+   "key": "seed",
+   "label": "种子",
+   "type": "seed",
+   "default": 358,
+   "max": 18446744073709551615,
+   "target": {"node": "30", "input": "seed", "vtype": "INT"}
+  }
+ ],
+ "warnings": []
+}
