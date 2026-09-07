@@ -34,9 +34,10 @@
  "compare": false,
  "inputs": [
   {
-   "key": "input_image",
+   "key": "images[0]",
    "label": "参考图片",
    "type": "image",
+   "required": true,
    "target": {
     "node": "63",
     "input": "image"
