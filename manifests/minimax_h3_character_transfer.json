@@ -81,6 +81,17 @@
    "target": {"node": "11", "input": "generation_seconds", "vtype": "FLOAT"}
   },
   {
+   "key": "preview_seconds",
+   "label": "仅测试前几秒",
+   "type": "slider",
+   "min": 0,
+   "max": 15,
+   "step": 5,
+   "default": 0,
+   "hint": "0 = 生成完整视频；5/10/15 = 只生成来源视频开头对应时长，用于快速确认人物迁移效果。",
+   "target": {"node": "11", "input": "timeline_data", "kind": "timeline_option"}
+  },
+  {
    "key": "steps",
    "label": "采样步数",
    "type": "slider",
