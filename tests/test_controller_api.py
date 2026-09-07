@@ -89,6 +89,19 @@ class H3CharacterTransferPatchTest(unittest.TestCase):
         self.assertEqual(timeline["videoClips"][0]["referenceMode"], "edit")
         self.assertEqual(timeline["images"][0]["file"], "chouka/person.png")
 
+    @mock.patch.object(controller_app, "probe_video", return_value={
+        "duration": 67.033, "fps": 29.97, "frames": 2009, "has_audio": True,
+    })
+    def test_preview_seconds_limits_timeline_to_one_source_window(self, _probe):
+        graph = controller_app.patch_graph(
+            self.cap,
+            {"preview_seconds": 10},
+            {"video[0]": "chouka/dance.mp4", "images[0]": "chouka/person.png"},
+        )
+        clip = json.loads(graph["11"]["inputs"]["timeline_data"])["videoClips"][0]
+        self.assertEqual(clip["duration"], 10)
+        self.assertEqual(clip["sourceDuration"], 10)
+
     def test_requires_both_video_and_identity_image(self):
         with self.assertRaisesRegex(web.HTTPBadRequest, "替换人物参考图"):
             controller_app.patch_graph(

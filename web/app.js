@@ -391,7 +391,7 @@ const optToRatio = (opt) => {
 function openResPop(c, anchor) {
   const cap = CAPS[runCap(c)] || capOf(c);
   const has = cap && cap.inputs.some(x =>
-    ["megapixels", "width", "height", "aspect_ratio", "duration", "target_fps", "scale_to_length"].includes(x.key));
+    ["megapixels", "width", "height", "aspect_ratio", "duration", "preview_seconds", "target_fps", "scale_to_length"].includes(x.key));
   if (!has) return toast("这个模式没有可调的分辨率参数");
 
   /** 原位刷新弹窗内容（选中态要变），**不关不重开** —— 重开会按重建过的锚点按钮
@@ -400,9 +400,9 @@ function openResPop(c, anchor) {
   const refill = () => {
     el.respop.innerHTML = "";
     el.respop.appendChild(clarityPicker(c, cap, refill));
-    // 视频节点的常规参数（duration/target_fps）也收进这个弹窗，不在面板里摊开
+    // 视频节点的常规参数也收进这个弹窗，不在面板里摊开
     const specs = cap.inputs;
-    const PARAM_KEYS = ["duration", "target_fps"];
+    const PARAM_KEYS = ["duration", "preview_seconds", "target_fps"];
     const params = specs.filter(s => PARAM_KEYS.includes(s.key) && s.type === "slider");
     if (params.length) {
       const pwrap = document.createElement("div"); pwrap.className = "pwrap";
@@ -419,8 +419,8 @@ function openResPop(c, anchor) {
         r.value = n.value = cur != null ? cur : r.min;
         const set = (v) => {
           r.value = n.value = v; c.params[s.key] = parseFloat(v); save();
-          // duration 变了要更新胶囊摘要
-          if (s.key === "duration" && el.panel._id === c.id) {
+          // 时长或预览范围变了要更新胶囊摘要
+          if (["duration", "preview_seconds"].includes(s.key) && el.panel._id === c.id) {
             const caps = el.panel.querySelectorAll(".foot .tcap");
             const pb = caps[caps.length - 1];
             if (pb && pb.textContent.startsWith("⚙")) {
@@ -673,7 +673,8 @@ function paramsBrief(c, cap) {
   const w = cap.inputs.find(x => x.key === "width");
   const stl = cap.inputs.find(x => x.key === "scale_to_length");
   const dur = cap.inputs.find(x => x.key === "duration");
-  if (!ar && !mp && !w && !stl && !dur) return null;
+  const preview = cap.inputs.find(x => x.key === "preview_seconds");
+  if (!ar && !mp && !w && !stl && !dur && !preview) return null;
   const parts = [];
   // scale_to_length 模式：只显示最长边数字
   if (stl && !ar) {
@@ -702,7 +703,11 @@ function paramsBrief(c, cap) {
   // 视频时长
   if (dur) {
     const v = c.params.duration != null ? c.params.duration : dur.default;
-    parts.push(`${v}秒`);
+    parts.push(`${v}秒${preview ? "/段" : ""}`);
+  }
+  if (preview) {
+    const v = c.params.preview_seconds != null ? c.params.preview_seconds : preview.default;
+    if (+v > 0) parts.push(`试前${v}秒`);
   }
   return parts.join(" · ");
 }
@@ -3528,10 +3533,10 @@ function openPanel(id) {
   };
   // 生图节点的分辨率/比例不在面板里摊开了：点「⚙」胶囊弹独立小窗（openResPop）。
   // 别的节点照旧摊开剩余旋钮；高级参数整个不画（用户定的：基本上不动）
-  // **compact 模式：分辨率参数 + 常规参数（duration/target_fps）收进 ⚙ 弹窗**
+  // **compact 模式：分辨率参数 + 常规参数收进 ⚙ 弹窗**
   const pwrap = document.createElement("div"); pwrap.className = "pwrap";
   const COMPACT_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "scale_to_length",
-    "duration", "target_fps"]);
+    "duration", "preview_seconds", "target_fps"]);
   for (const s of rows) if (!(compact && COMPACT_KEYS.has(s.key))) addRow(pwrap, s);
   body.appendChild(pwrap);
 

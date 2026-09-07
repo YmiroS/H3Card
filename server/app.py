@@ -327,7 +327,7 @@ def derive_target_fps(g, spec, tgt, uploaded):
     return tgt
 
 
-def patch_h3_character_transfer(g, cap, uploaded):
+def patch_h3_character_transfer(g, cap, params, uploaded):
     """把抽卡面板里的动作视频和人物图封装成 TimelineDirector 素材时间线。"""
     spec = cap.get("patch") or {}
     if spec.get("kind") != "h3_character_transfer":
@@ -342,6 +342,8 @@ def patch_h3_character_transfer(g, cap, uploaded):
         raise web.HTTPBadRequest(reason="无法读取动作来源视频时长")
     if source_duration < 5:
         raise web.HTTPBadRequest(reason="动作来源视频不能短于 5 秒")
+    preview_seconds = max(0, float(params.get("preview_seconds") or 0))
+    output_duration = min(source_duration, preview_seconds) if preview_seconds else source_duration
     node = str(spec.get("timelineNode", "11"))
     segment_seconds = float(g[node]["inputs"].get("generation_seconds") or 10)
     timeline = {
@@ -354,9 +356,9 @@ def patch_h3_character_transfer(g, cap, uploaded):
             "file": video,
             "name": Path(video).name,
             "start": 0,
-            "duration": source_duration,
+            "duration": output_duration,
             "trimStart": 0,
-            "sourceDuration": source_duration,
+            "sourceDuration": output_duration,
             "hasAudio": bool(info.get("has_audio")),
             "referenceMode": "edit",
         }],
@@ -433,7 +435,7 @@ def patch_graph(cap, params, uploaded):
                     blank.append(f"{labels.get(pair, pair)}")
                 # 注意：文本清空后必须写入 ""，不能当"没给"跳过，
                 # 否则模板里作者自带的演示提示词会悄悄生效（出片跑偏）
-        if tgt.get("kind") == "timeline_asset":
+        if tgt.get("kind") in ("timeline_asset", "timeline_option"):
             continue
         g[node]["inputs"][field] = val
     if missing:
@@ -441,7 +443,7 @@ def patch_graph(cap, params, uploaded):
     if blank:
         raise web.HTTPBadRequest(
             reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
-    patch_h3_character_transfer(g, cap, uploaded)
+    patch_h3_character_transfer(g, cap, params, uploaded)
     return g
 
 
