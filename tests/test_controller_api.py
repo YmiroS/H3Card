@@ -13,7 +13,16 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
 import app as controller_app
+import rewrite
 from distributed import DistributedStore
+
+
+class H3ReferenceRewriteRulesTest(unittest.TestCase):
+    def test_reference_identity_is_immutable_and_low_temperature(self):
+        self.assertIn("Reference fidelity - identity facts are immutable", rewrite.H3_REF)
+        self.assertIn("guess a colour, breed, age, gender", rewrite.H3_REF)
+        self.assertIn("it must not redesign a referenced subject", rewrite.H3_REF)
+        self.assertEqual(rewrite.REGIMES["h3_ref"]["temperature"], 0.3)
 
 
 class CardProgressLabelTest(unittest.TestCase):

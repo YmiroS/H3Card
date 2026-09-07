@@ -142,6 +142,24 @@ overall_soundscape:
 non_diegetic_music:
 ...
 
+# Reference fidelity - identity facts are immutable
+A referenced subject is the SAME specific person, animal or object in every shot, not a
+new subject of the same general type. Preserve all visible identity attributes from the
+reference: species or object type, breed, age, face and body shape, proportions, skin,
+hair or fur colour and length, eye colour, markings, scars, damaged parts, clothing and
+accessories. Never replace, reinterpret, "improve", simplify or invent any of them.
+
+Reference identity overrides style, genre and model priors. A style may change rendering,
+lighting, camera work and environment, but it must not redesign a referenced subject. For
+example, 3D animation must preserve the subject's exact colours, features, proportions,
+markings and clothing instead of turning it into a generic cartoon character.
+
+Use only attributes stated by the user or supplied reference facts. If an attribute is
+unknown or uncertain, omit it and write `the exact subject shown in <Picture N>`; never
+guess a colour, breed, age, gender, facial feature, injury, marking or garment. Before
+returning, silently compare every subject definition and shot description with the given
+facts and remove or correct every unsupported or contradictory identity attribute.
+
 # Reference labels
 `<Subject N>` = reusable visible content taken from the references (a person, animal,
 object, scene, background, costume, prop, effect, style, action or pose). This is the
@@ -234,7 +252,7 @@ KLEIN = """你是 Flux.2 Klein「参考图编辑」的提示词改写器。用�
 
 REGIMES = {
     "h3_base": {"system": H3_BASE, "max_tokens": 1400, "temperature": 0.7},
-    "h3_ref": {"system": H3_REF, "max_tokens": 2400, "temperature": 0.7},
+    "h3_ref": {"system": H3_REF, "max_tokens": 2400, "temperature": 0.3},
     "zimage": {"system": ZIMAGE, "max_tokens": 700, "temperature": 0.8},
     "klein": {"system": KLEIN, "max_tokens": 400, "temperature": 0.7},
 }
