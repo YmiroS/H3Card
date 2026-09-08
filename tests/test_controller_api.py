@@ -16,6 +16,7 @@ import app as controller_app
 import rewrite
 import scan_workflows
 import translate as prompt_translate
+from costs import CostLedger
 from distributed import DistributedStore
 
 
@@ -187,6 +188,83 @@ class ModelFamilyTest(unittest.TestCase):
         self.assertEqual(controller_app.model_family("unknown_workflow"), "unknown_workflow")
 
 
+class CostLedgerTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        database_path = Path(self.temp.name) / "control.db"
+        self.store = DistributedStore(database_path)
+        self.ledger = CostLedger(database_path, ROOT / "pricing.json")
+
+    def tearDown(self):
+        self.ledger.close()
+        self.store.close()
+        self.temp.cleanup()
+
+    def test_backfill_combines_recent_actual_and_historical_estimates(self):
+        rows = [
+            ("recent", "krea2_t2i", "done"),
+            ("historical", "zimage_t2i", "done"),
+            ("failed", "gimmvfi_interp", "error"),
+        ]
+        for job_id, capability, status in rows:
+            self.store.enqueue(job_id, {
+                "capability": capability, "model_family": capability,
+                "graph": {}, "assets": {},
+            })
+            with self.store.lock, self.store.db:
+                self.store.db.execute(
+                    "UPDATE dispatch_jobs SET status=? WHERE job_id=?",
+                    (status, job_id),
+                )
+
+        self.ledger.backfill([{
+            "id": "recent", "capability": "krea2_t2i", "status": "done",
+            "created": 1, "started": 10, "ended": 70,
+            "projectName": "线上项目", "cardName": "文生图",
+        }])
+        report = self.ledger.report()
+
+        self.assertEqual(report["overview"]["tasks"], 3)
+        self.assertEqual(report["overview"]["done"], 2)
+        self.assertEqual(report["overview"]["error"], 1)
+        self.assertAlmostEqual(report["overview"]["actual_cost"], 60 * 5 / 3600, places=6)
+        self.assertAlmostEqual(report["overview"]["estimated_cost"], 0.013, places=6)
+        self.assertEqual(report["overview"]["unknown_cost_tasks"], 1)
+        sources = {item["job_id"]: item["cost_source"] for item in report["jobs"]}
+        self.assertEqual(sources, {
+            "recent": "actual", "historical": "estimated", "failed": "unknown",
+        })
+        self.store.clear_finished()
+        self.assertEqual(self.ledger.report()["overview"]["tasks"], 3)
+
+    def test_api_cost_uses_separate_input_and_output_token_rates(self):
+        self.ledger.record_api(
+            "text", "qwen3.7-plus", 1_000_000, 1_000_000, 250,
+            project_name="文案项目", card_name="润色",
+        )
+        report = self.ledger.report()
+
+        self.assertEqual(report["overview"]["tasks"], 1)
+        self.assertAlmostEqual(report["overview"]["api_cost"], 9.7767, places=6)
+        self.assertAlmostEqual(report["overview"]["total_cost"], 9.7767, places=6)
+        self.assertEqual(report["jobs"][0]["category_name"], "文本与反推")
+        self.assertEqual(report["jobs"][0]["project_name"], "文案项目")
+
+    def test_start_and_finish_retries_do_not_change_runtime(self):
+        self.ledger.record_job({
+            "id": "retry-job", "capability": "krea2_t2i",
+            "status": "queued", "created": 1,
+        })
+        self.ledger.start_job("retry-job", "worker-1", 100)
+        self.ledger.start_job("retry-job", "worker-1", 110)
+        self.ledger.finish_job("retry-job", "done", 160, "worker-1")
+        self.ledger.finish_job("retry-job", "done", 180, "worker-1")
+
+        detail = self.ledger.report()["jobs"][0]
+        self.assertEqual(detail["runtime_seconds"], 60)
+        self.assertAlmostEqual(detail["actual_cost"], 60 * 5 / 3600, places=6)
+
+
 class FfmpegDiscoveryTest(unittest.TestCase):
     def test_uses_imageio_ffmpeg_binary_outside_windows_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -256,7 +334,9 @@ class H3CharacterTransferPatchTest(unittest.TestCase):
 class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.store = DistributedStore(Path(self.temp.name) / "control.db")
+        database_path = Path(self.temp.name) / "control.db"
+        self.store = DistributedStore(database_path)
+        self.ledger = CostLedger(database_path, ROOT / "pricing.json")
         self.old_token = controller_app.ENROLLMENT_TOKEN
         self.old_save_jobs = controller_app.save_jobs
         self.old_controller_mode = controller_app.CONTROLLER_MODE
@@ -268,13 +348,17 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         controller_app.WEIGHTS.clear()
 
         application = web.Application()
+        application["session"] = object()
         application["distributed"] = self.store
+        application["costs"] = self.ledger
         application.router.add_get("/controller", controller_app.controller_index)
+        application.router.add_get("/controller/costs", controller_app.controller_costs)
         application.router.add_get("/api/health", controller_app.api_health)
         application.router.add_get("/api/cards", controller_app.api_cards)
         application.router.add_post("/api/reload", controller_app.api_reload)
         application.router.add_get("/api/jobs", controller_app.api_jobs)
         application.router.add_post("/api/generate", controller_app.api_generate)
+        application.router.add_post("/api/text", controller_app.api_text)
         application.router.add_post("/agent/v1/register", controller_app.api_agent_register)
         application.router.add_post("/agent/v1/heartbeat", controller_app.api_agent_heartbeat)
         application.router.add_post("/agent/v1/jobs/acquire", controller_app.api_agent_acquire)
@@ -283,11 +367,13 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         application.router.add_post("/agent/v1/jobs/{pid}/complete", controller_app.api_agent_complete)
         application.router.add_post("/agent/v1/jobs/{pid}/failed", controller_app.api_agent_failed)
         application.router.add_get("/api/workers", controller_app.api_workers)
+        application.router.add_get("/api/costs", controller_app.api_costs)
         self.client = TestClient(TestServer(application))
         await self.client.start_server()
 
     async def asyncTearDown(self):
         await self.client.close()
+        self.ledger.close()
         self.store.close()
         self.temp.cleanup()
         controller_app.ENROLLMENT_TOKEN = self.old_token
@@ -313,6 +399,13 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("<title>运行面板</title>", dashboard)
         self.assertIn('id="worker-cards" class="worker-grid"', dashboard)
         self.assertIn("GPU 利用率", dashboard)
+        self.assertIn("/controller/costs", dashboard)
+
+        response = await self.client.get("/controller/costs")
+        self.assertEqual(response.status, 200)
+        costs_page = await response.text()
+        self.assertIn("<title>费用统计</title>", costs_page)
+        self.assertIn("确认总费用", costs_page)
 
         response = await self.client.get("/api/health")
         self.assertEqual(response.status, 200)
@@ -341,6 +434,31 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["cardName"], "主视觉")
         listed = await (await self.client.get("/api/jobs")).json()
         self.assertEqual(listed["jobs"][0]["projectName"], "广告片项目")
+        costs = await (await self.client.get("/api/costs")).json()
+        self.assertEqual(costs["overview"]["tasks"], 1)
+        self.assertEqual(costs["jobs"][0]["project_name"], "广告片项目")
+        self.assertEqual(costs["jobs"][0]["card_name"], "主视觉")
+
+    async def test_text_api_records_prompt_and_completion_token_cost(self):
+        result = {
+            "text": "润色后的文本", "model": "qwen3.7-plus", "tokens": 300,
+            "prompt_tokens": 200, "completion_tokens": 100, "warn": "",
+        }
+        with mock.patch.object(controller_app.llm, "ready", return_value=True), \
+             mock.patch.object(controller_app.llm, "chat", new=mock.AsyncMock(return_value=result)):
+            response = await self.client.post("/api/text", json={
+                "op": "polish", "model": "api",
+                "inputs": [{"name": "原文", "text": "测试文本"}],
+                "projectName": "文案项目", "cardName": "润色卡",
+            })
+
+        self.assertEqual(response.status, 200)
+        costs = await (await self.client.get("/api/costs")).json()
+        self.assertEqual(costs["overview"]["tasks"], 1)
+        expected = (200 * 1.9596 + 100 * 7.8171) / 1_000_000
+        self.assertAlmostEqual(costs["overview"]["api_cost"], expected, places=6)
+        self.assertEqual(costs["jobs"][0]["project_name"], "文案项目")
+        self.assertEqual(costs["jobs"][0]["cost_source"], "actual")
 
     async def test_register_heartbeat_acquire_and_complete(self):
         denied = await self.client.post("/agent/v1/register", json={
@@ -382,9 +500,11 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
 
         controller_app.JOBS["job-1"] = {
-            "id": "job-1", "status": "queued", "created": 1,
+            "id": "job-1", "capability": "krea2_t2i",
+            "status": "queued", "created": 1,
             "progress": 0.0, "outputs": [], "error": None,
         }
+        self.ledger.record_job(controller_app.JOBS["job-1"])
         self.store.enqueue(
             "job-1", {"graph": {"1": {"class_type": "KSampler", "inputs": {}}}},
             ["KSampler"],
@@ -422,6 +542,11 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("token_hash", worker)
         self.assertEqual(worker["name"], "gpu-01")
         self.assertEqual(worker["capabilities"]["telemetry"], telemetry)
+        cost_job = self.ledger.report()["jobs"][0]
+        self.assertEqual(cost_job["job_id"], "job-1")
+        self.assertEqual(cost_job["status"], "done")
+        self.assertEqual(cost_job["cost_source"], "actual")
+        self.assertEqual(cost_job["worker_name"], "gpu-01")
 
     async def test_execution_error_atomically_finishes_dispatch(self):
         response = await self.client.post("/agent/v1/register", json={

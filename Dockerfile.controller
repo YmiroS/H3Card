@@ -14,6 +14,7 @@ COPY server/ server/
 COPY web/ web/
 COPY manifests/ manifests/
 COPY graphs/ graphs/
+COPY pricing.json ./
 COPY llm.json.例子 ./
 
 RUN mkdir -p data/uploads data/artifacts data/projects

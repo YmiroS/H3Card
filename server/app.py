@@ -38,6 +38,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import rewrite as rw
 import llm
 import translate as tr
+from costs import CostLedger
 from distributed import DistributedStore
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
@@ -96,6 +97,21 @@ def distributed_store(app):
     if store is None:
         raise web.HTTPServiceUnavailable(reason="分布式控制层未启用")
     return store
+
+
+def cost_ledger(app):
+    return app.get("costs")
+
+
+def record_api_cost(app, capability, result, elapsed_ms, body):
+    ledger = cost_ledger(app)
+    if ledger:
+        ledger.record_api(
+            capability, result.get("model"), result.get("prompt_tokens"),
+            result.get("completion_tokens"), elapsed_ms,
+            project=body.get("project"), project_name=body.get("projectName"),
+            card=body.get("card"), card_name=body.get("cardName"),
+        )
 
 
 def controller_comfy_online(app):
@@ -698,12 +714,16 @@ async def api_generate(request):
             nd.get("class_type") for nd in graph.values()
             if isinstance(nd, dict) and nd.get("class_type")
         }
+        family = model_family(cid)
         distributed_store(request.app).enqueue(
             pid,
             {"graph": graph, "assets": uploaded, "capability": cid,
-             "model_family": model_family(cid)},
+             "model_family": family},
             required_nodes,
         )
+        ledger = cost_ledger(request.app)
+        if ledger:
+            ledger.record_job(JOBS[pid], params, uploaded, graph, probe_video, family)
     save_jobs()
     return web.json_response(JOBS[pid])
 
@@ -776,10 +796,12 @@ async def api_rewrite(request):
     text, warn = rw.clean(raw, spec, cap, params, assets)
     if warn:
         warns.append(warn)
+    elapsed_ms = int((time.time() - t0) * 1000)
+    if via == "api":
+        record_api_cost(request.app, cid, got, elapsed_ms, body)
     return web.json_response({"text": text, "warn": "；".join(warns),
                               "via": via, "fallback": fell, "model": mname,
-                              "tokens": tokens,
-                              "ms": int((time.time() - t0) * 1000)})
+                              "tokens": tokens, "ms": elapsed_ms})
 
 
 async def rewrite_local(request, job_name, system, user, sampling, body, t0, fell=""):
@@ -893,11 +915,13 @@ async def api_text(request):
         except (llm.LLMError, tr.TranslateError) as e:
             raise web.HTTPBadGateway(reason=(
                 f"有道翻译不可用（{youdao_error}），云端翻译失败：{e}")[:400])
+        elapsed_ms = int((time.time() - t0) * 1000)
+        record_api_cost(request.app, "text", got, elapsed_ms, body)
         return web.json_response({
             "text": translated,
             "warn": f"有道翻译不可用，已改用 {got['model']}",
             "via": "api", "model": got["model"], "tokens": got["tokens"],
-            "ms": int((time.time() - t0) * 1000)
+            "ms": elapsed_ms
         })
 
     cfg = rw.TEXT_OPS.get(op)
@@ -933,9 +957,12 @@ async def api_text(request):
         if got["warn"]:
             warns = [got["warn"]]
     text = rw.text_clean(raw)
+    elapsed_ms = int((time.time() - t0) * 1000)
+    if via == "api":
+        record_api_cost(request.app, "text", got, elapsed_ms, body)
     return web.json_response({"text": text, "warn": "；".join(warns),
                               "via": via, "model": mname, "tokens": tokens,
-                              "ms": int((time.time() - t0) * 1000)})
+                              "ms": elapsed_ms})
 
 
 async def api_job(request):
@@ -1051,11 +1078,15 @@ async def api_agent_start(request):
     pid, lease_token = require_lease(request, worker_id)
     if not distributed_store(request.app).mark_running(pid, worker_id, lease_token):
         raise web.HTTPConflict(reason="任务无法进入运行状态")
+    started_at = time.time()
     job = JOBS.get(pid)
     if job:
         job.update(status="running", progress=0.0, step="", error=None,
-                   started=time.time(), ended=None, worker_id=worker_id)
+                   started=started_at, ended=None, worker_id=worker_id)
         save_jobs()
+    ledger = cost_ledger(request.app)
+    if ledger:
+        ledger.start_job(pid, worker_id, started_at)
     return web.json_response({"ok": True})
 
 
@@ -1079,6 +1110,7 @@ async def api_agent_event(request):
         if not store.finish(pid, worker_id, lease_token, terminal):
             if store.dispatch_status(pid, worker_id) != terminal:
                 raise web.HTTPConflict(reason="任务无法结束")
+        ended_at = time.time()
         job = JOBS.get(pid)
         if job:
             if terminal == "error":
@@ -1086,11 +1118,14 @@ async def api_agent_event(request):
                          f"{data.get('exception_message') or 'ComfyUI 执行失败'}")[:12000]
             else:
                 error = None
-            job.update(status=terminal, step="", ended=time.time(),
+            job.update(status=terminal, step="", ended=ended_at,
                        worker_id=worker_id, error=error)
             STEPS.pop(pid, None)
             WEIGHTS.pop(pid, None)
             save_jobs()
+        ledger = cost_ledger(request.app)
+        if ledger:
+            ledger.finish_job(pid, terminal, ended_at, worker_id)
         return web.json_response({"ok": True, "terminal": terminal})
 
     await handle_event(None, event, remote=True)
@@ -1135,13 +1170,17 @@ async def api_agent_complete(request):
     outputs = body.get("outputs") if isinstance(body.get("outputs"), list) else []
     if not distributed_store(request.app).finish(pid, worker_id, lease_token, "done"):
         raise web.HTTPConflict(reason="任务无法完成")
+    ended_at = time.time()
     job = JOBS.get(pid)
     if job:
         job.update(status="done", progress=1.0, outputs=outputs, step="",
-                   ended=time.time(), worker_id=worker_id, error=None)
+                   ended=ended_at, worker_id=worker_id, error=None)
         STEPS.pop(pid, None)
         WEIGHTS.pop(pid, None)
         save_jobs()
+    ledger = cost_ledger(request.app)
+    if ledger:
+        ledger.finish_job(pid, "done", ended_at, worker_id)
     return web.json_response({"ok": True})
 
 
@@ -1161,12 +1200,17 @@ async def api_agent_failed(request):
         if not store.finish(pid, worker_id, lease_token, dispatch_status):
             raise web.HTTPConflict(reason="任务无法结束")
     job = JOBS.get(pid)
-    if job and not already_terminal:
-        job.update(status="canceled" if canceled else "error", step="", ended=time.time(),
-                   worker_id=worker_id, error=None if canceled else str(body.get("error") or "Worker 执行失败")[:2000])
-        STEPS.pop(pid, None)
-        WEIGHTS.pop(pid, None)
-        save_jobs()
+    ended_at = (job or {}).get("ended") or time.time()
+    if not already_terminal:
+        if job:
+            job.update(status=dispatch_status, step="", ended=ended_at,
+                       worker_id=worker_id, error=None if canceled else str(body.get("error") or "Worker 执行失败")[:2000])
+            STEPS.pop(pid, None)
+            WEIGHTS.pop(pid, None)
+            save_jobs()
+    ledger = cost_ledger(request.app)
+    if ledger:
+        ledger.finish_job(pid, dispatch_status, ended_at, worker_id)
     return web.json_response({"ok": True})
 
 
@@ -1247,9 +1291,14 @@ async def stop_job(app, pid):
         return "finished"
     if CONTROLLER_MODE:
         state = distributed_store(app).request_cancel(pid)
-        if state == "canceled" and job:
-            job.update(status="canceled", step="", ended=time.time())
-            save_jobs()
+        if state == "canceled":
+            ended_at = time.time()
+            if job:
+                job.update(status="canceled", step="", ended=ended_at)
+                save_jobs()
+            ledger = cost_ledger(app)
+            if ledger:
+                ledger.finish_job(pid, "canceled", ended_at)
         return state
     session = app["session"]
     if job and job["status"] == "running":
@@ -1433,6 +1482,29 @@ async def controller_index(request):
     return web.FileResponse(ROOT / "web" / "controller.html")
 
 
+async def controller_costs(request):
+    if not CONTROLLER_MODE:
+        raise web.HTTPNotFound(reason="费用统计只在 controller 模式提供")
+    return web.FileResponse(ROOT / "web" / "costs.html")
+
+
+async def api_costs(request):
+    ledger = cost_ledger(request.app)
+    if not ledger:
+        raise web.HTTPServiceUnavailable(reason="费用统计未启用")
+    try:
+        start = float(request.query["from"]) if request.query.get("from") else None
+        end = float(request.query["to"]) if request.query.get("to") else None
+        limit = int(request.query.get("limit", 100))
+    except ValueError:
+        raise web.HTTPBadRequest(reason="from、to、limit 必须是数字")
+    if ((start is not None and not math.isfinite(start))
+            or (end is not None and not math.isfinite(end))
+            or (start is not None and end is not None and start > end)):
+        raise web.HTTPBadRequest(reason="统计时间范围无效")
+    return web.json_response(ledger.report(start, end, limit))
+
+
 async def api_health(request):
     workers = distributed_store(request.app).list_workers() if CONTROLLER_MODE else []
     return web.json_response({
@@ -1459,6 +1531,9 @@ async def on_stop(app):
     if task:
         task.cancel()
     await app["session"].close()
+    ledger = app.get("costs")
+    if ledger:
+        ledger.close()
     store = app.get("distributed")
     if store:
         store.close()
@@ -1510,10 +1585,14 @@ def make_app():
     load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2)
     if CONTROLLER_MODE:
-        app["distributed"] = DistributedStore(ROOT / "data" / "control.db")
+        database_path = ROOT / "data" / "control.db"
+        app["distributed"] = DistributedStore(database_path)
+        app["costs"] = CostLedger(database_path, ROOT / "pricing.json")
+        app["costs"].backfill(JOBS.values())
     app.on_response_prepare.append(no_cache)
     app.router.add_get("/", index)
     app.router.add_get("/controller", controller_index)
+    app.router.add_get("/controller/costs", controller_costs)
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/cards", api_cards)
@@ -1538,6 +1617,7 @@ def make_app():
     app.router.add_post("/api/reveal", api_reveal)
     if CONTROLLER_MODE:
         app.router.add_get("/api/workers", api_workers)
+        app.router.add_get("/api/costs", api_costs)
         app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
         app.router.add_post("/agent/v1/register", api_agent_register)
         app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)

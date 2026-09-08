@@ -176,10 +176,14 @@ async def chat(session, system, user, max_tokens, temperature):
                      + ("，多半是被内容审核拦了" if fin in ("content_filter", "stop") else ""))
 
     usage = data.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens") or usage.get("input_tokens") or 0
+    completion_tokens = usage.get("completion_tokens") or usage.get("output_tokens") or 0
     return {
         "text": text,
         "model": data.get("model") or c["model"],
-        "tokens": usage.get("total_tokens") or 0,
+        "tokens": usage.get("total_tokens") or prompt_tokens + completion_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
         # 截断的输出格式是不完整的（H3 那两套尤其明显：少半个字段）。
         # 不当失败处理 —— 落本地要等好几分钟，而这种残缺用户自己一眼看得出来
         # 报的是真实上限（含 RESERVE），不然用户按这个数去翻配置会找不到对应的东西
