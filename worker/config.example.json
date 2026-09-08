@@ -5,6 +5,7 @@
   "comfy_url": "http://127.0.0.1:8188",
   "comfy_input_dir": "E:/ComfyUI_Mie_V33/ComfyUI/input",
   "heartbeat_seconds": 10,
+  "telemetry_seconds": 10,
   "capability_scan_seconds": 300,
   "state_file": "worker-state.json"
 }

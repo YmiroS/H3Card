@@ -2,9 +2,12 @@
 """Windows pull worker for a Linux-hosted chouka controller."""
 import argparse
 import asyncio
+import csv
+import ctypes
 import json
 import mimetypes
 import os
+import platform
 import re
 import ssl
 import subprocess
@@ -43,7 +46,9 @@ class WorkerAgent:
         self.session = None
         self.current = None
         self.capabilities = {}
+        self.telemetry = {}
         self.last_capability_scan = 0.0
+        self.last_telemetry_scan = 0.0
         self.comfy_online = False
         self.local_busy = False
         self.stop_event = asyncio.Event()
@@ -85,7 +90,106 @@ class WorkerAgent:
             except ValueError as exc:
                 raise AgentError(f"{method} {url} 返回了非 JSON 内容") from exc
 
+    @staticmethod
+    def _nvidia_gpus():
+        command = [
+            "nvidia-smi",
+            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ]
+        try:
+            result = subprocess.run(
+                command, capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=5, check=False,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except (OSError, subprocess.TimeoutExpired, ValueError):
+            return []
+        if result.returncode != 0:
+            return []
+
+        gpus = []
+        for row in csv.reader(result.stdout.splitlines()):
+            if len(row) < 5:
+                continue
+            try:
+                index = int(row[0].strip())
+            except ValueError:
+                continue
+            try:
+                utilization = float(row[2].strip())
+            except ValueError:
+                utilization = None
+            try:
+                memory_used = int(float(row[3].strip()) * 1024 ** 2)
+                memory_total = int(float(row[4].strip()) * 1024 ** 2)
+            except ValueError:
+                memory_used = None
+                memory_total = None
+            gpus.append({
+                "index": index,
+                "name": row[1].strip(),
+                "utilization_percent": utilization,
+                "memory_used_bytes": memory_used,
+                "memory_total_bytes": memory_total,
+            })
+        return gpus
+
+    @staticmethod
+    def _system_memory():
+        if os.name != "nt":
+            return None
+
+        class MemoryStatus(ctypes.Structure):
+            _fields_ = [
+                ("dwLength", ctypes.c_ulong),
+                ("dwMemoryLoad", ctypes.c_ulong),
+                ("ullTotalPhys", ctypes.c_ulonglong),
+                ("ullAvailPhys", ctypes.c_ulonglong),
+                ("ullTotalPageFile", ctypes.c_ulonglong),
+                ("ullAvailPageFile", ctypes.c_ulonglong),
+                ("ullTotalVirtual", ctypes.c_ulonglong),
+                ("ullAvailVirtual", ctypes.c_ulonglong),
+                ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+            ]
+
+        status = MemoryStatus()
+        status.dwLength = ctypes.sizeof(status)
+        try:
+            ok = ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+        except (AttributeError, OSError):
+            return None
+        if not ok:
+            return None
+        total = int(status.ullTotalPhys)
+        available = int(status.ullAvailPhys)
+        return {"used_bytes": total - available, "total_bytes": total}
+
+    def collect_telemetry(self):
+        try:
+            gpus = self._nvidia_gpus()
+        except Exception:
+            gpus = []
+        try:
+            memory = self._system_memory()
+        except Exception:
+            memory = None
+        return {
+            "hostname": os.environ.get("COMPUTERNAME") or platform.node()
+                        or self.config.get("worker_name") or "windows-worker",
+            "gpus": gpus,
+            "memory": memory,
+            "collected_at": time.time(),
+        }
+
+    async def scan_telemetry(self):
+        self.telemetry = await asyncio.to_thread(self.collect_telemetry)
+        self.last_telemetry_scan = time.time()
+        self.capabilities["telemetry"] = self.telemetry
+        return self.telemetry
+
     async def scan_capabilities(self):
+        await self.scan_telemetry()
         try:
             stats, nodes = await asyncio.gather(
                 self._json_request("GET", self.comfy + "/system_stats"),
@@ -94,13 +198,14 @@ class WorkerAgent:
         except Exception as exc:
             self.comfy_online = False
             print(f"[Worker] ComfyUI 不可用：{exc}")
-            return None
+            return self.capabilities or None
         self.comfy_online = True
         self.capabilities = {
             "node_classes": sorted(nodes.keys()),
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
-            "agent_version": 1,
+            "telemetry": self.telemetry,
+            "agent_version": 2,
         }
         self.last_capability_scan = time.time()
         return self.capabilities
@@ -126,7 +231,8 @@ class WorkerAgent:
         if not token:
             raise AgentError("首次启动缺少 enrollment_token")
         body = {
-            "name": self.config.get("worker_name") or os.environ.get("COMPUTERNAME") or "windows-worker",
+            "name": self.config.get("worker_name")
+                    or self.telemetry.get("hostname") or "windows-worker",
             "enrollment_token": token,
             "capabilities": capabilities,
         }
@@ -140,21 +246,27 @@ class WorkerAgent:
     async def heartbeat_loop(self):
         interval = max(float(self.config.get("heartbeat_seconds", 10)), 2.0)
         capability_interval = max(float(self.config.get("capability_scan_seconds", 300)), 30.0)
+        telemetry_interval = max(float(self.config.get("telemetry_seconds", interval)), 2.0)
         while not self.stop_event.is_set():
             try:
                 await self.local_status()
+                now = time.time()
                 include_caps = (
                     not self.current
-                    and time.time() - self.last_capability_scan >= capability_interval
+                    and now - self.last_capability_scan >= capability_interval
                 )
                 if include_caps:
                     await self.scan_capabilities()
+                elif now - self.last_telemetry_scan >= telemetry_interval:
+                    await self.scan_telemetry()
                 body = {
                     "comfy_online": self.comfy_online,
                     "busy": bool(self.current) or self.local_busy,
                     "local_busy": self.local_busy,
                     "current_job_id": self.current["job_id"] if self.current else None,
                 }
+                if self.telemetry:
+                    body["telemetry"] = self.telemetry
                 if include_caps and self.capabilities:
                     body["capabilities"] = self.capabilities
                 reply = await self._json_request(

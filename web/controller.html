@@ -36,12 +36,48 @@ tr:last-child td { border-bottom:0; }
 .bad { color:var(--bad); }
 .progress { min-width:190px; }
 .bar { height:4px; margin-top:6px; background:rgba(255,255,255,.06); border-radius:6px; overflow:hidden; }
-.bar i { display:block; height:100%; background:#e4e4e7; border-radius:inherit; }
+.bar i { display:block; height:100%; background:#e4e4e7; border-radius:inherit; transition:width .25s ease; }
+.bar i.ok { background:var(--ok); }
+.bar i.warn { background:var(--warn); }
+.bar i.bad { background:var(--bad); }
+.worker-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; padding:14px; }
+.worker-card { position:relative; min-width:0; padding:15px; background:var(--panel2); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
+.worker-card::before { content:""; position:absolute; inset:0 auto 0 0; width:3px; background:var(--ok); }
+.worker-card.busy::before { background:var(--warn); }
+.worker-card.offline::before,.worker-card.disabled::before,.worker-card.error::before { background:var(--bad); }
+.worker-head { display:flex; align-items:flex-start; gap:10px; }
+.worker-title { flex:1; min-width:0; }
+.worker-title strong { display:block; overflow:hidden; color:#fff; font-size:15px; font-weight:650; text-overflow:ellipsis; white-space:nowrap; }
+.worker-host { display:block; margin-top:2px; overflow:hidden; color:var(--muted); font:10px/1.4 "Cascadia Code",Consolas,monospace; text-overflow:ellipsis; white-space:nowrap; }
+.state-pill { flex:none; padding:2px 8px; border:1px solid currentColor; border-radius:999px; font-size:10px; }
+.worker-flags { display:flex; gap:6px; margin-top:11px; }
+.flag { padding:2px 7px; color:var(--muted); background:rgba(255,255,255,.035); border:1px solid var(--line); border-radius:6px; font-size:10px; }
+.worker-task { margin-top:11px; padding:9px 10px; background:rgba(0,0,0,.18); border:1px solid var(--line); border-radius:8px; }
+.worker-task>span { display:block; color:#737985; font-size:9px; font-weight:650; letter-spacing:.8px; text-transform:uppercase; }
+.worker-task strong,.worker-task em { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.worker-task strong { margin-top:3px; color:#e5e7eb; font-size:12px; font-weight:550; }
+.worker-task em { margin-top:1px; color:var(--muted); font-size:10px; font-style:normal; }
+.resources { display:grid; gap:8px; margin-top:11px; }
+.resource { min-width:0; padding:9px 10px; background:rgba(255,255,255,.022); border:1px solid var(--line); border-radius:8px; }
+.resource-head { display:flex; align-items:center; gap:8px; min-width:0; }
+.resource-head strong { flex:1; overflow:hidden; color:#d5d8de; font-size:11px; font-weight:550; text-overflow:ellipsis; white-space:nowrap; }
+.resource-head span { flex:none; color:var(--muted); font:10px/1.4 "Cascadia Code",Consolas,monospace; }
+.usage { margin-top:7px; }
+.usage-head { display:flex; justify-content:space-between; gap:8px; color:#7f8590; font-size:10px; }
+.usage-head span:last-child { color:#bec2c9; font-family:"Cascadia Code",Consolas,monospace; white-space:nowrap; }
+.usage .bar { height:5px; margin-top:4px; }
+.worker-foot { display:flex; justify-content:space-between; gap:10px; margin-top:11px; padding-top:9px; color:var(--muted); border-top:1px solid var(--line); font-size:10px; }
+.worker-foot span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.job-origin { min-width:180px; white-space:normal; }
+.job-origin strong,.job-origin span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.job-origin strong { color:#e5e7eb; font-weight:550; }
+.job-origin span { margin-top:2px; color:var(--muted); font-size:10px; }
 .empty { padding:24px; color:var(--muted); text-align:center; }
 .error { margin-bottom:12px; padding:10px 12px; color:#fecdd3; background:rgba(244,63,94,.08); border:1px solid rgba(244,63,94,.25); border-radius:9px; display:none; }
 ::-webkit-scrollbar { width:7px; height:7px; }
 ::-webkit-scrollbar-thumb { background:#343841; border-radius:10px; }
-@media (max-width:700px) { header { padding:10px 12px; flex-wrap:wrap; } header .state { order:4; width:100%; } main { padding:12px; } }
+@media (max-width:1100px) { .worker-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+@media (max-width:700px) { header { padding:10px 12px; flex-wrap:wrap; } header .state { order:4; width:100%; } main { padding:12px; } .worker-grid { grid-template-columns:1fr; padding:10px; } }
 </style>
 </head>
 <body>
@@ -64,10 +100,7 @@ tr:last-child td { border-bottom:0; }
 
   <section class="section">
     <h2>Windows 执行端</h2>
-    <div class="scroll"><table>
-      <thead><tr><th>机器</th><th>状态</th><th>ComfyUI</th><th>当前任务</th><th>设备</th><th>节点能力</th><th>最后心跳</th></tr></thead>
-      <tbody id="worker-rows"></tbody>
-    </table></div>
+    <div id="worker-cards" class="worker-grid"></div>
     <div id="worker-empty" class="empty" hidden>还没有注册执行端</div>
   </section>
 
@@ -108,6 +141,74 @@ function duration(sec) {
   if (sec<3600) return `${Math.floor(sec/60)} 分 ${Math.round(sec%60)} 秒`;
   return `${Math.floor(sec/3600)} 小时 ${Math.floor(sec%3600/60)} 分`;
 }
+function numeric(value) {
+  if (value == null || value === "") return null;
+  const result=Number(value);
+  return Number.isFinite(result) ? result : null;
+}
+function clampPercent(value) {
+  const result=numeric(value);
+  return result == null ? null : Math.max(0,Math.min(100,result));
+}
+function formatBytes(value) {
+  const bytes=numeric(value);
+  if (bytes == null) return "--";
+  if (bytes>=1024**3) return `${(bytes/1024**3).toFixed(1)} GB`;
+  if (bytes>=1024**2) return `${Math.round(bytes/1024**2)} MB`;
+  return `${Math.round(bytes/1024)} KB`;
+}
+function usageClass(value) {
+  const pct=clampPercent(value);
+  return pct == null ? "" : pct>=90 ? "bad" : pct>=70 ? "warn" : "ok";
+}
+function make(tag,className,value) {
+  const element=document.createElement(tag);
+  if (className) element.className=className;
+  if (value != null) element.textContent=value;
+  return element;
+}
+function projectName(job,projects) {
+  if (!job) return "";
+  if (job.projectName) return job.projectName;
+  const project=(projects||[]).find(item=>item.id===job.project);
+  return project ? project.name : job.project ? "项目已删除" : "未归属项目";
+}
+function addUsage(container,label,value,pct) {
+  const item=make("div","usage");
+  const head=make("div","usage-head");
+  head.append(make("span","",label),make("span","",value));
+  const bar=make("div","bar");
+  const fill=document.createElement("i");
+  const width=clampPercent(pct);
+  fill.style.width=`${width==null ? 0 : width}%`;
+  fill.className=usageClass(width);
+  bar.appendChild(fill); item.append(head,bar); container.appendChild(item);
+}
+function gpuItems(caps) {
+  const telemetry=caps.telemetry||{};
+  if (Array.isArray(telemetry.gpus) && telemetry.gpus.length) return telemetry.gpus;
+  return (caps.devices||[]).map((device,index)=>{
+    const total=numeric(device.vram_total);
+    const free=numeric(device.vram_free);
+    return {
+      index:device.index==null ? index : device.index,
+      name:device.name||device.device_name||device.type||`GPU ${index}`,
+      utilization_percent:null,
+      memory_used_bytes:total!=null && free!=null ? Math.max(0,total-free) : null,
+      memory_total_bytes:total,
+    };
+  });
+}
+function memoryItem(caps) {
+  const telemetry=caps.telemetry||{};
+  if (telemetry.memory) return telemetry.memory;
+  const system=caps.system||{};
+  const total=numeric(system.ram_total);
+  const free=numeric(system.ram_free);
+  return total==null ? null : {
+    used_bytes:free==null ? null : Math.max(0,total-free), total_bytes:total,
+  };
+}
 function td(row,value,className,title) {
   const cell=document.createElement("td");
   cell.textContent=value == null || value === "" ? "--" : String(value);
@@ -116,33 +217,120 @@ function td(row,value,className,title) {
   row.appendChild(cell);
   return cell;
 }
-function renderWorkers(items) {
-  const body=$("worker-rows"); body.replaceChildren(); $("worker-empty").hidden=items.length>0;
+function renderWorkers(items,jobs,projects) {
+  const container=$("worker-cards");
+  container.replaceChildren(); $("worker-empty").hidden=items.length>0;
   for (const worker of items) {
-    const row=document.createElement("tr");
-    td(row,worker.name);
-    td(row,STATUS[worker.state]||worker.state,cls(worker.state));
-    td(row,worker.comfy_online?"在线":"不可用",worker.comfy_online?"ok":"bad");
-    td(row,worker.current_job_id||"--","muted",worker.current_job_id);
     const caps=worker.capabilities||{};
-    const devices=(caps.devices||[]).map(d=>d.name||d.type||d.device_name).filter(Boolean).join("、");
-    td(row,devices||"未上报",devices?"":"muted",devices);
-    td(row,`${(caps.node_classes||[]).length} 个`);
-    td(row,ago(worker.last_seen),"muted",when(worker.last_seen));
-    body.appendChild(row);
+    const telemetry=caps.telemetry||{};
+    const card=make("article",`worker-card ${worker.state||"offline"}`);
+    card.title=worker.id||"";
+
+    const head=make("div","worker-head");
+    const title=make("div","worker-title");
+    const displayName=worker.name||telemetry.hostname||"未命名执行端";
+    title.appendChild(make("strong","",displayName));
+    const host=telemetry.hostname && telemetry.hostname!==displayName
+      ? `Windows 主机 · ${telemetry.hostname}` : "Windows 执行端";
+    title.appendChild(make("span","worker-host",host));
+    head.append(title,make("span",`state-pill ${cls(worker.state)}`,
+      STATUS[worker.state]||worker.state||"未知"));
+    card.appendChild(head);
+
+    const flags=make("div","worker-flags");
+    flags.appendChild(make("span",`flag ${worker.comfy_online?"ok":"bad"}`,
+      worker.comfy_online?"ComfyUI 在线":"ComfyUI 不可用"));
+    flags.appendChild(make("span","flag",worker.busy?"正在占用":"可接任务"));
+    card.appendChild(flags);
+
+    const task=make("div","worker-task");
+    task.appendChild(make("span","","当前任务"));
+    const current=(jobs||[]).find(job=>job.id===worker.current_job_id);
+    if (current) {
+      task.appendChild(make("strong","",current.cardName||current.name||"未命名卡片"));
+      task.appendChild(make("em","",projectName(current,projects)));
+    } else if (worker.current_job_id) {
+      task.appendChild(make("strong","","任务详情暂未载入"));
+      task.appendChild(make("em","",worker.current_job_id));
+    } else if (worker.busy) {
+      task.appendChild(make("strong","","ComfyUI 本地任务"));
+      task.appendChild(make("em","","非中间层派发"));
+    } else {
+      task.appendChild(make("strong","","当前无任务"));
+      task.appendChild(make("em","","等待任务分配"));
+    }
+    card.appendChild(task);
+
+    const resources=make("div","resources");
+    const gpus=gpuItems(caps);
+    if (!gpus.length) {
+      const resource=make("div","resource");
+      const resourceHead=make("div","resource-head");
+      resourceHead.append(make("strong","","未检测到 GPU 指标"),make("span","","GPU"));
+      resource.appendChild(resourceHead);
+      addUsage(resource,"GPU 利用率","--",null);
+      addUsage(resource,"显存","--",null);
+      resources.appendChild(resource);
+    }
+    for (const gpu of gpus) {
+      const resource=make("div","resource");
+      const resourceHead=make("div","resource-head");
+      resourceHead.append(
+        make("strong","",gpu.name||"未命名 GPU"),
+        make("span","",`GPU ${gpu.index==null?0:gpu.index}`),
+      );
+      resource.appendChild(resourceHead);
+      const utilization=clampPercent(gpu.utilization_percent);
+      addUsage(resource,"GPU 利用率",utilization==null?"--":`${Math.round(utilization)}%`,utilization);
+      const used=numeric(gpu.memory_used_bytes);
+      const total=numeric(gpu.memory_total_bytes);
+      const memoryPct=used!=null && total>0 ? used/total*100 : null;
+      const memoryText=used==null || total==null ? "--" : `${formatBytes(used)} / ${formatBytes(total)}`;
+      addUsage(resource,"显存",memoryText,memoryPct);
+      resources.appendChild(resource);
+    }
+
+    const memory=memoryItem(caps);
+    const memoryResource=make("div","resource");
+    const memoryHead=make("div","resource-head");
+    memoryHead.append(make("strong","","系统内存"),make("span","","RAM"));
+    memoryResource.appendChild(memoryHead);
+    const memoryUsed=memory&&numeric(memory.used_bytes);
+    const memoryTotal=memory&&numeric(memory.total_bytes);
+    const memoryPct=memoryUsed!=null && memoryTotal>0 ? memoryUsed/memoryTotal*100 : null;
+    const memoryText=memoryUsed==null || memoryTotal==null
+      ? "--" : `${formatBytes(memoryUsed)} / ${formatBytes(memoryTotal)}`;
+    addUsage(memoryResource,"内存使用",memoryText,memoryPct);
+    resources.appendChild(memoryResource);
+    card.appendChild(resources);
+
+    const foot=make("div","worker-foot");
+    foot.append(
+      make("span","",`节点能力 ${(caps.node_classes||[]).length} 个`),
+      make("span","",`心跳 ${ago(worker.last_seen)}`),
+    );
+    foot.lastElementChild.title=when(worker.last_seen);
+    card.appendChild(foot); container.appendChild(card);
   }
 }
-function renderJobs(items) {
+function renderJobs(items,workers,projects) {
   const body=$("job-rows"); body.replaceChildren(); $("job-empty").hidden=items.length>0;
+  const workerNames=new Map((workers||[]).map(worker=>[worker.id,worker.name]));
   for (const job of items.slice(0,30)) {
     const row=document.createElement("tr");
     td(row,STATUS[job.status]||job.status,cls(job.status));
-    td(row,[job.projectName,job.cardName||job.name].filter(Boolean).join(" / ")||job.name);
+    const origin=document.createElement("td"); origin.className="job-origin";
+    origin.append(
+      make("strong","",projectName(job,projects)),
+      make("span","",`卡片 · ${job.cardName||job.name||"未命名"}`),
+    );
+    row.appendChild(origin);
     const pct=Math.round((job.progress||0)*100);
     const progress=td(row,`${pct}%${job.step?` · ${job.step}`:""}`,"progress",job.step);
     const bar=document.createElement("div"); bar.className="bar";
     const fill=document.createElement("i"); fill.style.width=`${pct}%`; bar.appendChild(fill); progress.appendChild(bar);
-    td(row,job.worker_id||"--","muted",job.worker_id);
+    const workerName=job.worker_id ? workerNames.get(job.worker_id)||"未知执行端" : "--";
+    td(row,workerName,job.worker_id?"":"muted",job.worker_id);
     td(row,when(job.created),"muted");
     const elapsed=job.started ? duration((job.ended||Date.now()/1000)-job.started) : "--";
     td(row,job.error||elapsed,job.error?"bad":"muted",job.error);
@@ -163,13 +351,19 @@ function renderConfig(health) {
 }
 async function refresh() {
   try {
-    const [health,status,workers,jobs]=await Promise.all([get("/api/health"),get("/api/status"),get("/api/workers"),get("/api/jobs")]);
+    const [health,status,workerData,jobData,projectData]=await Promise.all([
+      get("/api/health"),get("/api/status"),get("/api/workers"),
+      get("/api/jobs"),get("/api/projects"),
+    ]);
+    const workers=workerData.workers||[];
+    const jobs=jobData.jobs||[];
+    const projects=projectData.projects||[];
     text("service",health.ok?"运行正常":"异常"); $("service").className=health.ok?"ok":"bad";
     text("workers",`${health.online_workers||0} / ${health.workers||0}`);
     text("running",status.running_count||0); text("queued",status.queued_count||0);
     text("comfy",health.comfy_online?"可用":"不可用"); $("comfy").className=health.comfy_online?"ok":"bad";
     text("uptime",health.started_at?duration(health.server_time-health.started_at):"--");
-    renderWorkers(workers.workers||[]); renderJobs(jobs.jobs||[]); renderConfig(health);
+    renderWorkers(workers,jobs,projects); renderJobs(jobs,workers,projects); renderConfig(health);
     $("error").style.display="none";
     text("refresh-state",`最后刷新：${new Date().toLocaleTimeString("zh-CN",{hour12:false})}`);
   } catch (error) {
