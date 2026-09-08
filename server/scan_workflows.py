@@ -124,6 +124,13 @@ ROUTE_CARDS = {
     },
 }
 
+# 同一种玩法可切换的模型。模式列表只显示一次，前端用 modelSwitch 切换实际能力；
+# 每条能力仍保留自己的 manifest，所以换模型后参数面板会跟着切成对应的参数。
+MODEL_SWITCHES = {
+    "zimage_t2i": {"zimage": "zimage_t2i", "krea2": "krea2_t2i"},
+    "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i"},
+}
+
 # 风格卡：画布上唯一一张**不对应任何工作流**的卡。它没有 manifest、没有能力，
 # 自己也不跑 —— 只存一段风格描述，连到哪张卡就在提交时并进那张卡的提示词里。
 # 于是"整条链子统一一个风格"变成改一处：风格卡改一次，挂在它下游的卡全跟着变。
@@ -1771,6 +1778,18 @@ def build_modes(ms):
             md["name"] = ladders[m["id"]]["name"]
             md["ladder"] = ladders[m["id"]]["ladder"]
         modes.append(md)
+
+    available = {m["id"] for m in ms}
+    for base_id, switches in MODEL_SWITCHES.items():
+        if base_id not in available:
+            continue
+        choices = {name: wid for name, wid in switches.items() if wid in available}
+        if len(choices) < 2:
+            continue
+        base = next(md for md in modes if md["id"] == base_id)
+        base["modelSwitch"] = choices
+        alternatives = set(choices.values()) - {base_id}
+        modes = [md for md in modes if md["id"] not in alternatives]
     return modes
 
 
