@@ -53,6 +53,48 @@ class PromptTranslationProtectionTest(unittest.TestCase):
         self.assertIn("是一只灰猫", result)
         self.assertIn("灰色毛发", result)
 
+    def test_rejects_reordered_protected_tokens(self):
+        masked, protected = prompt_translate.protect_prompt_tokens(
+            "subject_definitions:\n<Subject 1> is a gray cat."
+        )
+        first, second = [token for token, _original in protected]
+        reordered = masked.replace(first, "__TEMP__").replace(second, first).replace(
+            "__TEMP__", second
+        )
+
+        with self.assertRaisesRegex(prompt_translate.TranslateError, "顺序"):
+            prompt_translate.restore_prompt_tokens(reordered, protected)
+
+
+class TranslationFallbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_uses_configured_llm_when_youdao_is_not_configured(self):
+        request = mock.MagicMock()
+        request.json = mock.AsyncMock(return_value={
+            "op": "translate",
+            "inputs": [{"name": "原文", "text":
+                        "subject_definitions:\n<Subject 1> is a gray cat."}],
+        })
+        request.app = {"session": object()}
+
+        async def chat(_session, _system, user, _max_tokens, _temperature):
+            self.assertIn("__CK_KEEP_", user)
+            return {
+                "text": user.replace("is a gray cat", "是一只灰猫"),
+                "model": "configured-model", "tokens": 12, "warn": "",
+            }
+
+        with mock.patch.object(prompt_translate, "ready", return_value=False), \
+             mock.patch.object(controller_app.llm, "ready", return_value=True), \
+             mock.patch.object(controller_app.llm, "chat", side_effect=chat):
+            response = await controller_app.api_text(request)
+
+        payload = json.loads(response.text)
+        self.assertEqual(payload["via"], "api")
+        self.assertEqual(payload["model"], "configured-model")
+        self.assertIn("subject_definitions:", payload["text"])
+        self.assertIn("<Subject 1>", payload["text"])
+        self.assertIn("是一只灰猫", payload["text"])
+
 
 class H3ReferenceRewriteRulesTest(unittest.TestCase):
     def test_reference_identity_is_immutable_and_low_temperature(self):
