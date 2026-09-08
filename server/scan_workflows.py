@@ -402,6 +402,13 @@ RMBG_RES = ("处理精度", 512, 2048, 128,
             "有用，还会更慢更吃显存。调低更快但边缘会变粗糙")
 
 CAP_KNOBS = {
+    "minimax_h3_ref_2pass": {
+        "audio_denoise": (
+            "音频降噪强度", 0, 1, 0.05,
+            "推荐 {d}：二采时轻度重绘音频。0.7 容易让声音失真或崩坏；"
+            "0 = 锁定第一遍生成的音频，不在二采阶段重绘"
+        ),
+    },
     "zimage_i2i": {
         "denoise": ("重绘幅度", 0.2, 1, 0.05,
                     "工作流默认 {d}（完全重画，原图只剩尺寸）。"
@@ -590,6 +597,7 @@ def knob_key(api, nid, field, knobs=None):
 # 短边；再往上是训练分布外，只会更慢更糊，所以封在 1.1 而不是插件作者给的 16。
 RES_FIELDS = {
     "aspect_ratio":    ("画面比例", "select", None),
+    "resolution":      ("画面尺寸", "select", None),
     "megapixels":      ("分辨率", "slider", (0.2, 1.1, 0.01)),
     "scale_to_length": ("分辨率(长边)", "number", (512, 1344, 32)),
 }
@@ -1322,7 +1330,10 @@ def derive_inputs(api, oi, wid=None):
                             f"{n} 张各自缩到这个尺寸再拼起来"
                             + (f"，整图宽高各是它的 {k} 倍。" if k * k == n else "。"))
         if kind == "select":
-            item["options"] = list(opts.get("options") or [])
+            # 新版 combo 把候选放在 options；旧插件（如 TTResolutionSelector）
+            # 直接把候选列表放在类型位置，两种格式都要认。
+            choices = opts.get("options") or (vt if isinstance(vt, list) else [])
+            item["options"] = list(choices)
             if not item["options"]:
                 return None
         else:

@@ -257,7 +257,7 @@
    ],
    "scale_by": 1.5,
    "method": "bicubic",
-   "audio_denoise": 0.7
+   "audio_denoise": 0.3
   },
   "_meta": {
    "title": "MiniMax H3 Latent Upscale Combined"
