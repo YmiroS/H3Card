@@ -858,23 +858,47 @@ async def api_text(request):
     body = await request.json()
     op = str(body.get("op") or "")
 
-    # 翻译操作走有道 API，不走 LLM
+    # 翻译优先走有道；没配置或请求失败时，复用 llm.json 中的云端模型。
     if op == "translate":
         inputs = [(str(i.get("name") or "?"), str(i.get("text") or ""))
                   for i in body.get("inputs") or [] if str(i.get("text") or "").strip()]
         if not inputs:
             raise web.HTTPBadRequest(reason="没有要翻译的文本")
-        src_text = inputs[0][1]  # 取第一条输入
+        src_text = inputs[0][1]
         t0 = time.time()
+        youdao_error = "服务端未配置 YOUDAO_APP_KEY / YOUDAO_APP_SECRET"
+        if tr.ready():
+            try:
+                translated = tr.youdao_translate(src_text)
+                return web.json_response({
+                    "text": translated, "warn": "",
+                    "via": "youdao", "model": "有道翻译", "tokens": 0,
+                    "ms": int((time.time() - t0) * 1000)
+                })
+            except tr.TranslateError as e:
+                youdao_error = str(e)
+
+        if not llm.ready():
+            w = llm.where()
+            raise web.HTTPBadGateway(reason=(
+                f"有道翻译不可用（{youdao_error}），云端翻译也没配好（"
+                f"{w.get('error') or 'llm.json 里 base_url / api_key / model 没填全'}）")[:400])
+
+        cfg = rw.TEXT_OPS["translate"]
+        query, protected = tr.protect_prompt_tokens(src_text)
         try:
-            translated = tr.youdao_translate(src_text)
-            return web.json_response({
-                "text": translated, "warn": "",
-                "via": "youdao", "model": "有道翻译", "tokens": 0,
-                "ms": int((time.time() - t0) * 1000)
-            })
-        except tr.TranslateError as e:
-            raise web.HTTPBadGateway(reason=f"有道翻译失败：{e}"[:400])
+            got = await llm.chat(request.app["session"], cfg["system"], query,
+                                 cfg["max_tokens"], cfg["temperature"])
+            translated = tr.restore_prompt_tokens(rw.text_clean(got["text"]), protected)
+        except (llm.LLMError, tr.TranslateError) as e:
+            raise web.HTTPBadGateway(reason=(
+                f"有道翻译不可用（{youdao_error}），云端翻译失败：{e}")[:400])
+        return web.json_response({
+            "text": translated,
+            "warn": f"有道翻译不可用，已改用 {got['model']}",
+            "via": "api", "model": got["model"], "tokens": got["tokens"],
+            "ms": int((time.time() - t0) * 1000)
+        })
 
     cfg = rw.TEXT_OPS.get(op)
     if not cfg:
