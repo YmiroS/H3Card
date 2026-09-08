@@ -90,7 +90,7 @@ tr:last-child td { border-bottom:0; }
   </section>
 
   <section class="section">
-    <div class="section-head"><h2>费用明细</h2><span class="section-note">最多显示最近 200 条</span></div>
+    <div class="section-head"><h2>费用明细</h2><span id="detail-note" class="section-note">正在读取明细</span></div>
     <div class="scroll"><table>
       <thead><tr><th>时间</th><th>状态</th><th>类型</th><th>项目 / 卡片</th><th>能力</th><th>执行端</th><th>耗时</th><th>计费依据</th><th>费用</th></tr></thead>
       <tbody id="job-rows"></tbody>
@@ -150,7 +150,7 @@ function renderJobs(items) {
 async function refresh() {
   try {
     const days=Number($("period").value||0);
-    const query=new URLSearchParams({limit:"200"});
+    const query=new URLSearchParams({limit:"2000"});
     if (days) query.set("from",String(Date.now()/1000-days*86400));
     const response=await fetch(`/api/costs?${query}`,{cache:"no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
@@ -164,6 +164,7 @@ async function refresh() {
     $("pricing").textContent=`计价版本 ${data.pricing_version} · 币种 ${data.currency}`;
     rankList("by-category",data.by_category); rankList("by-capability",data.by_capability);
     rankList("by-worker",data.by_worker); renderJobs(data.jobs||[]);
+    $("detail-note").textContent=`显示 ${data.jobs.length} / ${o.tasks} 条`;
     $("error").style.display="none";
     $("refresh-state").textContent=`最后刷新：${new Date().toLocaleTimeString("zh-CN",{hour12:false})}`;
   } catch (error) {

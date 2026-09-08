@@ -264,6 +264,14 @@ class CostLedgerTest(unittest.TestCase):
         self.assertEqual(detail["runtime_seconds"], 60)
         self.assertAlmostEqual(detail["actual_cost"], 60 * 5 / 3600, places=6)
 
+    def test_report_can_return_more_than_five_hundred_details(self):
+        for _index in range(501):
+            self.ledger.record_api("text", "qwen3.7-plus", 0, 0, 1)
+
+        report = self.ledger.report(limit=2000)
+        self.assertEqual(report["overview"]["tasks"], 501)
+        self.assertEqual(len(report["jobs"]), 501)
+
 
 class FfmpegDiscoveryTest(unittest.TestCase):
     def test_uses_imageio_ffmpeg_binary_outside_windows_bundle(self):
@@ -406,6 +414,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         costs_page = await response.text()
         self.assertIn("<title>费用统计</title>", costs_page)
         self.assertIn("确认总费用", costs_page)
+        self.assertIn('limit:"2000"', costs_page)
 
         response = await self.client.get("/api/health")
         self.assertEqual(response.status, 200)

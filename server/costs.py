@@ -299,7 +299,7 @@ class CostLedger:
     def report(self, start=None, end=None, limit=100):
         start = float(start or 0)
         end = float(end or time.time())
-        limit = max(1, min(int(limit or 100), 500))
+        limit = max(1, min(int(limit or 100), 2000))
         with self.lock:
             rows = [dict(row) for row in self.db.execute(
                 """SELECT c.*,w.name AS worker_name FROM cost_events c
