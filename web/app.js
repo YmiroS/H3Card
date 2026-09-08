@@ -78,8 +78,12 @@ const modeHas = (md, cid) => md.id === cid
   // modelSwitch：同一模式换模型跑的另一条能力（图生图的 zimage_i2i ↔ krea2_i2i）。
   // 不认它的话 modeOf 对 krea 的 cap 返回空，面板模式胶囊会兜底显示 modes[0]「文生图」
   || !!(md.modelSwitch && Object.values(md.modelSwitch).includes(cid));
-/** 一个模式落到画布上时先跑哪条能力。路由节点（route）用排在最前那一路当初始状态 */
-const modeCap = (md) => md ? (md.route ? md.route[Object.keys(md.route)[0]].cap : md.id) : null;
+/** 一个模式落到画布上时先跑哪条能力。切换玩法时保留当前模型；新建节点默认用模式 id。 */
+const modeCap = (md, model) => {
+  if (!md) return null;
+  if (model && md.modelSwitch && md.modelSwitch[model]) return md.modelSwitch[model];
+  return md.route ? md.route[Object.keys(md.route)[0]].cap : md.id;
+};
 /** 同一条能力可能同时挂在两个节点上（补帧既有自己那个节点，也是「画质增强」的视频那一路），
     所以先认节点自己记的 c.type，只有它对不上时才去全局找。 */
 const defOf = (c) => {
@@ -1036,9 +1040,13 @@ async function openProject(pid) {
   for (const c of PROJ.cards) {
     const md = modeOf(c);
     // 路由节点的模式 id 不是能力 id（它就是那个节点），c.cap 已经是两路里的一条，别动。
-    // modelSwitch 命中的也别归一：krea2_i2i 归回 zimage_i2i 等于把用户选的模型换了
+    // modelSwitch 命中的也别归一：krea2_i2i 归回 zimage_i2i 等于把用户选的模型换了。
     if (md && !md.route && md.id !== c.cap
       && !(md.modelSwitch && Object.values(md.modelSwitch).includes(c.cap))) c.cap = md.id;
+    if (md && md.modelSwitch) {
+      const selected = Object.entries(md.modelSwitch).find(([, cid]) => cid === c.cap);
+      if (selected) c._model = selected[0];
+    }
     seedHistory(c);
   }
   // 文本节点曾经分 5 种模式（text_source / text_polish…），后来合成一种。
@@ -3512,7 +3520,7 @@ function openPanel(id) {
       b.className = modeHas(md, c.cap) ? "on" : "";
       b.textContent = md.name;
       hoverTip(b, () => modeBriefEl(c, md, md.name));
-      b.onclick = () => { tipHide(); c.cap = modeCap(md); openPanel(id); paintTitle(c); save(); };
+      b.onclick = () => { tipHide(); c.cap = modeCap(md, c._model); openPanel(id); paintTitle(c); save(); };
       m.appendChild(b);
     }
     el.panel.appendChild(m);
@@ -3615,7 +3623,7 @@ function openPanel(id) {
         icon: def.icon,
         text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),
         tip: () => modeBriefEl(c, mo, mo.name),
-        run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo); openPanel(id); paintTitle(c); save(); },
+        run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo, c._model); openPanel(id); paintTitle(c); save(); },
       })));
     hoverTip(modeButton, () => modeBriefEl(c, currentMode, currentMode.name));
     foot.appendChild(modeButton);
