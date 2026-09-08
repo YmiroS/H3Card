@@ -120,13 +120,14 @@ class DistributedStore:
             )
         return cur.rowcount > 0
 
-    def heartbeat(self, worker_id, *, capabilities=None, comfy_online=False,
-                  busy=False, local_busy=None, current_job_id=None):
+    def heartbeat(self, worker_id, *, capabilities=None, telemetry=None,
+                  comfy_online=False, busy=False, local_busy=None,
+                  current_job_id=None):
         now = time.time()
         with self.lock, self.db:
             self._requeue_expired_locked(now)
             row = self.db.execute(
-                "SELECT id FROM workers WHERE id = ?", (worker_id,)
+                "SELECT id, capabilities_json FROM workers WHERE id = ?", (worker_id,)
             ).fetchone()
             if not row:
                 return None
@@ -162,9 +163,17 @@ class DistributedStore:
                 "current_job_id = ?", "updated_at = ?",
             ]
             values = [now, int(bool(comfy_online)), int(effective_busy), active_job_id, now]
-            if capabilities is not None:
+            if capabilities is not None or telemetry is not None:
+                merged_capabilities = (
+                    dict(capabilities) if capabilities is not None
+                    else json.loads(row["capabilities_json"] or "{}")
+                )
+                if not isinstance(merged_capabilities, dict):
+                    merged_capabilities = {}
+                if telemetry is not None:
+                    merged_capabilities["telemetry"] = telemetry
                 fields.append("capabilities_json = ?")
-                values.append(_json(capabilities))
+                values.append(_json(merged_capabilities))
             values.append(worker_id)
             self.db.execute(
                 f"UPDATE workers SET {', '.join(fields)} WHERE id = ?", values

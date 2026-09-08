@@ -180,6 +180,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         application["distributed"] = self.store
         application.router.add_get("/controller", controller_app.controller_index)
         application.router.add_get("/api/health", controller_app.api_health)
+        application.router.add_get("/api/jobs", controller_app.api_jobs)
+        application.router.add_post("/api/generate", controller_app.api_generate)
         application.router.add_post("/agent/v1/register", controller_app.api_agent_register)
         application.router.add_post("/agent/v1/heartbeat", controller_app.api_agent_heartbeat)
         application.router.add_post("/agent/v1/jobs/acquire", controller_app.api_agent_acquire)
@@ -205,7 +207,10 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     async def test_controller_dashboard_and_health_metadata(self):
         response = await self.client.get("/controller")
         self.assertEqual(response.status, 200)
-        self.assertIn("<title>运行面板</title>", await response.text())
+        dashboard = await response.text()
+        self.assertIn("<title>运行面板</title>", dashboard)
+        self.assertIn('id="worker-cards" class="worker-grid"', dashboard)
+        self.assertIn("GPU 利用率", dashboard)
 
         response = await self.client.get("/api/health")
         self.assertEqual(response.status, 200)
@@ -213,6 +218,27 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(health["mode"], controller_app.EXECUTION_MODE)
         self.assertIn("server_time", health)
         self.assertIn("started_at", health)
+
+    @mock.patch.object(controller_app, "patch_graph", return_value={
+        "1": {"class_type": "KSampler", "inputs": {}}
+    })
+    async def test_generate_preserves_project_and_card_names(self, _patch_graph):
+        capability = {
+            "name": "测试生成", "outputType": "image", "_graph_ok": True,
+        }
+        with mock.patch.dict(controller_app.CAPS, {"dashboard-test": capability}):
+            response = await self.client.post("/api/generate", json={
+                "capability": "dashboard-test", "params": {}, "assets": {},
+                "project": "project-1", "projectName": "广告片项目",
+                "card": "card-1", "cardName": "主视觉",
+            })
+
+        self.assertEqual(response.status, 200)
+        job = await response.json()
+        self.assertEqual(job["projectName"], "广告片项目")
+        self.assertEqual(job["cardName"], "主视觉")
+        listed = await (await self.client.get("/api/jobs")).json()
+        self.assertEqual(listed["jobs"][0]["projectName"], "广告片项目")
 
     async def test_register_heartbeat_acquire_and_complete(self):
         denied = await self.client.post("/agent/v1/register", json={
@@ -232,10 +258,24 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "Authorization": f"Bearer {credentials['worker_token']}",
         }
 
+        telemetry = {
+            "hostname": "RENDER-01",
+            "gpus": [{
+                "index": 0, "name": "NVIDIA GeForce RTX 4090",
+                "utilization_percent": 73,
+                "memory_used_bytes": 12 * 1024 ** 3,
+                "memory_total_bytes": 24 * 1024 ** 3,
+            }],
+            "memory": {
+                "used_bytes": 30 * 1024 ** 3,
+                "total_bytes": 64 * 1024 ** 3,
+            },
+        }
         response = await self.client.post("/agent/v1/heartbeat", headers=headers, json={
             "comfy_online": True,
             "busy": False,
             "capabilities": {"node_classes": ["KSampler"]},
+            "telemetry": telemetry,
         })
         self.assertEqual(response.status, 200)
 
@@ -278,6 +318,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         response = await self.client.get("/api/workers")
         worker = (await response.json())["workers"][0]
         self.assertNotIn("token_hash", worker)
+        self.assertEqual(worker["name"], "gpu-01")
+        self.assertEqual(worker["capabilities"]["telemetry"], telemetry)
 
     async def test_execution_error_atomically_finishes_dispatch(self):
         response = await self.client.post("/agent/v1/register", json={
