@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>费用统计</title>
+<style>
+:root { color-scheme:dark; --bg:#0b0d10; --panel:#111318; --panel2:#16191f; --line:rgba(255,255,255,.10); --muted:#8f949e; --text:#f3f4f6; --ok:#34d399; --warn:#fbbf24; --bad:#fb7185; --blue:#38bdf8; }
+* { box-sizing:border-box; }
+body { min-height:100vh; margin:0; background-color:var(--bg); background-image:radial-gradient(rgba(255,255,255,.07) 1px,transparent 1px); background-size:24px 24px; color:var(--text); font:13px/1.5 Inter,system-ui,"Microsoft YaHei",sans-serif; }
+header { position:sticky; top:0; z-index:2; display:flex; align-items:center; gap:10px; min-height:60px; padding:10px 22px; background:rgba(11,13,16,.88); border-bottom:1px solid var(--line); backdrop-filter:blur(18px); }
+header h1 { margin:0; font-size:15px; font-weight:650; }
+header h1::before { content:"¥"; display:inline-grid; place-items:center; width:28px; height:28px; margin-right:9px; color:#b4b8c0; border:1px solid var(--line); border-radius:8px; background:rgba(255,255,255,.04); }
+header .state { margin-right:auto; color:var(--muted); font-size:12px; }
+a,button,select { color:#d3d6dc; border:1px solid var(--line); background:#15181d; border-radius:8px; padding:7px 11px; text-decoration:none; cursor:pointer; }
+a:hover,button:hover,select:hover { color:#fff; border-color:rgba(255,255,255,.20); background:#1b1f25; }
+main { max-width:1440px; margin:auto; padding:24px; }
+.summary { display:grid; grid-template-columns:repeat(auto-fit,minmax(170px,1fr)); gap:12px; }
+.metric,.section { background:rgba(17,19,24,.96); border:1px solid var(--line); border-radius:12px; box-shadow:0 12px 34px rgba(0,0,0,.20); }
+.metric { padding:16px; }
+.metric span { display:block; color:var(--muted); font-size:11px; }
+.metric strong { display:block; margin-top:5px; font-size:22px; font-weight:650; letter-spacing:-.4px; }
+.metric small { display:block; margin-top:3px; color:#737985; font-size:10px; }
+.section { margin-top:14px; overflow:hidden; }
+.section-head { display:flex; align-items:center; justify-content:space-between; gap:10px; padding:14px 16px; border-bottom:1px solid var(--line); }
+.section h2 { margin:0; font-size:13px; font-weight:650; }
+.section-note { color:var(--muted); font-size:10px; }
+.breakdown { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; padding:14px; }
+.group { min-width:0; padding:13px; background:var(--panel2); border:1px solid var(--line); border-radius:10px; }
+.group h3 { margin:0 0 10px; color:#d7dae0; font-size:11px; font-weight:650; }
+.rank { display:grid; grid-template-columns:minmax(90px,1fr) auto; gap:4px 12px; padding:8px 0; border-top:1px solid rgba(255,255,255,.06); }
+.rank:first-of-type { border-top:0; }
+.rank strong { overflow:hidden; font-size:11px; font-weight:550; text-overflow:ellipsis; white-space:nowrap; }
+.rank span { color:#dfe2e7; font:11px/1.5 "Cascadia Code",Consolas,monospace; }
+.rank small { grid-column:1/-1; color:var(--muted); font-size:9px; }
+.bar { grid-column:1/-1; height:4px; background:rgba(255,255,255,.06); border-radius:6px; overflow:hidden; }
+.bar i { display:block; height:100%; background:var(--blue); border-radius:inherit; }
+.scroll { overflow:auto; }
+table { width:100%; border-collapse:collapse; white-space:nowrap; }
+th,td { padding:11px 14px; border-bottom:1px solid var(--line); text-align:left; font-weight:400; }
+th { color:#747983; background:rgba(255,255,255,.018); font-size:10px; font-weight:650; letter-spacing:.6px; }
+tbody tr:hover { background:rgba(255,255,255,.025); }
+tr:last-child td { border-bottom:0; }
+.origin { max-width:240px; overflow:hidden; text-overflow:ellipsis; }
+.muted { color:var(--muted); }
+.ok { color:var(--ok); }
+.warn { color:var(--warn); }
+.bad { color:var(--bad); }
+.error { display:none; margin-bottom:12px; padding:10px 12px; color:#fecdd3; background:rgba(244,63,94,.08); border:1px solid rgba(244,63,94,.25); border-radius:9px; }
+.empty { padding:24px; color:var(--muted); text-align:center; }
+::-webkit-scrollbar { width:7px; height:7px; }
+::-webkit-scrollbar-thumb { background:#343841; border-radius:10px; }
+@media (max-width:900px) { .breakdown { grid-template-columns:1fr; } }
+@media (max-width:700px) { header { padding:10px 12px; flex-wrap:wrap; } header .state { order:4; width:100%; } main { padding:12px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>费用统计</h1>
+  <span id="refresh-state" class="state">正在读取...</span>
+  <select id="period" aria-label="统计周期">
+    <option value="0">全部记录</option>
+    <option value="7">最近 7 天</option>
+    <option value="30">最近 30 天</option>
+    <option value="90">最近 90 天</option>
+  </select>
+  <a href="/controller">运行面板</a>
+  <button id="refresh">立即刷新</button>
+</header>
+<main>
+  <div id="error" class="error"></div>
+  <section class="summary">
+    <div class="metric"><span>确认总费用</span><strong id="total">--</strong><small>实际 + 历史估算</small></div>
+    <div class="metric"><span>实际费用</span><strong id="actual">--</strong><small>有执行时长或 API token</small></div>
+    <div class="metric"><span>历史估算</span><strong id="estimated">--</strong><small>无时长的成功任务</small></div>
+    <div class="metric"><span>GPU 用量</span><strong id="gpu-hours">--</strong><small id="electricity">电费 --</small></div>
+    <div class="metric"><span>API 费用</span><strong id="api-cost">--</strong><small>按输入 / 输出 token</small></div>
+    <div class="metric"><span>失败与取消损耗</span><strong id="waste">--</strong><small id="unknown">未知费用 -- 项</small></div>
+    <div class="metric"><span>运行中累计</span><strong id="running">--</strong><small>按当前运行时长动态计算</small></div>
+    <div class="metric"><span>任务数量</span><strong id="tasks">--</strong><small id="statuses">完成 -- · 失败 -- · 取消 --</small></div>
+  </section>
+
+  <section class="section">
+    <div class="section-head"><h2>费用构成</h2><span id="pricing" class="section-note"></span></div>
+    <div class="breakdown">
+      <div class="group"><h3>按类型</h3><div id="by-category"></div></div>
+      <div class="group"><h3>按能力</h3><div id="by-capability"></div></div>
+      <div class="group"><h3>按执行端</h3><div id="by-worker"></div></div>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-head"><h2>费用明细</h2><span class="section-note">最多显示最近 200 条</span></div>
+    <div class="scroll"><table>
+      <thead><tr><th>时间</th><th>状态</th><th>类型</th><th>项目 / 卡片</th><th>能力</th><th>执行端</th><th>耗时</th><th>计费依据</th><th>费用</th></tr></thead>
+      <tbody id="job-rows"></tbody>
+    </table></div>
+    <div id="empty" class="empty" hidden>这个周期内还没有费用记录</div>
+  </section>
+</main>
+<script>
+const STATUS={queued:"排队中",running:"运行中",done:"已完成",error:"失败",canceled:"已取消"};
+const SOURCE={actual:"实际",estimated:"估算",unknown:"未知"};
+const $=id=>document.getElementById(id);
+const money=value=>`¥${Number(value||0).toFixed(4)}`;
+const when=value=>value?new Date(value*1000).toLocaleString("zh-CN",{hour12:false}):"--";
+function duration(sec) {
+  if (!Number.isFinite(sec)) return "--";
+  if (sec<60) return `${Math.round(sec)} 秒`;
+  if (sec<3600) return `${Math.floor(sec/60)} 分 ${Math.round(sec%60)} 秒`;
+  return `${Math.floor(sec/3600)} 小时 ${Math.floor(sec%3600/60)} 分`;
+}
+function stateClass(status) { return status==="done"?"ok":status==="running"||status==="queued"?"warn":"bad"; }
+function rankList(id,items) {
+  const root=$(id); root.replaceChildren();
+  const shown=(items||[]).slice(0,10);
+  const max=Math.max(0,...shown.map(item=>item.total_cost||0));
+  for (const item of shown) {
+    const row=document.createElement("div"); row.className="rank";
+    const label=document.createElement("strong"); label.textContent=item.label||item.key;
+    label.title=item.key;
+    const amount=document.createElement("span"); amount.textContent=money(item.total_cost);
+    const note=document.createElement("small");
+    note.textContent=`${item.tasks} 项 · 实际 ${money(item.actual_cost)} · 估算 ${money(item.estimated_cost)}`;
+    const bar=document.createElement("div"); bar.className="bar";
+    const fill=document.createElement("i"); fill.style.width=`${max?item.total_cost/max*100:0}%`;
+    bar.appendChild(fill); row.append(label,amount,note,bar); root.appendChild(row);
+  }
+  if (!shown.length) root.textContent="暂无记录";
+}
+function cell(row,value,className,title) {
+  const td=document.createElement("td"); td.textContent=value==null||value===""?"--":value;
+  if (className) td.className=className; if (title) td.title=title; row.appendChild(td);
+}
+function renderJobs(items) {
+  const body=$("job-rows"); body.replaceChildren(); $("empty").hidden=items.length>0;
+  for (const item of items) {
+    const row=document.createElement("tr");
+    cell(row,when(item.created_at),"muted");
+    cell(row,STATUS[item.status]||item.status,stateClass(item.status));
+    cell(row,item.category_name);
+    cell(row,[item.project_name,item.card_name].filter(Boolean).join(" / ")||"未归属","origin");
+    cell(row,item.capability,"muted"); cell(row,item.worker_name,"muted");
+    cell(row,duration(item.runtime_seconds),"muted");
+    cell(row,SOURCE[item.cost_source]||item.cost_source,item.cost_source==="estimated"?"warn":"muted");
+    cell(row,item.cost_source==="unknown"?"--":money(item.recognized_cost));
+    body.appendChild(row);
+  }
+}
+async function refresh() {
+  try {
+    const days=Number($("period").value||0);
+    const query=new URLSearchParams({limit:"200"});
+    if (days) query.set("from",String(Date.now()/1000-days*86400));
+    const response=await fetch(`/api/costs?${query}`,{cache:"no-store"});
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const data=await response.json(), o=data.overview;
+    $("total").textContent=money(o.total_cost); $("actual").textContent=money(o.actual_cost);
+    $("estimated").textContent=money(o.estimated_cost); $("gpu-hours").textContent=`${o.gpu_hours.toFixed(2)} 小时`;
+    $("electricity").textContent=`其中电费 ${money(o.electricity_cost)}`; $("api-cost").textContent=money(o.api_cost);
+    $("waste").textContent=money(o.failed_waste); $("unknown").textContent=`未知费用 ${o.unknown_cost_tasks} 项`;
+    $("running").textContent=money(o.running_accrued); $("tasks").textContent=o.tasks;
+    $("statuses").textContent=`完成 ${o.done} · 失败 ${o.error} · 取消 ${o.canceled}`;
+    $("pricing").textContent=`计价版本 ${data.pricing_version} · 币种 ${data.currency}`;
+    rankList("by-category",data.by_category); rankList("by-capability",data.by_capability);
+    rankList("by-worker",data.by_worker); renderJobs(data.jobs||[]);
+    $("error").style.display="none";
+    $("refresh-state").textContent=`最后刷新：${new Date().toLocaleTimeString("zh-CN",{hour12:false})}`;
+  } catch (error) {
+    $("error").textContent=`读取费用统计失败：${error.message}`; $("error").style.display="block";
+    $("refresh-state").textContent="连接失败";
+  }
+}
+$("refresh").onclick=refresh; $("period").onchange=refresh;
+refresh(); setInterval(refresh,15000);
+</script>
+</body>
+</html>
