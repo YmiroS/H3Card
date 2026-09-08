@@ -29,7 +29,7 @@ _PROMPT_TOKEN_RE = re.compile(
 )
 
 
-def _protect_prompt_tokens(text):
+def protect_prompt_tokens(text):
     """用不会被翻译的占位符保护提示词标签和结构化关键词。"""
     protected = []
 
@@ -44,10 +44,15 @@ def _protect_prompt_tokens(text):
     return _PROMPT_TOKEN_RE.sub(replace, text), protected
 
 
-def _restore_prompt_tokens(text, protected):
-    for token, original in protected:
+def restore_prompt_tokens(text, protected):
+    positions = []
+    for token, _original in protected:
         if text.count(token) != 1:
             raise TranslateError("翻译服务改动了受保护的提示词标签或关键词")
+        positions.append(text.index(token))
+    if positions != sorted(positions):
+        raise TranslateError("翻译服务改变了受保护提示词标签或关键词的顺序")
+    for token, original in protected:
         text = text.replace(token, original)
     return text
 
@@ -55,6 +60,10 @@ def _restore_prompt_tokens(text, protected):
 class TranslateError(Exception):
     """翻译失败"""
     pass
+
+
+def ready():
+    return bool(YOUDAO_APP_KEY and YOUDAO_APP_SECRET)
 
 
 def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers"):
@@ -76,7 +85,7 @@ def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers")
     if not YOUDAO_APP_KEY or not YOUDAO_APP_SECRET:
         raise TranslateError("服务端未配置 YOUDAO_APP_KEY / YOUDAO_APP_SECRET")
 
-    query, protected = _protect_prompt_tokens(text)
+    query, protected = protect_prompt_tokens(text)
 
     # 自动判断目标语言：如果源文本主要是中文 → 英文，否则 → 中文
     if to_lang == "auto":
@@ -126,7 +135,7 @@ def youdao_translate(text, from_lang="auto", to_lang="auto", domain="computers")
             raise TranslateError("有道 API 返回结果为空")
 
         translated = "\n".join(translation) if isinstance(translation, list) else str(translation)
-        return _restore_prompt_tokens(translated, protected)
+        return restore_prompt_tokens(translated, protected)
 
     except requests.RequestException as e:
         raise TranslateError(f"网络请求失败：{e}")

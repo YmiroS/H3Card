@@ -4738,7 +4738,7 @@ async function doTranslate(c, s) {
     }
     save();
     c._rwBusy = false; repanel(c);
-    toast(`翻译完成 · ${(r.ms / 1000).toFixed(1)} 秒 · 有道翻译`
+    toast(`翻译完成 · ${(r.ms / 1000).toFixed(1)} 秒 · ${r.model || "翻译服务"}`
       + (r.warn ? `\n${r.warn}` : ""));
   } catch (e) {
     c._rwBusy = false;
