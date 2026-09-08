@@ -5077,13 +5077,15 @@ function paintPort(c) {
   const md = modeOf(c), cap = capOf(c);
   // 素材节点不收任何输入：左边那颗绿点不画，不然会有人去拖线进来（linkTo 会拒绝）
   if (isAsset(c)) { p.style.display = "none"; return; }
-  // 能接文本节点的也点这颗点：不然用户不知道往哪儿拖那根线
-  const styleOk = !isTextCard(c) && promptSpecs(cap).length;
-  // 文本节点收 @text（多根，当加工输入）；风格节点不收任何输入
+  // 文本节点收 @text（多根，当加工输入）；风格节点不收任何输入。
   const textIn = isText(c);
   const kinds = md && md.route ? Object.keys(md.route)
     : [...new Set((cap ? cap.inputs : []).filter(s => MEDIA.includes(s.type)).map(s => s.type))];
-  p.style.display = (kinds.length || styleOk || textIn) ? "" : "none";
+  // 纯文生图没有图片/音频/视频输入槽，即使有提示词也不显示素材输入点。
+  if (!kinds.length && !textIn) { p.style.display = "none"; return; }
+  // 有素材输入的生成节点仍可从同一个点接文本节点。
+  const styleOk = !isTextCard(c) && promptSpecs(cap).length;
+  p.style.display = "";
   p.title = textIn
     ? "文本节点的出口拖到这里：接进来的文字都是这段加工的输入（按连线顺序）"
     : kinds.length
