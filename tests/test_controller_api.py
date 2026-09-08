@@ -250,6 +250,56 @@ class CostLedgerTest(unittest.TestCase):
         self.assertEqual(report["jobs"][0]["category_name"], "文本与反推")
         self.assertEqual(report["jobs"][0]["project_name"], "文案项目")
 
+    def test_h3_retail_prices_follow_segment_and_output_second_rules(self):
+        self.assertEqual(
+            self.ledger.retail_quote("minimax_h3_i2v"),
+            (1_500_000, 2_500_000, "per_segment"),
+        )
+        self.assertEqual(
+            self.ledger.retail_quote("minimax_h3_comic20", {"segment_count": 5}),
+            (20_000_000, 30_000_000, "segment_count"),
+        )
+        self.assertEqual(
+            self.ledger.retail_quote("minimax_h3_character_transfer", {
+                "source_duration": 67, "width": 480, "height": 848,
+            }),
+            (16_750_000, 26_800_000, "output_second_resolution"),
+        )
+        self.assertEqual(
+            self.ledger.retail_quote("minimax_h3_character_transfer", {
+                "source_duration": 67, "width": 720, "height": 1280,
+            }),
+            (53_600_000, 80_400_000, "output_second_resolution"),
+        )
+
+    def test_image_retail_prices_match_published_ranges(self):
+        expected = {
+            "zimage_t2i": (0.08, 0.15),
+            "krea2_t2i": (0.30, 0.60),
+            "zimage_i2i": (0.30, 0.60),
+            "krea2_i2i": (0.30, 0.60),
+            "flux2_klein_edit": (0.20, 0.40),
+            "flux2_klein_storyboard9": (1.0, 2.0),
+        }
+        for capability, (low, high) in expected.items():
+            quote = self.ledger.retail_quote(capability)
+            self.assertEqual(quote[:2], (round(low * 1_000_000), round(high * 1_000_000)))
+
+    def test_report_separates_retail_price_from_internal_cost(self):
+        self.ledger.record_job({
+            "id": "h3-job", "capability": "minimax_h3_ref9",
+            "status": "queued", "created": 1,
+        })
+        self.ledger.start_job("h3-job", "worker-1", 100)
+        self.ledger.finish_job("h3-job", "done", 280, "worker-1")
+
+        report = self.ledger.report()
+        self.assertEqual(report["overview"]["retail_min"], 3.0)
+        self.assertEqual(report["overview"]["retail_max"], 5.0)
+        self.assertEqual(report["overview"]["retail_mid"], 4.0)
+        self.assertAlmostEqual(report["overview"]["actual_cost"], 0.25, places=6)
+        self.assertEqual(report["jobs"][0]["retail_basis"], "per_segment")
+
     def test_start_and_finish_retries_do_not_change_runtime(self):
         self.ledger.record_job({
             "id": "retry-job", "capability": "krea2_t2i",
@@ -413,7 +463,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         costs_page = await response.text()
         self.assertIn("<title>费用统计</title>", costs_page)
-        self.assertIn("确认总费用", costs_page)
+        self.assertIn("建议收费区间", costs_page)
+        self.assertIn("内部总成本", costs_page)
         self.assertIn('limit:"2000"', costs_page)
 
         response = await self.client.get("/api/health")

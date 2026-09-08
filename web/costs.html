@@ -70,13 +70,13 @@ tr:last-child td { border-bottom:0; }
 <main>
   <div id="error" class="error"></div>
   <section class="summary">
-    <div class="metric"><span>确认总费用</span><strong id="total">--</strong><small>实际 + 历史估算</small></div>
-    <div class="metric"><span>实际费用</span><strong id="actual">--</strong><small>有执行时长或 API token</small></div>
-    <div class="metric"><span>历史估算</span><strong id="estimated">--</strong><small>无时长的成功任务</small></div>
+    <div class="metric"><span>建议收费区间</span><strong id="retail-range">--</strong><small>按成片、分段或输出秒计价</small></div>
+    <div class="metric"><span>建议收费中值</span><strong id="retail-mid">--</strong><small id="retail-coverage">已定价 -- 项 · 未定价 -- 项</small></div>
+    <div class="metric"><span>内部总成本</span><strong id="internal-total">--</strong><small id="internal-split">实际 -- · 历史估算 --</small></div>
+    <div class="metric"><span>内部实际成本</span><strong id="actual">--</strong><small id="running">运行中累计 --</small></div>
     <div class="metric"><span>GPU 用量</span><strong id="gpu-hours">--</strong><small id="electricity">电费 --</small></div>
-    <div class="metric"><span>API 费用</span><strong id="api-cost">--</strong><small>按输入 / 输出 token</small></div>
-    <div class="metric"><span>失败与取消损耗</span><strong id="waste">--</strong><small id="unknown">未知费用 -- 项</small></div>
-    <div class="metric"><span>运行中累计</span><strong id="running">--</strong><small>按当前运行时长动态计算</small></div>
+    <div class="metric"><span>API 成本</span><strong id="api-cost">--</strong><small>按输入 / 输出 token</small></div>
+    <div class="metric"><span>失败与取消损耗</span><strong id="waste">--</strong><small id="unknown">内部成本未知 -- 项</small></div>
     <div class="metric"><span>任务数量</span><strong id="tasks">--</strong><small id="statuses">完成 -- · 失败 -- · 取消 --</small></div>
   </section>
 
@@ -92,7 +92,7 @@ tr:last-child td { border-bottom:0; }
   <section class="section">
     <div class="section-head"><h2>费用明细</h2><span id="detail-note" class="section-note">正在读取明细</span></div>
     <div class="scroll"><table>
-      <thead><tr><th>时间</th><th>状态</th><th>类型</th><th>项目 / 卡片</th><th>能力</th><th>执行端</th><th>耗时</th><th>计费依据</th><th>费用</th></tr></thead>
+      <thead><tr><th>时间</th><th>状态</th><th>类型</th><th>项目 / 卡片</th><th>能力</th><th>执行端</th><th>耗时</th><th>收费依据</th><th>建议收费</th><th>内部成本</th></tr></thead>
       <tbody id="job-rows"></tbody>
     </table></div>
     <div id="empty" class="empty" hidden>这个周期内还没有费用记录</div>
@@ -101,8 +101,10 @@ tr:last-child td { border-bottom:0; }
 <script>
 const STATUS={queued:"排队中",running:"运行中",done:"已完成",error:"失败",canceled:"已取消"};
 const SOURCE={actual:"实际",estimated:"估算",unknown:"未知"};
+const BASIS={per_job:"按次",per_segment:"按段",segment_count:"按分段数",output_second_resolution:"按输出秒和分辨率"};
 const $=id=>document.getElementById(id);
 const money=value=>`¥${Number(value||0).toFixed(4)}`;
+const moneyRange=(low,high)=>Number(low)===Number(high)?money(low):`${money(low)}–${money(high)}`;
 const when=value=>value?new Date(value*1000).toLocaleString("zh-CN",{hour12:false}):"--";
 function duration(sec) {
   if (!Number.isFinite(sec)) return "--";
@@ -114,16 +116,17 @@ function stateClass(status) { return status==="done"?"ok":status==="running"||st
 function rankList(id,items) {
   const root=$(id); root.replaceChildren();
   const shown=(items||[]).slice(0,10);
-  const max=Math.max(0,...shown.map(item=>item.total_cost||0));
+  const max=Math.max(0,...shown.map(item=>item.retail_mid||0));
   for (const item of shown) {
     const row=document.createElement("div"); row.className="rank";
     const label=document.createElement("strong"); label.textContent=item.label||item.key;
     label.title=item.key;
-    const amount=document.createElement("span"); amount.textContent=money(item.total_cost);
+    const amount=document.createElement("span");
+    amount.textContent=item.retail_known_tasks?moneyRange(item.retail_min,item.retail_max):"未定价";
     const note=document.createElement("small");
-    note.textContent=`${item.tasks} 项 · 实际 ${money(item.actual_cost)} · 估算 ${money(item.estimated_cost)}`;
+    note.textContent=`${item.tasks} 项 · 已定价 ${item.retail_known_tasks} · 内部成本 ${money(item.total_cost)}`;
     const bar=document.createElement("div"); bar.className="bar";
-    const fill=document.createElement("i"); fill.style.width=`${max?item.total_cost/max*100:0}%`;
+    const fill=document.createElement("i"); fill.style.width=`${max?item.retail_mid/max*100:0}%`;
     bar.appendChild(fill); row.append(label,amount,note,bar); root.appendChild(row);
   }
   if (!shown.length) root.textContent="暂无记录";
@@ -142,8 +145,14 @@ function renderJobs(items) {
     cell(row,[item.project_name,item.card_name].filter(Boolean).join(" / ")||"未归属","origin");
     cell(row,item.capability,"muted"); cell(row,item.worker_name,"muted");
     cell(row,duration(item.runtime_seconds),"muted");
-    cell(row,SOURCE[item.cost_source]||item.cost_source,item.cost_source==="estimated"?"warn":"muted");
-    cell(row,item.cost_source==="unknown"?"--":money(item.recognized_cost));
+    const basis=item.retail_source==="priced"?(BASIS[item.retail_basis]||"按次")
+      :item.retail_source==="not_billable"?"未完成":"未定价";
+    cell(row,basis,item.retail_source==="unpriced"?"warn":"muted");
+    const retail=item.retail_source==="priced"?moneyRange(item.retail_min,item.retail_max)
+      :item.retail_source==="not_billable"?"不计费":"--";
+    cell(row,retail,item.retail_source==="priced"?"ok":"muted");
+    cell(row,item.cost_source==="unknown"?"--":money(item.recognized_cost),"muted",
+      `内部成本：${SOURCE[item.cost_source]||item.cost_source}`);
     body.appendChild(row);
   }
 }
@@ -155,11 +164,15 @@ async function refresh() {
     const response=await fetch(`/api/costs?${query}`,{cache:"no-store"});
     if (!response.ok) throw new Error(`HTTP ${response.status}`);
     const data=await response.json(), o=data.overview;
-    $("total").textContent=money(o.total_cost); $("actual").textContent=money(o.actual_cost);
-    $("estimated").textContent=money(o.estimated_cost); $("gpu-hours").textContent=`${o.gpu_hours.toFixed(2)} 小时`;
+    $("retail-range").textContent=moneyRange(o.retail_min,o.retail_max);
+    $("retail-mid").textContent=money(o.retail_mid);
+    $("retail-coverage").textContent=`已定价 ${o.retail_known_tasks} 项 · 未定价 ${o.retail_unknown_tasks} 项`;
+    $("internal-total").textContent=money(o.total_cost);
+    $("internal-split").textContent=`实际 ${money(o.actual_cost)} · 历史估算 ${money(o.estimated_cost)}`;
+    $("actual").textContent=money(o.actual_cost); $("gpu-hours").textContent=`${o.gpu_hours.toFixed(2)} 小时`;
     $("electricity").textContent=`其中电费 ${money(o.electricity_cost)}`; $("api-cost").textContent=money(o.api_cost);
-    $("waste").textContent=money(o.failed_waste); $("unknown").textContent=`未知费用 ${o.unknown_cost_tasks} 项`;
-    $("running").textContent=money(o.running_accrued); $("tasks").textContent=o.tasks;
+    $("waste").textContent=money(o.failed_waste); $("unknown").textContent=`内部成本未知 ${o.unknown_cost_tasks} 项`;
+    $("running").textContent=`运行中累计 ${money(o.running_accrued)}`; $("tasks").textContent=o.tasks;
     $("statuses").textContent=`完成 ${o.done} · 失败 ${o.error} · 取消 ${o.canceled}`;
     $("pricing").textContent=`计价版本 ${data.pricing_version} · 币种 ${data.currency}`;
     rankList("by-category",data.by_category); rankList("by-capability",data.by_capability);
