@@ -402,51 +402,42 @@ function resolutionPresets(spec) {
 function resolutionPreset(spec, value) {
   return resolutionPresets(spec).find(x => x.value === value) || null;
 }
-/** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度 + 画面比例 + 常规参数（视频时长等）。
-    照参考图那种浮层：一个小标题、选项网格、点外面/Esc 关。 */
+const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length"]);
+const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
+  !RES_PARAM_KEYS.has(s.key) && !MEDIA.includes(s.type) && s.type !== "textarea"
+  && s.type !== "seed" && !s.advanced && !s.mirror && !s.rangeOf);
+
+/** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度、画面比例和当前模式的常规参数。 */
 function openResPop(c, anchor) {
   const cap = CAPS[runCap(c)] || capOf(c);
-  const has = cap && cap.inputs.some(x =>
-    ["megapixels", "width", "height", "aspect_ratio", "resolution", "duration", "preview_seconds", "target_fps", "scale_to_length"].includes(x.key));
-  if (!has) return toast("这个模式没有可调的分辨率参数");
+  const hasResolution = cap && cap.inputs.some(x => RES_PARAM_KEYS.has(x.key));
+  const params = popoverParams(cap);
+  if (!hasResolution && !params.length) return toast("这个模式没有可调参数");
+
+  const refreshBrief = () => {
+    if (el.panel._id !== c.id) return;
+    const caps = el.panel.querySelectorAll(".foot .tcap");
+    const pb = caps[caps.length - 1];
+    if (!pb || !pb.textContent.startsWith("⚙")) return;
+    const brief = paramsBrief(c, cap);
+    pb.textContent = brief ? `⚙ ${brief}` : "⚙ 参数";
+  };
 
   /** 原位刷新弹窗内容（选中态要变），**不关不重开** —— 重开会按重建过的锚点按钮
       重新摆位，弹窗就跳位置（这就是"选完参数窗口会跑"的 bug）。
       位置不动：只换 innerHTML，left/top 留在 style 上。 */
   const refill = () => {
     el.respop.innerHTML = "";
-    el.respop.appendChild(clarityPicker(c, cap, refill));
-    // 视频节点的常规参数也收进这个弹窗，不在面板里摊开
-    const specs = cap.inputs;
-    const PARAM_KEYS = ["duration", "preview_seconds", "target_fps"];
-    const params = specs.filter(s => PARAM_KEYS.includes(s.key) && s.type === "slider");
+    if (hasResolution) el.respop.appendChild(clarityPicker(c, cap, refill));
     if (params.length) {
       const pwrap = document.createElement("div"); pwrap.className = "pwrap";
-      pwrap.style.marginTop = "12px";
+      if (hasResolution) pwrap.style.marginTop = "12px";
       for (const s of params) {
-        const row = document.createElement("div"); row.className = "row";
-        const lb = document.createElement("label"); lb.textContent = s.label; lb.title = s.hint || s.label;
-        row.appendChild(lb);
-        const cur = c.params[s.key] != null ? c.params[s.key] : s.default;
-        const r = document.createElement("input"); r.type = "range";
-        r.min = s.min != null ? s.min : 1; r.max = s.max != null ? s.max : 30; r.step = s.step || 1;
-        const n = document.createElement("input"); n.type = "number";
-        n.min = r.min; n.max = r.max; n.step = r.step; n.style.width = "72px";
-        r.value = n.value = cur != null ? cur : r.min;
-        const set = (v) => {
-          r.value = n.value = v; c.params[s.key] = parseFloat(v); save();
-          // 时长或预览范围变了要更新胶囊摘要
-          if (["duration", "preview_seconds"].includes(s.key) && el.panel._id === c.id) {
-            const caps = el.panel.querySelectorAll(".foot .tcap");
-            const pb = caps[caps.length - 1];
-            if (pb && pb.textContent.startsWith("⚙")) {
-              const cb = paramsBrief(c, cap);
-              pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
-            }
-          }
-        };
-        r.oninput = () => set(r.value); n.oninput = () => set(n.value);
-        row.appendChild(r); row.appendChild(n);
+        const row = rowEl(c, s);
+        for (const input of row.querySelectorAll("input, select")) {
+          input.addEventListener("input", refreshBrief);
+          input.addEventListener("change", refreshBrief);
+        }
         pwrap.appendChild(row);
       }
       el.respop.appendChild(pwrap);
@@ -455,16 +446,8 @@ function openResPop(c, anchor) {
     x.className = "x"; x.textContent = "✕"; x.title = "关闭 (Esc)";
     x.onclick = closeResPop;
     el.respop.appendChild(x);
-    // 面板底部 ⚙ 胶囊的摘要跟着新选择变。只改那颗按钮的文案，不 openPanel 整块重建
-    // （重建会把锚点按钮换成新元素，虽然弹窗位置不受影响，但没必要）
-    if (el.panel._id === c.id) {
-      const caps = el.panel.querySelectorAll(".foot .tcap");
-      const pb = caps[caps.length - 1];      // 最后那颗胶囊 = ⚙（生图节点是第二颗）
-      if (pb && pb.textContent.startsWith("⚙")) {
-        const cb = paramsBrief(c, cap);
-        pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
-      }
-    }
+    // 面板底部 ⚙ 胶囊的摘要跟着新选择变，不重建整个面板。
+    refreshBrief();
   };
   refill();
   el.respop.style.display = "";
@@ -964,7 +947,9 @@ function hoverTip(node, contentGetter) {
 /* ================= 启动 ================= */
 (async function boot() {
   try {
-    const d = await api("/api/cards");
+    // 服务进程可能还缓存着修改前的 _cards.json；页面刷新时先让后端重载一次。
+    try { await api("/api/reload", { method: "POST" }); } catch (_e) { /* 兼容旧服务 */ }
+    const d = await api("/api/cards", { cache: "no-store" });
     CARDS = d.cards; CAPS = d.capabilities;
     el.dot.classList.toggle("on", !!d.comfy_online);
   } catch (e) { toast("后端未就绪：" + e.message); }
@@ -3601,13 +3586,10 @@ function openPanel(id) {
       box.appendChild(nt);
     }
   };
-  // 生图节点的分辨率/比例不在面板里摊开了：点「⚙」胶囊弹独立小窗（openResPop）。
-  // 别的节点照旧摊开剩余旋钮；高级参数整个不画（用户定的：基本上不动）
-  // **compact 模式：分辨率参数 + 常规参数收进 ⚙ 弹窗**
+  // 生图/生视频节点的常规参数统一收进底部「⚙ 参数」弹窗；其他节点仍在面板中展开。
+  // 高级参数整个不画（用户定的：基本上不动）。
   const pwrap = document.createElement("div"); pwrap.className = "pwrap";
-  const COMPACT_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length",
-    "duration", "preview_seconds", "target_fps"]);
-  for (const s of rows) if (!(compact && COMPACT_KEYS.has(s.key))) addRow(pwrap, s);
+  for (const s of rows) if (!compact) addRow(pwrap, s);
   body.appendChild(pwrap);
 
   if (c.error) body.appendChild(errBox(c.error));
