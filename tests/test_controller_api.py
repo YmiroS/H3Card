@@ -152,9 +152,9 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
 
     def test_zimage_text_to_image_parameters_are_patchable(self):
         cap = controller_app.CAPS["zimage_t2i"]
-        graph = controller_app.patch_graph(cap, {"width": 1280, "height": 720}, {})
-        self.assertEqual(graph["41"]["inputs"]["width"], 1280)
-        self.assertEqual(graph["41"]["inputs"]["height"], 720)
+        graph = controller_app.patch_graph(cap, {"width": 2048, "height": 2048}, {})
+        self.assertEqual(graph["41"]["inputs"]["width"], 2048)
+        self.assertEqual(graph["41"]["inputs"]["height"], 2048)
 
     def test_krea2_text_to_image_exposes_resolution_presets(self):
         cap = controller_app.CAPS["krea2_t2i"]
