@@ -368,6 +368,7 @@ const CLARITY_STEPS = [
   { id: "720P", label: "720P", val: 720 },
   { id: "1080P", label: "1080P", val: 1080 },
   { id: "1440P", label: "1440P", val: 1440 },
+  { id: "2K", label: "2K", val: 2048 },
 ];
 /** 比例网格（照参考图内置的 13 种；映射到工作流那 8 档 select 里的最优近似） */
 const RATIO_GRID = [
