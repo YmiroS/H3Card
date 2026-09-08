@@ -3941,7 +3941,8 @@ async function runText(c) {
       op, model: (c.params || {}).model || "api",
       inputs,
       params: { instr: String((c.params || {}).instr || "") },
-      project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
+      project: PROJ && PROJ.id, projectName: PROJ && PROJ.name,
+      card: c.id, cardName: titleOf(c),
     });
     c.params._prev = String((c.params || {}).text || "");   // 留一步可恢复
     c.params.text = r.text;
@@ -4725,7 +4726,8 @@ async function doTranslate(c, s) {
     const r = await jpost("/api/text", {
       op: "translate", model: "youdao",
       inputs: [{ name: "原文", text: src }], params: {},
-      project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
+      project: PROJ && PROJ.id, projectName: PROJ && PROJ.name,
+      card: c.id, cardName: titleOf(c),
     });
     // 翻译结果写回当前选中的版本
     if (useOpt) {
@@ -4877,7 +4879,8 @@ async function doRewrite(c, s, model) {
       prompt: resolvedPrompt,  // 使用解析后的提示词
       style: styles.join("\n\n"), model: model || "auto",
       cardInfo: buildCardInfo(c),  // 传递卡片信息映射
-      project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c),
+      project: PROJ && PROJ.id, projectName: PROJ && PROJ.name,
+      card: c.id, cardName: titleOf(c),
     });
     // 调试：打印完整的返回数据
     console.log("=== /api/rewrite 返回数据 ===");
@@ -5498,9 +5501,10 @@ function payloadOf(c) {
     }
   }
   for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
-  // card/cardName 只给任务浮窗用：光有能力名说不清是哪个节点在跑，也没法点回去
+  // 项目/卡片信息只给任务面板用：既要认出来源，也要能从任务跳回那张卡
   return { capability: cap.id, params, assets,
-           project: PROJ && PROJ.id, card: c.id, cardName: titleOf(c) };
+           project: PROJ && PROJ.id, projectName: PROJ && PROJ.name,
+           card: c.id, cardName: titleOf(c) };
 }
 
 async function run(c) {
@@ -5704,9 +5708,9 @@ function renderJobs() {
   list.scrollTop = scrolled;
 }
 
-/** 任务是哪个项目的。当前打开的这个直接用 PROJ.name（刚改的名字 projects 里还是旧的），
-    别的项目去 projects 列表里认 id；项目已经被删了就只剩节点名。 */
+/** 新任务直接带提交时的项目名；老任务再按项目 id 从当前画布或项目列表反查。 */
 function jobProjName(j) {
+  if (j.projectName) return j.projectName;
   if (!j.project) return "";
   if (PROJ && j.project === PROJ.id) return PROJ.name;
   return (projects.find(p => p.id === j.project) || {}).name || "";

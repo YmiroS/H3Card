@@ -1,10 +1,12 @@
 import asyncio
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
@@ -43,6 +45,29 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertNotIn("token_hash", worker)
         self.assertEqual(worker["state"], "idle")
         self.assertEqual(worker["capabilities"]["node_classes"], ["KSampler", "SaveImage"])
+
+    def test_heartbeat_merges_telemetry_without_dropping_capabilities(self):
+        telemetry = {
+            "hostname": "RENDER-01",
+            "gpus": [{
+                "index": 0, "name": "NVIDIA GeForce RTX 4090",
+                "utilization_percent": 42,
+                "memory_used_bytes": 8 * 1024 ** 3,
+                "memory_total_bytes": 24 * 1024 ** 3,
+            }],
+            "memory": {
+                "used_bytes": 32 * 1024 ** 3,
+                "total_bytes": 64 * 1024 ** 3,
+            },
+        }
+
+        self.store.heartbeat(
+            self.worker_id, telemetry=telemetry, comfy_online=True, busy=False
+        )
+
+        capabilities = self.store.list_workers()[0]["capabilities"]
+        self.assertEqual(capabilities["node_classes"], ["KSampler", "SaveImage"])
+        self.assertEqual(capabilities["telemetry"], telemetry)
 
     def test_acquire_matches_capabilities_and_enforces_lease(self):
         self.store.enqueue("missing", {"graph": {}}, ["MissingNode"])
@@ -191,6 +216,68 @@ class DistributedStoreMigrationTest(unittest.TestCase):
                 self.assertIn("last_model_family", columns)
             finally:
                 store.close()
+
+
+class WorkerTelemetryTest(unittest.TestCase):
+    @mock.patch("agent.subprocess.run")
+    def test_reads_nvidia_gpu_utilization_and_vram(self, run):
+        run.return_value = mock.Mock(
+            returncode=0,
+            stdout="0, NVIDIA GeForce RTX 4090, 73, 12288, 24564\n",
+        )
+
+        gpus = WorkerAgent._nvidia_gpus()
+
+        self.assertEqual(gpus, [{
+            "index": 0,
+            "name": "NVIDIA GeForce RTX 4090",
+            "utilization_percent": 73.0,
+            "memory_used_bytes": 12288 * 1024 ** 2,
+            "memory_total_bytes": 24564 * 1024 ** 2,
+        }])
+
+    def test_reads_windows_system_memory(self):
+        total = 64 * 1024 ** 3
+        available = 18 * 1024 ** 3
+        windows = mock.Mock()
+
+        def fill_memory(status_pointer):
+            status_pointer._obj.ullTotalPhys = total
+            status_pointer._obj.ullAvailPhys = available
+            return 1
+
+        windows.kernel32.GlobalMemoryStatusEx.side_effect = fill_memory
+        with mock.patch("agent.os.name", "nt"), \
+             mock.patch("agent.ctypes.windll", windows, create=True):
+            memory = WorkerAgent._system_memory()
+
+        self.assertEqual(memory, {
+            "used_bytes": total - available,
+            "total_bytes": total,
+        })
+
+    @mock.patch("agent.subprocess.run", side_effect=FileNotFoundError)
+    def test_missing_nvidia_smi_reports_no_gpu_metrics(self, _run):
+        self.assertEqual(WorkerAgent._nvidia_gpus(), [])
+
+    @mock.patch("agent.subprocess.run")
+    def test_nvidia_smi_timeout_reports_no_gpu_metrics(self, run):
+        run.side_effect = subprocess.TimeoutExpired("nvidia-smi", 5)
+        self.assertEqual(WorkerAgent._nvidia_gpus(), [])
+
+    def test_probe_failures_do_not_break_telemetry(self):
+        worker = WorkerAgent.__new__(WorkerAgent)
+        worker.config = {"worker_name": "GPU-FALLBACK"}
+        with mock.patch.object(
+                WorkerAgent, "_nvidia_gpus", side_effect=RuntimeError("gpu failed")), \
+             mock.patch.object(
+                WorkerAgent, "_system_memory", side_effect=RuntimeError("ram failed")):
+            telemetry = worker.collect_telemetry()
+
+        self.assertEqual(telemetry["gpus"], [])
+        self.assertIsNone(telemetry["memory"])
+        self.assertIn("hostname", telemetry)
+        self.assertIn("collected_at", telemetry)
 
 
 class WorkerInputPathTest(unittest.TestCase):

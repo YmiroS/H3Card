@@ -690,8 +690,9 @@ async def api_generate(request):
                  "seed": params.get("_seed_used", params.get("seed")),
                  "step": "", "outputs": [], "error": None,
                  # 任务面板要能说清"这是哪张卡在跑"，还要能点回那张卡
-                 "project": body.get("project"), "card": body.get("card"),
-                 "cardName": body.get("cardName")}
+                 "project": body.get("project"),
+                 "projectName": body.get("projectName"),
+                 "card": body.get("card"), "cardName": body.get("cardName")}
     if CONTROLLER_MODE:
         required_nodes = {
             nd.get("class_type") for nd in graph.values()
@@ -806,8 +807,9 @@ async def rewrite_local(request, job_name, system, user, sampling, body, t0, fel
                  "outputType": "text", "status": "queued",
                  "progress": 0.0, "created": t0, "seed": None,
                  "step": "", "outputs": [], "error": None,
-                 "project": body.get("project"), "card": body.get("card"),
-                 "cardName": body.get("cardName")}
+                 "project": body.get("project"),
+                 "projectName": body.get("projectName"),
+                 "card": body.get("card"), "cardName": body.get("cardName")}
 
     job = JOBS[pid]
     try:
@@ -992,6 +994,7 @@ async def api_agent_heartbeat(request):
     result = distributed_store(request.app).heartbeat(
         worker_id,
         capabilities=body.get("capabilities") if isinstance(body.get("capabilities"), dict) else None,
+        telemetry=body.get("telemetry") if isinstance(body.get("telemetry"), dict) else None,
         comfy_online=bool(body.get("comfy_online")),
         busy=bool(body.get("busy")),
         local_busy=body.get("local_busy") if "local_busy" in body else None,
