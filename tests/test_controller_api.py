@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "server"))
 
 import app as controller_app
 import rewrite
+import scan_workflows
 import translate as prompt_translate
 from distributed import DistributedStore
 
@@ -131,6 +132,29 @@ class CardProgressLabelTest(unittest.TestCase):
 class WorkflowParameterRegressionTest(unittest.TestCase):
     def setUp(self):
         controller_app.load_caps()
+
+    def test_text_to_image_models_share_one_mode(self):
+        card = next(item for item in controller_app.CARDS if item["id"] == "card_image")
+        text_modes = [item for item in card["modes"] if item["name"] == "文生图"]
+        self.assertEqual(len(text_modes), 1)
+        self.assertEqual(text_modes[0]["modelSwitch"], {
+            "zimage": "zimage_t2i", "krea2": "krea2_t2i",
+        })
+
+        modes = scan_workflows.build_modes([
+            controller_app.CAPS["zimage_t2i"],
+            controller_app.CAPS["krea2_t2i"],
+            controller_app.CAPS["zimage_i2i"],
+            controller_app.CAPS["krea2_i2i"],
+        ])
+        self.assertEqual([item["name"] for item in modes], ["文生图", "图生图"])
+        self.assertEqual(modes[1]["modelSwitch"]["krea2"], "krea2_i2i")
+
+    def test_zimage_text_to_image_parameters_are_patchable(self):
+        cap = controller_app.CAPS["zimage_t2i"]
+        graph = controller_app.patch_graph(cap, {"width": 1280, "height": 720}, {})
+        self.assertEqual(graph["41"]["inputs"]["width"], 1280)
+        self.assertEqual(graph["41"]["inputs"]["height"], 720)
 
     def test_krea2_text_to_image_exposes_resolution_presets(self):
         cap = controller_app.CAPS["krea2_t2i"]

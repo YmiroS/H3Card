@@ -9,17 +9,20 @@
    {
     "id": "zimage_t2i",
     "name": "文生图",
-    "slots": "img0+aud0+vid0"
-   },
-   {
-    "id": "krea2_t2i",
-    "name": "文生图",
-    "slots": "img0+aud0+vid0"
+    "slots": "img0+aud0+vid0",
+    "modelSwitch": {
+     "zimage": "zimage_t2i",
+     "krea2": "krea2_t2i"
+    }
    },
    {
     "id": "zimage_i2i",
     "name": "图生图",
-    "slots": "img1+aud0+vid0"
+    "slots": "img1+aud0+vid0",
+    "modelSwitch": {
+     "zimage": "zimage_i2i",
+     "krea2": "krea2_i2i"
+    }
    },
    {
     "id": "flux2_klein_storyboard9",
