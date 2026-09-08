@@ -271,6 +271,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         application["distributed"] = self.store
         application.router.add_get("/controller", controller_app.controller_index)
         application.router.add_get("/api/health", controller_app.api_health)
+        application.router.add_get("/api/cards", controller_app.api_cards)
+        application.router.add_post("/api/reload", controller_app.api_reload)
         application.router.add_get("/api/jobs", controller_app.api_jobs)
         application.router.add_post("/api/generate", controller_app.api_generate)
         application.router.add_post("/agent/v1/register", controller_app.api_agent_register)
@@ -294,6 +296,15 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
         controller_app.WEIGHTS.clear()
+
+    async def test_reload_exposes_one_text_to_image_mode(self):
+        response = await self.client.post("/api/reload")
+        self.assertEqual(response.status, 200)
+        payload = await (await self.client.get("/api/cards")).json()
+        card = next(item for item in payload["cards"] if item["id"] == "card_image")
+        text_modes = [item for item in card["modes"] if item["name"] == "文生图"]
+        self.assertEqual(len(text_modes), 1)
+        self.assertEqual(text_modes[0]["modelSwitch"]["krea2"], "krea2_t2i")
 
     async def test_controller_dashboard_and_health_metadata(self):
         response = await self.client.get("/controller")
