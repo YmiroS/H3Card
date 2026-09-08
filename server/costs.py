@@ -156,6 +156,32 @@ class CostLedger:
                     low, high = low * duration, 0.08 * duration
         return _micros(low), _micros(high)
 
+    def retail_quote(self, capability, dimensions=None):
+        spec = self._spec(capability)
+        dims = dimensions or {}
+        basis = spec.get("retail_basis") or "per_job"
+        if basis == "output_second_resolution":
+            duration = _number(dims.get("source_duration") or dims.get("duration"))
+            if not duration:
+                return None, None, basis
+            width = _number(dims.get("width")) or 0
+            height = _number(dims.get("height")) or 0
+            level = "high" if width * height >= 800_000 else "low"
+            low = _number(spec.get(f"retail_{level}_min_per_second"))
+            high = _number(spec.get(f"retail_{level}_max_per_second"))
+            if low is None or high is None:
+                return None, None, basis
+            return _micros(low * duration), _micros(high * duration), basis
+
+        low = _number(spec.get("retail_min"))
+        high = _number(spec.get("retail_max"))
+        if low is None or high is None:
+            return None, None, basis
+        if basis == "segment_count":
+            count = max(1, int(_number(dims.get("segment_count")) or 1))
+            low, high = low * count, high * count
+        return _micros(low), _micros(high), basis
+
     def record_job(self, job, params=None, assets=None, graph=None, probe_video=None,
                    model_family=None, historical=False):
         capability = job.get("capability") or "unknown"
@@ -310,6 +336,8 @@ class CostLedger:
         labels = self.pricing.get("categories") or {}
         overview = {
             "tasks": len(rows), "done": 0, "error": 0, "canceled": 0,
+            "retail_min": 0.0, "retail_max": 0.0, "retail_mid": 0.0,
+            "retail_known_tasks": 0, "retail_unknown_tasks": 0,
             "actual_cost": 0.0, "estimated_cost": 0.0, "total_cost": 0.0,
             "electricity_cost": 0.0, "api_cost": 0.0, "gpu_hours": 0.0,
             "failed_waste": 0.0, "running_accrued": 0.0, "unknown_cost_tasks": 0,
@@ -317,11 +345,14 @@ class CostLedger:
         groups = {"by_category": {}, "by_capability": {}, "by_worker": {}}
         now = time.time()
 
-        def add(group, key, label, row, actual, estimated, recognized):
+        def add(group, key, label, row, actual, estimated, recognized,
+                retail_min, retail_max, retail_priced):
             item = group.setdefault(key, {
                 "key": key, "label": label, "tasks": 0, "done": 0, "error": 0,
                 "canceled": 0, "runtime_seconds": 0.0, "actual_cost": 0.0,
                 "estimated_cost": 0.0, "total_cost": 0.0,
+                "retail_min": 0.0, "retail_max": 0.0, "retail_mid": 0.0,
+                "retail_known_tasks": 0, "retail_unknown_tasks": 0,
             })
             item["tasks"] += 1
             if row["status"] in ("done", "error", "canceled"):
@@ -330,6 +361,11 @@ class CostLedger:
             item["actual_cost"] += actual
             item["estimated_cost"] += estimated
             item["total_cost"] += recognized
+            item["retail_min"] += retail_min
+            item["retail_max"] += retail_max
+            item["retail_mid"] += (retail_min + retail_max) / 2
+            if row["status"] == "done":
+                item["retail_known_tasks" if retail_priced else "retail_unknown_tasks"] += 1
 
         details = []
         for row in rows:
@@ -339,6 +375,23 @@ class CostLedger:
             high = row.get("estimated_max_micros")
             estimate = _yuan(round((low + high) / 2)) if not has_actual and row["status"] == "done" and low is not None and high is not None else 0.0
             recognized = actual + estimate
+            dimensions = json.loads(row.get("dimensions_json") or "{}")
+            quote_capability = "text" if row["event_kind"] == "api" else row["capability"]
+            retail_low_micros, retail_high_micros, retail_basis = self.retail_quote(
+                quote_capability, dimensions
+            )
+            retail_priced = row["status"] == "done" and retail_low_micros is not None
+            if retail_priced:
+                retail_min = _yuan(retail_low_micros)
+                retail_max = _yuan(retail_high_micros)
+                overview["retail_known_tasks"] += 1
+            else:
+                retail_min = retail_max = 0.0
+                if row["status"] == "done":
+                    overview["retail_unknown_tasks"] += 1
+            overview["retail_min"] += retail_min
+            overview["retail_max"] += retail_max
+            overview["retail_mid"] += (retail_min + retail_max) / 2
             overview["done"] += row["status"] == "done"
             overview["error"] += row["status"] == "error"
             overview["canceled"] += row["status"] == "canceled"
@@ -358,9 +411,12 @@ class CostLedger:
             category = row["category"] or "other"
             worker_key = row.get("worker_id") or "unassigned"
             worker_label = row.get("worker_name") or "未分配执行端"
-            add(groups["by_category"], category, labels.get(category, category), row, actual, estimate, recognized)
-            add(groups["by_capability"], row["capability"], row["card_name"] or row["capability"], row, actual, estimate, recognized)
-            add(groups["by_worker"], worker_key, worker_label, row, actual, estimate, recognized)
+            add(groups["by_category"], category, labels.get(category, category), row,
+                actual, estimate, recognized, retail_min, retail_max, retail_priced)
+            add(groups["by_capability"], row["capability"], row["card_name"] or row["capability"],
+                row, actual, estimate, recognized, retail_min, retail_max, retail_priced)
+            add(groups["by_worker"], worker_key, worker_label, row, actual, estimate,
+                recognized, retail_min, retail_max, retail_priced)
             if len(details) < limit:
                 details.append({
                     "job_id": row["job_id"], "event_kind": row["event_kind"],
@@ -371,7 +427,11 @@ class CostLedger:
                     "runtime_seconds": row.get("runtime_seconds"), "actual_cost": actual,
                     "estimated_cost": estimate, "recognized_cost": recognized,
                     "cost_source": "actual" if has_actual else ("estimated" if estimate else "unknown"),
-                    "dimensions": json.loads(row.get("dimensions_json") or "{}"),
+                    "retail_min": retail_min, "retail_max": retail_max,
+                    "retail_basis": retail_basis,
+                    "retail_source": ("priced" if row["status"] == "done" and retail_low_micros is not None
+                                      else "unpriced" if row["status"] == "done" else "not_billable"),
+                    "dimensions": dimensions,
                 })
 
         for key in overview:
@@ -381,9 +441,10 @@ class CostLedger:
         for name, values in groups.items():
             items = list(values.values())
             for item in items:
-                for field in ("runtime_seconds", "actual_cost", "estimated_cost", "total_cost"):
+                for field in ("runtime_seconds", "actual_cost", "estimated_cost", "total_cost",
+                              "retail_min", "retail_max", "retail_mid"):
                     item[field] = round(item[field], 6)
-            result_groups[name] = sorted(items, key=lambda item: item["total_cost"], reverse=True)
+            result_groups[name] = sorted(items, key=lambda item: item["retail_mid"], reverse=True)
         return {
             "pricing_version": self.pricing.get("version"),
             "currency": self.pricing.get("currency", "CNY"),
