@@ -386,12 +386,24 @@ const optToRatio = (opt) => {
   const wh = RATIO_WH[opt];
   return wh ? RATIO_GRID.find(r => r[1] === wh[0] && r[2] === wh[1]) : null;
 };
+/** TT 分辨率节点把宽、高和比例塞在同一个下拉值里，例如 1280x720 (16:9)。 */
+function resolutionPresets(spec) {
+  return (spec && spec.options || []).map(value => {
+    const m = /^(\d+)x(\d+)\s+\(([^)]+)\)$/.exec(String(value));
+    if (!m) return null;
+    const width = parseInt(m[1], 10), height = parseInt(m[2], 10);
+    return { value, width, height, ratio: m[3], short: Math.min(width, height) };
+  }).filter(Boolean);
+}
+function resolutionPreset(spec, value) {
+  return resolutionPresets(spec).find(x => x.value === value) || null;
+}
 /** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度 + 画面比例 + 常规参数（视频时长等）。
     照参考图那种浮层：一个小标题、选项网格、点外面/Esc 关。 */
 function openResPop(c, anchor) {
   const cap = CAPS[runCap(c)] || capOf(c);
   const has = cap && cap.inputs.some(x =>
-    ["megapixels", "width", "height", "aspect_ratio", "duration", "preview_seconds", "target_fps", "scale_to_length"].includes(x.key));
+    ["megapixels", "width", "height", "aspect_ratio", "resolution", "duration", "preview_seconds", "target_fps", "scale_to_length"].includes(x.key));
   if (!has) return toast("这个模式没有可调的分辨率参数");
 
   /** 原位刷新弹窗内容（选中态要变），**不关不重开** —— 重开会按重建过的锚点按钮
@@ -469,10 +481,55 @@ const closeResPop = () => (el.respop.style.display = "none");
 function clarityPicker(c, cap, onchange) {
   const arSpec = cap.inputs.find(x => x.key === "aspect_ratio");
   const mpSpec = cap.inputs.find(x => x.key === "megapixels");
+  const resolutionSpec = cap.inputs.find(x => x.key === "resolution");
   const wSpec = cap.inputs.find(x => x.key === "width") && cap.inputs.find(x => x.key === "height");
   const stlSpec = cap.inputs.find(x => x.key === "scale_to_length");
 
   const wrap = document.createElement("div"); wrap.className = "cpick";
+
+  // Krea2 的 TTResolutionSelector：一个下拉值同时决定宽、高和比例。
+  if (resolutionSpec) {
+    const choices = resolutionPresets(resolutionSpec);
+    const currentValue = c.params.resolution != null ? c.params.resolution : resolutionSpec.default;
+    const current = resolutionPreset(resolutionSpec, currentValue) || choices[0];
+    if (!current) return wrap;
+
+    const ratioTitle = document.createElement("div");
+    ratioTitle.className = "ctitle"; ratioTitle.textContent = "画面比例";
+    const ratioGrid = document.createElement("div"); ratioGrid.className = "cgrid";
+    for (const ratio of [...new Set(choices.map(x => x.ratio))]) {
+      const sample = choices.find(x => x.ratio === ratio);
+      const button = document.createElement("button");
+      button.className = ratio === current.ratio ? "on" : "";
+      button.innerHTML = `<i style="aspect-ratio:${sample.width}/${sample.height}"></i><span>${ratio}</span>`;
+      button.title = `画面比例 ${ratio}`;
+      button.onclick = () => {
+        const matches = choices.filter(x => x.ratio === ratio);
+        const next = matches.reduce((best, item) =>
+          Math.abs(item.short - current.short) < Math.abs(best.short - current.short) ? item : best);
+        c.params.resolution = next.value;
+        save(); onchange && onchange();
+      };
+      ratioGrid.appendChild(button);
+    }
+    wrap.append(ratioTitle, ratioGrid);
+
+    const sizeTitle = document.createElement("div");
+    sizeTitle.className = "ctitle"; sizeTitle.textContent = "分辨率";
+    const sizeGrid = document.createElement("div"); sizeGrid.className = "cgrid k";
+    for (const item of choices.filter(x => x.ratio === current.ratio)) {
+      const button = document.createElement("button");
+      button.className = item.value === current.value ? "on" : "";
+      button.textContent = `${item.width}×${item.height}`;
+      button.onclick = () => {
+        c.params.resolution = item.value;
+        save(); onchange && onchange();
+      };
+      sizeGrid.appendChild(button);
+    }
+    wrap.append(sizeTitle, sizeGrid);
+    return wrap;
+  }
 
   // scale_to_length 模式（H3 基础视频：图生视频、说话唱歌）：只有一个数字输入框，控制最长边
   if (stlSpec && !arSpec) {
@@ -670,11 +727,12 @@ function paramsBrief(c, cap) {
   if (!cap) return null;
   const ar = cap.inputs.find(x => x.key === "aspect_ratio");
   const mp = cap.inputs.find(x => x.key === "megapixels");
+  const resolution = cap.inputs.find(x => x.key === "resolution");
   const w = cap.inputs.find(x => x.key === "width");
   const stl = cap.inputs.find(x => x.key === "scale_to_length");
   const dur = cap.inputs.find(x => x.key === "duration");
   const preview = cap.inputs.find(x => x.key === "preview_seconds");
-  if (!ar && !mp && !w && !stl && !dur && !preview) return null;
+  if (!ar && !mp && !resolution && !w && !stl && !dur && !preview) return null;
   const parts = [];
   // scale_to_length 模式：只显示最长边数字
   if (stl && !ar) {
@@ -682,7 +740,11 @@ function paramsBrief(c, cap) {
     parts.push(`${v}px`);
     return parts.join(" · ");
   }
-  if (ar) {
+  if (resolution) {
+    const cur = c.params.resolution != null ? c.params.resolution : resolution.default;
+    const preset = resolutionPreset(resolution, cur);
+    if (preset) parts.push(preset.ratio, `${preset.width}×${preset.height}`);
+  } else if (ar) {
     const cur = c.params.aspect_ratio != null ? c.params.aspect_ratio : ar.default;
     const g = optToRatio(cur);
     parts.push(g ? g[0] : cur.split(" ")[0]);
@@ -3535,7 +3597,7 @@ function openPanel(id) {
   // 别的节点照旧摊开剩余旋钮；高级参数整个不画（用户定的：基本上不动）
   // **compact 模式：分辨率参数 + 常规参数收进 ⚙ 弹窗**
   const pwrap = document.createElement("div"); pwrap.className = "pwrap";
-  const COMPACT_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "scale_to_length",
+  const COMPACT_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length",
     "duration", "preview_seconds", "target_fps"]);
   for (const s of rows) if (!(compact && COMPACT_KEYS.has(s.key))) addRow(pwrap, s);
   body.appendChild(pwrap);

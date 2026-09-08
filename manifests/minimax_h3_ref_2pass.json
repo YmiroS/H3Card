@@ -324,6 +324,22 @@
    }
   },
   {
+   "key": "audio_denoise",
+   "label": "音频降噪强度",
+   "type": "slider",
+   "min": 0,
+   "max": 1,
+   "step": 0.05,
+   "default": 0.3,
+   "hint": "推荐 0.3：二采时轻度重绘音频。0.7 容易让声音失真或崩坏；0 = 锁定第一遍生成的音频，不在二采阶段重绘",
+   "advanced": true,
+   "target": {
+    "node": "199",
+    "input": "audio_denoise",
+    "vtype": "FLOAT"
+   }
+  },
+  {
    "key": "strength_model",
    "label": "加速模型强度",
    "type": "slider",

@@ -128,6 +128,31 @@ class CardProgressLabelTest(unittest.TestCase):
         })
 
 
+class WorkflowParameterRegressionTest(unittest.TestCase):
+    def setUp(self):
+        controller_app.load_caps()
+
+    def test_krea2_text_to_image_exposes_resolution_presets(self):
+        cap = controller_app.CAPS["krea2_t2i"]
+        spec = next(item for item in cap["inputs"] if item["key"] == "resolution")
+        self.assertEqual(spec["target"], {"node": "49", "input": "resolution"})
+        self.assertIn("1280x720 (16:9)", spec["options"])
+        graph = controller_app.patch_graph(
+            cap, {"resolution": "1280x720 (16:9)"}, {}
+        )
+        self.assertEqual(graph["49"]["inputs"]["resolution"], "1280x720 (16:9)")
+
+    def test_h3_two_pass_uses_tested_audio_denoise(self):
+        cap = controller_app.CAPS["minimax_h3_ref_2pass"]
+        spec = next(item for item in cap["inputs"] if item["key"] == "audio_denoise")
+        self.assertEqual(spec["default"], 0.3)
+        self.assertEqual(spec["target"], {
+            "node": "199", "input": "audio_denoise", "vtype": "FLOAT",
+        })
+        graph = controller_app.patch_graph(cap, {}, {})
+        self.assertEqual(graph["199"]["inputs"]["audio_denoise"], 0.3)
+
+
 class ModelFamilyTest(unittest.TestCase):
     def test_related_workflows_share_model_family(self):
         self.assertEqual(controller_app.model_family("minimax_h3_ref9"), "minimax_h3")
