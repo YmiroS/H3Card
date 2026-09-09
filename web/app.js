@@ -8,7 +8,7 @@ const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
 const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
 
-// 全站不弹浏览器原生右键菜单：想存图/定位文件走节点和素材格自己的菜单
+// 全站不弹浏览器原生右键菜单：素材操作走节点和素材格自己的菜单
 document.addEventListener("contextmenu", (ev) => ev.preventDefault());
 
 let CARDS = [];            // 节点种类（生图 / 生视频）
@@ -2733,7 +2733,6 @@ function cardMenu(cx, cy, c) {
       ...(a ? [{ icon: "⛶", text: VIEW_WORD[a.kind] || "查看大图", run: () => openAsset(a) }] : []),
       ...(a ? [{ icon: "⬇", text: `下载${KIND_ZH[a.kind] || "文件"}`, run: () => downloadOut(a) }] : []),
       { icon: "📁", text: "选择 / 换文件", run: () => pickAsset(c) },
-      ...(a ? [{ icon: "⌕", text: "定位文件", run: () => revealAsset(a) }] : []),
       { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
       { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
       { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
@@ -3202,12 +3201,6 @@ function openAsset(a) {
     url: a.url, kind: a.kind,
     filename: (a.origin || a.url).split(/[\\/]/).pop(),
   }], null);
-}
-
-/** 在资源管理器里选中这份素材。只把文件名发过去，路径由服务端在 data/uploads 里拼 */
-async function revealAsset(a) {
-  try { await jpost("/api/reveal", { name: a.url.split("/").pop() }); }
-  catch (e) { toast("定位失败：" + e.message); }
 }
 
 /* ================= 右侧历史产物栏 ================= */
@@ -3807,7 +3800,7 @@ function assetPanel(c) {
   hd.append(nm, cnt);
   wrap.appendChild(hd);
 
-  // 操作行：换 / 看 / 找，只在有文件时给「看」和「找」
+  // 操作行：始终可换文件，有文件时可查看
   const ops = document.createElement("div"); ops.className = "prow";
   const chg = document.createElement("button"); chg.textContent = a ? "换一个文件" : "选择文件";
   chg.onclick = () => pickAsset(c);
@@ -3815,9 +3808,7 @@ function assetPanel(c) {
   if (a) {
     const vw = document.createElement("button"); vw.textContent = "查看大图";
     vw.onclick = () => openAsset(a);
-    const rv = document.createElement("button"); rv.textContent = "定位文件";
-    rv.onclick = () => revealAsset(a);
-    ops.appendChild(vw); ops.appendChild(rv);
+    ops.appendChild(vw);
   }
   const clr = document.createElement("button"); clr.textContent = "清空";
   clr.title = "把这份素材扔掉，节点变回空（不会删文件本身）";
@@ -5191,7 +5182,6 @@ function slotEl(c, s) {
     // 以前右键直接就把这一格清了，手滑一下素材就没了，还跟"右键=看菜单"的直觉相反
     showMenu(ev.clientX, ev.clientY, a.origin || slotName(s, c), [
       { icon: "⛶", text: a.kind === "image" ? "查看大图" : "放大播放", run: () => openAsset(a) },
-      { icon: "📁", text: "定位文件", run: () => revealAsset(a) },
       {
         icon: "✕", text: "清空这一格", danger: true, run: () => {
           delete c.assets[s.key];
