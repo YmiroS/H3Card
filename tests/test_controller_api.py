@@ -398,6 +398,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.old_token = controller_app.ENROLLMENT_TOKEN
         self.old_save_jobs = controller_app.save_jobs
         self.old_controller_mode = controller_app.CONTROLLER_MODE
+        self.old_project_dir = controller_app.PROJ_DIR
+        controller_app.PROJ_DIR = Path(self.temp.name) / "projects"
         controller_app.ENROLLMENT_TOKEN = "controller-test-enrollment-token"
         controller_app.CONTROLLER_MODE = True
         controller_app.save_jobs = lambda: None
@@ -417,6 +419,10 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         application.router.add_get("/api/jobs", controller_app.api_jobs)
         application.router.add_post("/api/generate", controller_app.api_generate)
         application.router.add_post("/api/text", controller_app.api_text)
+        application.router.add_get("/api/projects", controller_app.api_projects)
+        application.router.add_post("/api/projects", controller_app.api_project_create)
+        application.router.add_get("/api/projects/{pid}", controller_app.api_project_get)
+        application.router.add_post("/api/projects/{pid}/rename", controller_app.api_project_rename)
         application.router.add_post("/agent/v1/register", controller_app.api_agent_register)
         application.router.add_post("/agent/v1/heartbeat", controller_app.api_agent_heartbeat)
         application.router.add_post("/agent/v1/jobs/acquire", controller_app.api_agent_acquire)
@@ -437,6 +443,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         controller_app.ENROLLMENT_TOKEN = self.old_token
         controller_app.save_jobs = self.old_save_jobs
         controller_app.CONTROLLER_MODE = self.old_controller_mode
+        controller_app.PROJ_DIR = self.old_project_dir
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
         controller_app.WEIGHTS.clear()
@@ -498,6 +505,33 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(costs["overview"]["tasks"], 1)
         self.assertEqual(costs["jobs"][0]["project_name"], "广告片项目")
         self.assertEqual(costs["jobs"][0]["card_name"], "主视觉")
+
+    async def test_project_rename_updates_jobs_and_cost_history(self):
+        created = await (await self.client.post(
+            "/api/projects", json={"name": "旧项目名"}
+        )).json()
+        project_id = created["id"]
+        controller_app.JOBS["rename-job"] = {
+            "id": "rename-job", "capability": "zimage_t2i", "status": "done",
+            "created": 1, "project": project_id, "projectName": "旧项目名",
+            "card": "card-1", "cardName": "主视觉",
+        }
+        self.ledger.record_job(controller_app.JOBS["rename-job"], historical=True)
+
+        response = await self.client.post(
+            f"/api/projects/{project_id}/rename", json={"name": "新项目名"}
+        )
+        self.assertEqual(response.status, 200)
+        renamed = await response.json()
+        self.assertEqual(renamed["name"], "新项目名")
+        self.assertEqual(renamed["rev"], 1)
+
+        projects = await (await self.client.get("/api/projects")).json()
+        self.assertEqual(projects["projects"][0]["name"], "新项目名")
+        jobs = await (await self.client.get("/api/jobs")).json()
+        self.assertEqual(jobs["jobs"][0]["projectName"], "新项目名")
+        costs = await (await self.client.get("/api/costs")).json()
+        self.assertEqual(costs["jobs"][0]["project_name"], "新项目名")
 
     async def test_text_api_records_prompt_and_completion_token_cost(self):
         result = {

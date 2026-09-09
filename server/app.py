@@ -1357,6 +1357,19 @@ def proj_path(pid):
     return PROJ_DIR / f"{pid}.json"
 
 
+def sync_project_name(app, project_id, project_name):
+    changed = False
+    for job in JOBS.values():
+        if job.get("project") == project_id and job.get("projectName") != project_name:
+            job["projectName"] = project_name
+            changed = True
+    if changed:
+        save_jobs()
+    ledger = cost_ledger(app)
+    if ledger:
+        ledger.rename_project(project_id, project_name)
+
+
 async def api_projects(request):
     PROJ_DIR.mkdir(parents=True, exist_ok=True)
     out = []
@@ -1411,13 +1424,44 @@ async def api_project_save(request):
     if body.get("rev") != rev:
         # reason 走 HTTP 头，只能是 ASCII，中文提示由前端自己出
         raise web.HTTPConflict(reason="stale rev")
+    if "name" in body:
+        body["name"] = str(body.get("name") or "").strip()[:40]
+        if not body["name"]:
+            raise web.HTTPBadRequest(reason="项目名不能为空")
+    previous_name = old.get("name")
     for k in ("name", "cards", "edges", "groups", "view"):
         if k in body:
             old[k] = body[k]
     old["rev"] = rev + 1
     old["updated"] = time.time()
     p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+    if old.get("name") != previous_name:
+        sync_project_name(request.app, pid, old.get("name") or "未命名")
     return web.json_response({"ok": True, "updated": old["updated"], "rev": old["rev"]})
+
+
+async def api_project_rename(request):
+    pid = request.match_info["pid"]
+    p = proj_path(pid)
+    if not p.exists():
+        raise web.HTTPNotFound(reason="项目不存在")
+    project = json.loads(p.read_text(encoding="utf-8"))
+    if project.get("locked"):
+        raise web.HTTPForbidden(reason="locked project")
+    body = await request.json()
+    name = str(body.get("name") or "").strip()[:40]
+    if not name:
+        raise web.HTTPBadRequest(reason="项目名不能为空")
+    if project.get("name") != name:
+        project["name"] = name
+        project["rev"] = project.get("rev", 0) + 1
+        project["updated"] = time.time()
+        p.write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+        sync_project_name(request.app, pid, name)
+    return web.json_response({
+        "ok": True, "name": project["name"], "updated": project.get("updated", 0),
+        "rev": project.get("rev", 0),
+    })
 
 
 async def api_project_delete(request):
@@ -1611,6 +1655,7 @@ def make_app():
     app.router.add_post("/api/projects", api_project_create)
     app.router.add_get("/api/projects/{pid}", api_project_get)
     app.router.add_put("/api/projects/{pid}", api_project_save)
+    app.router.add_post("/api/projects/{pid}/rename", api_project_rename)
     app.router.add_delete("/api/projects/{pid}", api_project_delete)
     app.router.add_get("/api/file", api_file)
     app.router.add_get("/api/artifact/{pid}/{name}", api_artifact)
