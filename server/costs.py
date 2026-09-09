@@ -42,6 +42,13 @@ class CostLedger:
         with self.lock:
             self.db.close()
 
+    def rename_project(self, project_id, project_name):
+        with self.lock, self.db:
+            self.db.execute(
+                "UPDATE cost_events SET project_name=?, updated_at=? WHERE project_id=?",
+                (project_name, time.time(), project_id),
+            )
+
     def _create_schema(self):
         with self.lock, self.db:
             self.db.executescript(

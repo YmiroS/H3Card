@@ -74,8 +74,9 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 .pitem .nm { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pitem .ct { color: var(--dim); font-size: 11px; font-family: var(--mono); }
-.pitem .del { color: var(--dim); opacity: 0; padding: 0 2px; }
-.pitem:hover .del { opacity: 1; }
+.pitem .ren, .pitem .del { color: var(--dim); opacity: 0; padding: 0 2px; }
+.pitem:hover .ren, .pitem:hover .del { opacity: 1; }
+.pitem .ren:hover { color: var(--acc); text-shadow: 0 0 8px var(--acc); }
 .pitem .del:hover { color: var(--acc2); text-shadow: 0 0 8px var(--acc2); }
 
 /* ---------- 主区 ---------- */
@@ -1211,7 +1212,8 @@ input:focus, textarea:focus, select:focus {
 .pitem:hover { background: rgba(255,255,255,.04); border-color: rgba(255,255,255,.06); }
 .pitem.on { color: #fff; background: rgba(255,255,255,.075); border-color: var(--line); }
 .pitem .ct { min-width: 24px; padding: 1px 6px; color: #858a94; background: rgba(255,255,255,.05); border-radius: 9px; text-align: center; }
-.pitem .del { border-radius: 5px; }
+.pitem .ren, .pitem .del { border-radius: 5px; }
+.pitem .ren:hover { color: #fff; text-shadow: none; background: rgba(255,255,255,.08); }
 .pitem .del:hover { color: var(--err); text-shadow: none; background: rgba(244,63,94,.10); }
 #side .side-foot { display: flex; align-items: center; gap: 7px; margin: auto 14px 0; padding: 13px 3px 15px; border-top: 1px solid var(--line); color: #6f747e; font-size: 11px; }
 .side-foot-dot { width: 6px; height: 6px; border-radius: 50%; background: #525761; }
