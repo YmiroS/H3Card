@@ -170,9 +170,10 @@ function make(tag,className,value) {
 }
 function projectName(job,projects) {
   if (!job) return "";
-  if (job.projectName) return job.projectName;
   const project=(projects||[]).find(item=>item.id===job.project);
-  return project ? project.name : job.project ? "项目已删除" : "未归属项目";
+  if (project) return project.name;
+  if (job.projectName) return job.projectName;
+  return job.project ? "项目已删除" : "未归属项目";
 }
 function addUsage(container,label,value,pct) {
   const item=make("div","usage");

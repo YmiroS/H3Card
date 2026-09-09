@@ -990,11 +990,15 @@ async function loadProjects() {
   for (const p of projects) {
     const d = document.createElement("div");
     d.className = "pitem" + (PROJ && PROJ.id === p.id ? " on" : "");
-    // locked 的项目（示例）不给删除按钮，服务端也会拒
+    // locked 的项目（示例）不给重命名/删除按钮，服务端也会拒
     d.innerHTML = `<span class="nm"></span><span class="ct">${p.cards}</span>`
-      + (p.locked ? "" : `<button class="del" title="删除">✕</button>`);
-    d.querySelector(".nm").textContent = p.name;
+      + (p.locked ? "" : `<button class="ren" title="重命名">✎</button><button class="del" title="删除">✕</button>`);
+    const nm = d.querySelector(".nm");
+    nm.textContent = p.name;
     d.onclick = () => openProject(p.id);
+    const ren = d.querySelector(".ren");
+    if (ren) ren.onclick = (ev) => { ev.stopPropagation(); renameProject(p); };
+    if (!p.locked) nm.ondblclick = (ev) => { ev.stopPropagation(); renameProject(p); };
     const del = d.querySelector(".del");
     if (del) del.onclick = async (ev) => {
       ev.stopPropagation();
@@ -1013,6 +1017,29 @@ async function newProject() {
   const p = await jpost("/api/projects", { name });
   await loadProjects();
   openProject(p.id);
+}
+
+async function renameProject(project) {
+  const value = prompt("修改项目名", project.name || "");
+  if (value === null) return;
+  const name = value.trim();
+  if (!name) return toast("项目名不能为空");
+  try {
+    const result = await jpost(`/api/projects/${project.id}/rename`, { name });
+    project.name = result.name;
+    if (PROJ && PROJ.id === project.id) {
+      PROJ.name = result.name;
+      PROJ.rev = result.rev;
+      el.ptitle.textContent = result.name;
+    }
+    for (const job of TASKS) {
+      if (job.project === project.id) job.projectName = result.name;
+    }
+    if (el.jobs.style.display !== "none") renderJobs();
+    await loadProjects();
+  } catch (error) {
+    toast("项目重命名失败：" + error.message);
+  }
 }
 
 async function openProject(pid) {
@@ -5763,12 +5790,11 @@ function renderJobs() {
   list.scrollTop = scrolled;
 }
 
-/** 新任务直接带提交时的项目名；老任务再按项目 id 从当前画布或项目列表反查。 */
+/** 项目名以当前项目列表为准，任务提交时的名称只给已删除项目兜底。 */
 function jobProjName(j) {
-  if (j.projectName) return j.projectName;
-  if (!j.project) return "";
+  if (!j.project) return j.projectName || "";
   if (PROJ && j.project === PROJ.id) return PROJ.name;
-  return (projects.find(p => p.id === j.project) || {}).name || "";
+  return (projects.find(p => p.id === j.project) || {}).name || j.projectName || "";
 }
 
 function jobRow(j) {
