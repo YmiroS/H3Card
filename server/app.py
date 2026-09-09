@@ -1495,27 +1495,6 @@ async def api_file(request):
         return resp
 
 
-async def api_reveal(request):
-    """在资源管理器里选中素材文件。
-
-    路径全由服务端拼：客户端只能给一个文件名，且只放行 data/uploads 这一个目录，
-    免得这个接口被当成"打开任意路径"用。
-    """
-    body = await request.json()
-    name = Path((body.get("name") or "").replace("\\", "/")).name
-    if not name:
-        raise web.HTTPBadRequest(reason="缺 name")
-    up = (ROOT / "data" / "uploads").resolve()
-    p = (up / name).resolve()
-    if p.parent != up or not p.is_file():
-        raise web.HTTPNotFound(reason="素材文件已经不在了")
-    if os.name != "nt":
-        raise web.HTTPBadRequest(reason="定位文件只支持 Windows")
-    # explorer /select 正常也会返回非 0，别去看返回码
-    subprocess.Popen(["explorer", f"/select,{p}"])
-    return web.json_response({"ok": True, "path": str(p)})
-
-
 async def index(request):
     return web.FileResponse(ROOT / "web" / "index.html")
 
@@ -1659,7 +1638,6 @@ def make_app():
     app.router.add_delete("/api/projects/{pid}", api_project_delete)
     app.router.add_get("/api/file", api_file)
     app.router.add_get("/api/artifact/{pid}/{name}", api_artifact)
-    app.router.add_post("/api/reveal", api_reveal)
     if CONTROLLER_MODE:
         app.router.add_get("/api/workers", api_workers)
         app.router.add_get("/api/costs", api_costs)
