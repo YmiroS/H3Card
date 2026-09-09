@@ -188,10 +188,15 @@ class DistributedStore:
         now = time.time()
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM workers ORDER BY name COLLATE NOCASE, created_at"
+                "SELECT * FROM workers ORDER BY name COLLATE NOCASE, created_at DESC, id DESC"
             ).fetchall()
         workers = []
+        seen_names = set()
         for row in rows:
+            name_key = row["name"].strip().casefold()
+            if name_key in seen_names:
+                continue
+            seen_names.add(name_key)
             item = dict(row)
             item.pop("token_hash", None)
             item["enabled"] = bool(item["enabled"])
