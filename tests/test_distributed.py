@@ -46,6 +46,23 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(worker["state"], "idle")
         self.assertEqual(worker["capabilities"]["node_classes"], ["KSampler", "SaveImage"])
 
+    def test_list_workers_keeps_only_latest_same_name_registration(self):
+        newest = self.store.register_worker(
+            "GPU-01", {"node_classes": ["KSampler", "SaveImage", "VHS_LoadVideo"]}
+        )
+        self.store.heartbeat(
+            newest["worker_id"], comfy_online=True, busy=False,
+        )
+
+        workers = self.store.list_workers()
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0]["id"], newest["worker_id"])
+        self.assertEqual(workers[0]["name"], "GPU-01")
+        self.assertEqual(
+            self.store.db.execute("SELECT COUNT(*) FROM workers").fetchone()[0], 2
+        )
+        self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
+
     def test_heartbeat_merges_telemetry_without_dropping_capabilities(self):
         telemetry = {
             "hostname": "RENDER-01",
