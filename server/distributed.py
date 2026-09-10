@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import sqlite3
 import threading
@@ -13,6 +14,19 @@ from pathlib import Path
 
 LIVE_DISPATCH = ("assigned", "running", "cancel_requested")
 FINISHED_DISPATCH = ("done", "error", "canceled")
+RTX_5090_ONLY_CAPABILITIES = frozenset({"minimax_h3_ref_2pass"})
+
+
+def can_run_capability(capability, devices):
+    if capability not in RTX_5090_ONLY_CAPABILITIES:
+        return True
+    # ComfyUI 的 devices[0] 是实际执行的主设备，不能用机器名或其他闲置显卡放行。
+    if not isinstance(devices, list) or not devices or not isinstance(devices[0], dict):
+        return False
+    primary = devices[0]
+    return primary.get("type") == "cuda" and bool(
+        re.search(r"\bRTX\s*5090D?\b", str(primary.get("name") or ""), re.IGNORECASE)
+    )
 
 
 def _hash_token(token):
@@ -248,8 +262,11 @@ class DistributedStore:
             eligible = []
             for row in rows:
                 required = set(json.loads(row["required_nodes_json"] or "[]"))
-                if required.issubset(available_nodes):
-                    eligible.append((row, json.loads(row["payload_json"])))
+                payload = json.loads(row["payload_json"])
+                if required.issubset(available_nodes) and can_run_capability(
+                    payload.get("capability"), capabilities.get("devices")
+                ):
+                    eligible.append((row, payload))
             if not eligible:
                 return None
 
