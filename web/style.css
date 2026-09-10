@@ -680,9 +680,10 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 
 /* 高亮 wrapper 里可见文字只由高亮层出：isdemo/optta 给 textarea 上过的文字色
    必须退成透明 —— 否则原生文字和高亮层是两份近似同色的字错位叠在一起
-   （优化后那份四五百词的长文上最明显）。文字着色改由层上的 demo/opt 接替 */
-#panel .prompt-highlight-wrapper textarea.isdemo,
-#panel .prompt-highlight-wrapper textarea.optta { color: transparent; }
+   （优化后那份四五百词的长文上最明显）。文字着色改由层上的 demo/opt 接替。
+   带上 .pblock 提高优先级，避免后面的主题色规则重新显示 textarea 文字。 */
+#panel .pblock .prompt-highlight-wrapper textarea.isdemo,
+#panel .pblock .prompt-highlight-wrapper textarea.optta { color: transparent; }
 #panel .prompt-highlight-layer.demo { color: #ffd88a; }
 #panel .prompt-highlight-layer.opt { color: #cdeef5; }
 
