@@ -408,7 +408,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         controller_app.WEIGHTS.clear()
 
         application = web.Application()
-        application["session"] = object()
+        application["session"] = mock.MagicMock()
         application["distributed"] = self.store
         application["costs"] = self.ledger
         application.router.add_get("/controller", controller_app.controller_index)
@@ -505,6 +505,70 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(costs["overview"]["tasks"], 1)
         self.assertEqual(costs["jobs"][0]["project_name"], "广告片项目")
         self.assertEqual(costs["jobs"][0]["card_name"], "主视觉")
+
+    @mock.patch.object(controller_app, "patch_graph", return_value={
+        "1": {"class_type": "KSampler", "inputs": {}}
+    })
+    async def test_high_quality_h3_dispatches_only_to_rtx_5090(self, _patch_graph):
+        capability = {"name": "H3全能参考(高质量)", "outputType": "video", "_graph_ok": True}
+        with mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
+            response = await self.client.post("/api/generate", json={
+                "capability": "minimax_h3_ref_2pass", "params": {}, "assets": {},
+            })
+        self.assertEqual(response.status, 200)
+        job = await response.json()
+        for gpu, status in (("RTX 4090", 204), ("RTX 5090", 200)):
+            credentials = self.store.register_worker(gpu, {
+                "node_classes": ["KSampler"], "devices": [{"type": "cuda", "name": gpu}],
+            })
+            self.store.heartbeat(credentials["worker_id"], comfy_online=True)
+            response = await self.client.post("/agent/v1/jobs/acquire", json={}, headers={
+                "X-Worker-ID": credentials["worker_id"],
+                "Authorization": f"Bearer {credentials['worker_token']}",
+            })
+            self.assertEqual(response.status, status)
+            if status == 200:
+                assignment = await response.json()
+                self.assertEqual(assignment["job_id"], job["id"])
+                self.assertEqual(assignment["payload"]["capability"], "minimax_h3_ref_2pass")
+            else:
+                self.assertEqual(controller_app.JOBS[job["id"]]["status"], "queued")
+
+    @mock.patch.object(controller_app, "patch_graph", return_value={
+        "1": {"class_type": "KSampler", "inputs": {}}
+    })
+    @mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock, return_value="local-hq")
+    async def test_local_high_quality_h3_checks_gpu_before_submit(self, submit, _patch_graph):
+        capability = {"name": "H3全能参考(高质量)", "outputType": "video", "_graph_ok": True}
+        session = self.client.server.app["session"]
+        stats_response = session.get.return_value.__aenter__.return_value
+        stats_response.raise_for_status = mock.Mock()
+        stats_response.json = mock.AsyncMock()
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+             mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
+            for gpu, status in (("RTX 4090", 400), (None, 400), ("RTX 5090", 200)):
+                with self.subTest(gpu=gpu):
+                    submit.reset_mock()
+                    stats_response.json.return_value = {
+                        "devices": [{"type": "cuda", "name": gpu}] if gpu else [],
+                    }
+                    response = await self.client.post("/api/generate", json={
+                        "capability": "minimax_h3_ref_2pass",
+                    })
+                    self.assertEqual(response.status, status)
+                    if status == 200:
+                        submit.assert_awaited_once()
+                    else:
+                        submit.assert_not_awaited()
+                        self.assertIn("RTX 5090", await response.text())
+
+            submit.reset_mock()
+            stats_response.json.side_effect = TimeoutError()
+            response = await self.client.post("/api/generate", json={
+                "capability": "minimax_h3_ref_2pass",
+            })
+            self.assertEqual(response.status, 503)
+            submit.assert_not_awaited()
 
     async def test_project_rename_updates_jobs_and_cost_history(self):
         created = await (await self.client.post(

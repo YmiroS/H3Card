@@ -39,7 +39,7 @@ import rewrite as rw
 import llm
 import translate as tr
 from costs import CostLedger
-from distributed import DistributedStore
+from distributed import DistributedStore, RTX_5090_ONLY_CAPABILITIES, can_run_capability
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -693,6 +693,17 @@ async def api_generate(request):
                      for n, nd in tpl.items() for k, v in nd["inputs"].items()
                      if k not in graph[n]["inputs"]})
         return web.json_response({"dry_run": True, "changed": diff})
+    if not CONTROLLER_MODE and cid in RTX_5090_ONLY_CAPABILITIES:
+        try:
+            async with request.app["session"].get(
+                COMFY_HTTP + "/system_stats", timeout=aiohttp.ClientTimeout(total=5)
+            ) as response:
+                response.raise_for_status()
+                stats = await response.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，H3全能参考(高质量)仅支持 RTX 5090")
+        if not can_run_capability(cid, stats.get("devices")):
+            raise web.HTTPBadRequest(reason="H3全能参考(高质量)只能在 RTX 5090 机器上运行")
     pid = str(uuid.uuid4()) if CONTROLLER_MODE else await comfy_submit(
         request.app["session"], graph
     )

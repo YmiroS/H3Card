@@ -86,6 +86,65 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(capabilities["node_classes"], ["KSampler", "SaveImage"])
         self.assertEqual(capabilities["telemetry"], telemetry)
 
+    def test_high_quality_h3_requires_primary_rtx_5090(self):
+        self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+        rejected = [
+            None, [], [{}],
+            [{"type": "cuda", "name": "NVIDIA GeForce RTX 4090"}],
+            [{"type": "cuda", "name": "NVIDIA GeForce RTX 50900"}],
+            [{"type": "cpu", "name": "RTX 5090"}],
+            [{"type": "cuda", "name": "RTX 4090"}, {"type": "cuda", "name": "RTX 5090"}],
+        ]
+        for devices in rejected:
+            with self.subTest(devices=devices):
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+                    "node_classes": ["KSampler"], "devices": devices,
+                    "telemetry": {"hostname": "GPU-5090", "gpus": [{"name": "RTX 5090"}]},
+                })
+                self.assertIsNone(self.store.acquire(self.worker_id))
+                self.assertEqual(self.store.db.execute(
+                    "SELECT status FROM dispatch_jobs WHERE job_id = 'hq'"
+                ).fetchone()[0], "queued")
+
+        for name in ("cuda:0 NVIDIA GeForce RTX 5090 : cudaMallocAsync", "NVIDIA GeForce RTX 5090 D", "rtx 5090d"):
+            with self.subTest(name=name):
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+                    "node_classes": ["KSampler"], "devices": [{"type": "cuda", "name": name}],
+                })
+                assignment = self.store.acquire(self.worker_id)
+                self.assertEqual(assignment["job_id"], "hq")
+                self.store.finish("hq", self.worker_id, assignment["lease_token"], "done")
+                self.store.remove_job("hq")
+                self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+
+    def test_high_quality_gpu_rule_precedes_affinity_and_fifo(self):
+        self._finish_success("warm", "minimax_h3_ref9", "minimax_h3")
+        self.store.enqueue("hq", {
+            "capability": "minimax_h3_ref_2pass", "model_family": "minimax_h3",
+        }, ["KSampler"])
+        self.store.enqueue("ordinary", {"capability": "zimage_t2i"}, ["KSampler"])
+        for wait_limit in (0, 60):
+            with self.subTest(wait_limit=wait_limit):
+                self.store.affinity_max_wait_seconds = wait_limit
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE workers SET last_capability_id = ?, last_model_family = ? WHERE id = ?",
+                        ("minimax_h3_ref_2pass", "minimax_h3", self.worker_id),
+                    )
+                assignment = self.store.acquire(self.worker_id)
+                self.assertEqual(assignment["job_id"], "ordinary")
+                self.store.finish("ordinary", self.worker_id, assignment["lease_token"], "done")
+                self.store.remove_job("ordinary")
+                self.store.enqueue("ordinary", {"capability": "zimage_t2i"}, ["KSampler"])
+
+    def test_rtx_5090_still_needs_required_nodes(self):
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "NVIDIA GeForce RTX 5090"}],
+        })
+        self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["MissingNode"])
+        self.assertIsNone(self.store.acquire(self.worker_id))
+
     def test_acquire_matches_capabilities_and_enforces_lease(self):
         self.store.enqueue("missing", {"graph": {}}, ["MissingNode"])
         self.store.enqueue("matched", {"graph": {"1": {"class_type": "KSampler"}}}, ["KSampler"])
