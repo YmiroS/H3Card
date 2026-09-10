@@ -7,6 +7,7 @@ const CW = 268;            // 节点默认宽度，与 style.css 保持一致
 const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
 const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
+const IS_MAC = /Mac/.test(navigator.platform || navigator.userAgent || "");
 
 // 全站不弹浏览器原生右键菜单：素材操作走节点和素材格自己的菜单
 document.addEventListener("contextmenu", (ev) => ev.preventDefault());
@@ -2199,9 +2200,10 @@ function bindGlobal() {
     // 按钮执行时手里就没节点了 —— 这就是打组点了没反应的原因
     // 参数面板也同理：点面板上的按钮不能关掉面板
     if (ev.target.closest("#selbar") || ev.target.closest("#panel")) return;
-    // 中键 = 拖画布（在哪儿按都行，节点上按中键也放过来了）
-    if (ev.button === 1) {
-      ev.preventDefault();          // 掐掉浏览器中键的自动滚动
+    // 中键始终拖画布。macOS 的“三指拖移”会被浏览器报告成左键拖动，无法取得
+    // 实际触控点数量，因此在 Mac 空白画布上把普通左拖用于平移；Shift+左拖仍可框选。
+    if (ev.button === 1 || (IS_MAC && ev.button === 0 && !ev.shiftKey)) {
+      ev.preventDefault();          // 掐掉中键自动滚动及 macOS 合成拖拽的默认行为
       const s = { mx: ev.clientX, my: ev.clientY, x: view.x, y: view.y };
       el.stage.classList.add("panning");
       let moved = false;
@@ -2221,7 +2223,7 @@ function bindGlobal() {
       return;
     }
     if (ev.button !== 0) return;
-    // 左键点空白：清掉选中；按住拖出去一个框 = 框选节点
+    // 左键点空白：清掉选中；拖动框选节点（Mac 上需按住 Shift）
     closeMenu(); closeJobs();
     selId = null; closePanel();
     if (selEdge) { selEdge = null; drawWires(); }
