@@ -21,6 +21,7 @@ import mimetypes
 import random
 import re
 import socket
+import shutil
 import subprocess
 import sys
 import time
@@ -40,6 +41,7 @@ import llm
 import translate as tr
 from costs import CostLedger
 from distributed import DistributedStore, RTX_5090_ONLY_CAPABILITIES, can_run_capability
+from video_preview import VideoPreviews, preview_status, preview_file
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -266,6 +268,9 @@ def ffmpeg_bin():
             return exe
     except (ImportError, RuntimeError):
         pass
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return Path(system_ffmpeg)
     d = PACK / "python_embeded/Lib/site-packages/imageio_ffmpeg/binaries"
     return next(iter(sorted(d.glob("ffmpeg-*.exe"), reverse=True)), None)
 
@@ -650,9 +655,8 @@ async def api_upload(request):
         local = ROOT / "data" / "uploads" / safe
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(raw)
-        # 控制层只保存一份中心素材；领取任务的 Worker 会下载到自己的
-        # ComfyUI/input/chouka/，所以工作流里的相对引用保持一致。
-        ref = f"chouka/{safe}" if CONTROLLER_MODE else await comfy_upload(
+        # 视频原片只作备份，生成提交时再把转码 MP4 交给本地 ComfyUI 或 Worker。
+        ref = f"chouka/{safe}" if CONTROLLER_MODE or kind_of(safe) == "video" else await comfy_upload(
             session, part.name, safe, raw
         )
         item = {"ref": ref, "kind": kind_of(safe), "origin": name,
@@ -660,7 +664,8 @@ async def api_upload(request):
         if item["kind"] == "video":
             # 帧率给「目标帧率」反算倍数用，总帧数给「只处理前几帧」当分母。
             # 上传时探一次存下来，面板就不用每次开都去探文件
-            item.update(probe_video(ref))
+            item.update(await asyncio.to_thread(probe_video, ref))
+            request.app["video_previews"].ensure(safe)
         saved.append(item)
     if not saved:
         raise web.HTTPBadRequest(reason="没有收到文件")
@@ -670,7 +675,34 @@ async def api_upload(request):
 async def api_media(request):
     """现探一份素材的帧率/总帧数。给这条改动之前存下的素材兜底（老项目里的素材
        记录只有 ref/kind/url，没有 fps/frames）。"""
-    return web.json_response(probe_video(request.query.get("ref") or ""))
+    return web.json_response(await asyncio.to_thread(probe_video, request.query.get("ref") or ""))
+
+
+async def generation_assets(request, assets):
+    """项目保留原片引用；真正提交的图和 Worker 素材清单统一使用兼容 MP4。"""
+    replacements = {}
+    for ref in set(assets.values()):
+        if not ref or kind_of(ref) != "video" or not ref.startswith("chouka/"):
+            continue
+        previews = request.app["video_previews"]
+        name = ref.removeprefix("chouka/")
+        if name.endswith(".browser.mp4"):
+            path = previews.source(name)
+        else:
+            state = previews.ensure(name)
+            if state["status"] == "error":
+                raise web.HTTPUnprocessableEntity(text=state["error"])
+            if state["status"] != "ready":
+                raise web.HTTPConflict(text="视频正在转码为 MP4，请等待预览就绪后再生成；不会使用原片执行。")
+            path = previews.target(name)
+        replacements[ref] = path
+
+    resolved = {}
+    for ref, path in replacements.items():
+        resolved[ref] = f"chouka/{path.name}" if CONTROLLER_MODE else await comfy_upload(
+            request.app["session"], "file", path.name, await asyncio.to_thread(path.read_bytes),
+        )
+    return {key: resolved.get(ref, ref) for key, ref in assets.items()}
 
 
 async def api_generate(request):
@@ -682,7 +714,7 @@ async def api_generate(request):
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
-    uploaded = body.get("assets") or {}        # {"images[0]": "chouka/ck_xxx.png"}
+    uploaded = await generation_assets(request, body.get("assets") or {})
     graph = patch_graph(cap, params, uploaded)
     if body.get("dry_run"):
         tpl = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
@@ -1561,6 +1593,7 @@ async def on_start(app):
 
 
 async def on_stop(app):
+    await app["video_previews"].close()
     task = app.get("ws_task")
     if task:
         task.cancel()
@@ -1618,6 +1651,9 @@ def make_app():
     n = load_caps()
     load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2)
+    app["video_previews"] = VideoPreviews(
+        ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
+    )
     if CONTROLLER_MODE:
         database_path = ROOT / "data" / "control.db"
         app["distributed"] = DistributedStore(database_path)
@@ -1632,6 +1668,8 @@ def make_app():
     app.router.add_get("/api/cards", api_cards)
     app.router.add_post("/api/reload", api_reload)
     app.router.add_post("/api/upload", api_upload)
+    app.router.add_get("/api/preview/{name}/file", preview_file)
+    app.router.add_get("/api/preview/{name}", preview_status)
     app.router.add_get("/api/media", api_media)
     app.router.add_post("/api/generate", api_generate)
     app.router.add_post("/api/rewrite", api_rewrite)

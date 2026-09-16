@@ -324,6 +324,11 @@ class CostLedgerTest(unittest.TestCase):
 
 
 class FfmpegDiscoveryTest(unittest.TestCase):
+    def test_falls_back_to_linux_system_ffmpeg(self):
+        with mock.patch.dict(sys.modules, {"imageio_ffmpeg": None}), \
+             mock.patch.object(controller_app.shutil, "which", return_value="/usr/bin/ffmpeg"):
+            self.assertEqual(controller_app.ffmpeg_bin(), Path("/usr/bin/ffmpeg"))
+
     def test_uses_imageio_ffmpeg_binary_outside_windows_bundle(self):
         with tempfile.TemporaryDirectory() as directory:
             executable = Path(directory) / "ffmpeg"
