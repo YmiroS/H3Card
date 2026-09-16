@@ -529,6 +529,9 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 .hrun .rp { border-top: 1px solid var(--line); font-size: 11px; }
 .hrun .rp summary { padding: 5px 8px; color: var(--sty); cursor: pointer; }
 .hrun .rp summary:hover { color: #d7c1ff; }
+.hrun .history-prompt { position: relative; }
+.hrun .history-prompt summary { padding-right: 64px; min-height: 30px; }
+.hrun .history-prompt-copy { position: absolute; top: 4px; right: 8px; padding: 2px 8px; font-size: 12px; }
 .hrun .rp > div {
   padding: 0 8px 7px; max-height: 150px; overflow: auto; line-height: 1.6;
   color: var(--dim); white-space: pre-wrap; word-break: break-word;
