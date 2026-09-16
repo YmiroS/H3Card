@@ -72,6 +72,7 @@ tr:last-child td { border-bottom:0; }
 .job-origin strong,.job-origin span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .job-origin strong { color:#e5e7eb; font-weight:550; }
 .job-origin span { margin-top:2px; color:var(--muted); font-size:10px; }
+.job-mode { min-width:130px; max-width:240px; white-space:normal; overflow-wrap:anywhere; }
 .empty { padding:24px; color:var(--muted); text-align:center; }
 .error { margin-bottom:12px; padding:10px 12px; color:#fecdd3; background:rgba(244,63,94,.08); border:1px solid rgba(244,63,94,.25); border-radius:9px; display:none; }
 ::-webkit-scrollbar { width:7px; height:7px; }
@@ -108,7 +109,7 @@ tr:last-child td { border-bottom:0; }
   <section class="section">
     <h2>最近任务</h2>
     <div class="scroll"><table>
-      <thead><tr><th>状态</th><th>项目 / 卡片</th><th>过程进度</th><th>执行端</th><th>创建时间</th><th>耗时 / 错误</th></tr></thead>
+      <thead><tr><th>状态</th><th>项目 / 卡片</th><th>模式</th><th>过程进度</th><th>执行端</th><th>创建时间</th><th>耗时 / 错误</th></tr></thead>
       <tbody id="job-rows"></tbody>
     </table></div>
     <div id="job-empty" class="empty" hidden>还没有任务</div>
@@ -327,6 +328,7 @@ function renderJobs(items,workers,projects) {
       make("span","",`卡片 · ${job.cardName||job.name||"未命名"}`),
     );
     row.appendChild(origin);
+    td(row,job.name||job.capability||"未记录","job-mode",job.capability);
     const pct=Math.round((job.progress||0)*100);
     const progress=td(row,`${pct}%${job.step?` · ${job.step}`:""}`,"progress",job.step);
     const bar=document.createElement("div"); bar.className="bar";

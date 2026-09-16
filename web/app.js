@@ -5228,7 +5228,8 @@ function slotEl(c, s) {
   const a = c.assets[s.key];
   const d = document.createElement("div");
   d.className = "slot" + (a ? " filled" : s.required ? " req" : "");
-  d.title = (s.hint || slotName(s, c)) + (s.required ? "（必填）" : "");
+  d.title = (s.hint || slotName(s, c)) + (s.required ? "（必填）" : "")
+    + (a ? "\n单击预览；右键更换、下载或清空素材" : "\n单击上传素材");
   d.innerHTML = `<div class="box"></div><span class="lbl"></span>`;
   d.querySelector(".lbl").textContent = slotName(s, c);
   const box = d.querySelector(".box");
@@ -5238,7 +5239,7 @@ function slotEl(c, s) {
     prepareVideos(box);
   } else box.textContent = s.type === "audio" ? "🎵"
     : s.type === "video" ? "🎬" : gridWord(s) ? "田" : "＋";
-  d.onclick = () => pickFile(c, s);
+  d.onclick = () => a ? openAsset(a) : pickFile(c, s);
   d.oncontextmenu = (ev) => {
     ev.stopPropagation();
     ev.preventDefault();
@@ -5246,6 +5247,10 @@ function slotEl(c, s) {
     // 以前右键直接就把这一格清了，手滑一下素材就没了，还跟"右键=看菜单"的直觉相反
     showMenu(ev.clientX, ev.clientY, a.origin || slotName(s, c), [
       { icon: "⛶", text: a.kind === "image" ? "查看大图" : "放大播放", run: () => openAsset(a) },
+      { icon: "↻", text: "更换素材", run: () => pickFile(c, s) },
+      { icon: "↓", text: "下载素材", run: () => downloadOut({
+        ...a, filename: a.origin || a.filename || a.url,
+      }) },
       {
         icon: "✕", text: "清空这一格", danger: true, run: () => {
           delete c.assets[s.key];
