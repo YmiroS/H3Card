@@ -3355,6 +3355,31 @@ function openHistory(id) {
   // 摆面板的活交给紧跟着的 openPanel()：那时画布已经被栏子挤窄，量出来的边界才是对的
 }
 
+async function copyHistoryText(value, message) {
+  const text = String(value);
+  try {
+    if (navigator.clipboard?.writeText) {
+      await navigator.clipboard.writeText(text);
+    } else {
+      const active = document.activeElement;
+      const input = document.createElement("textarea");
+      input.value = text;
+      input.style.cssText = "position:fixed;top:0;left:0;opacity:0;pointer-events:none";
+      document.body.appendChild(input);
+      try {
+        input.focus(); input.select();
+        if (!document.execCommand("copy")) throw new Error("复制失败");
+      } finally {
+        input.remove();
+        active?.focus({ preventScroll: true });
+      }
+    }
+    toast(message);
+  } catch (_) {
+    toast("复制失败，请展开后手动选中文字复制");
+  }
+}
+
 function histRun(c, h, cur) {
   const outs = h.outputs || [];
   const box = document.createElement("div");
@@ -3420,8 +3445,7 @@ function histRun(c, h, cur) {
   if (h.seed != null) {
     const cp = document.createElement("button");
     cp.textContent = "复制"; cp.title = "复制 seed";
-    cp.onclick = () => navigator.clipboard.writeText(String(h.seed))
-      .then(() => toast("已复制 seed " + h.seed), () => toast("复制失败，手动选中即可"));
+    cp.onclick = () => copyHistoryText(h.seed, "已复制 seed " + h.seed);
     rs.appendChild(cp);
   }
   box.appendChild(rs);
@@ -3444,8 +3468,7 @@ function histRun(c, h, cur) {
       cpBtn.textContent = "复制";
       cpBtn.style.fontSize = "12px";
       cpBtn.style.padding = "2px 8px";
-      cpBtn.onclick = () => navigator.clipboard.writeText(h.user_prompt)
-        .then(() => toast("已复制正面提示词"), () => toast("复制失败"));
+      cpBtn.onclick = () => copyHistoryText(h.user_prompt, "已复制正面提示词");
       row.append(label, cpBtn);
       const content = document.createElement("div");
       content.style.marginBottom = h.negative_prompt ? "8px" : "0";
@@ -3465,8 +3488,7 @@ function histRun(c, h, cur) {
       cpBtn.textContent = "复制";
       cpBtn.style.fontSize = "12px";
       cpBtn.style.padding = "2px 8px";
-      cpBtn.onclick = () => navigator.clipboard.writeText(h.negative_prompt)
-        .then(() => toast("已复制负面提示词"), () => toast("复制失败"));
+      cpBtn.onclick = () => copyHistoryText(h.negative_prompt, "已复制负面提示词");
       row.append(label, cpBtn);
       const content = document.createElement("div");
       content.textContent = h.negative_prompt;
@@ -3480,26 +3502,18 @@ function histRun(c, h, cur) {
   // 不等于跑出这一轮的那段话，不放出来的话这一轮等于没法复现
   if (h.prompt) {
     const rp = document.createElement("details"); rp.className = "rp";
-    const smRow = document.createElement("div");
-    smRow.style.display = "flex";
-    smRow.style.justifyContent = "space-between";
-    smRow.style.alignItems = "center";
+    const section = document.createElement("div"); section.className = "history-prompt";
     const sm = document.createElement("summary"); sm.textContent = "当时提交的提示词";
     const cpBtn = document.createElement("button");
     cpBtn.textContent = "复制";
-    cpBtn.style.fontSize = "12px";
-    cpBtn.style.padding = "2px 8px";
-    cpBtn.style.marginLeft = "8px";
-    cpBtn.onclick = (ev) => {
-      ev.preventDefault();
-      ev.stopPropagation();
-      navigator.clipboard.writeText(h.prompt)
-        .then(() => toast("已复制提示词"), () => toast("复制失败"));
-    };
-    sm.appendChild(cpBtn);
+    cpBtn.type = "button";
+    cpBtn.className = "history-prompt-copy";
+    cpBtn.title = "复制当时提交的提示词";
+    cpBtn.onclick = () => copyHistoryText(h.prompt, "已复制提示词");
     const tx = document.createElement("div"); tx.textContent = h.prompt;
     rp.append(sm, tx);
-    box.appendChild(rp);
+    section.append(rp, cpBtn);
+    box.appendChild(section);
   }
   return box;
 }
