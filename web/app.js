@@ -1582,12 +1582,12 @@ function paint(c) {
       // 一组产物铺成宫格，data-i 供双击时定位到具体哪一张
       body.style.setProperty("--cols", outs.length <= 4 ? 2 : outs.length <= 9 ? 3 : 4);
       body.innerHTML = outs.map((o, i) => o.kind === "video"
-        ? `<video src="${o.url}" data-i="${i}" loop preload="metadata" draggable="false"></video>`
+        ? `<video data-video-url="${o.url}" data-i="${i}" loop preload="metadata" draggable="false"></video>`
         : `<img src="${o.url}" data-i="${i}" alt="" draggable="false">`).join("");
     } else {
       // .vprog 是自己画的进度条：不给 controls 就没有任何进度反馈，按住拖也没了准头
       body.innerHTML = out.kind === "video"
-        ? `<video src="${out.url}" loop preload="metadata" draggable="false"></video>`
+        ? `<video data-video-url="${out.url}" loop preload="metadata" draggable="false"></video>`
           + `<div class="vprog" title="按住左右拖 → 定位进度（画面上按住是挪节点）"><i></i></div>`
         : out.kind === "audio"
           ? `<audio src="${out.url}" controls style="width:92%"></audio>`
@@ -1601,6 +1601,7 @@ function paint(c) {
               + `<div class="cmptip">按住往右拖 → 回到原图</div></div>`
             : `<img src="${out.url}" alt="" draggable="false">`;
     }
+    prepareVideos(body);
     if (cmp) applyCmp(c);
     // seed 不再压在画面上，改由右侧「历史产物」栏单独一行展示
     // 探测产物的真实尺寸（图片/视频），存回 outputs 里，paintKind 会读它显示分辨率
@@ -2661,7 +2662,8 @@ function paintViewer() {
   let m;
   if (out.kind === "video") {
     m = document.createElement("video");
-    m.src = out.url; m.controls = m.autoplay = m.loop = true;
+    m.controls = m.autoplay = m.loop = true;
+    prepareVideo(m, out.url);
     m.onloadedmetadata = () => {
       bits.splice(bits.indexOf(out.filename) + 1, 0, `${m.videoWidth}×${m.videoHeight}`, fmtDur(m.duration));
       put();
@@ -3197,6 +3199,64 @@ async function importOutput(out) {
   return r.files[0];
 }
 
+// 项目保留原片 url/ref 用于备份下载；播放器和后端实际提交的工作流使用转码 MP4。
+const VIDEO_PREVIEWS = new Map();
+
+function videoPreviewSource(url) {
+  const match = /^\/api\/upload\/([^/?#]+)$/.exec(url);
+  if (!match) return Promise.resolve(url);
+  if (!VIDEO_PREVIEWS.has(url)) {
+    const pending = (async () => {
+      for (;;) {
+        const state = await api(`/api/preview/${match[1]}`);
+        if (state.status === "ready") return state.url;
+        if (state.status === "error") throw new Error(state.error);
+        await new Promise(resolve => setTimeout(resolve, 1500));
+      }
+    })();
+    VIDEO_PREVIEWS.set(url, pending);
+    pending.catch(() => VIDEO_PREVIEWS.delete(url));
+  }
+  return VIDEO_PREVIEWS.get(url);
+}
+
+function prepareVideo(video, url) {
+  video.playsInline = true;
+  if (!/^\/api\/upload\//.test(url)) { video.src = url; return; }
+  video.dataset.previewOriginal = url;
+  const poster = video.getAttribute("poster");
+  const title = video.title;
+  const notice = (failed, detail) => {
+    video.dataset.previewState = failed ? "error" : "processing";
+    video.title = detail;
+    const lines = failed ? ["视频转码失败", "修复转码后才能生成"] : ["正在转码为 MP4", "完成后可预览和生成"];
+    video.poster = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(
+      `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">`
+      + `<rect width="640" height="360" fill="#111318"/><g fill="#d1d5db" text-anchor="middle" font-family="sans-serif" font-size="25">`
+      + `<text x="320" y="168">${lines[0]}</text><text x="320" y="208" font-size="19">${lines[1]}</text></g></svg>`);
+  };
+  notice(false, "服务器正在生成兼容 MP4；原片已备份，转码完成后下游节点使用 MP4 生成。");
+  return videoPreviewSource(url).then(source => {
+    if (video.dataset.previewOriginal !== url) return;
+    video.dataset.previewState = "ready";
+    video.title = title || "MP4 转码已完成，预览和后续生成均使用此版本；原片已备份。";
+    if (poster) video.poster = poster;
+    else video.removeAttribute("poster");
+    video.src = source;
+  }).catch(error => {
+    if (video.dataset.previewOriginal !== url) return;
+    notice(true, error.message || "转码状态加载失败；请检查服务器后重试生成。");
+    video.removeAttribute("src");
+    video.load();
+  });
+}
+
+function prepareVideos(root) {
+  root.querySelectorAll("video[data-video-url]").forEach(video => {
+    prepareVideo(video, video.dataset.videoUrl);
+  });
+}
+
 /** 素材格里的图/视频/音频：复用产物大图那套查看器，不用为它再写一个 */
 function openAsset(a) {
   openViewer(null, 0, [{
@@ -3313,10 +3373,11 @@ function histRun(c, h, cur) {
   rg.className = "rg" + (outs.length === 1 ? " one" : "");
   rg.style.setProperty("--hcols", outs.length === 1 ? 1 : outs.length <= 4 ? 2 : 3);
   rg.innerHTML = outs.map((o, i) => o.kind === "video"
-    ? `<video src="${o.url}" data-i="${i}" muted loop preload="metadata" draggable="false"></video>`
+    ? `<video data-video-url="${o.url}" data-i="${i}" muted loop preload="metadata" draggable="false"></video>`
     : o.kind === "audio"
       ? `<div class="rg-a" data-i="${i}" title="${o.filename}">🎵</div>`
       : `<img src="${o.url}" data-i="${i}" alt="" draggable="false">`).join("");
+  prepareVideos(rg);
   rg.onclick = (ev) => {
     const t = ev.target.closest("[data-i]");
     if (t) openViewer(c, +t.dataset.i, outs, h.seed);
@@ -4508,7 +4569,7 @@ function promptBlock(c, s, label) {
       previewEl.appendChild(img);
     } else if (data.type === 'video') {
       const video = document.createElement("video");
-      video.src = data.url;
+      prepareVideo(video, data.url);
       video.style.cssText = "max-width: 300px; max-height: 200px; display: block; border-radius: 2px;";
       video.muted = true;
       video.autoplay = true;
@@ -5173,7 +5234,8 @@ function slotEl(c, s) {
   const box = d.querySelector(".box");
   if (a) {
     box.innerHTML = a.kind === "image" ? `<img src="${a.url}" draggable="false">`
-      : a.kind === "video" ? `<video src="${a.url}" muted draggable="false"></video>` : `🎵`;
+      : a.kind === "video" ? `<video data-video-url="${a.url}" muted draggable="false"></video>` : `🎵`;
+    prepareVideos(box);
   } else box.textContent = s.type === "audio" ? "🎵"
     : s.type === "video" ? "🎬" : gridWord(s) ? "田" : "＋";
   d.onclick = () => pickFile(c, s);
@@ -5381,6 +5443,7 @@ async function setAssetItem(c, item) {
   } else if (item.kind === "video") {
     const v = document.createElement("video");
     v.onloadedmetadata = () => {
+      if (c.outputs[0]?.url !== item.url) return;
       const w0 = v.videoWidth, h0 = v.videoHeight;
       c.w = Math.round(w0 / 2);
       c.h = Math.round(h0 / 2);
@@ -5388,7 +5451,7 @@ async function setAssetItem(c, item) {
       c.outputs[0].height = h0;
       applySize(c); paintKind(c); save();
     };
-    v.src = item.url;
+    prepareVideo(v, item.url);
   }
   // 音频不调整尺寸，用默认的
 }
