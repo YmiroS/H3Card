@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sqlite3
 import subprocess
 import sys
@@ -7,6 +8,8 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+
+import aiohttp
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
@@ -417,6 +420,8 @@ class WorkerExecutionEventTest(unittest.IsolatedAsyncioTestCase):
                 return FakeWebSocket()
 
         agent = WorkerAgent.__new__(WorkerAgent)
+        agent.comfy_lock = asyncio.Lock()
+        agent.release_failed = None
         agent.server = "http://controller"
         agent.comfy = "http://comfy"
         agent.comfy_ws = "ws://comfy/ws"
@@ -444,6 +449,257 @@ class WorkerExecutionEventTest(unittest.IsolatedAsyncioTestCase):
         })
 
         self.assertNotIn("heartbeat", agent.session.kwargs)
+
+
+class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.agent = WorkerAgent.__new__(WorkerAgent)
+        agent = self.agent
+        agent.comfy_lock = asyncio.Lock()
+        agent.release_failed = None
+        agent.current = None
+        agent.comfy_online = True
+        agent.local_busy = False
+        agent.server = "http://controller"
+        agent.comfy = "http://comfy"
+        agent.comfy_ws = "ws://comfy/ws"
+        agent.state = {"worker_id": "worker", "worker_token": "token"}
+        agent.config = {}
+        agent.telemetry = {}
+        agent.capabilities = {}
+        agent.last_capability_scan = time.time()
+        agent.last_telemetry_scan = time.time()
+        agent.prepare_inputs = mock.AsyncMock()
+        agent.patch_silent_video_audio = mock.AsyncMock()
+        agent.collect_outputs = mock.AsyncMock(return_value=[])
+        agent.report_event = mock.AsyncMock()
+        self.assignment = {
+            "job_id": "job-1", "lease_token": "lease",
+            "payload": {"graph": {}}, "lease_expires_at": time.time() + 60,
+        }
+        self.cleanup_started = asyncio.Event()
+        self.cleanup_ack = asyncio.Event()
+        self.ack = {"cancelled": True, "cleanup_complete": True}
+        self.requests = []
+
+        async def request(method, url, **kwargs):
+            self.requests.append((method, url, kwargs))
+            if url.endswith("/cancel"):
+                self.cleanup_started.set()
+                await self.cleanup_ack.wait()
+                if isinstance(self.ack, Exception):
+                    raise self.ack
+                return self.ack
+            if url.endswith("/prompt"):
+                return {"prompt_id": "job-1"}
+            return {}
+
+        agent._json_request = mock.AsyncMock(side_effect=request)
+        self.execution_started = asyncio.Event()
+        self.ws_closed = asyncio.Event()
+        self.ws = mock.MagicMock()
+        self.ws.closed = False
+        self.ws.__aenter__.return_value = self.ws
+
+        async def close():
+            self.ws.closed = True
+            self.ws_closed.set()
+
+        self.ws.close = mock.AsyncMock(side_effect=close)
+        agent.session = mock.Mock()
+        agent.session.ws_connect.return_value = self.ws
+
+        async def execute_comfy(_assignment):
+            self.assignment["_ws"] = self.ws
+            self.execution_started.set()
+            await self.ws_closed.wait()
+            raise JobFailed("ComfyUI WebSocket 已断开")
+
+        agent.execute_comfy = mock.AsyncMock(side_effect=execute_comfy)
+
+    def failed_requests(self):
+        return [kwargs["json"] for _, url, kwargs in self.requests if url.endswith("/failed")]
+
+    async def test_cancel_retains_current_until_ack_and_reuses_targeted_cleanup(self):
+        task = asyncio.create_task(self.agent.execute(self.assignment))
+        await self.execution_started.wait()
+        await self.agent.cancel_current("unrelated-job")
+        self.assertNotIn("cancel_requested", self.assignment)
+        await asyncio.wait_for(self.agent.cancel_current("job-1"), 0.5)
+        await self.cleanup_started.wait()
+        cleanup = self.assignment["_cleanup_task"]
+        await self.agent.cancel_current("job-1")
+        self.assertIs(self.assignment["_cleanup_task"], cleanup)
+        self.assertIs(self.agent.current, self.assignment)
+        self.assertFalse(task.done())
+        self.assertEqual(self.failed_requests(), [])
+        self.assertIsNone(await self.agent.acquire())
+        self.cleanup_ack.set()
+        await task
+        self.assertIsNone(self.agent.current)
+        self.assertTrue(self.failed_requests()[0]["canceled"])
+        comfy_calls = [(url, kw) for _, url, kw in self.requests if url.startswith(self.agent.comfy)]
+        self.assertEqual(len(comfy_calls), 1)
+        url, kwargs = comfy_calls[0]
+        self.assertEqual(url, "http://comfy/api/jobs/job-1/cancel")
+        self.assertEqual(kwargs["json"], {"free_memory": True})
+        self.assertEqual(kwargs["timeout"].total, 130)
+
+    async def test_missing_ack_and_timeout_keep_release_failed_gate(self):
+        for ack in ({"cancelled": True}, asyncio.TimeoutError()):
+            with self.subTest(ack=ack):
+                self.assignment.pop("_cleanup_task", None)
+                self.agent.release_failed = None
+                self.ack = ack
+                self.cleanup_ack.set()
+                self.agent.execute_comfy = mock.AsyncMock(side_effect=JobFailed("OOM"))
+                await self.agent.execute(self.assignment)
+                self.assertIsNone(self.agent.current)
+                self.assertIn("重启相关进程", self.agent.release_failed)
+                self.assertFalse(self.failed_requests()[-1]["canceled"])
+                self.assertIn("显存释放未确认", self.failed_requests()[-1]["error"])
+                count = len(self.requests)
+                self.assertIsNone(await self.agent.acquire())
+                self.assertEqual(len(self.requests), count)
+
+    async def test_cancel_during_input_download_never_submits_prompt(self):
+        downloading = asyncio.Event()
+        downloaded = asyncio.Event()
+
+        async def prepare(_assignment):
+            downloading.set()
+            await downloaded.wait()
+
+        self.agent.prepare_inputs = prepare
+        self.agent.execute_comfy = WorkerAgent.execute_comfy.__get__(self.agent)
+        task = asyncio.create_task(self.agent.execute(self.assignment))
+        await downloading.wait()
+        await self.agent.cancel_current("job-1")
+        await self.cleanup_started.wait()
+        downloaded.set()
+        self.assertIs(self.agent.current, self.assignment)
+        self.cleanup_ack.set()
+        await task
+        self.assertFalse(any(url.endswith("/prompt") for _, url, _ in self.requests))
+        self.assertTrue(self.failed_requests()[0]["canceled"])
+
+    async def test_heartbeat_continues_renewing_during_cleanup(self):
+        self.agent.current = self.assignment
+        self.agent.local_status = mock.AsyncMock()
+        self.agent.stop_event = mock.Mock()
+        self.agent.stop_event.is_set.side_effect = [False, False, True]
+        self.agent.stop_event.wait = mock.AsyncMock(side_effect=asyncio.TimeoutError)
+        heartbeats = []
+        original = self.agent._json_request
+
+        async def request(method, url, **kwargs):
+            if url.endswith("/heartbeat"):
+                heartbeats.append(kwargs["json"])
+                return {"commands": [{"type": "cancel_job", "job_id": "job-1"}],
+                        "lease_ttl_seconds": 60}
+            return await original(method, url, **kwargs)
+
+        self.agent._json_request = request
+        await asyncio.wait_for(self.agent.heartbeat_loop(), 1)
+        await self.cleanup_started.wait()
+        self.assertEqual(len(heartbeats), 2)
+        self.assertTrue(heartbeats[1]["local_busy"])
+        self.assertGreater(self.assignment["_lease_deadline"], time.monotonic())
+        self.assertFalse(self.assignment["_cleanup_task"].done())
+        self.cleanup_ack.set()
+        await self.assignment["_cleanup_task"]
+
+        self.agent.current = None
+        self.agent.release_failed = "显存释放未确认"
+        self.agent.stop_event.is_set.side_effect = [False, True]
+        await self.agent.heartbeat_loop()
+        self.assertIsNone(heartbeats[-1]["current_job_id"])
+        self.assertTrue(heartbeats[-1]["local_busy"])
+        self.assertTrue(heartbeats[-1]["busy"])
+
+    async def test_cancel_waits_for_inflight_submit_then_targets_same_id(self):
+        submitted = asyncio.Event()
+        submit_done = asyncio.Event()
+        original = self.agent._json_request
+
+        async def request(method, url, **kwargs):
+            if url.endswith("/prompt"):
+                self.assertEqual(kwargs["json"]["prompt_id"], "job-1")
+                submitted.set()
+                await submit_done.wait()
+            return await original(method, url, **kwargs)
+
+        self.agent._json_request = request
+        self.agent.execute_comfy = WorkerAgent.execute_comfy.__get__(self.agent)
+        task = asyncio.create_task(self.agent.execute(self.assignment))
+        await submitted.wait()
+        await self.agent.cancel_current("job-1")
+        await self.ws_closed.wait()
+        self.assertFalse(self.cleanup_started.is_set())
+        submit_done.set()
+        await self.cleanup_started.wait()
+        self.assertIs(self.agent.current, self.assignment)
+        self.cleanup_ack.set()
+        await task
+        self.assertTrue(self.failed_requests()[0]["canceled"])
+
+    async def test_late_websocket_success_during_cancel_is_not_forwarded(self):
+        receiving = asyncio.Event()
+
+        async def receive(timeout=None):
+            receiving.set()
+            await self.ws_closed.wait()
+            return mock.Mock(type=aiohttp.WSMsgType.TEXT, data=json.dumps({
+                "type": "execution_success", "data": {"prompt_id": "job-1"},
+            }))
+
+        self.ws.receive = receive
+        self.agent.execute_comfy = WorkerAgent.execute_comfy.__get__(self.agent)
+        task = asyncio.create_task(self.agent.execute(self.assignment))
+        await receiving.wait()
+        await self.agent.cancel_current("job-1")
+        await self.cleanup_started.wait()
+        self.agent.report_event.assert_not_awaited()
+        self.agent.collect_outputs.assert_not_awaited()
+        self.assertEqual(self.failed_requests(), [])
+        self.cleanup_ack.set()
+        await task
+        self.assertTrue(self.failed_requests()[0]["canceled"])
+        self.assertFalse(any(url.endswith("/complete") for _, url, _ in self.requests))
+
+    async def test_execute_task_cancellation_waits_for_release(self):
+        task = asyncio.create_task(self.agent.execute(self.assignment))
+        await self.execution_started.wait()
+        task.cancel()
+        await self.cleanup_started.wait()
+        self.assertIs(self.agent.current, self.assignment)
+        self.assertEqual(self.failed_requests(), [])
+        self.cleanup_ack.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await task
+        self.assertIsNone(self.agent.current)
+
+    async def test_error_and_interrupted_events_defer_failure_until_cleanup(self):
+        for event_type in ("execution_error", "execution_interrupted"):
+            with self.subTest(event_type=event_type):
+                await self.asyncSetUp()
+                self.agent.execute_comfy = WorkerAgent.execute_comfy.__get__(self.agent)
+                self.ws.receive = mock.AsyncMock(return_value=mock.Mock(
+                    type=aiohttp.WSMsgType.TEXT,
+                    data=json.dumps({"type": event_type, "data": {
+                        "prompt_id": "job-1", "exception_message": "OOM",
+                    }}),
+                ))
+                task = asyncio.create_task(self.agent.execute(self.assignment))
+                await self.cleanup_started.wait()
+                event = self.agent.report_event.await_args.args[1]
+                self.assertTrue(event["data"]["cleanup_pending"])
+                self.assertIs(self.agent.current, self.assignment)
+                self.assertEqual(self.failed_requests(), [])
+                self.cleanup_ack.set()
+                await task
+                self.assertEqual(self.failed_requests()[0]["canceled"],
+                                 event_type == "execution_interrupted")
 
 
 if __name__ == "__main__":

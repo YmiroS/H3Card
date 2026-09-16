@@ -45,6 +45,8 @@ class WorkerAgent:
         self.state = self._load_state()
         self.session = None
         self.current = None
+        self.comfy_lock = asyncio.Lock()
+        self.release_failed = None
         self.capabilities = {}
         self.telemetry = {}
         self.last_capability_scan = 0.0
@@ -261,8 +263,9 @@ class WorkerAgent:
                     await self.scan_telemetry()
                 body = {
                     "comfy_online": self.comfy_online,
-                    "busy": bool(self.current) or self.local_busy,
-                    "local_busy": self.local_busy,
+                    "busy": bool(self.current) or self.local_busy or bool(self.release_failed),
+                    "local_busy": self.local_busy or bool(self.release_failed)
+                                  or bool(self.current and self.current.get("_cleanup_task")),
                     "current_job_id": self.current["job_id"] if self.current else None,
                 }
                 if self.telemetry:
@@ -294,32 +297,45 @@ class WorkerAgent:
             except asyncio.TimeoutError:
                 pass
 
+    def start_cleanup(self, assignment):
+        task = assignment.get("_cleanup_task")
+        if task is None:
+            task = asyncio.create_task(self.cancel_and_release(assignment))
+            assignment["_cleanup_task"] = task
+        return task
+
     async def cancel_current(self, job_id):
         if not self.current or self.current["job_id"] != job_id:
             return
-        already_requested = bool(self.current.get("cancel_requested"))
         self.current["cancel_requested"] = True
-        if not already_requested:
-            print(f"[Worker] 正在取消任务 {job_id}", flush=True)
-            try:
-                await self._json_request(
-                    "POST", self.comfy + f"/api/jobs/{job_id}/cancel", json={}
+        # 心跳只发起清理，不等待长达 130 秒的确认，继续为旧任务续租。
+        self.start_cleanup(self.current)
+
+    async def cancel_and_release(self, assignment):
+        try:
+            ws = assignment.get("_ws")
+            if ws is not None and not ws.closed:
+                await ws.close()
+            async with self.comfy_lock:
+                ack = await self._json_request(
+                    "POST", self.comfy + f"/api/jobs/{assignment['job_id']}/cancel",
+                    json={"free_memory": True},
+                    timeout=aiohttp.ClientTimeout(total=130, sock_connect=15),
                 )
-            except Exception:
-                try:
-                    await self._json_request(
-                        "POST", self.comfy + "/interrupt", json={"prompt_id": job_id}
-                    )
-                except Exception as exc:
-                    print(f"[Worker] 取消 ComfyUI 任务失败：{exc}", flush=True)
-        # ComfyUI 已经报错或完成时不会再发事件；主动关闭连接才能让
-        # execute_comfy 退出，随后释放 self.current。
-        ws = self.current.get("_ws")
-        if ws is not None and not ws.closed:
-            await ws.close()
+                if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
+                        or not isinstance(ack.get("cancelled"), bool)):
+                    raise AgentError("ComfyUI 未确认 cleanup_complete")
+            return True
+        except Exception as exc:
+            self.release_failed = (
+                f"显存释放未确认：{type(exc).__name__}: {exc}；"
+                "已停止接单，请检查 ComfyUI 后重启相关进程。"
+            )
+            print(f"[Worker] {self.release_failed}", flush=True)
+            return False
 
     async def acquire(self):
-        if not self.comfy_online or self.local_busy or self.current:
+        if self.release_failed or not self.comfy_online or self.local_busy or self.current:
             return None
         return await self._json_request(
             "POST", self.server + "/agent/v1/jobs/acquire",
@@ -460,28 +476,39 @@ class WorkerAgent:
         async with self.session.ws_connect(
                 f"{self.comfy_ws}?clientId={client_id}") as ws:
             assignment["_ws"] = ws
-            result = await self._json_request(
-                "POST", self.comfy + "/prompt",
-                json={
-                    "prompt": assignment["payload"]["graph"],
-                    "client_id": client_id,
-                    "prompt_id": job_id,
-                },
-            )
+            async with self.comfy_lock:
+                if assignment.get("cancel_requested"):
+                    raise JobFailed("任务已取消", canceled=True)
+                if self.release_failed:
+                    raise JobFailed(self.release_failed)
+                result = await self._json_request(
+                    "POST", self.comfy + "/prompt",
+                    json={
+                        "prompt": assignment["payload"]["graph"],
+                        "client_id": client_id,
+                        "prompt_id": job_id,
+                    },
+                )
             if result.get("prompt_id") != job_id:
                 raise JobFailed("ComfyUI 返回了不同的 prompt_id")
             next_history_check = time.monotonic() + 5
             while True:
+                if assignment.get("cancel_requested"):
+                    raise JobFailed("任务已取消", canceled=True)
                 timeout = max(next_history_check - time.monotonic(), 0.1)
                 try:
                     msg = await ws.receive(timeout=timeout)
                 except asyncio.TimeoutError:
                     msg = None
+                if assignment.get("cancel_requested"):
+                    raise JobFailed("任务已取消", canceled=True)
                 if time.monotonic() >= next_history_check:
                     next_history_check = time.monotonic() + 5
                     try:
                         if await self.history_finished(job_id):
                             return
+                    except JobFailed:
+                        raise
                     except (aiohttp.ClientError, asyncio.TimeoutError, AgentError):
                         pass
                 if msg is None:
@@ -498,6 +525,9 @@ class WorkerAgent:
                 if data.get("prompt_id") != job_id:
                     continue
                 event_type = event.get("type")
+                if event_type in ("execution_error", "execution_interrupted"):
+                    data["cleanup_pending"] = True
+                    self.start_cleanup(assignment)
                 now = time.monotonic()
                 if event_type != "progress_state" or now - last_progress >= 0.5:
                     await self.report_event(assignment, event)
@@ -588,29 +618,37 @@ class WorkerAgent:
             await self.prepare_inputs(assignment)
             await self.patch_silent_video_audio(assignment)
             await self.execute_comfy(assignment)
+            if assignment.get("cancel_requested"):
+                raise JobFailed("任务已取消", canceled=True)
             outputs = await self.collect_outputs(assignment)
+            if assignment.get("cancel_requested"):
+                raise JobFailed("任务已取消", canceled=True)
             await self._json_request(
                 "POST", self.server + f"/agent/v1/jobs/{job_id}/complete",
                 headers=self._agent_headers(assignment["lease_token"]),
                 json={"outputs": outputs},
             )
             print(f"[Worker] 任务完成 {job_id}，产物 {len(outputs)} 个")
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
-            canceled = isinstance(exc, JobFailed) and exc.canceled
-            if self.current and self.current.get("cancel_requested"):
-                canceled = True
-            print(f"[Worker] 任务失败 {job_id}：{exc}")
+        except (Exception, asyncio.CancelledError) as exc:
+            canceled = (isinstance(exc, JobFailed) and exc.canceled
+                        or bool(assignment.get("cancel_requested")))
+            released = await asyncio.shield(self.start_cleanup(assignment))
+            error = str(exc) if released else self.release_failed
+            print(f"[Worker] 任务失败 {job_id}：{error}")
             try:
                 await self._json_request(
                     "POST", self.server + f"/agent/v1/jobs/{job_id}/failed",
                     headers=self._agent_headers(assignment["lease_token"]),
-                    json={"error": str(exc), "canceled": canceled},
+                    json={"error": error, "canceled": bool(canceled and released)},
                 )
             except Exception as report_error:
                 print(f"[Worker] 上报失败状态失败：{report_error}")
+            if isinstance(exc, asyncio.CancelledError):
+                raise
         finally:
+            task = assignment.get("_cleanup_task")
+            if task is not None:
+                await asyncio.shield(task)
             self.current = None
 
     async def run(self):
