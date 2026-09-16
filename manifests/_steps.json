@@ -33,6 +33,8 @@
   "LoadImage": "加载图像",
   "LoraLoaderModelOnly": "加载LoRA模型",
   "MathExpression|pysssss": "数学表达式",
+  "MiniMaxChunkFeedForward": "MiniMax H3前馈分块计算",
+  "MiniMaxLowVRAMAttention": "MiniMax H3低显存注意力",
   "MiniMaxH3ImageToVideo": "MiniMax H3图生视频",
   "MiniMaxH3LatentUpscaleCombined": "MiniMax H3潜空间放大",
   "MiniMaxH3ReferenceToVideo": "MiniMax H3参考生成视频",

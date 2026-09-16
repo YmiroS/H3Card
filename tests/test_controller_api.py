@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sys
 import tempfile
@@ -413,6 +414,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         controller_app.WEIGHTS.clear()
 
         application = web.Application()
+        application["comfy_lock"] = asyncio.Lock()
+        application["cleanup_pending"] = set()
+        application["cleanup_tasks"] = {}
         application["session"] = mock.MagicMock()
         application["distributed"] = self.store
         application["costs"] = self.ledger
@@ -422,6 +426,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         application.router.add_get("/api/cards", controller_app.api_cards)
         application.router.add_post("/api/reload", controller_app.api_reload)
         application.router.add_get("/api/jobs", controller_app.api_jobs)
+        application.router.add_post("/api/job/{pid}/cancel", controller_app.api_cancel)
+        application.router.add_delete("/api/job/{pid}", controller_app.api_job_delete)
         application.router.add_post("/api/generate", controller_app.api_generate)
         application.router.add_post("/api/text", controller_app.api_text)
         application.router.add_get("/api/projects", controller_app.api_projects)
@@ -806,6 +812,58 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cost_job["cost_source"], "actual")
         self.assertEqual(cost_job["worker_name"], "gpu-01")
 
+    async def test_cleanup_pending_events_keep_lease_until_worker_failure_report(self):
+        credentials = self.store.register_worker("cleanup-worker", {})
+        worker_id = credentials["worker_id"]
+        headers = {"X-Worker-ID": worker_id,
+                   "Authorization": f"Bearer {credentials['worker_token']}"}
+        self.store.heartbeat(worker_id, comfy_online=True)
+        controller_app.JOBS["cleanup-job"] = {
+            "id": "cleanup-job", "status": "queued", "created": 1,
+            "progress": 0.3, "outputs": [], "error": None,
+        }
+        self.store.enqueue("cleanup-job", {"graph": {}}, [])
+        assignment = self.store.acquire(worker_id)
+        headers["X-Lease-Token"] = assignment["lease_token"]
+        await self.client.post("/agent/v1/jobs/cleanup-job/start", headers=headers, json={})
+        for event_type in ("execution_error", "execution_interrupted"):
+            response = await self.client.post(
+                "/agent/v1/jobs/cleanup-job/event", headers=headers,
+                json={"type": event_type, "data": {
+                    "cleanup_pending": True, "exception_message": "OOM",
+                }},
+            )
+            self.assertEqual(response.status, 200)
+            self.assertTrue((await response.json())["cleanup_pending"])
+            self.assertTrue(self.store.validate_lease(
+                "cleanup-job", worker_id, assignment["lease_token"],
+            ))
+            self.assertEqual(self.store.dispatch_status("cleanup-job"), "running")
+            self.assertEqual(controller_app.JOBS["cleanup-job"]["status"], "running")
+            self.assertEqual(controller_app.JOBS["cleanup-job"]["step"], "正在释放显存")
+        for event_type in ("executing", "execution_success", "progress_state"):
+            await self.client.post("/agent/v1/jobs/cleanup-job/event", headers=headers,
+                                   json={"type": event_type, "data": {"node": None}})
+        self.assertEqual(controller_app.JOBS["cleanup-job"]["step"], "正在释放显存")
+        self.store.enqueue("next-job", {"graph": {}}, [])
+        self.assertIsNone(self.store.acquire(worker_id))
+        response = await self.client.post("/agent/v1/jobs/cleanup-job/complete", headers=headers,
+                                          json={"outputs": []})
+        self.assertEqual(response.status, 409)
+        self.assertEqual(self.store.dispatch_status("cleanup-job"), "running")
+        response = await self.client.post("/agent/v1/jobs/cleanup-job/failed", headers=headers,
+                                          json={"error": "释放失败，需重启相关进程", "canceled": False})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.store.dispatch_status("cleanup-job"), "error")
+        self.assertFalse(controller_app.JOBS["cleanup-job"]["cleanup_pending"])
+        for current in ("cleanup-job", None):
+            await self.client.post("/agent/v1/heartbeat", headers=headers, json={
+                "comfy_online": True, "busy": True, "local_busy": True,
+                "current_job_id": current,
+            })
+            self.assertEqual(self.store.list_workers()[0]["state"], "busy")
+            self.assertIsNone(self.store.acquire(worker_id))
+
     async def test_execution_error_atomically_finishes_dispatch(self):
         response = await self.client.post("/agent/v1/register", json={
             "name": "gpu-error-test",
@@ -869,6 +927,210 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(worker["state"], "idle")
         self.assertIsNone(worker["current_job_id"])
+
+
+class LocalCleanupTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        for patcher in (
+            mock.patch.object(controller_app, "CONTROLLER_MODE", False),
+            mock.patch.object(controller_app, "save_jobs"),
+            mock.patch.object(controller_app, "JOBS", {}),
+            mock.patch.object(controller_app, "STEPS", {}),
+            mock.patch.object(controller_app, "WEIGHTS", {}),
+            mock.patch.object(controller_app, "patch_graph", return_value={}),
+            mock.patch.dict(controller_app.CAPS, {"cleanup-test": {
+                "_graph_ok": True, "name": "测试", "outputType": "image",
+            }}),
+        ):
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        self.job = {"id": "local-job", "status": "running", "progress": 0.4,
+                    "step": "采样", "created": 1, "outputs": [], "error": None}
+        controller_app.JOBS["local-job"] = self.job
+        self.started = asyncio.Event()
+        self.confirmed = asyncio.Event()
+        self.ack = {"cancelled": True, "cleanup_complete": True}
+        self.session = mock.MagicMock()
+        response = self.session.post.return_value.__aenter__.return_value
+        response.raise_for_status = mock.Mock()
+
+        async def acknowledgement():
+            self.started.set()
+            await self.confirmed.wait()
+            if isinstance(self.ack, Exception):
+                raise self.ack
+            return self.ack
+
+        response.json = mock.AsyncMock(side_effect=acknowledgement)
+        self.app = web.Application()
+        self.app["session"] = self.session
+        self.app["comfy_lock"] = asyncio.Lock()
+        self.app["cleanup_pending"] = set()
+        self.app["cleanup_tasks"] = {}
+        self.app.router.add_post("/api/generate", controller_app.api_generate)
+        self.app.router.add_get("/api/jobs", controller_app.api_jobs)
+        self.app.router.add_post("/api/job/{pid}/cancel", controller_app.api_cancel)
+        self.app.router.add_delete("/api/job/{pid}", controller_app.api_job_delete)
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        self.confirmed.set()
+        await asyncio.gather(*self.app["cleanup_tasks"].values(), return_exceptions=True)
+        await self.client.close()
+
+    async def assert_generation_blocked(self):
+        with mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock) as submit:
+            response = await self.client.post("/api/generate", json={"capability": "cleanup-test"})
+            self.assertEqual(response.status, 409)
+            submit.assert_not_awaited()
+
+    async def test_cancel_ack_gates_generation_events_and_deletion(self):
+        stopping = asyncio.create_task(self.client.post("/api/job/local-job/cancel"))
+        await self.started.wait()
+        self.assertEqual(self.job["status"], "running")
+        self.assertEqual(self.job["step"], "正在停止并释放显存")
+        listed = await (await self.client.get("/api/jobs")).json()
+        self.assertEqual(listed["jobs"][0]["step"], "正在停止并释放显存")
+        await self.assert_generation_blocked()
+        for event_type in ("execution_start", "executing", "execution_success", "progress_state",
+                           "execution_error", "execution_interrupted", "execution_cached"):
+            await controller_app.handle_event(self.session, {
+                "type": event_type, "data": {"prompt_id": "local-job", "node": None},
+            })
+        self.assertEqual(self.job["status"], "running")
+        self.assertEqual(self.job["step"], "正在停止并释放显存")
+        self.assertEqual(self.job["progress"], 0.4)
+        deleted = await (await self.client.delete("/api/job/local-job")).json()
+        self.assertTrue(deleted["pending"])
+        self.assertIn("local-job", controller_app.JOBS)
+        self.confirmed.set()
+        response = await stopping
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.job["status"], "canceled")
+        self.assertFalse(self.app["cleanup_pending"])
+        await controller_app.handle_event(self.session, {
+            "type": "execution_error", "data": {"prompt_id": "local-job"},
+        })
+        self.assertEqual(self.job["status"], "canceled")
+        self.session.post.assert_called_once()
+        args, kwargs = self.session.post.call_args
+        self.assertEqual(args[0], controller_app.COMFY_HTTP + "/api/jobs/local-job/cancel")
+        self.assertEqual(kwargs["json"], {"free_memory": True})
+        self.assertEqual(kwargs["timeout"].total, 130)
+        with mock.patch.object(controller_app, "comfy_submit", new=mock.AsyncMock(return_value="next")):
+            response = await self.client.post("/api/generate", json={"capability": "cleanup-test"})
+            self.assertEqual(response.status, 200)
+
+    async def test_disconnected_caller_and_duplicate_cancel_share_cleanup(self):
+        first = asyncio.create_task(controller_app.stop_job(self.app, "local-job"))
+        await self.started.wait()
+        cleanup = self.app["cleanup_tasks"]["local-job"]
+        first.cancel()
+        with self.assertRaises(asyncio.CancelledError):
+            await first
+        self.assertFalse(cleanup.cancelled())
+        second = asyncio.create_task(controller_app.stop_job(self.app, "local-job"))
+        await self.assert_generation_blocked()
+        self.assertIs(self.app["cleanup_tasks"]["local-job"], cleanup)
+        self.assertFalse(second.done())
+        self.confirmed.set()
+        self.assertEqual(await second, "canceled")
+        self.session.post.assert_called_once()
+
+    async def test_unknown_id_never_calls_comfy_cleanup(self):
+        response = await self.client.post("/api/job/unknown/cancel")
+        self.assertEqual(response.status, 404)
+        self.session.post.assert_not_called()
+        self.assertFalse(self.app["cleanup_pending"])
+
+    async def test_queued_cancel_and_shutdown_wait_for_ack(self):
+        self.job["status"] = "queued"
+        stopping = asyncio.create_task(controller_app.stop_job(self.app, "local-job"))
+        await self.started.wait()
+        self.assertEqual(self.job["status"], "queued")
+        session = mock.Mock(close=mock.AsyncMock())
+        previews = mock.Mock(close=mock.AsyncMock())
+        shutdown = asyncio.create_task(controller_app.on_stop({
+            "cleanup_tasks": self.app["cleanup_tasks"], "session": session,
+            "video_previews": previews,
+        }))
+        await self.assert_generation_blocked()
+        self.assertFalse(shutdown.done())
+        session.close.assert_not_awaited()
+        self.confirmed.set()
+        await stopping
+        await shutdown
+        session.close.assert_awaited_once()
+        self.assertEqual(self.job["status"], "canceled")
+
+    async def test_inflight_output_collection_cannot_override_cancel(self):
+        collecting = asyncio.Event()
+        collected = asyncio.Event()
+
+        async def outputs(_session, _pid):
+            collecting.set()
+            await collected.wait()
+            return [{"filename": "late.png"}]
+
+        with mock.patch.object(controller_app, "collect_outputs", side_effect=outputs):
+            event = asyncio.create_task(controller_app.handle_event(self.session, {
+                "type": "execution_success", "data": {"prompt_id": "local-job"},
+            }))
+            await collecting.wait()
+            stopping = asyncio.create_task(controller_app.stop_job(self.app, "local-job"))
+            await self.started.wait()
+            collected.set()
+            await event
+            self.assertEqual(self.job["status"], "running")
+            self.assertEqual(self.job["outputs"], [])
+            self.confirmed.set()
+            await stopping
+            self.assertEqual(self.job["status"], "canceled")
+
+    async def test_submit_lock_orders_cancel_before_later_submission(self):
+        submitting = asyncio.Event()
+        submitted = asyncio.Event()
+
+        async def submit(_session, _graph):
+            submitting.set()
+            await submitted.wait()
+            return "prior-job"
+
+        with mock.patch.object(controller_app, "comfy_submit", side_effect=submit) as prompt:
+            first = asyncio.create_task(controller_app.local_submit(self.app, {}))
+            await submitting.wait()
+            # 排在已发出的提交之后，后到的提交之前。
+            stopping = asyncio.create_task(controller_app.stop_job(self.app, "local-job"))
+            later = asyncio.create_task(controller_app.local_submit(self.app, {}))
+            submitted.set()
+            self.assertEqual(await first, "prior-job")
+            await self.started.wait()
+            with self.assertRaises(web.HTTPConflict):
+                await later
+            prompt.assert_awaited_once()
+            self.confirmed.set()
+            await stopping
+
+    async def test_missing_ack_and_timeout_keep_gate_and_allow_cancel_retry(self):
+        self.confirmed.set()
+        for ack in ({"cancelled": True}, asyncio.TimeoutError()):
+            with self.subTest(ack=ack):
+                self.ack = ack
+                response = await self.client.post("/api/job/local-job/cancel")
+                self.assertEqual(response.status, 503)
+                self.assertEqual(self.job["status"], "running")
+                self.assertTrue(self.job["cleanup_pending"])
+                self.assertIn("重试取消", self.job["step"])
+                await self.assert_generation_blocked()
+                deleted = await (await self.client.delete("/api/job/local-job")).json()
+                self.assertTrue(deleted["pending"])
+        self.ack = {"cancelled": False, "cleanup_complete": True}
+        response = await self.client.post("/api/job/local-job/cancel")
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.job["status"], "canceled")
+        self.assertFalse(self.app["cleanup_pending"])
+        self.assertEqual(self.session.post.call_count, 3)
 
 
 if __name__ == "__main__":

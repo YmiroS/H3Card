@@ -26,6 +26,9 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
             self.uploads, controller_app.ffmpeg_bin, controller_app.VID_EXT,
         )
         app = web.Application()
+        app["comfy_lock"] = asyncio.Lock()
+        app["cleanup_pending"] = set()
+        app["cleanup_tasks"] = {}
         app["video_previews"] = self.previews
         app["session"] = object()
         app["distributed"] = mock.Mock()
