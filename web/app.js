@@ -3268,27 +3268,17 @@ function openAsset(a) {
 /* ================= 右侧历史产物栏 ================= */
 const HIST_MAX = 20;               // 每个节点留 20 轮；再往前的去 ComfyUI 的 output 目录里找
 
-/** 一轮产物的签名，用来判重：轮询会反复读到同一轮，不能记成好多条 */
-const runSig = (outs) => (outs || []).map(o => o.url).join("|");
-
 /** 把节点刚出的这一轮记进历史（最新的在最前面） */
-function pushHistory(c) {
+function pushHistory(c, job) {
   const outs = c.outputs || [];
   if (!outs.length) return;
   c.history = c.history || [];
-  const sig = runSig(outs);
-  if (c.history.some(h => runSig(h.outputs) === sig)) return;
+  if (c.history.some(h => h.job === job.id)) return;
   c.history.unshift({
-    ts: Date.now(), seed: c.seed != null ? c.seed : null,
-    cap: runCap(c), ms: c.ms != null ? c.ms : null, outputs: outs,
-    // 挂了风格节点时，节点上提示词框里的字并不是真发出去的那段（风格是提交那一刻并进去的）。
-    // 只有把当时真提交的整段留下来，这一轮才复现得出来 —— 风格节点后来改了、解除了都不影响它
-    ...(c._sent ? { prompt: c._sent } : {}),
-    // 生图节点：记录提示词和负面提示词
-    ...((c.cap === "zimage_t2i" || c.cap === "krea2_t2i") && c.params ? {
-      user_prompt: c.params.prompt || "",
-      negative_prompt: c.params.negative_prompt || ""
-    } : {}),
+    ts: Date.now(), job: job.id, seed: c.seed != null ? c.seed : null,
+    cap: job.capability, ms: c.ms != null ? c.ms : null, outputs: outs,
+    // 只读任务提交时落盘的快照，不能用运行期间可能改过的卡片参数补历史。
+    ...(job.prompts ? { prompts: job.prompts.map(p => ({ ...p })) } : {}),
   });
   if (c.history.length > HIST_MAX) c.history.length = HIST_MAX;
 }
@@ -3498,19 +3488,18 @@ function histRun(c, h, cur) {
     box.appendChild(rp);
   }
 
-  // 套了风格节点的那几轮：把当时真提交的整段提示词收在这儿。节点上那个框里的字
-  // 不等于跑出这一轮的那段话，不放出来的话这一轮等于没法复现
-  if (h.prompt) {
+  const prompts = h.prompts || (h.prompt != null ? [{ label: "提示词", text: h.prompt }] : []);
+  for (const p of prompts) {
     const rp = document.createElement("details"); rp.className = "rp";
     const section = document.createElement("div"); section.className = "history-prompt";
-    const sm = document.createElement("summary"); sm.textContent = "当时提交的提示词";
+    const sm = document.createElement("summary"); sm.textContent = "当时提交的" + p.label;
     const cpBtn = document.createElement("button");
     cpBtn.textContent = "复制";
     cpBtn.type = "button";
     cpBtn.className = "history-prompt-copy";
-    cpBtn.title = "复制当时提交的提示词";
-    cpBtn.onclick = () => copyHistoryText(h.prompt, "已复制提示词");
-    const tx = document.createElement("div"); tx.textContent = h.prompt;
+    cpBtn.title = "复制当时提交的" + p.label;
+    cpBtn.onclick = () => copyHistoryText(p.text, "已复制" + p.label);
+    const tx = document.createElement("div"); tx.textContent = p.text || "（本次提交为空）";
     rp.append(sm, tx);
     section.append(rp, cpBtn);
     box.appendChild(section);
@@ -5671,12 +5660,6 @@ async function run(c) {
   c.error = null; c.progress = 0; c.status = "queued"; c.outputs = []; c.ms = null; c.step = "";
   paint(c); openPanel(c.id);      // status 一进 queued，paint 就把画面区换成加载态
   const pl = payloadOf(c);
-  // 留一手给历史记录：真提交的那段跟面板上原词那个框不一样时（并了风格节点、或者用的是
-  // 优化后那份），只有把真提交的整段留下来这一轮才复现得出来（见 pushHistory）。
-  // `_` 开头不落盘，真正持久化的是 history 里那一条
-  const pk = promptSpecs(CAPS[runCap(c)] || cap).map(s => s.key);
-  const sent = pk.length ? String(pl.params[pk[0]] || "") : "";
-  c._sent = (pk.length && sent !== String(c.params[pk[0]] || "")) ? sent : null;
   try {
     const job = await jpost("/api/generate", pl);
     c.job = job.id; c.seed = job.seed; c.status = job.status;
@@ -5724,7 +5707,7 @@ async function pollJobs() {
       dirty = true;
       if (el.panel._id === c.id) openPanel(c.id);
       if (c.status === "done") {
-        pushHistory(c);
+        pushHistory(c, j);
         if (el.hist._id === c.id) openHistory(c.id);
         drawWires();
         // 下游已连线的节点自动吃掉新产物（风格线传的是文字，没有产物可搬，跳过）
