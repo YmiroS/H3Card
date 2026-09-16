@@ -615,6 +615,49 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
     })
+    async def test_video_over_ten_seconds_gets_rtx_5090_policy(self, _patch_graph):
+        capability = {
+            "name": "视频参考生成", "outputType": "video", "kind": "gen",
+            "_graph_ok": True,
+            "inputs": [{"key": "video[0]", "type": "video"}],
+        }
+        assets = {"video[0]": "chouka/source.mp4"}
+        with mock.patch.dict(controller_app.CAPS, {"video-ref": capability}), \
+             mock.patch.object(
+                 controller_app, "generation_assets",
+                 new=mock.AsyncMock(return_value=assets),
+             ):
+            for duration, expects_policy in ((10.0, False), (10.001, True)):
+                with self.subTest(duration=duration), \
+                     mock.patch.object(
+                         controller_app, "probe_video", return_value={"duration": duration}
+                     ):
+                    response = await self.client.post("/api/generate", json={
+                        "capability": "video-ref", "params": {}, "assets": assets,
+                    })
+                    self.assertEqual(response.status, 200)
+                    job = await response.json()
+                    row = self.store.db.execute(
+                        "SELECT payload_json FROM dispatch_jobs WHERE job_id = ?",
+                        (job["id"],),
+                    ).fetchone()
+                    payload = json.loads(row[0])
+                    self.assertEqual("gpu_policy" in payload, expects_policy)
+                    if expects_policy:
+                        self.assertEqual(
+                            payload["gpu_policy"], controller_app.RTX_5090_GPU_POLICY
+                        )
+
+            with mock.patch.object(controller_app, "probe_video", return_value={}):
+                response = await self.client.post("/api/generate", json={
+                    "capability": "video-ref", "params": {}, "assets": assets,
+                })
+                self.assertEqual(response.status, 400)
+                self.assertIn("无法读取引入视频时长", await response.text())
+
+    @mock.patch.object(controller_app, "patch_graph", return_value={
+        "1": {"class_type": "KSampler", "inputs": {}}
+    })
     async def test_high_quality_h3_dispatches_only_to_rtx_5090(self, _patch_graph):
         capability = {"name": "H3全能参考(高质量)", "outputType": "video", "_graph_ok": True}
         with mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
@@ -675,6 +718,48 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             })
             self.assertEqual(response.status, 503)
             submit.assert_not_awaited()
+
+    @mock.patch.object(controller_app, "patch_graph", return_value={
+        "1": {"class_type": "KSampler", "inputs": {}}
+    })
+    @mock.patch.object(
+        controller_app, "comfy_submit", new_callable=mock.AsyncMock,
+        return_value="local-long-video",
+    )
+    async def test_local_long_video_checks_gpu_before_submit(self, submit, _patch_graph):
+        capability = {
+            "name": "视频参考生成", "outputType": "video", "kind": "gen",
+            "_graph_ok": True,
+            "inputs": [{"key": "video[0]", "type": "video"}],
+        }
+        assets = {"video[0]": "chouka/source.mp4"}
+        session = self.client.server.app["session"]
+        stats_response = session.get.return_value.__aenter__.return_value
+        stats_response.raise_for_status = mock.Mock()
+        stats_response.json = mock.AsyncMock()
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+             mock.patch.dict(controller_app.CAPS, {"video-ref": capability}), \
+             mock.patch.object(
+                 controller_app, "generation_assets",
+                 new=mock.AsyncMock(return_value=assets),
+             ), \
+             mock.patch.object(
+                 controller_app, "probe_video", return_value={"duration": 10.001}
+             ):
+            for gpu, status in (("RTX 4090", 400), ("RTX 5090", 200)):
+                with self.subTest(gpu=gpu):
+                    submit.reset_mock()
+                    stats_response.json.return_value = {
+                        "devices": [{"type": "cuda", "name": gpu}],
+                    }
+                    response = await self.client.post("/api/generate", json={
+                        "capability": "video-ref", "params": {}, "assets": assets,
+                    })
+                    self.assertEqual(response.status, status)
+                    if status == 200:
+                        submit.assert_awaited_once()
+                    else:
+                        submit.assert_not_awaited()
 
     async def test_project_rename_updates_jobs_and_cost_history(self):
         created = await (await self.client.post(

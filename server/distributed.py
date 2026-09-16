@@ -15,10 +15,12 @@ from pathlib import Path
 LIVE_DISPATCH = ("assigned", "running", "cancel_requested")
 FINISHED_DISPATCH = ("done", "error", "canceled")
 RTX_5090_ONLY_CAPABILITIES = frozenset({"minimax_h3_ref_2pass"})
+RTX_5090_GPU_POLICY = "primary_rtx_5090"
 
 
-def can_run_capability(capability, devices):
-    if capability not in RTX_5090_ONLY_CAPABILITIES:
+def can_run_capability(capability, devices, gpu_policy=None):
+    if (capability not in RTX_5090_ONLY_CAPABILITIES
+            and gpu_policy != RTX_5090_GPU_POLICY):
         return True
     # ComfyUI 的 devices[0] 是实际执行的主设备，不能用机器名或其他闲置显卡放行。
     if not isinstance(devices, list) or not devices or not isinstance(devices[0], dict):
@@ -264,7 +266,8 @@ class DistributedStore:
                 required = set(json.loads(row["required_nodes_json"] or "[]"))
                 payload = json.loads(row["payload_json"])
                 if required.issubset(available_nodes) and can_run_capability(
-                    payload.get("capability"), capabilities.get("devices")
+                    payload.get("capability"), capabilities.get("devices"),
+                    payload.get("gpu_policy"),
                 ):
                     eligible.append((row, payload))
             if not eligible:

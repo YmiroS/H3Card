@@ -40,7 +40,10 @@ import rewrite as rw
 import llm
 import translate as tr
 from costs import CostLedger
-from distributed import DistributedStore, RTX_5090_ONLY_CAPABILITIES, can_run_capability
+from distributed import (
+    DistributedStore, RTX_5090_GPU_POLICY, RTX_5090_ONLY_CAPABILITIES,
+    can_run_capability,
+)
 from video_preview import VideoPreviews, preview_status, preview_file
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
@@ -55,6 +58,7 @@ if EXECUTION_MODE not in ("local", "controller"):
 CONTROLLER_MODE = EXECUTION_MODE == "controller"
 ENROLLMENT_TOKEN = os.environ.get("CHOUKA_ENROLLMENT_TOKEN", "")
 ARTIFACT_DIR = ROOT / "data" / "artifacts"
+LONG_VIDEO_RTX_5090_SECONDS = 10
 
 MODEL_FAMILY = {
     **{cap: "minimax_h3" for cap in (
@@ -321,6 +325,25 @@ def probe_fps(ref):
     return probe_video(ref).get("fps")
 
 
+def inspect_imported_videos(cap, assets):
+    """探测生视频能力实际引入的视频；有素材但读不到时长则拒绝派发。"""
+    if cap.get("kind") != "gen" or cap.get("outputType") != "video":
+        return None, {}
+    refs = {
+        assets.get(spec.get("key"))
+        for spec in cap.get("inputs") or []
+        if spec.get("type") == "video" and assets.get(spec.get("key"))
+    }
+    metadata = {ref: probe_video(ref) for ref in refs}
+    durations = []
+    for info in metadata.values():
+        duration = info.get("duration")
+        if not duration:
+            raise web.HTTPBadRequest(reason="无法读取引入视频时长")
+        durations.append(float(duration))
+    return (max(durations) if durations else None), metadata
+
+
 def derive_target_fps(g, spec, tgt, uploaded):
     """「目标帧率」一个框，写三个节点：成片帧率 / 补帧倍数 / 输入重采样帧率。
 
@@ -348,7 +371,7 @@ def derive_target_fps(g, spec, tgt, uploaded):
     return tgt
 
 
-def patch_h3_character_transfer(g, cap, params, uploaded):
+def patch_h3_character_transfer(g, cap, params, uploaded, video_metadata=None):
     """把抽卡面板里的动作视频和人物图封装成 TimelineDirector 素材时间线。"""
     spec = cap.get("patch") or {}
     if spec.get("kind") != "h3_character_transfer":
@@ -357,7 +380,7 @@ def patch_h3_character_transfer(g, cap, params, uploaded):
     image = uploaded.get(spec.get("image", "images[0]"))
     if not video or not image:
         return
-    info = probe_video(video)
+    info = (video_metadata or {}).get(video) or probe_video(video)
     source_duration = float(info.get("duration") or 0)
     if not source_duration:
         raise web.HTTPBadRequest(reason="无法读取动作来源视频时长")
@@ -396,7 +419,7 @@ def patch_h3_character_transfer(g, cap, params, uploaded):
     )
 
 
-def patch_graph(cap, params, uploaded):
+def patch_graph(cap, params, uploaded, video_metadata=None):
     """按 manifest 把用户参数写进 API 工作流模板"""
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
     labels = {s["key"]: s["label"] for s in cap["inputs"]}
@@ -422,7 +445,7 @@ def patch_graph(cap, params, uploaded):
                 # VHS 的音频输出是惰性读取：只要 H3 的视频音频引用仍连着，它就会让
                 # ffmpeg 提取音轨。静音视频根本没有音频流，必须只拔掉这条音频引用，
                 # 视频输出本身仍正常作为动作和镜头参考。
-                info = probe_video(val)
+                info = (video_metadata or {}).get(val) or probe_video(val)
                 if info.get("has_audio") is False:
                     for drop in spec["dropIfNoAudio"]:
                         g[str(drop["node"])]["inputs"].pop(drop["input"], None)
@@ -464,7 +487,7 @@ def patch_graph(cap, params, uploaded):
     if blank:
         raise web.HTTPBadRequest(
             reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
-    patch_h3_character_transfer(g, cap, params, uploaded)
+    patch_h3_character_transfer(g, cap, params, uploaded, video_metadata)
     return g
 
 
@@ -735,7 +758,12 @@ async def api_generate(request):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
     uploaded = await generation_assets(request, body.get("assets") or {})
-    graph = patch_graph(cap, params, uploaded)
+    source_video_duration, video_metadata = None, {}
+    if not body.get("dry_run"):
+        source_video_duration, video_metadata = await asyncio.to_thread(
+            inspect_imported_videos, cap, uploaded
+        )
+    graph = patch_graph(cap, params, uploaded, video_metadata)
     if body.get("dry_run"):
         tpl = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
         diff = {f"#{n}.{k}": [tpl[n]["inputs"].get(k), v]
@@ -745,7 +773,14 @@ async def api_generate(request):
                      for n, nd in tpl.items() for k, v in nd["inputs"].items()
                      if k not in graph[n]["inputs"]})
         return web.json_response({"dry_run": True, "changed": diff})
-    if not CONTROLLER_MODE and cid in RTX_5090_ONLY_CAPABILITIES:
+    gpu_policy = (
+        RTX_5090_GPU_POLICY
+        if cid in RTX_5090_ONLY_CAPABILITIES or (
+            source_video_duration is not None
+            and source_video_duration > LONG_VIDEO_RTX_5090_SECONDS
+        ) else None
+    )
+    if not CONTROLLER_MODE and gpu_policy:
         try:
             async with request.app["session"].get(
                 COMFY_HTTP + "/system_stats", timeout=aiohttp.ClientTimeout(total=5)
@@ -753,9 +788,9 @@ async def api_generate(request):
                 response.raise_for_status()
                 stats = await response.json()
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，H3全能参考(高质量)仅支持 RTX 5090")
-        if not can_run_capability(cid, stats.get("devices")):
-            raise web.HTTPBadRequest(reason="H3全能参考(高质量)只能在 RTX 5090 机器上运行")
+            raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，此任务仅支持 RTX 5090")
+        if not can_run_capability(cid, stats.get("devices"), gpu_policy):
+            raise web.HTTPBadRequest(reason="此任务只能在 RTX 5090 机器上运行")
     pid = str(uuid.uuid4()) if CONTROLLER_MODE else await local_submit(request.app, graph)
     # 步骤名和权重单独放 STEPS / WEIGHTS，不塞进 job：job 每次轮询整份回给前端，
     # 59 个节点名白传
@@ -783,15 +818,17 @@ async def api_generate(request):
             if isinstance(nd, dict) and nd.get("class_type")
         }
         family = model_family(cid)
-        distributed_store(request.app).enqueue(
-            pid,
-            {"graph": graph, "assets": uploaded, "capability": cid,
-             "model_family": family},
-            required_nodes,
-        )
+        dispatch_payload = {
+            "graph": graph, "assets": uploaded, "capability": cid,
+            "model_family": family,
+        }
+        if gpu_policy:
+            dispatch_payload["gpu_policy"] = gpu_policy
+        distributed_store(request.app).enqueue(pid, dispatch_payload, required_nodes)
         ledger = cost_ledger(request.app)
         if ledger:
-            ledger.record_job(JOBS[pid], params, uploaded, graph, probe_video, family)
+            cached_probe = lambda ref: video_metadata.get(ref) or probe_video(ref)
+            ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
     save_jobs()
     return web.json_response(JOBS[pid])
 

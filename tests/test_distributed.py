@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "worker"))
 
-from distributed import DistributedStore
+from distributed import DistributedStore, RTX_5090_GPU_POLICY
 from agent import JobFailed, WorkerAgent
 
 
@@ -119,6 +119,28 @@ class DistributedStoreTest(unittest.TestCase):
                 self.store.finish("hq", self.worker_id, assignment["lease_token"], "done")
                 self.store.remove_job("hq")
                 self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+
+    def test_long_video_gpu_policy_requires_primary_rtx_5090(self):
+        self.store.enqueue("long-video", {
+            "capability": "minimax_h3_ref9",
+            "gpu_policy": RTX_5090_GPU_POLICY,
+        }, ["KSampler"])
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "NVIDIA GeForce RTX 4090"}],
+        })
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.assertEqual(self.store.db.execute(
+            "SELECT status FROM dispatch_jobs WHERE job_id = 'long-video'"
+        ).fetchone()[0], "queued")
+
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "NVIDIA GeForce RTX 5090"}],
+        })
+        assignment = self.store.acquire(self.worker_id)
+        self.assertEqual(assignment["job_id"], "long-video")
+        self.assertEqual(assignment["payload"]["gpu_policy"], RTX_5090_GPU_POLICY)
 
     def test_high_quality_gpu_rule_precedes_affinity_and_fifo(self):
         self._finish_success("warm", "minimax_h3_ref9", "minimax_h3")
