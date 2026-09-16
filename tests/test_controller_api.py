@@ -489,7 +489,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
     })
-    async def test_generate_preserves_project_and_card_names(self, _patch_graph):
+    async def test_generate_preserves_project_card_and_mode_names(self, _patch_graph):
         capability = {
             "name": "测试生成", "outputType": "image", "_graph_ok": True,
         }
@@ -504,8 +504,20 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         job = await response.json()
         self.assertEqual(job["projectName"], "广告片项目")
         self.assertEqual(job["cardName"], "主视觉")
-        listed = await (await self.client.get("/api/jobs")).json()
+        self.assertEqual(job["name"], "测试生成")
+        self.assertEqual(job["capability"], "dashboard-test")
+        with mock.patch.dict(controller_app.CAPS, {
+            "dashboard-test": {**capability, "name": "修改后的模式名称"},
+        }):
+            listed = await (await self.client.get("/api/jobs")).json()
         self.assertEqual(listed["jobs"][0]["projectName"], "广告片项目")
+        self.assertEqual(listed["jobs"][0]["name"], "测试生成")
+        with mock.patch.object(controller_app, "JOBS_FILE", Path(self.temp.name) / "jobs.json"):
+            self.old_save_jobs()
+            controller_app.JOBS.clear()
+            controller_app.load_jobs()
+        restored = await (await self.client.get("/api/jobs")).json()
+        self.assertEqual(restored["jobs"][0]["name"], "测试生成")
         costs = await (await self.client.get("/api/costs")).json()
         self.assertEqual(costs["overview"]["tasks"], 1)
         self.assertEqual(costs["jobs"][0]["project_name"], "广告片项目")
