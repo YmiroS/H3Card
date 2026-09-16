@@ -486,6 +486,89 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("server_time", health)
         self.assertIn("started_at", health)
 
+    async def test_generate_persists_every_submitted_prompt_before_completion(self):
+        controller_app.load_caps()
+        expected = {}
+        jobs_file = Path(self.temp.name) / "prompt-jobs.json"
+        with mock.patch.object(controller_app, "JOBS_FILE", jobs_file), \
+             mock.patch.object(controller_app, "save_jobs", self.old_save_jobs), \
+             mock.patch.object(controller_app, "cost_ledger", return_value=None):
+            for cid in ("zimage_t2i", "zimage_i2i", "krea2_t2i", "krea2_i2i",
+                        "minimax_h3_i2v", "minimax_h3_comic20"):
+                cap = controller_app.CAPS[cid]
+                specs = [s for s in cap["inputs"] if s["type"] == "textarea"]
+                for round_number in range(2):
+                    params = {s["key"]: f"{cid}:{s['key']} 第{round_number}轮\n中文 <tags>"
+                              for s in specs}
+                    params["seed"] = 123
+                    uploaded = {s["key"]: "chouka/test.png" for s in cap["inputs"]
+                                if s["type"] == "image"}
+                    with mock.patch.object(controller_app, "generation_assets", return_value=uploaded):
+                        response = await self.client.post("/api/generate", json={
+                            "capability": cid, "params": params, "assets": uploaded,
+                            "project": "project-1", "card": "card-1",
+                        })
+                    self.assertEqual(response.status, 200, await response.text())
+                    job = await response.json()
+                    expected[job["id"]] = [
+                        {"key": s["key"], "label": s["label"], "text": params[s["key"]]}
+                        for s in specs
+                    ]
+                    self.assertEqual(job["status"], "queued")
+                    self.assertEqual(job["prompts"], expected[job["id"]])
+                    saved = {j["id"]: j for j in json.loads(jobs_file.read_text(encoding="utf-8"))}
+                    self.assertEqual(saved[job["id"]]["prompts"], expected[job["id"]])
+            controller_app.JOBS.clear()
+            controller_app.load_jobs()
+            listed = await (await self.client.get("/api/jobs")).json()
+            self.assertEqual({j["id"]: j["prompts"] for j in listed["jobs"]}, expected)
+
+    async def test_local_prompt_snapshot_survives_restart_without_browser(self):
+        controller_app.load_caps()
+        jobs_file = Path(self.temp.name) / "local-prompt-jobs.json"
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+             mock.patch.object(controller_app, "JOBS_FILE", jobs_file), \
+             mock.patch.object(controller_app, "save_jobs", self.old_save_jobs), \
+             mock.patch.object(controller_app, "comfy_submit", return_value="local-history"):
+            response = await self.client.post("/api/generate", json={
+                "capability": "zimage_t2i", "params": {"prompt": "实际提交的提示词"},
+            })
+            self.assertEqual(response.status, 200, await response.text())
+            job = await response.json()
+            controller_app.JOBS.clear()
+            controller_app.load_jobs()
+            restored = controller_app.JOBS[job["id"]]
+            self.assertEqual(restored["status"], "canceled")
+            self.assertEqual(restored["prompts"], job["prompts"])
+            self.assertEqual(restored["prompts"][0]["text"], "实际提交的提示词")
+
+    async def test_prompt_snapshot_uses_patched_graph_defaults_and_empty_values(self):
+        controller_app.load_caps()
+        with mock.patch.object(controller_app, "cost_ledger", return_value=None):
+            for params in ({}, {"prompt": ""}):
+                response = await self.client.post("/api/generate", json={
+                    "capability": "zimage_t2i", "params": params,
+                })
+                self.assertEqual(response.status, 200, await response.text())
+                job = await response.json()
+                spec = controller_app.CAPS["zimage_t2i"]["inputs"][0]
+                graph = controller_app.patch_graph(controller_app.CAPS["zimage_t2i"], params, {})
+                text = graph[str(spec["target"]["node"])]["inputs"][spec["target"]["input"]]
+                self.assertEqual(job["prompts"][0]["text"], text)
+            with mock.patch.object(controller_app, "generation_assets", return_value={
+                "images[0]": "chouka/test.png",
+            }):
+                response = await self.client.post("/api/generate", json={
+                    "capability": "minimax_h3_comic20",
+                    "params": {"prompt": "第一组分镜", "prompt2": "没有配图，不应实际提交"},
+                })
+            self.assertEqual(response.status, 200, await response.text())
+            job = await response.json()
+            prompts = {p["key"]: p["text"] for p in job["prompts"]}
+            self.assertEqual(prompts["prompt"], "第一组分镜")
+            self.assertEqual(prompts["prompt2"], "")
+            self.assertIn("prompt6", prompts)
+
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
     })

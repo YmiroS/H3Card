@@ -748,6 +748,13 @@ async def api_generate(request):
                  "progress": 0.0, "created": time.time(),
                  "seed": params.get("_seed_used", params.get("seed")),
                  "step": "", "outputs": [], "error": None,
+                 # 按最终工作流留存每次提交的文本，包含默认值、空串及多段提示词。
+                 "prompts": [
+                     {"key": spec["key"], "label": spec["label"],
+                      "text": graph[str(spec["target"]["node"])]["inputs"][spec["target"]["input"]]}
+                     for spec in cap.get("inputs", [])
+                     if spec["type"] == "textarea" or spec["key"] == "negative_prompt"
+                 ],
                  # 任务面板要能说清"这是哪张卡在跑"，还要能点回那张卡
                  "project": body.get("project"),
                  "projectName": body.get("projectName"),
