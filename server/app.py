@@ -489,6 +489,17 @@ async def comfy_submit(session, graph):
         return json.loads(body)["prompt_id"]
 
 
+def check_local_cleanup(app):
+    if app["cleanup_pending"]:
+        raise web.HTTPConflict(text="正在停止并释放显存，或释放尚未确认；请等待或重试取消。")
+
+
+async def local_submit(app, graph):
+    async with app["comfy_lock"]:
+        check_local_cleanup(app)
+        return await comfy_submit(app["session"], graph)
+
+
 async def collect_outputs(session, pid):
     async with session.get(f"{COMFY_HTTP}/history/{pid}") as r:
         hist = await r.json()
@@ -546,11 +557,15 @@ async def handle_event(session, ev, remote=False):
     pid = d.get("prompt_id")
     job = JOBS.get(pid) if pid else None
 
+    if job and job.get("cleanup_pending"):
+        return
+
     # 失败 / 取消 / 完成都是终局。ComfyUI 报错之后还会补发 executing(node=None)、
     # progress_state 这类收尾事件，放进来会把状态改回 done —— 一次失败在界面上显示成
     # "生成成功"，卡片还挂着上一次的产物，比直接报错更难查。
     if job and job["status"] in ("error", "canceled", "done") and t in (
-            "execution_start", "executing", "execution_success", "progress_state"):
+            "execution_start", "executing", "execution_success", "progress_state",
+            "execution_error", "execution_interrupted", "execution_cached"):
         return
 
     if t == "execution_start" and job:
@@ -562,7 +577,10 @@ async def handle_event(session, ev, remote=False):
             if remote:
                 job.update(progress=max(job.get("progress") or 0.0, 0.99), step="正在归集产物")
                 return
-            job["outputs"] = await collect_outputs(session, pid)
+            outputs = await collect_outputs(session, pid)
+            if job.get("cleanup_pending") or job["status"] in ("canceled", "error"):
+                return
+            job["outputs"] = outputs
             job.update(status="done", progress=1.0, ended=time.time(), step="")
             STEPS.pop(pid, None)
             WEIGHTS.pop(pid, None)
@@ -707,6 +725,8 @@ async def generation_assets(request, assets):
 
 async def api_generate(request):
     body = await request.json()
+    if not CONTROLLER_MODE and not body.get("dry_run"):
+        check_local_cleanup(request.app)
     cid = body.get("capability")
     cap = CAPS.get(cid)
     if not cap:
@@ -736,9 +756,7 @@ async def api_generate(request):
             raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，H3全能参考(高质量)仅支持 RTX 5090")
         if not can_run_capability(cid, stats.get("devices")):
             raise web.HTTPBadRequest(reason="H3全能参考(高质量)只能在 RTX 5090 机器上运行")
-    pid = str(uuid.uuid4()) if CONTROLLER_MODE else await comfy_submit(
-        request.app["session"], graph
-    )
+    pid = str(uuid.uuid4()) if CONTROLLER_MODE else await local_submit(request.app, graph)
     # 步骤名和权重单独放 STEPS / WEIGHTS，不塞进 job：job 每次轮询整份回给前端，
     # 59 个节点名白传
     STEPS[pid] = step_labels(graph)
@@ -872,7 +890,7 @@ async def rewrite_local(request, job_name, system, user, sampling, body, t0, fel
 
     graph = rw.build_graph(system, user, sampling["max_tokens"],
                            sampling["temperature"], random.randint(0, 2 ** 31 - 1))
-    pid = await comfy_submit(request.app["session"], graph)
+    pid = await local_submit(request.app, graph)
     STEPS[pid] = step_labels(graph)
     WEIGHTS[pid] = step_weights(graph)
     JOBS[pid] = {"id": pid, "capability": "text", "name": job_name,
@@ -887,7 +905,7 @@ async def rewrite_local(request, job_name, system, user, sampling, body, t0, fel
     try:
         while job["status"] in LIVE:
             if time.time() - t0 > REWRITE_TIMEOUT:
-                await stop_job(request.app["session"], pid)
+                await stop_job(request.app, pid)
                 raise web.HTTPGatewayTimeout(
                     reason=f"改写等了 {REWRITE_TIMEOUT // 60} 分钟还没出结果，已取消")
             await asyncio.sleep(0.4)
@@ -908,9 +926,10 @@ async def rewrite_local(request, job_name, system, user, sampling, body, t0, fel
     finally:
         # 一次性任务：成了失败了都别留在任务面板里。结果和报错都当场回给了前端，
         # 面板上再挂一排「提示词优化」只会把真正在跑的出图任务挤下去
-        JOBS.pop(pid, None)
-        STEPS.pop(pid, None)
-        WEIGHTS.pop(pid, None)
+        if not job.get("cleanup_pending"):
+            JOBS.pop(pid, None)
+            STEPS.pop(pid, None)
+            WEIGHTS.pop(pid, None)
         # 落盘时它已经不在 JOBS 里了 —— 正是要的效果：跑的过程中 handle_event 顺手
         # 把它写进了文件，不擦掉的话重启后面板上会冒出一条早就结束的「提示词优化」
         save_jobs()
@@ -1152,9 +1171,14 @@ async def api_agent_event(request):
     data["prompt_id"] = pid
     event_type = event.get("type")
 
-    # 错误事件本身就是可信终态。必须在同一次请求里结束租约并释放 Worker，
-    # 不能依赖 Agent 再补一次 /failed；补报一旦断线，心跳就会把失败任务续租成 running。
+    # 新 Worker 在显存清理确认后才补报 /failed；旧 Worker 保留即时终态语义。
     if event_type in ("execution_error", "execution_interrupted"):
+        if data.get("cleanup_pending") is True:
+            job = JOBS.get(pid)
+            if job:
+                job.update(cleanup_pending=True, step="正在释放显存")
+                save_jobs()
+            return web.json_response({"ok": True, "cleanup_pending": True})
         terminal = "error" if event_type == "execution_error" else "canceled"
         store = distributed_store(request.app)
         if not store.finish(pid, worker_id, lease_token, terminal):
@@ -1218,6 +1242,8 @@ async def api_agent_complete(request):
     pid, lease_token = require_lease(request, worker_id)
     body = await request.json()
     outputs = body.get("outputs") if isinstance(body.get("outputs"), list) else []
+    if (JOBS.get(pid) or {}).get("cleanup_pending"):
+        raise web.HTTPConflict(reason="正在释放显存，等待 Worker 确认")
     if not distributed_store(request.app).finish(pid, worker_id, lease_token, "done"):
         raise web.HTTPConflict(reason="任务无法完成")
     ended_at = time.time()
@@ -1254,6 +1280,7 @@ async def api_agent_failed(request):
     if not already_terminal:
         if job:
             job.update(status=dispatch_status, step="", ended=ended_at,
+                       cleanup_pending=False,
                        worker_id=worker_id, error=None if canceled else str(body.get("error") or "Worker 执行失败")[:2000])
             STEPS.pop(pid, None)
             WEIGHTS.pop(pid, None)
@@ -1325,7 +1352,9 @@ def load_jobs():
         return
     cut = 0
     for j in rows:
-        if j.get("status") in LIVE and not CONTROLLER_MODE:
+        if j.get("cleanup_pending") and not CONTROLLER_MODE:
+            j.update(step="显存释放未确认，请重试取消")
+        elif j.get("status") in LIVE and not CONTROLLER_MODE:
             j.update(status="canceled", step="", ended=j.get("ended") or time.time(),
                      error="抽卡系统重启了，这一轮没跑完（重启前的进度不留，重跑一次就行）")
             cut += 1
@@ -1337,7 +1366,7 @@ def load_jobs():
 async def stop_job(app, pid):
     """停止本地任务，或向远端 Worker 发出取消请求。"""
     job = JOBS.get(pid)
-    if job and job["status"] not in LIVE:
+    if job and job["status"] not in LIVE and not job.get("cleanup_pending"):
         return "finished"
     if CONTROLLER_MODE:
         state = distributed_store(app).request_cancel(pid)
@@ -1350,19 +1379,51 @@ async def stop_job(app, pid):
             if ledger:
                 ledger.finish_job(pid, "canceled", ended_at)
         return state
-    session = app["session"]
-    if job and job["status"] == "running":
-        async with session.post(COMFY_HTTP + "/interrupt") as r:
-            await r.read()
-    else:
-        async with session.post(COMFY_HTTP + "/queue",
-                                json={"delete": [pid]}) as r:
-            await r.read()
-    if job:
-        job["status"] = "canceled"
-        job["step"] = ""
-        save_jobs()
+    if job is None:
+        raise web.HTTPNotFound(reason="任务不存在")
+    async with app["comfy_lock"]:
+        if job["status"] not in LIVE and not job.get("cleanup_pending"):
+            return "finished"
+        task = app["cleanup_tasks"].get(pid)
+        if task is None or task.done():
+            app["cleanup_pending"].add(pid)
+            job.update(cleanup_pending=True, step="正在停止并释放显存", error=None)
+            save_jobs()
+            task = asyncio.create_task(cancel_local_and_release(app, pid))
+            app["cleanup_tasks"][pid] = task
+    # HTTP 客户端断开不能取消实际清理，也不能提前放开提交门禁。
+    if not await asyncio.shield(task):
+        raise web.HTTPServiceUnavailable(text="显存释放未确认，请检查 ComfyUI 后重试取消。")
     return "canceled"
+
+
+async def cancel_local_and_release(app, pid):
+    job = JOBS.get(pid)
+    try:
+        async with app["session"].post(
+            f"{COMFY_HTTP}/api/jobs/{pid}/cancel", json={"free_memory": True},
+            timeout=aiohttp.ClientTimeout(total=130, sock_connect=10),
+        ) as response:
+            response.raise_for_status()
+            ack = await response.json()
+        if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
+                or not isinstance(ack.get("cancelled"), bool)):
+            raise ValueError("ComfyUI 未确认 cleanup_complete")
+    except Exception as exc:
+        if job:
+            job.update(step="显存释放未确认，请重试取消",
+                       error=f"显存释放未确认，请检查 ComfyUI 后重试取消：{exc}")
+            save_jobs()
+        return False
+    if job:
+        job.update(status="canceled", cleanup_pending=False, step="", error=None,
+                   ended=time.time())
+        STEPS.pop(pid, None)
+        WEIGHTS.pop(pid, None)
+        save_jobs()
+    app["cleanup_pending"].discard(pid)
+    app["cleanup_tasks"].pop(pid, None)
+    return True
 
 
 async def api_cancel(request):
@@ -1373,6 +1434,8 @@ async def api_cancel(request):
 async def api_job_delete(request):
     """从任务列表里抹掉一条；远端运行中的任务需先等待 Worker 确认取消。"""
     pid = request.match_info["pid"]
+    if (JOBS.get(pid) or {}).get("cleanup_pending"):
+        return web.json_response({"ok": True, "pending": True})
     state = await stop_job(request.app, pid)
     if CONTROLLER_MODE and state == "cancel_requested":
         return web.json_response({"ok": True, "pending": True})
@@ -1387,7 +1450,8 @@ async def api_job_delete(request):
 
 async def api_jobs_clear(request):
     """一键清掉所有已结束的任务（成功/失败/已取消），还在跑和排队的留着。"""
-    gone = [pid for pid, j in JOBS.items() if j["status"] not in LIVE]
+    gone = [pid for pid, j in JOBS.items()
+            if j["status"] not in LIVE and not j.get("cleanup_pending")]
     for pid in gone:
         JOBS.pop(pid, None)
         STEPS.pop(pid, None)
@@ -1600,10 +1664,12 @@ async def on_start(app):
 
 
 async def on_stop(app):
+    await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
     await app["video_previews"].close()
     task = app.get("ws_task")
     if task:
         task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     await app["session"].close()
     ledger = app.get("costs")
     if ledger:
@@ -1658,6 +1724,10 @@ def make_app():
     n = load_caps()
     load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2)
+    app["comfy_lock"] = asyncio.Lock()
+    app["cleanup_pending"] = {pid for pid, job in JOBS.items()
+                              if job.get("cleanup_pending") and not CONTROLLER_MODE}
+    app["cleanup_tasks"] = {}
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
     )
