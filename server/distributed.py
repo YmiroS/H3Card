@@ -3,7 +3,6 @@
 import hashlib
 import hmac
 import json
-import re
 import secrets
 import sqlite3
 import threading
@@ -14,21 +13,36 @@ from pathlib import Path
 
 LIVE_DISPATCH = ("assigned", "running", "cancel_requested")
 FINISHED_DISPATCH = ("done", "error", "canceled")
-RTX_5090_ONLY_CAPABILITIES = frozenset({"minimax_h3_ref_2pass"})
-RTX_5090_GPU_POLICY = "primary_rtx_5090"
+HIGH_VRAM_CAPABILITIES = frozenset({"minimax_h3_ref_2pass"})
+HIGH_VRAM_GPU_POLICY = "primary_gpu_vram_gte_32gb"
+MIN_HIGH_QUALITY_VRAM_BYTES = 32_000_000_000
+
+
+def primary_gpu_vram_bytes(devices):
+    # ComfyUI 的 devices[0] 是实际执行的主设备，不能用机器名或其他闲置显卡放行。
+    if not isinstance(devices, list) or not devices or not isinstance(devices[0], dict):
+        return 0
+    primary = devices[0]
+    if primary.get("type") != "cuda":
+        return 0
+    for key in ("vram_total", "torch_vram_total"):
+        try:
+            value = int(primary.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if value > 0:
+            return value
+    return 0
+
+
+def requires_high_vram(capability, gpu_policy=None):
+    return capability in HIGH_VRAM_CAPABILITIES or gpu_policy == HIGH_VRAM_GPU_POLICY
 
 
 def can_run_capability(capability, devices, gpu_policy=None):
-    if (capability not in RTX_5090_ONLY_CAPABILITIES
-            and gpu_policy != RTX_5090_GPU_POLICY):
+    if not requires_high_vram(capability, gpu_policy):
         return True
-    # ComfyUI 的 devices[0] 是实际执行的主设备，不能用机器名或其他闲置显卡放行。
-    if not isinstance(devices, list) or not devices or not isinstance(devices[0], dict):
-        return False
-    primary = devices[0]
-    return primary.get("type") == "cuda" and bool(
-        re.search(r"\bRTX\s*5090D?\b", str(primary.get("name") or ""), re.IGNORECASE)
-    )
+    return primary_gpu_vram_bytes(devices) >= MIN_HIGH_QUALITY_VRAM_BYTES
 
 
 def _hash_token(token):
@@ -258,6 +272,16 @@ class DistributedStore:
                 return None
             capabilities = json.loads(worker["capabilities_json"] or "{}")
             available_nodes = set(capabilities.get("node_classes") or [])
+            current_vram = primary_gpu_vram_bytes(capabilities.get("devices"))
+            idle_workers = self.db.execute(
+                """SELECT id, capabilities_json FROM workers
+                   WHERE id != ? AND enabled = 1 AND comfy_online = 1
+                     AND busy = 0 AND current_job_id IS NULL AND last_seen >= ?""",
+                (worker_id, now - self.offline_seconds),
+            ).fetchall()
+            idle_capabilities = [
+                json.loads(item["capabilities_json"] or "{}") for item in idle_workers
+            ]
             rows = self.db.execute(
                 "SELECT * FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
             ).fetchall()
@@ -265,11 +289,20 @@ class DistributedStore:
             for row in rows:
                 required = set(json.loads(row["required_nodes_json"] or "[]"))
                 payload = json.loads(row["payload_json"])
-                if required.issubset(available_nodes) and can_run_capability(
-                    payload.get("capability"), capabilities.get("devices"),
-                    payload.get("gpu_policy"),
+                capability = payload.get("capability")
+                gpu_policy = payload.get("gpu_policy")
+                if not required.issubset(available_nodes) or not can_run_capability(
+                    capability, capabilities.get("devices"), gpu_policy,
                 ):
-                    eligible.append((row, payload))
+                    continue
+                if requires_high_vram(capability, gpu_policy) and any(
+                    primary_gpu_vram_bytes(other.get("devices")) > current_vram
+                    and required.issubset(set(other.get("node_classes") or []))
+                    and can_run_capability(capability, other.get("devices"), gpu_policy)
+                    for other in idle_capabilities
+                ):
+                    continue
+                eligible.append((row, payload))
             if not eligible:
                 return None
 
