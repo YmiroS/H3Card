@@ -645,7 +645,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual("gpu_policy" in payload, expects_policy)
                     if expects_policy:
                         self.assertEqual(
-                            payload["gpu_policy"], controller_app.RTX_5090_GPU_POLICY
+                            payload["gpu_policy"], controller_app.HIGH_VRAM_GPU_POLICY
                         )
 
             with mock.patch.object(controller_app, "probe_video", return_value={}):
@@ -658,7 +658,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
     })
-    async def test_high_quality_h3_dispatches_only_to_rtx_5090(self, _patch_graph):
+    async def test_high_quality_h3_dispatches_to_gpu_with_at_least_32gb(self, _patch_graph):
         capability = {"name": "H3全能参考(高质量)", "outputType": "video", "_graph_ok": True}
         with mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
             response = await self.client.post("/api/generate", json={
@@ -666,9 +666,11 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             })
         self.assertEqual(response.status, 200)
         job = await response.json()
-        for gpu, status in (("RTX 4090", 204), ("RTX 5090", 200)):
+        gib = 1024 ** 3
+        for gpu, vram, status in (("RTX 4090", 24 * gib, 204), ("RTX A6000", 48 * gib, 200)):
             credentials = self.store.register_worker(gpu, {
-                "node_classes": ["KSampler"], "devices": [{"type": "cuda", "name": gpu}],
+                "node_classes": ["KSampler"],
+                "devices": [{"type": "cuda", "name": gpu, "vram_total": vram}],
             })
             self.store.heartbeat(credentials["worker_id"], comfy_online=True)
             response = await self.client.post("/agent/v1/jobs/acquire", json={}, headers={
@@ -695,11 +697,16 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         stats_response.json = mock.AsyncMock()
         with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
              mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
-            for gpu, status in (("RTX 4090", 400), (None, 400), ("RTX 5090", 200)):
+            gib = 1024 ** 3
+            for gpu, vram, status in (
+                ("RTX 4090", 24 * gib, 400), (None, 0, 400), ("RTX A6000", 48 * gib, 200),
+            ):
                 with self.subTest(gpu=gpu):
                     submit.reset_mock()
                     stats_response.json.return_value = {
-                        "devices": [{"type": "cuda", "name": gpu}] if gpu else [],
+                        "devices": [{
+                            "type": "cuda", "name": gpu, "vram_total": vram,
+                        }] if gpu else [],
                     }
                     response = await self.client.post("/api/generate", json={
                         "capability": "minimax_h3_ref_2pass",
@@ -709,7 +716,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
                         submit.assert_awaited_once()
                     else:
                         submit.assert_not_awaited()
-                        self.assertIn("RTX 5090", await response.text())
+                        self.assertIn("32GB", await response.text())
 
             submit.reset_mock()
             stats_response.json.side_effect = TimeoutError()
@@ -746,11 +753,14 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(
                  controller_app, "probe_video", return_value={"duration": 10.001}
              ):
-            for gpu, status in (("RTX 4090", 400), ("RTX 5090", 200)):
+            gib = 1024 ** 3
+            for gpu, vram, status in (("RTX 4090", 24 * gib, 400), ("RTX A6000", 48 * gib, 200)):
                 with self.subTest(gpu=gpu):
                     submit.reset_mock()
                     stats_response.json.return_value = {
-                        "devices": [{"type": "cuda", "name": gpu}],
+                        "devices": [{
+                            "type": "cuda", "name": gpu, "vram_total": vram,
+                        }],
                     }
                     response = await self.client.post("/api/generate", json={
                         "capability": "video-ref", "params": {}, "assets": assets,
