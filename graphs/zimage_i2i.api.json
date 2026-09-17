@@ -71,7 +71,7 @@
   }
  },
  "73": {
-  "class_type": "VAEEncode",
+  "class_type": "VAEEncodeTiled",
   "inputs": {
    "pixels": [
     "63",
@@ -80,10 +80,14 @@
    "vae": [
     "33",
     0
-   ]
+   ],
+   "tile_size": 512,
+   "overlap": 64,
+   "temporal_size": 64,
+   "temporal_overlap": 8
   },
   "_meta": {
-   "title": "VAE Encode"
+   "title": "VAE Encode (Tiled)"
   }
  },
  "31": {
@@ -191,10 +195,7 @@
    "method": "lanczos",
    "round_to_multiple": "8",
    "scale_to_side": "longest",
-   "scale_to_length": [
-    "65",
-    0
-   ],
+   "scale_to_length": 2048,
    "background_color": "#000000"
   },
   "_meta": {
@@ -259,7 +260,7 @@
    "max_frames": 24,
    "max_size": 256,
    "seed": 1,
-   "force_offload": false,
+   "force_offload": true,
    "save_states": false
   },
   "_meta": {
