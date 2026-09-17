@@ -41,7 +41,7 @@ import llm
 import translate as tr
 from costs import CostLedger
 from distributed import (
-    DistributedStore, RTX_5090_GPU_POLICY, RTX_5090_ONLY_CAPABILITIES,
+    DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     can_run_capability,
 )
 from video_preview import VideoPreviews, preview_status, preview_file
@@ -58,7 +58,7 @@ if EXECUTION_MODE not in ("local", "controller"):
 CONTROLLER_MODE = EXECUTION_MODE == "controller"
 ENROLLMENT_TOKEN = os.environ.get("CHOUKA_ENROLLMENT_TOKEN", "")
 ARTIFACT_DIR = ROOT / "data" / "artifacts"
-LONG_VIDEO_RTX_5090_SECONDS = 10
+LONG_VIDEO_HIGH_VRAM_SECONDS = 10
 
 MODEL_FAMILY = {
     **{cap: "minimax_h3" for cap in (
@@ -774,10 +774,10 @@ async def api_generate(request):
                      if k not in graph[n]["inputs"]})
         return web.json_response({"dry_run": True, "changed": diff})
     gpu_policy = (
-        RTX_5090_GPU_POLICY
-        if cid in RTX_5090_ONLY_CAPABILITIES or (
+        HIGH_VRAM_GPU_POLICY
+        if cid in HIGH_VRAM_CAPABILITIES or (
             source_video_duration is not None
-            and source_video_duration > LONG_VIDEO_RTX_5090_SECONDS
+            and source_video_duration > LONG_VIDEO_HIGH_VRAM_SECONDS
         ) else None
     )
     if not CONTROLLER_MODE and gpu_policy:
@@ -788,9 +788,9 @@ async def api_generate(request):
                 response.raise_for_status()
                 stats = await response.json()
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，此任务仅支持 RTX 5090")
+            raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，此任务要求主 GPU 显存至少 32GB")
         if not can_run_capability(cid, stats.get("devices"), gpu_policy):
-            raise web.HTTPBadRequest(reason="此任务只能在 RTX 5090 机器上运行")
+            raise web.HTTPBadRequest(reason="此任务只能在主 GPU 显存至少 32GB 的机器上运行")
     pid = str(uuid.uuid4()) if CONTROLLER_MODE else await local_submit(request.app, graph)
     # 步骤名和权重单独放 STEPS / WEIGHTS，不塞进 job：job 每次轮询整份回给前端，
     # 59 个节点名白传

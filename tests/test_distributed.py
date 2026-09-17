@@ -15,7 +15,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "worker"))
 
-from distributed import DistributedStore, RTX_5090_GPU_POLICY
+from distributed import DistributedStore, HIGH_VRAM_GPU_POLICY
 from agent import JobFailed, WorkerAgent
 
 
@@ -89,30 +89,41 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(capabilities["node_classes"], ["KSampler", "SaveImage"])
         self.assertEqual(capabilities["telemetry"], telemetry)
 
-    def test_high_quality_h3_requires_primary_rtx_5090(self):
+    def test_high_quality_h3_requires_32gb_primary_cuda_gpu(self):
         self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+        gb = 1000 ** 3
+        gib = 1024 ** 3
         rejected = [
             None, [], [{}],
-            [{"type": "cuda", "name": "NVIDIA GeForce RTX 4090"}],
-            [{"type": "cuda", "name": "NVIDIA GeForce RTX 50900"}],
-            [{"type": "cpu", "name": "RTX 5090"}],
-            [{"type": "cuda", "name": "RTX 4090"}, {"type": "cuda", "name": "RTX 5090"}],
+            [{"type": "cuda", "name": "RTX 5090"}],
+            [{"type": "cuda", "name": "RTX 4090", "vram_total": 24 * gib}],
+            [{"type": "cuda", "name": "GPU", "vram_total": 32 * gb - 1}],
+            [{"type": "cpu", "name": "A6000", "vram_total": 48 * gib}],
+            [
+                {"type": "cuda", "name": "RTX 4090", "vram_total": 24 * gib},
+                {"type": "cuda", "name": "A6000", "vram_total": 48 * gib},
+            ],
         ]
         for devices in rejected:
             with self.subTest(devices=devices):
                 self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
                     "node_classes": ["KSampler"], "devices": devices,
-                    "telemetry": {"hostname": "GPU-5090", "gpus": [{"name": "RTX 5090"}]},
                 })
                 self.assertIsNone(self.store.acquire(self.worker_id))
                 self.assertEqual(self.store.db.execute(
                     "SELECT status FROM dispatch_jobs WHERE job_id = 'hq'"
                 ).fetchone()[0], "queued")
 
-        for name in ("cuda:0 NVIDIA GeForce RTX 5090 : cudaMallocAsync", "NVIDIA GeForce RTX 5090 D", "rtx 5090d"):
+        accepted = (
+            ("exact 32GB", 32 * gb),
+            ("live RTX 5090 D", 34_190_458_880),
+            ("RTX A6000", 48 * gib),
+        )
+        for name, vram in accepted:
             with self.subTest(name=name):
                 self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
-                    "node_classes": ["KSampler"], "devices": [{"type": "cuda", "name": name}],
+                    "node_classes": ["KSampler"],
+                    "devices": [{"type": "cuda", "name": name, "vram_total": vram}],
                 })
                 assignment = self.store.acquire(self.worker_id)
                 self.assertEqual(assignment["job_id"], "hq")
@@ -120,14 +131,15 @@ class DistributedStoreTest(unittest.TestCase):
                 self.store.remove_job("hq")
                 self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
 
-    def test_long_video_gpu_policy_requires_primary_rtx_5090(self):
+    def test_long_video_gpu_policy_requires_32gb_primary_cuda_gpu(self):
+        gib = 1024 ** 3
         self.store.enqueue("long-video", {
             "capability": "minimax_h3_ref9",
-            "gpu_policy": RTX_5090_GPU_POLICY,
+            "gpu_policy": HIGH_VRAM_GPU_POLICY,
         }, ["KSampler"])
         self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
             "node_classes": ["KSampler"],
-            "devices": [{"type": "cuda", "name": "NVIDIA GeForce RTX 4090"}],
+            "devices": [{"type": "cuda", "name": "RTX 4090", "vram_total": 24 * gib}],
         })
         self.assertIsNone(self.store.acquire(self.worker_id))
         self.assertEqual(self.store.db.execute(
@@ -136,11 +148,44 @@ class DistributedStoreTest(unittest.TestCase):
 
         self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
             "node_classes": ["KSampler"],
-            "devices": [{"type": "cuda", "name": "NVIDIA GeForce RTX 5090"}],
+            "devices": [{"type": "cuda", "name": "RTX A6000", "vram_total": 48 * gib}],
         })
         assignment = self.store.acquire(self.worker_id)
         self.assertEqual(assignment["job_id"], "long-video")
-        self.assertEqual(assignment["payload"]["gpu_policy"], RTX_5090_GPU_POLICY)
+        self.assertEqual(assignment["payload"]["gpu_policy"], HIGH_VRAM_GPU_POLICY)
+
+    def test_high_quality_h3_prefers_idle_worker_with_more_vram(self):
+        gib = 1024 ** 3
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "RTX 5090", "vram_total": 32 * gib}],
+        })
+        larger = self.store.register_worker("GPU-A6000", {
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "RTX A6000", "vram_total": 48 * gib}],
+        })
+        self.store.heartbeat(larger["worker_id"], comfy_online=True)
+        self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        assignment = self.store.acquire(larger["worker_id"])
+        self.assertEqual(assignment["job_id"], "hq")
+
+    def test_incompatible_larger_worker_does_not_block_high_vram_worker(self):
+        gib = 1024 ** 3
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "RTX 5090", "vram_total": 32 * gib}],
+        })
+        larger = self.store.register_worker("GPU-A6000", {
+            "node_classes": ["SaveImage"],
+            "devices": [{"type": "cuda", "name": "RTX A6000", "vram_total": 48 * gib}],
+        })
+        self.store.heartbeat(larger["worker_id"], comfy_online=True)
+        self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+
+        assignment = self.store.acquire(self.worker_id)
+        self.assertEqual(assignment["job_id"], "hq")
 
     def test_high_quality_gpu_rule_precedes_affinity_and_fifo(self):
         self._finish_success("warm", "minimax_h3_ref9", "minimax_h3")
@@ -162,10 +207,12 @@ class DistributedStoreTest(unittest.TestCase):
                 self.store.remove_job("ordinary")
                 self.store.enqueue("ordinary", {"capability": "zimage_t2i"}, ["KSampler"])
 
-    def test_rtx_5090_still_needs_required_nodes(self):
+    def test_high_vram_worker_still_needs_required_nodes(self):
         self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
             "node_classes": ["KSampler"],
-            "devices": [{"type": "cuda", "name": "NVIDIA GeForce RTX 5090"}],
+            "devices": [{
+                "type": "cuda", "name": "RTX A6000", "vram_total": 48 * 1024 ** 3,
+            }],
         })
         self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["MissingNode"])
         self.assertIsNone(self.store.acquire(self.worker_id))
