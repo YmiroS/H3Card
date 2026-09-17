@@ -2269,7 +2269,7 @@ function bindGlobal() {
     if (!PROJ) return;
     ev.preventDefault();
     const w = toWorld(ev.clientX, ev.clientY);
-    const k = Math.min(2, Math.max(0.25, view.k * (ev.deltaY < 0 ? 1.1 : 1 / 1.1)));
+    const k = Math.min(2, Math.max(0.1, view.k * (ev.deltaY < 0 ? 1.1 : 1 / 1.1)));
     const r = el.stage.getBoundingClientRect();
     view.x = ev.clientX - r.left - w.x * k;
     view.y = ev.clientY - r.top - w.y * k;
@@ -2350,14 +2350,14 @@ function bindGlobal() {
           try {
             const r = await fetch("/api/upload", { method: "POST", body: fd });
             if (!r.ok) throw new Error(await r.text());
-            const asset = await r.json();
+            const { files } = await r.json();
+            const item = files[0];
             const assetCard = CARDS.find(d => d.kind === "asset");
             if (!assetCard) return toast("找不到素材节点定义");
             const c = addCard(assetCard.id, at.x, at.y, assetCard.modes[0].id);
-            c.outputs = [asset];
-            paintCard(c);
-            save();
-            toast("已上传：" + asset.filename);
+            if (!c) return;
+            await setAssetItem(c, item);
+            toast("已上传：" + item.origin);
           } catch (err) {
             toast("上传失败：" + err.message);
           }
@@ -2509,6 +2509,8 @@ function bindGlobal() {
       { icon: "1:1", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); save(); } },
       { icon: "−", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); save(); } },
       { icon: "−", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); save(); } },
+      { icon: "−", text: "缩小 (25%)", run: () => { view.k = 0.25; applyView(); placePanel(); save(); } },
+      { icon: "−", text: "缩小 (10%)", run: () => { view.k = 0.1; applyView(); placePanel(); save(); } },
       { icon: "□", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); } },
     ];
     showMenu(ev.clientX, ev.clientY - 200, "缩放", items);
@@ -5419,10 +5421,12 @@ function pickAsset(c, onItem) {
 
 /** 把上传接口回来的那一份（无 filename 键）抄进素材节点的 outputs[0]，
     并补一个 filename —— 画面区 meta 行、下载都按产物那套读它。
-    图片/视频加载完后按原始比例缩小一半显示。 */
+    卡片保持默认尺寸，图片/视频在画面区内等比例完整显示。 */
 async function setAssetItem(c, item) {
   c.outputs = [{ ...item, filename: (item.origin || item.url).split(/[\\/]/).pop() }];
-  paint(c); paintTitle(c); openPanel(c.id); save();
+  delete c.w; delete c.h;
+  applySize(c);
+  paint(c); paintTitle(c); openPanel(c.id); drawWires(); save();
 
   // 同步更新所有引用这个素材节点的下游节点。上游曾清空过时下游格也会是空的，
   // 不能拿“当前有值”当条件，否则重新选择文件后连线还在、引用却恢复不了。
@@ -5436,16 +5440,15 @@ async function setAssetItem(c, item) {
     paintKind(to);
   }
 
-  // 加载媒体获取原始尺寸，缩小一半显示
+  // 原始尺寸只用于分辨率信息，不改变卡片大小。
   if (item.kind === "image") {
     const img = new Image();
     img.onload = () => {
+      if (c.outputs[0]?.url !== item.url) return;
       const w0 = img.naturalWidth, h0 = img.naturalHeight;
-      c.w = Math.round(w0 / 2);
-      c.h = Math.round(h0 / 2);
       c.outputs[0].width = w0;   // 存原始尺寸，paintKind 会读它
       c.outputs[0].height = h0;
-      applySize(c); paintKind(c); save();
+      paintKind(c); save();
     };
     img.src = item.url;
   } else if (item.kind === "video") {
@@ -5453,11 +5456,9 @@ async function setAssetItem(c, item) {
     v.onloadedmetadata = () => {
       if (c.outputs[0]?.url !== item.url) return;
       const w0 = v.videoWidth, h0 = v.videoHeight;
-      c.w = Math.round(w0 / 2);
-      c.h = Math.round(h0 / 2);
       c.outputs[0].width = w0;
       c.outputs[0].height = h0;
-      applySize(c); paintKind(c); save();
+      paintKind(c); save();
     };
     prepareVideo(v, item.url);
   }
