@@ -1,7 +1,6 @@
 import asyncio
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -12,39 +11,44 @@ from aiohttp.test_utils import TestClient, TestServer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
+sys.path.insert(0, str(ROOT / "tests"))
 import app as controller_app
-from video_preview import VideoPreviews, preview_status, preview_file
+import auth_support
+from video_preview import VideoPreviews
 
 
-class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
+class VideoPreviewTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def asyncSetUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.root = Path(self.temp.name)
+        self.auth_setup()
         self.uploads = self.root / "data" / "uploads"
         self.uploads.mkdir(parents=True)
         self.previews = VideoPreviews(
             self.uploads, controller_app.ffmpeg_bin, controller_app.VID_EXT,
         )
-        app = web.Application()
+        self.old_project_dir = controller_app.PROJ_DIR
+        controller_app.PROJ_DIR = self.root / "data" / "projects"
+        self.own_project("p")
+        app = self.build_app()
         app["video_previews"] = self.previews
         app["session"] = object()
         app["distributed"] = mock.Mock()
         app.router.add_post("/api/upload", controller_app.api_upload)
         app.router.add_post("/api/generate", controller_app.api_generate)
-        app.router.add_get("/api/preview/{name}/file", preview_file)
-        app.router.add_get("/api/preview/{name}", preview_status)
-        app.router.add_static("/api/upload/", self.uploads)
-        self.client = TestClient(TestServer(app))
-        await self.client.start_server()
+        app.router.add_get("/api/preview/{name}/file", controller_app.api_preview_file)
+        app.router.add_get("/api/preview/{name}", controller_app.api_preview_status)
+        app.router.add_get("/api/upload/{name}", controller_app.api_upload_file)
+        await self.start_client(app)
 
     async def asyncTearDown(self):
         await self.previews.close()
         await self.client.close()
-        self.temp.cleanup()
+        controller_app.PROJ_DIR = self.old_project_dir
+        self.auth_teardown()
 
     def source(self, name="ck_123456789abc.mov", data=b"original"):
         path = self.uploads / name
         path.write_bytes(data)
+        self.register_asset(name)
         return path
 
     async def test_missing_ffmpeg_keeps_original_and_reports_error(self):
@@ -57,7 +61,7 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
         state = await response.json()
         self.assertEqual(state["status"], "error")
         self.assertIn("FFmpeg", state["error"])
-        self.assertEqual(response.headers["Cache-Control"], "no-store")
+        self.assertIn("no-store", response.headers["Cache-Control"])
         self.assertEqual(path.read_bytes(), b"original")
         self.assertFalse(self.previews.target(path.name).exists())
         response = await self.client.get(f"/api/preview/{path.name}/file")
@@ -147,7 +151,8 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(controller_app, "probe_video", return_value={}), \
              mock.patch.object(controller_app, "comfy_upload", new_callable=mock.AsyncMock) as upload:
             upload.return_value = "chouka/original.mov"
-            response = await self.client.post("/api/upload", data=form)
+            response = await self.client.post(
+                "/api/upload", data=form, params={"project": "p"}, headers=self.headers)
         asset = (await response.json())["files"][0]
         self.assertTrue(asset["ref"].startswith("chouka/ck_"))
         self.assertTrue(asset["ref"].endswith(".mov"))
@@ -200,7 +205,8 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
                 "target": {"node": "1", "input": "video"},
             }],
         }
-        body = {"capability": "test-video", "assets": {"video[0]": f"chouka/{original.name}"}}
+        body = {"capability": "test-video", "assets": {"video[0]": f"chouka/{original.name}"},
+                "project": "p"}
         with mock.patch.object(controller_app, "ROOT", self.root), \
              mock.patch.object(controller_app, "CONTROLLER_MODE", True), \
              mock.patch.dict(controller_app.CAPS, {"test-video": cap}), \
@@ -208,7 +214,7 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(controller_app, "STEPS", {}), \
              mock.patch.object(controller_app, "WEIGHTS", {}), \
              mock.patch.object(controller_app, "save_jobs"):
-            response = await self.client.post("/api/generate", json=body)
+            response = await self.client.post("/api/generate", json=body, headers=self.headers)
         self.assertEqual(response.status, 200, await response.text())
         payload = self.client.server.app["distributed"].enqueue.call_args.args[1]
         expected = f"chouka/{converted.name}"
@@ -221,13 +227,15 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
     async def test_generation_rejects_pending_or_failed_transcode(self):
         original = self.source()
         cap = {"id": "test-video", "_graph_ok": True}
-        body = {"capability": "test-video", "assets": {"video[0]": f"chouka/{original.name}"}}
+        body = {"capability": "test-video", "assets": {"video[0]": f"chouka/{original.name}"},
+                "project": "p"}
         for state, status in (({"status": "processing"}, 409),
                               ({"status": "error", "error": "转码失败"}, 422)):
             with self.subTest(state=state), \
                  mock.patch.dict(controller_app.CAPS, {"test-video": cap}), \
                  mock.patch.object(self.previews, "ensure", return_value=state):
-                response = await self.client.post("/api/generate", json=body)
+                response = await self.client.post(
+                    "/api/generate", json=body, headers=self.headers)
                 self.assertEqual(response.status, status)
                 self.assertIn("转码", await response.text())
         self.client.server.app["distributed"].enqueue.assert_not_called()
@@ -269,7 +277,8 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
         form.add_field("file", original, filename="原片.MOV", content_type="video/quicktime")
         with mock.patch.object(controller_app, "ROOT", self.root), \
              mock.patch.object(controller_app, "CONTROLLER_MODE", True):
-            response = await self.client.post("/api/upload", data=form)
+            response = await self.client.post(
+                "/api/upload", data=form, params={"project": "p"}, headers=self.headers)
         self.assertEqual(response.status, 200)
         asset = (await response.json())["files"][0]
         name = asset["url"].rsplit("/", 1)[1]
@@ -296,6 +305,7 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.object(controller_app, "CONTROLLER_MODE", True):
             refs = await controller_app.generation_assets(
                 mock.Mock(app=self.client.server.app), {"video[0]": asset["ref"]},
+                project_id="p",
             )
         self.assertEqual(refs["video[0]"], f"chouka/{name}.browser.mp4")
         worker_download = await self.client.get(f"/api/upload/{Path(refs['video[0]']).name}")

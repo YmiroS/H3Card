@@ -85,7 +85,9 @@ tr:last-child td { border-bottom:0; }
   <h1>运行面板</h1>
   <span id="refresh-state" class="state">正在读取...</span>
   <a href="/controller/costs">费用统计</a>
+  <a href="/admin/permissions">权限管理</a>
   <a href="/">打开 Chouka Web</a>
+  <span id="account" class="account-bar"></span>
   <button id="refresh">立即刷新</button>
 </header>
 <main>
@@ -119,15 +121,14 @@ tr:last-child td { border-bottom:0; }
     <div class="scroll"><table><tbody id="config-rows"></tbody></table></div>
   </section>
 </main>
+<script src="/auth.js"></script>
 <script>
 const STATUS = {idle:"空闲",busy:"忙碌",offline:"离线",disabled:"已禁用",error:"异常",queued:"排队中",assigned:"已分配",running:"运行中",done:"已完成",canceled:"已取消",cancel_requested:"正在取消"};
 const $ = id => document.getElementById(id);
 const text = (id,value) => { $(id).textContent = value; };
 
 async function get(path) {
-  const response = await fetch(path,{cache:"no-store"});
-  if (!response.ok) throw new Error(`${path} 返回 HTTP ${response.status}`);
-  return response.json();
+  return H3Auth.request(path,{cache:"no-store"});
 }
 function cls(state) { return ["idle","done"].includes(state) ? "ok" : ["busy","running","queued","assigned","cancel_requested"].includes(state) ? "warn" : ["offline","disabled","error","canceled"].includes(state) ? "bad" : ""; }
 function when(value) { return value ? new Date(value*1000).toLocaleString("zh-CN",{hour12:false}) : "--"; }
@@ -374,8 +375,13 @@ async function refresh() {
   }
 }
 $("refresh").onclick=refresh;
-refresh();
-setInterval(refresh,5000);
+H3Auth.requireUser(true).then(() => {
+  H3Auth.mountAccount($("account"));
+  refresh();
+  H3Auth.every(refresh,5000);
+}).catch(error => {
+  $("error").textContent=error.message; $("error").style.display="block";
+});
 </script>
 </body>
 </html>

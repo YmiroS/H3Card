@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 抽卡系统</title><link rel="icon" type="image/png" href="favicon.png"><link rel="stylesheet" href="/style.css"></head>
+<body class="auth-page auth-login">
+<main class="login-card">
+  <div class="brandmark"><img src="icon.png" alt=""><b>抽卡系统</b></div>
+  <p class="login-sub">账号由管理员创建或审批开通</p>
+  <form id="login">
+    <label class="fld"><span>账号</span><input name="username" autocomplete="username" required autofocus></label>
+    <label class="fld"><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label>
+    <p id="error" role="alert"></p>
+    <button class="btn primary" type="submit" disabled>登录</button>
+    <button class="btn" type="button" id="to-register">注册账号</button>
+  </form>
+  <p id="register-done" class="login-sub" role="status" hidden></p>
+</main>
+<dialog id="register-dialog" class="auth-dialog" aria-labelledby="register-heading">
+  <form id="register">
+    <h2 id="register-heading">注册账号</h2>
+    <label class="fld"><span>登录账号</span><input name="username" autocomplete="username" required></label>
+    <label class="fld"><span>真实姓名 / 花名</span><input name="display_name" required maxlength="64"></label>
+    <label class="fld"><span>密码（至少 12 位）</span><input name="password" type="password" autocomplete="new-password" required minlength="12"></label>
+    <label class="fld"><span>再输一次密码</span><input name="confirm_password" type="password" autocomplete="new-password" required minlength="12"></label>
+    <p id="register-error" role="alert"></p>
+    <p class="auth-note">请填写真实姓名或花名，审批通过后才能登录。</p>
+    <footer>
+      <button class="btn" type="button" id="to-login">取消</button>
+      <button class="btn primary" type="submit">提交注册申请</button>
+    </footer>
+  </form>
+</dialog>
+<script src="/auth.js"></script><script>
+const registerDialog = document.getElementById('register-dialog');
+const loginForm = document.getElementById('login'), error = document.getElementById('error'), loginButton = loginForm.querySelector('button');
+const registerForm = document.getElementById('register'), registerError = document.getElementById('register-error');
+const done = document.getElementById('register-done');
+H3Auth.me().then(() => location.replace('/')).catch(e => { if (e.status !== 401) error.textContent = e.message; loginButton.disabled = false; });
+loginForm.onsubmit = async event => {
+  event.preventDefault(); loginButton.disabled = true; error.textContent = '';
+  try { await H3Auth.login(loginForm.elements.username.value, loginForm.elements.password.value); loginForm.reset(); location.replace('/'); }
+  catch (e) { error.textContent = e.message; loginButton.disabled = false; }
+};
+document.getElementById('to-register').onclick = () => {
+  registerError.textContent = '';
+  registerDialog.showModal();
+  registerForm.elements.username.focus();
+};
+document.getElementById('to-login').onclick = () => registerDialog.close();
+registerDialog.addEventListener('close', () => {
+  registerForm.elements.password.value = '';
+  registerForm.elements.confirm_password.value = '';
+});
+registerForm.onsubmit = async event => {
+  event.preventDefault(); registerError.textContent = '';
+  const data = Object.fromEntries(new FormData(registerForm));
+  if (data.password !== data.confirm_password) {
+    registerError.textContent = '两次输入的密码不一致';
+    registerForm.elements.confirm_password.focus();
+    return;
+  }
+  const button = registerForm.querySelector('button[type=submit]');
+  button.disabled = true;
+  try {
+    const result = await H3Auth.register(data.username, data.display_name, data.password);
+    registerForm.reset(); registerDialog.close();
+    loginForm.elements.username.value = result.username;
+    done.hidden = false;
+    done.textContent = `注册申请已提交（${result.display_name}），等待审批通过后即可登录。`;
+  } catch (e) {
+    registerError.textContent = e.message;
+  } finally {
+    button.disabled = false;
+  }
+};
+</script></body></html>
