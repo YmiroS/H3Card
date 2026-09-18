@@ -538,6 +538,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         agent.capabilities = {}
         agent.last_capability_scan = time.time()
         agent.last_telemetry_scan = time.time()
+        agent.last_release_check = 0.0
         agent.prepare_inputs = mock.AsyncMock()
         agent.patch_silent_video_audio = mock.AsyncMock()
         agent.collect_outputs = mock.AsyncMock(return_value=[])
@@ -630,6 +631,32 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 count = len(self.requests)
                 self.assertIsNone(await self.agent.acquire())
                 self.assertEqual(len(self.requests), count)
+
+    async def test_release_failed_gate_recovers_after_comfy_confirms_cleanup(self):
+        self.agent.release_failed = "显存释放未确认"
+        self.agent._json_request = mock.AsyncMock(
+            return_value={"cleanup_complete": True})
+
+        await self.agent.confirm_release_recovery()
+
+        self.assertIsNone(self.agent.release_failed)
+        self.agent._json_request.assert_awaited_once()
+        method, url = self.agent._json_request.await_args.args
+        kwargs = self.agent._json_request.await_args.kwargs
+        self.assertEqual((method, url), ("POST", "http://comfy/free"))
+        self.assertEqual(kwargs["json"], {
+            "free_memory": True, "unload_models": True, "wait": True,
+        })
+        self.assertEqual(kwargs["timeout"].total, 130)
+
+    async def test_release_failed_gate_stays_closed_without_cleanup_confirmation(self):
+        self.agent.release_failed = "显存释放未确认"
+        self.agent._json_request = mock.AsyncMock(
+            return_value={"cleanup_complete": False})
+
+        await self.agent.confirm_release_recovery()
+
+        self.assertEqual(self.agent.release_failed, "显存释放未确认")
 
     async def test_cancel_during_input_download_never_submits_prompt(self):
         downloading = asyncio.Event()
