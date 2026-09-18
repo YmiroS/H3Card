@@ -65,6 +65,8 @@ tr:last-child td { border-bottom:0; }
     <option value="90">最近 90 天</option>
   </select>
   <a href="/controller">运行面板</a>
+  <a href="/admin/permissions">权限管理</a>
+  <span id="account" class="account-bar"></span>
   <button id="refresh">立即刷新</button>
 </header>
 <main>
@@ -98,6 +100,7 @@ tr:last-child td { border-bottom:0; }
     <div id="empty" class="empty" hidden>这个周期内还没有费用记录</div>
   </section>
 </main>
+<script src="/auth.js"></script>
 <script>
 const STATUS={queued:"排队中",running:"运行中",done:"已完成",error:"失败",canceled:"已取消"};
 const SOURCE={actual:"实际",estimated:"估算",unknown:"未知"};
@@ -161,9 +164,8 @@ async function refresh() {
     const days=Number($("period").value||0);
     const query=new URLSearchParams({limit:"2000"});
     if (days) query.set("from",String(Date.now()/1000-days*86400));
-    const response=await fetch(`/api/costs?${query}`,{cache:"no-store"});
-    if (!response.ok) throw new Error(`HTTP ${response.status}`);
-    const data=await response.json(), o=data.overview;
+    const response=await H3Auth.request(`/api/costs?${query}`,{cache:"no-store"});
+    const data=response, o=data.overview;
     $("retail-range").textContent=moneyRange(o.retail_min,o.retail_max);
     $("retail-mid").textContent=money(o.retail_mid);
     $("retail-coverage").textContent=`已定价 ${o.retail_known_tasks} 项 · 未定价 ${o.retail_unknown_tasks} 项`;
@@ -186,7 +188,12 @@ async function refresh() {
   }
 }
 $("refresh").onclick=refresh; $("period").onchange=refresh;
-refresh(); setInterval(refresh,15000);
+H3Auth.requireUser(true).then(() => {
+  H3Auth.mountAccount($("account"));
+  refresh(); H3Auth.every(refresh,15000);
+}).catch(error => {
+  $("error").textContent=error.message; $("error").style.display="block";
+});
 </script>
 </body>
 </html>
