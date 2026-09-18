@@ -51,6 +51,7 @@ class WorkerAgent:
         self.telemetry = {}
         self.last_capability_scan = 0.0
         self.last_telemetry_scan = 0.0
+        self.last_release_check = 0.0
         self.comfy_online = False
         self.local_busy = False
         self.stop_event = asyncio.Event()
@@ -245,6 +246,27 @@ class WorkerAgent:
         self._save_state()
         print(f"[Worker] 注册成功：{result['worker_id']}")
 
+    async def confirm_release_recovery(self):
+        if not self.release_failed or not self.comfy_online or self.current:
+            return
+        interval = max(float(self.config.get("release_recheck_seconds", 30)), 10.0)
+        now = time.monotonic()
+        if now - self.last_release_check < interval:
+            return
+        self.last_release_check = now
+        try:
+            ack = await self._json_request(
+                "POST", self.comfy + "/free",
+                json={"free_memory": True, "unload_models": True, "wait": True},
+                timeout=aiohttp.ClientTimeout(total=130, sock_connect=15),
+            )
+            if not isinstance(ack, dict) or ack.get("cleanup_complete") is not True:
+                return
+        except Exception:
+            return
+        self.release_failed = None
+        print("[Worker] ComfyUI 已确认显存释放，恢复接单。", flush=True)
+
     async def heartbeat_loop(self):
         interval = max(float(self.config.get("heartbeat_seconds", 10)), 2.0)
         capability_interval = max(float(self.config.get("capability_scan_seconds", 300)), 30.0)
@@ -252,6 +274,7 @@ class WorkerAgent:
         while not self.stop_event.is_set():
             try:
                 await self.local_status()
+                await self.confirm_release_recovery()
                 now = time.time()
                 include_caps = (
                     not self.current
