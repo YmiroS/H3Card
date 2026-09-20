@@ -36,6 +36,7 @@
   "LoadAudio": "加载音频",
   "LoadImage": "加载图像",
   "LoraLoaderModelOnly": "加载LoRA模型",
+  "LatentUpscaleBy": "潜空间按比例缩放",
   "MathExpression|pysssss": "数学表达式",
   "MiniMaxChunkFeedForward": "MiniMax H3前馈分块计算",
   "MiniMaxLowVRAMAttention": "MiniMax H3低显存注意力",

@@ -75,6 +75,7 @@ MODEL_FAMILY = {
     "zimage_t2i": "zimage",
     "zimage_i2i": "zimage",
     "qwen_image_edit_2511_i2i": "qwen_image_edit_2511",
+    "qwen_image_2512_t2i": "qwen_image_2512",
     "qwen_image_reverse": "qwen35_27b",
     "qwen_video_reverse": "qwen35_27b",
     "rmbg_cutout": "rmbg2",

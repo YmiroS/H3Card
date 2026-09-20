@@ -1,0 +1,77 @@
+{
+ "id": "qwen_image_2512_t2i",
+ "name": "文生图",
+ "file": "Qwen文生图双阶段细化",
+ "source": "../ComfyUI/user/default/workflows/Qwen生图/Qwen文生图双阶段细化.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "gen",
+ "card": "image",
+ "slots": "img0+aud0+vid0",
+ "images": 0,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {
+  "image": {"min": 0, "max": 0},
+  "audio": {"min": 0, "max": 0},
+  "video": {"min": 0, "max": 0}
+ },
+ "graph": "graphs/qwen_image_2512_t2i.api.json",
+ "output": {"node": "16"},
+ "note": "Qwen Image 2512 双阶段文生图。正向提示词描述画面，负向提示词排除不希望出现的内容，两者同时用于两个阶段。比例和分辨率使用现有文生图参数面板；默认 1024×1024、第一阶段 6 步、第二阶段 2 步，保持原工作流实际配置（阶段间缩放倍率为 1）。更高分辨率会增加显存占用。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "prompt", "label": "正向提示词", "type": "textarea", "default": "",
+   "target": {"node": "8", "input": "text"}
+  },
+  {
+   "key": "negative_prompt", "label": "负向提示词", "type": "textarea",
+   "default": "低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲。",
+   "hint": "填写不希望出现的内容；可清空，不会自动并入正向提示词或引用文本。",
+   "target": {"node": "9", "input": "text"}
+  },
+  {
+   "key": "width", "label": "宽", "type": "number", "default": 1024,
+   "target": {"node": "7", "input": "width", "vtype": "INT"}
+  },
+  {
+   "key": "height", "label": "高", "type": "number", "default": 1024,
+   "target": {"node": "7", "input": "height", "vtype": "INT"}
+  },
+  {
+   "key": "steps", "label": "第一阶段步数", "type": "slider", "default": 6,
+   "min": 1, "max": 40, "step": 1,
+   "hint": "原工作流实际为 6 步；只调整第一阶段，不覆盖第二阶段。",
+   "target": {"node": "10", "input": "steps", "vtype": "INT"}
+  },
+  {
+   "key": "refine_steps", "label": "第二阶段步数", "type": "slider", "default": 2,
+   "min": 1, "max": 40, "step": 1,
+   "hint": "原工作流实际为 2 步，使用第一阶段的潜空间结果继续采样。",
+   "target": {"node": "12", "input": "steps", "vtype": "INT"}
+  },
+  {
+   "key": "cfg", "label": "提示词引导强度", "type": "slider", "default": 1.5,
+   "min": 1, "max": 10, "step": 0.1, "advanced": true,
+   "target": {"node": "10", "input": "cfg", "vtype": "FLOAT"}
+  },
+  {
+   "key": "cfg", "label": "提示词引导强度", "type": "slider", "default": 1.5,
+   "min": 1, "max": 10, "step": 0.1, "advanced": true, "mirror": true,
+   "target": {"node": "12", "input": "cfg", "vtype": "FLOAT"}
+  },
+  {
+   "key": "seed", "label": "种子", "type": "seed", "default": 79879643192314,
+   "max": 18446744073709551615,
+   "target": {"node": "10", "input": "seed", "vtype": "INT"}
+  },
+  {
+   "key": "seed", "label": "种子", "type": "seed", "default": 187838009409191,
+   "max": 18446744073709551615, "mirror": true,
+   "target": {"node": "12", "input": "seed", "vtype": "INT"}
+  }
+ ],
+ "warnings": []
+}
