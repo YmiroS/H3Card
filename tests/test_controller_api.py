@@ -141,6 +141,7 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
         self.assertEqual(len(text_modes), 1)
         self.assertEqual(text_modes[0]["modelSwitch"], {
             "zimage": "zimage_t2i", "krea2": "krea2_t2i",
+            "qwen2512": "qwen_image_2512_t2i",
         })
 
         modes = scan_workflows.build_modes([

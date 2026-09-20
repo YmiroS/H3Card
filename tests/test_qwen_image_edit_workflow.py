@@ -103,10 +103,13 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
             root = Path(tmp)
             (root / "manifests").mkdir()
             (root / "graphs").mkdir()
+            for wid in scan_workflows.BUNDLED_CAPABILITIES:
+                source = ROOT / "manifests" / f"{wid}.json"
+                cap = json.loads(source.read_text(encoding="utf-8"))
+                (root / "manifests" / source.name).write_bytes(source.read_bytes())
+                (root / cap["graph"]).write_bytes((ROOT / cap["graph"]).read_bytes())
             manifest_path = root / "manifests" / f"{self.cap['id']}.json"
-            manifest_path.write_text(json.dumps(self.cap), encoding="utf-8")
             graph_path = root / self.cap["graph"]
-            graph_path.write_bytes((ROOT / self.cap["graph"]).read_bytes())
             with mock.patch.object(scan_workflows, "ROOT", root), \
                  mock.patch.object(scan_workflows, "ALIASES", {}), \
                  mock.patch.object(scan_workflows, "load_object_info", return_value={}), \
@@ -116,7 +119,8 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
                 scan_workflows.main()
             cards = json.loads((root / "manifests/_cards.json").read_text(encoding="utf-8"))
             image_card = next(c for c in cards if c["id"] == "card_image")
-            self.assertEqual(image_card["modes"][0]["id"], self.cap["id"])
+            self.assertEqual({m["id"] for m in image_card["modes"]},
+                             scan_workflows.BUNDLED_CAPABILITIES)
             self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), self.cap)
             self.assertEqual(graph_path.read_bytes(), (ROOT / self.cap["graph"]).read_bytes())
 

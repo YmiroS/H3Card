@@ -9,13 +9,16 @@ const { chromium } = require('playwright');
 
 const root = path.join(__dirname, '..');
 const qwenId = 'qwen_image_edit_2511_i2i';
+const qwenT2iId = 'qwen_image_2512_t2i';
+const qwenT2iName = 'Qwen Image 2512（双阶段）';
+const qwenNegative = '低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲。';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 const capabilities = Object.fromEntries(['zimage_t2i', 'zimage_i2i', 'krea2_t2i', 'krea2_i2i',
-  'flux2_klein_storyboard9', 'flux2_klein_edit', qwenId].map(id =>
+  'flux2_klein_storyboard9', 'flux2_klein_edit', qwenId, qwenT2iId].map(id =>
   [id, JSON.parse(readFileSync(path.join(root, 'manifests', id + '.json'), 'utf8'))]));
 capabilities.no_switch = {id:'no_switch', name:'独立模式', outputType:'image', inputs:[]};
 const cards = JSON.parse(readFileSync(path.join(root, 'manifests', '_cards.json'), 'utf8'))
-  .filter(c => ['card_image', 'card_asset'].includes(c.id));
+  .filter(c => ['card_image', 'card_asset', 'card_text', 'card_style'].includes(c.id));
 cards.find(c => c.id === 'card_image').modes.push({id:'no_switch', name:'独立模式'});
 const project = {
   id:'model-test', name:'模型菜单回归', locked:true, edges:[], groups:[], view:{x:100, y:70, k:1},
@@ -126,18 +129,156 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.match(await modelButton.innerText(), /^custom/);
     });
 
-    await t.test('Qwen remains i2i-only; mode changes ignore stale model state; no mapping hides menu', async () => {
+    await t.test('Qwen versions stay mode-specific; mode changes ignore stale model state; no mapping hides menu', async () => {
       await reset(qwenId, 'krea2');
       await chooseMode('文生图');
       assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'zimage_t2i');
       await modelButton.click();
-      assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(), ['Z-Image（当前）', 'Krea2']);
+      assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
+        ['Z-Image（当前）', 'Krea2', qwenT2iName]);
       await page.locator('#menu button').filter({hasText:'Krea2'}).click();
       await page.evaluate(() => { PROJ.cards[0]._model = 'qwen2511'; });
       await chooseMode('图生图');
       assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'krea2_i2i');
       await chooseMode('独立模式');
       assert.equal(await modelButton.count(), 0);
+    });
+
+    await t.test('Qwen 2512 negative defaults, edits and clearing survive legacy model switches', async () => {
+      await reset('zimage_t2i');
+      await chooseModel(qwenT2iName);
+      assert.equal(await page.evaluate(() => PROJ.cards[0].cap), qwenT2iId);
+      assert.equal(await modelButton.locator('span').innerText(), qwenT2iName);
+      const spec = capabilities[qwenT2iId].inputs.find(s => s.key === 'negative_prompt');
+      assert.equal(spec.default, qwenNegative);
+      const negativeBlock = page.locator('#panel .pblock').filter({hasText:spec.label});
+      const negative = negativeBlock.locator('textarea');
+      const positive = page.locator('#panel .pblock textarea').first();
+      assert.equal(await page.locator('#panel .pblock textarea').count(), 2);
+      assert.equal(await positive.inputValue(), '');
+      assert.equal(await negative.inputValue(), qwenNegative);
+      let payload = await submit();
+      assert.equal(payload.params.prompt, '');
+      assert.equal(payload.params.negative_prompt, qwenNegative);
+      assert.deepEqual([payload.params.width, payload.params.height, payload.params.steps,
+        payload.params.refine_steps, payload.params.cfg, payload.params.seed], [1024, 1024, 6, 2, 1.5, -1]);
+      assert.deepEqual(payload.assets, {});
+      await positive.fill('雨后的街道');
+      await negative.fill('不要水印或模糊');
+      assert.equal((await submit()).params.negative_prompt, '不要水印或模糊');
+      for (const name of ['Z-Image', 'Krea2']) {
+        await chooseModel(name);
+        assert.equal(await negative.count(), 0, 'undeclared negative input stays hidden');
+        payload = await submit();
+        assert.equal(Object.hasOwn(payload.params, 'negative_prompt'), false);
+        assert.equal(payload.params.prompt, '雨后的街道');
+        await chooseModel(qwenT2iName);
+        assert.equal(await negative.inputValue(), '不要水印或模糊');
+      }
+      await negativeBlock.getByRole('button', {name:'清空', exact:true}).click();
+      assert.equal(await negative.inputValue(), '');
+      assert.equal((await submit()).params.negative_prompt, '');
+      await chooseModel('Z-Image');
+      await chooseModel(qwenT2iName);
+      assert.equal(await negative.inputValue(), '', 'explicit blank must not restore the preset');
+      assert.equal((await submit()).params.negative_prompt, '');
+      await negative.fill('临时负向');
+      await negative.fill('');
+      assert.equal((await submit()).params.negative_prompt, '', 'keyboard clearing also submits an explicit blank');
+    });
+
+    await t.test('negative input never inherits styles, text references or positive optimization', async () => {
+      await reset(qwenT2iId);
+      await page.evaluate(async () => {
+        const c = PROJ.cards[0];
+        const style = addCard('card_style', 700, 20);
+        style.params.style = '水彩风格';
+        const text = addCard('card_text', 700, 220);
+        text.params.text = '远处有一座山';
+        text.name = '引用文本';
+        await linkTo(style, c);
+        PROJ.edges.push({from:text.id, to:c.id, slot:TEXT_SLOT});
+        c.params.prompt = '河边的小屋';
+        openPanel(c.id);
+      });
+      const spec = capabilities[qwenT2iId].inputs.find(s => s.key === 'negative_prompt');
+      const negativeBlock = page.locator('#panel .pblock').filter({hasText:spec.label});
+      const negative = negativeBlock.locator('textarea');
+      const positive = page.locator('#panel .pblock textarea').first();
+      assert.equal(await positive.inputValue(), '水彩风格\n\n远处有一座山\n\n河边的小屋');
+      assert.equal(await negative.inputValue(), qwenNegative);
+      assert.doesNotMatch(await negativeBlock.locator('.phd').innerText(), /已并入/);
+      assert.equal(await negativeBlock.locator('.tbtool.opt').count(), 0);
+      assert.deepEqual(await page.evaluate(() => promptSpecs(capOf(PROJ.cards[0])).map(s => s.key)), ['prompt']);
+      let payload = await submit();
+      assert.match(payload.params.prompt, /水彩风格/);
+      assert.equal(payload.params.negative_prompt, qwenNegative);
+      await positive.fill('水彩风格\n\n远处有一座山\n\n正向 @引用文本');
+      await negative.fill('不要水印 @引用文本');
+      payload = await submit();
+      assert.match(payload.params.prompt, /水彩风格/);
+      assert.match(payload.params.prompt, /正向 远处有一座山/);
+      assert.equal(payload.params.negative_prompt, '不要水印 @引用文本', 'negative text stays literal, without mention expansion');
+      await negativeBlock.getByRole('button', {name:'清空', exact:true}).click();
+      assert.equal(await negative.inputValue(), '');
+      payload = await submit();
+      assert.equal(payload.params.negative_prompt, '');
+      assert.match(payload.params.prompt, /水彩风格/);
+    });
+
+    await t.test('Qwen 2512 reuses resolution controls and exposes independent 6+2 sampling steps', async () => {
+      await reset(qwenT2iId);
+      await paramsButton.click();
+      assert.equal(await page.locator('#respop .cpick').count(), 1);
+      assert.equal(await page.locator('#respop button[title^="画面比例 1:1"]').getAttribute('class'), 'on');
+      const stepSpec = capabilities[qwenT2iId].inputs.find(s => s.key === 'steps');
+      const refineSpec = capabilities[qwenT2iId].inputs.find(s => s.key === 'refine_steps');
+      const row = label => page.locator('#respop .row').filter({has:page.getByText(label, {exact:true})});
+      const steps = row(stepSpec.label);
+      const refine = row(refineSpec.label);
+      assert.equal(await page.locator('#respop .row').count(), 2, 'cfg and seed do not become extra controls');
+      assert.equal(await steps.locator('input[type="number"]').inputValue(), '6');
+      assert.equal(await refine.locator('input[type="number"]').inputValue(), '2');
+      await steps.locator('input[type="number"]').fill('8');
+      assert.equal(await steps.locator('input[type="range"]').inputValue(), '8');
+      assert.equal(await refine.locator('input[type="number"]').inputValue(), '2');
+      await refine.locator('input[type="number"]').fill('3');
+      assert.equal(await refine.locator('input[type="range"]').inputValue(), '3');
+      assert.equal(await steps.locator('input[type="number"]').inputValue(), '8');
+      await page.locator('#respop button[title^="画面比例 16:9"]').click();
+      await page.locator('#respop .cgrid.k').getByRole('button', {name:'720P', exact:true}).click();
+      assert.match(await paramsButton.innerText(), /16:9.*720P/);
+      await page.locator('#respop .x').click();
+      await paramsButton.click();
+      assert.equal(await steps.locator('input[type="number"]').inputValue(), '8');
+      assert.equal(await refine.locator('input[type="number"]').inputValue(), '3');
+      await page.locator('#respop .x').click();
+      let payload = await submit();
+      assert.deepEqual([payload.params.width, payload.params.height, payload.params.steps,
+        payload.params.refine_steps, payload.params.cfg], [1280, 720, 8, 3, 1.5]);
+      await chooseModel('Z-Image');
+      payload = await submit();
+      assert.deepEqual([payload.params.width, payload.params.height], [1280, 720]);
+      assert.equal(Object.hasOwn(payload.params, 'refine_steps'), false);
+      await chooseModel(qwenT2iName);
+      payload = await submit();
+      assert.deepEqual([payload.params.width, payload.params.height, payload.params.steps,
+        payload.params.refine_steps], [1280, 720, 8, 3]);
+      await chooseMode('图生图');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'zimage_i2i');
+      await modelButton.click();
+      assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
+        ['Z-Image（当前）', 'Krea2', 'Qwen Image Edit 2511']);
+    });
+
+    await t.test('multi-image editing modes do not acquire the text-to-image model menu', async () => {
+      await reset(qwenT2iId);
+      for (const [name, cap] of [['多宫格故事分镜', 'flux2_klein_storyboard9'], ['参考图编辑(保人物)', 'flux2_klein_edit']]) {
+        await chooseMode(name);
+        assert.equal(await page.evaluate(() => PROJ.cards[0].cap), cap);
+        assert.equal(await modelButton.count(), 0);
+        assert.equal(await page.locator('#panel textarea[placeholder^="负向提示词"]').count(), 0);
+      }
     });
 
     await t.test('Qwen parameters are editable, summarized and sent through the real run button', async () => {

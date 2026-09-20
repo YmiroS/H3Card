@@ -96,7 +96,8 @@ const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHa
 // 以实际能力反查模型，避免旧项目或复制节点留下的 _model 与当前能力不一致。
 const modelOf = (c) => Object.entries((modeOf(c) || {}).modelSwitch || {})
   .find(([, cid]) => cid === c.cap)?.[0];
-const IMAGE_MODEL_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen Image Edit 2511" };
+const IMAGE_MODEL_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen Image Edit 2511",
+  qwen2512: "Qwen Image 2512（双阶段）" };
 /** 节点显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
     路由节点同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
     最后兜底用模式名而不是裸 id：风格节点在 CAPS 里根本没有条目（它不是能力）。 */
@@ -160,10 +161,10 @@ const ownTexts = (c) => (PROJ ? PROJ.edges : [])
   .map(s => ({ id: s.id, name: titleOf(s), text: textOf(s) }));
 
 /** 这条能力的「提示词」框。作者调好的格式规范（template）和高级里的不算 ——
-    风格是往画面描述里加的，不该混进那份规范。一个都没有的节点（补帧、放大、拼图）
+    风格是往画面描述里加的，不该混进那份规范或负向提示词。一个都没有的节点（补帧、放大、拼图）
     接不了风格节点：那些节点根本不写提示词。 */
 const promptSpecs = (cap) => ((cap && cap.inputs) || [])
-  .filter(s => s.type === "textarea" && !s.template && !s.advanced);
+  .filter(s => s.type === "textarea" && s.key !== "negative_prompt" && !s.template && !s.advanced);
 
 /** 直接挂在这个节点上的文本节点（风格节点 / 原始文本 / 处理节点的输出），按连线顺序。
     **手里还没字的不算** —— 先连线后写字是常事，那一阵子它既不该出现在读数里，
@@ -3654,11 +3655,7 @@ function openPanel(id) {
   const paired = norm.filter(x => x.pairWith && specs.some(y => y.key === x.pairWith));
   if (paired.length > 1) body.appendChild(promptTabs(c, paired));
   for (const s of norm) {
-    // 负面提示词只在文生图模式下显示（Z-Image和Krea2都支持）
-    if (s.key === "negative_prompt") {
-      const isT2I = c.cap === "zimage_t2i" || c.cap === "krea2_t2i";
-      if (!isT2I) continue;
-    }
+    // 只显示当前 manifest 声明的输入，负向提示词不按模型名硬编码。
     if (!paired.includes(s) || paired.length < 2) body.appendChild(promptBlock(c, s));
   }
   for (const s of tpl) body.appendChild(templateBlock(c, s));
@@ -4127,11 +4124,10 @@ function promptTabs(c, list) {
     优化过之后这一格有两份词（原词 / 优化后），页签选哪份就提交哪份。 */
 function promptBlock(c, s, label) {
   const wrap = document.createElement("div"); wrap.className = "pblock";
-  const scs = styleCards(c);
-  const styles = scs.map(textOf);
-  const own = ownStyles(c);
-  // 获取引用的文本节点
-  const texts = ownTexts(c);
+  const negative = s.key === "negative_prompt";
+  // 负向是独立输入，不继承正向风格或文本引用。
+  const styles = negative ? [] : styleCards(c).map(textOf);
+  const texts = negative ? [] : ownTexts(c);
 
   // ✨优化只画在"主提示词"那一格，而且这条能力得在扫描器的 REWRITE 表里登记过
   // （manifest.rewrite）。分镜那种一图一句的节点本来就没登记
@@ -4156,7 +4152,7 @@ function promptBlock(c, s, label) {
   if (opt) wrap.appendChild(optTabs(c, s, useOpt));
 
   const ta = document.createElement("textarea");
-  ta.placeholder = `${label || s.label}：描述你想要的画面/动作/镜头`;
+  ta.placeholder = `${label || s.label}：${negative ? "描述不希望出现的内容" : "描述你想要的画面/动作/镜头"}`;
 
   // @ 标签高亮：textarea 底下垫一层排版完全一致的 div（文字透明、标签上色），
   // textarea 盖在上面接所有鼠标事件 —— 高亮层纯视觉，pointer-events: none
@@ -4198,7 +4194,7 @@ function promptBlock(c, s, label) {
 
   // 构建输入框内容：引用内容在上方 + 用户文本在下方
   let baseValue = useOpt ? opt
-    : (c.params[s.key] != null ? c.params[s.key] : "");
+    : (c.params[s.key] != null ? c.params[s.key] : (negative ? s.default ?? "" : ""));
 
   // 如果不是优化后的版本，在输入框内显示引用内容（不带标签）在上方
   if (!useOpt && totalTexts > 0) {
@@ -4229,7 +4225,7 @@ function promptBlock(c, s, label) {
     let html = "", last = 0;
     const re = /@([\u4e00-\u9fa5\w]+)/g;
     let m;
-    while ((m = re.exec(text))) {
+    while (!negative && (m = re.exec(text))) {
       html += esc(text.slice(last, m.index));
       html += `<mark class="at-mention" data-name="${esc(m[1])}">${esc(m[0])}</mark>`;
       last = m.index + m[0].length;
@@ -4250,7 +4246,7 @@ function promptBlock(c, s, label) {
   // @标签 是一个整体：退格/删除键只要落在标签范围内（含紧贴标签前后沿），
   // 一次删掉整个标签，不会删出半个来
   ta.addEventListener("keydown", (ev) => {
-    if (ev.isComposing) return;                        // 输入法组字中不插手
+    if (negative || ev.isComposing) return;            // 负向按普通文本编辑，输入法组字中不插手
     if (ev.key !== "Backspace" && ev.key !== "Delete") return;
     if (ta.selectionStart !== ta.selectionEnd) return; // 有选区时按默认行为删
     const pos = ta.selectionStart;
@@ -4282,7 +4278,7 @@ function promptBlock(c, s, label) {
     // 匹配 @ 后面的文字（可以是中文、英文、数字）
     const match = textBefore.match(/@([\u4e00-\u9fa5\w]*)$/);
 
-    if (match && !useOpt) {
+    if (match && !useOpt && !negative) {
       const query = match[1].toLowerCase();
       atMenuStart = cursorPos - match[0].length;
 
@@ -4410,7 +4406,7 @@ function promptBlock(c, s, label) {
 
     // 点击外部关闭菜单
     const closeOnOutside = (e) => {
-      if (!atMenuEl.contains(e.target) && e.target !== textarea) {
+      if (!atMenuEl || (!atMenuEl.contains(e.target) && e.target !== textarea)) {
         hideAtMenu();
         document.removeEventListener("mousedown", closeOnOutside);
       }
@@ -4595,7 +4591,7 @@ function promptBlock(c, s, label) {
 
   const sync = () => {
     // 示例文案警告：清空了默认文案才算
-    const isDemo = !useOpt && !!s.default && ta.value.trim() === String(s.default).trim();
+    const isDemo = !negative && !useOpt && !!s.default && ta.value.trim() === String(s.default).trim();
     tag.style.display = isDemo ? "" : "none";
     ta.classList.toggle("isdemo", isDemo);
     highlightLayer.classList.toggle("demo", isDemo);   // 文字色由高亮层出，同步打给层
