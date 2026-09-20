@@ -128,8 +128,13 @@ ROUTE_CARDS = {
 # 每条能力仍保留自己的 manifest，所以换模型后参数面板会跟着切成对应的参数。
 MODEL_SWITCHES = {
     "zimage_t2i": {"zimage": "zimage_t2i", "krea2": "krea2_t2i"},
-    "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i"},
+    "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i",
+                   "qwen2511": "qwen_image_edit_2511_i2i"},
 }
+
+# API 图和输入槽随项目维护，不依赖原作者本机的界面工作流路径。
+# Qwen 固定图生图分支，将界面开关和整数控件内联；模型与采样链保持原配置。
+BUNDLED_CAPABILITIES = {"qwen_image_edit_2511_i2i"}
 
 # 风格卡：画布上唯一一张**不对应任何工作流**的卡。它没有 manifest、没有能力，
 # 自己也不跑 —— 只存一段风格描述，连到哪张卡就在提交时并进那张卡的提示词里。
@@ -2019,6 +2024,13 @@ def main():
                   f"-> #{i['target']['node']}.{i['target']['input']}  默认={dv}{flag}")
         for w in m["warnings"]:
             print(f"    ⚠ {w}")
+
+    for wid in sorted(BUNDLED_CAPABILITIES):
+        m = json.loads((ROOT / "manifests" / f"{wid}.json").read_text(encoding="utf-8"))
+        if not (ROOT / m["graph"]).exists():
+            raise FileNotFoundError(m["graph"])
+        manifests.append(m)
+        groups.setdefault(m["card"], []).append(m)
 
     CARD_META = {
         "image": ("card_image", "生图", "🖼"),
