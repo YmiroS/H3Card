@@ -520,9 +520,19 @@ def check_local_cleanup(app):
 
 
 async def local_submit(app, graph):
-    async with app["comfy_lock"]:
-        check_local_cleanup(app)
-        return await comfy_submit(app["session"], graph)
+    try:
+        # 这里只等提交确认，不是等出图；也限制被另一个挂起提交占住锁的等待。
+        async with asyncio.timeout(30):
+            async with app["comfy_lock"]:
+                check_local_cleanup(app)
+                return await comfy_submit(app["session"], graph)
+    except asyncio.TimeoutError:
+        raise web.HTTPGatewayTimeout(text=(
+            "等待 ComfyUI 确认提交超时（最长等待 30 秒），后端可能无响应或显存不足。"
+            "请先检查 ComfyUI 队列，确认该任务是否已提交，避免重复生成。"))
+    except aiohttp.ClientConnectionError:
+        raise web.HTTPServiceUnavailable(text=(
+            "无法连接本地 ComfyUI，请确认生成后端已启动且能够响应。"))
 
 
 async def collect_outputs(session, pid):
@@ -604,6 +614,11 @@ async def handle_event(session, ev, remote=False):
                 return
             outputs = await collect_outputs(session, pid)
             if job.get("cleanup_pending") or job["status"] in ("canceled", "error"):
+                return
+            if not outputs and t == "execution_success":
+                # execution_success 可能早于 history 入库；后续 executing(None) 才确认任务已收尾。
+                job.update(status="running", progress=max(job.get("progress") or 0.0, 0.99),
+                           step="正在取回产物")
                 return
             job["outputs"] = outputs
             job.update(status="done", progress=1.0, ended=time.time(), step="")
