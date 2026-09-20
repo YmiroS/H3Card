@@ -12,7 +12,8 @@
     "slots": "img0+aud0+vid0",
     "modelSwitch": {
      "zimage": "zimage_t2i",
-     "krea2": "krea2_t2i"
+     "krea2": "krea2_t2i",
+     "qwen2512": "qwen_image_2512_t2i"
     }
    },
    {
