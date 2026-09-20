@@ -93,6 +93,10 @@ const defOf = (c) => {
   return CARDS.find(d => d.modes.some(m => modeHas(m, c.cap))) || cardDef(c.type);
 };
 const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHas(m, c.cap)); };
+// 以实际能力反查模型，避免旧项目或复制节点留下的 _model 与当前能力不一致。
+const modelOf = (c) => Object.entries((modeOf(c) || {}).modelSwitch || {})
+  .find(([, cid]) => cid === c.cap)?.[0];
+const IMAGE_MODEL_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen Image Edit 2511" };
 /** 节点显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
     路由节点同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
     最后兜底用模式名而不是裸 id：风格节点在 CAPS 里根本没有条目（它不是能力）。 */
@@ -3594,7 +3598,7 @@ function openPanel(id) {
       b.className = modeHas(md, c.cap) ? "on" : "";
       b.textContent = md.name;
       hoverTip(b, () => modeBriefEl(c, md, md.name));
-      b.onclick = () => { tipHide(); c.cap = modeCap(md, c._model); openPanel(id); paintTitle(c); save(); };
+      b.onclick = () => { tipHide(); c.cap = modeCap(md, modelOf(c)); openPanel(id); paintTitle(c); save(); };
       m.appendChild(b);
     }
     el.panel.appendChild(m);
@@ -3694,46 +3698,27 @@ function openPanel(id) {
         icon: def.icon,
         text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),
         tip: () => modeBriefEl(c, mo, mo.name),
-        run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo, c._model); openPanel(id); paintTitle(c); save(); },
+        run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo, modelOf(c)); openPanel(id); paintTitle(c); save(); },
       })));
     hoverTip(modeButton, () => modeBriefEl(c, currentMode, currentMode.name));
     foot.appendChild(modeButton);
 
-    // 模型选择按钮（文生图和图生图模式显示，用于在Z-Image和Krea2之间切换）
-    if (def.id === "card_image" && c.cap && (c.cap === "zimage_t2i" || c.cap === "krea2_t2i" || c.cap === "zimage_i2i" || c.cap === "krea2_i2i")) {
-      // 保存当前选择的模型到卡片对象
-      if (!c._model) c._model = (c.cap === "krea2_t2i" || c.cap === "krea2_i2i") ? "krea2" : "zimage";
-      const curModel = c._model || "zimage";
-
+    // 菜单完全由当前模式声明的模型映射决定，不推测能力名或图生图后缀。
+    if (def.id === "card_image" && currentMode.modelSwitch) {
+      const curModel = modelOf(c);
+      const modelName = (key) => IMAGE_MODEL_NAMES[key] || key;
       const modelBtn = capBtn(
-        curModel === "krea2" ? "🎨 Krea2" : "🖼 Z-Image",
+        modelName(curModel) || cap.name,
         "生图模型",
-        () => [
-          {
-            icon: "🖼",
-            text: "Z-Image" + (curModel === "zimage" ? "（当前）" : ""),
-            run: () => {
-              tipHide(); closeResPop();
-              c._model = "zimage";
-              // 实时判断当前是否为图生图模式（检查后缀而不是具体值，更robust）
-              const isCurrentI2I = c.cap && c.cap.endsWith("_i2i");
-              c.cap = isCurrentI2I ? "zimage_i2i" : "zimage_t2i";
-              openPanel(id); paintTitle(c); save();
-            }
+        () => Object.entries(currentMode.modelSwitch).map(([key, cid]) => ({
+          text: modelName(key) + (cid === c.cap ? "（当前）" : ""),
+          run: () => {
+            tipHide(); closeResPop();
+            c.cap = cid;
+            c._model = key;
+            openPanel(id); paintTitle(c); save();
           },
-          {
-            icon: "🎨",
-            text: "Krea2" + (curModel === "krea2" ? "（当前）" : ""),
-            run: () => {
-              tipHide(); closeResPop();
-              c._model = "krea2";
-              // 实时判断当前是否为图生图模式（检查后缀而不是具体值，更robust）
-              const isCurrentI2I = c.cap && c.cap.endsWith("_i2i");
-              c.cap = isCurrentI2I ? "krea2_i2i" : "krea2_t2i";
-              openPanel(id); paintTitle(c); save();
-            }
-          }
-        ]
+        }))
       );
       foot.appendChild(modelBtn);
     }
@@ -5646,7 +5631,11 @@ function payloadOf(c) {
       params[s.key] = resolved;
     }
   }
-  for (const [k, v] of Object.entries(c.assets)) if (v && v.ref) assets[k] = v.ref;
+  // 换回单图模型时保留卡片内的多图引用，但只提交当前能力真正接收的槽位。
+  for (const s of cap.inputs.filter(s => MEDIA.includes(s.type))) {
+    const v = c.assets[s.key];
+    if (v && v.ref) assets[s.key] = v.ref;
+  }
   // 项目/卡片信息只给任务面板用：既要认出来源，也要能从任务跳回那张卡
   return { capability: cap.id, params, assets,
            project: PROJ && PROJ.id, projectName: PROJ && PROJ.name,
