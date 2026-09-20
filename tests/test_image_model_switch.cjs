@@ -28,6 +28,8 @@ const project = {
 test('image model menus, parameters and media limits in the complete UI', async (t) => {
   const generated = [], unexpected = [];
   let uploads = 0;
+  let generateDelay = null, generateStatus = 'done', generateError = '';
+  let jobs = [], savedProject = project;
   const json = (res, value) => {
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.end(JSON.stringify(value));
@@ -37,9 +39,9 @@ test('image model menus, parameters and media limits in the complete UI', async 
     if (url === '/api/cards') return json(res, {cards, capabilities, comfy_online:true});
     if (url === '/api/reload') return json(res, {ok:true});
     if (url === '/api/health') return json(res, {comfy_online:true});
-    if (url === '/api/jobs') return json(res, {jobs:[]});
+    if (url === '/api/jobs') return json(res, {jobs});
     if (url === '/api/projects') return json(res, {projects:[{...project, cards:1}]});
-    if (url === '/api/projects/model-test') return json(res, project);
+    if (url === '/api/projects/model-test') return json(res, savedProject);
     if (url === '/api/upload' && req.method === 'POST') {
       req.resume();
       const n = ++uploads;
@@ -48,9 +50,17 @@ test('image model menus, parameters and media limits in the complete UI', async 
     if (url === '/api/generate' && req.method === 'POST') {
       const chunks = [];
       req.on('data', chunk => chunks.push(chunk));
-      req.on('end', () => {
+      req.on('end', async () => {
         generated.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));
-        json(res, {id:'test-job-' + generated.length, status:'done', seed:42});
+        const id = 'test-job-' + generated.length;
+        if (generateDelay) await generateDelay;
+        if (generateError) {
+          res.writeHead(504, {'Content-Type':'text/plain; charset=utf-8'});
+          return res.end(generateError);
+        }
+        const job = {id, status:generateStatus, seed:42};
+        if (job.status === 'queued') jobs.push(job);
+        json(res, job);
       });
       return;
     }
@@ -395,6 +405,118 @@ test('image model menus, parameters and media limits in the complete UI', async 
         assert.equal(await page.evaluate(() => PROJ.cards[0].cap), model + '_i2i');
         assert.match(await modelButton.innerText(), model === 'zimage' ? /^Z-Image/ : /^Krea2/);
         assert.deepEqual((await submit()).assets, {'images[0]':'legacy.png'});
+      }
+    });
+
+    await t.test('submission pending clears old jobs, blocks repeats and only queues after acknowledgement', async () => {
+      await reset('zimage_t2i');
+      jobs = [{id:'old-job', status:'done', progress:1, outputs:[]}];
+      await page.evaluate(() => {
+        const c = PROJ.cards[0];
+        c.job = 'old-job'; c.status = 'done'; c.queue_remaining = 9;
+        paint(c); openPanel(c.id);
+      });
+      let release;
+      generateDelay = new Promise(resolve => { release = resolve; });
+      generateStatus = 'queued';
+      const before = generated.length;
+      const response = page.waitForResponse(r => r.url().endsWith('/api/generate'));
+      try {
+        await page.locator('#panel .go').click();
+        const pending = await page.evaluate(async () => {
+          await pollJobs();
+          const c = PROJ.cards[0];
+          return {status:c.status, job:c.job, queue:c.queue_remaining,
+            text:c._el.querySelector('.st').textContent};
+        });
+        assert.deepEqual(pending, {status:'queued', job:null, queue:null, text:'正在提交…'});
+        assert.equal(await page.locator('#panel .go').isDisabled(), true);
+        assert.equal(await page.locator('#panel .cancel').count(), 0);
+        await page.evaluate(() => run(PROJ.cards[0]));
+      } finally {
+        release(); generateDelay = null;
+      }
+      await response;
+      await page.waitForFunction(() => !!PROJ.cards[0].job);
+      assert.equal(generated.length, before + 1, 'pending repeat must not submit another request');
+      assert.deepEqual(await page.evaluate(() => {
+        const c = PROJ.cards[0];
+        return [c.status, c.job, c._el.querySelector('.st').textContent];
+      }), ['queued', 'test-job-' + generated.length, '排队中']);
+      assert.equal(await page.locator('#panel .go').isDisabled(), true);
+      assert.equal(await page.locator('#panel .cancel').isVisible(), true);
+      await page.evaluate(async () => {
+        const c = PROJ.cards[0];
+        await run(c);
+        c.status = 'running';
+        await run(c);
+        await pollJobs();
+      });
+      assert.equal(generated.length, before + 1, 'queued and running repeats must not submit');
+      generateStatus = 'done'; jobs = [];
+    });
+
+    await t.test('Chinese submission timeout shows error and permits retry', async () => {
+      await reset('zimage_t2i');
+      generateError = '提交确认超时（30秒），请先检查任务列表，确认后再重试';
+      const response = page.waitForResponse(r => r.url().endsWith('/api/generate'));
+      await page.locator('#panel .go').click();
+      assert.equal((await response).status(), 504);
+      await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+      assert.deepEqual(await page.evaluate(() => [PROJ.cards[0].job, PROJ.cards[0].error]),
+        [null, generateError]);
+      assert.match(await page.locator('#panel .err').innerText(), /提交确认超时/);
+      assert.equal(await page.locator('#panel .go').isDisabled(), false);
+      assert.equal(await page.locator('#panel .cancel').count(), 0);
+      assert.equal(await page.locator('#world .load').count(), 0);
+      generateError = '';
+      await submit();
+    });
+
+    await t.test('payload construction errors leave loading state without sending a request', async () => {
+      await reset('zimage_t2i');
+      const before = generated.length;
+      await page.evaluate(() => {
+        window.originalPayloadOf = payloadOf;
+        payloadOf = () => { throw new Error('提交参数读取失败'); };
+      });
+      await page.locator('#panel .go').click();
+      await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+      assert.equal(await page.locator('#panel .err').innerText(), '提交参数读取失败');
+      assert.equal(await page.locator('#panel .go').isDisabled(), false);
+      assert.equal(await page.locator('#panel .cancel').count(), 0);
+      assert.equal(await page.locator('#world .load').count(), 0);
+      assert.equal(await page.evaluate(() => PROJ.cards[0].job), null);
+      assert.equal(generated.length, before);
+      await page.evaluate(() => { payloadOf = window.originalPayloadOf; delete window.originalPayloadOf; });
+      await submit();
+    });
+
+    await t.test('reloading unacknowledged queued cards recovers without changing real jobs or text cards', async () => {
+      await reset('zimage_t2i');
+      savedProject = await page.evaluate(() => {
+        const c = PROJ.cards[0];
+        c.status = 'queued'; c.job = null;
+        const queued = {...plain(c), id:'real-queued', job:'saved-job', x:600};
+        const text = addCard('card_text', 900, 20);
+        text.status = 'queued'; text.job = null;
+        return {...PROJ, cards:[plain(c), queued, plain(text)]};
+      });
+      jobs = [{id:'saved-job', status:'queued'}];
+      try {
+        await page.reload();
+        await page.waitForFunction(() => PROJ && PROJ.cards[0]?._el);
+        await page.evaluate(() => pick(PROJ.cards[0].id));
+        assert.deepEqual(await page.evaluate(() => PROJ.cards.map(c => [c.status, c.job])),
+          [['error', null], ['queued', 'saved-job'], ['queued', null]]);
+        assert.equal(await page.locator('#panel .err').innerText(),
+          '上次提交未取得任务编号，请先检查任务列表，确认后再重试');
+        assert.equal(await page.locator('#panel .go').isDisabled(), false);
+        assert.equal(await page.locator('#panel .cancel').count(), 0);
+        assert.equal(await page.evaluate(() => PROJ.cards[0]._el.querySelector('.load')), null);
+        await submit();
+      } finally {
+        savedProject = project; jobs = [];
       }
     });
 
