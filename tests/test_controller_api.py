@@ -1025,6 +1025,103 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(worker["current_job_id"])
 
 
+class LocalSubmissionTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.app = {"comfy_lock": asyncio.Lock(), "cleanup_pending": set(), "session": object()}
+
+    async def test_submission_acknowledgement_does_not_wait_for_generation(self):
+        with mock.patch.object(controller_app, "comfy_submit", new=mock.AsyncMock(return_value="accepted")) as submit:
+            self.assertEqual(await controller_app.local_submit(self.app, {"node": {}}), "accepted")
+        submit.assert_awaited_once_with(self.app["session"], {"node": {}})
+        self.assertFalse(self.app["comfy_lock"].locked())
+
+    async def test_stalled_submit_times_out_and_releases_lock_without_retry(self):
+        timeout = asyncio.timeout
+        canceled = asyncio.Event()
+
+        async def stalled(*_args):
+            try:
+                await asyncio.Event().wait()
+            finally:
+                canceled.set()
+
+        with mock.patch.object(controller_app, "comfy_submit", side_effect=stalled) as submit, \
+             mock.patch.object(controller_app.asyncio, "timeout", side_effect=lambda _seconds: timeout(0.02)) as deadline:
+            with self.assertRaises(web.HTTPGatewayTimeout) as raised:
+                await controller_app.local_submit(self.app, {})
+        deadline.assert_called_once_with(30)
+        submit.assert_awaited_once()
+        self.assertTrue(canceled.is_set())
+        self.assertFalse(self.app["comfy_lock"].locked())
+        self.assertIn("确认提交", raised.exception.text)
+        self.assertIn("避免重复生成", raised.exception.text)
+
+    async def test_waiting_for_another_submission_is_also_bounded(self):
+        timeout = asyncio.timeout
+        await self.app["comfy_lock"].acquire()
+        try:
+            with mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock) as submit, \
+                 mock.patch.object(controller_app.asyncio, "timeout", side_effect=lambda _seconds: timeout(0.02)):
+                with self.assertRaises(web.HTTPGatewayTimeout):
+                    await controller_app.local_submit(self.app, {})
+            submit.assert_not_awaited()
+            self.assertTrue(self.app["comfy_lock"].locked(), "must not release another request's lock")
+        finally:
+            self.app["comfy_lock"].release()
+
+    async def test_connection_failure_is_an_actionable_service_error(self):
+        with mock.patch.object(controller_app, "comfy_submit", side_effect=controller_app.aiohttp.ClientConnectionError()):
+            with self.assertRaises(web.HTTPServiceUnavailable) as raised:
+                await controller_app.local_submit(self.app, {})
+        self.assertIn("无法连接本地 ComfyUI", raised.exception.text)
+        self.assertFalse(self.app["comfy_lock"].locked())
+
+    async def test_validation_and_cleanup_errors_are_not_rewritten(self):
+        error = web.HTTPBadRequest(reason="missing model")
+        with mock.patch.object(controller_app, "comfy_submit", side_effect=error):
+            with self.assertRaises(web.HTTPBadRequest) as raised:
+                await controller_app.local_submit(self.app, {})
+        self.assertIs(raised.exception, error)
+        self.app["cleanup_pending"].add("old-job")
+        with mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock) as submit:
+            with self.assertRaises(web.HTTPConflict):
+                await controller_app.local_submit(self.app, {})
+        submit.assert_not_awaited()
+
+
+class LocalOutputEventOrderTest(unittest.IsolatedAsyncioTestCase):
+    async def test_early_success_waits_for_history_before_finishing(self):
+        job = {"status": "running", "progress": 0.8, "outputs": []}
+        output = [{"filename": "result.png", "kind": "image"}]
+        with mock.patch.object(controller_app, "JOBS", {"event-order": job}), \
+             mock.patch.object(controller_app, "save_jobs"), \
+             mock.patch.object(controller_app, "collect_outputs", new=mock.AsyncMock(side_effect=[[], output])) as collect:
+            await controller_app.handle_event(None, {
+                "type": "execution_success", "data": {"prompt_id": "event-order"},
+            })
+            self.assertEqual(job["status"], "running")
+            self.assertEqual(job["step"], "正在取回产物")
+            self.assertNotIn("ended", job)
+            await controller_app.handle_event(None, {
+                "type": "executing", "data": {"prompt_id": "event-order", "node": None},
+            })
+            self.assertEqual(job["status"], "done")
+            self.assertEqual(job["outputs"], output)
+            self.assertEqual(collect.await_count, 2)
+
+    async def test_success_with_available_outputs_finishes_immediately(self):
+        job = {"status": "running", "outputs": []}
+        output = [{"filename": "cached.png", "kind": "image"}]
+        with mock.patch.object(controller_app, "JOBS", {"ready-output": job}), \
+             mock.patch.object(controller_app, "save_jobs"), \
+             mock.patch.object(controller_app, "collect_outputs", new=mock.AsyncMock(return_value=output)):
+            await controller_app.handle_event(None, {
+                "type": "execution_success", "data": {"prompt_id": "ready-output"},
+            })
+        self.assertEqual(job["status"], "done")
+        self.assertEqual(job["outputs"], output)
+
+
 class LocalCleanupTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         for patcher in (

@@ -1066,6 +1066,10 @@ async function openProject(pid) {
       const selected = Object.entries(md.modelSwitch).find(([, cid]) => cid === c.cap);
       if (selected) c._model = selected[0];
     }
+    if (!isTextCard(c) && !isAsset(c) && c.status === "queued" && !c.job) {
+      c.status = "error";
+      c.error = "上次提交未取得任务编号，请先检查任务列表，确认后再重试";
+    }
     seedHistory(c);
   }
   // 文本节点曾经分 5 种模式（text_source / text_polish…），后来合成一种。
@@ -1653,7 +1657,7 @@ function paint(c) {
 
   const s = c.status;
   st.className = "st" + (s === "running" || s === "queued" ? " run" : s === "done" ? " done" : s === "error" ? " err" : "");
-  st.textContent = s === "queued" ? (c.queue_remaining > 1 ? `排队中 (${c.queue_remaining})` : "排队中")
+  st.textContent = s === "queued" ? (!c.job ? "正在提交…" : c.queue_remaining > 1 ? `排队中 (${c.queue_remaining})` : "排队中")
     : s === "running" ? `生成中 ${Math.round((c.progress || 0) * 100)}%`
                         + (c.step ? ` · ${c.step}` : "")
     : s === "done" ? (fmtEla(c.ms) ? `已完成 · ${fmtEla(c.ms)}` : "已完成")
@@ -3735,7 +3739,7 @@ function openPanel(id) {
   // 上一轮跑了多久：视频一轮动辄几分钟，这个数得在面板里也报一声（节点脚上一直有）
   if (c.status === "done" && c.ms > 0) info.textContent += ` · 上次 ${fmtEla(c.ms)}`;
   foot.appendChild(info);
-  if (running) {
+  if (running && c.job) {
     const cn = document.createElement("button");
     cn.className = "cancel"; cn.textContent = "取消";
     cn.onclick = () => cancel(c);
@@ -5641,12 +5645,14 @@ function payloadOf(c) {
 async function run(c) {
   if (isStyle(c)) return toast("风格节点不用运行：它只把风格并进挂着的那几个节点的提示词");
   if (isText(c)) return runText(c);
+  if (c.status === "queued" || c.status === "running") return;
   const cap = capOf(c);
   if (!cap) return toast("能力不可用");
+  c.job = null; c.queue_remaining = null;
   c.error = null; c.progress = 0; c.status = "queued"; c.outputs = []; c.ms = null; c.step = "";
   paint(c); openPanel(c.id);      // status 一进 queued，paint 就把画面区换成加载态
-  const pl = payloadOf(c);
   try {
+    const pl = payloadOf(c);
     const job = await jpost("/api/generate", pl);
     c.job = job.id; c.seed = job.seed; c.status = job.status;
   } catch (e) {
