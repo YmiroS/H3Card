@@ -43,7 +43,7 @@ tr:last-child td { border-bottom:0; }
 .worker-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:12px; padding:14px; }
 .worker-card { position:relative; min-width:0; padding:15px; background:var(--panel2); border:1px solid var(--line); border-radius:11px; overflow:hidden; }
 .worker-card::before { content:""; position:absolute; inset:0 auto 0 0; width:3px; background:var(--ok); }
-.worker-card.busy::before { background:var(--warn); }
+.worker-card.busy::before,.worker-card.syncing::before { background:var(--warn); }
 .worker-card.offline::before,.worker-card.disabled::before,.worker-card.error::before { background:var(--bad); }
 .worker-head { display:flex; align-items:flex-start; gap:10px; }
 .worker-title { flex:1; min-width:0; }
@@ -89,6 +89,7 @@ tr:last-child td { border-bottom:0; }
   <a href="/admin/permissions">权限管理</a>
   <a href="/">打开 Chouka Web</a>
   <span id="account" class="account-bar"></span>
+  <button id="sync-all">一键同步全部节点</button>
   <button id="refresh">立即刷新</button>
 </header>
 <main>
@@ -124,14 +125,15 @@ tr:last-child td { border-bottom:0; }
 </main>
 <script src="/auth.js"></script>
 <script>
-const STATUS = {idle:"空闲",busy:"忙碌",offline:"离线",disabled:"已禁用",error:"异常",queued:"排队中",assigned:"已分配",running:"运行中",done:"已完成",canceled:"已取消",cancel_requested:"正在取消"};
+const STATUS = {idle:"空闲",busy:"忙碌",syncing:"正在同步",offline:"离线",disabled:"已禁用",error:"异常",queued:"排队中",assigned:"已分配",running:"运行中",done:"已完成",canceled:"已取消",cancel_requested:"正在取消"};
+const SYNC_STATUS = {idle:"尚未同步",pending:"等待空闲",running:"正在同步",done:"同步完成",error:"同步失败"};
 const $ = id => document.getElementById(id);
 const text = (id,value) => { $(id).textContent = value; };
 
 async function get(path) {
   return H3Auth.request(path,{cache:"no-store"});
 }
-function cls(state) { return ["idle","done"].includes(state) ? "ok" : ["busy","running","queued","assigned","cancel_requested"].includes(state) ? "warn" : ["offline","disabled","error","canceled"].includes(state) ? "bad" : ""; }
+function cls(state) { return ["idle","done"].includes(state) ? "ok" : ["busy","syncing","running","queued","assigned","cancel_requested"].includes(state) ? "warn" : ["offline","disabled","error","canceled"].includes(state) ? "bad" : ""; }
 function when(value) { return value ? new Date(value*1000).toLocaleString("zh-CN",{hour12:false}) : "--"; }
 function ago(value) {
   if (!value) return "--";
@@ -245,6 +247,12 @@ function renderWorkers(items,jobs,projects) {
     flags.appendChild(make("span",`flag ${worker.comfy_online?"ok":"bad"}`,
       worker.comfy_online?"ComfyUI 在线":"ComfyUI 不可用"));
     flags.appendChild(make("span","flag",worker.busy?"正在占用":"可接任务"));
+    if (worker.sync_status && worker.sync_status!=="idle") {
+      const syncClass=worker.sync_status==="error"?"bad":worker.sync_status==="done"?"ok":"warn";
+      const syncFlag=make("span",`flag ${syncClass}`,SYNC_STATUS[worker.sync_status]||worker.sync_status);
+      syncFlag.title=worker.sync_message||"";
+      flags.appendChild(syncFlag);
+    }
     card.appendChild(flags);
 
     const task=make("div","worker-task");
@@ -256,6 +264,9 @@ function renderWorkers(items,jobs,projects) {
     } else if (worker.current_job_id) {
       task.appendChild(make("strong","","任务详情暂未载入"));
       task.appendChild(make("em","",worker.current_job_id));
+    } else if (["pending","running"].includes(worker.sync_status)) {
+      task.appendChild(make("strong","",SYNC_STATUS[worker.sync_status]));
+      task.appendChild(make("em","",worker.sync_message||"等待节点反馈"));
     } else if (worker.busy) {
       task.appendChild(make("strong","","ComfyUI 本地任务"));
       task.appendChild(make("em","","非中间层派发"));
@@ -376,6 +387,23 @@ async function refresh() {
     text("refresh-state","连接失败");
   }
 }
+async function syncAllWorkers() {
+  if (!confirm("确认让全部节点增量同步 models 和 user？\n\n忙碌节点会等当前任务结束，离线节点会在下次上线后执行。")) return;
+  const button=$("sync-all");
+  button.disabled=true;
+  try {
+    const result=await H3Auth.json("/api/admin/workers/sync-all","POST",{});
+    await refresh();
+    const skipped=result.skipped_count||0;
+    alert(`已向 ${result.worker_count||0} 个节点下发同步请求。${skipped?`\n${skipped} 个旧版节点已跳过，请先手动更新一次 chouka。`:""}`);
+  } catch (error) {
+    $("error").textContent=`下发同步请求失败：${error.message}`;
+    $("error").style.display="block";
+  } finally {
+    button.disabled=false;
+  }
+}
+$("sync-all").onclick=syncAllWorkers;
 $("refresh").onclick=refresh;
 H3Auth.requireUser(true).then(() => {
   H3Auth.mountAccount($("account"));

@@ -466,6 +466,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_post("/agent/v1/jobs/{pid}/complete", controller_app.api_agent_complete)
         application.router.add_post("/agent/v1/jobs/{pid}/failed", controller_app.api_agent_failed)
         application.router.add_get("/api/workers", controller_app.api_workers)
+        application.router.add_post(
+            "/api/admin/workers/sync-all", controller_app.api_workers_sync_all
+        )
         application.router.add_get("/api/costs", controller_app.api_costs)
         await self.start_client(application)
 
@@ -499,6 +502,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn("<title>运行面板</title>", dashboard)
         self.assertIn('id="worker-cards" class="worker-grid"', dashboard)
         self.assertIn("GPU 利用率", dashboard)
+        self.assertIn("一键同步全部节点", dashboard)
         self.assertIn("/controller/costs", dashboard)
 
         response = await self.client.get("/controller/costs")
@@ -515,6 +519,36 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(health["mode"], controller_app.EXECUTION_MODE)
         self.assertIn("server_time", health)
         self.assertIn("started_at", health)
+
+    async def test_admin_can_request_all_workers_to_sync(self):
+        credentials = self.store.register_worker(
+            "gpu-sync", {
+                "node_classes": ["KSampler"], "supports_file_sync": True,
+            }
+        )
+        self.store.heartbeat(
+            credentials["worker_id"], comfy_online=True, busy=False
+        )
+
+        response = await self.client.post(
+            "/api/admin/workers/sync-all", headers=self.headers, json={}
+        )
+
+        self.assertEqual(response.status, 202, await response.text())
+        payload = await response.json()
+        self.assertEqual(payload["worker_count"], 1)
+        agent_headers = {
+            "X-Worker-ID": credentials["worker_id"],
+            "Authorization": f"Bearer {credentials['worker_token']}",
+        }
+        response = await self.client.post(
+            "/agent/v1/heartbeat", headers=agent_headers,
+            json={"comfy_online": True, "busy": False},
+        )
+        heartbeat = await response.json()
+        self.assertIn({
+            "type": "sync_files", "request_id": payload["request_id"],
+        }, heartbeat["commands"])
 
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
         self.own_project("project-1")
