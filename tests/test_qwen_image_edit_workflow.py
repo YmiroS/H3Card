@@ -13,7 +13,9 @@ from aiohttp.test_utils import TestClient, TestServer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
+sys.path.insert(0, str(ROOT / "tests"))
 import app
+import auth_support
 import scan_workflows
 
 
@@ -132,14 +134,23 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
             self.assertRegex(labels[nid], r"[\u4e00-\u9fff]")
 
 
-class QwenRuntimeCardsTest(unittest.IsolatedAsyncioTestCase):
+class QwenRuntimeCardsTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def test_http_reload_publishes_real_manifest_and_model_choice(self):
-        application = web.Application()
+        self.auth_setup()
+        self.addCleanup(self.auth_teardown)
+        self.own_project("p")
+        self.enterContext(mock.patch.object(app, "PROJ_DIR", self.root / "data" / "projects"))
+        for i in range(3):
+            self.register_asset(f"image{i}.png")
+        application = self.build_app()
         application.router.add_post("/api/reload", app.api_reload)
         application.router.add_get("/api/cards", app.api_cards)
         application.router.add_post("/api/generate", app.api_generate)
         with mock.patch.object(app, "CONTROLLER_MODE", False):
             async with TestClient(TestServer(application)) as client:
+                self.client = client
+                self.origin = str(client.make_url('/')).rstrip('/')
+                client.session.headers.update(await self.login())
                 response = await client.post("/api/reload")
                 self.assertEqual(response.status, 200)
                 self.assertTrue((await response.json())["ok"])
@@ -148,7 +159,7 @@ class QwenRuntimeCardsTest(unittest.IsolatedAsyncioTestCase):
                 data = await response.json()
                 for count in (1, 2, 3):
                     response = await client.post("/api/generate", json={
-                        "capability": "qwen_image_edit_2511_i2i", "dry_run": True,
+                        "capability": "qwen_image_edit_2511_i2i", "dry_run": True, "project": "p",
                         "assets": {f"images[{i}]": f"chouka/image{i}.png" for i in range(count)},
                         "params": {"prompt": "更换背景", "scale_to_length": 1024},
                     })

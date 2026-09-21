@@ -28,7 +28,10 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
     <span id="zoom-percent"></span><div id="menu" style="display:none"></div><script>
     const el = Object.fromEntries(['stage','world','wires','groups','menu'].map(id => [id,document.getElementById(id)]));
     el.zoomMenu = document.getElementById('zoom-menu'); el.zoomPercent = document.getElementById('zoom-percent');
-    const PROJ = {cards:[],edges:[]}, CARDS = [{id:'card_asset',kind:'asset',modes:[{id:'asset'}]}], CLIP = null;
+    const PROJ = {id:'asset-test',cards:[],edges:[]}, CARDS = [{id:'card_asset',kind:'asset',modes:[{id:'asset'}]}], CLIP = null;
+    const canOperate = () => true, requireOperate = () => true;
+    const api = async (url, options) => { const r = await fetch(url, options); if (!r.ok) throw Error('HTTP ' + r.status); return r.json(); };
+    ${block('const projectUploadUrl =', 'async function api(')}
     let view = {x:0,y:0,k:1};
     ${block('const CW =', 'document.addEventListener(')}
     const isAsset = () => true, isStyle = () => false, isText = () => false, isTextCard = () => false;
@@ -72,13 +75,13 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
   const media = new Map();
   const uploads = [];
   const server = createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/api/upload') {
+    if (req.method === 'POST' && req.url === '/api/upload?project=asset-test') {
       const chunks = [];
       req.on('data', chunk => chunks.push(chunk));
       req.on('end', () => {
         uploads.push({type:req.headers['content-type'],body:Buffer.concat(chunks).toString('latin1')});
         res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify({files:[{kind:'image',origin:'landscape.png',url:'/media/landscape.png'}]}));
+        res.end(JSON.stringify({files:[{kind:'image',origin:'landscape.png',url:'/media/landscape.png',ref:'chouka/landscape.png'}]}));
       });
     } else if (media.has(req.url)) {
       res.setHeader('Content-Type', req.url.endsWith('.mp4') ? 'video/mp4' : 'image/png');
@@ -262,7 +265,7 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
       assert.deepEqual(await page.evaluate(() => {
         const c = PROJ.cards[1], img = c._el.querySelector('img');
         return {at:{x:c.x,y:c.y},size:dimensions(c._el),out:c.outputs[0],fit:getComputedStyle(img).objectFit,hasSize:'w' in c || 'h' in c};
-      }), {at,size:defaults,out:{kind:'image',origin:'landscape.png',url:'/media/landscape.png',filename:'landscape.png',width:1200,height:600},fit:'contain',hasSize:false});
+      }), {at,size:defaults,out:{kind:'image',origin:'landscape.png',url:'/media/landscape.png',ref:'chouka/landscape.png',filename:'landscape.png',width:1200,height:600},fit:'contain',hasSize:false});
       assert.deepEqual(await page.evaluate(() => notices), ['已上传：landscape.png']);
     });
     assert.deepEqual(errors, []);
@@ -282,6 +285,8 @@ test('filled asset slots preview on click and replace/download through the conte
     const el = {menu:document.getElementById('menu'), view:document.getElementById('view'),
       vbox:document.querySelector('.vbox'), picker:document.getElementById('picker')};
     const api = async (url, options) => { const r = await fetch(url, options); if (!r.ok) throw Error('HTTP ' + r.status); return r.json(); };
+    const PROJ = {id:'asset-test'}, canOperate = () => true, requireOperate = () => true;
+    ${block('const projectUploadUrl =', 'async function api(')}
     const slotName = s => s.label, gridWord = () => false, modeOf = () => null, tipHide = () => {};
     const toast = message => { throw Error(message); };
     window.saved = 0; window.detached = [];
@@ -311,11 +316,11 @@ test('filled asset slots preview on click and replace/download through the conte
     </script>`;
   let uploads = 0;
   const server = createServer((req, res) => {
-    if (req.method === 'POST' && req.url === '/api/upload') {
+    if (req.method === 'POST' && req.url === '/api/upload?project=asset-test') {
       uploads++;
       req.resume();
       res.setHeader('Content-Type', 'application/json');
-      res.end(JSON.stringify({files:[{kind:'image', origin:'replacement.png', url:'/api/upload/replacement.png'}]}));
+      res.end(JSON.stringify({files:[{kind:'image', origin:'replacement.png', url:'/api/upload/replacement.png', ref:'chouka/replacement.png'}]}));
     } else if (req.url.startsWith('/api/preview/') && !req.url.endsWith('/file')) {
       res.setHeader('Content-Type', 'application/json');
       res.end(JSON.stringify({status:'ready', url:'/api/preview/original.mov/file'}));

@@ -10,7 +10,9 @@ from aiohttp.test_utils import TestClient, TestServer
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 
+sys.path.insert(0, str(ROOT / "tests"))
 import app
+import auth_support
 import scan_workflows
 
 CAP_ID = "qwen_image_2512_t2i"
@@ -101,9 +103,13 @@ class QwenTextToImageWorkflowTest(unittest.TestCase):
             self.assertRegex(label, r"[\u4e00-\u9fff]")
 
 
-class QwenTextToImageApiTest(unittest.IsolatedAsyncioTestCase):
+class QwenTextToImageApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def test_reload_dry_run_and_recorded_negative_prompt(self):
-        application = web.Application()
+        self.auth_setup()
+        self.addCleanup(self.auth_teardown)
+        self.own_project("p")
+        self.enterContext(mock.patch.object(app, "PROJ_DIR", self.root / "data" / "projects"))
+        application = self.build_app()
         application["cleanup_pending"] = set()
         application.router.add_post("/api/reload", app.api_reload)
         application.router.add_get("/api/cards", app.api_cards)
@@ -115,6 +121,9 @@ class QwenTextToImageApiTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(app, "STEPS", {}), \
              mock.patch.object(app, "WEIGHTS", {}):
             async with TestClient(TestServer(application)) as client:
+                self.client = client
+                self.origin = str(client.make_url('/')).rstrip('/')
+                client.session.headers.update(await self.login())
                 response = await client.post("/api/reload")
                 self.assertEqual(response.status, 200)
                 response = await client.get("/api/cards")
@@ -124,7 +133,7 @@ class QwenTextToImageApiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(mode["modelSwitch"]["qwen2512"], CAP_ID)
                 inputs = data["capabilities"][CAP_ID]["inputs"]
                 self.assertIn("negative_prompt", [s["key"] for s in inputs])
-                body = {"capability": CAP_ID, "assets": {}, "dry_run": True,
+                body = {"capability": CAP_ID, "assets": {}, "dry_run": True, "project": "p",
                         "params": {"prompt": "窗边的猫", "negative_prompt": "", "width": 1280,
                                    "height": 720, "steps": 7, "refine_steps": 3, "seed": 123}}
                 response = await client.post("/api/generate", json=body)
@@ -144,6 +153,13 @@ class QwenTextToImageApiTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(submitted_graph["9"]["inputs"]["text"], "不要水印")
                 prompts = {p["key"]: p["text"] for p in app.JOBS["qwen-t2i-test"]["prompts"]}
                 self.assertEqual(prompts, {"prompt": "窗边的猫", "negative_prompt": "不要水印"})
+                viewer = self.auth.create_user("viewer", auth_support.PASSWORD)
+                self.auth.set_grant(viewer["id"], self.admin["id"], "read")
+                client.session.headers.update(await self.login("viewer"))
+                submit.reset_mock()
+                response = await client.post("/api/generate", json=body)
+                self.assertEqual(response.status, 403)
+                submit.assert_not_awaited()
 
 
 if __name__ == "__main__":

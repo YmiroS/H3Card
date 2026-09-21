@@ -21,7 +21,7 @@ const cards = JSON.parse(readFileSync(path.join(root, 'manifests', '_cards.json'
   .filter(c => ['card_image', 'card_asset', 'card_text', 'card_style'].includes(c.id));
 cards.find(c => c.id === 'card_image').modes.push({id:'no_switch', name:'独立模式'});
 const project = {
-  id:'model-test', name:'模型菜单回归', locked:true, edges:[], groups:[], view:{x:100, y:70, k:1},
+  id:'model-test', name:'模型菜单回归', permission:'operate', locked:true, edges:[], groups:[], view:{x:100, y:70, k:1},
   cards:[{id:'image-card', type:'card_image', cap:'zimage_i2i', x:100, y:20, params:{}, assets:{}, outputs:[]}],
 };
 
@@ -36,10 +36,11 @@ test('image model menus, parameters and media limits in the complete UI', async 
   };
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost').pathname;
+    if (url === '/api/auth/me') return json(res, {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'test-csrf'});
     if (url === '/api/cards') return json(res, {cards, capabilities, comfy_online:true});
     if (url === '/api/reload') return json(res, {ok:true});
     if (url === '/api/health') return json(res, {comfy_online:true});
-    if (url === '/api/jobs') return json(res, {jobs});
+    if (url === '/api/jobs') return json(res, {jobs:jobs.map(j => ({permission:'operate', ...j}))});
     if (url === '/api/projects') return json(res, {projects:[{...project, cards:1}]});
     if (url === '/api/projects/model-test') return json(res, savedProject);
     if (url === '/api/upload' && req.method === 'POST') {
@@ -65,7 +66,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       return;
     }
     if (url === '/fixture.png') { res.setHeader('Content-Type', 'image/png'); return res.end(png); }
-    const files = {'/':'index.html', '/app.js':'app.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+    const files = {'/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
     if (Object.hasOwn(files, url)) {
       const name = files[url];
       res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript; charset=utf-8'
