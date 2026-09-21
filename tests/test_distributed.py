@@ -48,6 +48,11 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertNotIn("token_hash", worker)
         self.assertEqual(worker["state"], "idle")
         self.assertEqual(worker["capabilities"]["node_classes"], ["KSampler", "SaveImage"])
+        self.store.enqueue("job-1", {"graph": {}}, ["KSampler"])
+        assignment = self.store.acquire(self.worker_id)
+        self.assertEqual(assignment["job_id"], "job-1")
+        self.assertEqual(self.store.job_worker_names(["job-1"]), {"job-1": "gpu-01"})
+        self.assertEqual(self.store.job_worker_names([]), {})
 
     def test_list_workers_keeps_only_latest_same_name_registration(self):
         newest = self.store.register_worker(
@@ -307,6 +312,7 @@ class DistributedStoreTest(unittest.TestCase):
         self.store.heartbeat(
             self.worker_id, comfy_online=True, busy=False, current_job_id=None
         )
+        self.assertEqual(self.store.job_worker_names(["job-1"]), {})
         second = self.store.acquire(self.worker_id)
 
         self.assertEqual(second["job_id"], "job-1")
