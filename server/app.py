@@ -97,6 +97,30 @@ def model_family(capability_id):
     return MODEL_FAMILY.get(capability_id, capability_id)
 
 
+MODEL_NAMES = {
+    "minimax_h3": "MiniMax H3",
+    "flux2_klein": "FLUX.2 Klein",
+    "krea2": "Krea2",
+    "zimage": "Z-Image",
+    "qwen_image_edit_2511": "Qwen Image Edit 2511",
+    "qwen_image_2512": "Qwen Image 2512（双阶段）",
+    "qwen35_27b": "Qwen3.5 27B",
+    "rmbg2": "RMBG 2.0",
+    "seedvr2": "SeedVR2",
+    "gimmvfi_interp": "GIMM-VFI",
+    "grid4_stitch": "无需模型（拼图工具）",
+    "rmbg_erase": "RMBG 2.0 + FLUX.2 Klein",
+    "text": "Qwen3.5 27B",
+}
+
+
+def model_name(capability_id):
+    if not capability_id:
+        return "未知模型"
+    family = model_family(capability_id)
+    return MODEL_NAMES.get(capability_id, MODEL_NAMES.get(family, family))
+
+
 CLIENT_ID = uuid.uuid4().hex
 STARTED_AT = time.time()
 JOBS = {}                  # prompt_id -> job dict
@@ -945,6 +969,7 @@ async def api_generate(request):
     STEPS[pid] = step_labels(graph)
     WEIGHTS[pid] = step_weights(graph)
     JOBS[pid] = {"id": pid, "capability": cid, "name": cap["name"],
+                 "modelName": model_name(cid),
                  "outputType": cap["outputType"], "status": "queued",
                  "progress": 0.0, "created": time.time(),
                  "seed": params.get("_seed_used", params.get("seed")),
@@ -1086,6 +1111,7 @@ async def rewrite_local(request, job_name, system, user, sampling, body, t0, fel
     STEPS[pid] = step_labels(graph)
     WEIGHTS[pid] = step_weights(graph)
     JOBS[pid] = {"id": pid, "capability": "text", "name": job_name,
+                 "modelName": model_name("text"),
                  "outputType": "text", "status": "queued",
                  "progress": 0.0, "created": t0, "seed": None,
                  "step": "", "outputs": [], "error": None,
@@ -1245,24 +1271,44 @@ async def authorized_job(request, jid, operate=False):
     return permission
 
 
+def job_display_info(job, node_name):
+    return {
+        "modelName": job.get("modelName") or model_name(job.get("capability")),
+        "nodeName": node_name,
+    }
+
+
+def job_node_names(app, jobs):
+    if CONTROLLER_MODE:
+        return distributed_store(app).job_worker_names(job["id"] for job in jobs)
+    return {job["id"]: "本机" for job in jobs}
+
+
 async def api_job(request):
     pid = request.match_info["pid"]
     permission = await authorized_job(request, pid)
     job = JOBS.get(pid)
     if not job:
         raise web.HTTPNotFound(reason="没有这个任务")
-    return web.json_response(job | {"permission": permission})
+    node_name = job_node_names(request.app, [job]).get(pid)
+    return web.json_response(
+        job | job_display_info(job, node_name) | {"permission": permission}
+    )
 
 
 async def api_jobs(request):
-    out = []
+    visible = []
     for job in sorted(list(JOBS.values()), key=lambda j: j["created"], reverse=True):
         permission = await job_permission(request, job["id"])
         if permission:
-            out.append(job | {"permission": permission})
-        if len(out) == 60:
+            visible.append((job, permission))
+        if len(visible) == 60:
             break
-    return web.json_response({"jobs": out})
+    node_names = job_node_names(request.app, [job for job, _permission in visible])
+    return web.json_response({"jobs": [
+        job | job_display_info(job, node_names.get(job["id"])) | {"permission": permission}
+        for job, permission in visible
+    ]})
 
 
 LIVE = ("queued", "running")

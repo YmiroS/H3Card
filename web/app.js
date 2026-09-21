@@ -5774,7 +5774,10 @@ async function cancel(c) {
 /** 一次把所有任务捞回来：右上角的计数要算上别的项目/别处提交的活儿，
     所以不能只按当前项目的节点一张张问。 */
 async function pollJobs() {
-  try { TASKS = (await api("/api/jobs")).jobs || []; } catch (e) { return; }
+  if (!pollJobs._request) {
+    pollJobs._request = api("/api/jobs").finally(() => { pollJobs._request = null; });
+  }
+  try { TASKS = (await pollJobs._request).jobs || []; } catch (e) { return; }
   paintJobsBtn();
   if (el.jobs.style.display !== "none") renderJobs();
   if (!PROJ || !canOperate()) return;
@@ -5979,7 +5982,11 @@ function jobRow(j) {
   d._sp = document.createElement("span"); d._sp.className = "sp";
   d._tm = document.createElement("span");
   r2.append(d._sp, d._tm);
-  d.append(r1, r2);
+  const r3 = document.createElement("div"); r3.className = "r3";
+  d._node = document.createElement("span"); d._node.className = "node";
+  d._step = document.createElement("span"); d._step.className = "step";
+  r3.append(d._node, d._step);
+  d.append(r1, r2, r3);
 
   if (jobLive(j)) {
     const bar = document.createElement("div"); bar.className = "bar";
@@ -6001,14 +6008,19 @@ function jobRow(j) {
   return d;
 }
 
-/** 只刷每次轮询都在变的那几处：状态百分比、当前步骤、耗时、进度条 */
+/** 只刷每次轮询都在变的那几处：状态百分比、当前步骤、执行节点、耗时、进度条 */
 function fillJobRow(d, j) {
   const pct = Math.round((j.progress || 0) * 100);
   // 排队的不报"前面还有几个"：ComfyUI 的 queue_remaining 是整条队列的长度，
   // 不是这一条自己的位次，拿它当位次就是编数字。队列长度改在浮窗标题上说一次
   d._st.textContent = j.status === "running" ? `运行中 ${pct}%`
     : JOB_ZH[j.status] || j.status;
-  d._sp.textContent = j.step || j.name;   // 在跑就报当前步骤，没跑就报用的哪条能力
+  const modelText = `${j.name} · ${j.modelName || j.capability}`;
+  if (d._sp.textContent !== modelText) d._sp.textContent = d._sp.title = modelText;
+  const nodeText = `执行节点：${j.nodeName || "等待分配"}`;
+  if (d._node.textContent !== nodeText) d._node.textContent = d._node.title = nodeText;
+  const stepText = j.step ? `当前：${j.step}` : "";
+  if (d._step.textContent !== stepText) d._step.textContent = d._step.title = stepText;
   const ela = j.started ? fmtEla(((j.ended || Date.now() / 1000) - j.started) * 1000) : "";
   d._tm.textContent = histTime(j.created * 1000) + (ela ? ` · ${ela}` : "");
   if (d._bar) d._bar.style.width = pct + "%";

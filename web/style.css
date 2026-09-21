@@ -1116,6 +1116,16 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   color: var(--dim); font-size: 11px; font-family: var(--mono);
 }
 .jrow .r2 .sp { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jrow .r3 {
+  display: flex; gap: 8px; margin-top: 3px; min-width: 0;
+  color: var(--dim); font-size: 11px; font-family: var(--mono);
+}
+.jrow .r3 .node {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--txt);
+}
+.jrow .r3 .step {
+  flex: 0 1 45%; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right;
+}
 .jrow .bar { margin-top: 6px; }
 .jrow .msg {
   margin-top: 5px; padding-left: 6px; font-size: 11px; line-height: 1.6;

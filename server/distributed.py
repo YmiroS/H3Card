@@ -302,6 +302,21 @@ class DistributedStore:
                 "maintenance_ack": maintenance_ack,
             }
 
+    def job_worker_names(self, job_ids):
+        job_ids = list(job_ids)
+        if not job_ids:
+            return {}
+        placeholders = ",".join("?" for _ in job_ids)
+        with self.lock:
+            rows = self.db.execute(
+                f"""SELECT jobs.job_id, workers.name
+                    FROM dispatch_jobs AS jobs
+                    JOIN workers ON workers.id = jobs.worker_id
+                    WHERE jobs.job_id IN ({placeholders})""",
+                job_ids,
+            ).fetchall()
+        return {row["job_id"]: row["name"] for row in rows}
+
     def list_workers(self):
         now = time.time()
         with self.lock:
