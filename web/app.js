@@ -132,7 +132,7 @@ const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHa
 const modelOf = (c) => Object.entries((modeOf(c) || {}).modelSwitch || {})
   .find(([, cid]) => cid === c.cap)?.[0];
 const IMAGE_MODEL_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen Image Edit 2511",
-  qwen2512: "Qwen Image 2512（双阶段）" };
+  qwen2512: "Qwen Image 2512（双阶段）", qwen21: "Qwen Image 2.1" };
 /** 节点显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
     路由节点同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
     最后兜底用模式名而不是裸 id：风格节点在 CAPS 里根本没有条目（它不是能力）。 */

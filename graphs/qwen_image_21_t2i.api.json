@@ -1,0 +1,67 @@
+{
+ "2": {
+  "class_type": "UNETLoader",
+  "inputs": {"unet_name": "qwen_image_2.1_int8_convrot.safetensors", "weight_dtype": "default"},
+  "_meta": {"title": "加载 Qwen Image 2.1 模型"}
+ },
+ "3": {
+  "class_type": "CLIPLoader",
+  "inputs": {"clip_name": "qwen3vl_8b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default"},
+  "_meta": {"title": "加载 Qwen 文本编码器"}
+ },
+ "4": {
+  "class_type": "VAELoader",
+  "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"},
+  "_meta": {"title": "加载 Qwen Image 2.1 VAE"}
+ },
+ "7": {
+  "class_type": "QwenImage21Cache",
+  "inputs": {"model": ["14", 0], "device": "auto", "dtype": "default"},
+  "_meta": {"title": "Qwen Image 2.1 缓存"}
+ },
+ "8": {
+  "class_type": "KSampler",
+  "inputs": {"model": ["7", 0], "positive": ["37", 0], "negative": ["37", 1], "latent_image": ["38", 0], "seed": 123456789, "steps": 40, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1},
+  "_meta": {"title": "图像采样"}
+ },
+ "9": {
+  "class_type": "VAEDecode",
+  "inputs": {"samples": ["8", 0], "vae": ["4", 0]},
+  "_meta": {"title": "图像解码"}
+ },
+ "10": {
+  "class_type": "SaveImage",
+  "inputs": {"images": ["9", 0], "filename_prefix": "chouka/qwen_image_21_t2i"},
+  "_meta": {"title": "保存生成图像"}
+ },
+ "13": {
+  "class_type": "PrimitiveStringMultiline",
+  "inputs": {"value": ""},
+  "_meta": {"title": "提示词"}
+ },
+ "14": {
+  "class_type": "ModelAttentionBackend",
+  "inputs": {"model": ["2", 0], "attention": "comfy kitchen attention"},
+  "_meta": {"title": "设置注意力后端"}
+ },
+ "37": {
+  "class_type": "TextEncodeQwenImage21",
+  "inputs": {"clip": ["3", 0], "vae": ["4", 0], "prompt": ["13", 0], "negative_prompt": "", "resolution": 1024},
+  "_meta": {"title": "Qwen Image 2.1 提示词编码"}
+ },
+ "38": {
+  "class_type": "EmptyLatentImage",
+  "inputs": {"width": ["39", 0], "height": ["39", 1], "batch_size": ["42", 0]},
+  "_meta": {"title": "创建输出画布"}
+ },
+ "39": {
+  "class_type": "ResolutionSelector",
+  "inputs": {"aspect_ratio": "9:16 (Portrait Widescreen)", "megapixels": 1, "multiple": 16},
+  "_meta": {"title": "设置输出比例和像素数"}
+ },
+ "42": {
+  "class_type": "PrimitiveInt",
+  "inputs": {"value": 1},
+  "_meta": {"title": "生成图片张数"}
+ }
+}

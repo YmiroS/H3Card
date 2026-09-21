@@ -128,14 +128,18 @@ ROUTE_CARDS = {
 # 每条能力仍保留自己的 manifest，所以换模型后参数面板会跟着切成对应的参数。
 MODEL_SWITCHES = {
     "zimage_t2i": {"zimage": "zimage_t2i", "krea2": "krea2_t2i",
-                   "qwen2512": "qwen_image_2512_t2i"},
+                   "qwen2512": "qwen_image_2512_t2i", "qwen21": "qwen_image_21_t2i"},
     "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i",
-                   "qwen2511": "qwen_image_edit_2511_i2i"},
+                   "qwen2511": "qwen_image_edit_2511_i2i", "qwen21": "qwen_image_21_i2i"},
 }
 
 # API 图和输入槽随项目维护，不依赖原作者本机的界面工作流路径。
 # Qwen 图生图固定编辑分支；文生图保留双阶段和独立负向输入，防止重扫合并两阶段步数。
-BUNDLED_CAPABILITIES = {"qwen_image_edit_2511_i2i", "qwen_image_2512_t2i"}
+# Qwen 2.1 固定拆出文生图、单图和16图编辑，避免按原文件旁路状态丢掉多图分支。
+BUNDLED_CAPABILITIES = {
+    "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
+    "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
+}
 
 # 风格卡：画布上唯一一张**不对应任何工作流**的卡。它没有 manifest、没有能力，
 # 自己也不跑 —— 只存一段风格描述，连到哪张卡就在提交时并进那张卡的提示词里。

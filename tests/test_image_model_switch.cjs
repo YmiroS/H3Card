@@ -14,7 +14,8 @@ const qwenT2iName = 'Qwen Image 2512（双阶段）';
 const qwenNegative = '低分辨率，低画质，肢体畸形，手指畸形，画面过饱和，蜡像感，人脸无细节，过度光滑，画面具有AI感。构图混乱。文字模糊，扭曲。';
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 const capabilities = Object.fromEntries(['zimage_t2i', 'zimage_i2i', 'krea2_t2i', 'krea2_i2i',
-  'flux2_klein_storyboard9', 'flux2_klein_edit', qwenId, qwenT2iId].map(id =>
+  'flux2_klein_storyboard9', 'flux2_klein_edit', qwenId, qwenT2iId,
+  'qwen_image_21_t2i', 'qwen_image_21_i2i', 'qwen_image_21_multi'].map(id =>
   [id, JSON.parse(readFileSync(path.join(root, 'manifests', id + '.json'), 'utf8'))]));
 capabilities.no_switch = {id:'no_switch', name:'独立模式', outputType:'image', inputs:[]};
 const cards = JSON.parse(readFileSync(path.join(root, 'manifests', '_cards.json'), 'utf8'))
@@ -117,14 +118,14 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.match(await modelButton.innerText(), /^Z-Image/);
       await modelButton.click();
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
-        ['Z-Image（当前）', 'Krea2', 'Qwen Image Edit 2511']);
+        ['Z-Image（当前）', 'Krea2', 'Qwen Image Edit 2511', 'Qwen Image 2.1']);
       await page.locator('#menu button').filter({hasText:'Qwen Image Edit 2511'}).click();
       assert.equal(await page.evaluate(() => PROJ.cards[0].cap), qwenId);
       assert.match(await modelButton.innerText(), /^Qwen Image Edit 2511/);
       await page.evaluate(() => { PROJ.cards[0]._model = 'zimage'; openPanel(PROJ.cards[0].id); });
       await modelButton.click();
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
-        ['Z-Image', 'Krea2', 'Qwen Image Edit 2511（当前）']);
+        ['Z-Image', 'Krea2', 'Qwen Image Edit 2511（当前）', 'Qwen Image 2.1']);
       await page.locator('#menu button').filter({hasText:'Krea2'}).click();
       assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'krea2_i2i');
       await chooseModel('Z-Image');
@@ -146,7 +147,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'zimage_t2i');
       await modelButton.click();
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
-        ['Z-Image（当前）', 'Krea2', qwenT2iName]);
+        ['Z-Image（当前）', 'Krea2', qwenT2iName, 'Qwen Image 2.1']);
       await page.locator('#menu button').filter({hasText:'Krea2'}).click();
       await page.evaluate(() => { PROJ.cards[0]._model = 'qwen2511'; });
       await chooseMode('图生图');
@@ -196,6 +197,58 @@ test('image model menus, parameters and media limits in the complete UI', async 
       await negative.fill('临时负向');
       await negative.fill('');
       assert.equal((await submit()).params.negative_prompt, '', 'keyboard clearing also submits an explicit blank');
+    });
+
+    await t.test('Qwen 2.1 model switches expose working parameters and submit separate single/multi-image modes', async () => {
+      await reset('zimage_t2i');
+      await chooseModel('Qwen Image 2.1');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'qwen_image_21_t2i');
+      await paramsButton.click();
+      assert.equal(await page.locator('#respop').isVisible(), true);
+      const steps = page.locator('#respop .row').filter({hasText:'采样步数'});
+      assert.equal(await steps.locator('input[type="number"]').inputValue(), '40');
+      await steps.locator('input[type="number"]').fill('24');
+      await page.locator('#respop button[title^="画面比例 16:9"]').click();
+      await page.locator('#respop .x').click();
+      let payload = await submit();
+      assert.equal(payload.capability, 'qwen_image_21_t2i');
+      assert.equal(payload.params.steps, 24);
+      assert.equal(payload.params.aspect_ratio, '16:9 (Widescreen)');
+      assert.deepEqual(payload.assets, {});
+      await chooseMode('图生图');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'qwen_image_21_i2i');
+      assert.match(await page.locator('#panel .refhead').innerText(), /图片 1/);
+      const chooser = page.waitForEvent('filechooser');
+      await page.locator('#panel .refadd').click();
+      await (await chooser).setFiles({name:'qwen21.png', mimeType:'image/png', buffer:png});
+      await page.waitForFunction(() => !!PROJ.cards[0].assets['images[0]']);
+      payload = await submit();
+      assert.equal(payload.capability, 'qwen_image_21_i2i');
+      assert.deepEqual(Object.keys(payload.assets), ['images[0]']);
+
+      await chooseMode('Qwen 2.1 多图编辑');
+      assert.equal(await modelButton.count(), 0);
+      assert.match(await page.locator('#panel .refhead').innerText(), /图片 16/);
+      await paramsButton.click();
+      assert.equal(await page.locator('#respop').isVisible(), true);
+      const spec = capabilities.qwen_image_21_multi.inputs.find(s => s.key === 'reference_pixels');
+      const pixels = page.locator('#respop .row').filter({has:page.getByText(spec.label, {exact:true})});
+      assert.equal(await pixels.count(), 1, 'mirrored reference size controls appear once');
+      assert.equal(await pixels.locator('input[type="number"]').inputValue(), '1536');
+      await pixels.locator('input[type="number"]').fill('1024');
+      await page.locator('#respop .x').click();
+      for (let i = 1; i < 16; i++) {
+        const chooser = page.waitForEvent('filechooser');
+        await page.locator('#panel .refadd').click();
+        await (await chooser).setFiles({name:`qwen21-${i}.png`, mimeType:'image/png', buffer:png});
+        await page.waitForFunction(i => !!PROJ.cards[0].assets[`images[${i}]`], i);
+      }
+      assert.equal(await page.locator('#panel .refadd').count(), 0);
+      payload = await submit();
+      assert.equal(payload.capability, 'qwen_image_21_multi');
+      assert.equal(payload.params.reference_pixels, 1024);
+      assert.equal(Object.keys(payload.assets).length, 16);
+      assert.equal(Object.hasOwn(payload.params, 'aspect_ratio'), false);
     });
 
     await t.test('negative input never inherits styles, text references or positive optimization', async () => {
@@ -279,7 +332,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'zimage_i2i');
       await modelButton.click();
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
-        ['Z-Image（当前）', 'Krea2', 'Qwen Image Edit 2511']);
+        ['Z-Image（当前）', 'Krea2', 'Qwen Image Edit 2511', 'Qwen Image 2.1']);
     });
 
     await t.test('multi-image editing modes do not acquire the text-to-image model menu', async () => {

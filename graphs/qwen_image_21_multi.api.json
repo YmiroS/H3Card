@@ -1,0 +1,233 @@
+{
+ "45": {
+  "class_type": "PrimitiveStringMultiline",
+  "inputs": {"value": ""},
+  "_meta": {"title": "提示词"}
+ },
+ "47": {
+  "class_type": "PrimitiveInt",
+  "inputs": {"value": 1},
+  "_meta": {"title": "生成图片张数"}
+ },
+ "48": {
+  "class_type": "UNETLoader",
+  "inputs": {"unet_name": "qwen_image_2.1_int8_convrot.safetensors", "weight_dtype": "default"},
+  "_meta": {"title": "加载 Qwen Image 2.1 模型"}
+ },
+ "49": {
+  "class_type": "CLIPLoader",
+  "inputs": {"clip_name": "qwen3vl_8b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default"},
+  "_meta": {"title": "加载 Qwen 文本编码器"}
+ },
+ "51": {
+  "class_type": "GetImageSize",
+  "inputs": {"image": ["75", 0]},
+  "_meta": {"title": "读取图1缩放后尺寸"}
+ },
+ "52": {
+  "class_type": "ModelAttentionBackend",
+  "inputs": {"model": ["48", 0], "attention": "comfy kitchen attention"},
+  "_meta": {"title": "设置注意力后端"}
+ },
+ "53": {
+  "class_type": "EmptyLatentImage",
+  "inputs": {"width": ["51", 0], "height": ["51", 1], "batch_size": ["47", 0]},
+  "_meta": {"title": "按图1尺寸创建输出画布"}
+ },
+ "54": {
+  "class_type": "TextEncodeQwenImage21",
+  "inputs": {
+   "clip": ["49", 0], "vae": ["57", 0], "prompt": ["45", 0], "negative_prompt": "", "resolution": 1024,
+   "images.image_1": ["75", 0], "images.image_2": ["86", 0], "images.image_3": ["102", 0], "images.image_4": ["78", 0],
+   "images.image_5": ["87", 0], "images.image_6": ["103", 0], "images.image_7": ["91", 0], "images.image_8": ["93", 0],
+   "images.image_9": ["106", 0], "images.image_10": ["122", 0], "images.image_11": ["127", 0], "images.image_12": ["131", 0],
+   "images.image_13": ["135", 0], "images.image_14": ["140", 0], "images.image_15": ["143", 0], "images.image_16": ["147", 0]
+  },
+  "_meta": {"title": "Qwen Image 2.1 多图与提示词编码"}
+ },
+ "56": {
+  "class_type": "QwenImage21Cache",
+  "inputs": {"model": ["52", 0], "device": "auto", "dtype": "default"},
+  "_meta": {"title": "Qwen Image 2.1 缓存"}
+ },
+ "57": {
+  "class_type": "VAELoader",
+  "inputs": {"vae_name": "qwen_image_2.1_vae_bf16.safetensors"},
+  "_meta": {"title": "加载 Qwen Image 2.1 VAE"}
+ },
+ "59": {
+  "class_type": "KSampler",
+  "inputs": {"model": ["56", 0], "positive": ["54", 0], "negative": ["54", 1], "latent_image": ["53", 0], "seed": 726976251916383, "steps": 40, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1},
+  "_meta": {"title": "多图编辑采样"}
+ },
+ "61": {
+  "class_type": "VAEDecode",
+  "inputs": {"samples": ["59", 0], "vae": ["57", 0]},
+  "_meta": {"title": "图像解码"}
+ },
+ "62": {
+  "class_type": "SaveImage",
+  "inputs": {"images": ["61", 0], "filename_prefix": "chouka/qwen_image_21_multi"},
+  "_meta": {"title": "保存多图编辑结果"}
+ },
+ "72": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_1.png"},
+  "_meta": {"title": "加载图1（主图）"}
+ },
+ "75": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["72", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图1"}
+ },
+ "81": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_2.png"},
+  "_meta": {"title": "加载图2（参考图）"}
+ },
+ "86": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["81", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图2"}
+ },
+ "97": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_3.png"},
+  "_meta": {"title": "加载图3（参考图）"}
+ },
+ "102": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["97", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图3"}
+ },
+ "79": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_4.png"},
+  "_meta": {"title": "加载图4（参考图）"}
+ },
+ "78": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["79", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图4"}
+ },
+ "82": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_5.png"},
+  "_meta": {"title": "加载图5（参考图）"}
+ },
+ "87": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["82", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图5"}
+ },
+ "98": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_6.png"},
+  "_meta": {"title": "加载图6（参考图）"}
+ },
+ "103": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["98", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图6"}
+ },
+ "90": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_7.png"},
+  "_meta": {"title": "加载图7（参考图）"}
+ },
+ "91": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["90", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图7"}
+ },
+ "92": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_8.png"},
+  "_meta": {"title": "加载图8（参考图）"}
+ },
+ "93": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["92", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图8"}
+ },
+ "96": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_9.png"},
+  "_meta": {"title": "加载图9（参考图）"}
+ },
+ "106": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["96", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图9"}
+ },
+ "121": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_10.png"},
+  "_meta": {"title": "加载图10（参考图）"}
+ },
+ "122": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["121", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图10"}
+ },
+ "126": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_11.png"},
+  "_meta": {"title": "加载图11（参考图）"}
+ },
+ "127": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["126", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图11"}
+ },
+ "130": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_12.png"},
+  "_meta": {"title": "加载图12（参考图）"}
+ },
+ "131": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["130", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图12"}
+ },
+ "134": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_13.png"},
+  "_meta": {"title": "加载图13（参考图）"}
+ },
+ "135": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["134", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图13"}
+ },
+ "138": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_14.png"},
+  "_meta": {"title": "加载图14（参考图）"}
+ },
+ "140": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["138", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图14"}
+ },
+ "142": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_15.png"},
+  "_meta": {"title": "加载图15（参考图）"}
+ },
+ "143": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["142", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图15"}
+ },
+ "145": {
+  "class_type": "LoadImage",
+  "inputs": {"image": "chouka/qwen21_input_16.png"},
+  "_meta": {"title": "加载图16（参考图）"}
+ },
+ "147": {
+  "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
+  "inputs": {"image": ["145", 0], "aspect_ratio": "original", "proportional_width": 1, "proportional_height": 1, "fit": "crop", "method": "lanczos", "round_to_multiple": "32", "scale_to_side": "total_pixel(kilo pixel)", "scale_to_length": 1536, "background_color": "#000000"},
+  "_meta": {"title": "按总像素缩放图16"}
+ }
+}
