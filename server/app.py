@@ -1360,6 +1360,7 @@ async def api_agent_heartbeat(request):
         busy=bool(body.get("busy")),
         local_busy=body.get("local_busy") if "local_busy" in body else None,
         current_job_id=body.get("current_job_id"),
+        maintenance=body.get("maintenance") if isinstance(body.get("maintenance"), dict) else None,
     )
     if result is None:
         raise web.HTTPNotFound(reason="Worker 不存在")
@@ -1580,6 +1581,12 @@ async def api_worker_enabled(request):
             request.match_info["worker_id"], enabled):
         raise web.HTTPNotFound(reason="Worker 不存在")
     return web.json_response({"ok": True, "enabled": enabled})
+
+
+async def api_workers_sync_all(request):
+    require_admin(request)
+    result = distributed_store(request.app).request_sync_all()
+    return web.json_response({"ok": True, **result}, status=202)
 
 
 async def api_artifact(request):
@@ -2170,6 +2177,7 @@ def make_app(auth_path=None):
         app.router.add_get("/api/workers", api_workers)
         app.router.add_get("/api/costs", api_costs)
         app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
+        app.router.add_post("/api/admin/workers/sync-all", api_workers_sync_all)
         app.router.add_post("/agent/v1/register", api_agent_register)
         app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)
         app.router.add_post("/agent/v1/jobs/acquire", api_agent_acquire)

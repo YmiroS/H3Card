@@ -66,6 +66,64 @@ class DistributedStoreTest(unittest.TestCase):
         )
         self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
 
+    def test_sync_all_skips_workers_without_sync_support(self):
+        request = self.store.request_sync_all()
+        self.assertEqual(request["worker_count"], 0)
+        self.assertEqual(request["skipped_count"], 1)
+        self.assertEqual(self.store.list_workers()[0]["sync_status"], "idle")
+
+    def test_sync_all_queues_latest_worker_and_blocks_jobs_until_finished(self):
+        newest = self.store.register_worker(
+            "GPU-01", {
+                "node_classes": ["KSampler", "SaveImage"],
+                "supports_file_sync": True,
+            }
+        )
+        newest_id = newest["worker_id"]
+        self.store.heartbeat(newest_id, comfy_online=True, busy=False)
+        self.store.enqueue("job-1", {"graph": {}}, ["KSampler"])
+
+        request = self.store.request_sync_all()
+
+        self.assertEqual(request["worker_count"], 1)
+        rows = self.store.db.execute(
+            "SELECT id, sync_status FROM workers ORDER BY created_at"
+        ).fetchall()
+        self.assertEqual(rows[0]["sync_status"], "idle")
+        self.assertEqual(rows[1]["sync_status"], "pending")
+        self.assertIsNone(self.store.acquire(newest_id))
+        heartbeat = self.store.heartbeat(newest_id, comfy_online=True, busy=False)
+        self.assertIn({
+            "type": "sync_files", "request_id": request["request_id"],
+        }, heartbeat["commands"])
+        self.assertEqual(self.store.list_workers()[0]["state"], "syncing")
+
+        heartbeat = self.store.heartbeat(
+            newest_id, comfy_online=True, busy=True,
+            maintenance={
+                "request_id": request["request_id"],
+                "status": "running",
+                "message": "正在同步模型和用户目录",
+            },
+        )
+        self.assertEqual(heartbeat["maintenance_ack"], {
+            "request_id": request["request_id"], "status": "running",
+        })
+        self.assertIsNone(self.store.acquire(newest_id))
+
+        self.store.heartbeat(
+            newest_id, comfy_online=True, busy=False,
+            maintenance={
+                "request_id": request["request_id"],
+                "status": "done",
+                "message": "同步完成",
+            },
+        )
+        worker = self.store.list_workers()[0]
+        self.assertEqual(worker["sync_status"], "done")
+        self.assertEqual(worker["state"], "idle")
+        self.assertEqual(self.store.acquire(newest_id)["job_id"], "job-1")
+
     def test_heartbeat_merges_telemetry_without_dropping_capabilities(self):
         telemetry = {
             "hostname": "RENDER-01",
@@ -342,7 +400,7 @@ class DistributedStoreTest(unittest.TestCase):
 
 
 class DistributedStoreMigrationTest(unittest.TestCase):
-    def test_existing_worker_table_gains_affinity_columns(self):
+    def test_existing_worker_table_gains_new_columns(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "control.db"
             db = sqlite3.connect(path)
@@ -362,6 +420,9 @@ class DistributedStoreMigrationTest(unittest.TestCase):
                 columns = {row[1] for row in store.db.execute("PRAGMA table_info(workers)")}
                 self.assertIn("last_capability_id", columns)
                 self.assertIn("last_model_family", columns)
+                self.assertIn("sync_request_id", columns)
+                self.assertIn("sync_status", columns)
+                self.assertIn("sync_finished_at", columns)
             finally:
                 store.close()
 
@@ -529,6 +590,8 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         agent.current = None
         agent.comfy_online = True
         agent.local_busy = False
+        agent.pending_sync = None
+        agent.sync_report = None
         agent.server = "http://controller"
         agent.comfy = "http://comfy"
         agent.comfy_ws = "ws://comfy/ws"
@@ -589,6 +652,30 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
 
     def failed_requests(self):
         return [kwargs["json"] for _, url, kwargs in self.requests if url.endswith("/failed")]
+
+    async def test_sync_command_runs_batch_and_records_success(self):
+        class Process:
+            returncode = 0
+
+            async def communicate(self):
+                return b"models synchronized\nSynchronization completed successfully.\n", None
+
+        with tempfile.TemporaryDirectory() as directory:
+            script = Path(directory) / "sync.bat"
+            script.write_text("@exit /b 0", encoding="ascii")
+            create_process = mock.AsyncMock(return_value=Process())
+            with mock.patch.object(self.agent, "sync_script_path", return_value=script), \
+                 mock.patch("agent.asyncio.create_subprocess_exec", create_process), \
+                 mock.patch("agent.os.name", "nt"):
+                self.agent.queue_sync({"type": "sync_files", "request_id": "sync-1"})
+                await self.agent.execute_pending_sync()
+
+        self.assertIsNone(self.agent.pending_sync)
+        self.assertEqual(self.agent.sync_report["request_id"], "sync-1")
+        self.assertEqual(self.agent.sync_report["status"], "done")
+        arguments = create_process.await_args.args
+        self.assertEqual(arguments[:3], ("cmd.exe", "/d", "/c"))
+        self.assertEqual(arguments[-1], "--non-interactive")
 
     async def test_cancel_retains_current_until_ack_and_reuses_targeted_cleanup(self):
         task = asyncio.create_task(self.agent.execute(self.assignment))

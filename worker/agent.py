@@ -54,6 +54,8 @@ class WorkerAgent:
         self.last_release_check = 0.0
         self.comfy_online = False
         self.local_busy = False
+        self.pending_sync = None
+        self.sync_report = None
         self.stop_event = asyncio.Event()
 
     def _load_state(self):
@@ -208,7 +210,8 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 2,
+            "agent_version": 3,
+            "supports_file_sync": True,
         }
         self.last_capability_scan = time.time()
         return self.capabilities
@@ -267,6 +270,70 @@ class WorkerAgent:
         self.release_failed = None
         print("[Worker] ComfyUI 已确认显存释放，恢复接单。", flush=True)
 
+    def queue_sync(self, command):
+        request_id = str(command.get("request_id") or "")
+        if not request_id:
+            return
+        if self.pending_sync and self.pending_sync.get("request_id") == request_id:
+            return
+        if self.sync_report and self.sync_report.get("request_id") == request_id:
+            return
+        self.pending_sync = {"request_id": request_id}
+        print(f"[Worker] 已收到文件同步请求：{request_id}", flush=True)
+
+    def sync_script_path(self):
+        configured = self.config.get("sync_script")
+        if configured:
+            path = Path(configured)
+            return path if path.is_absolute() else (self.config_path.parent / path).resolve()
+        return self.config_path.parent.parent / "同步主节点模型和用户.bat"
+
+    async def execute_pending_sync(self):
+        command = self.pending_sync
+        if not command:
+            return
+        request_id = command["request_id"]
+        self.sync_report = {
+            "request_id": request_id,
+            "status": "running",
+            "message": "正在同步模型和用户目录",
+        }
+        print(f"[Worker] 开始同步模型和用户目录：{request_id}", flush=True)
+        try:
+            if os.name != "nt":
+                raise AgentError("文件同步脚本只能在 Windows Worker 上运行")
+            script = self.sync_script_path()
+            if not script.is_file():
+                raise AgentError(f"找不到同步脚本：{script}")
+            process = await asyncio.create_subprocess_exec(
+                "cmd.exe", "/d", "/c", str(script), "--non-interactive",
+                cwd=str(script.parent),
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+            output, _ = await process.communicate()
+            text = output.decode("utf-8", errors="replace") if output else ""
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            message = " | ".join(lines[-6:])[-1000:]
+            if process.returncode != 0:
+                raise AgentError(message or f"同步脚本退出码 {process.returncode}")
+            self.sync_report = {
+                "request_id": request_id,
+                "status": "done",
+                "message": message or "模型和用户目录同步完成",
+            }
+            print(f"[Worker] 文件同步完成：{request_id}", flush=True)
+        except Exception as exc:
+            self.sync_report = {
+                "request_id": request_id,
+                "status": "error",
+                "message": str(exc)[:1000],
+            }
+            print(f"[Worker] 文件同步失败：{exc}", flush=True)
+        finally:
+            self.pending_sync = None
+
     async def heartbeat_loop(self):
         interval = max(float(self.config.get("heartbeat_seconds", 10)), 2.0)
         capability_interval = max(float(self.config.get("capability_scan_seconds", 300)), 30.0)
@@ -284,17 +351,24 @@ class WorkerAgent:
                     await self.scan_capabilities()
                 elif now - self.last_telemetry_scan >= telemetry_interval:
                     await self.scan_telemetry()
+                sync_running = bool(
+                    self.sync_report and self.sync_report.get("status") == "running"
+                )
                 body = {
                     "comfy_online": self.comfy_online,
-                    "busy": bool(self.current) or self.local_busy or bool(self.release_failed),
-                    "local_busy": self.local_busy or bool(self.release_failed)
-                                  or bool(self.current and self.current.get("_cleanup_task")),
+                    "busy": (bool(self.current) or self.local_busy
+                             or bool(self.release_failed) or sync_running),
+                    "local_busy": (self.local_busy or bool(self.release_failed)
+                                   or bool(self.current and self.current.get("_cleanup_task"))
+                                   or sync_running),
                     "current_job_id": self.current["job_id"] if self.current else None,
                 }
                 if self.telemetry:
                     body["telemetry"] = self.telemetry
                 if include_caps and self.capabilities:
                     body["capabilities"] = self.capabilities
+                if self.sync_report:
+                    body["maintenance"] = dict(self.sync_report)
                 reply = await self._json_request(
                     "POST", self.server + "/agent/v1/heartbeat",
                     headers=self._agent_headers(), json=body,
@@ -303,9 +377,17 @@ class WorkerAgent:
                     self.current["_lease_deadline"] = (
                         time.monotonic() + float(reply["lease_ttl_seconds"])
                     )
+                acknowledgement = (reply or {}).get("maintenance_ack") or {}
+                if (self.sync_report
+                        and self.sync_report.get("status") in {"done", "error"}
+                        and acknowledgement.get("request_id") == self.sync_report.get("request_id")
+                        and acknowledgement.get("status") == self.sync_report.get("status")):
+                    self.sync_report = None
                 for command in (reply or {}).get("commands", []):
                     if command.get("type") in ("cancel_job", "abort_job"):
                         await self.cancel_current(command.get("job_id"))
+                    elif command.get("type") == "sync_files":
+                        self.queue_sync(command)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -686,11 +768,15 @@ class WorkerAgent:
             self.session = session
             await self.ensure_registered()
             await self.scan_capabilities()
+            self.last_capability_scan = 0.0
             heartbeat = asyncio.create_task(self.heartbeat_loop())
             try:
                 while not self.stop_event.is_set():
                     try:
                         await self.local_status()
+                        if self.pending_sync and not self.local_busy and not self.release_failed:
+                            await self.execute_pending_sync()
+                            continue
                         assignment = await self.acquire()
                         if assignment:
                             await self.execute(assignment)
