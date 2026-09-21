@@ -383,7 +383,12 @@ class WorkerAgent:
             if target.is_file() and target.stat().st_size > 0:
                 continue
             tmp = target.with_suffix(target.suffix + ".part")
-            async with self.session.get(self.server + f"/api/upload/{filename}") as response:
+            # 素材仅能通过当前任务租约下载，不能使用公开上传路径。
+            url = self.server + f"/agent/v1/jobs/{assignment['job_id']}/inputs/{filename}"
+            async with self.session.get(
+                url, headers=self._agent_headers(assignment["lease_token"]),
+                allow_redirects=False,
+            ) as response:
                 if response.status != 200:
                     raise JobFailed(f"下载素材 {filename} 失败：HTTP {response.status}")
                 with tmp.open("wb") as fp:

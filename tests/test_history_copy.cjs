@@ -22,6 +22,7 @@ test('history uses persisted job snapshots after reload and keeps each submissio
     el:{jobs:{style:{display:'none'}}, panel:{}, hist:{}},
     api:async () => ({jobs:[job]}),
     paintJobsBtn() {}, paint() {}, drawWires() {}, toast() {}, save() {},
+    canOperate:() => true, canTask:() => true,
   });
   vm.runInContext(
     source.slice(source.indexOf('const HIST_MAX'), source.indexOf('async function copyHistoryText(')) +

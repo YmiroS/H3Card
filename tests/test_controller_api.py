@@ -7,13 +7,16 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import aiohttp
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
+sys.path.insert(0, str(ROOT / "tests"))
 
 import app as controller_app
+import auth_support
 import rewrite
 import scan_workflows
 import translate as prompt_translate
@@ -69,15 +72,30 @@ class PromptTranslationProtectionTest(unittest.TestCase):
             prompt_translate.restore_prompt_tokens(reordered, protected)
 
 
-class TranslationFallbackTest(unittest.IsolatedAsyncioTestCase):
+class TranslationFallbackTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
+    async def asyncSetUp(self):
+        self.auth_setup()
+        self.old_project_dir = controller_app.PROJ_DIR
+        controller_app.PROJ_DIR = self.root / "data" / "projects"
+        self.own_project("p")
+
+    async def asyncTearDown(self):
+        controller_app.PROJ_DIR = self.old_project_dir
+        self.auth_teardown()
+
     async def test_uses_configured_llm_when_youdao_is_not_configured(self):
         request = mock.MagicMock()
+        request.get = mock.MagicMock(
+            side_effect=lambda key, default=None: {"user": self.admin}.get(key, default))
+        request.cookies = {}
         request.json = mock.AsyncMock(return_value={
             "op": "translate",
+            "project": "p",
             "inputs": [{"name": "原文", "text":
                         "subject_definitions:\n<Subject 1> is a gray cat."}],
         })
-        request.app = {"session": object()}
+        request.app = {"session": object(), "auth_store": self.auth,
+                       "resource_access": self.access}
 
         async def chat(_session, _system, user, _max_tokens, _temperature):
             self.assertIn("__CK_KEEP_", user)
@@ -396,25 +414,28 @@ class H3CharacterTransferPatchTest(unittest.TestCase):
         )
 
 
-class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
+class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def asyncSetUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        database_path = Path(self.temp.name) / "control.db"
+        self.auth_setup()
+        database_path = self.root / "data" / "control.db"
         self.store = DistributedStore(database_path)
         self.ledger = CostLedger(database_path, ROOT / "pricing.json")
         self.old_token = controller_app.ENROLLMENT_TOKEN
         self.old_save_jobs = controller_app.save_jobs
         self.old_controller_mode = controller_app.CONTROLLER_MODE
         self.old_project_dir = controller_app.PROJ_DIR
-        controller_app.PROJ_DIR = Path(self.temp.name) / "projects"
+        self.old_artifact_dir = controller_app.ARTIFACT_DIR
+        controller_app.PROJ_DIR = self.root / "data" / "projects"
+        controller_app.ARTIFACT_DIR = self.root / "data" / "artifacts"
         controller_app.ENROLLMENT_TOKEN = "controller-test-enrollment-token"
         controller_app.CONTROLLER_MODE = True
         controller_app.save_jobs = lambda: None
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
         controller_app.WEIGHTS.clear()
+        self.own_project("p")
 
-        application = web.Application()
+        application = self.build_app()
         application["comfy_lock"] = asyncio.Lock()
         application["cleanup_pending"] = set()
         application["cleanup_tasks"] = {}
@@ -434,34 +455,36 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         application.router.add_get("/api/projects", controller_app.api_projects)
         application.router.add_post("/api/projects", controller_app.api_project_create)
         application.router.add_get("/api/projects/{pid}", controller_app.api_project_get)
+        application.router.add_put("/api/projects/{pid}", controller_app.api_project_save)
         application.router.add_post("/api/projects/{pid}/rename", controller_app.api_project_rename)
         application.router.add_post("/agent/v1/register", controller_app.api_agent_register)
         application.router.add_post("/agent/v1/heartbeat", controller_app.api_agent_heartbeat)
         application.router.add_post("/agent/v1/jobs/acquire", controller_app.api_agent_acquire)
         application.router.add_post("/agent/v1/jobs/{pid}/start", controller_app.api_agent_start)
         application.router.add_post("/agent/v1/jobs/{pid}/event", controller_app.api_agent_event)
+        application.router.add_post("/agent/v1/jobs/{pid}/artifact", controller_app.api_agent_artifact)
         application.router.add_post("/agent/v1/jobs/{pid}/complete", controller_app.api_agent_complete)
         application.router.add_post("/agent/v1/jobs/{pid}/failed", controller_app.api_agent_failed)
         application.router.add_get("/api/workers", controller_app.api_workers)
         application.router.add_get("/api/costs", controller_app.api_costs)
-        self.client = TestClient(TestServer(application))
-        await self.client.start_server()
+        await self.start_client(application)
 
     async def asyncTearDown(self):
         await self.client.close()
         self.ledger.close()
         self.store.close()
-        self.temp.cleanup()
+        self.auth_teardown()
         controller_app.ENROLLMENT_TOKEN = self.old_token
         controller_app.save_jobs = self.old_save_jobs
         controller_app.CONTROLLER_MODE = self.old_controller_mode
         controller_app.PROJ_DIR = self.old_project_dir
+        controller_app.ARTIFACT_DIR = self.old_artifact_dir
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
         controller_app.WEIGHTS.clear()
 
     async def test_reload_exposes_one_text_to_image_mode(self):
-        response = await self.client.post("/api/reload")
+        response = await self.client.post("/api/reload", headers=self.headers)
         self.assertEqual(response.status, 200)
         payload = await (await self.client.get("/api/cards")).json()
         card = next(item for item in payload["cards"] if item["id"] == "card_image")
@@ -494,6 +517,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("started_at", health)
 
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
+        self.own_project("project-1")
+        self.register_asset("test.png", "project-1")
         controller_app.load_caps()
         expected = {}
         jobs_file = Path(self.temp.name) / "prompt-jobs.json"
@@ -538,7 +563,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(controller_app, "save_jobs", self.old_save_jobs), \
              mock.patch.object(controller_app, "comfy_submit", return_value="local-history"):
             response = await self.client.post("/api/generate", json={
-                "capability": "zimage_t2i", "params": {"prompt": "实际提交的提示词"},
+                "capability": "zimage_t2i", "params": {"prompt": "实际提交的提示词"}, "project": "p",
             })
             self.assertEqual(response.status, 200, await response.text())
             job = await response.json()
@@ -550,11 +575,12 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(restored["prompts"][0]["text"], "实际提交的提示词")
 
     async def test_prompt_snapshot_uses_patched_graph_defaults_and_empty_values(self):
+        self.register_asset("test.png")
         controller_app.load_caps()
         with mock.patch.object(controller_app, "cost_ledger", return_value=None):
             for params in ({}, {"prompt": ""}):
                 response = await self.client.post("/api/generate", json={
-                    "capability": "zimage_t2i", "params": params,
+                    "capability": "zimage_t2i", "params": params, "project": "p",
                 })
                 self.assertEqual(response.status, 200, await response.text())
                 job = await response.json()
@@ -566,7 +592,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
                 "images[0]": "chouka/test.png",
             }):
                 response = await self.client.post("/api/generate", json={
-                    "capability": "minimax_h3_comic20",
+                    "capability": "minimax_h3_comic20", "project": "p",
                     "params": {"prompt": "第一组分镜", "prompt2": "没有配图，不应实际提交"},
                 })
             self.assertEqual(response.status, 200, await response.text())
@@ -584,11 +610,12 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "name": "测试生成", "outputType": "image", "_graph_ok": True,
         }
         with mock.patch.dict(controller_app.CAPS, {"dashboard-test": capability}):
+            self.own_project("project-1", "广告片项目")
             response = await self.client.post("/api/generate", json={
                 "capability": "dashboard-test", "params": {}, "assets": {},
                 "project": "project-1", "projectName": "广告片项目",
                 "card": "card-1", "cardName": "主视觉",
-            })
+            }, headers=self.headers)
 
         self.assertEqual(response.status, 200)
         job = await response.json()
@@ -623,6 +650,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "inputs": [{"key": "video[0]", "type": "video"}],
         }
         assets = {"video[0]": "chouka/source.mp4"}
+        self.register_asset("source.mp4")
         with mock.patch.dict(controller_app.CAPS, {"video-ref": capability}), \
              mock.patch.object(
                  controller_app, "generation_assets",
@@ -634,7 +662,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
                          controller_app, "probe_video", return_value={"duration": duration}
                      ):
                     response = await self.client.post("/api/generate", json={
-                        "capability": "video-ref", "params": {}, "assets": assets,
+                        "capability": "video-ref", "params": {}, "assets": assets, "project": "p",
                     })
                     self.assertEqual(response.status, 200)
                     job = await response.json()
@@ -651,7 +679,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
 
             with mock.patch.object(controller_app, "probe_video", return_value={}):
                 response = await self.client.post("/api/generate", json={
-                    "capability": "video-ref", "params": {}, "assets": assets,
+                    "capability": "video-ref", "params": {}, "assets": assets, "project": "p",
                 })
                 self.assertEqual(response.status, 400)
                 self.assertIn("无法读取引入视频时长", await response.text())
@@ -664,7 +692,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         with mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
             response = await self.client.post("/api/generate", json={
                 "capability": "minimax_h3_ref_2pass", "params": {}, "assets": {},
-            })
+                "project": "p",
+            }, headers=self.headers)
         self.assertEqual(response.status, 200)
         job = await response.json()
         gib = 1024 ** 3
@@ -710,8 +739,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
                         }] if gpu else [],
                     }
                     response = await self.client.post("/api/generate", json={
-                        "capability": "minimax_h3_ref_2pass",
-                    })
+                        "capability": "minimax_h3_ref_2pass", "project": "p",
+                    }, headers=self.headers)
                     self.assertEqual(response.status, status)
                     if status == 200:
                         submit.assert_awaited_once()
@@ -722,8 +751,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             submit.reset_mock()
             stats_response.json.side_effect = TimeoutError()
             response = await self.client.post("/api/generate", json={
-                "capability": "minimax_h3_ref_2pass",
-            })
+                "capability": "minimax_h3_ref_2pass", "project": "p",
+            }, headers=self.headers)
             self.assertEqual(response.status, 503)
             submit.assert_not_awaited()
 
@@ -741,6 +770,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "inputs": [{"key": "video[0]", "type": "video"}],
         }
         assets = {"video[0]": "chouka/source.mp4"}
+        self.register_asset("source.mp4")
         session = self.client.server.app["session"]
         stats_response = session.get.return_value.__aenter__.return_value
         stats_response.raise_for_status = mock.Mock()
@@ -764,7 +794,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
                         }],
                     }
                     response = await self.client.post("/api/generate", json={
-                        "capability": "video-ref", "params": {}, "assets": assets,
+                        "capability": "video-ref", "params": {}, "assets": assets, "project": "p",
                     })
                     self.assertEqual(response.status, status)
                     if status == 200:
@@ -774,7 +804,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_project_rename_updates_jobs_and_cost_history(self):
         created = await (await self.client.post(
-            "/api/projects", json={"name": "旧项目名"}
+            "/api/projects", json={"name": "旧项目名"}, headers=self.headers
         )).json()
         project_id = created["id"]
         controller_app.JOBS["rename-job"] = {
@@ -782,10 +812,12 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "created": 1, "project": project_id, "projectName": "旧项目名",
             "card": "card-1", "cardName": "主视觉",
         }
+        self.register_job("rename-job", project_id)
         self.ledger.record_job(controller_app.JOBS["rename-job"], historical=True)
 
         response = await self.client.post(
-            f"/api/projects/{project_id}/rename", json={"name": "新项目名"}
+            f"/api/projects/{project_id}/rename", json={"name": "新项目名"},
+            headers=self.headers,
         )
         self.assertEqual(response.status, 200)
         renamed = await response.json()
@@ -806,11 +838,13 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         }
         with mock.patch.object(controller_app.llm, "ready", return_value=True), \
              mock.patch.object(controller_app.llm, "chat", new=mock.AsyncMock(return_value=result)):
+            self.own_project("copywriting", "文案项目")
             response = await self.client.post("/api/text", json={
                 "op": "polish", "model": "api",
                 "inputs": [{"name": "原文", "text": "测试文本"}],
-                "projectName": "文案项目", "cardName": "润色卡",
-            })
+                "project": "copywriting", "projectName": "文案项目",
+                "cardName": "润色卡",
+            }, headers=self.headers)
 
         self.assertEqual(response.status, 200)
         costs = await (await self.client.get("/api/costs")).json()
@@ -864,6 +898,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "status": "queued", "created": 1,
             "progress": 0.0, "outputs": [], "error": None,
         }
+        self.register_job("job-1", "p")
         self.ledger.record_job(controller_app.JOBS["job-1"])
         self.store.enqueue(
             "job-1", {"graph": {"1": {"class_type": "KSampler", "inputs": {}}}},
@@ -889,9 +924,20 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(controller_app.JOBS["job-1"]["progress"], 0.99)
         self.assertEqual(controller_app.JOBS["job-1"]["step"], "正在归集产物")
 
+        # 产物必须先经 Worker 上传登记，完成回调只认本任务已登记的产物。
+        artifact_form = aiohttp.FormData()
+        artifact_form.add_field("file", b"png-bytes", filename="file.png",
+                                content_type="image/png")
+        response = await self.client.post(
+            "/agent/v1/jobs/job-1/artifact", headers=lease_headers,
+            data=artifact_form, params={"kind": "image"},
+        )
+        self.assertEqual(response.status, 201, await response.text())
+        artifact = await response.json()
+
         response = await self.client.post(
             "/agent/v1/jobs/job-1/complete", headers=lease_headers,
-            json={"outputs": [{"kind": "image", "url": "/api/artifact/job-1/file.png"}]},
+            json={"outputs": [{"kind": "image", "url": artifact["url"]}]},
         )
         self.assertEqual(response.status, 200)
         self.assertEqual(controller_app.JOBS["job-1"]["status"], "done")
@@ -918,6 +964,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "id": "cleanup-job", "status": "queued", "created": 1,
             "progress": 0.3, "outputs": [], "error": None,
         }
+        self.register_job("cleanup-job")
         self.store.enqueue("cleanup-job", {"graph": {}}, [])
         assignment = self.store.acquire(worker_id)
         headers["X-Lease-Token"] = assignment["lease_token"]
@@ -981,6 +1028,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase):
             "id": "job-error", "status": "queued", "created": 1,
             "progress": 0.0, "outputs": [], "error": None,
         }
+        self.register_job("job-error", "p")
         self.store.enqueue(
             "job-error", {"graph": {"78": {"class_type": "VHS_LoadVideo", "inputs": {}}}},
             ["VHS_LoadVideo"],
@@ -1032,14 +1080,19 @@ class LocalSubmissionTest(unittest.IsolatedAsyncioTestCase):
     async def test_submission_acknowledgement_does_not_wait_for_generation(self):
         with mock.patch.object(controller_app, "comfy_submit", new=mock.AsyncMock(return_value="accepted")) as submit:
             self.assertEqual(await controller_app.local_submit(self.app, {"node": {}}), "accepted")
-        submit.assert_awaited_once_with(self.app["session"], {"node": {}})
+        submit.assert_awaited_once_with(self.app["session"], {"node": {}}, prompt_id=None)
         self.assertFalse(self.app["comfy_lock"].locked())
+
+    async def test_submission_preserves_the_pre_registered_permission_job_id(self):
+        with mock.patch.object(controller_app, "comfy_submit", new=mock.AsyncMock(return_value="owned-job")) as submit:
+            self.assertEqual(await controller_app.local_submit(self.app, {}, prompt_id="owned-job"), "owned-job")
+        submit.assert_awaited_once_with(self.app["session"], {}, prompt_id="owned-job")
 
     async def test_stalled_submit_times_out_and_releases_lock_without_retry(self):
         timeout = asyncio.timeout
         canceled = asyncio.Event()
 
-        async def stalled(*_args):
+        async def stalled(*_args, **_kwargs):
             try:
                 await asyncio.Event().wait()
             finally:
@@ -1109,6 +1162,26 @@ class LocalOutputEventOrderTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(job["outputs"], output)
             self.assertEqual(collect.await_count, 2)
 
+    async def test_permission_registration_cannot_override_concurrent_cleanup(self):
+        job = {"status": "running", "outputs": []}
+
+        async def register(*_args):
+            job["cleanup_pending"] = True
+            job["step"] = "正在停止并释放显存"
+
+        with mock.patch.object(controller_app, "JOBS", {"acl-cancel": job}), \
+             mock.patch.object(controller_app, "save_jobs"), \
+             mock.patch.object(controller_app, "collect_outputs", new=mock.AsyncMock(return_value=[{"filename": "late.png"}])), \
+             mock.patch.object(controller_app, "call_store", new=mock.AsyncMock(side_effect=[{"project_id": "p"}, {"state": "active"}])), \
+             mock.patch.object(controller_app, "resource_call", side_effect=register):
+            await controller_app.handle_event(None, {
+                "type": "execution_success", "data": {"prompt_id": "acl-cancel"},
+            }, app={})
+        self.assertEqual(job["status"], "running")
+        self.assertEqual(job["outputs"], [])
+        self.assertEqual(job["step"], "正在停止并释放显存")
+        self.assertNotIn("ended", job)
+
     async def test_success_with_available_outputs_finishes_immediately(self):
         job = {"status": "running", "outputs": []}
         output = [{"filename": "cached.png", "kind": "image"}]
@@ -1122,9 +1195,13 @@ class LocalOutputEventOrderTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["outputs"], output)
 
 
-class LocalCleanupTest(unittest.IsolatedAsyncioTestCase):
+class LocalCleanupTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def asyncSetUp(self):
+        self.auth_setup()
+        self.own_project("p")
+        self.register_job("local-job")
         for patcher in (
+            mock.patch.object(controller_app, "PROJ_DIR", self.root / "data" / "projects"),
             mock.patch.object(controller_app, "CONTROLLER_MODE", False),
             mock.patch.object(controller_app, "save_jobs"),
             mock.patch.object(controller_app, "JOBS", {}),
@@ -1155,7 +1232,7 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase):
             return self.ack
 
         response.json = mock.AsyncMock(side_effect=acknowledgement)
-        self.app = web.Application()
+        self.app = self.build_app()
         self.app["session"] = self.session
         self.app["comfy_lock"] = asyncio.Lock()
         self.app["cleanup_pending"] = set()
@@ -1164,17 +1241,17 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.app.router.add_get("/api/jobs", controller_app.api_jobs)
         self.app.router.add_post("/api/job/{pid}/cancel", controller_app.api_cancel)
         self.app.router.add_delete("/api/job/{pid}", controller_app.api_job_delete)
-        self.client = TestClient(TestServer(self.app))
-        await self.client.start_server()
+        await self.start_client(self.app)
 
     async def asyncTearDown(self):
         self.confirmed.set()
         await asyncio.gather(*self.app["cleanup_tasks"].values(), return_exceptions=True)
         await self.client.close()
+        self.auth_teardown()
 
     async def assert_generation_blocked(self):
         with mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock) as submit:
-            response = await self.client.post("/api/generate", json={"capability": "cleanup-test"})
+            response = await self.client.post("/api/generate", json={"capability": "cleanup-test", "project": "p"})
             self.assertEqual(response.status, 409)
             submit.assert_not_awaited()
 
@@ -1212,7 +1289,7 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(kwargs["json"], {"free_memory": True})
         self.assertEqual(kwargs["timeout"].total, 130)
         with mock.patch.object(controller_app, "comfy_submit", new=mock.AsyncMock(return_value="next")):
-            response = await self.client.post("/api/generate", json={"capability": "cleanup-test"})
+            response = await self.client.post("/api/generate", json={"capability": "cleanup-test", "project": "p"})
             self.assertEqual(response.status, 200)
 
     async def test_disconnected_caller_and_duplicate_cancel_share_cleanup(self):
@@ -1285,7 +1362,7 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase):
         submitting = asyncio.Event()
         submitted = asyncio.Event()
 
-        async def submit(_session, _graph):
+        async def submit(_session, _graph, prompt_id=None):
             submitting.set()
             await submitted.wait()
             return "prior-job"

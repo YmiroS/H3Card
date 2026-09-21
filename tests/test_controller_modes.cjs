@@ -17,6 +17,7 @@ test('recent jobs show their recorded mode separately from card names', async ()
     {...base, id:'escaped-name', status:'error', name:'<img src=x onerror="window.injected=true">'},
   ];
   const payloads = {
+    '/api/auth/me': {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'test-csrf'},
     '/api/health': {ok:true, mode:'controller', server_time:1789535400, started_at:1789535300},
     '/api/status': {running_count:1, queued_count:1},
     '/api/workers': {workers:[]},
@@ -24,6 +25,10 @@ test('recent jobs show their recorded mode separately from card names', async ()
     '/api/projects': {projects:[{id:'project-1', name:'模式展示测试'}]},
   };
   const server = createServer((req, res) => {
+    if (req.url === '/auth.js') {
+      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
+      return res.end(readFileSync(path.join(__dirname, '..', 'web', 'auth.js')));
+    }
     if (Object.hasOwn(payloads, req.url)) {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       res.end(JSON.stringify(payloads[req.url]));

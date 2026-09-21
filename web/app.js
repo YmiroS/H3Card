@@ -37,21 +37,56 @@ const el = {
 };
 
 /* ================= 工具 ================= */
-async function api(path, opt) {
-  const r = await fetch(path, opt);
-  const ct = r.headers.get("content-type") || "";
-  let data = null, txt = "";
-  if (ct.includes("json")) { try { data = await r.json(); } catch (e) {} }
-  else { txt = await r.text(); }
-  if (!r.ok) {
-    const msg = (txt || r.statusText || "请求失败").replace(/<[^>]*>/g, " ")
-      .replace(/\s+/g, " ").trim();
-    const err = new Error(msg.slice(0, 300));
-    err.status = r.status;
-    throw err;
+const canOperate = (project = PROJ) => H3Auth.active && project?.permission === 'operate';
+const canSave = () => canOperate() && !PROJ.locked;
+const canTask = job => H3Auth.active && job?.permission === 'operate';
+const requireOperate = () => { if (canOperate()) return true; toast('此画布只读，不能修改或运行'); return false; };
+const projectUploadUrl = () => {
+  if (!PROJ?.id) throw new Error('请先打开可操作画布');
+  return `/api/upload?project=${encodeURIComponent(PROJ.id)}`;
+};
+const uploadAsset = async file => {
+  if (!requireOperate()) throw new Error('此画布只读');
+  const form = new FormData(); form.append('file', file, file.name);
+  const data = await api(projectUploadUrl(), {method:'POST', body:form});
+  const asset = data.files?.[0] || data;
+  if (!asset?.url || !asset?.ref) throw new Error('上传接口未返回素材');
+  return asset;
+};
+async function api(path, opt = {}) {
+  // 写请求再校验一次，避免旧菜单、异步回调绕过交互层权限。
+  const method = (opt.method || 'GET').toUpperCase();
+  if (!['GET','HEAD'].includes(method)) {
+    const url = new URL(path, location.href);
+    if (/^\/api\/(upload|generate|text|rewrite)$/.test(url.pathname) && !canOperate()) throw new Error('此画布只读');
+    const match = url.pathname.match(/^\/api\/projects\/([^/]+)(?:\/(rename|copy))?$/);
+    if (match) {
+      const project = projects.find(p => p.id === decodeURIComponent(match[1])) || (PROJ?.id === decodeURIComponent(match[1]) ? PROJ : null);
+      if (!canOperate(project) || (project.locked && match[2] !== 'copy')) throw new Error('此画布不可修改');
+    }
   }
-  return data;
+  return H3Auth.request(path, opt);
 }
+function clearProject() {
+  clearTimeout(saveTimer); PROJ = null; selId = null; selIds.clear();
+  closePanel(); closeHistory(); closeViewer(); closeMenu(); closeJobs(); closeResPop();
+  el.groups.replaceChildren(); el.selbar.style.display = 'none'; showEmpty();
+}
+function syncPermissionUI() {
+  document.body.classList.toggle('project-readonly', !!PROJ && !canOperate());
+  if (!canOperate()) { clearTimeout(saveTimer); closeMenu(); closeResPop(); }
+  el.dock.style.display = canOperate() ? '' : 'none';
+  if (PROJ) { el.ptitle.textContent = PROJ.name; const badge = document.createElement('span'); badge.className = 'ro'; badge.textContent = !canOperate() ? '只读' : PROJ.locked ? '试玩画布 · 刷新还原' : ''; el.ptitle.append(badge); }
+}
+window.addEventListener('h3auth:expired', () => { CLIP = null; TASKS = []; projects = []; clearProject(); el.plist.replaceChildren(); });
+let refreshingAccess = false;
+window.addEventListener('h3auth:denied', async ({detail}) => {
+  if (refreshingAccess || !H3Auth.active || !/^\/api\/(projects|job|upload|generate|text|rewrite|media)/.test(detail.path)) return;
+  refreshingAccess = true;
+  // 403 不登出；先冻结写操作，再读取最新权限。404 则同时清理已撤权内容。
+  if (PROJ) { PROJ.permission = 'read'; syncPermissionUI(); }
+  try { await loadProjects(); await pollJobs(); } finally { refreshingAccess = false; }
+});
 const jpost = (p, b) => api(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
 const jput = (p, b) => api(p, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
 
@@ -954,28 +989,29 @@ function hoverTip(node, contentGetter) {
 /* ================= 启动 ================= */
 (async function boot() {
   try {
-    // 服务进程可能还缓存着修改前的 _cards.json；页面刷新时先让后端重载一次。
-    try { await api("/api/reload", { method: "POST" }); } catch (_e) { /* 兼容旧服务 */ }
+    await H3Auth.requireUser();
+    H3Auth.mountAccount(document.getElementById('account'));
     const d = await api("/api/cards", { cache: "no-store" });
     CARDS = d.cards; CAPS = d.capabilities;
     el.dot.classList.toggle("on", !!d.comfy_online);
-  } catch (e) { toast("后端未就绪：" + e.message); }
+  } catch (e) { toast("后端未就绪：" + e.message); if (!H3Auth.active) return; }
   await loadProjects();
   bindGlobal();
   // 一进来就打开示例（locked 那个），新用户不用先面对一张空画布
   const demo = projects.find(p => p.locked);
   if (demo) await openProject(demo.id);
   await health();
-  setInterval(health, 5000);
+  H3Auth.every(health, 5000);
+  H3Auth.every(loadProjects, 5000);
   pollJobs();
-  setInterval(pollJobs, 700);
+  H3Auth.every(pollJobs, 700);
 })();
 
 async function health() {
   try {
     const h = await api("/api/health");
     el.dot.classList.toggle("on", !!h.comfy_online);
-    if (h.mode === "controller") {
+    if (h.mode === "controller" && H3Auth.user?.role === 'admin') {
       el.dot.href = "/controller";
       el.dot.title = "打开运行面板";
       el.dot.setAttribute("aria-label", "打开运行面板");
@@ -991,20 +1027,33 @@ async function health() {
 
 /* ================= 项目栏 ================= */
 async function loadProjects() {
-  try { projects = (await api("/api/projects")).projects; } catch (e) { projects = []; }
+  if (!H3Auth.active) return;
+  try { projects = (await api("/api/projects")).projects; } catch (e) { return; }
+  if (PROJ) {
+    const latest = projects.find(p => p.id === PROJ.id);
+    if (!latest) { clearProject(); TASKS = TASKS.filter(j => projects.some(p => p.id === j.project)); }
+    else {
+      const changed = PROJ.permission !== latest.permission;
+      Object.assign(PROJ, {permission:latest.permission, owner_id:latest.owner_id, owner_username:latest.owner_username, name:latest.name, locked:latest.locked});
+      if (changed) { closePanel(); closeHistory(); render(); }
+    }
+  }
+  syncPermissionUI();
   el.plist.innerHTML = "";
   for (const p of projects) {
     const d = document.createElement("div");
     d.className = "pitem" + (PROJ && PROJ.id === p.id ? " on" : "");
     // locked 的项目（示例）不给重命名/删除按钮，服务端也会拒
-    d.innerHTML = `<span class="nm"></span><span class="ct">${p.cards}</span>`
-      + (p.locked ? "" : `<button class="ren" title="重命名">✎</button><button class="del" title="删除">✕</button>`);
+    d.innerHTML = '<span class="nm"></span><span class="ct"></span>'
+      + (p.locked || !canOperate(p) ? '' : '<button class="ren" title="重命名">✎</button><button class="del" title="删除">✕</button>');
+    d.querySelector('.ct').textContent = String(p.cards ?? 0);
+    d.title = `${p.owner_username || ''} · ${p.permission === 'operate' ? '可操作' : '只读'}`;
     const nm = d.querySelector(".nm");
     nm.textContent = p.name;
     d.onclick = () => openProject(p.id);
     const ren = d.querySelector(".ren");
     if (ren) ren.onclick = (ev) => { ev.stopPropagation(); renameProject(p); };
-    if (!p.locked) nm.ondblclick = (ev) => { ev.stopPropagation(); renameProject(p); };
+    if (!p.locked && canOperate(p)) nm.ondblclick = (ev) => { ev.stopPropagation(); renameProject(p); };
     const del = d.querySelector(".del");
     if (del) del.onclick = async (ev) => {
       ev.stopPropagation();
@@ -1026,6 +1075,7 @@ async function newProject() {
 }
 
 async function renameProject(project) {
+  if (!canOperate(project) || project.locked) return;
   const value = prompt("修改项目名", project.name || "");
   if (value === null) return;
   const name = value.trim();
@@ -1048,8 +1098,11 @@ async function renameProject(project) {
   }
 }
 
+let openingProject = 0;
 async function openProject(pid) {
-  try { PROJ = await api(`/api/projects/${pid}`); }
+  clearTimeout(saveTimer);
+  const opening = ++openingProject;
+  try { const project = await api(`/api/projects/${encodeURIComponent(pid)}`); if (opening !== openingProject || !H3Auth.active) return; PROJ = project; }
   catch (e) { return toast(e.message); }
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
@@ -1119,16 +1172,17 @@ const plain = (c) => Object.fromEntries(Object.entries(c).filter(([k]) => k[0] !
 let saveChain = Promise.resolve();
 
 function save() {
-  if (!PROJ) return;
+  if (!canSave()) return;
   // 示例是只读的：拖节点、改参数、重跑都随便，但只活在这一次打开里，刷新就回到那份固定的示例。
   // 这里直接不发请求（服务端也会回 403），否则每动一下就弹一次「保存失败」
   if (PROJ.locked) return;
   clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => { saveChain = saveChain.then(doSave); }, 700);
+  const expectedId = PROJ.id;
+  saveTimer = setTimeout(() => { saveChain = saveChain.then(() => doSave(expectedId)); }, 700);
 }
 
-async function doSave() {
-  if (!PROJ) return;
+async function doSave(expectedId = PROJ?.id) {
+  if (!canSave() || PROJ.id !== expectedId) return;
   const id = PROJ.id;
   PROJ.view = view;
   try {
@@ -1993,6 +2047,7 @@ function paintGroups() {
       showMenu(ev.clientX, ev.clientY, g.name, [
         { icon: "✎", text: "重命名", run: () => renameGroup(g) },
         { icon: "✕", text: "删除组（节点保留）", danger: true, run: () => {
+            if (!requireOperate()) return;
             PROJ.groups = PROJ.groups.filter(x => x !== g);
             paintGroups(); save();
           } },
@@ -2003,6 +2058,7 @@ function paintGroups() {
 }
 
 function renameGroup(g) {
+  if (!requireOperate()) return;
   const n = prompt("组名", g.name);
   if (n === null) return;
   g.name = n.trim().slice(0, 30) || g.name;
@@ -2011,6 +2067,7 @@ function renameGroup(g) {
 
 /** 按住一起拖动几个节点：单节点拖动、框选多张后拖、拖分组框，全走这里。 */
 function beginCardsMove(ev, cards) {
+  if (!canOperate()) return;
   if (ev.button !== 0 || !cards.length) return;
   ev.stopPropagation(); ev.preventDefault();
   tipHide();
@@ -2038,6 +2095,7 @@ function beginCardsMove(ev, cards) {
 
 /** Delete 删掉框选的一堆节点（会问一句 —— 没有撤销）。 */
 function askDelMany() {
+  if (!requireOperate()) return;
   const cards = [...selIds].map(cardOf).filter(Boolean);
   if (!cards.length) return;
   const n = cards.filter(c => (c.history || []).length || (c.outputs || []).length).length;
@@ -2069,6 +2127,7 @@ function edgeMenu(cx, cy, e) {
 /** 删一根线。文本/风格引用是实时从 edges 读取的；产物线还要把它写进下游
     assets 的一格或多格一起删掉，否则画面上虽然断线，运行时仍会继续引用旧产物。 */
 function delEdge(e) {
+  if (!requireOperate()) return;
   const cleared = !isTextEdge(e) && clearEdgeAssets(e);
   removeEdges([e], false);
   if (selEdge === e) selEdge = null;
@@ -2092,6 +2151,7 @@ function pick(id) {
 }
 
 function startDrag(ev, c, d) {
+  if (!canOperate()) { ev.stopPropagation(); pick(c.id); return; }
   if (ev.button !== 0) return;
   // 谁跟着这个节点一起动：先看框选（拖选中里的一张 = 整个选择动），
   // 没框选就看分组（组里的节点拖一张 = 整组动；同时在几个组里就全跟着），
@@ -2112,6 +2172,7 @@ function startDrag(ev, c, d) {
  *  所以位置要跟着一起变）。按住 Shift 只改宽 —— 宫格的排布只看宽度，调宫格节点时
  *  往往不想顺手把画面区高度也动了。 */
 function startResize(ev, c, d, dir) {
+  if (!requireOperate()) return;
   if (ev.button !== 0) return;
   ev.stopPropagation(); ev.preventDefault();
   tipHide(); pick(c.id);
@@ -2145,6 +2206,7 @@ function startResize(ev, c, d, dir) {
 }
 
 function startWire(ev, c) {
+  if (!requireOperate()) return;
   ev.stopPropagation(); ev.preventDefault();
   tipHide();
   const a = cardBox(c.id);
@@ -2173,6 +2235,17 @@ function startWire(ev, c) {
 }
 
 function bindGlobal() {
+  // 捕获参数编辑与上传事件，拦住已经打开的旧面板；视图与媒体预览不受影响。
+  for (const type of ['beforeinput','input','change','paste','drop','dragover','click','mousedown']) {
+    document.addEventListener(type, event => {
+      if (canOperate() || !PROJ) return;
+      const target = event.target;
+      const editing = target.closest?.('#panel, #respop, #dock, #selbar');
+      const field = target.closest?.('#world input, #world textarea, #world select, #world [contenteditable]');
+      const transfer = ['paste','drop','dragover'].includes(type) && target.closest?.('#stage');
+      if (editing || field || transfer) { event.preventDefault(); event.stopImmediatePropagation(); }
+    }, true);
+  }
   $("#toggle").onclick = () => document.body.classList.toggle("collapsed");
   $("#newproj").onclick = newProject;
   $("#createHere").onclick = newProject;
@@ -2186,7 +2259,7 @@ function bindGlobal() {
   gb.className = "mkgroup"; gb.textContent = "▦ 打组";
   gb.title = "把选中的节点圈成一个组：拖分组框整体移动；双击组名改名，右键框删组（节点保留）";
   gb.onclick = () => {
-    if (selIds.size < 2) return;
+    if (!canOperate() || selIds.size < 2) return;
     PROJ.groups = PROJ.groups || [];
     const same = PROJ.groups.find(g => g.cards.length === selIds.size
       && g.cards.every(x => selIds.has(x)));
@@ -2289,7 +2362,7 @@ function bindGlobal() {
   // 空白处右键：新建节点、上传、粘贴
   el.stage.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
-    if (!PROJ || ev.target.closest(".card")) return;
+    if (!canOperate() || ev.target.closest(".card")) return;
     tipHide();
     const at = toWorld(ev.clientX, ev.clientY);
     const menu = [];
@@ -2354,13 +2427,8 @@ function bindGlobal() {
         input.onchange = async (e) => {
           const file = e.target.files[0];
           if (!file) return;
-          const fd = new FormData();
-          fd.append("file", file, file.name);
           try {
-            const r = await fetch("/api/upload", { method: "POST", body: fd });
-            if (!r.ok) throw new Error(await r.text());
-            const { files } = await r.json();
-            const item = files[0];
+            const item = await uploadAsset(file);
             const assetCard = CARDS.find(d => d.kind === "asset");
             if (!assetCard) return toast("找不到素材节点定义");
             const c = addCard(assetCard.id, at.x, at.y, assetCard.modes[0].id);
@@ -2399,7 +2467,7 @@ function bindGlobal() {
     ev.dataTransfer.dropEffect = "copy";
   });
   el.stage.addEventListener("drop", async (ev) => {
-    if (!PROJ) return;
+    if (!canOperate()) return;
     ev.preventDefault();
     const files = [...(ev.dataTransfer?.files || [])];
     if (!files.length) return;
@@ -2408,10 +2476,8 @@ function bindGlobal() {
     if (!valid.length) return toast("只支持图片、视频、音频文件");
     const at = toWorld(ev.clientX, ev.clientY);
     for (const f of valid) {
-      const fd = new FormData(); fd.append("file", f, f.name);
       try {
-        const r = await api("/api/upload", { method: "POST", body: fd });
-        const item = r.files[0];
+        const item = await uploadAsset(f);
         const p = { x: Math.round(at.x - 134), y: Math.round(at.y - 84) };   // 节点中心对齐鼠标位置
         const c = addCard("card_asset", p.x, p.y);
         if (!c) continue;
@@ -2452,6 +2518,7 @@ function bindGlobal() {
     const typing = tag === "input" || tag === "textarea" || tag === "select" || t.isContentEditable;
     if (PROJ && !typing && el.view.style.display === "none") {
       const c = cardOf(selId);
+      if (!canOperate() && (['Delete','Backspace'].includes(ev.key) || ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'v'))) { ev.preventDefault(); return; }
       if (ev.key === "Delete" || ev.key === "Backspace") {
         // 线优先：选中线的那一刻节点选中就被清了，两个不会同时亮
         if (selEdge) { ev.preventDefault(); delEdge(selEdge); return; }
@@ -2716,6 +2783,10 @@ function fmtDur(s) {
 }
 
 function cardMenu(cx, cy, c) {
+  if (!canOperate()) return showMenu(cx, cy, titleOf(c), [
+    {text:'复制节点', run:() => copyCard(c)},
+    ...((c.outputs || []).length ? [{text:'预览产物', run:() => openViewer(c)}] : []),
+  ]);
   const cap = capOf(c);
   if (isStyle(c)) {
     const n = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e)).length;
@@ -2788,11 +2859,13 @@ function downloadOut(o) {
 }
 
 function resetSize(c) {
+  if (!requireOperate()) return;
   delete c.w; delete c.h;      // 删掉而不是写回 268/168：默认值将来改了，老节点也跟着走
   applySize(c); drawWires(); placePanel(); save();
 }
 
 function renameCard(c) {
+  if (!requireOperate()) return;
   const cap = capOf(c);
   const oldName = titleOf(c);
   const n = prompt("节点名字（留空恢复成工作流名）", c.name || (cap ? cap.name : ""));
@@ -2835,6 +2908,7 @@ function renameCard(c) {
 }
 
 function cloneCard(c) {
+  if (!requireOperate()) return;
   const n = addCard(c.type, c.x + 24, c.y + 28);
   const outputs = JSON.parse(JSON.stringify(c.outputs || []));
   Object.assign(n, {
@@ -2846,6 +2920,7 @@ function cloneCard(c) {
 }
 
 function addCard(type, x, y, cap) {
+  if (!requireOperate()) return null;
   const def = cardDef(type);
   if (!def || !def.modes || !def.modes.length) {
     toast(`节点类型 ${type} 不可用：找不到定义或没有模式`);
@@ -2870,6 +2945,7 @@ function addCard(type, x, y, cap) {
 }
 
 function delCard(id) {
+  if (!requireOperate()) return;
   // 删上游节点等同于删掉它的所有出口线：下游里由这些线带入的引用也必须清掉。
   removeEdges(PROJ.edges.filter(e => e.from === id));
   PROJ.cards = PROJ.cards.filter(c => c.id !== id);
@@ -2910,6 +2986,7 @@ let pasteN = 0;
 
 function copyCard(c) {
   CLIP = {
+    sourceProject: PROJ?.id,
     type: c.type, cap: c.cap, name: c.name || null, w: c.w, h: c.h, x: c.x, y: c.y,
     params: JSON.parse(JSON.stringify(c.params || {})),
     assets: JSON.parse(JSON.stringify(c.assets || {})),
@@ -2919,26 +2996,34 @@ function copyCard(c) {
   toast(`已复制「${titleOf(c)}」${CLIP.outputs.length ? "（包含当前产物）" : ""} · Ctrl+V 粘贴`);
 }
 
-function pasteCard() {
-  if (!CLIP) return toast("还没复制东西：先点一个节点，Ctrl+C");
-  // cardDef 找不到会落回第一个节点（生图），照它粘会粘出一张不相干的节点，所以这儿要精确查
-  if (!CARDS.some(d => d.id === CLIP.type)) return toast("这种节点在当前版本里不存在了，粘不了");
-  // 鼠标不在画布上（比如刚在侧边栏点完）就按老位置错开一点，连着粘也不会重叠
-  const at = mouseW || { x: CLIP.x + 24 * ++pasteN, y: CLIP.y + 28 * pasteN };
-  const n = addCard(CLIP.type, at.x - CW / 2, at.y - 40, CLIP.cap);
-  const outputs = JSON.parse(JSON.stringify(CLIP.outputs || []));
-  Object.assign(n, {
-    name: CLIP.name,
-    params: JSON.parse(JSON.stringify(CLIP.params)),
-    assets: JSON.parse(JSON.stringify(CLIP.assets)),
-    outputs,
-    status: outputs.length ? "done" : null,
-  });
-  if (CLIP.w) n.w = CLIP.w;
-  if (CLIP.h) n.h = CLIP.h;
+function insertPastedCard(card, at) {
+  if (!CARDS.some(d => d.id === card.type)) throw new Error("这种节点在当前版本里不存在了，粘不了");
+  const n = addCard(card.type, at.x - CW / 2, at.y - 40, card.cap);
+  if (!n) return null;
+  const outputs = JSON.parse(JSON.stringify(card.outputs || []));
+  const {sourceProject, id, x, y, ...copied} = card;
+  Object.assign(n, {...copied, id:n.id, x:n.x, y:n.y, outputs, status:outputs.length ? 'done' : null});
   paintTitle(n); applySize(n); paint(n); paintKind(n); paintPort(n);
   openPanel(n.id); save();
   toast(`已粘贴「${titleOf(n)}」`);
+  return n;
+}
+
+async function pasteCard() {
+  if (!requireOperate()) return;
+  if (!CLIP) return toast("还没复制东西：先点一个节点，Ctrl+C");
+  const at = mouseW || { x: CLIP.x + 24 * ++pasteN, y: CLIP.y + 28 * pasteN };
+  if (!CLIP.sourceProject || CLIP.sourceProject === PROJ.id) return insertPastedCard(CLIP, at);
+  const targetId = PROJ.id;
+  try {
+    const result = await jpost(`/api/projects/${encodeURIComponent(targetId)}/copy`, {
+      source_project: CLIP.sourceProject, card: CLIP,
+    });
+    // 等待复制时切换画布或权限被撤销，绝不能把迟到素材写入新上下文。
+    if (!canOperate() || PROJ.id !== targetId) throw new Error('画布已切换或权限已变化，未粘贴');
+    if (!result.card) throw new Error('复制接口未返回节点');
+    insertPastedCard(result.card, at);
+  } catch (error) { toast(`粘贴失败：${error.message}`); }
 }
 
 /* ================= 连线传产物 ================= */
@@ -2962,6 +3047,7 @@ function firstFreeSlot(c, kind) {
     只记一条 @ 开头的连线：连生成节点就是提交那一刻并进提示词（payloadOf），
     连另一个文本节点就是运行那一刻当输入。所以改上游的字不用重连、也不用重跑下游。 */
 function linkText(from, to) {
+  if (!requireOperate()) return;
   if (from.id === to.id) return;
   if (isText(to)) {
     // 文本节点：@text 边，一张能收好几根（多个文本输入），同一根不重复接
@@ -2994,6 +3080,7 @@ function linkText(from, to) {
 }
 
 async function linkTo(from, to) {
+  if (!requireOperate()) return;
   if (!to) return;
   if (isTextCard(from)) return linkText(from, to);
   if (isTextCard(to)) return toast("文本节点不收图片/视频素材：把文本节点的出口拖过来才是接文本");
@@ -3101,6 +3188,7 @@ function modeTakes(md, kind) {
     而且"视频接进生图当参考图"根本跑不通（LoadImage 读不了 mp4）。
     这里只列槽位类型对得上的，选完直接建节点 + 连线。 */
 async function spawnDownstream(from, at, cx, cy) {
+  if (!requireOperate()) return;
   // 一个节点一条，收口成跟底部工具条一样的几样（文本/图片/视频/工具箱），不再按玩法摊开。
   // 建节点用的是**第一个收得下这份素材的模式**——拖一张图给「图片」建出来就是图生图，
   // 不是文生图，不然线接上去发现没有格子可进。
@@ -3203,11 +3291,13 @@ async function spawnDownstream(from, at, cx, cy) {
 
 /** 把 ComfyUI 输出目录里的产物搬进 input 目录，得到可用的 LoadImage 值 */
 async function importOutput(out) {
-  const blob = await (await fetch(out.url)).blob();
-  const fd = new FormData();
-  fd.append("file", blob, out.filename.split(/[\\/]/).pop());
-  const r = await api("/api/upload", { method: "POST", body: fd });
-  return r.files[0];
+  if (!canOperate()) throw new Error('此画布只读，不能导入素材');
+  // 二进制产物不走 JSON 包装，但必须带同源会话并明确检查响应。
+  const download = await fetch(new URL(out.url, location.href), {credentials:'same-origin'});
+  if (!download.ok) throw new Error(`读取产物失败（${download.status}）`);
+  const blob = await download.blob();
+  const file = new File([blob], out.filename.split(/[\\/]/).pop(), {type:blob.type});
+  return uploadAsset(file);
 }
 
 // 项目保留原片 url/ref 用于备份下载；播放器和后端实际提交的工作流使用转码 MP4。
@@ -3577,6 +3667,13 @@ function placePanel() {
 }
 
 function openPanel(id) {
+  if (!canOperate()) {
+    const card = cardOf(id); if (!card) return;
+    el.panel.replaceChildren(); el.panel._id = id; el.panel.style.display = '';
+    const title = document.createElement('strong'); title.textContent = '只读 · ' + titleOf(card);
+    const params = document.createElement('pre'); params.textContent = JSON.stringify(card.params || {}, null, 2);
+    el.panel.append(title, params); placePanel(); return;
+  }
   const c = PROJ.cards.find(x => x.id === id);
   if (!c) return closePanel();
   const def = defOf(c), cap = capOf(c);
@@ -4051,6 +4148,7 @@ function textPanel(c) {
     按选定的加工方式处理，结果**写回节点上**（运行前的字留一步可恢复）。
     上游改了字或重跑过，这里读到的就是新的 —— 继承是实时的，不用重新连线。 */
 async function runText(c) {
+  if (!requireOperate()) return;
   const op = textOp(c);
   if (!op) return toast("先在上面选一种加工方式（润色 / 优化 / 扩写 / 自定义）");
   // 防止重复点击：已经在运行就不要再发请求
@@ -4836,6 +4934,7 @@ function rwToast(r) {
     前面有活儿还得排队，界面上就是按钮一直显示「优化中…」。 */
 /** 翻译提示词（中→英 / 英→中），调用有道翻译 API */
 async function doTranslate(c, s) {
+  if (!requireOperate()) return;
   // 防止重复点击：已经在跑就不要再发请求
   if (c._rwBusy) return toast("翻译正在进行中，请稍候");
   // 根据当前选中的 tab 决定翻译哪个版本：优化后 or 原文
@@ -4978,6 +5077,7 @@ function buildCardInfo(card) {
 }
 
 async function doRewrite(c, s, model) {
+  if (!requireOperate()) return;
   const cap = CAPS[runCap(c)] || capOf(c);
   if (!cap || !cap.rewrite) return;
   // 防止重复点击：已经在跑就不要再发请求
@@ -5368,6 +5468,7 @@ function audioRange(c, slot, sSpec, eSpec) {
 }
 
 function pickFile(c, s) {
+  if (!requireOperate()) return;
   // 路由节点那一格两种都收，accept 不能只写一种，否则选视频时文件对话框里根本看不到
   const r = modeOf(c), both = r && r.route && Object.keys(r.route).length > 1
     && Object.values(r.route).some(x => x.slot === s.key);
@@ -5376,10 +5477,8 @@ function pickFile(c, s) {
   el.picker.onchange = async () => {
     const f = el.picker.files[0]; el.picker.value = "";
     if (!f) return;
-    const fd = new FormData(); fd.append("file", f, f.name);
     try {
-      const r = await api("/api/upload", { method: "POST", body: fd });
-      putAsset(c, s, r.files[0]);
+      putAsset(c, s, await uploadAsset(f));
       openPanel(c.id); save();
     } catch (e) { toast("上传失败：" + e.message); }
   };
@@ -5390,15 +5489,15 @@ function pickFile(c, s) {
     素材节点不往格子里放，收进 c.outputs[0]。
     第二个参数传函数时当"上传成功后拿这一份去建节点"用（底部工具条的「上传」走这条）。 */
 function pickAsset(c, onItem) {
+  if (!requireOperate()) return;
   el.picker.accept = "image/*,video/*,audio/*";   // 三种都收，别只写一种
   el.picker.onchange = async () => {
     const f = el.picker.files[0]; el.picker.value = "";
     if (!f) return;
-    const fd = new FormData(); fd.append("file", f, f.name);
     try {
-      const r = await api("/api/upload", { method: "POST", body: fd });
-      if (onItem) onItem(r.files[0]);
-      else setAssetItem(c, r.files[0]);
+      const item = await uploadAsset(f);
+      if (onItem) onItem(item);
+      else setAssetItem(c, item);
     } catch (e) { toast("上传失败：" + e.message); }
   };
   el.picker.click();
@@ -5408,6 +5507,7 @@ function pickAsset(c, onItem) {
     并补一个 filename —— 画面区 meta 行、下载都按产物那套读它。
     卡片保持默认尺寸，图片/视频在画面区内等比例完整显示。 */
 async function setAssetItem(c, item) {
+  if (!requireOperate() || !PROJ.cards.includes(c)) return;
   c.outputs = [{ ...item, filename: (item.origin || item.url).split(/[\\/]/).pop() }];
   delete c.w; delete c.h;
   applySize(c);
@@ -5455,6 +5555,7 @@ async function setAssetItem(c, item) {
     浏览器就不再把随后那次 picker.click() 当"用户点出来的"，对话框会被静默拦掉。
     取消选择就什么都不建，画布上不留空节点。 */
 function addAssetCard() {
+  if (!requireOperate()) return;
   if (!PROJ) return;
   pickAsset(null, (item) => {
     const p = blankSpot();
@@ -5545,9 +5646,10 @@ async function augFrames(c, s, row) {
   for (const i of row.querySelectorAll("input")) i.addEventListener("input", draw);
   if (a.frames) return;
   try {
-    Object.assign(a, await api("/api/media?ref=" + encodeURIComponent(a.ref)));
+    Object.assign(a, await api("/api/media?ref=" + encodeURIComponent(a.ref)
+      + "&project=" + encodeURIComponent(PROJ.id)));
     if (a.frames) save();
-  } catch (e) { /* 探不到就落到下面那句 */ }
+  } catch (e) { toast(`读取媒体信息失败：${e.message}`); }
   miss = "总帧数读不出来（填 0 = 整段，一定没错）";
   draw();
 }
@@ -5643,6 +5745,7 @@ function payloadOf(c) {
 }
 
 async function run(c) {
+  if (!requireOperate()) return;
   if (isStyle(c)) return toast("风格节点不用运行：它只把风格并进挂着的那几个节点的提示词");
   if (isText(c)) return runText(c);
   if (c.status === "queued" || c.status === "running") return;
@@ -5674,7 +5777,8 @@ async function pollJobs() {
   try { TASKS = (await api("/api/jobs")).jobs || []; } catch (e) { return; }
   paintJobsBtn();
   if (el.jobs.style.display !== "none") renderJobs();
-  if (!PROJ) return;
+  if (!PROJ || !canOperate()) return;
+  const projectId = PROJ.id;
   const live = PROJ.cards.filter(c => c.job && ["queued", "running"].includes(c.status));
   if (!live.length) return;
   let dirty = false;
@@ -5687,6 +5791,8 @@ async function pollJobs() {
       if (el.panel._id === c.id) openPanel(c.id);
       continue;
     }
+    // 任务列表随授权变化；只读任务可查看状态，但不能自动回写画布。
+    if (!canTask(j) || !PROJ || PROJ.id !== projectId || !canOperate()) continue;
     const was = c.status;
     c.status = j.status; c.progress = j.progress; c.error = j.error;
     c.queue_remaining = j.queue_remaining; c.step = j.step || "";
@@ -5917,11 +6023,13 @@ function actBtn(text, run, danger) {
 }
 
 async function stopTask(j) {
+  if (!canTask(j)) return toast("此任务关联的画布为只读，不能停止");
   try { await jpost(`/api/job/${j.id}/cancel`); } catch (e) { return toast(e.message); }
   pollJobs();
 }
 
 async function delTask(j) {
+  if (!canTask(j)) return toast("此任务关联的画布为只读，不能删除");
   // 还在跑的删掉等于先停后删，这一步不可逆（跑到一半的算力就没了），所以问一句
   if (jobLive(j) && !confirm("这个任务还没跑完，删除会先把它停掉。继续？")) return;
   try { await api(`/api/job/${j.id}`, { method: "DELETE" }); } catch (e) { return toast(e.message); }
