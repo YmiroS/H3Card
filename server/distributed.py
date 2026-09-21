@@ -88,6 +88,12 @@ class DistributedStore:
                     capabilities_json TEXT NOT NULL DEFAULT '{}',
                     last_capability_id TEXT,
                     last_model_family TEXT,
+                    sync_request_id TEXT,
+                    sync_status TEXT NOT NULL DEFAULT 'idle',
+                    sync_message TEXT,
+                    sync_requested_at REAL,
+                    sync_started_at REAL,
+                    sync_finished_at REAL,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -117,6 +123,17 @@ class DistributedStore:
                 self.db.execute("ALTER TABLE workers ADD COLUMN last_capability_id TEXT")
             if "last_model_family" not in columns:
                 self.db.execute("ALTER TABLE workers ADD COLUMN last_model_family TEXT")
+            sync_columns = {
+                "sync_request_id": "TEXT",
+                "sync_status": "TEXT NOT NULL DEFAULT 'idle'",
+                "sync_message": "TEXT",
+                "sync_requested_at": "REAL",
+                "sync_started_at": "REAL",
+                "sync_finished_at": "REAL",
+            }
+            for name, definition in sync_columns.items():
+                if name not in columns:
+                    self.db.execute(f"ALTER TABLE workers ADD COLUMN {name} {definition}")
 
     def register_worker(self, name, capabilities=None):
         now = time.time()
@@ -150,17 +167,81 @@ class DistributedStore:
             )
         return cur.rowcount > 0
 
+    def request_sync_all(self):
+        now = time.time()
+        request_id = str(uuid.uuid4())
+        with self.lock, self.db:
+            rows = self.db.execute(
+                """SELECT id, name, capabilities_json FROM workers
+                   ORDER BY name COLLATE NOCASE, created_at DESC, id DESC"""
+            ).fetchall()
+            worker_ids = []
+            skipped_count = 0
+            seen_names = set()
+            for row in rows:
+                name_key = row["name"].strip().casefold()
+                if name_key in seen_names:
+                    continue
+                seen_names.add(name_key)
+                capabilities = json.loads(row["capabilities_json"] or "{}")
+                if (not isinstance(capabilities, dict)
+                        or not capabilities.get("supports_file_sync")):
+                    skipped_count += 1
+                    continue
+                worker_ids.append(row["id"])
+            for worker_id in worker_ids:
+                self.db.execute(
+                    """UPDATE workers
+                       SET sync_request_id = ?, sync_status = 'pending',
+                           sync_message = ?, sync_requested_at = ?,
+                           sync_started_at = NULL, sync_finished_at = NULL,
+                           updated_at = ?
+                       WHERE id = ?""",
+                    (request_id, "等待节点空闲", now, now, worker_id),
+                )
+        return {
+            "request_id": request_id,
+            "worker_count": len(worker_ids),
+            "skipped_count": skipped_count,
+        }
+
     def heartbeat(self, worker_id, *, capabilities=None, telemetry=None,
                   comfy_online=False, busy=False, local_busy=None,
-                  current_job_id=None):
+                  current_job_id=None, maintenance=None):
         now = time.time()
         with self.lock, self.db:
             self._requeue_expired_locked(now)
             row = self.db.execute(
-                "SELECT id, capabilities_json FROM workers WHERE id = ?", (worker_id,)
+                """SELECT id, capabilities_json, sync_request_id, sync_status
+                   FROM workers WHERE id = ?""",
+                (worker_id,),
             ).fetchone()
             if not row:
                 return None
+
+            sync_request_id = row["sync_request_id"]
+            sync_status = row["sync_status"] or "idle"
+            maintenance_ack = None
+            if isinstance(maintenance, dict):
+                report_request_id = str(maintenance.get("request_id") or "")
+                report_status = str(maintenance.get("status") or "")
+                if (report_request_id == sync_request_id
+                        and report_status in {"running", "done", "error"}):
+                    message = str(maintenance.get("message") or "")[:1000]
+                    finished_at = now if report_status in {"done", "error"} else None
+                    self.db.execute(
+                        """UPDATE workers
+                           SET sync_status = ?, sync_message = ?,
+                               sync_started_at = COALESCE(sync_started_at, ?),
+                               sync_finished_at = ?, updated_at = ?
+                           WHERE id = ?""",
+                        (report_status, message, now, finished_at, now, worker_id),
+                    )
+                    sync_status = report_status
+                    maintenance_ack = {
+                        "request_id": report_request_id,
+                        "status": report_status,
+                    }
 
             commands = []
             lease_ttl_seconds = None
@@ -185,6 +266,12 @@ class DistributedStore:
                     # Worker 仍在报告一个已经结束或失效的租约。不能让这条迟到的
                     # 心跳把机器重新写成 busy，更不能续租后重复执行。
                     commands.append({"type": "abort_job", "job_id": current_job_id})
+
+            if sync_request_id and sync_status == "pending":
+                commands.append({
+                    "type": "sync_files",
+                    "request_id": sync_request_id,
+                })
 
             reported_local_busy = bool(busy) if local_busy is None else bool(local_busy)
             effective_busy = reported_local_busy or active_job_id is not None
@@ -212,6 +299,7 @@ class DistributedStore:
                 "commands": commands,
                 "server_time": now,
                 "lease_ttl_seconds": lease_ttl_seconds,
+                "maintenance_ack": maintenance_ack,
             }
 
     def list_workers(self):
@@ -236,6 +324,8 @@ class DistributedStore:
             online = now - item["last_seen"] <= self.offline_seconds
             if not online:
                 item["state"] = "offline"
+            elif item.get("sync_status") in {"pending", "running"}:
+                item["state"] = "syncing"
             elif not item["enabled"]:
                 item["state"] = "disabled"
             elif not item["comfy_online"]:
@@ -265,6 +355,8 @@ class DistributedStore:
                 "SELECT * FROM workers WHERE id = ?", (worker_id,)
             ).fetchone()
             if not worker or not worker["enabled"] or not worker["comfy_online"]:
+                return None
+            if worker["sync_status"] in ("pending", "running"):
                 return None
             if now - worker["last_seen"] > self.offline_seconds:
                 return None
