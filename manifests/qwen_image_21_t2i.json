@@ -1,0 +1,67 @@
+{
+ "id": "qwen_image_21_t2i",
+ "name": "文生图",
+ "file": "qwen_image_2_1_workflow",
+ "source": "../ComfyUI/user/default/workflows/Qwen_image_2.1/qwen_image_2_1_workflow.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "gen",
+ "card": "image",
+ "slots": "img0+aud0+vid0",
+ "images": 0,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+ "graph": "graphs/qwen_image_21_t2i.api.json",
+ "output": {"node": "10"},
+ "note": "Qwen Image 2.1 文生图：无需输入图片，可自定义输出比例和百万像素数，尺寸按 16 的倍数对齐。保留原工作流 40 步、CFG 1、euler/simple 配置；参考图编码尺寸不是输出尺寸。需要包含 QwenImage21Cache、TextEncodeQwenImage21 的 ComfyUI 版本及原版模型 qwen_image_2.1_int8_convrot.safetensors、qwen3vl_8b_fp8_scaled.safetensors、qwen_image_2.1_vae_bf16.safetensors。未完成出图验证。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "prompt", "label": "提示词", "type": "textarea", "default": "",
+   "target": {"node": "13", "input": "value"}
+  },
+  {
+   "key": "negative_prompt", "label": "负向提示词", "type": "textarea", "default": "",
+   "target": {"node": "37", "input": "negative_prompt"}
+  },
+  {
+   "key": "aspect_ratio", "label": "输出比例", "type": "select", "default": "9:16 (Portrait Widescreen)",
+   "options": ["1:1 (Square)", "2:3 (Portrait Photo)", "3:2 (Photo)", "3:4 (Portrait Standard)", "4:3 (Standard)", "9:16 (Portrait Widescreen)", "16:9 (Widescreen)", "21:9 (Ultrawide)"],
+   "target": {"node": "39", "input": "aspect_ratio"}
+  },
+  {
+   "key": "megapixels", "label": "输出百万像素", "type": "number", "default": 1,
+   "min": 0.1, "max": 4, "step": 0.1,
+   "target": {"node": "39", "input": "megapixels", "vtype": "FLOAT"}
+  },
+  {
+   "key": "encode_resolution", "label": "参考图编码尺寸", "type": "number", "default": 1024,
+   "advanced": true, "hint": "编码器的参考图处理尺寸，不控制输出画布；纯文生图通常保持默认。",
+   "target": {"node": "37", "input": "resolution", "vtype": "INT"}
+  },
+  {
+   "key": "steps", "label": "采样步数", "type": "slider", "default": 40,
+   "min": 1, "max": 100, "step": 1,
+   "hint": "原工作流默认 40 步。",
+   "target": {"node": "8", "input": "steps", "vtype": "INT"}
+  },
+  {
+   "key": "cfg", "label": "提示词引导强度", "type": "slider", "default": 1,
+   "min": 1, "max": 10, "step": 0.1, "advanced": true,
+   "target": {"node": "8", "input": "cfg", "vtype": "FLOAT"}
+  },
+  {
+   "key": "seed", "label": "种子", "type": "seed", "default": 123456789,
+   "max": 18446744073709551615,
+   "target": {"node": "8", "input": "seed", "vtype": "INT"}
+  },
+  {
+   "key": "batch_size", "label": "生成图片张数", "type": "number", "default": 1,
+   "min": 1, "max": 16, "step": 1,
+   "target": {"node": "42", "input": "value", "vtype": "INT"}
+  }
+ ],
+ "warnings": []
+}
