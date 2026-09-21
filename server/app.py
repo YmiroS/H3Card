@@ -28,6 +28,8 @@ import time
 import uuid
 from pathlib import Path
 from urllib.parse import urlencode
+from collections import defaultdict
+from functools import partial
 
 import aiohttp
 from aiohttp import web
@@ -45,6 +47,12 @@ from distributed import (
     can_run_capability,
 )
 from video_preview import VideoPreviews, preview_status, preview_file
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from server.auth_store import AuthStore
+from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
+from server.auth import (auth_middleware, register_auth_routes, require_user, require_admin,
+                         require_project, require_job, call_store)
+from server.resource_access import ResourceAccess
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -109,6 +117,82 @@ def distributed_store(app):
 
 def cost_ledger(app):
     return app.get("costs")
+
+
+async def resource_call(app, method, *args, **kwargs):
+    try:
+        return await asyncio.to_thread(
+            partial(getattr(app["resource_access"], method), *args, **kwargs))
+    except (PermissionError, FileNotFoundError):
+        raise web.HTTPNotFound(text="资源不存在或无权访问")
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+
+
+async def require_resource(request, kind, locator, project_id=None):
+    user = require_user(request)
+    if not await resource_call(request.app, "authorize", user["id"], kind,
+                               locator, project_id=project_id):
+        raise web.HTTPNotFound(text="资源不存在或无权访问")
+
+
+def write_project(path, document):
+    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
+    try:
+        temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+async def cache_comfy_outputs(request, card):
+    """复制前把缺失的 Comfy 输出按固定上游受控落入私有缓存。"""
+    refs = await resource_call(request.app, "references", card)
+    session = request.app["session"]
+    for kind, locator in refs:
+        if kind != "comfy":
+            continue
+        path = await resource_call(request.app, "local_path", kind, locator)
+        if path.is_file():
+            continue
+        obj = json.loads(locator)
+        async with session.get(COMFY_HTTP + "/view", params=obj) as r:
+            if r.status != 200:
+                raise web.HTTPNotFound(text="ComfyUI 产物已不可用")
+            data = await r.read()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_suffix(path.suffix + ".part")
+        await asyncio.to_thread(temporary.write_bytes, data)
+        os.replace(temporary, path)
+
+
+async def authorized_body(request):
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("project"), str):
+        raise web.HTTPBadRequest(text="必须提供画布 ID")
+    await require_project(request, body["project"], operate=True)
+    path = proj_path(body["project"])
+    if not path.is_file():
+        raise web.HTTPNotFound(text="画布不存在")
+    project = json.loads(path.read_text(encoding="utf-8"))
+    body["projectName"] = project.get("name", "未命名")
+    await resource_call(request.app, "validate_assets", require_user(request)["id"],
+                        body["project"], body.get("assets") or {})
+    return body
+
+
+@web.middleware
+async def project_write_lock(request, handler):
+    pid = request.match_info.get("pid") if request.path.startswith("/api/projects/") else None
+    if request.path == "/api/generate" and request.method == "POST":
+        body = await request.json()
+        pid = body.get("project") if isinstance(body, dict) else None
+    if request.path == "/api/upload" and request.method == "POST":
+        pid = request.query.get("project")
+    if isinstance(pid, str) and request.method not in ("GET", "HEAD", "OPTIONS"):
+        async with request.app["project_locks"][pid]:
+            return await handler(request)
+    return await handler(request)
 
 
 def record_api_cost(app, capability, result, elapsed_ms, body):
@@ -493,8 +577,10 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
     return g
 
 
-async def comfy_submit(session, graph):
+async def comfy_submit(session, graph, prompt_id=None):
     payload = {"prompt": graph, "client_id": CLIENT_ID}
+    if prompt_id:
+        payload["prompt_id"] = prompt_id
     async with session.post(COMFY_HTTP + "/prompt", json=payload) as r:
         body = await r.text()
         if r.status != 200:
@@ -519,13 +605,13 @@ def check_local_cleanup(app):
         raise web.HTTPConflict(text="正在停止并释放显存，或释放尚未确认；请等待或重试取消。")
 
 
-async def local_submit(app, graph):
+async def local_submit(app, graph, prompt_id=None):
     try:
         # 这里只等提交确认，不是等出图；也限制被另一个挂起提交占住锁的等待。
         async with asyncio.timeout(30):
             async with app["comfy_lock"]:
                 check_local_cleanup(app)
-                return await comfy_submit(app["session"], graph)
+                return await comfy_submit(app["session"], graph, prompt_id=prompt_id)
     except asyncio.TimeoutError:
         raise web.HTTPGatewayTimeout(text=(
             "等待 ComfyUI 确认提交超时（最长等待 30 秒），后端可能无响应或显存不足。"
@@ -578,14 +664,14 @@ async def ws_loop(app):
                         ev = json.loads(msg.data)
                     except Exception:
                         continue
-                    await handle_event(session, ev)
+                    await handle_event(session, ev, app=app)
         except Exception as e:
             STATE["comfy_online"] = False
             print(f"[ws] 与 ComfyUI 断开：{type(e).__name__}: {e}，3 秒后重连")
             await asyncio.sleep(3)
 
 
-async def handle_event(session, ev, remote=False):
+async def handle_event(session, ev, remote=False, app=None):
     t, d = ev.get("type"), ev.get("data") or {}
     if DEBUG:
         print(f"[ev] {t} {json.dumps(d, ensure_ascii=False)[:220]}", flush=True)
@@ -613,6 +699,18 @@ async def handle_event(session, ev, remote=False):
                 job.update(progress=max(job.get("progress") or 0.0, 0.99), step="正在归集产物")
                 return
             outputs = await collect_outputs(session, pid)
+            if job.get("cleanup_pending") or job["status"] in ("canceled", "error"):
+                return
+            if app is not None:
+                acl = await call_store(app, "get_job", pid)
+                project = await call_store(app, "get_project", acl["project_id"]) if acl else None
+                if not project or project["state"] != "active":
+                    job.update(status="canceled", outputs=[], ended=time.time(), step="")
+                    save_jobs()
+                    return
+                for output in outputs:
+                    await resource_call(app, "register", acl["project_id"], "comfy", output)
+            # 权限查询与产物登记期间也可能收到取消，不能把清理中的任务改回完成。
             if job.get("cleanup_pending") or job["status"] in ("canceled", "error"):
                 return
             if not outputs and t == "execution_success":
@@ -700,6 +798,8 @@ async def api_reload(request):
 
 
 async def api_upload(request):
+    project_id = request.query.get("project")
+    await require_project(request, project_id, operate=True)
     reader = await request.multipart()
     session = request.app["session"]
     saved = []
@@ -712,7 +812,12 @@ async def api_upload(request):
         safe = f"ck_{uuid.uuid4().hex[:12]}{Path(name).suffix.lower()}"
         local = ROOT / "data" / "uploads" / safe
         local.parent.mkdir(parents=True, exist_ok=True)
-        local.write_bytes(raw)
+        await resource_call(request.app, "register", project_id, "upload", safe, state="pending")
+        temporary = local.with_suffix(local.suffix + ".part")
+        await asyncio.to_thread(temporary.write_bytes, raw)
+        await require_project(request, project_id, operate=True)
+        os.replace(temporary, local)
+        await resource_call(request.app, "publish", "upload", safe)
         # 视频原片只作备份，生成提交时再把转码 MP4 交给本地 ComfyUI 或 Worker。
         ref = f"chouka/{safe}" if CONTROLLER_MODE or kind_of(safe) == "video" else await comfy_upload(
             session, part.name, safe, raw
@@ -733,10 +838,15 @@ async def api_upload(request):
 async def api_media(request):
     """现探一份素材的帧率/总帧数。给这条改动之前存下的素材兜底（老项目里的素材
        记录只有 ref/kind/url，没有 fps/frames）。"""
-    return web.json_response(await asyncio.to_thread(probe_video, request.query.get("ref") or ""))
+    ref = request.query.get("ref") or ""
+    parsed = await resource_call(request.app, "reference", ref)
+    if not parsed:
+        raise web.HTTPBadRequest(text="无法识别素材")
+    await require_resource(request, *parsed, project_id=request.query.get("project"))
+    return web.json_response(await asyncio.to_thread(probe_video, ref))
 
 
-async def generation_assets(request, assets):
+async def generation_assets(request, assets, project_id=None):
     """项目保留原片引用；真正提交的图和 Worker 素材清单统一使用兼容 MP4。"""
     replacements = {}
     for ref in set(assets.values()):
@@ -754,17 +864,29 @@ async def generation_assets(request, assets):
                 raise web.HTTPConflict(text="视频正在转码为 MP4，请等待预览就绪后再生成；不会使用原片执行。")
             path = previews.target(name)
         replacements[ref] = path
+        if project_id and path.name != name:
+            parent = await resource_call(request.app, "lookup", "upload", name)
+            await resource_call(request.app, "register", project_id, "upload", path.name,
+                                parent_id=parent["resource_id"])
 
     resolved = {}
+    if not CONTROLLER_MODE:
+        # 跨画布复制的素材只存在于控制端 uploads（external 标记），
+        # 提交前需补送本地 Comfy input；普通上传当时就已送过，不再重传。
+        for name in await resource_call(request.app, "pending_external_uploads",
+                                        list(set(assets.values()))):
+            replacements[f"chouka/{name}"] = ROOT / "data" / "uploads" / name
     for ref, path in replacements.items():
         resolved[ref] = f"chouka/{path.name}" if CONTROLLER_MODE else await comfy_upload(
             request.app["session"], "file", path.name, await asyncio.to_thread(path.read_bytes),
         )
+        if not CONTROLLER_MODE:
+            await resource_call(request.app, "mark_delivered", "upload", path.name)
     return {key: resolved.get(ref, ref) for key, ref in assets.items()}
 
 
 async def api_generate(request):
-    body = await request.json()
+    body = await authorized_body(request)
     if not CONTROLLER_MODE and not body.get("dry_run"):
         check_local_cleanup(request.app)
     cid = body.get("capability")
@@ -774,7 +896,7 @@ async def api_generate(request):
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
-    uploaded = await generation_assets(request, body.get("assets") or {})
+    uploaded = await generation_assets(request, body.get("assets") or {}, body["project"])
     source_video_duration, video_metadata = None, {}
     if not body.get("dry_run"):
         source_video_duration, video_metadata = await asyncio.to_thread(
@@ -808,7 +930,16 @@ async def api_generate(request):
             raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，此任务要求主 GPU 显存至少 32GB")
         if not can_run_capability(cid, stats.get("devices"), gpu_policy):
             raise web.HTTPBadRequest(reason="此任务只能在主 GPU 显存至少 32GB 的机器上运行")
-    pid = str(uuid.uuid4()) if CONTROLLER_MODE else await local_submit(request.app, graph)
+    await require_project(request, body["project"], operate=True)
+    pid = str(uuid.uuid4())
+    await call_store(request.app, "register_job", pid, body["project"], require_user(request)["id"])
+    await resource_call(request.app, "register_job_inputs", pid, uploaded)
+    if not CONTROLLER_MODE:
+        actual_pid = await local_submit(request.app, graph, prompt_id=pid)
+        if actual_pid != pid:
+            await call_store(request.app, "register_job", actual_pid, body["project"], require_user(request)["id"])
+            await resource_call(request.app, "register_job_inputs", actual_pid, uploaded)
+        pid = actual_pid
     # 步骤名和权重单独放 STEPS / WEIGHTS，不塞进 job：job 每次轮询整份回给前端，
     # 59 个节点名白传
     STEPS[pid] = step_labels(graph)
@@ -865,7 +996,7 @@ async def api_rewrite(request):
     还得 `force_offload` 卸掉；而且 `n_ctx` 只有 8192。走 API 不碰显存、不排
     ComfyUI 的队 —— **ComfyUI 没开着也能优化**。
     """
-    body = await request.json()
+    body = await authorized_body(request)
     cid = body.get("capability")
     cap = CAPS.get(cid)
     if not cap:
@@ -944,7 +1075,14 @@ async def rewrite_local(request, job_name, system, user, sampling, body, t0, fel
 
     graph = rw.build_graph(system, user, sampling["max_tokens"],
                            sampling["temperature"], random.randint(0, 2 ** 31 - 1))
-    pid = await local_submit(request.app, graph)
+    async with request.app["project_locks"][body["project"]]:
+        await require_project(request, body["project"], operate=True)
+        pid = str(uuid.uuid4())
+        await call_store(request.app, "register_job", pid, body["project"], require_user(request)["id"])
+        actual_pid = await local_submit(request.app, graph, prompt_id=pid)
+        if actual_pid != pid:
+            await call_store(request.app, "register_job", actual_pid, body["project"], require_user(request)["id"])
+        pid = actual_pid
     STEPS[pid] = step_labels(graph)
     WEIGHTS[pid] = step_weights(graph)
     JOBS[pid] = {"id": pid, "capability": "text", "name": job_name,
@@ -1000,7 +1138,7 @@ async def api_text(request):
       api   云端大模型（llm.json 那家），几秒，不占显存，ComfyUI 不用开
       local 本地 27B，不花钱，但要占显存、排 ComfyUI 的队，第一次好几分钟
     """
-    body = await request.json()
+    body = await authorized_body(request)
     op = str(body.get("op") or "")
 
     # 翻译优先走有道；没配置或请求失败时，复用 llm.json 中的云端模型。
@@ -1088,17 +1226,43 @@ async def api_text(request):
                               "ms": elapsed_ms})
 
 
+async def job_permission(request, jid):
+    user = require_user(request)
+    acl = await call_store(request.app, "get_job", jid)
+    if acl:
+        return await call_store(request.app, "project_permission", user["id"], acl["project_id"])
+    if user["role"] == "admin" and await resource_call(request.app, "is_legacy_job", jid):
+        return "operate"
+    return None
+
+
+async def authorized_job(request, jid, operate=False):
+    permission = await job_permission(request, jid)
+    if permission is None:
+        raise web.HTTPNotFound(text="任务不存在或不可访问")
+    if operate and permission != "operate":
+        raise web.HTTPForbidden(text="任务为只读")
+    return permission
+
+
 async def api_job(request):
     pid = request.match_info["pid"]
+    permission = await authorized_job(request, pid)
     job = JOBS.get(pid)
     if not job:
         raise web.HTTPNotFound(reason="没有这个任务")
-    return web.json_response(job)
+    return web.json_response(job | {"permission": permission})
 
 
 async def api_jobs(request):
-    return web.json_response({"jobs": sorted(JOBS.values(),
-                                             key=lambda j: j["created"], reverse=True)[:60]})
+    out = []
+    for job in sorted(list(JOBS.values()), key=lambda j: j["created"], reverse=True):
+        permission = await job_permission(request, job["id"])
+        if permission:
+            out.append(job | {"permission": permission})
+        if len(out) == 60:
+            break
+    return web.json_response({"jobs": out})
 
 
 LIVE = ("queued", "running")
@@ -1146,6 +1310,29 @@ def require_lease(request, worker_id):
     return pid, lease_token
 
 
+async def execution_project(app, job_id):
+    job = await call_store(app, "get_job", job_id)
+    project = await call_store(app, "get_project", job["project_id"]) if job else None
+    if not project or project["state"] != "active":
+        raise web.HTTPConflict(text="任务画布已不可用")
+    return project
+
+
+async def api_agent_input(request):
+    worker_id = require_agent(request)
+    jid, _ = require_lease(request, worker_id)
+    await execution_project(request.app, jid)
+    if distributed_store(request.app).dispatch_status(jid) == "cancel_requested":
+        raise web.HTTPConflict(text="任务已取消")
+    name = request.match_info["name"]
+    if not await resource_call(request.app, "job_input_allowed", jid, name):
+        raise web.HTTPNotFound(text="素材不在当前任务输入清单中")
+    path = await resource_call(request.app, "local_path", "upload", name)
+    if not path.is_file():
+        raise web.HTTPNotFound()
+    return private_file(path)
+
+
 async def api_agent_register(request):
     if not ENROLLMENT_TOKEN:
         raise web.HTTPServiceUnavailable(reason="服务端未配置 CHOUKA_ENROLLMENT_TOKEN")
@@ -1185,6 +1372,11 @@ async def api_agent_acquire(request):
     if assignment is None:
         return web.Response(status=204)
     pid = assignment["job_id"]
+    try:
+        await execution_project(request.app, pid)
+    except web.HTTPConflict:
+        distributed_store(request.app).finish(pid, worker_id, assignment["lease_token"], "canceled")
+        return web.Response(status=204)
     graph = assignment["payload"].get("graph") or {}
     STEPS.setdefault(pid, step_labels(graph))
     WEIGHTS.setdefault(pid, step_weights(graph))
@@ -1199,6 +1391,9 @@ async def api_agent_acquire(request):
 async def api_agent_start(request):
     worker_id = require_agent(request)
     pid, lease_token = require_lease(request, worker_id)
+    await execution_project(request.app, pid)
+    if distributed_store(request.app).dispatch_status(pid) == "cancel_requested":
+        raise web.HTTPConflict(text="任务已取消")
     if not distributed_store(request.app).mark_running(pid, worker_id, lease_token):
         raise web.HTTPConflict(reason="任务无法进入运行状态")
     started_at = time.time()
@@ -1256,13 +1451,15 @@ async def api_agent_event(request):
             ledger.finish_job(pid, terminal, ended_at, worker_id)
         return web.json_response({"ok": True, "terminal": terminal})
 
-    await handle_event(None, event, remote=True)
+    await execution_project(request.app, pid)
+    await handle_event(None, event, remote=True, app=request.app)
     return web.json_response({"ok": True})
 
 
 async def api_agent_artifact(request):
     worker_id = require_agent(request)
     pid, _lease_token = require_lease(request, worker_id)
+    project = await execution_project(request.app, pid)
     reader = await request.multipart()
     part = await reader.next()
     if part is None or part.name != "file":
@@ -1275,12 +1472,26 @@ async def api_agent_artifact(request):
     target_dir = ARTIFACT_DIR / pid
     target_dir.mkdir(parents=True, exist_ok=True)
     target = target_dir / stored_name
-    with target.open("wb") as fp:
-        while True:
-            chunk = await part.read_chunk(1024 * 1024)
-            if not chunk:
-                break
-            fp.write(chunk)
+    locator = f"{pid}/{stored_name}"
+    await resource_call(request.app, "register", project["project_id"], "artifact", locator, state="pending")
+    temporary = target.with_suffix(target.suffix + ".part")
+    total = 0
+    try:
+        with temporary.open("wb") as fp:
+            while True:
+                chunk = await part.read_chunk(1024 * 1024)
+                if not chunk:
+                    break
+                total += len(chunk)
+                if total > 512 * 1024 ** 2:
+                    raise web.HTTPRequestEntityTooLarge(max_size=512 * 1024 ** 2, actual_size=total)
+                fp.write(chunk)
+        require_lease(request, worker_id)
+        await execution_project(request.app, pid)
+        os.replace(temporary, target)
+        await resource_call(request.app, "publish", "artifact", locator)
+    finally:
+        temporary.unlink(missing_ok=True)
     output = {
         "kind": request.query.get("kind") or kind_of(original),
         "filename": original,
@@ -1296,8 +1507,21 @@ async def api_agent_complete(request):
     pid, lease_token = require_lease(request, worker_id)
     body = await request.json()
     outputs = body.get("outputs") if isinstance(body.get("outputs"), list) else []
+    project = await execution_project(request.app, pid)
+    for output in outputs:
+        if not isinstance(output, dict):
+            raise web.HTTPBadRequest(text="无效产物")
+        ref = await resource_call(request.app, "reference", output.get("url"))
+        if not ref or ref[0] != "artifact" or not ref[1].startswith(pid + "/"):
+            raise web.HTTPBadRequest(text="产物不属于当前任务")
+        row = await resource_call(request.app, "lookup", *ref)
+        if not row or row["state"] != "ready":
+            raise web.HTTPBadRequest(text="产物尚未可信登记")
+    await execution_project(request.app, pid)
     if (JOBS.get(pid) or {}).get("cleanup_pending"):
         raise web.HTTPConflict(reason="正在释放显存，等待 Worker 确认")
+    if distributed_store(request.app).dispatch_status(pid) == "cancel_requested":
+        raise web.HTTPConflict(text="任务已取消")
     if not distributed_store(request.app).finish(pid, worker_id, lease_token, "done"):
         raise web.HTTPConflict(reason="任务无法完成")
     ended_at = time.time()
@@ -1363,7 +1587,8 @@ async def api_artifact(request):
     name = request.match_info["name"]
     if Path(pid).name != pid or Path(name).name != name:
         raise web.HTTPNotFound()
-    path = ARTIFACT_DIR / pid / name
+    await require_resource(request, "artifact", f"{pid}/{name}")
+    path = await resource_call(request.app, "local_path", "artifact", f"{pid}/{name}")
     if not path.is_file():
         raise web.HTTPNotFound(reason="产物不存在")
     response = web.FileResponse(path)
@@ -1480,14 +1705,24 @@ async def cancel_local_and_release(app, pid):
     return True
 
 
+async def check_task_mutation(request, pid):
+    await authorized_job(request, pid, operate=True)
+    if (not CONTROLLER_MODE and JOBS.get(pid, {}).get("status") == "running"
+            and require_user(request)["role"] != "admin"):
+        raise web.HTTPConflict(text="本地执行器仅支持全局中断，请由管理员取消运行中的任务")
+
+
 async def api_cancel(request):
-    state = await stop_job(request.app, request.match_info["pid"])
+    pid = request.match_info["pid"]
+    await check_task_mutation(request, pid)
+    state = await stop_job(request.app, pid)
     return web.json_response({"ok": True, "state": state})
 
 
 async def api_job_delete(request):
     """从任务列表里抹掉一条；远端运行中的任务需先等待 Worker 确认取消。"""
     pid = request.match_info["pid"]
+    await check_task_mutation(request, pid)
     if (JOBS.get(pid) or {}).get("cleanup_pending"):
         return web.json_response({"ok": True, "pending": True})
     state = await stop_job(request.app, pid)
@@ -1504,14 +1739,18 @@ async def api_job_delete(request):
 
 async def api_jobs_clear(request):
     """一键清掉所有已结束的任务（成功/失败/已取消），还在跑和排队的留着。"""
-    gone = [pid for pid, j in JOBS.items()
-            if j["status"] not in LIVE and not j.get("cleanup_pending")]
+    gone = []
+    for pid, job in list(JOBS.items()):
+        if (job["status"] not in LIVE and not job.get("cleanup_pending")
+                and await job_permission(request, pid) == "operate"):
+            gone.append(pid)
     for pid in gone:
         JOBS.pop(pid, None)
         STEPS.pop(pid, None)
         WEIGHTS.pop(pid, None)
     if CONTROLLER_MODE:
-        distributed_store(request.app).clear_finished()
+        for pid in gone:
+            distributed_store(request.app).remove_job(pid)
     save_jobs()
     return web.json_response({"ok": True, "removed": len(gone)})
 
@@ -1539,41 +1778,59 @@ def sync_project_name(app, project_id, project_name):
 
 
 async def api_projects(request):
-    PROJ_DIR.mkdir(parents=True, exist_ok=True)
+    user = require_user(request)
+    accessible = await call_store(request.app, "list_projects", user["id"])
     out = []
-    for f in PROJ_DIR.glob("*.json"):
-        try:
-            d = json.loads(f.read_text(encoding="utf-8"))
-            out.append({"id": d["id"], "name": d.get("name", "未命名"),
-                        "updated": d.get("updated", 0),
-                        "cards": len(d.get("cards", [])),
-                        "locked": bool(d.get("locked"))})
-        except Exception:
+    for acl in accessible:
+        path = proj_path(acl["project_id"])
+        if not path.is_file():
             continue
+        try:
+            d = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        out.append({"id": acl["project_id"], "name": d.get("name", "未命名"),
+                    "updated": d.get("updated", 0), "cards": len(d.get("cards", [])),
+                    "locked": bool(d.get("locked")), "owner_id": acl["owner_id"],
+                    "owner_username": acl.get("owner_username", ""),
+                    "permission": acl["permission"]})
     out.sort(key=lambda p: p["updated"], reverse=True)
     return web.json_response({"projects": out})
 
 
 async def api_project_create(request):
+    user = require_user(request)
     body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("name", ""), str):
+        raise web.HTTPBadRequest(text="画布名称必须为字符串")
     PROJ_DIR.mkdir(parents=True, exist_ok=True)
     pid = uuid.uuid4().hex[:12]
     d = {"id": pid, "name": (body.get("name") or "新项目").strip()[:40],
          "cards": [], "edges": [], "view": {"x": 0, "y": 0, "k": 1},
-         "created": time.time(), "updated": time.time()}
-    proj_path(pid).write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    return web.json_response(d)
+         "created": time.time(), "updated": time.time(), "rev": 0}
+    await call_store(request.app, "create_project", pid, user["id"], state="pending")
+    write_project(proj_path(pid), d)
+    await call_store(request.app, "set_project_state", pid, "active")
+    return web.json_response(d | {"owner_id": user["id"], "owner_username": user["username"],
+                                  "permission": "operate"})
 
 
 async def api_project_get(request):
-    p = proj_path(request.match_info["pid"])
+    pid = request.match_info["pid"]
+    acl = await require_project(request, pid)
+    p = proj_path(pid)
     if not p.exists():
         raise web.HTTPNotFound(reason="项目不存在")
-    return web.json_response(json.loads(p.read_text(encoding="utf-8")))
+    owner = await call_store(request.app, "get_user", acl["owner_id"])
+    d = json.loads(p.read_text(encoding="utf-8"))
+    return web.json_response(d | {"owner_id": acl["owner_id"],
+                                  "owner_username": owner["username"],
+                                  "permission": acl["permission"]})
 
 
 async def api_project_save(request):
     pid = request.match_info["pid"]
+    await require_project(request, pid, operate=True)
     p = proj_path(pid)
     if not p.exists():
         raise web.HTTPNotFound(reason="项目不存在")
@@ -1596,13 +1853,15 @@ async def api_project_save(request):
         body["name"] = str(body.get("name") or "").strip()[:40]
         if not body["name"]:
             raise web.HTTPBadRequest(reason="项目名不能为空")
+    await resource_call(request.app, "validate_document", require_user(request)["id"], pid, body)
+    await require_project(request, pid, operate=True)
     previous_name = old.get("name")
     for k in ("name", "cards", "edges", "groups", "view"):
         if k in body:
             old[k] = body[k]
     old["rev"] = rev + 1
     old["updated"] = time.time()
-    p.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+    write_project(p, old)
     if old.get("name") != previous_name:
         sync_project_name(request.app, pid, old.get("name") or "未命名")
     return web.json_response({"ok": True, "updated": old["updated"], "rev": old["rev"]})
@@ -1610,6 +1869,7 @@ async def api_project_save(request):
 
 async def api_project_rename(request):
     pid = request.match_info["pid"]
+    await require_project(request, pid, operate=True)
     p = proj_path(pid)
     if not p.exists():
         raise web.HTTPNotFound(reason="项目不存在")
@@ -1624,7 +1884,8 @@ async def api_project_rename(request):
         project["name"] = name
         project["rev"] = project.get("rev", 0) + 1
         project["updated"] = time.time()
-        p.write_text(json.dumps(project, ensure_ascii=False), encoding="utf-8")
+        await require_project(request, pid, operate=True)
+        write_project(p, project)
         sync_project_name(request.app, pid, name)
     return web.json_response({
         "ok": True, "name": project["name"], "updated": project.get("updated", 0),
@@ -1633,13 +1894,36 @@ async def api_project_rename(request):
 
 
 async def api_project_delete(request):
-    p = proj_path(request.match_info["pid"])
+    pid = request.match_info["pid"]
+    await require_project(request, pid, operate=True)
+    p = proj_path(pid)
+    if p.exists() and json.loads(p.read_text(encoding="utf-8")).get("locked"):
+        raise web.HTTPForbidden(reason="locked project")
+    # 先封闭访问，再取消任务、移动文件；失败重试也不重新开放。
+    await call_store(request.app, "set_project_state", pid, "deleted")
+    jobs = await call_store(request.app, "list_project_jobs", pid)
+    for jid in jobs:
+        if CONTROLLER_MODE:
+            await stop_job(request.app, jid)
+        elif JOBS.get(jid, {}).get("status") == "queued":
+            await stop_job(request.app, jid)
     if p.exists():
-        # locked 的项目（示例）不给删：它是新用户进来第一眼看到的东西
-        if json.loads(p.read_text(encoding="utf-8")).get("locked"):
-            raise web.HTTPForbidden(reason="locked project")
-        p.rename(p.with_suffix(".json.deleted"))   # 软删除，误点不丢工作
+        p.rename(p.with_suffix(".json.deleted"))
     return web.json_response({"ok": True})
+
+
+async def api_project_copy(request):
+    target = request.match_info["pid"]
+    await require_project(request, target, operate=True)
+    body = await request.json()
+    if not isinstance(body, dict) or not isinstance(body.get("card"), dict):
+        raise web.HTTPBadRequest(text="必须提供要复制的节点")
+    await require_project(request, body.get("source_project"))
+    await cache_comfy_outputs(request, body["card"])
+    card = await resource_call(request.app, "copy_document", require_user(request)["id"],
+                               body["source_project"], target, body["card"])
+    await require_project(request, target, operate=True)
+    return web.json_response({"card": card})
 
 
 async def api_file(request):
@@ -1647,14 +1931,23 @@ async def api_file(request):
     q = request.rel_url.query
     if "filename" not in q:
         raise web.HTTPBadRequest(reason="缺 filename")
+    if set(q) - {"filename", "subfolder", "type"} or any(len(q.getall(k)) != 1 for k in q):
+        raise web.HTTPBadRequest(text="无效的文件查询参数")
+    ref = await resource_call(request.app, "reference", str(request.rel_url))
+    if not ref:
+        raise web.HTTPNotFound()
+    await require_resource(request, *ref)
     session = request.app["session"]
-    url = COMFY_HTTP + "/view?" + request.rel_url.query_string
+    locator = {"filename": q["filename"], "subfolder": q.get("subfolder", ""),
+               "type": q.get("type", "output")}
+    url = COMFY_HTTP + "/view?" + urlencode(locator)
     async with session.get(url) as r:
         if r.status != 200:
             raise web.HTTPNotFound(reason=f"ComfyUI /view 返回 {r.status}")
         resp = web.StreamResponse(status=200, headers={
             "Content-Type": r.headers.get("Content-Type", "application/octet-stream"),
-            "Cache-Control": "public, max-age=86400",
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
         })
         await resp.prepare(request)
         async for chunk in r.content.iter_chunked(64 * 1024):
@@ -1663,7 +1956,45 @@ async def api_file(request):
         return resp
 
 
+def private_file(path):
+    response = web.FileResponse(path, headers={
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
+    if path.suffix.lower() not in IMG_EXT | VID_EXT | AUD_EXT:
+        response.content_type = "application/octet-stream"
+        response.headers["Content-Disposition"] = "attachment"
+    return response
+
+
+async def api_upload_file(request):
+    name = request.match_info["name"]
+    await require_resource(request, "upload", name)
+    path = await resource_call(request.app, "local_path", "upload", name)
+    if not path.is_file():
+        raise web.HTTPNotFound()
+    return private_file(path)
+
+
+async def api_preview_status(request):
+    await require_resource(request, "upload", request.match_info["name"])
+    return await preview_status(request)
+
+
+async def api_preview_file(request):
+    await require_resource(request, "upload", request.match_info["name"])
+    return await preview_file(request)
+
+
+async def permissions_page(request):
+    require_admin(request)
+    return web.FileResponse(ROOT / "web" / "permissions.html")
+
+
+async def static_asset(request, *, name):
+    return web.FileResponse(ROOT / "web" / name)
+
+
 async def index(request):
+    require_user(request)
     return web.FileResponse(ROOT / "web" / "index.html")
 
 
@@ -1697,6 +2028,10 @@ async def api_costs(request):
 
 
 async def api_health(request):
+    user = require_user(request)
+    if user["role"] != "admin":
+        return web.json_response({"ok": True, "mode": EXECUTION_MODE,
+                                  "comfy_online": controller_comfy_online(request.app)})
     workers = distributed_store(request.app).list_workers() if CONTROLLER_MODE else []
     return web.json_response({
         "ok": True, "mode": EXECUTION_MODE,
@@ -1711,8 +2046,12 @@ async def api_health(request):
 
 # =====================================================================
 async def on_start(app):
+    app["auth_store"] = await asyncio.to_thread(AuthStore, app["auth_path"])
+    app["resource_access"] = await asyncio.to_thread(
+        ResourceAccess, app["auth_store"], ROOT, COMFY_INPUT)
     app["session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
+    setup_dingtalk(app, app["auth_store"])
     if not CONTROLLER_MODE:
         app["ws_task"] = asyncio.create_task(ws_loop(app))
 
@@ -1724,6 +2063,7 @@ async def on_stop(app):
     if task:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+    await stop_dingtalk(app)
     await app["session"].close()
     ledger = app.get("costs")
     if ledger:
@@ -1731,6 +2071,9 @@ async def on_stop(app):
     store = app.get("distributed")
     if store:
         store.close()
+    auth_store = app.get("auth_store")
+    if auth_store:
+        await asyncio.to_thread(auth_store.close)
 
 
 def lan_ips():
@@ -1774,14 +2117,18 @@ async def no_cache(request, response):
         response.headers.setdefault("Cache-Control", "no-cache")
 
 
-def make_app():
+def make_app(auth_path=None):
     n = load_caps()
     load_jobs()
-    app = web.Application(client_max_size=512 * 1024 ** 2)
+    app = web.Application(client_max_size=512 * 1024 ** 2,
+                          middlewares=[auth_middleware, project_write_lock])
     app["comfy_lock"] = asyncio.Lock()
     app["cleanup_pending"] = {pid for pid, job in JOBS.items()
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
+    app["auth_path"] = Path(auth_path or os.environ.get("CHOUKA_AUTH_DB") or ROOT / "data" / "auth.db")
+    app["project_locks"] = defaultdict(asyncio.Lock)
+    register_auth_routes(app, ROOT / "web")
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
     )
@@ -1799,8 +2146,8 @@ def make_app():
     app.router.add_get("/api/cards", api_cards)
     app.router.add_post("/api/reload", api_reload)
     app.router.add_post("/api/upload", api_upload)
-    app.router.add_get("/api/preview/{name}/file", preview_file)
-    app.router.add_get("/api/preview/{name}", preview_status)
+    app.router.add_get("/api/preview/{name}/file", api_preview_file)
+    app.router.add_get("/api/preview/{name}", api_preview_status)
     app.router.add_get("/api/media", api_media)
     app.router.add_post("/api/generate", api_generate)
     app.router.add_post("/api/rewrite", api_rewrite)
@@ -1815,6 +2162,7 @@ def make_app():
     app.router.add_get("/api/projects/{pid}", api_project_get)
     app.router.add_put("/api/projects/{pid}", api_project_save)
     app.router.add_post("/api/projects/{pid}/rename", api_project_rename)
+    app.router.add_post("/api/projects/{pid}/copy", api_project_copy)
     app.router.add_delete("/api/projects/{pid}", api_project_delete)
     app.router.add_get("/api/file", api_file)
     app.router.add_get("/api/artifact/{pid}/{name}", api_artifact)
@@ -1826,14 +2174,18 @@ def make_app():
         app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)
         app.router.add_post("/agent/v1/jobs/acquire", api_agent_acquire)
         app.router.add_post("/agent/v1/jobs/{pid}/start", api_agent_start)
+        app.router.add_get("/agent/v1/jobs/{pid}/inputs/{name}", api_agent_input)
         app.router.add_post("/agent/v1/jobs/{pid}/event", api_agent_event)
         app.router.add_post("/agent/v1/jobs/{pid}/artifact", api_agent_artifact)
         app.router.add_post("/agent/v1/jobs/{pid}/complete", api_agent_complete)
         app.router.add_post("/agent/v1/jobs/{pid}/failed", api_agent_failed)
     up = ROOT / "data" / "uploads"
     up.mkdir(parents=True, exist_ok=True)
-    app.router.add_static("/api/upload/", up)
-    app.router.add_static("/", ROOT / "web", show_index=False)
+    app.router.add_get("/api/upload/{name}", api_upload_file)
+    app.router.add_get("/admin/permissions", permissions_page)
+    # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
+    for name in ("app.js", "style.css"):
+        app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
     app.on_cleanup.append(on_stop)
     print(f"[抽卡系统] 载入 {n} 个能力，{len(CARDS)} 张卡")
@@ -1843,8 +2195,7 @@ def make_app():
     print(f"[抽卡系统] 本机   http://127.0.0.1:{PORT}")
     for ip in lan_ips():
         print(f"[抽卡系统] 局域网 http://{ip}:{PORT}   ← 手机/别的电脑用这个")
-    print("[抽卡系统] 局域网是敞开的：没有登录，进来的人就能跑任务、删画布、看产物。"
-          "只在信得过的网里开")
+    print("[抽卡系统] 已启用账号鉴权；首次使用请先运行账号初始化和历史权限迁移。")
     return app
 
 
