@@ -46,7 +46,7 @@ set "SYNC_NAME=%~1"
 echo ============================================================
 echo Synchronizing %SYNC_NAME%...
 echo ============================================================
-robocopy "%~2" "%~3" /E /Z /MT:8 /R:2 /W:2 /XJ /COPY:DAT /DCOPY:DAT
+robocopy "%~2" "%~3" /E /Z /MT:32 /R:2 /W:2 /XJ /COPY:DAT /DCOPY:DAT
 set "ROBOCOPY_RESULT=%ERRORLEVEL%"
 if %ROBOCOPY_RESULT% GEQ 8 (
   echo ERROR: Robocopy failed for %SYNC_NAME% with code %ROBOCOPY_RESULT%.
