@@ -46,9 +46,7 @@ set "SYNC_NAME=%~1"
 echo ============================================================
 echo Synchronizing %SYNC_NAME%...
 echo ============================================================
-set "COPY_OPTIONS=/Z /MT:8"
-if /i "%SYNC_NAME%"=="models" set "COPY_OPTIONS=/J /MT:2"
-robocopy "%~2" "%~3" /E %COPY_OPTIONS% /R:2 /W:2 /XJ /COPY:DAT /DCOPY:DAT
+robocopy "%~2" "%~3" /E /Z /MT:8 /R:2 /W:2 /XJ /COPY:DAT /DCOPY:DAT
 set "ROBOCOPY_RESULT=%ERRORLEVEL%"
 if %ROBOCOPY_RESULT% GEQ 8 (
   echo ERROR: Robocopy failed for %SYNC_NAME% with code %ROBOCOPY_RESULT%.
