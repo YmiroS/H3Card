@@ -1,0 +1,218 @@
+{
+ "id": "qwen_image_21_multi",
+ "name": "Qwen 2.1 多图编辑",
+ "file": "【SevnFading】Qwen-Image-2.1 多合一工作流",
+ "source": "../ComfyUI/user/default/workflows/Qwen_image_2.1/【SevnFading】Qwen-Image-2.1 多合一工作流.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "gen",
+ "card": "image",
+ "slots": "img16+aud0+vid0",
+ "images": 16,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {"image": {"min": 1, "max": 16}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+ "graph": "graphs/qwen_image_21_multi.api.json",
+ "output": {"node": "62"},
+ "note": "Qwen Image 2.1 多图编辑：支持 1–16 张图片，图1为必填主图，图2至图16为可选参考图。建议按顺序添加，并在提示词中明确图1、图2等各图用途，例如保留图1场景，使用图2人物。输出尺寸跟随图1按总像素缩放后的尺寸，不单独设置输出比例；参考图总像素默认 1536 千像素，全部参考图保持各自原比例并按 32 对齐，此值不是最长边。保留原工作流 40 步、CFG 1、euler/simple 配置。需要包含 QwenImage21Cache、TextEncodeQwenImage21 的 ComfyUI 版本、LayerUtility: ImageScaleByAspectRatio V2 节点及原版模型 qwen_image_2.1_int8_convrot.safetensors、qwen3vl_8b_fp8_scaled.safetensors、qwen_image_2.1_vae_bf16.safetensors。未完成出图验证。",
+ "rewrite": null,
+ "compare": true,
+ "inputs": [
+  {
+   "key": "images[0]", "label": "图1（主图）", "type": "image", "required": true,
+   "hint": "必填主图，缩放后尺寸决定输出尺寸；提示词中称为图1。",
+   "target": {"node": "72", "input": "image", "kind": "upload_image"}
+  },
+  {
+   "key": "images[1]", "label": "图2（参考图）", "type": "image", "required": false,
+   "target": {"node": "81", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_2"}]
+  },
+  {
+   "key": "images[2]", "label": "图3（参考图）", "type": "image", "required": false,
+   "target": {"node": "97", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_3"}]
+  },
+  {
+   "key": "images[3]", "label": "图4（参考图）", "type": "image", "required": false,
+   "target": {"node": "79", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_4"}]
+  },
+  {
+   "key": "images[4]", "label": "图5（参考图）", "type": "image", "required": false,
+   "target": {"node": "82", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_5"}]
+  },
+  {
+   "key": "images[5]", "label": "图6（参考图）", "type": "image", "required": false,
+   "target": {"node": "98", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_6"}]
+  },
+  {
+   "key": "images[6]", "label": "图7（参考图）", "type": "image", "required": false,
+   "target": {"node": "90", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_7"}]
+  },
+  {
+   "key": "images[7]", "label": "图8（参考图）", "type": "image", "required": false,
+   "target": {"node": "92", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_8"}]
+  },
+  {
+   "key": "images[8]", "label": "图9（参考图）", "type": "image", "required": false,
+   "target": {"node": "96", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_9"}]
+  },
+  {
+   "key": "images[9]", "label": "图10（参考图）", "type": "image", "required": false,
+   "target": {"node": "121", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_10"}]
+  },
+  {
+   "key": "images[10]", "label": "图11（参考图）", "type": "image", "required": false,
+   "target": {"node": "126", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_11"}]
+  },
+  {
+   "key": "images[11]", "label": "图12（参考图）", "type": "image", "required": false,
+   "target": {"node": "130", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_12"}]
+  },
+  {
+   "key": "images[12]", "label": "图13（参考图）", "type": "image", "required": false,
+   "target": {"node": "134", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_13"}]
+  },
+  {
+   "key": "images[13]", "label": "图14（参考图）", "type": "image", "required": false,
+   "target": {"node": "138", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_14"}]
+  },
+  {
+   "key": "images[14]", "label": "图15（参考图）", "type": "image", "required": false,
+   "target": {"node": "142", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_15"}]
+  },
+  {
+   "key": "images[15]", "label": "图16（参考图）", "type": "image", "required": false,
+   "target": {"node": "145", "input": "image", "kind": "upload_image"},
+   "dropIfEmpty": [{"node": "54", "input": "images.image_16"}]
+  },
+  {
+   "key": "prompt", "label": "提示词", "type": "textarea", "default": "",
+   "target": {"node": "45", "input": "value"}
+  },
+  {
+   "key": "negative_prompt", "label": "负向提示词", "type": "textarea", "default": "",
+   "target": {"node": "54", "input": "negative_prompt"}
+  },
+  {
+   "key": "encode_resolution", "label": "参考图编码尺寸", "type": "number", "default": 1024,
+   "advanced": true, "hint": "编码器的参考图处理尺寸；输出尺寸由图1按总像素缩放后的尺寸决定。",
+   "target": {"node": "54", "input": "resolution", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1,
+   "hint": "同步调整全部参考图的总像素面积，不是最长边；保持各图原比例，按 32 对齐。输出尺寸跟随图1。",
+   "target": {"node": "75", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "86", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "102", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "78", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "87", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "103", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "91", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "93", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "106", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "122", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "127", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "131", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "135", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "140", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "143", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "reference_pixels", "label": "参考图总像素（千像素）", "type": "number", "default": 1536,
+   "min": 256, "max": 4096, "step": 1, "mirror": true,
+   "target": {"node": "147", "input": "scale_to_length", "vtype": "INT"}
+  },
+  {
+   "key": "steps", "label": "采样步数", "type": "slider", "default": 40,
+   "min": 1, "max": 100, "step": 1,
+   "hint": "原工作流默认 40 步。",
+   "target": {"node": "59", "input": "steps", "vtype": "INT"}
+  },
+  {
+   "key": "cfg", "label": "提示词引导强度", "type": "slider", "default": 1,
+   "min": 1, "max": 10, "step": 0.1, "advanced": true,
+   "target": {"node": "59", "input": "cfg", "vtype": "FLOAT"}
+  },
+  {
+   "key": "seed", "label": "种子", "type": "seed", "default": 726976251916383,
+   "max": 18446744073709551615,
+   "target": {"node": "59", "input": "seed", "vtype": "INT"}
+  },
+  {
+   "key": "batch_size", "label": "生成图片张数", "type": "number", "default": 1,
+   "min": 1, "max": 16, "step": 1,
+   "target": {"node": "47", "input": "value", "vtype": "INT"}
+  }
+ ],
+ "warnings": []
+}

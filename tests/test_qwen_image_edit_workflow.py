@@ -93,6 +93,7 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
         self.assertNotIn("qwen2511", t2i["modelSwitch"])
         modes = scan_workflows.build_modes([app.CAPS[wid] for wid in (
             "zimage_t2i", "krea2_t2i", "zimage_i2i", "krea2_i2i", self.cap["id"],
+            "qwen_image_21_i2i",
         )])
         self.assertEqual([m["name"] for m in modes], ["文生图", "图生图"])
         self.assertEqual(modes[1]["modelSwitch"], i2i[0]["modelSwitch"])
