@@ -206,6 +206,12 @@ class ModelFamilyTest(unittest.TestCase):
         self.assertEqual(controller_app.model_family("seedvr2_image_up"), "seedvr2")
         self.assertEqual(controller_app.model_family("seedvr2_video_up"), "seedvr2")
         self.assertEqual(controller_app.model_family("unknown_workflow"), "unknown_workflow")
+        self.assertEqual(controller_app.model_name("zimage_i2i"), "Z-Image")
+        self.assertEqual(controller_app.model_name("gimmvfi_interp"), "GIMM-VFI")
+        self.assertEqual(controller_app.model_name("rmbg_erase"), "RMBG 2.0 + FLUX.2 Klein")
+        self.assertEqual(controller_app.model_name("grid4_stitch"), "无需模型（拼图工具）")
+        self.assertEqual(controller_app.model_name("text"), "Qwen3.5 27B")
+        self.assertEqual(controller_app.model_name(None), "未知模型")
 
 
 class CostLedgerTest(unittest.TestCase):
@@ -657,12 +663,19 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(job["cardName"], "主视觉")
         self.assertEqual(job["name"], "测试生成")
         self.assertEqual(job["capability"], "dashboard-test")
+        self.assertEqual(job["modelName"], "dashboard-test")
+        worker = self.store.register_worker("渲染机-01", {"node_classes": ["KSampler"]})
+        self.store.heartbeat(worker["worker_id"], comfy_online=True, busy=False)
+        assignment = self.store.acquire(worker["worker_id"])
+        self.assertEqual(assignment["job_id"], job["id"])
         with mock.patch.dict(controller_app.CAPS, {
             "dashboard-test": {**capability, "name": "修改后的模式名称"},
         }):
             listed = await (await self.client.get("/api/jobs")).json()
         self.assertEqual(listed["jobs"][0]["projectName"], "广告片项目")
         self.assertEqual(listed["jobs"][0]["name"], "测试生成")
+        self.assertEqual(listed["jobs"][0]["modelName"], "dashboard-test")
+        self.assertEqual(listed["jobs"][0]["nodeName"], "渲染机-01")
         with mock.patch.object(controller_app, "JOBS_FILE", Path(self.temp.name) / "jobs.json"):
             self.old_save_jobs()
             controller_app.JOBS.clear()
