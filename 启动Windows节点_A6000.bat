@@ -1,5 +1,5 @@
 @echo off
-rem Keep this file pure ASCII. RTX A6000 48GB high-VRAM launcher.
+rem Keep this file pure ASCII. RTX A6000 48GB H3-safe dynamic-VRAM launcher.
 chcp 65001 >nul
 cd /d "%~dp0"
 
@@ -9,8 +9,8 @@ set "WORKER=worker\agent.py"
 set "WORKER_CONFIG=worker\config.json"
 set "COMFY_HOST=127.0.0.1"
 set "COMFY_PORT=8188"
-set "RESERVE_VRAM=2"
-set "COMFY_EXTRA_ARGS=--windows-standalone-build --highvram"
+set "RESERVE_VRAM=6"
+set "COMFY_EXTRA_ARGS=--windows-standalone-build"
 set "START_DELAY=8"
 
 if not exist "%PY%" (
@@ -31,12 +31,13 @@ if not exist "%WORKER_CONFIG%" (
 )
 if /i "%~1"=="check" (
   echo Windows RTX A6000 node launcher paths are valid.
+  echo ComfyUI args: %COMFY_EXTRA_ARGS% --listen %COMFY_HOST% --port %COMFY_PORT% --reserve-vram %RESERVE_VRAM%
   exit /b 0
 )
 
 "%PY%" -c "import socket,sys; s=socket.socket(); s.settimeout(1); sys.exit(s.connect_ex(('%COMFY_HOST%',%COMFY_PORT%)) != 0)"
 if errorlevel 1 (
-  echo Starting ComfyUI in RTX A6000 high-VRAM mode...
+  echo Starting ComfyUI in RTX A6000 H3-safe dynamic-VRAM mode...
   start "ComfyUI RTX A6000" cmd /k ""%PY%" -s "%COMFY_MAIN%" %COMFY_EXTRA_ARGS% --listen %COMFY_HOST% --port %COMFY_PORT% --reserve-vram %RESERVE_VRAM%"
   timeout /t %START_DELAY% /nobreak >nul
 ) else (
