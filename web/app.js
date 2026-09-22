@@ -4572,8 +4572,10 @@ function promptBlock(c, s, label) {
       const query = match[1].toLowerCase();
       atMenuStart = cursorPos - match[0].length;
 
-      // 构建可引用项列表：卡片 + 卡片的输入素材
+      // 构建可引用项列表：当前节点已填素材 + 画布里的素材/文本/风格节点。
+      // 画布节点中已经连到当前节点的排在最前面，输入 @ 后优先看到正在使用的引用。
       const items = [];
+      const connected = new Set(PROJ.edges.filter(e => e.to === c.id).map(e => e.from));
 
       // 1. 添加所有卡片（素材、文本、风格）
       PROJ.cards.forEach(card => {
@@ -4587,6 +4589,8 @@ function promptBlock(c, s, label) {
         const def = defOf(card);
         items.push({
           type: 'card',
+          section: 'canvas',
+          connected: connected.has(card.id),
           card: card,
           name: name,
           icon: def.icon || "◻",
@@ -4607,10 +4611,11 @@ function promptBlock(c, s, label) {
 
           items.push({
             type: 'slot',
+            section: 'current',
             key: s.key,
             name: slotLabel,
             icon: s.type === 'image' ? "🖼" : s.type === 'audio' ? "🎵" : "🎬",
-            label: "当前素材",
+            label: KIND_ZH[s.type] || "素材",
           });
         });
       }
@@ -4629,28 +4634,27 @@ function promptBlock(c, s, label) {
     hideAtMenu();
 
     atMenuEl = document.createElement("div");
-    atMenuEl.id = "menu"; // 使用现有的菜单样式
+    atMenuEl.id = "menu"; // 复用现有菜单基础样式
+    atMenuEl.className = "at-menu";
     atMenuEl.style.position = "absolute";
     atMenuEl.style.maxHeight = "280px";
     atMenuEl.style.overflowY = "auto";
 
-    items.forEach(item => {
+    const appendItem = (item) => {
       const btn = document.createElement("button");
-      btn.style.cssText = "display: flex; align-items: center; gap: 9px; width: 100%; " +
-        "padding: 8px 10px; border-radius: 2px; text-align: left;";
+      btn.className = "at-menu-item" + (item.connected ? " connected" : "");
 
       const icon = document.createElement("span");
+      icon.className = "at-menu-icon";
       icon.textContent = item.icon;
-      icon.style.fontSize = "14px";
 
       const nameSpan = document.createElement("span");
+      nameSpan.className = "at-menu-name";
       nameSpan.textContent = item.name;
-      nameSpan.style.flex = "1";
 
       const typeSpan = document.createElement("span");
-      typeSpan.textContent = item.label;
-      typeSpan.style.fontSize = "11px";
-      typeSpan.style.color = "var(--dim)";
+      typeSpan.className = "at-menu-type";
+      typeSpan.textContent = item.connected ? `已连线 · ${item.label}` : item.label;
 
       btn.append(icon, nameSpan, typeSpan);
 
@@ -4676,7 +4680,19 @@ function promptBlock(c, s, label) {
       };
 
       atMenuEl.appendChild(btn);
-    });
+    };
+
+    for (const [section, title] of [["current", "当前素材"], ["canvas", "画布"]]) {
+      const grouped = items.filter(item => item.section === section)
+        .sort((a, b) => Number(!!b.connected) - Number(!!a.connected));
+      if (!grouped.length) continue;
+      const heading = document.createElement("div");
+      heading.className = "at-menu-group";
+      const text = document.createElement("span"); text.textContent = title;
+      heading.appendChild(text);
+      atMenuEl.appendChild(heading);
+      grouped.forEach(appendItem);
+    }
 
     // 菜单位置：贴着 @ 字符、往**上**弹（跟参考图那种 mention 交互一致）。
     // @ 的屏幕坐标借高亮层当镜子算 —— 层里排版和 textarea 逐像素一致，

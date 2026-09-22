@@ -226,7 +226,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(payload.capability, 'qwen_image_21_i2i');
       assert.deepEqual(Object.keys(payload.assets), ['images[0]']);
 
-      await chooseMode('Qwen 2.1 多图编辑');
+      await chooseMode('Qwen 2.1 多图编辑（最多16张）');
       assert.equal(await modelButton.count(), 0);
       assert.match(await page.locator('#panel .refhead').innerText(), /图片 16/);
       await paramsButton.click();
@@ -249,6 +249,43 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(payload.params.reference_pixels, 1024);
       assert.equal(Object.keys(payload.assets).length, 16);
       assert.equal(Object.hasOwn(payload.params, 'aspect_ratio'), false);
+    });
+
+    await t.test('prompt mention menu groups current assets and prioritizes connected canvas nodes', async () => {
+      await reset('qwen_image_21_multi');
+      await page.evaluate(() => {
+        const current = PROJ.cards[0];
+        const connectedAsset = addCard('card_asset', 700, 20);
+        connectedAsset.name = '已连线素材';
+        connectedAsset.outputs = [{kind:'image', ref:'connected.png', url:'/fixture.png', filename:'connected.png'}];
+        const looseAsset = addCard('card_asset', 700, 220);
+        looseAsset.name = '画布素材';
+        looseAsset.outputs = [{kind:'image', ref:'loose.png', url:'/fixture.png', filename:'loose.png'}];
+        const connectedText = addCard('card_text', 700, 420);
+        connectedText.name = '已连线文本'; connectedText.params.text = '参考文本';
+        current.assets = {'images[0]': connectedAsset.outputs[0]};
+        PROJ.edges = [
+          {from:connectedAsset.id, to:current.id, slot:'images[0]', slots:['images[0]']},
+          {from:connectedText.id, to:current.id, slot:STYLE_SLOT},
+        ];
+        openPanel(current.id);
+      });
+      const prompt = page.locator('#panel .pblock textarea').first();
+      await prompt.fill('@');
+      const menu = page.locator('.at-menu');
+      await menu.waitFor();
+      assert.deepEqual(await menu.locator('.at-menu-group span').allTextContents(), ['当前素材','画布']);
+      const canvasItems = menu.locator('.at-menu-group').nth(1).locator('xpath=following-sibling::button');
+      assert.deepEqual(await canvasItems.locator('.at-menu-name').allTextContents(), ['已连线素材','已连线文本','画布素材']);
+      assert.deepEqual(await canvasItems.locator('.at-menu-type').allTextContents(), ['已连线 · 素材','已连线 · 文本','素材']);
+      const connected = menu.locator('button').filter({hasText:'已连线素材'});
+      const before = await connected.evaluate(el => getComputedStyle(el).backgroundColor);
+      await connected.hover();
+      await page.waitForTimeout(180);
+      const after = await connected.evaluate(el => getComputedStyle(el).backgroundColor);
+      assert.notEqual(after, before, 'mention item needs a visible hover state');
+      await menu.locator('button').filter({hasText:'画布素材'}).click();
+      assert.equal(await prompt.inputValue(), '@画布素材 ');
     });
 
     await t.test('negative input never inherits styles, text references or positive optimization', async () => {
