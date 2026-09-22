@@ -14,7 +14,7 @@
  "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
  "graph": "graphs/qwen_image_21_t2i.api.json",
  "output": {"node": "10"},
- "note": "Qwen Image 2.1 文生图：无需输入图片，可自定义输出比例和百万像素数，尺寸按 16 的倍数对齐。保留原工作流 40 步、CFG 1、euler/simple 配置；参考图编码尺寸不是输出尺寸。需要包含 QwenImage21Cache、TextEncodeQwenImage21 的 ComfyUI 版本及原版模型 qwen_image_2.1_int8_convrot.safetensors、qwen3vl_8b_fp8_scaled.safetensors、qwen_image_2.1_vae_bf16.safetensors。已在 ComfyUI 0.37.0 完成实际文生图验证。",
+ "note": "Qwen Image 2.1 文生图：无需输入图片，比例和清晰度统一使用基础参数；清晰度按短边，实际像素按模型要求对齐。保留原工作流 40 步、CFG 1、euler/simple 配置；参考图编码尺寸不是输出尺寸。需要包含 QwenImage21Cache、TextEncodeQwenImage21 的 ComfyUI 版本及原版模型 qwen_image_2.1_int8_convrot.safetensors、qwen3vl_8b_fp8_scaled.safetensors、qwen_image_2.1_vae_bf16.safetensors。已在 ComfyUI 0.37.0 完成实际文生图验证。",
  "rewrite": null,
  "compare": false,
  "inputs": [

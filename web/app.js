@@ -327,11 +327,11 @@ function putAsset(c, s, file) {
   let modeSwitched = false;
   if (def && def.id === "card_image" && file && file.kind === "image") {
     if (c.cap === "zimage_t2i") {
-      c.cap = "zimage_i2i";
+      switchImageCapability(c, "zimage_i2i");
       if (!c._model) c._model = "zimage";
       modeSwitched = true;
     } else if (c.cap === "krea2_t2i") {
-      c.cap = "krea2_i2i";
+      switchImageCapability(c, "krea2_i2i");
       if (!c._model) c._model = "krea2";
       modeSwitched = true;
     }
@@ -444,6 +444,68 @@ function resolutionPresets(spec) {
 function resolutionPreset(spec, value) {
   return resolutionPresets(spec).find(x => x.value === value) || null;
 }
+function imageSettings(c, cap) {
+  const controls = cap.imageControls;
+  const ratio = c.params.image_ratio;
+  const clarity = c.params.image_clarity;
+  return {
+    ratio: RATIO_GRID.some(r => r[0] === ratio) || (controls.mode === "i2i" && ratio === "original")
+      ? ratio : controls.defaultRatio,
+    clarity: CLARITY_STEPS.some(s => s.id === clarity) ? clarity : controls.defaultClarity,
+  };
+}
+
+function switchImageCapability(c, capability) {
+  const old = capOf(c), next = CAPS[capability];
+  if (old && next && old.id !== next.id && (old.imageControls || next.imageControls)) {
+    const modelKeys = cap => [...new Set(cap.inputs.filter(s =>
+      !MEDIA.includes(s.type) && s.type !== "textarea" && s.type !== "seed").map(s => s.key))];
+    const saved = c.params._imageModelParams ||= {};
+    saved[old.id] = Object.fromEntries(modelKeys(old).filter(k => c.params[k] != null).map(k => [k, c.params[k]]));
+    const ratios = c.params._imageRatios ||= {};
+    if (old.imageControls) ratios[old.imageControls.mode] = imageSettings(c, old).ratio;
+    for (const key of new Set([...modelKeys(old), ...modelKeys(next)])) delete c.params[key];
+    Object.assign(c.params, saved[next.id] || {});
+    if (next.imageControls && old.imageControls?.mode !== next.imageControls.mode) {
+      c.params.image_ratio = ratios[next.imageControls.mode] || next.imageControls.defaultRatio;
+    }
+  }
+  c.cap = capability;
+}
+
+function imageClarityPicker(c, cap, onchange) {
+  const current = imageSettings(c, cap);
+  const wrap = document.createElement("div"); wrap.className = "cpick image-size-controls";
+  const title = document.createElement("div"); title.className = "ctitle"; title.textContent = "画面比例";
+  const ratios = document.createElement("div"); ratios.className = "cgrid";
+  const choices = cap.imageControls.mode === "i2i" ? [["original", 1, 1], ...RATIO_GRID] : RATIO_GRID;
+  for (const [ratio, width, height] of choices) {
+    const button = document.createElement("button");
+    const label = ratio === "original" ? "原图" : ratio;
+    button.className = ratio === current.ratio ? "on" : "";
+    button.innerHTML = `<i style="aspect-ratio:${width}/${height}"></i><span>${label}</span>`;
+    button.title = `画面比例 ${label}`;
+    button.onclick = () => { c.params.image_ratio = ratio; save(); onchange(); };
+    ratios.appendChild(button);
+  }
+  const clarityTitle = document.createElement("div"); clarityTitle.className = "ctitle"; clarityTitle.textContent = "清晰度";
+  const sizes = document.createElement("div"); sizes.className = "cgrid k";
+  for (const step of CLARITY_STEPS) {
+    const button = document.createElement("button");
+    button.className = step.id === current.clarity ? "on" : "";
+    button.textContent = step.label;
+    button.title = `目标短边 ${step.val}px，实际尺寸按模型要求对齐`;
+    button.onclick = () => { c.params.image_clarity = step.id; save(); onchange(); };
+    sizes.appendChild(button);
+  }
+  const hint = document.createElement("div"); hint.className = "image-size-hint";
+  hint.textContent = cap.imageControls.mode === "i2i"
+    ? "清晰度按短边计算；默认保持原图比例。指定比例时，模型可能裁切主图以适配画布。"
+    : "清晰度按短边计算；实际尺寸按模型要求对齐。高分辨率会增加显存占用。";
+  wrap.append(title, ratios, clarityTitle, sizes, hint);
+  return wrap;
+}
+
 const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length"]);
 const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
   !RES_PARAM_KEYS.has(s.key) && !MEDIA.includes(s.type) && s.type !== "textarea"
@@ -452,8 +514,11 @@ const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
 /** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度、画面比例和当前模式的常规参数。 */
 function openResPop(c, anchor) {
   const cap = CAPS[runCap(c)] || capOf(c);
-  const hasResolution = cap && cap.inputs.some(x => RES_PARAM_KEYS.has(x.key));
-  const params = popoverParams(cap);
+  const hasResolution = cap && (cap.imageControls || cap.inputs.some(x => RES_PARAM_KEYS.has(x.key)));
+  const params = cap?.imageControls
+    ? ["steps", "seed"].map(key => cap.inputs.find(s => s.key === key && !s.mirror)).filter(Boolean)
+      .map(s => ({...s, label: s.key === "steps" ? "采样步数" : "种子"}))
+    : popoverParams(cap);
   if (!hasResolution && !params.length) return toast("这个模式没有可调参数");
 
   const refreshBrief = () => {
@@ -468,11 +533,12 @@ function openResPop(c, anchor) {
   /** 原位刷新弹窗内容（选中态要变），**不关不重开** —— 重开会按重建过的锚点按钮
       重新摆位，弹窗就跳位置（这就是"选完参数窗口会跑"的 bug）。
       位置不动：只换 innerHTML，left/top 留在 style 上。 */
+  let expanded = false;
   const refill = () => {
     el.respop.innerHTML = "";
     if (hasResolution) el.respop.appendChild(clarityPicker(c, cap, refill));
     if (params.length) {
-      const pwrap = document.createElement("div"); pwrap.className = "pwrap";
+      const pwrap = document.createElement("div"); pwrap.className = cap.imageControls ? "pwrap image-basic" : "pwrap";
       if (hasResolution) pwrap.style.marginTop = "12px";
       for (const s of params) {
         const row = rowEl(c, s);
@@ -484,6 +550,23 @@ function openResPop(c, anchor) {
       }
       el.respop.appendChild(pwrap);
     }
+    if (cap.imageControls) {
+      const special = cap.inputs.filter(s => !MEDIA.includes(s.type) && s.type !== "textarea"
+        && s.type !== "seed" && s.key !== "steps" && !RES_PARAM_KEYS.has(s.key) && !s.mirror && !s.rangeOf
+        && !(cap.imageControls.mode === "t2i" && s.key === "encode_resolution"));
+      if (special.length) {
+        const details = document.createElement("details"); details.className = "image-advanced"; details.open = expanded;
+        const summary = document.createElement("summary"); summary.textContent = "模型专属参数";
+        details.appendChild(summary);
+        details.addEventListener("toggle", () => {
+          if (!details.isConnected || details.open === expanded) return;
+          expanded = details.open;
+          position();
+        });
+        for (const spec of special) details.appendChild(rowEl(c, spec));
+        el.respop.appendChild(details);
+      }
+    }
     const x = document.createElement("button");
     x.className = "x"; x.textContent = "✕"; x.title = "关闭 (Esc)";
     x.onclick = closeResPop;
@@ -493,14 +576,20 @@ function openResPop(c, anchor) {
   };
   refill();
   el.respop.style.display = "";
-  // 摆在锚点按钮上方居中；上方放不下就放下方；横向夹在窗口里（只在开的那一刻定一次）
-  const r = anchor.getBoundingClientRect();
-  const w = el.respop.offsetWidth, h = el.respop.offsetHeight;
-  let left = Math.max(8, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 8));
-  let top = r.top - h - 8;
-  if (top < 56) top = Math.min(r.bottom + 8, innerHeight - h - 8);
-  el.respop.style.left = left + "px";
-  el.respop.style.top = top + "px";
+  // 打开或展开专属参数时避让底部按钮；选择比例和清晰度时不重新定位。
+  function position() {
+    if (el.respop.style.display === "none" || !anchor.isConnected) return;
+    const r = anchor.getBoundingClientRect();
+    const above = r.top - 64, below = innerHeight - r.bottom - 16;
+    el.respop.style.maxHeight = Math.max(160, Math.max(above, below)) + "px";
+    const w = el.respop.offsetWidth, h = el.respop.offsetHeight;
+    const left = Math.max(8, Math.min(r.left + r.width / 2 - w / 2, innerWidth - w - 8));
+    let top = r.top - h - 8;
+    if (top < 56) top = Math.max(8, Math.min(r.bottom + 8, innerHeight - h - 8));
+    el.respop.style.left = left + "px";
+    el.respop.style.top = top + "px";
+  }
+  position();
 }
 const closeResPop = () => (el.respop.style.display = "none");
 
@@ -508,6 +597,7 @@ const closeResPop = () => (el.respop.style.display = "none");
     有 aspect_ratio+megapixels 的走 H3 那套；width+height 的（文生图）算像素面积折 K 档。
     onchange：每点一格之后回调（弹窗要刷新胶囊摘要）。 */
 function clarityPicker(c, cap, onchange) {
+  if (cap.imageControls) return imageClarityPicker(c, cap, onchange);
   const arSpec = cap.inputs.find(x => x.key === "aspect_ratio");
   const mpSpec = cap.inputs.find(x => x.key === "megapixels");
   const resolutionSpec = cap.inputs.find(x => x.key === "resolution");
@@ -754,6 +844,10 @@ function whStep(cap, c) {
     没有分辨率参数的能力返回 null（胶囊就只写「参数」）。 */
 function paramsBrief(c, cap) {
   if (!cap) return null;
+  if (cap.imageControls) {
+    const current = imageSettings(c, cap);
+    return `${current.ratio === "original" ? "原图" : current.ratio} · ${current.clarity}`;
+  }
   const ar = cap.inputs.find(x => x.key === "aspect_ratio");
   const mp = cap.inputs.find(x => x.key === "megapixels");
   const resolution = cap.inputs.find(x => x.key === "resolution");
@@ -858,10 +952,15 @@ function capBrief(cap) {
   if (!mediaKinds.length) need.push("不需要素材，纯提示词驱动");
   if (txts.length) need.push(txts.length > 1 ? `提示词 ×${txts.length}` : "提示词");
   if (dur) opt.push(`时长 ${dur.min}–${dur.max} 秒`);
-  if (size.length) opt.push("画面宽高");
-  if (ratio) opt.push(`画面比例（${ratio.options.length} 档，默认 ${ratio.default}）`);
-  if (mp) opt.push(`分辨率 ${H3_P[0]}p–${H3_P[H3_P.length - 1]}p（短边，768p 为 H3 原生）`);
-  if (side) opt.push(`分辨率长边 ${side.min}–${side.max}，画面比例跟随原图`);
+  if (cap.imageControls) {
+    opt.push(`清晰度 ${CLARITY_STEPS.map(s => s.label).join(" / ")}（短边）`);
+    opt.push(cap.imageControls.mode === "i2i" ? "默认原图比例，也可另选画面比例" : "画面比例（13 档）");
+  } else {
+    if (size.length) opt.push("画面宽高");
+    if (ratio) opt.push(`画面比例（${ratio.options.length} 档，默认 ${ratio.default}）`);
+    if (mp) opt.push(`分辨率 ${H3_P[0]}p–${H3_P[H3_P.length - 1]}p（短边，768p 为 H3 原生）`);
+    if (side) opt.push(`分辨率长边 ${side.min}–${side.max}，画面比例跟随原图`);
+  }
   if (cap.inputs.some(s => s.type === "seed")) opt.push("种子");
   return { need, opt, out: OUT_TXT[cap.outputType] || cap.outputType, file: cap.file || cap.id };
 }
@@ -1755,7 +1854,7 @@ function paintTextFoot(c) {
 }
 
 /* ---------- 原图 ↔ 结果 对比线 ----------
-   只有 manifest 里 compare: true 的能力才画（现在是人物提取 / 抠出背景 / 人物擦除 三条）。
+   生图卡只显示生成结果；其他卡片中 manifest 的 compare: true 才开启对比。
    这几条的成败全在边缘那一圈，透明底的图单看只是一块空白，不跟原图叠着看根本判断不了
    干净没有。要给别的能力开就在 scan_workflows.py 的 COMPARE 集合里加一个 id。
    文案保持节点中立（"回到原图"，不写"还原背景"）：往右拖回来的东西每个节点都不一样，
@@ -1764,7 +1863,7 @@ function paintTextFoot(c) {
 /** 这个节点该不该画对比线；该画就返回压在上面那张原图的 url。 */
 function cmpSrc(c) {
   const md = CAPS[runCap(c)];
-  if (!md || !md.compare) return null;
+  if (!md || !md.compare || md.card === "image") return null;
   const outs = c.outputs || [];
   if (outs.length !== 1 || outs[0].kind !== "image") return null;   // 宫格/视频不画
   const s = (md.inputs || []).find(x => x.type === "image");
@@ -3094,12 +3193,12 @@ async function linkTo(from, to) {
   let modeSwitched = false;
   if (toDef && toDef.id === "card_image" && out.kind === "image") {
     if (to.cap === "zimage_t2i") {
-      to.cap = "zimage_i2i";
+      switchImageCapability(to, "zimage_i2i");
       if (!to._model) to._model = "zimage";
       paintTitle(to);
       modeSwitched = true;
     } else if (to.cap === "krea2_t2i") {
-      to.cap = "krea2_i2i";
+      switchImageCapability(to, "krea2_i2i");
       if (!to._model) to._model = "krea2";
       paintTitle(to);
       modeSwitched = true;
@@ -3796,7 +3895,7 @@ function openPanel(id) {
         icon: def.icon,
         text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),
         tip: () => modeBriefEl(c, mo, mo.name),
-        run: () => { tipHide(); closeResPop(); c.cap = modeCap(mo, modelOf(c)); openPanel(id); paintTitle(c); save(); },
+        run: () => { tipHide(); closeResPop(); switchImageCapability(c, modeCap(mo, modelOf(c))); openPanel(id); paintTitle(c); save(); },
       })));
     hoverTip(modeButton, () => modeBriefEl(c, currentMode, currentMode.name));
     foot.appendChild(modeButton);
@@ -3812,7 +3911,7 @@ function openPanel(id) {
           text: modelName(key) + (cid === c.cap ? "（当前）" : ""),
           run: () => {
             tipHide(); closeResPop();
-            c.cap = cid;
+            switchImageCapability(c, cid);
             c._model = key;
             openPanel(id); paintTitle(c); save();
           },
@@ -5715,8 +5814,8 @@ function payloadOf(c) {
   const pkeys = new Set(promptSpecs(cap).map(s => s.key));
   for (const s of cap.inputs) {
     if (MEDIA.includes(s.type) || s.mirror) continue;
-    // 种子永远默认 -1（每次随机）：面板里没有这个旋钮了，老节点里存过的固定值也不再生效
-    const v = s.type === "seed" ? undefined : c.params[s.key];
+    // 统一生图面板允许固定种子；其他模式继续使用原来的每次随机规则。
+    const v = s.type === "seed" && !cap.imageControls ? undefined : c.params[s.key];
     if (v != null) params[s.key] = v;
     else if (s.type === "seed") params[s.key] = -1;      // 每次随机
     else if (s.default !== undefined) params[s.key] = s.default;
@@ -5732,6 +5831,12 @@ function payloadOf(c) {
       if (styles.length) resolved = withStyle(resolved, styles);
       params[s.key] = resolved;
     }
+  }
+  if (cap.imageControls) {
+    const selected = imageSettings(c, cap);
+    params.image_ratio = selected.ratio;
+    params.image_clarity = selected.clarity;
+    for (const key of RES_PARAM_KEYS) delete params[key];
   }
   // 换回单图模型时保留卡片内的多图引用，但只提交当前能力真正接收的槽位。
   for (const s of cap.inputs.filter(s => MEDIA.includes(s.type))) {
