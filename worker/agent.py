@@ -422,11 +422,16 @@ class WorkerAgent:
             if ws is not None and not ws.closed:
                 await ws.close()
             async with self.comfy_lock:
-                ack = await self._json_request(
-                    "POST", self.comfy + f"/api/jobs/{assignment['job_id']}/cancel",
-                    json={"free_memory": True},
-                    timeout=aiohttp.ClientTimeout(total=130, sock_connect=15),
-                )
+                cancel_url = self.comfy + f"/api/jobs/{assignment['job_id']}/cancel"
+                request_options = {
+                    "json": {"free_memory": True},
+                    "timeout": aiohttp.ClientTimeout(total=130, sock_connect=15),
+                }
+                try:
+                    ack = await self._json_request("POST", cancel_url, **request_options)
+                except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError):
+                    # Retry the idempotent cancellation when delivery or response is uncertain.
+                    ack = await self._json_request("POST", cancel_url, **request_options)
                 if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
                         or not isinstance(ack.get("cancelled"), bool)):
                     raise AgentError("ComfyUI 未确认 cleanup_complete")
