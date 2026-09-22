@@ -1,5 +1,29 @@
 # ComfyUI 核心补丁（MiniMax H3）
 
+## 当前版本：0.37.0（2026-09-22）
+
+本机已合并官方 0.37.0，定制提交为 `3bca62ac`。**下文关于 0.33.0 的修法是历史记录，不要把旧 `model.py` 整文件覆盖回新版，也不要再用 `frame_count is None` 是否存在判断首尾帧功能。**
+
+- 音频 carry/速度逆变换与首尾帧定位使用新版原生实现，并增加数学和首尾帧回归测试。
+- 保留 TE-Speed 的 `_run_blocks` / `("block_loop", 0)` 钩子，同时保留新版 `layout`、`block_index`、attention 替换和预取接口。
+- 保留参考视频先裁剪再缩放、配对音频截断、低显存 attention/FFN 分块，以及取消任务后的显存清理确认。
+- 两套 H3 Director 的节点调用已改为关键字参数；Director 连续性适配新版 PackedLayout，保留关键帧音频及外部补丁冲突检查。
+- 实际 GPU 已通过首尾帧 + TE-Speed + SageAttention + 低显存分块组合，生成 256×256、56 帧且带非空音轨的视频；这不代表所有长视频长度与参数组合都已实际渲染。
+- Torch `2.10.0+cu130`、torchvision、torchaudio、NumPy、transformers、tokenizers、safetensors、Triton 和 CuPy 均保持升级前版本。
+
+升级前 Git 历史、未提交补丁、源码/定制节点/工作流哈希备份、数据库和被更新依赖的原文件保存在 `E:\ComfyUI_Mie_V33\temp\comfyui_upgrade_20260922`。旧模型补丁另保留在命名为 `H3 model before verified ComfyUI 0.37 migration 20260922` 的 Git stash 中；它是回滚材料，不应直接 apply 到新版。备份目录包含本机服务环境，不要公开上传。
+
+根目录原 `升级comfyui.bat` 仍含 `git reset --hard`，此次没有执行。以后升级仍需先备份、合并定制并回归验证，不能直接运行该脚本。
+
+回归命令（在整合包根目录运行）：
+
+```bat
+python_embeded\python.exe -B -m pytest -p no:cacheprovider -q ComfyUI/tests-unit/test_minimax_h3_memory.py ComfyUI/tests-unit/jobs_cancel_test/memory_cleanup_test.py
+python_embeded\python.exe -B ComfyUI/custom_nodes/ComfyUI_MiniMaxH3_Director/tests/test_h3_context_core_037.py
+```
+
+## 0.33.0 历史补丁记录
+
 > **背景**：`D:\ComfyUI_Mie_V33` 这个整合包标称 ComfyUI **0.33.0**，但 MiniMax H3 相关的
 > 三个文件被换成了**早期开发版**，和官方 v0.33.0 不一致：
 > - `comfy/ldm/minimax/model.py`
