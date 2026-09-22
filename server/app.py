@@ -95,6 +95,8 @@ MODEL_FAMILY = {
     "rmbg_bgonly": "rmbg2",
     "seedvr2_image_up": "seedvr2",
     "seedvr2_video_up": "seedvr2",
+    "depth_image": "depth_anything3",
+    "depth_video": "depth_anything3",
 }
 
 
@@ -113,6 +115,7 @@ MODEL_NAMES = {
     "qwen35_27b": "Qwen3.5 27B",
     "rmbg2": "RMBG 2.0",
     "seedvr2": "SeedVR2",
+    "depth_anything3": "Depth Anything 3",
     "gimmvfi_interp": "GIMM-VFI",
     "grid4_stitch": "无需模型（拼图工具）",
     "rmbg_erase": "RMBG 2.0 + FLUX.2 Klein",

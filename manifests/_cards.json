@@ -125,6 +125,16 @@
     "slots": "img0+aud0+vid1"
    },
    {
+    "id": "depth_image",
+    "name": "深度图片",
+    "slots": "img1+aud0+vid0"
+   },
+   {
+    "id": "depth_video",
+    "name": "深度视频",
+    "slots": "img0+aud0+vid1"
+   },
+   {
     "id": "card_enhance",
     "name": "画质增强",
     "slots": "image/video",

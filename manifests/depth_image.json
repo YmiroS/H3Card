@@ -1,0 +1,49 @@
+{
+ "id": "depth_image",
+ "name": "深度图片",
+ "file": "深度图片",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\深度转换\\深度图片.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "tool",
+ "card": "card_tools",
+ "slots": "img1+aud0+vid0",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/depth_image.api.json",
+ "output": {
+  "node": "88"
+ },
+ "note": "使用 Depth Anything 3 为单张图片生成相对深度图。白色表示较近，黑色表示较远。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "85",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  }
+ ],
+ "warnings": []
+}

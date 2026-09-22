@@ -215,6 +215,29 @@ test('all image models share real runtime controls without changing video parame
       assert.deepEqual(Object.keys(payload.assets),Array.from({length:16},(_,i)=>`images[${i}]`));
     });
 
+    await t.test('toolbox modes use the lower-left switcher',async()=>{
+      await reset('depth_image','card_tools');
+      assert.equal(await page.locator('#panel .modes').count(),0);
+      const switcher=page.locator('#panel button[title="工具箱模式 —— 点击换"]');
+      assert.equal(await switcher.count(),1);
+      await switcher.click();
+      const expected=runtime.cards.find(c=>c.id==='card_tools').modes.map(m=>m.name);
+      const shown=(await page.locator('#menu button span:nth-child(2)').allTextContents()).map(x=>x.replace('（当前）',''));
+      assert.deepEqual(shown,expected);
+      await page.locator('#menu button').filter({hasText:'深度视频'}).click();
+      assert.equal(await page.evaluate(()=>PROJ.cards[0].cap),'depth_video');
+      assert.equal(await page.locator('#panel button[title="工具箱模式 —— 点击换"] span').innerText(),'🧩 深度视频');
+      assert.equal(await paramsButton.count(),1);
+      await switcher.click();
+      await page.locator('#menu button').filter({hasText:'画质增强'}).click();
+      assert.equal(await page.evaluate(()=>PROJ.cards[0].cap),'seedvr2_image_up');
+      await page.locator('#dock button').filter({hasText:'工具箱'}).click();
+      const created=await page.evaluate(()=>({type:PROJ.cards.at(-1).type,cap:PROJ.cards.at(-1).cap}));
+      assert.deepEqual(created,{type:'card_tools',cap:'rmbg_cutout'});
+      assert.equal(await page.locator('#menu').isVisible(),false);
+      assert.equal(await page.locator('#panel button[title="工具箱模式 —— 点击换"]').count(),1);
+    });
+
     await t.test('image editing previews show only the result and still open the normal viewer',async()=>{
       const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
       for(const cap of ['zimage_i2i','krea2_i2i','qwen_image_edit_2511_i2i','qwen_image_21_i2i','qwen_image_21_multi']) {

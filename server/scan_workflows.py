@@ -54,6 +54,8 @@ ALIASES = {
     "SeedVR2图片视频高清/视频补帧插针(GIMM-VFI).json": "gimmvfi_interp",
     "SeedVR2图片视频高清/SeedVR2图片高清放大.json": "seedvr2_image_up",
     "SeedVR2图片视频高清/SeedVR2视频高清修复放大 v2.json": "seedvr2_video_up",
+    "深度转换/深度图片.json": "depth_image",
+    "深度转换/深度视频.json": "depth_video",
     "Qwen3.5VL大语言模型全套/qwen3.5-单图反推提示词.json": "qwen_image_reverse",
     "Qwen3.5VL大语言模型全套/qwen3.5-视频反推提示词-修改版.json": "qwen_video_reverse",
 }
@@ -82,6 +84,8 @@ DISPLAY = {
     "gimmvfi_interp": "视频补帧插针(GIMM-VFI)",
     "seedvr2_image_up": "SeedVR2 图片高清放大",
     "seedvr2_video_up": "SeedVR2 视频高清放大",
+    "depth_image": "深度图片",
+    "depth_video": "深度视频",
     "qwen_image_reverse": "Qwen 单图反推提示词",
     "qwen_video_reverse": "Qwen 视频反推提示词",
 }
@@ -100,6 +104,7 @@ SOLO = set()
 # card_enhance（画质增强）走 ROUTE_CARDS，是"放图/放视频切到对应那一路"，这里一并收进来当模式。
 TOOLS = {
     "grid4_stitch", "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "gimmvfi_interp",
+    "depth_image", "depth_video",
 }
 TOOLS_CARD = {"id": "card_tools", "name": "工具箱", "icon": "🧩"}
 
@@ -262,6 +267,9 @@ NOTES = {
                         "不会更顺滑 —— 要更顺滑用「视频补帧插针」那张卡。"
                         "非常慢（每一帧都要过一遍模型），先把「只处理前几帧」填 60 试一版，"
                         "确认清晰度和帧率合心意了再改回 0 跑整段。",
+    "depth_image": "使用 Depth Anything 3 为单张图片生成相对深度图。白色表示较近，黑色表示较远。",
+    "depth_video": "使用 Depth Anything 3 逐帧生成视频深度图，并保留原视频音频和帧率。"
+                   "长视频会占用较多显存，建议先用短片段测试。",
     "rmbg_cutout": "把画面里的主体抠出来、背景变透明，出的是带透明通道的 PNG。全程在本机跑，"
                    "不联网、不限次数。几秒钟一张，很快。\n"
                    "名字叫「人物提取」，但它不是只认人 —— 动物、商品、车、一盆花都能抠，"
@@ -1727,7 +1735,10 @@ def build_tools_card(ms, by_id):
     每个就是一个模式；再加一张「画质增强」（ROUTE_CARDS 的 card_enhance，按素材类型
     切图/视频两路），也作为一个模式收进来。模式顺序指排顺序就是先声明的先出现。
     """
-    order = ["rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "grid4_stitch", "gimmvfi_interp"]
+    order = [
+        "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "grid4_stitch", "gimmvfi_interp",
+        "depth_image", "depth_video",
+    ]
     modes = []
     for wid in order:
         m = by_id.get(wid)
