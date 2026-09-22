@@ -18,10 +18,11 @@
     <span class="brand-copy"><b>Chouka</b><small>CREATIVE CANVAS</small></span>
     <a class="dot" id="dot" title="ComfyUI 连接状态" aria-label="ComfyUI 连接状态"></a>
   </div>
-  <button id="newproj"><span aria-hidden="true">＋</span><span>新建项目</span></button>
-  <div class="section-label">我的画布</div>
+  <button id="newproj"><span aria-hidden="true">＋</span><span>新建画布</span></button>
+  <label class="space-picker"><span>画布空间</span><select id="space-select" aria-label="选择个人空间或项目组"><option value="personal">个人空间</option></select></label>
+  <div id="space-label" class="section-label">个人空间</div>
   <div id="plist"></div>
-  <div class="side-foot"><span class="side-foot-dot"></span>本地工作区</div>
+  <div class="side-foot"><span class="side-foot-dot"></span><span id="space-status">个人画布仅自己可见</span></div>
 </aside>
 
 <!-- ---------- 主区 ---------- -->

@@ -7,13 +7,14 @@
   <nav aria-label="管理导航">
     <a class="tbtn" href="/controller">运行面板</a>
     <a class="tbtn" href="/controller/costs">费用统计</a>
+    <a class="tbtn" href="/teams">项目组</a>
     <a class="tbtn" href="/">画布</a>
   </nav>
   <div id="account" class="account-bar"></div>
 </header>
 <div class="perm-intro">
   <h1>账号与权限</h1>
-  <p>管理团队账号、全画布访问权限与历史画布归属。</p>
+  <p>管理团队账号、组长权限、全画布访问权限与历史画布归属。</p>
 </div>
 <p id="error" role="alert"></p>
 
@@ -27,9 +28,10 @@
     <label class="fld"><span>账号名</span><input name="username" autocomplete="off" required></label>
     <label class="fld"><span>初始密码</span><input name="password" type="password" autocomplete="new-password" required minlength="12"></label>
     <label class="fld"><span>角色</span><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
+    <label class="fld"><span>项目组权限</span><span><input name="team_leader" type="checkbox"> 组长</span></label>
     <button class="btn primary">创建账号</button>
   </form>
-  <div class="table-scroll" tabindex="0" role="region" aria-label="账号列表"><table class="perm-table"><thead><tr><th scope="col">账号</th><th scope="col">姓名 / 花名</th><th scope="col">角色</th><th scope="col">状态</th><th scope="col">审批</th><th scope="col">操作</th></tr></thead><tbody id="users"></tbody></table></div>
+  <div class="table-scroll" tabindex="0" role="region" aria-label="账号列表"><table class="perm-table"><thead><tr><th scope="col">账号</th><th scope="col">姓名 / 花名</th><th scope="col">角色 / 项目组权限</th><th scope="col">状态</th><th scope="col">审批</th><th scope="col">操作</th></tr></thead><tbody id="users"></tbody></table></div>
   </div>
 </section>
 
@@ -64,7 +66,7 @@
 <section class="perm-section perm-history" aria-labelledby="history-heading">
   <div class="perm-description">
     <h2 id="history-heading">历史画布分配</h2>
-    <p class="auth-note">选择画布并分配给对应账号，每次最多 1000 个。这里列出全部未删除画布，也可修正已分配的归属。画布内容和历史费用不变；新所有者的授权访问者将获得相应权限，原所有者及其授权访问者可能失去访问权限。</p>
+    <p class="auth-note">选择个人空间画布并分配给对应账号，每次最多 1000 个。项目组画布由成员关系授权，不能在这里改为个人归属。画布内容和历史费用不变；新所有者的授权访问者将获得相应权限，原所有者及其授权访问者可能失去访问权限。</p>
   </div>
   <div class="perm-content">
   <div class="perm-toolbar">
@@ -79,7 +81,7 @@
   </form>
   </div>
   <p id="assign-status" class="auth-note" role="status"></p>
-  <div class="table-scroll" tabindex="0" role="region" aria-label="历史画布列表"><table class="perm-table perm-projects"><thead><tr><th scope="col"><input id="project-all" type="checkbox" aria-label="全选当前筛选结果"></th><th scope="col">画布名称</th><th scope="col">ID</th><th scope="col">当前所有者</th></tr></thead><tbody id="projects"></tbody></table></div>
+  <div class="table-scroll" tabindex="0" role="region" aria-label="历史画布列表"><table class="perm-table perm-projects"><thead><tr><th scope="col"><input id="project-all" type="checkbox" aria-label="全选当前筛选结果"></th><th scope="col">画布名称</th><th scope="col">空间</th><th scope="col">ID</th><th scope="col">当前所有者</th></tr></thead><tbody id="projects"></tbody></table></div>
   </div>
 </section>
 </main>
@@ -94,7 +96,7 @@ function filteredProjects() {
   return projects.filter(p => (!owner || String(p.owner_id) === owner) && (!search || String(p.name || '').toLowerCase().includes(search) || String(p.id).toLowerCase().includes(search)));
 }
 function updateSelection() {
-  const visible = filteredProjects(), count = visible.filter(p => selectedProjects.has(p.id)).length;
+  const visible = filteredProjects().filter(project => !project.team_id), count = visible.filter(p => selectedProjects.has(p.id)).length;
   $('project-selected').textContent = '已选 ' + selectedProjects.size + ' 个画布';
   $('project-all').checked = visible.length > 0 && count === visible.length;
   $('project-all').indeterminate = count > 0 && count < visible.length;
@@ -107,15 +109,16 @@ function renderProjects() {
   const visible = filteredProjects();
   for (const project of visible) {
     const row = document.createElement('tr'), checkbox = document.createElement('input');
-    checkbox.type = 'checkbox'; checkbox.checked = selectedProjects.has(project.id); checkbox.disabled = assigning;
+    checkbox.type = 'checkbox'; checkbox.checked = selectedProjects.has(project.id); checkbox.disabled = assigning || !!project.team_id;
     checkbox.setAttribute('aria-label', '选择画布 ' + (project.name || '未命名画布') + '（' + project.id + '）');
     checkbox.onchange = () => { if (checkbox.checked) selectedProjects.add(project.id); else selectedProjects.delete(project.id); updateSelection(); };
     cell(row,'').append(checkbox); cell(row,project.name || '未命名画布');
+    cell(row, project.team_name ? '项目组：' + project.team_name : '个人空间');
     const projectId = cell(row,project.id); projectId.className = 'perm-id'; projectId.title = String(project.id);
     cell(row,'').append(identity(projectOwner(project), project.owner_id));
     $('projects').append(row);
   }
-  if (!visible.length) { const row = document.createElement('tr'); cell(row,'暂无符合条件的画布').colSpan = 4; $('projects').append(row); }
+  if (!visible.length) { const row = document.createElement('tr'); cell(row,'暂无符合条件的画布').colSpan = 5; $('projects').append(row); }
   $('project-search').disabled = assigning; $('project-owner').disabled = assigning; $('assign').elements.owner_id.disabled = assigning;
   updateSelection();
 }
@@ -159,7 +162,9 @@ async function refresh() {
   for (const user of users) {
     const row = document.createElement('tr'); cell(row,'').append(identity(user.username, user.id));
     cell(row, user.display_name || '—');
-    cell(row,'').append(chip(user.role === 'admin' ? '管理员' : '普通用户', user.role === 'admin' ? 'admin' : ''));
+    const roles = cell(row,''); roles.className = 'acts';
+    roles.append(chip(user.role === 'admin' ? '管理员' : '普通用户', user.role === 'admin' ? 'admin' : ''));
+    if (user.team_leader) roles.append(chip('组长', 'op'));
     cell(row,'').append(chip(user.enabled ? '启用' : '已停用', user.enabled ? 'on' : 'off'));
     const approval = {approved: ['已通过','on'], pending: ['待审批',''], rejected: ['已拒绝','off']}[user.approval_status] || ['—',''];
     cell(row,'').append(chip(approval[0], approval[1]));
@@ -167,6 +172,11 @@ async function refresh() {
     const base = '/api/admin/users/' + encodeURIComponent(user.id);
     button(acts,user.enabled ? '停用' : '启用', () => H3Auth.json(base,'PATCH',{enabled:!user.enabled}), 'danger');
     button(acts,user.role === 'admin' ? '设为普通用户' : '设为管理员', async () => { if (confirm('确认修改账号角色？')) await H3Auth.json(base,'PATCH',{role:user.role === 'admin' ? 'user' : 'admin'}); });
+    button(acts,user.team_leader ? '取消组长权限' : '设为组长', async () => {
+      if (confirm(user.team_leader ? '取消后该用户不能再创建或管理项目组，确认继续？' : '授予该用户创建和管理项目组的权限？')) {
+        await H3Auth.json(base,'PATCH',{team_leader:!user.team_leader});
+      }
+    });
     button(acts,'重置密码', async () => {
       const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog';
       dialog.innerHTML = '<form><h2>重置 <b></b> 的密码</h2>'
@@ -227,7 +237,7 @@ async function refreshRegistrations() {
   }
 }
 $('project-search').oninput = $('project-owner').onchange = () => { selectedProjects.clear(); renderProjects(); };
-$('project-all').onchange = event => { selectedProjects.clear(); if (event.currentTarget.checked) for (const project of filteredProjects()) selectedProjects.add(project.id); renderProjects(); };
+$('project-all').onchange = event => { selectedProjects.clear(); if (event.currentTarget.checked) for (const project of filteredProjects().filter(project => !project.team_id)) selectedProjects.add(project.id); renderProjects(); };
 $('assign').elements.owner_id.onchange = updateSelection;
 $('assign').onsubmit = async event => {
   event.preventDefault();
@@ -248,7 +258,11 @@ $('assign').onsubmit = async event => {
   } catch (e) { $('error').textContent = e.message; }
   finally { assigning = false; renderProjects(); }
 };
-$('create').onsubmit = event => { event.preventDefault(); const form = event.currentTarget; perform(async () => { await H3Auth.json('/api/admin/users','POST',Object.fromEntries(new FormData(form))); form.reset(); }); };
+$('create').onsubmit = event => { event.preventDefault(); const form = event.currentTarget; perform(async () => {
+  const data = Object.fromEntries(new FormData(form));
+  data.team_leader = form.elements.team_leader.checked;
+  await H3Auth.json('/api/admin/users','POST',data); form.reset();
+}); };
 $('grant').onsubmit = event => { event.preventDefault(); const body = Object.fromEntries(new FormData(event.currentTarget)); perform(() => H3Auth.json('/api/admin/grants','PUT',body)); };
 H3Auth.requireUser(true).then(() => { H3Auth.mountAccount($('account')); return refresh(); }).catch(e => { $('error').textContent = e.message; });
 </script></body></html>

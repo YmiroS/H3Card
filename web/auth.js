@@ -133,7 +133,9 @@
     const who = document.createElement('span'); who.className = 'who'; who.textContent = user.username;
     const role = document.createElement('span'); role.className = 'chip' + (user.role === 'admin' ? ' admin' : '');
     const dot = document.createElement('i'); dot.className = 'd';
-    role.append(dot, document.createTextNode(user.role === 'admin' ? '管理员' : '普通用户'));
+    const roleText = user.role === 'admin' ? '管理员' : user.team_leader ? '组长' : '普通用户';
+    role.append(dot, document.createTextNode(roleText));
+    const teams = document.createElement('a'); teams.className = 'btn sm'; teams.href = '/teams'; teams.textContent = '项目组';
     const password = document.createElement('button'); password.className = 'btn sm'; password.textContent = '修改密码';
     password.onclick = () => {
       const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog';
@@ -170,7 +172,9 @@
     };
     const exit = document.createElement('button'); exit.className = 'btn sm'; exit.textContent = '退出登录';
     exit.onclick = () => logout().catch(() => {});
-    container.append(who, role, password, exit);
+    container.append(who, role);
+    if (user.role === 'admin' || user.team_leader) container.append(teams);
+    container.append(password, exit);
   }
   window.H3Auth = {request,json,me,requireUser,every,login,register,logout,mountAccount, get user(){return user;}, get active(){return !!user && !stopped;}};
 })();

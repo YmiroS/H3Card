@@ -45,13 +45,18 @@ class AuthStore:
             if version == 1:
                 self.db.executescript(migrations.joinpath('002_registration.sql').read_text(encoding='utf-8'))
                 version = 2
-            elif version != 2:
+            if version == 2:
+                self.db.executescript(migrations.joinpath('003_teams.sql').read_text(encoding='utf-8'))
+                version = 3
+            elif version != 3:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
-                'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status',
+                'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader',
                 'sessions': 'token_hash,user_id,csrf_token,expires_at,created_at',
                 'user_grants': 'viewer_id,owner_id,permission',
-                'project_acl': 'project_id,owner_id,state,created_at',
+                'project_acl': 'project_id,owner_id,state,created_at,team_id',
+                'teams': 'id,name,leader_id,state,created_at,updated_at',
+                'team_members': 'team_id,user_id,joined_at',
                 'job_acl': 'job_id,project_id,user_id', 'auth_meta': 'key,value',
                 'registration_requests': 'id,user_id,username,display_name,status,created_at,decided_at,decided_by,corp_id,out_track_id',
                 'notification_outbox': 'id,request_id,kind,dedupe_key,status,attempts,next_try_at,leased_until,created_at,last_error',
@@ -83,7 +88,8 @@ class AuthStore:
         return None if row is None else {'id': row['id'], 'username': row['username'],
                                          'role': row['role'], 'enabled': bool(row['enabled']),
                                          'display_name': row['display_name'],
-                                         'approval_status': row['approval_status']}
+                                         'approval_status': row['approval_status'],
+                                         'team_leader': bool(row['team_leader'])}
 
     @staticmethod
     def _identifier(value, label):
@@ -156,9 +162,11 @@ class AuthStore:
         with self._tx():
             self.db.execute("INSERT INTO auth_meta VALUES ('ready',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", ('1' if ready else '0',))
 
-    def create_user(self, username, password, role='user', *, actor_id=None, session_token=None):
+    def create_user(self, username, password, role='user', team_leader=False, *, actor_id=None, session_token=None):
         """管理员直接开户：既有特权操作，账号直接生效（approved），不走钉钉审批。"""
         self._role(role)
+        if not isinstance(team_leader, bool):
+            raise AuthError('team_leader 必须为布尔值')
         self._password(password)
         username, username_key = self._username(username)
         hashed = self.hasher.hash(password)
@@ -166,8 +174,8 @@ class AuthStore:
         with self._tx():
             self._check_actor(actor_id, session_token)
             try:
-                self.db.execute('INSERT INTO users(id,username,username_key,password_hash,role,created_at,display_name,approval_status) VALUES(?,?,?,?,?,?,?,?)',
-                                (uid, username, username_key, hashed, role, time.time(), username, 'approved'))
+                self.db.execute('INSERT INTO users(id,username,username_key,password_hash,role,created_at,display_name,approval_status,team_leader) VALUES(?,?,?,?,?,?,?,?,?)',
+                                (uid, username, username_key, hashed, role, time.time(), username, 'approved', int(team_leader)))
             except sqlite3.IntegrityError as exc:
                 raise AuthError('用户名已存在', 409) from exc
             return self._safe(self._user(uid))
@@ -181,11 +189,13 @@ class AuthStore:
         with self.lock:
             return [self._safe(row) for row in self.db.execute('SELECT * FROM users ORDER BY created_at,id')]
 
-    def set_user(self, uid, role=None, enabled=None, *, actor_id=None, session_token=None):
+    def set_user(self, uid, role=None, enabled=None, team_leader=None, *, actor_id=None, session_token=None):
         if role is not None:
             self._role(role)
         if enabled is not None and not isinstance(enabled, bool):
             raise AuthError('enabled 必须为布尔值')
+        if team_leader is not None and not isinstance(team_leader, bool):
+            raise AuthError('team_leader 必须为布尔值')
         with self._tx():
             self._check_actor(actor_id, session_token)
             old = self._user(uid)
@@ -193,10 +203,12 @@ class AuthStore:
                 raise AuthError('未通过审批的账号不能提升为管理员', 409)
             role = old['role'] if role is None else role
             enabled = bool(old['enabled']) if enabled is None else enabled
+            team_leader = bool(old['team_leader']) if team_leader is None else team_leader
             if old['role'] == 'admin' and old['enabled'] and (role != 'admin' or not enabled):
                 if self.db.execute("SELECT COUNT(*) FROM users WHERE enabled=1 AND role='admin'").fetchone()[0] <= 1:
                     raise AuthError('不能停用或降级最后一个管理员', 409)
-            self.db.execute('UPDATE users SET role=?,enabled=?,version=version+1 WHERE id=?', (role, int(enabled), uid))
+            self.db.execute('UPDATE users SET role=?,enabled=?,team_leader=?,version=version+1 WHERE id=?',
+                            (role, int(enabled), int(team_leader), uid))
             self.db.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
             return self._safe(self._user(uid))
 
@@ -410,6 +422,103 @@ class AuthStore:
         with self._tx():
             self.db.execute('DELETE FROM sessions WHERE token_hash=?', (self._digest(token),))
 
+    @staticmethod
+    def _team_name(name):
+        if not isinstance(name, str):
+            raise AuthError('无效项目组名称')
+        name = name.strip()
+        if not name or len(name) > 64 or any(ord(char) < 32 for char in name):
+            raise AuthError('项目组名称须为 1 至 64 个字符')
+        return name
+
+    def _check_team_manager(self, actor_id, team_id=None, session_token=None):
+        actor = self._user(actor_id)
+        if session_token is not None:
+            session = self.get_session(session_token)
+            if session is None or session['user']['id'] != actor_id:
+                raise AuthError('会话已失效，请重新登录', 401)
+        if not actor['enabled'] or actor['approval_status'] != 'approved':
+            raise AuthError('账号不可用', 403)
+        if actor['role'] != 'admin' and not actor['team_leader']:
+            raise AuthError('需要组长权限', 403)
+        if team_id is not None:
+            self._identifier(team_id, '项目组 ID')
+            team = self.db.execute("SELECT * FROM teams WHERE id=? AND state='active'", (team_id,)).fetchone()
+            if team is None:
+                raise AuthError('项目组不存在', 404)
+            if actor['role'] != 'admin' and team['leader_id'] != actor_id:
+                raise AuthError('只能管理自己创建的项目组', 403)
+            return team
+        return actor
+
+    def create_team(self, name, actor_id, session_token=None):
+        name = self._team_name(name)
+        team_id = uuid.uuid4().hex
+        now = time.time()
+        with self._tx():
+            self._check_team_manager(actor_id, session_token=session_token)
+            self.db.execute('INSERT INTO teams(id,name,leader_id,state,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+                            (team_id, name, actor_id, 'active', now, now))
+            self.db.execute('INSERT INTO team_members(team_id,user_id,joined_at) VALUES(?,?,?)',
+                            (team_id, actor_id, now))
+            return self._team(team_id)
+
+    def _team(self, team_id):
+        row = self.db.execute(
+            "SELECT t.*,u.username AS leader_username FROM teams t JOIN users u ON u.id=t.leader_id "
+            "WHERE t.id=? AND t.state='active'", (team_id,)).fetchone()
+        return dict(row) if row else None
+
+    def list_teams(self, user_id):
+        self._identifier(user_id, '用户 ID')
+        with self.lock:
+            user = self.get_user(user_id)
+            if not user or not user['enabled'] or user['approval_status'] != 'approved':
+                return []
+            if user['role'] == 'admin':
+                rows = self.db.execute(
+                    "SELECT t.*,u.username AS leader_username FROM teams t JOIN users u ON u.id=t.leader_id "
+                    "WHERE t.state='active' ORDER BY t.created_at,t.id").fetchall()
+            else:
+                rows = self.db.execute(
+                    "SELECT t.*,u.username AS leader_username FROM teams t "
+                    "JOIN team_members m ON m.team_id=t.id JOIN users u ON u.id=t.leader_id "
+                    "WHERE t.state='active' AND m.user_id=? ORDER BY t.created_at,t.id", (user_id,)).fetchall()
+            teams = []
+            for row in rows:
+                members = [dict(member) | {'enabled': bool(member['enabled'])} for member in self.db.execute(
+                    'SELECT u.id,u.username,u.display_name,u.enabled FROM team_members m '
+                    'JOIN users u ON u.id=m.user_id WHERE m.team_id=? ORDER BY m.joined_at,u.id',
+                    (row['id'],)).fetchall()]
+                teams.append(dict(row) | {'members': members,
+                                          'can_manage': user['role'] == 'admin' or row['leader_id'] == user_id})
+            return teams
+
+    def list_team_candidates(self, actor_id, session_token=None):
+        with self.lock:
+            self._check_team_manager(actor_id, session_token=session_token)
+            return [self._safe(row) for row in self.db.execute(
+                "SELECT * FROM users WHERE enabled=1 AND approval_status='approved' ORDER BY username_key,id")]
+
+    def add_team_member(self, team_id, user_id, actor_id, session_token=None):
+        with self._tx():
+            self._check_team_manager(actor_id, team_id, session_token)
+            user = self._user(user_id)
+            if not user['enabled'] or user['approval_status'] != 'approved':
+                raise AuthError('只能添加已启用且审批通过的账号', 409)
+            self.db.execute('INSERT OR IGNORE INTO team_members(team_id,user_id,joined_at) VALUES(?,?,?)',
+                            (team_id, user_id, time.time()))
+            return {'team_id': team_id, 'user_id': user_id}
+
+    def remove_team_member(self, team_id, user_id, actor_id, session_token=None):
+        with self._tx():
+            team = self._check_team_manager(actor_id, team_id, session_token)
+            self._user(user_id)
+            if team['leader_id'] == user_id:
+                raise AuthError('不能移除项目组组长', 409)
+            self.db.execute('DELETE FROM team_members WHERE team_id=? AND user_id=?',
+                            (team_id, user_id))
+
     def list_grants(self):
         with self.lock:
             return [dict(row) for row in self.db.execute('SELECT * FROM user_grants ORDER BY viewer_id,owner_id')]
@@ -432,16 +541,28 @@ class AuthStore:
             self._check_actor(actor_id, session_token)
             self.db.execute('DELETE FROM user_grants WHERE viewer_id=? AND owner_id=?', (viewer_id, owner_id))
 
-    def create_project(self, project_id, owner_id, state='active'):
+    def create_project(self, project_id, owner_id, state='active', team_id=None):
         self._identifier(project_id, '画布 ID')
         if state not in ('pending', 'active', 'deleted'):
             raise AuthError('无效画布状态')
+        if team_id is not None:
+            self._identifier(team_id, '项目组 ID')
         with self._tx():
-            self._user(owner_id)
+            owner = self._user(owner_id)
+            if not owner['enabled'] or owner['approval_status'] != 'approved':
+                raise AuthError('账号不可用', 403)
+            if team_id is not None:
+                member = self.db.execute(
+                    "SELECT 1 FROM teams t JOIN team_members m ON m.team_id=t.id "
+                    "WHERE t.id=? AND t.state='active' AND m.user_id=?", (team_id, owner_id)).fetchone()
+                if member is None and owner['role'] != 'admin':
+                    raise AuthError('你不是该项目组成员', 403)
             old = self.get_project(project_id)
-            if old and old['owner_id'] != owner_id:
+            if old and (old['owner_id'] != owner_id or old['team_id'] != team_id):
                 raise AuthError('画布不能重新绑定归属', 409)
-            self.db.execute('INSERT OR IGNORE INTO project_acl VALUES(?,?,?,?)', (project_id, owner_id, state, time.time()))
+            self.db.execute(
+                'INSERT OR IGNORE INTO project_acl(project_id,owner_id,state,created_at,team_id) VALUES(?,?,?,?,?)',
+                (project_id, owner_id, state, time.time(), team_id))
             return self.get_project(project_id)
 
     def assign_projects(self, projects, owner_id, *, actor_id=None, session_token=None):
@@ -464,6 +585,8 @@ class AuthStore:
                 old = self.get_project(item['project_id'])
                 if not old or old['state'] != 'active':
                     raise AuthError('画布不存在或已删除，请刷新列表', 409)
+                if old['team_id'] is not None:
+                    raise AuthError('项目组画布不能重新分配个人归属', 409)
                 if old['owner_id'] != item['owner_id']:
                     raise AuthError('画布归属已变化，请刷新后重新分配', 409)
             # 只更新访问归属；任务创建者、业务内容和费用记录保持原样。
@@ -474,7 +597,9 @@ class AuthStore:
     def get_project(self, project_id):
         self._identifier(project_id, '画布 ID')
         with self.lock:
-            row = self.db.execute('SELECT * FROM project_acl WHERE project_id=?', (project_id,)).fetchone()
+            row = self.db.execute(
+                'SELECT p.*,t.name AS team_name FROM project_acl p LEFT JOIN teams t ON t.id=p.team_id '
+                'WHERE p.project_id=?', (project_id,)).fetchone()
             return dict(row) if row else None
 
     def project_permission(self, user_id, project_id):
@@ -486,7 +611,13 @@ class AuthStore:
             if (not user or not user['enabled'] or user['approval_status'] != 'approved'
                     or not project or project['state'] != 'active'):
                 return None
-            if user['role'] == 'admin' or project['owner_id'] == user_id:
+            if user['role'] == 'admin':
+                return 'operate'
+            if project['team_id'] is not None:
+                member = self.db.execute('SELECT 1 FROM team_members WHERE team_id=? AND user_id=?',
+                                         (project['team_id'], user_id)).fetchone()
+                return 'operate' if member else None
+            if project['owner_id'] == user_id:
                 return 'operate'
             row = self.db.execute('SELECT permission FROM user_grants WHERE viewer_id=? AND owner_id=?',
                                   (user_id, project['owner_id'])).fetchone()
@@ -496,7 +627,10 @@ class AuthStore:
         self._identifier(user_id, '用户 ID')
         with self.lock:
             result = []
-            for row in self.db.execute('SELECT p.*,u.username AS owner_username FROM project_acl p JOIN users u ON u.id=p.owner_id ORDER BY p.created_at,p.project_id'):
+            for row in self.db.execute(
+                    'SELECT p.*,u.username AS owner_username,t.name AS team_name FROM project_acl p '
+                    'JOIN users u ON u.id=p.owner_id LEFT JOIN teams t ON t.id=p.team_id '
+                    'ORDER BY p.created_at,p.project_id'):
                 permission = self.project_permission(user_id, row['project_id'])
                 if permission:
                     result.append(dict(row) | {'permission': permission})

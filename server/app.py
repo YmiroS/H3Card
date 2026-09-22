@@ -51,7 +51,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.auth_store import AuthStore
 from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
 from server.auth import (auth_middleware, register_auth_routes, require_user, require_admin,
-                         require_project, require_job, call_store, setup_local_test_auth)
+                         require_team_leader, require_project, require_job, call_store,
+                         setup_local_test_auth)
 from server.resource_access import ResourceAccess
 from server.image_controls import image_controls, patch_image_controls
 
@@ -1858,25 +1859,32 @@ async def api_projects(request):
                     "updated": d.get("updated", 0), "cards": len(d.get("cards", [])),
                     "locked": bool(d.get("locked")), "owner_id": acl["owner_id"],
                     "owner_username": acl.get("owner_username", ""),
+                    "team_id": acl.get("team_id"), "team_name": acl.get("team_name"),
                     "permission": acl["permission"]})
     out.sort(key=lambda p: p["updated"], reverse=True)
-    return web.json_response({"projects": out})
+    teams = await call_store(request.app, "list_teams", user["id"])
+    return web.json_response({"projects": out, "teams": teams})
 
 
 async def api_project_create(request):
     user = require_user(request)
     body = await request.json()
-    if not isinstance(body, dict) or not isinstance(body.get("name", ""), str):
-        raise web.HTTPBadRequest(text="画布名称必须为字符串")
+    if (not isinstance(body, dict) or set(body) - {"name", "team_id"}
+            or not isinstance(body.get("name", ""), str)
+            or (body.get("team_id") is not None and not isinstance(body.get("team_id"), str))):
+        raise web.HTTPBadRequest(text="画布名称或项目组不正确")
+    team_id = body.get("team_id") or None
     PROJ_DIR.mkdir(parents=True, exist_ok=True)
     pid = uuid.uuid4().hex[:12]
     d = {"id": pid, "name": (body.get("name") or "新项目").strip()[:40],
          "cards": [], "edges": [], "view": {"x": 0, "y": 0, "k": 1},
          "created": time.time(), "updated": time.time(), "rev": 0}
-    await call_store(request.app, "create_project", pid, user["id"], state="pending")
+    acl = await call_store(request.app, "create_project", pid, user["id"],
+                           state="pending", team_id=team_id)
     write_project(proj_path(pid), d)
     await call_store(request.app, "set_project_state", pid, "active")
     return web.json_response(d | {"owner_id": user["id"], "owner_username": user["username"],
+                                  "team_id": team_id, "team_name": acl.get("team_name"),
                                   "permission": "operate"})
 
 
@@ -1890,6 +1898,8 @@ async def api_project_get(request):
     d = json.loads(p.read_text(encoding="utf-8"))
     return web.json_response(d | {"owner_id": acl["owner_id"],
                                   "owner_username": owner["username"],
+                                  "team_id": acl.get("team_id"),
+                                  "team_name": acl.get("team_name"),
                                   "permission": acl["permission"]})
 
 
@@ -2052,6 +2062,11 @@ async def api_preview_file(request):
 async def permissions_page(request):
     require_admin(request)
     return web.FileResponse(ROOT / "web" / "permissions.html")
+
+
+async def teams_page(request):
+    require_team_leader(request)
+    return web.FileResponse(ROOT / "web" / "teams.html")
 
 
 async def static_asset(request, *, name):
@@ -2260,6 +2275,7 @@ def make_app(auth_path=None):
     up.mkdir(parents=True, exist_ok=True)
     app.router.add_get("/api/upload/{name}", api_upload_file)
     app.router.add_get("/admin/permissions", permissions_page)
+    app.router.add_get("/teams", teams_page)
     # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
     for name in ("app.js", "style.css"):
         app.router.add_get("/" + name, partial(static_asset, name=name))

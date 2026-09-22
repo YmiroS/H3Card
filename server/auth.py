@@ -17,6 +17,7 @@ COOKIE = 'h3card_session'
 PUBLIC = {'/login', '/login.html', '/auth.js', '/style.css', '/favicon.png', '/icon.png'}
 ADMIN_PAGES = {'/controller', '/controller.html', '/controller/costs', '/costs.html',
                '/admin/permissions', '/permissions.html'}
+TEAM_PAGES = {'/teams', '/teams.html'}
 ADMIN_APIS = ('/api/admin', '/api/workers', '/api/costs', '/api/reload', '/api/status')
 
 
@@ -39,6 +40,12 @@ async def admin_call(request, method, *args, **kwargs):
                             actor_id=user['id'], session_token=request.cookies.get(COOKIE, ''))
 
 
+async def team_call(request, method, *args, **kwargs):
+    user = require_team_leader(request)
+    return await call_store(request.app, method, *args, **kwargs,
+                            actor_id=user['id'], session_token=request.cookies.get(COOKIE, ''))
+
+
 def require_user(request):
     user = request.get('user')
     if not user or not user.get('enabled'):
@@ -50,6 +57,13 @@ def require_admin(request):
     user = require_user(request)
     if user['role'] != 'admin':
         raise web.HTTPForbidden(text='需要管理员权限')
+    return user
+
+
+def require_team_leader(request):
+    user = require_user(request)
+    if user['role'] != 'admin' and not user.get('team_leader'):
+        raise web.HTTPForbidden(text='需要组长权限')
     return user
 
 
@@ -158,6 +172,8 @@ async def _local_test_request(request, handler):
     request['auth_session'] = session
     if _admin_path(path):
         require_admin(request)
+    if path in TEAM_PAGES:
+        require_team_leader(request)
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         _check_source(request)
         if not secrets.compare_digest(request.headers.get('X-CSRF-Token', ''), session['csrf_token']):
@@ -213,6 +229,8 @@ async def _browser_request(request, handler):
     request['auth_session'] = session
     if _admin_path(path):
         require_admin(request)
+    if path in TEAM_PAGES:
+        require_team_leader(request)
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         _check_source(request)
         supplied = request.headers.get('X-CSRF-Token', '')
@@ -234,9 +252,9 @@ async def _body(request, required=(), optional=()):
     if not isinstance(body, dict) or set(body) - set(required) - set(optional) or any(k not in body for k in required):
         raise web.HTTPBadRequest(text='请求字段不正确')
     for key, value in body.items():
-        if key == 'enabled':
+        if key in ('enabled', 'team_leader'):
             if not isinstance(value, bool):
-                raise web.HTTPBadRequest(text='enabled 必须为布尔值')
+                raise web.HTTPBadRequest(text=f'{key} 必须为布尔值')
         elif not isinstance(value, str):
             raise web.HTTPBadRequest(text='字段必须为字符串')
     return body
@@ -301,13 +319,13 @@ async def users(request):
     require_admin(request)
     if request.method == 'GET':
         return web.json_response({'users': await call_store(request.app, 'list_users')})
-    body = await _body(request, ('username', 'password', 'role'))
+    body = await _body(request, ('username', 'password', 'role'), ('team_leader',))
     return web.json_response({'user': await admin_call(request, 'create_user', **body)}, status=201)
 
 
 async def update_user(request):
     require_admin(request)
-    body = await _body(request, optional=('role', 'enabled'))
+    body = await _body(request, optional=('role', 'enabled', 'team_leader'))
     if not body:
         raise web.HTTPBadRequest(text='至少提供一个修改字段')
     return web.json_response({'user': await admin_call(request, 'set_user', request.match_info['uid'], **body)})
@@ -317,6 +335,30 @@ async def reset_password(request):
     require_admin(request)
     body = await _body(request, ('password',))
     await admin_call(request, 'reset_password', request.match_info['uid'], body['password'])
+    return web.json_response({'ok': True})
+
+
+async def teams(request):
+    user = require_user(request)
+    if request.method == 'GET':
+        return web.json_response({'teams': await call_store(request.app, 'list_teams', user['id'])})
+    body = await _body(request, ('name',))
+    return web.json_response({'team': await team_call(request, 'create_team', body['name'])}, status=201)
+
+
+async def team_candidates(request):
+    require_team_leader(request)
+    return web.json_response({'users': await team_call(request, 'list_team_candidates')})
+
+
+async def team_members(request):
+    body = await _body(request, ('user_id',))
+    result = await team_call(request, 'add_team_member', request.match_info['tid'], body['user_id'])
+    return web.json_response({'member': result}, status=201)
+
+
+async def delete_team_member(request):
+    await team_call(request, 'remove_team_member', request.match_info['tid'], request.match_info['uid'])
     return web.json_response({'ok': True})
 
 
@@ -385,6 +427,11 @@ def register_auth_routes(app, web_root):
     app.router.add_post('/api/auth/register', register)
     app.router.add_post('/api/auth/logout', logout)
     app.router.add_post('/api/auth/password', password)
+    app.router.add_get('/api/teams', teams)
+    app.router.add_post('/api/teams', teams)
+    app.router.add_get('/api/team-candidates', team_candidates)
+    app.router.add_post('/api/teams/{tid}/members', team_members)
+    app.router.add_delete('/api/teams/{tid}/members/{uid}', delete_team_member)
     app.router.add_get('/api/admin/registrations', registrations)
     app.router.add_post('/api/admin/projects/assign', assign_projects)
     app.router.add_get('/api/admin/users', users)

@@ -45,6 +45,7 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.headers = await self.login()
         self.assertEqual((await self.client.get('/')).status, 200)
         self.assertEqual((await self.client.get('/admin/permissions')).status, 200)
+        self.assertEqual((await self.client.get('/teams')).status, 200)
         # 根目录静态兜底已移除：直呼 .html 不再绕过页面权限。
         self.assertEqual((await self.client.get('/controller.html')).status, 404)
         self.assertEqual((await self.client.get('/costs.html')).status, 404)
@@ -93,6 +94,37 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.auth.delete_grant(bob['id'], self.admin['id'])
         got = await self.client.get(f"/api/projects/{created['id']}")
         self.assertEqual(got.status, 404)
+
+    async def test_team_project_is_shared_with_members_only(self):
+        bob = self.auth.create_user('bob', PASSWORD)
+        outsider = self.auth.create_user('outsider', PASSWORD)
+        response = await self.client.post('/api/teams', json={'name': '项目一组'}, headers=self.headers)
+        self.assertEqual(response.status, 201)
+        team = (await response.json())['team']
+        response = await self.client.post(
+            f"/api/teams/{team['id']}/members", json={'user_id': bob['id']}, headers=self.headers)
+        self.assertEqual(response.status, 201)
+
+        response = await self.client.post('/api/auth/login', json={'username': 'bob', 'password': PASSWORD},
+                                          headers={'Origin': self.origin})
+        session = await response.json()
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '共享画布', 'team_id': team['id']}, headers=headers)).json()
+        self.assertEqual(created['team_id'], team['id'])
+        listed = await (await self.client.get('/api/projects')).json()
+        self.assertEqual(listed['projects'][0]['team_name'], '项目一组')
+        self.assertEqual(listed['projects'][0]['permission'], 'operate')
+
+        response = await self.client.post('/api/auth/login', json={'username': 'outsider', 'password': PASSWORD},
+                                          headers={'Origin': self.origin})
+        outsider_session = await response.json()
+        outsider_headers = {'Origin': self.origin, 'X-CSRF-Token': outsider_session['csrf_token']}
+        self.assertEqual((await (await self.client.get('/api/projects')).json())['projects'], [])
+        self.assertEqual((await self.client.get(f"/api/projects/{created['id']}")).status, 404)
+        self.assertEqual((await self.client.post('/api/projects', json={'name': '越权', 'team_id': team['id']},
+                                                 headers=outsider_headers)).status, 403)
+        self.assertFalse(outsider['team_leader'])
 
 
 if __name__ == '__main__':

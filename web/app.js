@@ -16,6 +16,8 @@ let CARDS = [];            // 节点种类（生图 / 生视频）
 let CAPS = {};             // 能力清单
 let PROJ = null;           // 当前项目
 let projects = [];
+let teams = [];
+let selectedSpace = 'personal';
 let TASKS = [];            // 服务端所有任务（不限本项目），右上角计数和任务浮窗都看它
 let view = { x: 60, y: 70, k: 1 };
 let selId = null;
@@ -24,6 +26,7 @@ let saveTimer = null;
 
 const el = {
   side: $("#side"), plist: $("#plist"), dot: $("#dot"),
+  spaceSelect: $("#space-select"), spaceLabel: $("#space-label"), spaceStatus: $("#space-status"),
   ptitle: $("#ptitle"), hint: $("#hint"), fit: $("#fit"),
   stage: $("#stage"), world: $("#world"), wires: $("#wires"), groups: $("#groups"),
   lasso: $("#lasso"), selbar: $("#selbar"), dock: $("#dock"),
@@ -1125,28 +1128,49 @@ async function health() {
 }
 
 /* ================= 项目栏 ================= */
+const projectSpace = project => project.team_id ? `team:${project.team_id}`
+  : String(project.owner_id) === String(H3Auth.user?.id) ? 'personal' : 'shared';
+function syncSpaceOptions() {
+  const options = [{value:'personal', label:'个人空间'}];
+  if (projects.some(project => projectSpace(project) === 'shared')) options.push({value:'shared', label:'共享给我的画布'});
+  for (const team of teams) options.push({value:`team:${team.id}`, label:team.name});
+  if (!options.some(option => option.value === selectedSpace)) selectedSpace = 'personal';
+  el.spaceSelect.replaceChildren();
+  for (const item of options) { const option = document.createElement('option'); option.value = item.value; option.textContent = item.label; el.spaceSelect.append(option); }
+  el.spaceSelect.value = selectedSpace;
+  const current = options.find(option => option.value === selectedSpace);
+  el.spaceLabel.textContent = current?.label || '个人空间';
+  el.spaceStatus.textContent = selectedSpace === 'personal' ? '个人画布仅自己可见'
+    : selectedSpace === 'shared' ? '由画布所有者授权共享'
+    : '项目组画布由全体组员共享';
+}
+const visibleProjects = () => projects.filter(project => projectSpace(project) === selectedSpace);
+
 async function loadProjects() {
   if (!H3Auth.active) return;
-  try { projects = (await api("/api/projects")).projects; } catch (e) { return; }
+  try { const data = await api("/api/projects"); projects = data.projects; teams = data.teams || []; } catch (e) { return; }
   if (PROJ) {
     const latest = projects.find(p => p.id === PROJ.id);
     if (!latest) { clearProject(); TASKS = TASKS.filter(j => projects.some(p => p.id === j.project)); }
     else {
       const changed = PROJ.permission !== latest.permission;
-      Object.assign(PROJ, {permission:latest.permission, owner_id:latest.owner_id, owner_username:latest.owner_username, name:latest.name, locked:latest.locked});
+      Object.assign(PROJ, {permission:latest.permission, owner_id:latest.owner_id,
+        owner_username:latest.owner_username, team_id:latest.team_id, team_name:latest.team_name,
+        name:latest.name, locked:latest.locked});
       if (changed) { closePanel(); closeHistory(); render(); }
     }
   }
   syncPermissionUI();
+  syncSpaceOptions();
   el.plist.innerHTML = "";
-  for (const p of projects) {
+  for (const p of visibleProjects()) {
     const d = document.createElement("div");
     d.className = "pitem" + (PROJ && PROJ.id === p.id ? " on" : "");
     // locked 的项目（示例）不给重命名/删除按钮，服务端也会拒
     d.innerHTML = '<span class="nm"></span><span class="ct"></span>'
       + (p.locked || !canOperate(p) ? '' : '<button class="ren" title="重命名">✎</button><button class="del" title="删除">✕</button>');
     d.querySelector('.ct').textContent = String(p.cards ?? 0);
-    d.title = `${p.owner_username || ''} · ${p.permission === 'operate' ? '可操作' : '只读'}`;
+    d.title = `${p.team_name || p.owner_username || ''} · ${p.permission === 'operate' ? '可操作' : '只读'}`;
     const nm = d.querySelector(".nm");
     nm.textContent = p.name;
     d.onclick = () => openProject(p.id);
@@ -1166,9 +1190,12 @@ async function loadProjects() {
 }
 
 async function newProject() {
-  const name = prompt("项目名", "新项目 " + new Date().toLocaleDateString("zh-CN"));
+  if (selectedSpace === 'shared') return toast('共享给我的空间不能新建画布，请选择个人空间或项目组');
+  const teamId = selectedSpace.startsWith('team:') ? selectedSpace.slice(5) : null;
+  const spaceName = teamId ? teams.find(team => team.id === teamId)?.name : '个人空间';
+  const name = prompt(`在「${spaceName || '项目组'}」新建画布`, "新项目 " + new Date().toLocaleDateString("zh-CN"));
   if (name === null) return;
-  const p = await jpost("/api/projects", { name });
+  const p = await jpost("/api/projects", { name, team_id: teamId });
   await loadProjects();
   openProject(p.id);
 }
@@ -1203,6 +1230,8 @@ async function openProject(pid) {
   const opening = ++openingProject;
   try { const project = await api(`/api/projects/${encodeURIComponent(pid)}`); if (opening !== openingProject || !H3Auth.active) return; PROJ = project; }
   catch (e) { return toast(e.message); }
+  selectedSpace = projectSpace(PROJ);
+  syncSpaceOptions();
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
   PROJ.groups = PROJ.groups || [];
@@ -2348,6 +2377,11 @@ function bindGlobal() {
   $("#toggle").onclick = () => document.body.classList.toggle("collapsed");
   $("#newproj").onclick = newProject;
   $("#createHere").onclick = newProject;
+  el.spaceSelect.onchange = () => {
+    selectedSpace = el.spaceSelect.value;
+    if (PROJ && projectSpace(PROJ) !== selectedSpace) clearProject();
+    syncSpaceOptions(); loadProjects();
+  };
   // 底部工具条：新建节点的唯一入口。上传直接建素材节点，图片/视频/工具箱摊开各自节点里的玩法
   buildDock();
   el.fit.onclick = () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); };

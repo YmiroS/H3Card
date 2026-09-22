@@ -75,6 +75,40 @@ class StoreTests(unittest.TestCase):
         self.store.delete_grant(self.viewer, self.owner)
         self.assertEqual(len(self.store.list_grants()), 1)
 
+    def test_team_members_share_team_projects_and_keep_personal_private(self):
+        leader = self.store.create_user('leader', PASSWORD, team_leader=True)['id']
+        member = self.store.create_user('member', PASSWORD)['id']
+        outsider = self.store.create_user('outsider', PASSWORD)['id']
+        team = self.store.create_team('项目一组', leader)
+        self.store.add_team_member(team['id'], member, leader)
+        self.store.create_project('team-project', member, team_id=team['id'])
+        self.store.create_project('personal-project', member)
+        self.assertEqual(self.store.project_permission(leader, 'team-project'), 'operate')
+        self.assertEqual(self.store.project_permission(member, 'team-project'), 'operate')
+        self.assertIsNone(self.store.project_permission(outsider, 'team-project'))
+        self.assertIsNone(self.store.project_permission(leader, 'personal-project'))
+        self.store.set_grant(outsider, member, 'operate')
+        self.assertIsNone(self.store.project_permission(outsider, 'team-project'))
+        self.assertEqual(self.store.project_permission(outsider, 'personal-project'), 'operate')
+        listed = self.store.list_projects(leader)[0]
+        self.assertEqual(listed['team_name'], '项目一组')
+        self.store.remove_team_member(team['id'], member, leader)
+        self.assertIsNone(self.store.project_permission(member, 'team-project'))
+        self.assertEqual(self.store.project_permission(member, 'personal-project'), 'operate')
+
+    def test_team_management_permissions(self):
+        leader = self.store.create_user('leader', PASSWORD, team_leader=True)['id']
+        other_leader = self.store.create_user('leader2', PASSWORD, team_leader=True)['id']
+        team = self.store.create_team('项目一组', leader)
+        with self.assertRaises(AuthError):
+            self.store.add_team_member(team['id'], self.viewer, other_leader)
+        with self.assertRaises(AuthError):
+            self.store.create_team('无权限', self.viewer)
+        self.store.add_team_member(team['id'], self.viewer, self.admin)
+        with self.assertRaises(AuthError):
+            self.store.remove_team_member(team['id'], leader, leader)
+        self.assertTrue(self.store.list_teams(self.viewer)[0]['members'])
+
     def test_last_admin_across_connections(self):
         other_id = self.store.create_user('admin2', PASSWORD, 'admin')['id']
         other = AuthStore(self.path)
@@ -163,7 +197,7 @@ class StoreTests(unittest.TestCase):
     def test_unknown_schema_rejected(self):
         path = Path(self.tmp.name) / 'future.sqlite'
         db = sqlite3.connect(path)
-        db.execute('PRAGMA user_version=3')
+        db.execute('PRAGMA user_version=4')
         db.close()
         with self.assertRaises(AuthError):
             AuthStore(path)
@@ -191,6 +225,8 @@ class RegistrationStoreTests(unittest.TestCase):
         script = (Path(__file__).resolve().parents[1] / 'server/migrations/001_auth.sql').read_text(encoding='utf-8')
         db.executescript(script)
         db.execute("INSERT INTO users VALUES('u1','old','old','x','user',1,0,100.0)")
+        db.execute("INSERT INTO project_acl VALUES('legacy-project','u1','active',100.0)")
+        db.execute("UPDATE auth_meta SET value='1' WHERE key='ready'")
         db.commit()
         db.close()
         store = AuthStore(legacy)
@@ -198,7 +234,10 @@ class RegistrationStoreTests(unittest.TestCase):
             users = store.list_users()
             self.assertEqual(users[0]['approval_status'], 'approved')
             self.assertEqual(users[0]['display_name'], 'old')
+            self.assertFalse(users[0]['team_leader'])
             self.assertEqual(store._user('u1')['enabled'], 1)
+            self.assertTrue(store.is_ready())
+            self.assertIsNone(store.get_project('legacy-project')['team_id'])
         finally:
             store.close()
 
@@ -406,6 +445,28 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get_project('p')['owner_id'], self.uid)
         self.assertEqual((await self.client.post(url, json=body, headers=headers)).status, 409)
         self.assertEqual((await self.client.post(url, json={'projects': [None], 'owner_id': self.uid}, headers=headers)).status, 400)
+
+    async def test_team_api_requires_leader_and_manages_members(self):
+        member = self.store.create_user('member', PASSWORD)
+        normal = self.store.create_user('normal', PASSWORD)
+        self.store.set_user(self.uid, team_leader=True)
+        self.store.set_ready()
+        session = await self.login('user')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        response = await self.client.post('/api/teams', json={'name': '项目一组'}, headers=headers)
+        self.assertEqual(response.status, 201)
+        team = (await response.json())['team']
+        candidates = await (await self.client.get('/api/team-candidates')).json()
+        self.assertIn(member['id'], {user['id'] for user in candidates['users']})
+        response = await self.client.post(f"/api/teams/{team['id']}/members",
+                                          json={'user_id': member['id']}, headers=headers)
+        self.assertEqual(response.status, 201)
+        self.assertEqual(len(self.store.list_teams(member['id'])[0]['members']), 2)
+        session = await self.login('normal')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        self.assertEqual((await self.client.post('/api/teams', json={'name': '越权'}, headers=headers)).status, 403)
+        self.assertEqual((await self.client.get('/api/teams')).status, 200)
+        self.assertEqual(normal['team_leader'], False)
 
     async def test_rate_limit_and_project_acl(self):
         session = await self.login('user')
