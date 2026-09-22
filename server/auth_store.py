@@ -48,7 +48,10 @@ class AuthStore:
             if version == 2:
                 self.db.executescript(migrations.joinpath('003_teams.sql').read_text(encoding='utf-8'))
                 version = 3
-            elif version != 3:
+            if version == 3:
+                self.db.executescript(migrations.joinpath('004_project_shares.sql').read_text(encoding='utf-8'))
+                version = 4
+            elif version != 4:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
                 'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader',
@@ -57,6 +60,8 @@ class AuthStore:
                 'project_acl': 'project_id,owner_id,state,created_at,team_id',
                 'teams': 'id,name,leader_id,state,created_at,updated_at',
                 'team_members': 'team_id,user_id,joined_at',
+                'project_user_shares': 'project_id,user_id,created_at',
+                'project_team_shares': 'project_id,team_id,created_at',
                 'job_acl': 'job_id,project_id,user_id', 'auth_meta': 'key,value',
                 'registration_requests': 'id,user_id,username,display_name,status,created_at,decided_at,decided_by,corp_id,out_track_id',
                 'notification_outbox': 'id,request_id,kind,dedupe_key,status,attempts,next_try_at,leased_until,created_at,last_error',
@@ -541,6 +546,102 @@ class AuthStore:
             self._check_actor(actor_id, session_token)
             self.db.execute('DELETE FROM user_grants WHERE viewer_id=? AND owner_id=?', (viewer_id, owner_id))
 
+    def _shareable_project(self, project_id, actor_id):
+        project = self.get_project(project_id)
+        if not project or project['state'] != 'active':
+            raise AuthError('画布不存在或已删除', 404)
+        actor = self._user(actor_id)
+        if not actor['enabled'] or actor['approval_status'] != 'approved':
+            raise AuthError('账号不可用', 403)
+        if project['team_id'] is not None:
+            raise AuthError('只有个人空间画布可以定向分享', 409)
+        if actor['role'] != 'admin' and project['owner_id'] != actor_id:
+            raise AuthError('只有画布所有者可以管理分享', 403)
+        return project
+
+    def list_project_shares(self, project_id, actor_id):
+        self._identifier(project_id, '画布 ID')
+        self._identifier(actor_id, '用户 ID')
+        with self.lock:
+            project = self._shareable_project(project_id, actor_id)
+            user_ids = [row[0] for row in self.db.execute(
+                'SELECT user_id FROM project_user_shares WHERE project_id=? ORDER BY user_id',
+                (project_id,))]
+            team_ids = [row[0] for row in self.db.execute(
+                'SELECT team_id FROM project_team_shares WHERE project_id=? ORDER BY team_id',
+                (project_id,))]
+            users = [dict(row) for row in self.db.execute(
+                "SELECT id,username,display_name FROM users WHERE enabled=1 AND approval_status='approved' "
+                'AND id!=? ORDER BY username_key,id', (project['owner_id'],))]
+            teams = [dict(row) for row in self.db.execute(
+                "SELECT id,name FROM teams WHERE state='active' ORDER BY name,id")]
+            return {'user_ids': user_ids, 'team_ids': team_ids,
+                    'users': users, 'teams': teams}
+
+    def set_project_shares(self, project_id, user_ids, team_ids, actor_id):
+        self._identifier(project_id, '画布 ID')
+        self._identifier(actor_id, '用户 ID')
+        if (not isinstance(user_ids, list) or not isinstance(team_ids, list)
+                or len(user_ids) > 1000 or len(team_ids) > 1000):
+            raise AuthError('分享对象清单不正确')
+        for uid in user_ids:
+            self._identifier(uid, '用户 ID')
+        for team_id in team_ids:
+            self._identifier(team_id, '项目组 ID')
+        if len(set(user_ids)) != len(user_ids) or len(set(team_ids)) != len(team_ids):
+            raise AuthError('分享对象不能重复')
+        with self._tx():
+            project = self._shareable_project(project_id, actor_id)
+            if project['owner_id'] in user_ids:
+                raise AuthError('不能把画布分享给自己')
+            for uid in user_ids:
+                user = self._user(uid)
+                if not user['enabled'] or user['approval_status'] != 'approved':
+                    raise AuthError('只能分享给已启用且审批通过的账号', 409)
+            for team_id in team_ids:
+                team = self.db.execute(
+                    "SELECT 1 FROM teams WHERE id=? AND state='active'", (team_id,)).fetchone()
+                if team is None:
+                    raise AuthError('项目组不存在或已删除', 409)
+            now = time.time()
+            self.db.execute('DELETE FROM project_user_shares WHERE project_id=?', (project_id,))
+            self.db.execute('DELETE FROM project_team_shares WHERE project_id=?', (project_id,))
+            self.db.executemany(
+                'INSERT INTO project_user_shares(project_id,user_id,created_at) VALUES(?,?,?)',
+                [(project_id, uid, now) for uid in user_ids])
+            self.db.executemany(
+                'INSERT INTO project_team_shares(project_id,team_id,created_at) VALUES(?,?,?)',
+                [(project_id, team_id, now) for team_id in team_ids])
+        return self.list_project_shares(project_id, actor_id)
+
+    def _project_share_summary(self, user, project):
+        project_id = project['project_id']
+        user_count = self.db.execute(
+            'SELECT COUNT(*) FROM project_user_shares WHERE project_id=?', (project_id,)).fetchone()[0]
+        team_count = self.db.execute(
+            'SELECT COUNT(*) FROM project_team_shares WHERE project_id=?', (project_id,)).fetchone()[0]
+        if user['role'] == 'admin' or project['owner_id'] == user['id']:
+            team_ids = [row[0] for row in self.db.execute(
+                'SELECT team_id FROM project_team_shares WHERE project_id=? ORDER BY team_id',
+                (project_id,))]
+        else:
+            team_ids = [row[0] for row in self.db.execute(
+                'SELECT s.team_id FROM project_team_shares s '
+                'JOIN team_members m ON m.team_id=s.team_id '
+                "JOIN teams t ON t.id=s.team_id AND t.state='active' "
+                'WHERE s.project_id=? AND m.user_id=? ORDER BY s.team_id',
+                (project_id, user['id']))]
+        direct = self.db.execute(
+            'SELECT 1 FROM project_user_shares WHERE project_id=? AND user_id=?',
+            (project_id, user['id'])).fetchone() is not None
+        owner_grant = self.db.execute(
+            'SELECT 1 FROM user_grants WHERE viewer_id=? AND owner_id=?',
+            (user['id'], project['owner_id'])).fetchone() is not None
+        return {'share_count': user_count + team_count,
+                'shared_team_ids': team_ids,
+                'shared_personally': direct or owner_grant
+                or (user['role'] == 'admin' and project['owner_id'] != user['id'])}
+
     def create_project(self, project_id, owner_id, state='active', team_id=None):
         self._identifier(project_id, '画布 ID')
         if state not in ('pending', 'active', 'deleted'):
@@ -619,6 +720,18 @@ class AuthStore:
                 return 'operate' if member else None
             if project['owner_id'] == user_id:
                 return 'operate'
+            direct = self.db.execute(
+                'SELECT 1 FROM project_user_shares WHERE project_id=? AND user_id=?',
+                (project_id, user_id)).fetchone()
+            if direct:
+                return 'operate'
+            team_share = self.db.execute(
+                'SELECT 1 FROM project_team_shares s '
+                'JOIN team_members m ON m.team_id=s.team_id '
+                "JOIN teams t ON t.id=s.team_id AND t.state='active' "
+                'WHERE s.project_id=? AND m.user_id=? LIMIT 1', (project_id, user_id)).fetchone()
+            if team_share:
+                return 'operate'
             row = self.db.execute('SELECT permission FROM user_grants WHERE viewer_id=? AND owner_id=?',
                                   (user_id, project['owner_id'])).fetchone()
             return row[0] if row else None
@@ -627,14 +740,37 @@ class AuthStore:
         self._identifier(user_id, '用户 ID')
         with self.lock:
             result = []
+            user = self.get_user(user_id)
+            if not user or not user['enabled'] or user['approval_status'] != 'approved':
+                return result
             for row in self.db.execute(
                     'SELECT p.*,u.username AS owner_username,t.name AS team_name FROM project_acl p '
                     'JOIN users u ON u.id=p.owner_id LEFT JOIN teams t ON t.id=p.team_id '
                     'ORDER BY p.created_at,p.project_id'):
                 permission = self.project_permission(user_id, row['project_id'])
                 if permission:
-                    result.append(dict(row) | {'permission': permission})
+                    sharing = ({'share_count': 0, 'shared_team_ids': [], 'shared_personally': False}
+                               if row['team_id'] is not None else self._project_share_summary(user, row))
+                    result.append(dict(row) | {'permission': permission} | sharing)
             return result
+
+    def get_project_for_user(self, user_id, project_id):
+        self._identifier(user_id, '用户 ID')
+        self._identifier(project_id, '画布 ID')
+        with self.lock:
+            permission = self.project_permission(user_id, project_id)
+            if permission is None:
+                return None
+            row = self.db.execute(
+                'SELECT p.*,u.username AS owner_username,t.name AS team_name FROM project_acl p '
+                'JOIN users u ON u.id=p.owner_id LEFT JOIN teams t ON t.id=p.team_id '
+                'WHERE p.project_id=?', (project_id,)).fetchone()
+            if row is None:
+                return None
+            user = self.get_user(user_id)
+            sharing = ({'share_count': 0, 'shared_team_ids': [], 'shared_personally': False}
+                       if row['team_id'] is not None else self._project_share_summary(user, row))
+            return dict(row) | {'permission': permission} | sharing
 
     def set_project_state(self, project_id, state):
         self._identifier(project_id, '画布 ID')

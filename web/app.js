@@ -1128,11 +1128,19 @@ async function health() {
 }
 
 /* ================= 项目栏 ================= */
-const projectSpace = project => project.team_id ? `team:${project.team_id}`
-  : String(project.owner_id) === String(H3Auth.user?.id) ? 'personal' : 'shared';
+function projectSpaces(project) {
+  if (project.team_id) return [`team:${project.team_id}`];
+  const own = String(project.owner_id) === String(H3Auth.user?.id);
+  const spaces = own ? ['personal'] : [];
+  if (!own && project.shared_personally) spaces.push('shared');
+  for (const teamId of project.shared_team_ids || []) spaces.push(`team:${teamId}`);
+  // 兼容既有 owner 全量授权和管理员全局访问返回的个人画布。
+  if (!own && !spaces.length) spaces.push('shared');
+  return spaces;
+}
 function syncSpaceOptions() {
   const options = [{value:'personal', label:'个人空间'}];
-  if (projects.some(project => projectSpace(project) === 'shared')) options.push({value:'shared', label:'共享给我的画布'});
+  if (projects.some(project => projectSpaces(project).includes('shared'))) options.push({value:'shared', label:'共享给我的画布'});
   for (const team of teams) options.push({value:`team:${team.id}`, label:team.name});
   if (!options.some(option => option.value === selectedSpace)) selectedSpace = 'personal';
   el.spaceSelect.replaceChildren();
@@ -1144,7 +1152,7 @@ function syncSpaceOptions() {
     : selectedSpace === 'shared' ? '由画布所有者授权共享'
     : '项目组画布由全体组员共享';
 }
-const visibleProjects = () => projects.filter(project => projectSpace(project) === selectedSpace);
+const visibleProjects = () => projects.filter(project => projectSpaces(project).includes(selectedSpace));
 
 async function loadProjects() {
   if (!H3Auth.active) return;
@@ -1156,7 +1164,8 @@ async function loadProjects() {
       const changed = PROJ.permission !== latest.permission;
       Object.assign(PROJ, {permission:latest.permission, owner_id:latest.owner_id,
         owner_username:latest.owner_username, team_id:latest.team_id, team_name:latest.team_name,
-        name:latest.name, locked:latest.locked});
+        share_count:latest.share_count, shared_team_ids:latest.shared_team_ids,
+        shared_personally:latest.shared_personally, name:latest.name, locked:latest.locked});
       if (changed) { closePanel(); closeHistory(); render(); }
     }
   }
@@ -1170,10 +1179,23 @@ async function loadProjects() {
     d.innerHTML = '<span class="nm"></span><span class="ct"></span>'
       + (p.locked || !canOperate(p) ? '' : '<button class="ren" title="重命名">✎</button><button class="del" title="删除">✕</button>');
     d.querySelector('.ct').textContent = String(p.cards ?? 0);
+    if (p.share_count > 0) {
+      const shared = document.createElement('span'); shared.className = 'pshare';
+      shared.textContent = '↗'; shared.title = `已分享给 ${p.share_count} 个个人或项目组`;
+      d.querySelector('.ct').after(shared);
+    }
     d.title = `${p.team_name || p.owner_username || ''} · ${p.permission === 'operate' ? '可操作' : '只读'}`;
     const nm = d.querySelector(".nm");
     nm.textContent = p.name;
     d.onclick = () => openProject(p.id);
+    const canShare = selectedSpace === 'personal' && !p.team_id
+      && String(p.owner_id) === String(H3Auth.user?.id) && !p.locked;
+    if (canShare) d.oncontextmenu = (ev) => {
+      ev.preventDefault(); ev.stopPropagation();
+      showMenu(ev.clientX, ev.clientY, p.name || '未命名画布', [
+        {icon:'↗', text:'分享给个人或项目组', run:() => openShareDialog(p)},
+      ]);
+    };
     const ren = d.querySelector(".ren");
     if (ren) ren.onclick = (ev) => { ev.stopPropagation(); renameProject(p); };
     if (!p.locked && canOperate(p)) nm.ondblclick = (ev) => { ev.stopPropagation(); renameProject(p); };
@@ -1187,6 +1209,65 @@ async function loadProjects() {
     };
     el.plist.appendChild(d);
   }
+}
+
+async function openShareDialog(project) {
+  let data;
+  try { data = await api(`/api/projects/${encodeURIComponent(project.id)}/shares`); }
+  catch (error) { return toast('共享设置加载失败：' + error.message); }
+
+  const dialog = document.createElement('dialog');
+  dialog.className = 'auth-dialog project-share-dialog';
+  const form = document.createElement('form');
+  const title = document.createElement('h2'); title.textContent = `分享「${project.name || '未命名画布'}」`;
+  const note = document.createElement('p'); note.className = 'auth-note';
+  note.textContent = '被选中的个人或项目组成员可以共同查看、编辑和运行这张画布。画布仍保留在你的个人空间。';
+  const columns = document.createElement('div'); columns.className = 'share-columns';
+
+  const buildGroup = (heading, kind, items, selected, emptyText) => {
+    const section = document.createElement('section'); section.className = 'share-targets';
+    const h3 = document.createElement('h3'); h3.textContent = heading; section.appendChild(h3);
+    const list = document.createElement('div'); list.className = 'share-target-list';
+    for (const item of items) {
+      const label = document.createElement('label'); label.className = 'share-target';
+      const input = document.createElement('input'); input.type = 'checkbox';
+      input.name = kind; input.value = item.id; input.checked = selected.includes(item.id);
+      const text = document.createElement('span');
+      text.textContent = item.name || item.username;
+      if (item.display_name) text.textContent += `（${item.display_name}）`;
+      label.append(input, text); list.appendChild(label);
+    }
+    if (!items.length) { const empty = document.createElement('p'); empty.className = 'auth-note'; empty.textContent = emptyText; list.appendChild(empty); }
+    section.appendChild(list); return section;
+  };
+
+  columns.append(
+    buildGroup('个人', 'user_ids', data.users || [], data.user_ids || [], '暂无可分享的其他账号'),
+    buildGroup('项目组', 'team_ids', data.teams || [], data.team_ids || [], '暂无可分享的项目组'),
+  );
+  const error = document.createElement('p'); error.setAttribute('role', 'alert');
+  const footer = document.createElement('footer');
+  const cancel = document.createElement('button'); cancel.type = 'button'; cancel.className = 'btn'; cancel.textContent = '取消';
+  const submit = document.createElement('button'); submit.className = 'btn primary'; submit.textContent = '确定分享';
+  footer.append(cancel, submit); form.append(title, note, columns, error, footer); dialog.appendChild(form);
+  cancel.onclick = () => dialog.close();
+  dialog.addEventListener('close', () => dialog.remove());
+  dialog.addEventListener('click', ev => { if (ev.target === dialog) dialog.close(); });
+  form.onsubmit = async ev => {
+    ev.preventDefault(); submit.disabled = true; submit.textContent = '保存中…'; error.textContent = '';
+    const checked = name => [...form.querySelectorAll(`input[name="${name}"]:checked`)].map(input => input.value);
+    const body = {user_ids:checked('user_ids'), team_ids:checked('team_ids')};
+    try {
+      await H3Auth.json(`/api/projects/${encodeURIComponent(project.id)}/shares`, 'PUT', body);
+      dialog.close(); await loadProjects();
+      toast(body.user_ids.length + body.team_ids.length
+        ? `已分享给 ${body.user_ids.length + body.team_ids.length} 个个人或项目组`
+        : '已取消全部分享');
+    } catch (saveError) {
+      error.textContent = saveError.message; submit.disabled = false; submit.textContent = '确定分享';
+    }
+  };
+  document.body.appendChild(dialog); dialog.showModal();
 }
 
 async function newProject() {
@@ -1230,7 +1311,8 @@ async function openProject(pid) {
   const opening = ++openingProject;
   try { const project = await api(`/api/projects/${encodeURIComponent(pid)}`); if (opening !== openingProject || !H3Auth.active) return; PROJ = project; }
   catch (e) { return toast(e.message); }
-  selectedSpace = projectSpace(PROJ);
+  const spaces = projectSpaces(PROJ);
+  if (!spaces.includes(selectedSpace)) selectedSpace = spaces[0] || 'personal';
   syncSpaceOptions();
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
@@ -2379,7 +2461,7 @@ function bindGlobal() {
   $("#createHere").onclick = newProject;
   el.spaceSelect.onchange = () => {
     selectedSpace = el.spaceSelect.value;
-    if (PROJ && projectSpace(PROJ) !== selectedSpace) clearProject();
+    if (PROJ && !projectSpaces(PROJ).includes(selectedSpace)) clearProject();
     syncSpaceOptions(); loadProjects();
   };
   // 底部工具条：新建节点的唯一入口。上传直接建素材节点，图片/视频/工具箱摊开各自节点里的玩法
