@@ -1,0 +1,65 @@
+{
+ "id": "depth_video",
+ "name": "深度视频",
+ "file": "深度视频",
+ "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\深度转换\\深度视频.json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "tool",
+ "card": "card_tools",
+ "slots": "img0+aud0+vid1",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 0
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 1,
+   "max": 1
+  }
+ },
+ "graph": "graphs/depth_video.api.json",
+ "output": {
+  "node": "88"
+ },
+ "note": "使用 Depth Anything 3 逐帧生成视频深度图，并保留原视频音频和帧率。长视频会占用较多显存，建议先用短片段测试。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "video[0]",
+   "label": "视频",
+   "type": "video",
+   "required": true,
+   "target": {
+    "node": "100",
+    "input": "video",
+    "kind": "upload_video"
+   }
+  },
+  {
+   "key": "frame_load_cap",
+   "label": "只处理前几帧",
+   "type": "slider",
+   "min": 0,
+   "max": 300,
+   "step": 15,
+   "default": 0,
+   "hint": "0 = 整段都处理。跑不动或者只想先看效果，就填 60（约 2 秒）试一版，满意了再改回 0",
+   "advanced": false,
+   "target": {
+    "node": "100",
+    "input": "frame_load_cap",
+    "vtype": "INT"
+   }
+  }
+ ],
+ "warnings": []
+}
