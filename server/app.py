@@ -53,6 +53,7 @@ from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
 from server.auth import (auth_middleware, register_auth_routes, require_user, require_admin,
                          require_project, require_job, call_store, setup_local_test_auth)
 from server.resource_access import ResourceAccess
+from server.image_controls import image_controls, patch_image_controls
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -271,6 +272,9 @@ def load_caps():
         if f.name.startswith("_"):
             continue
         m = json.loads(f.read_text(encoding="utf-8"))
+        controls = image_controls(m["id"])
+        if controls is not None:
+            m["imageControls"] = controls
         gp = ROOT / m["graph"]
         m["_graph_ok"] = gp.exists()
         CAPS[m["id"]] = m
@@ -602,6 +606,10 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
         raise web.HTTPBadRequest(
             reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
     patch_h3_character_transfer(g, cap, params, uploaded, video_metadata)
+    try:
+        patch_image_controls(g, cap["id"], params)
+    except ValueError as exc:
+        raise web.HTTPBadRequest(reason=str(exc)) from exc
     return g
 
 
@@ -933,9 +941,9 @@ async def api_generate(request):
     graph = patch_graph(cap, params, uploaded, video_metadata)
     if body.get("dry_run"):
         tpl = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
-        diff = {f"#{n}.{k}": [tpl[n]["inputs"].get(k), v]
+        diff = {f"#{n}.{k}": [tpl.get(n, {}).get("inputs", {}).get(k), v]
                 for n, nd in graph.items() for k, v in nd["inputs"].items()
-                if tpl[n]["inputs"].get(k) != v}
+                if n not in tpl or tpl[n]["inputs"].get(k) != v}
         diff.update({f"#{n}.{k}": [v, "<断开>"]           # dropIfEmpty 拔掉的线
                      for n, nd in tpl.items() for k, v in nd["inputs"].items()
                      if k not in graph[n]["inputs"]})
