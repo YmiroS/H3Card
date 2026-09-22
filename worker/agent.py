@@ -296,9 +296,9 @@ class WorkerAgent:
         self.sync_report = {
             "request_id": request_id,
             "status": "running",
-            "message": "正在同步模型和用户目录",
+            "message": "正在同步 ComfyUI、模型和用户目录",
         }
-        print(f"[Worker] 开始同步模型和用户目录：{request_id}", flush=True)
+        print(f"[Worker] 开始同步 ComfyUI、模型和用户目录：{request_id}", flush=True)
         try:
             if os.name != "nt":
                 raise AgentError("文件同步脚本只能在 Windows Worker 上运行")
@@ -306,7 +306,7 @@ class WorkerAgent:
             if not script.is_file():
                 raise AgentError(f"找不到同步脚本：{script}")
             process = await asyncio.create_subprocess_exec(
-                "cmd.exe", "/d", "/c", str(script), "--non-interactive",
+                "cmd.exe", "/d", "/c", str(script), "--upgrade", "--non-interactive",
                 cwd=str(script.parent),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
@@ -321,7 +321,7 @@ class WorkerAgent:
             self.sync_report = {
                 "request_id": request_id,
                 "status": "done",
-                "message": message or "模型和用户目录同步完成",
+                "message": message or "ComfyUI、模型和用户目录同步完成",
             }
             print(f"[Worker] 文件同步完成：{request_id}", flush=True)
         except Exception as exc:
