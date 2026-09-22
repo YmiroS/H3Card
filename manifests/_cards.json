@@ -40,7 +40,7 @@
    },
    {
     "id": "qwen_image_21_multi",
-    "name": "Qwen 2.1 多图编辑",
+    "name": "Qwen 2.1 多图编辑（最多16张）",
     "slots": "img16+aud0+vid0"
    }
   ]

@@ -1,6 +1,6 @@
 {
  "id": "qwen_image_21_multi",
- "name": "Qwen 2.1 多图编辑",
+ "name": "Qwen 2.1 多图编辑（最多16张）",
  "file": "【SevnFading】Qwen-Image-2.1 多合一工作流",
  "source": "../ComfyUI/user/default/workflows/Qwen_image_2.1/【SevnFading】Qwen-Image-2.1 多合一工作流.json",
  "group": "图片",
