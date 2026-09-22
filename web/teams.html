@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>项目组 · 抽卡系统</title><link rel="icon" type="image/png" href="/favicon.png"><link rel="stylesheet" href="/style.css"></head>
+<body class="auth-page permissions-page">
+<main class="perm-page">
+<header class="perm-header">
+  <div class="brandmark"><img src="/icon.png" alt=""><b>抽卡系统</b></div>
+  <nav aria-label="项目组导航"><a class="tbtn" href="/">画布</a><a id="permissions-link" class="tbtn" href="/admin/permissions" hidden>账号与权限</a></nav>
+  <div id="account" class="account-bar"></div>
+</header>
+<div class="perm-intro"><h1>项目组</h1><p>创建项目组并添加组员。项目组空间中的全部画布由所有组员共同查看和编辑。</p></div>
+<p id="error" role="alert"></p>
+<section class="perm-section" aria-labelledby="create-heading">
+  <div class="perm-description"><h2 id="create-heading">新建项目组</h2><p class="auth-note">创建者自动成为组长和首位成员。</p></div>
+  <div class="perm-content"><form id="create-team" class="form-row"><label class="fld"><span>项目组名称</span><input name="name" maxlength="64" required autocomplete="off" placeholder="例如：短剧项目 A 组"></label><button class="btn primary">创建项目组</button></form></div>
+</section>
+<section class="perm-section" aria-labelledby="teams-heading">
+  <div class="perm-description"><h2 id="teams-heading">项目组与组员</h2><p class="auth-note">组员被移除后会立即失去该组画布、任务和素材的访问权限。</p></div>
+  <div id="team-list" class="perm-content team-list"></div>
+</section>
+</main>
+<script src="/auth.js"></script><script>
+const $ = id => document.getElementById(id);
+let teams = [], candidates = [];
+const cell = (row, value) => { const td = document.createElement('td'); td.textContent = value; row.append(td); return td; };
+function identity(user) {
+  const wrap = document.createElement('span'); wrap.className = 'perm-identity';
+  const avatar = document.createElement('span'); avatar.className = 'perm-avatar'; avatar.setAttribute('aria-hidden','true'); avatar.textContent = Array.from(String(user.username))[0]?.toUpperCase() || '?';
+  const detail = document.createElement('span'); detail.className = 'perm-identity-detail';
+  const name = document.createElement('span'); name.className = 'perm-username'; name.textContent = user.username;
+  const meta = document.createElement('span'); meta.className = 'perm-user-id'; meta.textContent = user.display_name || ('ID: ' + user.id);
+  detail.append(name, meta); wrap.append(avatar, detail); return wrap;
+}
+async function refresh() {
+  const [teamData, userData] = await Promise.all([H3Auth.request('/api/teams'), H3Auth.request('/api/team-candidates')]);
+  teams = teamData.teams; candidates = userData.users; render();
+}
+function render() {
+  const list = $('team-list'); list.replaceChildren();
+  for (const team of teams) {
+    const card = document.createElement('article'); card.className = 'team-card';
+    const header = document.createElement('header');
+    const title = document.createElement('div');
+    const h3 = document.createElement('h3'); h3.textContent = team.name;
+    const meta = document.createElement('p'); meta.className = 'auth-note'; meta.textContent = '组长：' + team.leader_username + ' · ' + team.members.length + ' 名成员';
+    title.append(h3, meta); header.append(title); card.append(header);
+    if (team.can_manage) {
+      const form = document.createElement('form'); form.className = 'form-row team-add-member';
+      const field = document.createElement('label'); field.className = 'fld';
+      const caption = document.createElement('span'); caption.textContent = '添加组员';
+      const select = document.createElement('select'); select.required = true;
+      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '请选择账号'; select.append(placeholder);
+      const memberIds = new Set(team.members.map(member => String(member.id)));
+      for (const user of candidates.filter(user => !memberIds.has(String(user.id)))) { const option = document.createElement('option'); option.value = user.id; option.textContent = user.username + (user.display_name ? '（' + user.display_name + '）' : ''); select.append(option); }
+      const submit = document.createElement('button'); submit.className = 'btn primary'; submit.textContent = '添加'; submit.disabled = select.options.length === 1;
+      field.append(caption, select); form.append(field, submit);
+      form.onsubmit = event => perform(async () => { event.preventDefault(); await H3Auth.json('/api/teams/' + encodeURIComponent(team.id) + '/members','POST',{user_id:select.value}); });
+      card.append(form);
+    }
+    const scroll = document.createElement('div'); scroll.className = 'table-scroll';
+    const table = document.createElement('table'); table.className = 'perm-table'; table.innerHTML = '<thead><tr><th>组员</th><th>身份</th><th>状态</th><th>操作</th></tr></thead>';
+    const body = document.createElement('tbody');
+    for (const member of team.members) {
+      const row = document.createElement('tr'); cell(row,'').append(identity(member));
+      cell(row, member.id === team.leader_id ? '组长' : '组员'); cell(row, member.enabled ? '启用' : '已停用');
+      const actions = cell(row,''); actions.className = 'acts';
+      if (team.can_manage && member.id !== team.leader_id) { const remove = document.createElement('button'); remove.className = 'btn sm danger'; remove.textContent = '移除'; remove.onclick = () => { if (confirm('移除 ' + member.username + '？该账号会立即失去项目组画布访问权限。')) perform(() => H3Auth.request('/api/teams/' + encodeURIComponent(team.id) + '/members/' + encodeURIComponent(member.id),{method:'DELETE'})); }; actions.append(remove); }
+      body.append(row);
+    }
+    table.append(body); scroll.append(table); card.append(scroll); list.append(card);
+  }
+  if (!teams.length) { const empty = document.createElement('p'); empty.className = 'auth-note'; empty.textContent = '暂无项目组。请先创建一个项目组。'; list.append(empty); }
+}
+async function perform(action) { $('error').textContent = ''; try { await action(); await refresh(); } catch (error) { $('error').textContent = error.message; } }
+$('create-team').onsubmit = event => { event.preventDefault(); const form = event.currentTarget; perform(async () => { await H3Auth.json('/api/teams','POST',{name:form.elements.name.value}); form.reset(); }); };
+H3Auth.requireUser().then(user => { if (user.role !== 'admin' && !user.team_leader) throw new Error('仅管理员或组长可访问'); $('permissions-link').hidden = user.role !== 'admin'; H3Auth.mountAccount($('account')); return refresh(); }).catch(error => { $('error').textContent = error.message; });
+</script></body></html>
