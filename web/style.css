@@ -1554,9 +1554,10 @@ body.auth-page { display: block; overflow: auto; }
 .project-share-dialog .share-targets { min-width: 0; padding: 12px; border: 1px solid var(--line); border-radius: 7px; background: var(--panel2); }
 .project-share-dialog .share-targets h3 { margin: 0 0 9px; font-size: 12px; color: var(--txt); }
 .project-share-dialog .share-target-list { display: grid; align-content: start; gap: 5px; max-height: 300px; overflow: auto; }
-.project-share-dialog .share-target { display: flex; align-items: center; gap: 9px; padding: 7px 8px; border-radius: 5px; cursor: pointer; }
+.project-share-dialog .share-target { display: flex; align-items: center; gap: 9px; padding: 7px 8px; border-radius: 5px; color: var(--txt); cursor: pointer; }
 .project-share-dialog .share-target:hover { background: #00e5ff12; }
-.project-share-dialog .share-target input { flex: none; }
+.project-share-dialog .share-target input { flex: none; width: 16px; height: 16px; margin: 0; padding: 0; }
+.project-share-dialog .share-target span { min-width: 0; overflow-wrap: anywhere; }
 @media (max-width: 620px) { .project-share-dialog .share-columns { grid-template-columns: 1fr; } }
 
 .auth-page .fld, .auth-dialog .fld { display: grid; gap: 5px; }
