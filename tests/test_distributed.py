@@ -725,6 +725,30 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNone(await self.agent.acquire())
                 self.assertEqual(len(self.requests), count)
 
+    async def test_connection_loss_during_cancel_retries_targeted_cleanup(self):
+        for error in (
+                aiohttp.ClientOSError(64, "指定的网络名不再可用"),
+                aiohttp.ClientPayloadError("response body disconnected")):
+            with self.subTest(error=error):
+                self.agent._json_request = mock.AsyncMock(side_effect=[
+                    error, {"cancelled": False, "cleanup_complete": True},
+                ])
+
+                released = await self.agent.cancel_and_release(self.assignment)
+
+                self.assertTrue(released)
+                self.assertIsNone(self.agent.release_failed)
+                self.assertEqual(self.agent._json_request.await_count, 2)
+                for request in self.agent._json_request.await_args_list:
+                    method, url = request.args
+                    self.assertEqual(
+                        (method, url),
+                        ("POST", "http://comfy/api/jobs/job-1/cancel"),
+                    )
+                    self.assertEqual(request.kwargs["json"], {"free_memory": True})
+                    self.assertEqual(request.kwargs["timeout"].total, 130)
+                    self.assertEqual(request.kwargs["timeout"].sock_connect, 15)
+
     async def test_release_failed_gate_recovers_after_comfy_confirms_cleanup(self):
         self.agent.release_failed = "显存释放未确认"
         self.agent._json_request = mock.AsyncMock(
