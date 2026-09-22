@@ -130,12 +130,12 @@ MODEL_SWITCHES = {
     "zimage_t2i": {"zimage": "zimage_t2i", "krea2": "krea2_t2i",
                    "qwen2512": "qwen_image_2512_t2i", "qwen21": "qwen_image_21_t2i"},
     "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i",
-                   "qwen2511": "qwen_image_edit_2511_i2i", "qwen21": "qwen_image_21_i2i"},
+                   "qwen2511": "qwen_image_edit_2511_i2i", "qwen21": "qwen_image_21_multi"},
 }
 
 # API 图和输入槽随项目维护，不依赖原作者本机的界面工作流路径。
 # Qwen 图生图固定编辑分支；文生图保留双阶段和独立负向输入，防止重扫合并两阶段步数。
-# Qwen 2.1 固定拆出文生图、单图和16图编辑，避免按原文件旁路状态丢掉多图分支。
+# Qwen 2.1 的图生图模型直接使用16图编辑能力；旧单图能力只保留给历史任务和项目迁移。
 BUNDLED_CAPABILITIES = {
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
@@ -1758,6 +1758,8 @@ def build_modes(ms):
     张数是多余的；更糟的是选了首尾帧却只传一张，模板自带的演示尾帧会顶上来照跑。
     合并后张数说话，模式列表也短了。
     """
+    # 旧能力仍保留给历史任务和项目迁移，但不再作为可新建的独立模式。
+    ms = [m for m in ms if not m.get("_hiddenMode")]
     fam = {}
     for m in ms:
         fam.setdefault(fingerprint(m), []).append(m)

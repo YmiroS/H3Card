@@ -25,7 +25,7 @@
      "zimage": "zimage_i2i",
      "krea2": "krea2_i2i",
      "qwen2511": "qwen_image_edit_2511_i2i",
-     "qwen21": "qwen_image_21_i2i"
+     "qwen21": "qwen_image_21_multi"
     }
    },
    {
@@ -37,11 +37,6 @@
     "id": "flux2_klein_edit",
     "name": "参考图编辑(保人物)",
     "slots": "img2+aud0+vid0"
-   },
-   {
-    "id": "qwen_image_21_multi",
-    "name": "Qwen 2.1 多图编辑（最多16张）",
-    "slots": "img16+aud0+vid0"
    }
   ]
  },

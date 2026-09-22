@@ -17,6 +17,7 @@
  "note": "Qwen Image 2.1 单图编辑：图1为必填主图，在提示词中说明要保留和修改的内容。基础参数默认按主图比例输出，也可另选画面比例；清晰度按短边档位设置，实际像素按模型要求对齐。保留原工作流 40 步、CFG 1、euler/simple 配置；参考图编码尺寸不是输出尺寸。需要包含 QwenImage21Cache、TextEncodeQwenImage21 的 ComfyUI 版本及原版模型 qwen_image_2.1_int8_convrot.safetensors、qwen3vl_8b_fp8_scaled.safetensors、qwen_image_2.1_vae_bf16.safetensors。已在 ComfyUI 0.37.0 完成实际单图编辑验证。",
  "rewrite": null,
  "compare": true,
+ "_hiddenMode": true,
  "inputs": [
   {
    "key": "images[0]", "label": "图1（主图）", "type": "image", "required": true,

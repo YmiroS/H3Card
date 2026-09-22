@@ -199,7 +199,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal((await submit()).params.negative_prompt, '', 'keyboard clearing also submits an explicit blank');
     });
 
-    await t.test('Qwen 2.1 model switches expose working parameters and submit separate single/multi-image modes', async () => {
+    await t.test('Qwen 2.1 model switch uses the sixteen-image workflow inside image-to-image mode', async () => {
       await reset('zimage_t2i');
       await chooseModel('Qwen Image 2.1');
       assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'qwen_image_21_t2i');
@@ -215,19 +215,10 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(payload.params.steps, 24);
       assert.equal(payload.params.aspect_ratio, '16:9 (Widescreen)');
       assert.deepEqual(payload.assets, {});
-      await chooseMode('图生图');
-      assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'qwen_image_21_i2i');
-      assert.match(await page.locator('#panel .refhead').innerText(), /图片 1/);
-      const chooser = page.waitForEvent('filechooser');
-      await page.locator('#panel .refadd').click();
-      await (await chooser).setFiles({name:'qwen21.png', mimeType:'image/png', buffer:png});
-      await page.waitForFunction(() => !!PROJ.cards[0].assets['images[0]']);
-      payload = await submit();
-      assert.equal(payload.capability, 'qwen_image_21_i2i');
-      assert.deepEqual(Object.keys(payload.assets), ['images[0]']);
 
-      await chooseMode('Qwen 2.1 多图编辑（最多16张）');
-      assert.equal(await modelButton.count(), 0);
+      await chooseMode('图生图');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].cap), 'qwen_image_21_multi');
+      assert.match(await modelButton.innerText(), /^Qwen Image 2.1/);
       assert.match(await page.locator('#panel .refhead').innerText(), /图片 16/);
       await paramsButton.click();
       assert.equal(await page.locator('#respop').isVisible(), true);
@@ -237,7 +228,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(await pixels.locator('input[type="number"]').inputValue(), '1536');
       await pixels.locator('input[type="number"]').fill('1024');
       await page.locator('#respop .x').click();
-      for (let i = 1; i < 16; i++) {
+      for (let i = 0; i < 16; i++) {
         const chooser = page.waitForEvent('filechooser');
         await page.locator('#panel .refadd').click();
         await (await chooser).setFiles({name:`qwen21-${i}.png`, mimeType:'image/png', buffer:png});
@@ -249,6 +240,9 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(payload.params.reference_pixels, 1024);
       assert.equal(Object.keys(payload.assets).length, 16);
       assert.equal(Object.hasOwn(payload.params, 'aspect_ratio'), false);
+      await page.locator('#panel button[title="生图模式 —— 点击换"]').click();
+      assert.equal(await page.locator('#menu button').filter({hasText:'Qwen 2.1 多图编辑'}).count(), 0);
+      await page.keyboard.press('Escape');
     });
 
     await t.test('prompt mention menu groups current assets and prioritizes connected canvas nodes', async () => {
