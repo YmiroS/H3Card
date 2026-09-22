@@ -798,6 +798,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 /* ---------- ⚙ 参数弹窗（清晰度 + 比例选择器，照参考图） ---------- */
 #respop {
   position: fixed; z-index: 50; width: 380px; padding: 12px 14px 14px;
+  max-height: calc(100vh - 80px); overflow-y: auto;
   background: #080c17f7; border: 1px solid var(--acc); border-radius: 4px;
   backdrop-filter: blur(10px);
   box-shadow: 0 14px 44px #000d, 0 0 22px #00e5ff2e;
@@ -810,6 +811,15 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   margin: 10px 0 6px; font-size: 12px; color: var(--dim); letter-spacing: 1px;
 }
 .cpick .ctitle:first-child { margin-top: 0; }
+.image-size-hint { margin-top: 8px; color: var(--dim); font-size: 11px; line-height: 1.6; }
+.image-advanced { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 9px; }
+.image-advanced summary { cursor: pointer; color: var(--dim); font-size: 12px; margin-bottom: 8px; }
+#respop .image-size-controls .cgrid.k { grid-template-columns: repeat(5, 1fr); }
+#respop .image-size-controls .cgrid.k button { justify-content: center; }
+#respop .image-basic .row, #respop .image-advanced .row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; }
+#respop .image-basic .row > label { flex: 0 0 64px; color: var(--dim); }
+#respop .image-advanced .row > label { flex: 0 0 92px; color: var(--dim); }
+#respop .image-basic input[type=range], #respop .image-advanced input[type=range] { flex: 1; min-width: 0; accent-color: #d4d4d8; }
 .cgrid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px; }
 .cgrid.k { grid-template-columns: repeat(4, 1fr); }
 /* 比例格：上面一块小示意图（按真实纵横比画），下面文字。选中=青框亮 */
