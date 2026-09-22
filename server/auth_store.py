@@ -40,10 +40,10 @@ class AuthStore:
             if version == 0:
                 if self.db.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchone():
                     raise AuthError('拒绝初始化无版本的非空数据库')
-                self.db.executescript(migrations.joinpath('001_auth.sql').read_text())
+                self.db.executescript(migrations.joinpath('001_auth.sql').read_text(encoding='utf-8'))
                 version = 1
             if version == 1:
-                self.db.executescript(migrations.joinpath('002_registration.sql').read_text())
+                self.db.executescript(migrations.joinpath('002_registration.sql').read_text(encoding='utf-8'))
                 version = 2
             elif version != 2:
                 raise AuthError('不支持的认证数据库版本')

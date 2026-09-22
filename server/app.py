@@ -51,7 +51,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.auth_store import AuthStore
 from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
 from server.auth import (auth_middleware, register_auth_routes, require_user, require_admin,
-                         require_project, require_job, call_store)
+                         require_project, require_job, call_store, setup_local_test_auth)
 from server.resource_access import ResourceAccess
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
@@ -2108,7 +2108,10 @@ async def on_start(app):
         ResourceAccess, app["auth_store"], ROOT, COMFY_INPUT)
     app["session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
-    setup_dingtalk(app, app["auth_store"])
+    if app["local_test"]:
+        await setup_local_test_auth(app)
+    else:
+        setup_dingtalk(app, app["auth_store"])
     if not CONTROLLER_MODE:
         app["ws_task"] = asyncio.create_task(ws_loop(app))
 
@@ -2175,6 +2178,9 @@ async def no_cache(request, response):
 
 
 def make_app(auth_path=None):
+    local_test = os.environ.get("CHOUKA_LOCAL_TEST") == "1"
+    if local_test and (CONTROLLER_MODE or EXECUTION_MODE != "local"):
+        raise RuntimeError("免登录测试只能使用 local 执行模式，不能用于 controller")
     n = load_caps()
     load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2,
@@ -2183,7 +2189,12 @@ def make_app(auth_path=None):
     app["cleanup_pending"] = {pid for pid, job in JOBS.items()
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
-    app["auth_path"] = Path(auth_path or os.environ.get("CHOUKA_AUTH_DB") or ROOT / "data" / "auth.db")
+    app["local_test"] = local_test
+    app["bind_host"] = "127.0.0.1" if local_test else "0.0.0.0"
+    if local_test:
+        app["auth_path"] = Path(auth_path or ROOT / "data" / "auth-local-test.db")
+    else:
+        app["auth_path"] = Path(auth_path or os.environ.get("CHOUKA_AUTH_DB") or ROOT / "data" / "auth.db")
     app["project_locks"] = defaultdict(asyncio.Lock)
     register_auth_routes(app, ROOT / "web")
     app["video_previews"] = VideoPreviews(
@@ -2251,9 +2262,12 @@ def make_app(auth_path=None):
     if CONTROLLER_MODE and not ENROLLMENT_TOKEN:
         print("[抽卡系统] 警告：未配置 CHOUKA_ENROLLMENT_TOKEN，Worker 注册已禁用")
     print(f"[抽卡系统] 本机   http://127.0.0.1:{PORT}")
-    for ip in lan_ips():
-        print(f"[抽卡系统] 局域网 http://{ip}:{PORT}   ← 手机/别的电脑用这个")
-    print("[抽卡系统] 已启用账号鉴权；首次使用请先运行账号初始化和历史权限迁移。")
+    if local_test:
+        print("[抽卡系统] 本地免登录测试：仅监听 127.0.0.1，使用独立测试身份，不迁移正式账号或历史权限。")
+    else:
+        for ip in lan_ips():
+            print(f"[抽卡系统] 局域网 http://{ip}:{PORT}   ← 手机/别的电脑用这个")
+        print("[抽卡系统] 已启用账号鉴权；首次使用请先运行账号初始化和历史权限迁移。")
     return app
 
 
@@ -2269,4 +2283,5 @@ if __name__ == "__main__":
     import logging
     logging.getLogger('asyncio').setLevel(logging.ERROR)
 
-    web.run_app(make_app(), host="0.0.0.0", port=PORT, print=None)
+    application = make_app()
+    web.run_app(application, host=application["bind_host"], port=PORT, print=None)

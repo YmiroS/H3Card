@@ -5,6 +5,7 @@ cd /d "%~dp0"
 
 set "PY=..\python_embeded\python.exe"
 set "CHOUKA_EXECUTION_MODE=local"
+set "CHOUKA_LOCAL_TEST=1"
 set "CHOUKA_PORT=8199"
 set "CHOUKA_COMFY_URL=http://127.0.0.1:8188"
 set "CHOUKA_DEBUG="

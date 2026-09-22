@@ -80,7 +80,9 @@ def _admin_path(path):
 
 
 def _check_source(request):
-    expected = os.environ.get('CHOUKA_AUTH_ORIGIN') or f'{request.scheme}://{request.host}'
+    expected = f'{request.scheme}://{request.host}'
+    if not request.app.get('local_test'):
+        expected = os.environ.get('CHOUKA_AUTH_ORIGIN') or expected
     source = request.headers.get('Origin') or request.headers.get('Referer')
     try:
         actual = urlsplit(source or '')
@@ -128,16 +130,54 @@ def _register_rate_limit(request, username=''):
         buckets.popitem(last=False)
 
 
+async def setup_local_test_auth(app):
+    users = await call_store(app, 'list_users')
+    if not users:
+        user = await call_store(app, 'create_user', 'local-test', secrets.token_urlsafe(48))
+    elif len(users) == 1 and users[0]['username'] == 'local-test' and users[0]['role'] == 'user' and users[0]['enabled']:
+        user = users[0]
+    else:
+        raise RuntimeError('本地测试账号库包含其他账号，拒绝用于免登录模式')
+    await call_store(app, 'set_ready')
+    app['local_test_session'] = {'user': user, 'csrf_token': secrets.token_urlsafe(32), 'local_test': True}
+
+
+async def _local_test_request(request, handler):
+    host = urlsplit(f'{request.scheme}://{request.host}').hostname
+    if request.remote not in ('127.0.0.1', '::1') or host not in ('127.0.0.1', 'localhost', '::1'):
+        raise web.HTTPForbidden(text='免登录测试服务仅允许本机访问')
+    if request.headers.get('Origin') or request.headers.get('Sec-Fetch-Site') == 'cross-site':
+        _check_source(request)
+    path = request.path
+    if path.startswith('/agent/v1/') or (path.startswith('/api/auth/') and path != '/api/auth/me'):
+        raise web.HTTPForbidden(text='本地测试模式不提供账号管理或 Worker 接口')
+    if path in ('/login', '/login.html'):
+        raise web.HTTPFound('/')
+    session = request.app['local_test_session']
+    request['user'] = session['user']
+    request['auth_session'] = session
+    if _admin_path(path):
+        require_admin(request)
+    if request.method not in ('GET', 'HEAD', 'OPTIONS'):
+        _check_source(request)
+        if not secrets.compare_digest(request.headers.get('X-CSRF-Token', ''), session['csrf_token']):
+            raise web.HTTPForbidden(text='CSRF 校验失败')
+    return await handler(request)
+
+
 @web.middleware
 async def auth_middleware(request, handler):
     try:
         if request.app.get('auth_store') is None:
             raise web.HTTPServiceUnavailable(text='认证服务尚未配置')
-        if request.path.startswith('/agent/v1/'):
+        if request.app.get('local_test'):
+            response = await _local_test_request(request, handler)
+        elif request.path.startswith('/agent/v1/'):
             if not await call_store(request.app, 'is_ready'):
                 raise web.HTTPServiceUnavailable(text='权限迁移尚未完成，Worker 通道暂不可用')
             return await handler(request)
-        response = await _browser_request(request, handler)
+        else:
+            response = await _browser_request(request, handler)
     except sqlite3.Error:
         response = web.json_response({'error': '认证数据暂不可用，请联系管理员'}, status=503)
     except AuthError as exc:

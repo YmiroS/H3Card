@@ -59,7 +59,7 @@
 })();
 
 (() => {
-  let user = null, csrf = '', stopped = false, pendingMe = null;
+  let user = null, csrf = '', stopped = false, pendingMe = null, localTest = false;
   const controllers = new Set(), timers = new Set();
   function invalidate(redirect = true) {
     stopped = true; user = null; csrf = '';
@@ -97,7 +97,7 @@
   const json = (path, method, body) => request(path, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body || {})});
   async function me() {
     if (!pendingMe) pendingMe = request('/api/auth/me', {cache:'no-store'}).then(data => {
-      user = data.user; csrf = data.csrf_token; return user;
+      user = data.user; csrf = data.csrf_token; localTest = data.local_test === true; return user;
     }).finally(() => { pendingMe = null; });
     return pendingMe;
   }
@@ -124,6 +124,12 @@
   }
   function mountAccount(container) {
     container.replaceChildren();
+    if (localTest) {
+      const badge = document.createElement('span'); badge.className = 'chip';
+      badge.textContent = '本地测试 · 免登录';
+      container.append(badge);
+      return;
+    }
     const who = document.createElement('span'); who.className = 'who'; who.textContent = user.username;
     const role = document.createElement('span'); role.className = 'chip' + (user.role === 'admin' ? ' admin' : '');
     const dot = document.createElement('i'); dot.className = 'd';
