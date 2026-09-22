@@ -1052,6 +1052,11 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   max-width: 94vw; max-height: 84vh; background: #070a12;
   border: 1px solid var(--line); box-shadow: 0 0 46px #00e5ff20;
 }
+#view img.vimage {
+  cursor: grab; touch-action: none; user-select: none; will-change: transform;
+  transform-origin: center center;
+}
+#view img.vimage.panning { cursor: grabbing; }
 #view audio { width: min(560px, 80vw); }
 #view .vinfo {
   font-family: var(--mono); font-size: 12px; color: var(--dim);

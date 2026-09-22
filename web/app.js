@@ -2835,6 +2835,58 @@ const VIEW_WORD = { video: "放大播放", audio: "放大播放" };
 // 那一组产物已经不是节点当前的 outputs 了
 let VIEW = null;
 
+function applyViewerImageTransform() {
+  if (!VIEW?.image) return;
+  VIEW.image.style.transform = `translate3d(${VIEW.x}px, ${VIEW.y}px, 0) scale(${VIEW.scale})`;
+}
+
+function resetViewerImage() {
+  if (!VIEW?.image) return;
+  VIEW.scale = 1; VIEW.x = 0; VIEW.y = 0;
+  applyViewerImageTransform();
+}
+
+function bindViewerImage(image) {
+  VIEW.image = image; VIEW.scale = 1; VIEW.x = 0; VIEW.y = 0;
+  image.classList.add("vimage");
+  image.title = "滚轮缩放 · 拖拽平移 · 双击还原";
+  applyViewerImageTransform();
+  image.addEventListener("wheel", (ev) => {
+    if (!VIEW || VIEW.image !== image) return;
+    ev.preventDefault();
+    const oldScale = VIEW.scale;
+    const nextScale = Math.min(8, Math.max(.2, oldScale * Math.exp(-ev.deltaY * .0015)));
+    if (nextScale === oldScale) return;
+    const rect = image.getBoundingClientRect(), ratio = nextScale / oldScale;
+    VIEW.x += (ev.clientX - (rect.left + rect.width / 2)) * (1 - ratio);
+    VIEW.y += (ev.clientY - (rect.top + rect.height / 2)) * (1 - ratio);
+    VIEW.scale = nextScale;
+    applyViewerImageTransform();
+  }, {passive:false});
+  let pan = null;
+  image.addEventListener("pointerdown", (ev) => {
+    if (ev.button !== 0 || !VIEW || VIEW.image !== image) return;
+    ev.preventDefault();
+    pan = {id:ev.pointerId, mx:ev.clientX, my:ev.clientY, x:VIEW.x, y:VIEW.y};
+    image.setPointerCapture(ev.pointerId);
+    image.classList.add("panning");
+  });
+  image.addEventListener("pointermove", (ev) => {
+    if (!pan || ev.pointerId !== pan.id || !VIEW || VIEW.image !== image) return;
+    VIEW.x = pan.x + ev.clientX - pan.mx;
+    VIEW.y = pan.y + ev.clientY - pan.my;
+    applyViewerImageTransform();
+  });
+  const finishPan = (ev) => {
+    if (!pan || ev.pointerId !== pan.id) return;
+    pan = null; image.classList.remove("panning");
+    if (image.hasPointerCapture(ev.pointerId)) image.releasePointerCapture(ev.pointerId);
+  };
+  image.addEventListener("pointerup", finishPan);
+  image.addEventListener("pointercancel", finishPan);
+  image.ondblclick = (ev) => { ev.preventDefault(); resetViewerImage(); };
+}
+
 function closeViewer() {
   el.vbox.innerHTML = "";          // 清空才会停掉正在播的视频
   el.view.style.display = "none";
@@ -2864,6 +2916,7 @@ function stepViewer(d) {
 function paintViewer() {
   const { outs, idx, seed } = VIEW;
   const out = outs[idx];
+  VIEW.image = null; VIEW.scale = 1; VIEW.x = 0; VIEW.y = 0;
   const info = document.createElement("div"); info.className = "vinfo";
   const bits = [out.filename];
   if (outs.length > 1) bits.unshift(`${idx + 1} / ${outs.length}`);
@@ -2886,7 +2939,9 @@ function paintViewer() {
   } else {
     m = document.createElement("img");
     m.src = out.url;
+    bits.push("滚轮缩放 · 拖拽平移 · 双击还原");
     m.onload = () => { bits.splice(bits.indexOf(out.filename) + 1, 0, `${m.naturalWidth}×${m.naturalHeight}`); put(); };
+    bindViewerImage(m);
   }
   m.draggable = false;
   put();
