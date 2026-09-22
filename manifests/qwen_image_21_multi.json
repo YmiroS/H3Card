@@ -14,7 +14,7 @@
  "slotLimits": {"image": {"min": 1, "max": 16}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
  "graph": "graphs/qwen_image_21_multi.api.json",
  "output": {"node": "62"},
- "note": "Qwen Image 2.1 多图编辑：支持 1–16 张图片，图1为必填主图，图2至图16为可选参考图。建议按顺序添加，并在提示词中明确图1、图2等各图用途，例如保留图1场景，使用图2人物。输出尺寸跟随图1按总像素缩放后的尺寸，不单独设置输出比例；参考图总像素默认 1536 千像素，全部参考图保持各自原比例并按 32 对齐，此值不是最长边。保留原工作流 40 步、CFG 1、euler/simple 配置。需要包含 QwenImage21Cache、TextEncodeQwenImage21 的 ComfyUI 版本、LayerUtility: ImageScaleByAspectRatio V2 节点及原版模型 qwen_image_2.1_int8_convrot.safetensors、qwen3vl_8b_fp8_scaled.safetensors、qwen_image_2.1_vae_bf16.safetensors。未完成出图验证。",
+ "note": "Qwen Image 2.1 多图编辑：支持 1–16 张图片，图1为必填主图，图2至图16为可选参考图。建议按顺序添加，并在提示词中明确图1、图2等各图用途，例如保留图1场景，使用图2人物。输出尺寸跟随图1按总像素缩放后的尺寸，不单独设置输出比例；参考图总像素默认 1536 千像素，全部参考图保持各自原比例并按 32 对齐，此值不是最长边。保留原工作流 40 步、CFG 1、euler/simple 配置。需要包含 QwenImage21Cache、TextEncodeQwenImage21 的 ComfyUI 版本、LayerUtility: ImageScaleByAspectRatio V2 节点及原版模型 qwen_image_2.1_int8_convrot.safetensors、qwen3vl_8b_fp8_scaled.safetensors、qwen_image_2.1_vae_bf16.safetensors。已在 ComfyUI 0.37.0 完成双图编辑出图验证；16 图上限尚未做满载实测。",
  "rewrite": null,
  "compare": true,
  "inputs": [
