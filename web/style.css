@@ -1006,6 +1006,21 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
   border-bottom: 1px solid var(--line); margin-bottom: 4px;
 }
+#menu.at-menu { min-width: 280px; }
+#menu.at-menu .at-menu-group {
+  display: flex; align-items: center; gap: 9px; padding: 8px 9px 4px;
+  color: var(--dim); font-size: 10px; letter-spacing: 1px;
+}
+#menu.at-menu .at-menu-group::after { content: ""; height: 1px; flex: 1; background: var(--line); }
+#menu.at-menu .at-menu-item { transition: background .12s, color .12s, transform .12s, box-shadow .12s; }
+#menu.at-menu .at-menu-item:hover, #menu.at-menu .at-menu-item:focus-visible {
+  color: #fff; background: #00e5ff1c; transform: translateX(2px);
+  box-shadow: inset 2px 0 0 var(--acc);
+}
+#menu.at-menu .at-menu-icon { width: 18px; flex: 0 0 18px; font-size: 14px; text-align: center; }
+#menu.at-menu .at-menu-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#menu.at-menu .at-menu-type { color: var(--dim); font-size: 11px; white-space: nowrap; }
+#menu.at-menu .at-menu-item.connected .at-menu-type { color: var(--acc); }
 
 /* ---------- 能力说明浮层 ---------- */
 #tip {

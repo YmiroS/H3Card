@@ -195,6 +195,26 @@ test('all image models share real runtime controls without changing video parame
       }
     });
 
+    await t.test('Qwen Image 2.1 multi-image mode exposes all sixteen web slots',async()=>{
+      await reset('zimage_i2i');
+      await mode('Qwen 2.1 多图编辑（最多16张）');
+      assert.equal(await page.evaluate(()=>PROJ.cards[0].cap),'qwen_image_21_multi');
+      assert.match(await page.locator('#panel .refhead').innerText(),/图片 16/);
+      assert.equal(await page.locator('#panel .refadd').innerText(),'＋ 添加图片（0/16）');
+      const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
+      const payload=await page.evaluate(png=>{
+        const c=PROJ.cards[0];
+        c.assets=Object.fromEntries(Array.from({length:16},(_,i)=>[
+          `images[${i}]`,{kind:'image',url:png+'#'+i,ref:`image${i}.png`},
+        ]));
+        openPanel(c.id);
+        return payloadOf(c);
+      },png);
+      assert.equal(await page.locator('#panel .slot.filled').count(),16);
+      assert.equal(await page.locator('#panel .refadd').count(),0);
+      assert.deepEqual(Object.keys(payload.assets),Array.from({length:16},(_,i)=>`images[${i}]`));
+    });
+
     await t.test('image editing previews show only the result and still open the normal viewer',async()=>{
       const png='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=';
       for(const cap of ['zimage_i2i','krea2_i2i','qwen_image_edit_2511_i2i','qwen_image_21_i2i','qwen_image_21_multi']) {
