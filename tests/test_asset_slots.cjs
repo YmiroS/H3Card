@@ -278,7 +278,7 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
 
 test('filled asset slots preview on click and replace/download through the context menu', async () => {
   const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
-  const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/style.css">
+  const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/style.css"><style>#view img{width:200px;height:140px}</style>
     <div id="panel" style="display:block;position:relative;width:760px"><div id="fixture" style="display:flex;gap:12px"></div></div>
     <div id="menu" style="display:none"></div><div id="view" style="display:none"><div class="vbox"></div></div>
     <input id="picker" type="file" hidden><script>
@@ -348,6 +348,20 @@ test('filled asset slots preview on click and replace/download through the conte
       assert.equal(await page.locator('#view').isVisible(), true);
       assert.equal(await page.locator('#view ' + tag).count(), 1);
       assert.equal(choosers.length, 0, 'preview must not open the file picker');
+      if (kind === 'image') {
+        const image = page.locator('#view img');
+        await image.hover(); await page.mouse.wheel(0, -500);
+        await page.waitForFunction(() => VIEW.scale > 1);
+        const box = await image.boundingBox();
+        await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+        await page.mouse.down(); await page.mouse.move(box.x + box.width / 2 + 70, box.y + box.height / 2 + 45); await page.mouse.up();
+        const moved = await page.evaluate(() => ({scale:VIEW.scale, x:VIEW.x, y:VIEW.y, transform:VIEW.image.style.transform}));
+        assert.ok(moved.scale > 1, 'wheel should zoom the full image');
+        assert.ok(Math.abs(moved.x) > 20 && Math.abs(moved.y) > 20, 'drag should pan the zoomed image');
+        assert.match(moved.transform, /translate3d\(.+scale\(/);
+        await image.dblclick();
+        assert.deepEqual(await page.evaluate(() => ({scale:VIEW.scale, x:VIEW.x, y:VIEW.y})), {scale:1, x:0, y:0});
+      }
       if (kind === 'video') {
         await page.waitForFunction(() => document.querySelector('#view video').getAttribute('src') === '/api/preview/original.mov/file');
       }
