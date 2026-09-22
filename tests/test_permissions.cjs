@@ -109,6 +109,17 @@ test('canvas separates personal, shared and team spaces when creating projects',
     await page.locator('#plist .pitem').filter({hasText:'个人画布'}).click({button:'right'});
     await page.getByRole('button',{name:/分享给个人或项目组/}).click();
     const shareDialog=page.locator('.project-share-dialog'); await shareDialog.waitFor();
+    const shareTargets=shareDialog.locator('.share-target');
+    assert.deepEqual(await shareTargets.locator('span').allTextContents(), ['bob（鲍勃）','项目一组']);
+    const targetLayout=await shareTargets.evaluateAll(labels=>labels.map(label=>{
+      const box=label.getBoundingClientRect(), input=label.querySelector('input').getBoundingClientRect();
+      const text=label.querySelector('span').getBoundingClientRect();
+      return {inputWidth:input.width, inputRight:input.right, textLeft:text.left, textRight:text.right, boxRight:box.right};
+    }));
+    for(const item of targetLayout) {
+      assert.ok(item.inputWidth<=20,'checkbox must not consume the option row');
+      assert.ok(item.textLeft>item.inputRight&&item.textRight<=item.boxRight,'share target name must remain visible beside its checkbox');
+    }
     await shareDialog.locator('label').filter({hasText:'bob'}).locator('input').check();
     await shareDialog.locator('label').filter({hasText:'项目一组'}).locator('input').check();
     const shareResponse=page.waitForResponse(r=>r.url().endsWith('/api/projects/p1/shares')&&r.request().method()==='PUT');
