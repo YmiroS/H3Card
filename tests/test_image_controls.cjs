@@ -195,9 +195,9 @@ test('all image models share real runtime controls without changing video parame
       }
     });
 
-    await t.test('Qwen Image 2.1 multi-image mode exposes all sixteen web slots',async()=>{
+    await t.test('Qwen Image 2.1 model switch exposes all sixteen web slots in image-to-image mode',async()=>{
       await reset('zimage_i2i');
-      await mode('Qwen 2.1 多图编辑（最多16张）');
+      await model('Qwen Image 2.1');
       assert.equal(await page.evaluate(()=>PROJ.cards[0].cap),'qwen_image_21_multi');
       assert.match(await page.locator('#panel .refhead').innerText(),/图片 16/);
       assert.equal(await page.locator('#panel .refadd').innerText(),'＋ 添加图片（0/16）');

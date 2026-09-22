@@ -93,7 +93,7 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
         self.assertNotIn("qwen2511", t2i["modelSwitch"])
         modes = scan_workflows.build_modes([app.CAPS[wid] for wid in (
             "zimage_t2i", "krea2_t2i", "zimage_i2i", "krea2_i2i", self.cap["id"],
-            "qwen_image_21_i2i",
+            "qwen_image_21_multi",
         )])
         self.assertEqual([m["name"] for m in modes], ["文生图", "图生图"])
         self.assertEqual(modes[1]["modelSwitch"], i2i[0]["modelSwitch"])
@@ -123,7 +123,7 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
             cards = json.loads((root / "manifests/_cards.json").read_text(encoding="utf-8"))
             image_card = next(c for c in cards if c["id"] == "card_image")
             self.assertEqual({m["id"] for m in image_card["modes"]},
-                             scan_workflows.BUNDLED_CAPABILITIES)
+                             scan_workflows.BUNDLED_CAPABILITIES - {"qwen_image_21_i2i"})
             self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), self.cap)
             self.assertEqual(graph_path.read_bytes(), (ROOT / self.cap["graph"]).read_bytes())
 

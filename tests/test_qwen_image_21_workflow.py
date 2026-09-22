@@ -130,11 +130,12 @@ class QwenImage21WorkflowTest(unittest.TestCase):
     def test_grouping_bundled_registration_and_chinese_progress(self):
         app.load_caps()
         modes = scan_workflows.build_modes([m for m in app.CAPS.values() if m["card"] == "image"])
-        for mode, suffix in (("文生图", "t2i"), ("图生图", "i2i")):
+        expected = {"文生图": "qwen_image_21_t2i", "图生图": "qwen_image_21_multi"}
+        for mode, capability_id in expected.items():
             selected = [m for m in modes if m["name"] == mode]
             self.assertEqual(len(selected), 1)
-            self.assertEqual(selected[0]["modelSwitch"]["qwen21"], f"qwen_image_21_{suffix}")
-        self.assertTrue(any(m["id"] == "qwen_image_21_multi" for m in modes))
+            self.assertEqual(selected[0]["modelSwitch"]["qwen21"], capability_id)
+        self.assertFalse(any(m["id"] == "qwen_image_21_multi" for m in modes))
         for cap_id in CAP_IDS:
             self.assertIn(cap_id, scan_workflows.BUNDLED_CAPABILITIES)
             self.assertEqual(app.model_name(cap_id), "Qwen Image 2.1")
@@ -166,10 +167,11 @@ class QwenImage21RuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.Auth
                 self.assertEqual(response.status, 200)
                 data = await response.json()
                 card = next(c for c in data["cards"] if c["id"] == "card_image")
-                for mode, suffix in (("文生图", "t2i"), ("图生图", "i2i")):
+                expected = {"文生图": "qwen_image_21_t2i", "图生图": "qwen_image_21_multi"}
+                for mode, capability_id in expected.items():
                     item = next(m for m in card["modes"] if m["name"] == mode)
-                    self.assertEqual(item["modelSwitch"]["qwen21"], f"qwen_image_21_{suffix}")
-                self.assertTrue(any(m["id"] == "qwen_image_21_multi" for m in card["modes"]))
+                    self.assertEqual(item["modelSwitch"]["qwen21"], capability_id)
+                self.assertFalse(any(m["id"] == "qwen_image_21_multi" for m in card["modes"]))
                 for mode, count, prompt_node in (("t2i", 0, "13"), ("i2i", 1, "13"),
                                                  ("multi", 1, "45"), ("multi", 16, "45")):
                     response = await client.post("/api/generate", json={
