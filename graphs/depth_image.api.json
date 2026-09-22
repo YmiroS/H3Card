@@ -1,0 +1,112 @@
+{
+ "86": {
+  "class_type": "GetImageSize",
+  "inputs": {
+   "image": [
+    "85",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "Get Image Size"
+  }
+ },
+ "87": {
+  "class_type": "ComfyMathExpression",
+  "inputs": {
+   "values.a": [
+    "86",
+    0
+   ],
+   "values.b": [
+    "86",
+    1
+   ],
+   "expression": "max(a, b)"
+  },
+  "_meta": {
+   "title": "Math Expression"
+  }
+ },
+ "90": {
+  "class_type": "DA3Render",
+  "inputs": {
+   "da3_geometry": [
+    "91",
+    0
+   ],
+   "output": "depth",
+   "output.normalization": "v2_style",
+   "output.apply_sky_clip": false
+  },
+  "_meta": {
+   "title": "Render Depth Anything 3"
+  }
+ },
+ "91": {
+  "class_type": "DA3Inference",
+  "inputs": {
+   "da3_model": [
+    "92",
+    0
+   ],
+   "image": [
+    "85",
+    0
+   ],
+   "resolution": [
+    "87",
+    1
+   ],
+   "resize_method": "upper_bound_resize",
+   "mode": "mono"
+  },
+  "_meta": {
+   "title": "Run Depth Anything 3"
+  }
+ },
+ "88": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "90",
+    0
+   ],
+   "filename_prefix": "Depth-anything3-I2I/Depth-anything3-I2I"
+  },
+  "_meta": {
+   "title": "Save Image"
+  }
+ },
+ "89": {
+  "class_type": "easy cleanGpuUsed",
+  "inputs": {
+   "anything": [
+    "88",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "easy cleanGpuUsed"
+  }
+ },
+ "92": {
+  "class_type": "LoadDA3Model",
+  "inputs": {
+   "model_name": "depth_anything_3_mono_large.safetensors",
+   "weight_dtype": "default"
+  },
+  "_meta": {
+   "title": "Load Depth Anything 3"
+  }
+ },
+ "85": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "aee80b64ab42ec52a5a76a4da5fd1de0b1c0f3d3b7544fe593f4ab2ea66aaa0d.png"
+  },
+  "_meta": {
+   "title": "Load Image"
+  }
+ }
+}

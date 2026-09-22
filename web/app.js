@@ -2861,9 +2861,8 @@ function capBtn(label, title, items) {
 
 /* ---------- 底部工具条（新建节点的唯一入口） ---------- */
 /** 节点都建在视野正中（blankSpot），建完就在眼前，不用去找。
-    文本/图片/视频点一下直接建，用该节点的第一个模式，玩法进参数面板左下角的胶囊换；
-    工具箱例外 —— 它那几样（抠图/拼图/补帧/画质增强）互相不搭，
-    默认给哪个都是错的，所以弹一份清单让用户挑。 */
+    文本/图片/视频/工具箱点一下直接建，用该节点的第一个模式，
+    玩法统一进参数面板左下角的胶囊换。 */
 function buildDock() {
   const mk = (icon, label, title, run) => {
     const b = document.createElement("button");
@@ -2881,21 +2880,6 @@ function buildDock() {
     const p = blankSpot();
     addCard(tid, p.x, p.y);
   };
-  // 工具箱：列出所有工具节点的每一样，选中才建节点。菜单往上弹（按钮贴着屏幕底沿）
-  const tools = (b) => {
-    if (!PROJ) return;
-    const items = [];
-    for (const def of CARDS.filter(d => d.kind === "tool" && d.modes.length)) {
-      for (const md of def.modes) items.push({
-        icon: def.icon, text: md.name,
-        run: () => { const p = blankSpot(); addCard(def.id, p.x, p.y, modeCap(md)); },
-      });
-    }
-    if (!items.length) return toast("没有可用的工具节点");
-    const r = b.getBoundingClientRect();
-    showMenu(r.left, r.top, "工具箱 · 选一样", items);
-    el.menu.style.top = Math.max(48, r.top - el.menu.offsetHeight - 8) + "px";
-  };
   const sep = () => { const s = document.createElement("div"); s.className = "sep"; return s; };
   el.dock.innerHTML = "";
   el.dock.append(
@@ -2905,7 +2889,7 @@ function buildDock() {
     mk("T", "文本", "新建一个文本节点：存一段字，连到生成节点就并进提示词", spawn("card_text")),
     mk("▧", "图片", "新建一个生图节点（默认文生图，玩法在参数面板左下角换）", spawn("card_image")),
     mk("▷", "视频", "新建一个生视频节点（默认图生视频，玩法在参数面板左下角换）", spawn("card_video")),
-    mk("◇", "工具箱", "抠图 / 拼图 / 补帧 / 画质增强 —— 点开选一样", tools),
+    mk("◇", "工具箱", "新建工具箱节点（玩法在参数面板左下角切换）", spawn("card_tools")),
   );
 }
 
@@ -3009,6 +2993,12 @@ function paintViewer() {
   if (out.kind === "video") {
     m = document.createElement("video");
     m.controls = m.autoplay = m.loop = true;
+    const playWhenReady = () => {
+      const pending = m.play();
+      if (pending && typeof pending.catch === "function") pending.catch(() => {});
+    };
+    if (m.readyState >= 3) playWhenReady();
+    else m.addEventListener("canplay", playWhenReady, {once:true});
     prepareVideo(m, out.url);
     m.onloadedmetadata = () => {
       bits.splice(bits.indexOf(out.filename) + 1, 0, `${m.videoWidth}×${m.videoHeight}`, fmtDur(m.duration));
@@ -3960,9 +3950,9 @@ function openPanel(id) {
   if (isAsset(c)) return assetPanel(c);
 
   // --- 模式切换 ---
-  // 生图节点和生视频节点的模式挪到底部工具条的胶囊里（面板只留素材引用和提示词，见底部 foot）；
-  // 别的多模式节点暂时还是顶部条
-  const compact = (def.id === "card_image" || def.id === "card_video") && def.modes.length > 1;
+  // 生图、生视频和工具箱节点的模式挪到底部工具条的胶囊里
+  // （面板只留素材引用和提示词，见底部 foot）；别的多模式节点暂时还是顶部条
+  const compact = ["card_image", "card_video", "card_tools"].includes(def.id) && def.modes.length > 1;
   if (def.modes.length > 1 && !compact) {
     const m = document.createElement("div"); m.className = "modes";
     for (const md of def.modes) {
@@ -4057,11 +4047,12 @@ function openPanel(id) {
 
   // --- 底部 ---
   const foot = document.createElement("div"); foot.className = "foot";
-  // 生图节点和生视频节点：左下「模式」胶囊（换玩法）+「⚙ 参数」（清晰度/比例弹窗），跟文本节点同一套
+  // 生图、生视频和工具箱节点：左下「模式」胶囊（换玩法）+「⚙ 参数」弹窗，跟文本节点同一套
   if (compact) {
-    const isVideo = def.id === "card_video";
+    const modeTitle = def.id === "card_video" ? "生视频模式"
+      : def.id === "card_tools" ? "工具箱模式" : "生图模式";
     const currentMode = modeOf(c) || def.modes[0];
-    const modeButton = capBtn(`${def.icon} ${currentMode.name}`, isVideo ? "生视频模式" : "生图模式",
+    const modeButton = capBtn(`${def.icon} ${currentMode.name}`, modeTitle,
       () => def.modes.map(mo => ({
         icon: def.icon,
         text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),

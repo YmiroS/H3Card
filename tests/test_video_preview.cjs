@@ -10,6 +10,7 @@ const { chromium } = require('playwright');
 
 const source = readFileSync(path.join(__dirname, '..', 'web', 'app.js'), 'utf8');
 const helpers = source.slice(source.indexOf('const VIDEO_PREVIEWS ='), source.indexOf('/** 素材格里的图/视频/音频'));
+const viewer = source.slice(source.indexOf('const VIEW_WORD ='), source.indexOf('function cardMenu('));
 
 test('video previews play in browser while assets keep original URLs and refs', async () => {
   const directory = mkdtempSync(path.join(tmpdir(), 'chouka-preview-'));
@@ -22,13 +23,18 @@ test('video previews play in browser while assets keep original URLs and refs', 
     ]);
     const videoBytes = readFileSync(fixture);
     let requests = 0, originalRequests = 0;
-    const html = `<!doctype html><meta charset="utf-8"><div id="fixture"></div><script>
+    const html = `<!doctype html><meta charset="utf-8"><div id="fixture"></div>
+      <button id="open-viewer">双击预览</button><div id="view" style="display:none"><div id="vbox"></div></div><script>
       const api = async url => { const r = await fetch(url); if (!r.ok) throw Error('HTTP ' + r.status); return r.json(); };
       ${helpers}
+      const el = {view:document.getElementById('view'), vbox:document.getElementById('vbox')};
+      const toast = message => { throw Error(message); };
+      ${viewer}
       window.testAsset = {kind:'video', url:'/api/upload/ck_123456789abc.mov', ref:'chouka/ck_123456789abc.mov'};
       const box = document.getElementById('fixture');
       box.innerHTML = '<video data-video-url="' + testAsset.url + '" muted controls></video><video data-video-url="' + testAsset.url + '" muted></video>';
       prepareVideos(box);
+      document.getElementById('open-viewer').ondblclick = () => openViewer({outputs:[{kind:'video',url:testAsset.url,filename:'preview.mp4'}]});
       window.createVideo = (url) => { const v = document.createElement('video'); box.append(v); return prepareVideo(v, url); };
       </script>`;
     server = createServer((req, res) => {
@@ -73,14 +79,20 @@ test('video previews play in browser while assets keep original URLs and refs', 
     assert.equal(result.width, 96);
     assert.equal(result.asset.url, '/api/upload/ck_123456789abc.mov');
     assert.equal(result.asset.ref, 'chouka/ck_123456789abc.mov');
+    await page.locator('#open-viewer').dblclick();
+    await page.waitForFunction(() => {
+      const video = document.querySelector('#vbox video');
+      return video && video.readyState >= 3 && !video.paused && video.currentTime > 0;
+    });
+    assert.equal(await page.locator('#vbox video').getAttribute('autoplay'), '');
     await page.evaluate(() => createVideo(testAsset.url));
     assert.equal(requests, 2, 'reopening should reuse the preview URL');
     await page.evaluate(() => createVideo('/api/artifact/result.mp4'));
-    assert.equal(await page.locator('video').last().getAttribute('src'), '/api/artifact/result.mp4');
+    assert.equal(await page.locator('#fixture video').last().getAttribute('src'), '/api/artifact/result.mp4');
     await page.evaluate(() => createVideo('/api/upload/broken.mov'));
-    assert.equal(await page.locator('video').last().getAttribute('data-preview-state'), 'error');
-    assert.match(await page.locator('video').last().getAttribute('title'), /修复转码后才能生成/);
-    assert.equal(await page.locator('video').last().getAttribute('src'), null);
+    assert.equal(await page.locator('#fixture video').last().getAttribute('data-preview-state'), 'error');
+    assert.match(await page.locator('#fixture video').last().getAttribute('title'), /修复转码后才能生成/);
+    assert.equal(await page.locator('#fixture video').last().getAttribute('src'), null);
     assert.equal(originalRequests, 0, 'failed transcodes must not fall back to the original');
     assert.deepEqual(errors, []);
   } finally {
