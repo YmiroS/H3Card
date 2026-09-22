@@ -55,13 +55,25 @@ test('readonly blocks save and operate while allowing view of granted projects',
 
 test('canvas separates personal, shared and team spaces when creating projects', async () => {
   const projects = [
-    {id:'p1', name:'个人画布', owner_id:'u1', owner_username:'alice', team_id:null, team_name:null, permission:'operate', cards:0, updated:3, locked:false},
+    {id:'p1', name:'个人画布', owner_id:'u1', owner_username:'alice', team_id:null, team_name:null, permission:'operate', cards:0, updated:3, locked:false, share_count:0, shared_team_ids:[], shared_personally:false},
     {id:'p2', name:'项目组画布', owner_id:'u2', owner_username:'bob', team_id:'t1', team_name:'项目一组', permission:'operate', cards:0, updated:2, locked:false},
     {id:'p3', name:'别人共享', owner_id:'u2', owner_username:'bob', team_id:null, team_name:null, permission:'read', cards:0, updated:1, locked:false},
   ];
   const teams = [{id:'t1', name:'项目一组', leader_id:'u2', leader_username:'bob', can_manage:false, members:[]}];
-  const mutations = [];
+  const mutations = [], shareMutations = [];
   const server = createServer((req, res) => {
+    if (req.url === '/api/projects/p1/shares' && req.method === 'GET') {
+      res.setHeader('Content-Type','application/json'); return res.end(JSON.stringify({
+        user_ids:[], team_ids:[], users:[{id:'u2',username:'bob',display_name:'鲍勃'}], teams:[{id:'t1',name:'项目一组'}],
+      }));
+    }
+    if (req.url === '/api/projects/p1/shares' && req.method === 'PUT') {
+      const chunks=[]; req.on('data',chunk=>chunks.push(chunk)); req.on('end',()=>{
+        const body=JSON.parse(Buffer.concat(chunks).toString()); shareMutations.push({body,csrf:req.headers['x-csrf-token']});
+        projects[0].share_count=body.user_ids.length+body.team_ids.length; projects[0].shared_team_ids=body.team_ids;
+        res.setHeader('Content-Type','application/json'); res.end(JSON.stringify(body));
+      }); return;
+    }
     if (req.method === 'POST' && req.url === '/api/projects') {
       const chunks = []; req.on('data', chunk => chunks.push(chunk)); req.on('end', () => {
         const body = JSON.parse(Buffer.concat(chunks).toString()); mutations.push({body, csrf:req.headers['x-csrf-token']});
@@ -94,6 +106,16 @@ test('canvas separates personal, shared and team spaces when creating projects',
     await page.waitForFunction(() => document.querySelectorAll('#plist .pitem').length === 1);
     assert.match(await page.locator('#plist').innerText(), /个人画布/);
     assert.deepEqual(await page.locator('#space-select option').allTextContents(), ['个人空间','共享给我的画布','项目一组']);
+    await page.locator('#plist .pitem').filter({hasText:'个人画布'}).click({button:'right'});
+    await page.getByRole('button',{name:/分享给个人或项目组/}).click();
+    const shareDialog=page.locator('.project-share-dialog'); await shareDialog.waitFor();
+    await shareDialog.locator('label').filter({hasText:'bob'}).locator('input').check();
+    await shareDialog.locator('label').filter({hasText:'项目一组'}).locator('input').check();
+    const shareResponse=page.waitForResponse(r=>r.url().endsWith('/api/projects/p1/shares')&&r.request().method()==='PUT');
+    await shareDialog.getByRole('button',{name:'确定分享'}).click(); await shareResponse;
+    await page.waitForFunction(()=>document.querySelector('#plist .pshare'));
+    assert.deepEqual(shareMutations,[{body:{user_ids:['u2'],team_ids:['t1']},csrf:'canvas-csrf'}]);
+    assert.match(await page.locator('#plist .pshare').getAttribute('title'),/已分享给 2 个/);
     await page.locator('#space-select').selectOption('team:t1');
     await page.waitForFunction(() => document.querySelector('#plist')?.textContent.includes('项目组画布'));
     const response = page.waitForResponse(r => r.url().endsWith('/api/projects') && r.request().method() === 'POST');

@@ -96,6 +96,34 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.project_permission(member, 'team-project'))
         self.assertEqual(self.store.project_permission(member, 'personal-project'), 'operate')
 
+    def test_personal_project_shares_to_users_and_teams(self):
+        teammate = self.store.create_user('teammate', PASSWORD)['id']
+        outsider = self.store.create_user('outsider', PASSWORD)['id']
+        team = self.store.create_team('共享项目组', self.admin)
+        self.store.add_team_member(team['id'], teammate, self.admin)
+        self.store.create_project('shared-personal', self.owner)
+        result = self.store.set_project_shares(
+            'shared-personal', [self.viewer], [team['id']], self.owner)
+        self.assertEqual(result['user_ids'], [self.viewer])
+        self.assertEqual(result['team_ids'], [team['id']])
+        self.assertEqual(self.store.project_permission(self.viewer, 'shared-personal'), 'operate')
+        self.assertEqual(self.store.project_permission(teammate, 'shared-personal'), 'operate')
+        self.assertIsNone(self.store.project_permission(outsider, 'shared-personal'))
+        owner_item = self.store.list_projects(self.owner)[0]
+        self.assertEqual(owner_item['share_count'], 2)
+        viewer_item = self.store.list_projects(self.viewer)[0]
+        self.assertTrue(viewer_item['shared_personally'])
+        teammate_item = self.store.list_projects(teammate)[0]
+        self.assertEqual(teammate_item['shared_team_ids'], [team['id']])
+        with self.assertRaises(AuthError):
+            self.store.list_project_shares('shared-personal', self.viewer)
+        self.store.set_project_shares('shared-personal', [], [], self.owner)
+        self.assertIsNone(self.store.project_permission(self.viewer, 'shared-personal'))
+        self.assertIsNone(self.store.project_permission(teammate, 'shared-personal'))
+        self.store.create_project('team-owned', self.admin, team_id=team['id'])
+        with self.assertRaises(AuthError):
+            self.store.set_project_shares('team-owned', [outsider], [], self.admin)
+
     def test_team_management_permissions(self):
         leader = self.store.create_user('leader', PASSWORD, team_leader=True)['id']
         other_leader = self.store.create_user('leader2', PASSWORD, team_leader=True)['id']
@@ -197,7 +225,7 @@ class StoreTests(unittest.TestCase):
     def test_unknown_schema_rejected(self):
         path = Path(self.tmp.name) / 'future.sqlite'
         db = sqlite3.connect(path)
-        db.execute('PRAGMA user_version=4')
+        db.execute('PRAGMA user_version=5')
         db.close()
         with self.assertRaises(AuthError):
             AuthStore(path)
@@ -237,7 +265,9 @@ class RegistrationStoreTests(unittest.TestCase):
             self.assertFalse(users[0]['team_leader'])
             self.assertEqual(store._user('u1')['enabled'], 1)
             self.assertTrue(store.is_ready())
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 4)
             self.assertIsNone(store.get_project('legacy-project')['team_id'])
+            self.assertEqual(store.list_project_shares('legacy-project', 'u1')['user_ids'], [])
         finally:
             store.close()
 

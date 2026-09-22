@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
@@ -94,6 +95,76 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.auth.delete_grant(bob['id'], self.admin['id'])
         got = await self.client.get(f"/api/projects/{created['id']}")
         self.assertEqual(got.status, 404)
+
+    async def test_personal_project_share_flow_for_user_and_team(self):
+        bob = self.auth.create_user('bob', PASSWORD)
+        teammate = self.auth.create_user('teammate', PASSWORD)
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '个人共享画布'}, headers=self.headers)).json()
+        team_response = await self.client.post('/api/teams', json={'name': '接收项目组'}, headers=self.headers)
+        team = (await team_response.json())['team']
+        await self.client.post(f"/api/teams/{team['id']}/members",
+                               json={'user_id': teammate['id']}, headers=self.headers)
+        share_url = f"/api/projects/{created['id']}/shares"
+        candidates = await (await self.client.get(share_url)).json()
+        self.assertIn(bob['id'], {user['id'] for user in candidates['users']})
+        self.assertIn(team['id'], {item['id'] for item in candidates['teams']})
+        response = await self.client.put(
+            share_url, json={'user_ids': [bob['id']], 'team_ids': [team['id']]}, headers=self.headers)
+        self.assertEqual(response.status, 200)
+
+        response = await self.client.post('/api/auth/login', json={'username': 'bob', 'password': PASSWORD},
+                                          headers={'Origin': self.origin})
+        bob_session = await response.json()
+        bob_headers = {'Origin': self.origin, 'X-CSRF-Token': bob_session['csrf_token']}
+        listed = await (await self.client.get('/api/projects')).json()
+        self.assertTrue(listed['projects'][0]['shared_personally'])
+        self.assertEqual(listed['projects'][0]['permission'], 'operate')
+        saved = await self.client.put(
+            f"/api/projects/{created['id']}",
+            json={'rev': created['rev'], 'name': '共同编辑', 'cards': [], 'edges': []},
+            headers=bob_headers)
+        self.assertEqual(saved.status, 200)
+        self.assertEqual((await self.client.get(share_url)).status, 403)
+
+        response = await self.client.post('/api/auth/login', json={'username': 'teammate', 'password': PASSWORD},
+                                          headers={'Origin': self.origin})
+        teammate_session = await response.json()
+        listed = await (await self.client.get('/api/projects')).json()
+        self.assertEqual(listed['projects'][0]['shared_team_ids'], [team['id']])
+
+        self.headers = await self.login()
+        response = await self.client.put(
+            share_url, json={'user_ids': [], 'team_ids': []}, headers=self.headers)
+        self.assertEqual(response.status, 200)
+        response = await self.client.post('/api/auth/login', json={'username': 'bob', 'password': PASSWORD},
+                                          headers={'Origin': self.origin})
+        bob_session = await response.json()
+        bob_headers = {'Origin': self.origin, 'X-CSRF-Token': bob_session['csrf_token']}
+        self.assertEqual((await self.client.get(f"/api/projects/{created['id']}")).status, 404)
+        self.assertEqual((await self.client.put(
+            f"/api/projects/{created['id']}", json={'rev': 1, 'cards': [], 'edges': []},
+            headers=bob_headers)).status, 404)
+        self.assertTrue(teammate_session['csrf_token'])
+
+    async def test_share_revoked_between_project_permission_checks_returns_not_found(self):
+        bob = self.auth.create_user('bob', PASSWORD)
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '撤销竞态画布'}, headers=self.headers)).json()
+        self.auth.set_project_shares(created['id'], [bob['id']], [], self.admin['id'])
+        await self.client.post('/api/auth/login', json={'username': 'bob', 'password': PASSWORD},
+                               headers={'Origin': self.origin})
+
+        original_call_store = controller_app.call_store
+
+        async def revoke_before_detail_lookup(application, method, *args, **kwargs):
+            if method == 'get_project_for_user':
+                self.auth.set_project_shares(created['id'], [], [], self.admin['id'])
+            return await original_call_store(application, method, *args, **kwargs)
+
+        with mock.patch.object(controller_app, 'call_store', side_effect=revoke_before_detail_lookup):
+            response = await self.client.get(f"/api/projects/{created['id']}")
+        self.assertEqual(response.status, 404)
 
     async def test_team_project_is_shared_with_members_only(self):
         bob = self.auth.create_user('bob', PASSWORD)

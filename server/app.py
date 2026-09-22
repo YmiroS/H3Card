@@ -1860,6 +1860,9 @@ async def api_projects(request):
                     "locked": bool(d.get("locked")), "owner_id": acl["owner_id"],
                     "owner_username": acl.get("owner_username", ""),
                     "team_id": acl.get("team_id"), "team_name": acl.get("team_name"),
+                    "share_count": acl.get("share_count", 0),
+                    "shared_team_ids": acl.get("shared_team_ids", []),
+                    "shared_personally": bool(acl.get("shared_personally")),
                     "permission": acl["permission"]})
     out.sort(key=lambda p: p["updated"], reverse=True)
     teams = await call_store(request.app, "list_teams", user["id"])
@@ -1885,22 +1888,47 @@ async def api_project_create(request):
     await call_store(request.app, "set_project_state", pid, "active")
     return web.json_response(d | {"owner_id": user["id"], "owner_username": user["username"],
                                   "team_id": team_id, "team_name": acl.get("team_name"),
-                                  "permission": "operate"})
+                                  "share_count": 0, "shared_team_ids": [],
+                                  "shared_personally": False, "permission": "operate"})
 
 
 async def api_project_get(request):
     pid = request.match_info["pid"]
-    acl = await require_project(request, pid)
+    await require_project(request, pid)
     p = proj_path(pid)
     if not p.exists():
         raise web.HTTPNotFound(reason="项目不存在")
-    owner = await call_store(request.app, "get_user", acl["owner_id"])
+    user = require_user(request)
+    details = await call_store(request.app, "get_project_for_user", user["id"], pid)
+    if details is None:
+        raise web.HTTPNotFound(reason="项目不存在或不可访问")
     d = json.loads(p.read_text(encoding="utf-8"))
-    return web.json_response(d | {"owner_id": acl["owner_id"],
-                                  "owner_username": owner["username"],
-                                  "team_id": acl.get("team_id"),
-                                  "team_name": acl.get("team_name"),
-                                  "permission": acl["permission"]})
+    return web.json_response(d | {"owner_id": details["owner_id"],
+                                  "owner_username": details["owner_username"],
+                                  "team_id": details.get("team_id"),
+                                  "team_name": details.get("team_name"),
+                                  "share_count": details.get("share_count", 0),
+                                  "shared_team_ids": details.get("shared_team_ids", []),
+                                  "shared_personally": bool(details.get("shared_personally")),
+                                  "permission": details["permission"]})
+
+
+async def api_project_shares(request):
+    user = require_user(request)
+    pid = request.match_info["pid"]
+    if request.method == "GET":
+        data = await call_store(request.app, "list_project_shares", pid, user["id"])
+        return web.json_response(data)
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
+    if (not isinstance(body, dict) or set(body) != {"user_ids", "team_ids"}
+            or not isinstance(body["user_ids"], list) or not isinstance(body["team_ids"], list)):
+        raise web.HTTPBadRequest(text="分享对象清单不正确")
+    data = await call_store(request.app, "set_project_shares", pid,
+                            body["user_ids"], body["team_ids"], user["id"])
+    return web.json_response(data)
 
 
 async def api_project_save(request):
@@ -2251,6 +2279,8 @@ def make_app(auth_path=None):
     app.router.add_get("/api/projects", api_projects)
     app.router.add_post("/api/projects", api_project_create)
     app.router.add_get("/api/projects/{pid}", api_project_get)
+    app.router.add_get("/api/projects/{pid}/shares", api_project_shares)
+    app.router.add_put("/api/projects/{pid}/shares", api_project_shares)
     app.router.add_put("/api/projects/{pid}", api_project_save)
     app.router.add_post("/api/projects/{pid}/rename", api_project_rename)
     app.router.add_post("/api/projects/{pid}/copy", api_project_copy)
