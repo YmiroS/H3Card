@@ -388,7 +388,7 @@ async function refresh() {
   }
 }
 async function syncAllWorkers() {
-  if (!confirm("确认让全部节点增量同步 models 和 user？\n\n忙碌节点会等当前任务结束，离线节点会在下次上线后执行。")) return;
+  if (!confirm("确认让全部节点增量同步 ComfyUI 核心、models 和 user？\n\n忙碌节点会等当前任务结束，离线节点会在下次上线后执行。同步完成后，请更新 requirements 并重启各节点的 ComfyUI。")) return;
   const button=$("sync-all");
   button.disabled=true;
   try {

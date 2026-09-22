@@ -681,7 +681,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agent.sync_report["status"], "done")
         arguments = create_process.await_args.args
         self.assertEqual(arguments[:3], ("cmd.exe", "/d", "/c"))
-        self.assertEqual(arguments[-1], "--non-interactive")
+        self.assertEqual(arguments[-2:], ("--upgrade", "--non-interactive"))
 
     async def test_cancel_retains_current_until_ack_and_reuses_targeted_cleanup(self):
         task = asyncio.create_task(self.agent.execute(self.assignment))
