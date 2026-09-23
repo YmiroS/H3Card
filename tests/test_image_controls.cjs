@@ -227,7 +227,18 @@ test('all image models share real runtime controls without changing video parame
       await page.locator('#menu button').filter({hasText:'深度视频'}).click();
       assert.equal(await page.evaluate(()=>PROJ.cards[0].cap),'depth_video');
       assert.equal(await page.locator('#panel button[title="工具箱模式 —— 点击换"] span').innerText(),'🧩 深度视频');
+      const depthModel=page.locator('#panel button[title="深度视频模型 —— 点击换"]');
+      assert.equal(await depthModel.locator('span').innerText(),'Depth Anything 3');
+      await depthModel.click();
+      assert.deepEqual(await page.locator('#menu button span:nth-child(2)').allTextContents(),['Depth Anything 3（当前）','DepthCrafter']);
+      await page.locator('#menu button').filter({hasText:'DepthCrafter'}).click();
+      assert.equal(await page.evaluate(()=>PROJ.cards[0].cap),'depthcrafter_video');
+      assert.equal(await depthModel.locator('span').innerText(),'DepthCrafter');
       assert.equal(await paramsButton.count(),1);
+      await paramsButton.click();
+      const depthParams=await page.locator('#respop .row > label').allTextContents();
+      for(const label of ['只处理前几帧','处理分辨率','推理步数','引导强度','窗口帧数','窗口重叠帧']) assert.ok(depthParams.includes(label),label);
+      await page.locator('#respop .x').click();
       await switcher.click();
       await page.locator('#menu button').filter({hasText:'画质增强'}).click();
       assert.equal(await page.evaluate(()=>PROJ.cards[0].cap),'seedvr2_image_up');

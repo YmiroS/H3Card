@@ -171,6 +171,36 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
         self.assertEqual([item["name"] for item in modes], ["文生图", "图生图"])
         self.assertEqual(modes[1]["modelSwitch"]["krea2"], "krea2_i2i")
 
+    def test_depth_video_models_share_one_tool_mode(self):
+        card = next(item for item in controller_app.CARDS if item["id"] == "card_tools")
+        mode = next(item for item in card["modes"] if item["id"] == "depth_video")
+        self.assertEqual(mode["modelSwitch"], {
+            "da3": "depth_video", "depthcrafter": "depthcrafter_video",
+        })
+        generated = scan_workflows.build_tools_card(
+            [cap for cap in controller_app.CAPS.values() if cap.get("card") == "card_tools"],
+            controller_app.CAPS,
+        )
+        generated_mode = next(item for item in generated["modes"] if item["id"] == "depth_video")
+        self.assertEqual(generated_mode["modelSwitch"], mode["modelSwitch"])
+        cap = controller_app.CAPS["depthcrafter_video"]
+        guidance = next(item for item in cap["inputs"] if item["key"] == "guidance_scale")
+        self.assertEqual(guidance["min"], 0.1)
+        self.assertEqual(scan_workflows.CAP_KNOBS["depthcrafter_video"]["guidance_scale"][1], 0.1)
+        graph = controller_app.patch_graph(cap, {"max_res": 768, "guidance_scale": 0.1}, {
+            "video[0]": "depth-source.mp4",
+        })
+        self.assertEqual(graph["30"]["inputs"]["video"], "depth-source.mp4")
+        self.assertEqual(graph["31"]["inputs"]["max_res"], 768)
+        self.assertEqual(graph["31"]["inputs"]["guidance_scale"], 0.1)
+        self.assertNotIn("37", graph)
+        self.assertNotIn("38", graph)
+        self.assertEqual(
+            [node for node, data in graph.items() if data["class_type"] == "VHS_VideoCombine"],
+            ["26"],
+        )
+        self.assertEqual(cap["output"], {"node": "26"})
+
     def test_zimage_text_to_image_parameters_are_patchable(self):
         cap = controller_app.CAPS["zimage_t2i"]
         graph = controller_app.patch_graph(cap, {"width": 2048, "height": 2048}, {})
@@ -205,6 +235,9 @@ class ModelFamilyTest(unittest.TestCase):
         self.assertEqual(controller_app.model_family("minimax_h3_character_transfer"), "minimax_h3")
         self.assertEqual(controller_app.model_family("seedvr2_image_up"), "seedvr2")
         self.assertEqual(controller_app.model_family("seedvr2_video_up"), "seedvr2")
+        self.assertEqual(controller_app.model_family("depth_video"), "depth_anything3")
+        self.assertEqual(controller_app.model_family("depthcrafter_video"), "depthcrafter")
+        self.assertEqual(controller_app.model_name("depthcrafter_video"), "DepthCrafter")
         self.assertEqual(controller_app.model_family("unknown_workflow"), "unknown_workflow")
         self.assertEqual(controller_app.model_name("zimage_i2i"), "Z-Image")
         self.assertEqual(controller_app.model_name("gimmvfi_interp"), "GIMM-VFI")
