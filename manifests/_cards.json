@@ -132,7 +132,11 @@
    {
     "id": "depth_video",
     "name": "深度视频",
-    "slots": "img0+aud0+vid1"
+    "slots": "img0+aud0+vid1",
+    "modelSwitch": {
+     "da3": "depth_video",
+     "depthcrafter": "depthcrafter_video"
+    }
    },
    {
     "id": "card_enhance",

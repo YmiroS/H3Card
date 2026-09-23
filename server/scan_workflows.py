@@ -56,6 +56,7 @@ ALIASES = {
     "SeedVR2图片视频高清/SeedVR2视频高清修复放大 v2.json": "seedvr2_video_up",
     "深度转换/深度图片.json": "depth_image",
     "深度转换/深度视频.json": "depth_video",
+    "深度转换/DepthCrafter深度视频.json": "depthcrafter_video",
     "Qwen3.5VL大语言模型全套/qwen3.5-单图反推提示词.json": "qwen_image_reverse",
     "Qwen3.5VL大语言模型全套/qwen3.5-视频反推提示词-修改版.json": "qwen_video_reverse",
 }
@@ -86,6 +87,7 @@ DISPLAY = {
     "seedvr2_video_up": "SeedVR2 视频高清放大",
     "depth_image": "深度图片",
     "depth_video": "深度视频",
+    "depthcrafter_video": "DepthCrafter 深度视频",
     "qwen_image_reverse": "Qwen 单图反推提示词",
     "qwen_video_reverse": "Qwen 视频反推提示词",
 }
@@ -136,6 +138,7 @@ MODEL_SWITCHES = {
                    "qwen2512": "qwen_image_2512_t2i", "qwen21": "qwen_image_21_t2i"},
     "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i",
                    "qwen2511": "qwen_image_edit_2511_i2i", "qwen21": "qwen_image_21_multi"},
+    "depth_video": {"da3": "depth_video", "depthcrafter": "depthcrafter_video"},
 }
 
 # API 图和输入槽随项目维护，不依赖原作者本机的界面工作流路径。
@@ -270,6 +273,9 @@ NOTES = {
     "depth_image": "使用 Depth Anything 3 为单张图片生成相对深度图。白色表示较近，黑色表示较远。",
     "depth_video": "使用 Depth Anything 3 逐帧生成视频深度图，并保留原视频音频和帧率。"
                    "长视频会占用较多显存，建议先用短片段测试。",
+    "depthcrafter_video": "使用 DepthCrafter 生成时序更稳定的黑白深度视频，适合 H3 等动作迁移。"
+                          "首次运行会下载 DepthCrafter 与 Stable Video Diffusion 模型，耗时较长。"
+                          "原工作流明确注明该方案不可商用，请仅用于测试或非商业用途。",
     "rmbg_cutout": "把画面里的主体抠出来、背景变透明，出的是带透明通道的 PNG。全程在本机跑，"
                    "不联网、不限次数。几秒钟一张，很快。\n"
                    "名字叫「人物提取」，但它不是只认人 —— 动物、商品、车、一盆花都能抠，"
@@ -427,6 +433,18 @@ RMBG_RES = ("处理精度", 512, 2048, 128,
             "有用，还会更慢更吃显存。调低更快但边缘会变粗糙")
 
 CAP_KNOBS = {
+    "depthcrafter_video": {
+        "max_res": ("处理分辨率", 512, 2048, 64,
+                    "推荐 {d}：DepthCrafter 推理时使用的最长边分辨率。越高细节越好，但更慢、更占显存"),
+        "num_inference_steps": ("推理步数", 1, 20, 1,
+                                "推荐 {d}：增加步数可能改善深度细节，但会明显增加处理时间"),
+        "guidance_scale": ("引导强度", 0.1, 10, 0.1,
+                           "推荐 {d}：控制深度预测的引导强度，通常保持默认即可"),
+        "window_size": ("窗口帧数", 16, 160, 1,
+                        "推荐 {d}：每次联合处理的帧数。越大时序越稳定，但显存占用越高"),
+        "overlap": ("窗口重叠帧", 0, 64, 1,
+                     "推荐 {d}：相邻窗口的重叠帧数，用于保持长视频深度连续"),
+    },
     "minimax_h3_ref_2pass": {
         "audio_denoise": (
             "音频降噪强度", 0, 1, 0.05,
@@ -508,7 +526,8 @@ CAP_HIDDEN_INPUT_KEYS = {
 # 抠不干净时要调的正是它们，折进「高级」等于把这张卡唯一的玩法藏起来
 PRIMARY_KNOBS = {"max_rows", "interpolation_factor", "target_fps", "resolution",
                  "max_resolution", "force_rate", "frame_load_cap", "denoise",
-                 "sensitivity", "mask_blur", "mask_offset"}
+                 "sensitivity", "mask_blur", "mask_offset", "max_res",
+                 "num_inference_steps", "guidance_scale", "window_size", "overlap"}
 # 表里的上限是硬上限。这类旋钮在图里常写成一个"等于不限"的大数（promptLine 的
 # max_rows=1000），那不是作者调过的设置，照抄成默认值滑条就变成 1000 档没法用。
 HARD_MAX = {"max_rows"}
@@ -1743,7 +1762,12 @@ def build_tools_card(ms, by_id):
     for wid in order:
         m = by_id.get(wid)
         if m:
-            modes.append({"id": m["id"], "name": m["name"], "slots": m["slots"]})
+            mode = {"id": m["id"], "name": m["name"], "slots": m["slots"]}
+            choices = {name: cid for name, cid in MODEL_SWITCHES.get(wid, {}).items()
+                       if cid in by_id}
+            if len(choices) > 1:
+                mode["modelSwitch"] = choices
+            modes.append(mode)
     # 画质增强：那张合并卡的 mode 已经带 route，直接复用
     if "card_enhance" in ROUTE_CARDS:
         card = route_card_def("card_enhance", ROUTE_CARDS["card_enhance"], by_id)
