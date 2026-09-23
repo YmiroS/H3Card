@@ -11,6 +11,7 @@
   python_embeded\\python.exe chouka\\server\\scan_workflows.py            # 扫默认清单
   python_embeded\\python.exe chouka\\server\\scan_workflows.py <文件或目录> ...
 """
+import copy
 import json
 import hashlib
 import re
@@ -518,6 +519,30 @@ CAP_KNOBS = {
 CAP_HIDDEN_INPUT_KEYS = {
     "minimax_h3_ref9": {"frame_load_cap", "force_rate"},
     "minimax_h3_ref_2pass": {"frame_load_cap", "force_rate"},
+}
+CAP_INPUT_PRESETS = {
+    "minimax_h3_ref9": [{
+        "key": "sampling_mode",
+        "label": "生成模式",
+        "type": "select",
+        "default": "fast",
+        "options": [
+            {"value": "fast", "label": "快速模式（8步·提速）"},
+            {"value": "quality", "label": "质量模式（20步·高一致性）"},
+        ],
+        "presets": {
+            "fast": {"steps": 8, "strength_model": 1, "processing_control_value": 0.12},
+            "quality": {"steps": 20, "strength_model": 0, "processing_control_value": 0},
+        },
+        "hint": "快速模式适合预览；质量模式关闭 Turbo 和 TE-Speed，建筑与物体更稳定，但生成更慢。",
+        "target": {"kind": "preset"},
+    }],
+}
+CAP_DURATION_WARNINGS = {
+    "minimax_h3_ref9": {
+        "warnAbove": 8,
+        "warning": "超过 8 秒仍会完整生成；质量模式建议拆成 5～8 秒一段，长镜头更慢且更容易漂移。",
+    },
 }
 # 上面这些旋钮默认折进「高级」。写在这里的是玩法本身的旋钮，要摆在面板正面。
 # max_resolution 进来不是因为它是玩法旋钮，而是因为它能悄悄盖掉 resolution ——
@@ -1565,6 +1590,17 @@ def derive_inputs(api, oi, wid=None):
         order = {"video": 0, "image": 1, "audio": 2}
         out.sort(key=lambda item: order.get(item["type"], 3))
 
+    duration_warning = CAP_DURATION_WARNINGS.get(wid)
+    if duration_warning:
+        duration = next((item for item in out if item.get("key") == "duration"), None)
+        if duration:
+            duration.update(duration_warning)
+    presets = CAP_INPUT_PRESETS.get(wid, [])
+    if presets:
+        insert_at = next((i for i, item in enumerate(out) if item.get("key") == "duration"), len(out))
+        for preset in reversed(presets):
+            out.insert(insert_at, copy.deepcopy(preset))
+
     # 切格子的工作流：这是用户唯一会踩的坑，写成卡片说明摆在最上面
     note = None
     grids = [tuple(s["grid"]) for s in out if s.get("grid")]
@@ -2062,8 +2098,11 @@ def main():
             flag = "*" if i.get("required") else (" advanced" if i.get("advanced") else "")
             dv = i.get("default")
             dv = (str(dv)[:40] + "…") if isinstance(dv, str) and len(str(dv)) > 40 else dv
+            target = i["target"]
+            dest = ("预设参数" if target.get("kind") == "preset"
+                    else f"#{target['node']}.{target['input']}")
             print(f"    - {i['label']:<10} {i['type']:<9} {i['key']:<12} "
-                  f"-> #{i['target']['node']}.{i['target']['input']}  默认={dv}{flag}")
+                  f"-> {dest}  默认={dv}{flag}")
         for w in m["warnings"]:
             print(f"    ⚠ {w}")
 
