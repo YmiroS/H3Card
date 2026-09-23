@@ -543,13 +543,30 @@ def patch_h3_character_transfer(g, cap, params, uploaded, video_metadata=None):
     )
 
 
+def apply_input_presets(cap, params):
+    """展开 manifest 声明的参数预设，并让预设值覆盖外部传入的冲突参数。"""
+    for spec in cap.get("inputs", []):
+        presets = spec.get("presets")
+        if not presets:
+            continue
+        key = spec["key"]
+        selected = params.get(key, spec.get("default"))
+        if selected not in presets:
+            raise web.HTTPBadRequest(reason=f"{spec['label']}无效：{selected}")
+        params[key] = selected
+        params.update(presets[selected])
+
+
 def patch_graph(cap, params, uploaded, video_metadata=None):
     """按 manifest 把用户参数写进 API 工作流模板"""
+    apply_input_presets(cap, params)
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
     labels = {s["key"]: s["label"] for s in cap["inputs"]}
     missing, blank = [], []
     for spec in cap["inputs"]:
         key, tgt = spec["key"], spec["target"]
+        if tgt.get("kind") == "preset":
+            continue
         node, field = str(tgt["node"]), tgt["input"]
         if node not in g:
             raise web.HTTPBadRequest(reason=f"工作流里没有节点 {node}（能力 {cap['id']} 需重新扫描）")

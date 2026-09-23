@@ -281,12 +281,25 @@ test('all image models share real runtime controls without changing video parame
       assert.equal(await page.locator('#world .cmp').count(),1,'cutout tool keeps its comparison preview');
     });
 
-    await t.test('H3 video clarity and random-seed behavior are unchanged',async()=>{
+    await t.test('H3 video quality mode expands its sampling preset and warns on long clips',async()=>{
       await reset('minimax_h3_ref9','card_video');await paramsButton.click();
       assert.deepEqual(await page.locator('#respop .cgrid.k button').allTextContents(),['480p','544p','640p','768p']);
       assert.equal(await page.locator('#respop .image-basic').count(),0);
+      const modeRow=page.locator('#respop .row').filter({hasText:'生成模式'});
+      const mode=modeRow.locator('select');
+      assert.deepEqual(await mode.locator('option').allTextContents(),['快速模式（8步·提速）','质量模式（20步·高一致性）']);
+      assert.equal(await mode.inputValue(),'fast');
+      await mode.selectOption('quality');
+      const durationRow=page.locator('#respop .row').filter({hasText:'时长(秒)'});
+      await durationRow.locator('input[type=number]').fill('10');
+      assert.equal(await durationRow.locator('.paramwarn').isVisible(),true);
       const payload=await page.evaluate(()=>{PROJ.cards[0].params.seed=123;return payloadOf(PROJ.cards[0]);});
       assert.equal(payload.params.seed,-1);
+      assert.equal(payload.params.sampling_mode,'quality');
+      assert.equal(payload.params.steps,20);
+      assert.equal(payload.params.strength_model,0);
+      assert.equal(payload.params.processing_control_value,0);
+      assert.equal(payload.params.duration,10);
       assert.equal(Object.hasOwn(payload.params,'image_ratio'),false);
       assert.equal(Object.hasOwn(payload.params,'image_clarity'),false);
     });

@@ -857,9 +857,10 @@ function paramsBrief(c, cap) {
   const resolution = cap.inputs.find(x => x.key === "resolution");
   const w = cap.inputs.find(x => x.key === "width");
   const stl = cap.inputs.find(x => x.key === "scale_to_length");
+  const mode = cap.inputs.find(x => x.presets);
   const dur = cap.inputs.find(x => x.key === "duration");
   const preview = cap.inputs.find(x => x.key === "preview_seconds");
-  if (!ar && !mp && !resolution && !w && !stl && !dur && !preview) return null;
+  if (!ar && !mp && !resolution && !w && !stl && !mode && !dur && !preview) return null;
   const parts = [];
   // scale_to_length 模式：只显示最长边数字
   if (stl && !ar) {
@@ -888,6 +889,12 @@ function paramsBrief(c, cap) {
   } else if (w) {
     const s = whStep(cap, c);
     if (s) parts.push(s.label);
+  }
+  if (mode) {
+    const selected = c.params[mode.key] != null ? c.params[mode.key] : mode.default;
+    const option = (mode.options || []).find(item => (typeof item === "object" ? item.value : item) === selected);
+    const label = typeof option === "object" ? option.label : option;
+    if (label) parts.unshift(label.replace(/（.*$/, ""));
   }
   // 视频时长
   if (dur) {
@@ -5879,7 +5886,12 @@ function rowEl(c, s) {
     row.appendChild(ta);
   } else if (s.type === "select" && s.options) {
     const sel = document.createElement("select"); sel.style.flex = "1";
-    for (const o of s.options) { const op = document.createElement("option"); op.value = op.textContent = o; sel.appendChild(op); }
+    for (const o of s.options) {
+      const op = document.createElement("option");
+      op.value = typeof o === "object" ? o.value : o;
+      op.textContent = typeof o === "object" ? o.label : o;
+      sel.appendChild(op);
+    }
     if (cur != null) sel.value = cur;
     sel.onchange = () => {
       c.params[s.key] = sel.value; save();
@@ -5896,6 +5908,19 @@ function rowEl(c, s) {
     i.style.flex = "1";
     i.oninput = () => { c.params[s.key] = i.type === "number" ? (i.value === "" ? "" : parseFloat(i.value)) : i.value; save(); };
     row.appendChild(i);
+  }
+  if (s.warnAbove != null && s.warning) {
+    const warning = document.createElement("div"); warning.className = "paramwarn";
+    const refresh = () => {
+      const value = parseFloat(c.params[s.key] != null ? c.params[s.key] : s.default);
+      warning.hidden = !isFinite(value) || value <= s.warnAbove;
+      warning.textContent = s.warning;
+    };
+    for (const input of row.querySelectorAll("input, select")) {
+      input.addEventListener("input", refresh);
+      input.addEventListener("change", refresh);
+    }
+    refresh(); row.appendChild(warning);
   }
   if (s.key === "megapixels" || s.key === "scale_to_length") augRes(c, s, row);
   if (s.key === "frame_load_cap") augFrames(c, s, row);
@@ -5983,6 +6008,16 @@ function augRes(c, s, row) {
 }
 
 /* ================= 运行 / 轮询 ================= */
+function applyInputPresets(cap, params) {
+  for (const spec of (cap.inputs || []).filter(s => s.presets)) {
+    const selected = params[spec.key] != null ? params[spec.key] : spec.default;
+    const preset = spec.presets[selected];
+    if (!preset) throw new Error(`${spec.label}无效：${selected}`);
+    params[spec.key] = selected;
+    Object.assign(params, preset);
+  }
+}
+
 /** 所见即所得：面板里显示的值就是提交的值。
     以前没动过的输入框不会进 params，ComfyUI 于是用了模板里作者的演示值 —
     图生视频出鼠标广告就是这么来的。 */
@@ -6011,6 +6046,7 @@ function payloadOf(c) {
       params[s.key] = resolved;
     }
   }
+  applyInputPresets(cap, params);
   if (cap.imageControls) {
     const selected = imageSettings(c, cap);
     params.image_ratio = selected.ratio;

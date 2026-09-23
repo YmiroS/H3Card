@@ -242,6 +242,38 @@
    }
   },
   {
+   "key": "sampling_mode",
+   "label": "生成模式",
+   "type": "select",
+   "default": "fast",
+   "options": [
+    {
+     "value": "fast",
+     "label": "快速模式（8步·提速）"
+    },
+    {
+     "value": "quality",
+     "label": "质量模式（20步·高一致性）"
+    }
+   ],
+   "presets": {
+    "fast": {
+     "steps": 8,
+     "strength_model": 1,
+     "processing_control_value": 0.12
+    },
+    "quality": {
+     "steps": 20,
+     "strength_model": 0,
+     "processing_control_value": 0
+    }
+   },
+   "hint": "快速模式适合预览；质量模式关闭 Turbo 和 TE-Speed，建筑与物体更稳定，但生成更慢。",
+   "target": {
+    "kind": "preset"
+   }
+  },
+  {
    "key": "duration",
    "label": "时长(秒)",
    "type": "slider",
@@ -254,7 +286,9 @@
     "node": "20",
     "input": "value",
     "vtype": "FLOAT"
-   }
+   },
+   "warnAbove": 8,
+   "warning": "超过 8 秒仍会完整生成；质量模式建议拆成 5～8 秒一段，长镜头更慢且更容易漂移。"
   },
   {
    "key": "strength_model",
