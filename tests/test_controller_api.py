@@ -217,6 +217,35 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
         )
         self.assertEqual(graph["49"]["inputs"]["resolution"], "1280x720 (16:9)")
 
+    def test_h3_reference_sampling_modes_override_conflicting_parameters(self):
+        cap = controller_app.CAPS["minimax_h3_ref9"]
+        mode = next(item for item in cap["inputs"] if item["key"] == "sampling_mode")
+        self.assertEqual(mode["default"], "fast")
+        self.assertEqual(mode["presets"]["quality"], {
+            "steps": 20, "strength_model": 0, "processing_control_value": 0,
+        })
+        duration = next(item for item in cap["inputs"] if item["key"] == "duration")
+        self.assertEqual(duration["warnAbove"], 8)
+
+        fast = controller_app.patch_graph(cap, {"sampling_mode": "fast"}, {})
+        self.assertEqual(fast["1"]["inputs"]["steps"], 8)
+        self.assertEqual(fast["69"]["inputs"]["strength_model"], 1)
+        self.assertEqual(fast["71"]["inputs"]["processing_control_value"], 0.12)
+
+        quality = controller_app.patch_graph(cap, {
+            "sampling_mode": "quality",
+            "steps": 8,
+            "strength_model": 1,
+            "processing_control_value": 0.12,
+            "duration": 10,
+        }, {})
+        self.assertEqual(quality["1"]["inputs"]["steps"], 20)
+        self.assertEqual(quality["69"]["inputs"]["strength_model"], 0)
+        self.assertEqual(quality["71"]["inputs"]["processing_control_value"], 0)
+        self.assertEqual(quality["20"]["inputs"]["value"], 10)
+        with self.assertRaises(web.HTTPBadRequest):
+            controller_app.patch_graph(cap, {"sampling_mode": "unknown"}, {})
+
     def test_h3_two_pass_uses_tested_audio_denoise(self):
         cap = controller_app.CAPS["minimax_h3_ref_2pass"]
         spec = next(item for item in cap["inputs"] if item["key"] == "audio_denoise")
