@@ -97,6 +97,7 @@ MODEL_FAMILY = {
     "seedvr2_video_up": "seedvr2",
     "depth_image": "depth_anything3",
     "depth_video": "depth_anything3",
+    "depthcrafter_video": "depthcrafter",
 }
 
 
@@ -116,6 +117,7 @@ MODEL_NAMES = {
     "rmbg2": "RMBG 2.0",
     "seedvr2": "SeedVR2",
     "depth_anything3": "Depth Anything 3",
+    "depthcrafter": "DepthCrafter",
     "gimmvfi_interp": "GIMM-VFI",
     "grid4_stitch": "无需模型（拼图工具）",
     "rmbg_erase": "RMBG 2.0 + FLUX.2 Klein",

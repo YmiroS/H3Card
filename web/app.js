@@ -134,8 +134,9 @@ const modeOf = (c) => { const d = defOf(c); return d && d.modes.find(m => modeHa
 // 以实际能力反查模型，避免旧项目或复制节点留下的 _model 与当前能力不一致。
 const modelOf = (c) => Object.entries((modeOf(c) || {}).modelSwitch || {})
   .find(([, cid]) => cid === c.cap)?.[0];
-const IMAGE_MODEL_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen Image Edit 2511",
-  qwen2512: "Qwen Image 2512（双阶段）", qwen21: "Qwen Image 2.1" };
+const MODEL_SWITCH_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen Image Edit 2511",
+  qwen2512: "Qwen Image 2512（双阶段）", qwen21: "Qwen Image 2.1",
+  da3: "Depth Anything 3", depthcrafter: "DepthCrafter" };
 /** 节点显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
     路由节点同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
     最后兜底用模式名而不是裸 id：风格节点在 CAPS 里根本没有条目（它不是能力）。 */
@@ -4062,13 +4063,13 @@ function openPanel(id) {
     hoverTip(modeButton, () => modeBriefEl(c, currentMode, currentMode.name));
     foot.appendChild(modeButton);
 
-    // 菜单完全由当前模式声明的模型映射决定，不推测能力名或图生图后缀。
-    if (def.id === "card_image" && currentMode.modelSwitch) {
+    // 菜单完全由当前模式声明的模型映射决定，不推测能力名或能力 id。
+    if (currentMode.modelSwitch) {
       const curModel = modelOf(c);
-      const modelName = (key) => IMAGE_MODEL_NAMES[key] || key;
+      const modelName = (key) => MODEL_SWITCH_NAMES[key] || key;
       const modelBtn = capBtn(
         modelName(curModel) || cap.name,
-        "生图模型",
+        def.id === "card_image" ? "生图模型" : "深度视频模型",
         () => Object.entries(currentMode.modelSwitch).map(([key, cid]) => ({
           text: modelName(key) + (cid === c.cap ? "（当前）" : ""),
           run: () => {

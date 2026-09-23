@@ -45,6 +45,7 @@
     "seedvr2_video_up": {"category": "video_tool", "estimated_min": 0.32, "estimated_max": 0.32},
     "depth_image": {"category": "image_tool"},
     "depth_video": {"category": "video_tool"},
+    "depthcrafter_video": {"category": "video_tool"},
     "qwen_image_reverse": {"category": "text", "estimated_min": 0.048, "estimated_max": 0.048},
     "qwen_video_reverse": {"category": "text"},
     "text": {"category": "text", "estimated_min": 0.002, "estimated_max": 0.03, "retail_min": 0.03, "retail_max": 0.10}
