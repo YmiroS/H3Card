@@ -5550,6 +5550,91 @@ function paintPort(c) {
       : "文本节点的出口拖到这里";
 }
 
+const IMAGE_SLOT_DRAG = "application/x-chouka-image-slot";
+
+/** 图片顺序就是固定槽位里素材的顺序。拖动时连素材、上游连线和一图一词的提示词一起搬，
+    后端仍然只需要认识 images[0]、images[1]……这些原有槽位。 */
+function reorderReferenceImages(c, imageSpecs, fromKey, toKey) {
+  const keys = imageSpecs.map(s => s.key);
+  const from = keys.indexOf(fromKey), to = keys.indexOf(toKey);
+  if (from < 0 || to < 0 || from === to) return false;
+
+  const ordered = keys.map(key => ({ key, asset: c.assets[key] }));
+  const [moved] = ordered.splice(from, 1);
+  ordered.splice(to, 0, moved);
+  const remap = Object.fromEntries(ordered.map((item, i) => [item.key, keys[i]]));
+  ordered.forEach((item, i) => { c.assets[keys[i]] = item.asset; });
+
+  const cap = capOf(c);
+  const paired = new Map((cap && cap.inputs || [])
+    .filter(s => s.pairWith).map(s => [s.pairWith, s.key]));
+  if (keys.every(key => paired.has(key))) {
+    const moves = ordered.map((item, i) => ({ from: paired.get(item.key), to: paired.get(keys[i]) }));
+    for (const state of [c.params, c.opt, c.optUse, c.optStyle]) {
+      if (!state) continue;
+      const values = moves.map(move => ({
+        to: move.to,
+        has: Object.prototype.hasOwnProperty.call(state, move.from),
+        value: state[move.from],
+      }));
+      for (const move of moves) delete state[move.to];
+      for (const value of values) if (value.has) state[value.to] = value.value;
+    }
+    const active = keys.filter(key => paired.has(key));
+    if (Number.isInteger(c._tab) && active[c._tab]) {
+      c._tab = active.indexOf(remap[active[c._tab]]);
+    }
+  }
+
+  for (const edge of (PROJ && PROJ.edges || [])) {
+    if (edge.to !== c.id || isTextEdge(edge)) continue;
+    if (remap[edge.slot]) edge.slot = remap[edge.slot];
+    if (Array.isArray(edge.slots)) edge.slots = edge.slots.map(key => remap[key] || key);
+  }
+  return true;
+}
+
+function enableReferenceImageDrag(c, s, d, imageSpecs) {
+  if (imageSpecs.length < 2) return;
+  d.draggable = true;
+  d.classList.add("sortable");
+  d.title += "\n拖拽可调整图片顺序";
+  const internalDrag = ev => Array.from(ev.dataTransfer && ev.dataTransfer.types || [])
+    .includes(IMAGE_SLOT_DRAG);
+  d.ondragstart = (ev) => {
+    if (!requireOperate()) return ev.preventDefault();
+    d._skipClick = true;
+    ev.dataTransfer.effectAllowed = "move";
+    ev.dataTransfer.setData(IMAGE_SLOT_DRAG, s.key);
+    requestAnimationFrame(() => d.classList.add("dragging"));
+  };
+  d.ondragenter = (ev) => {
+    if (!internalDrag(ev)) return;
+    ev.preventDefault(); ev.stopPropagation();
+    d.classList.add("drop-target");
+  };
+  d.ondragover = (ev) => {
+    if (!internalDrag(ev)) return;
+    ev.preventDefault(); ev.stopPropagation();
+    ev.dataTransfer.dropEffect = "move";
+  };
+  d.ondragleave = (ev) => {
+    if (!d.contains(ev.relatedTarget)) d.classList.remove("drop-target");
+  };
+  d.ondrop = (ev) => {
+    if (!internalDrag(ev)) return;
+    ev.preventDefault(); ev.stopPropagation();
+    d.classList.remove("drop-target");
+    const fromKey = ev.dataTransfer.getData(IMAGE_SLOT_DRAG);
+    if (!reorderReferenceImages(c, imageSpecs, fromKey, s.key)) return;
+    paintKind(c); drawWires(); paintStyles(); openPanel(c.id); save();
+  };
+  d.ondragend = () => {
+    d.classList.remove("dragging", "drop-target");
+    setTimeout(() => { d._skipClick = false; }, 0);
+  };
+}
+
 /** 素材引用按需显示：只有已经引用的素材才画卡片；下面的添加按钮直接打开文件选择，
     取消选择不会留下空槽。每种类型同时标出上限，连线和手动上传共用同一套限制。 */
 function referenceSlots(c, specs, md) {
@@ -5571,7 +5656,12 @@ function referenceSlots(c, specs, md) {
     head.textContent = `引用上限：${limits.join(" · ")}`;
   }
   wrap.appendChild(head);
-  for (const s of filled) wrap.appendChild(slotEl(c, s));
+  const imageSpecs = filled.filter(s => s.type === "image");
+  for (const s of filled) {
+    const slot = slotEl(c, s);
+    if (s.type === "image") enableReferenceImageDrag(c, s, slot, imageSpecs);
+    wrap.appendChild(slot);
+  }
 
   const adds = document.createElement("div"); adds.className = "refadds";
   if (route) {
@@ -5603,6 +5693,7 @@ function slotEl(c, s) {
   const a = c.assets[s.key];
   const d = document.createElement("div");
   d.className = "slot" + (a ? " filled" : s.required ? " req" : "");
+  d.dataset.key = s.key;
   d.title = (s.hint || slotName(s, c)) + (s.required ? "（必填）" : "")
     + (a ? "\n单击预览；右键更换、下载或清空素材" : "\n单击上传素材");
   d.innerHTML = `<div class="box"></div><span class="lbl"></span>`;
@@ -5614,7 +5705,10 @@ function slotEl(c, s) {
     prepareVideos(box);
   } else box.textContent = s.type === "audio" ? "🎵"
     : s.type === "video" ? "🎬" : gridWord(s) ? "田" : "＋";
-  d.onclick = () => a ? openAsset(a) : pickFile(c, s);
+  d.onclick = () => {
+    if (d._skipClick) return;
+    return a ? openAsset(a) : pickFile(c, s);
+  };
   d.oncontextmenu = (ev) => {
     ev.stopPropagation();
     ev.preventDefault();
