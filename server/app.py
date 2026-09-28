@@ -2126,9 +2126,14 @@ async def broadcast_presence(app, pid):
 async def api_project_presence(request):
     pid = request.match_info["pid"]
     await require_project(request, pid)
+    if request.app["lifecycle"]["shutting_down"]:
+        raise web.HTTPServiceUnavailable(text="服务正在重启")
     user = require_user(request)
     socket = web.WebSocketResponse(heartbeat=25)
     await socket.prepare(request)
+    if request.app["lifecycle"]["shutting_down"]:
+        await socket.close(code=1001, message=b"server shutdown")
+        return socket
     connection_id = uuid.uuid4().hex
     room = request.app["presence_rooms"][pid]
     room[connection_id] = {
@@ -2451,6 +2456,7 @@ async def api_health(request):
 
 # =====================================================================
 async def on_start(app):
+    app["lifecycle"]["shutting_down"] = False
     app["auth_store"] = await asyncio.to_thread(AuthStore, app["auth_path"])
     app["resource_access"] = await asyncio.to_thread(
         ResourceAccess, app["auth_store"], ROOT, COMFY_INPUT)
@@ -2464,13 +2470,20 @@ async def on_start(app):
         app["ws_task"] = asyncio.create_task(ws_loop(app))
 
 
-async def on_stop(app):
-    await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
+async def close_presence_connections(app):
+    lifecycle = app.get("lifecycle")
+    if lifecycle is not None:
+        lifecycle["shutting_down"] = True
     presence_rooms = app.get("presence_rooms", {})
     sockets = [entry["ws"] for room in presence_rooms.values() for entry in room.values()]
+    presence_rooms.clear()
     await asyncio.gather(*(socket.close(code=1001, message=b"server shutdown")
                            for socket in sockets), return_exceptions=True)
-    presence_rooms.clear()
+
+
+async def on_stop(app):
+    await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
+    await close_presence_connections(app)
     await app["video_previews"].close()
     task = app.get("ws_task")
     if task:
@@ -2542,6 +2555,7 @@ def make_app(auth_path=None):
     app["cleanup_pending"] = {pid for pid, job in JOBS.items()
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
+    app["lifecycle"] = {"shutting_down": False}
     app["local_test"] = local_test
     app["bind_host"] = "127.0.0.1" if local_test else "0.0.0.0"
     if local_test:
@@ -2618,6 +2632,7 @@ def make_app(auth_path=None):
     for name in ("app.js", "style.css"):
         app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
+    app.on_shutdown.append(close_presence_connections)
     app.on_cleanup.append(on_stop)
     print(f"[抽卡系统] 载入 {n} 个能力，{len(CARDS)} 张卡")
     print(f"[抽卡系统] 执行模式：{EXECUTION_MODE}")
