@@ -39,7 +39,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "",
+   "default": "开心女生在跳舞",
    "target": {
     "node": "45",
     "input": "text"

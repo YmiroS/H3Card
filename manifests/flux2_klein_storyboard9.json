@@ -48,7 +48,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "",
+   "default": "写实风格，苗疆女孩探险的故事",
    "target": {
     "node": "183:182",
     "input": "custom_prompt"
@@ -113,7 +113,7 @@
   }
  ],
  "warnings": [
-  "子图工作流：使用已导出的 flux2_klein_storyboard9.api.json（本地未重新转换）",
+  "子图工作流：使用已维护的 flux2_klein_storyboard9.api.json",
   "本地大模型：#183:179.model = Qwen3.5-27B-IQ4_XS.gguf",
   "本地大模型：#183:179.mmproj = mmproj-F16.gguf"
  ]

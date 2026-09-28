@@ -46,7 +46,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "",
+   "default": "详细描述图像内容",
    "target": {
     "node": "4",
     "input": "custom_prompt"
