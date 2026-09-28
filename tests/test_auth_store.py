@@ -222,10 +222,19 @@ class StoreTests(unittest.TestCase):
             self.store.assign_projects([{'project_id': 'p', 'owner_id': self.admin}], self.viewer,
                                        actor_id=self.admin, session_token=session['token'])
 
+    def test_project_views_are_independent_per_user(self):
+        self.store.create_project('shared', self.owner)
+        self.store.set_project_view(self.owner, 'shared', 10.0, 20.0, 1.2)
+        self.store.set_project_view(self.viewer, 'shared', -30.0, 40.0, 0.75)
+        self.assertEqual(self.store.get_project_view(self.owner, 'shared'),
+                         {'x': 10.0, 'y': 20.0, 'k': 1.2})
+        self.assertEqual(self.store.get_project_view(self.viewer, 'shared'),
+                         {'x': -30.0, 'y': 40.0, 'k': 0.75})
+
     def test_unknown_schema_rejected(self):
         path = Path(self.tmp.name) / 'future.sqlite'
         db = sqlite3.connect(path)
-        db.execute('PRAGMA user_version=5')
+        db.execute('PRAGMA user_version=6')
         db.close()
         with self.assertRaises(AuthError):
             AuthStore(path)
@@ -265,7 +274,7 @@ class RegistrationStoreTests(unittest.TestCase):
             self.assertFalse(users[0]['team_leader'])
             self.assertEqual(store._user('u1')['enabled'], 1)
             self.assertTrue(store.is_ready())
-            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 4)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 5)
             self.assertIsNone(store.get_project('legacy-project')['team_id'])
             self.assertEqual(store.list_project_shares('legacy-project', 'u1')['user_ids'], [])
         finally:

@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import app as controller_app
 import auth_support
+from aiohttp import ClientSession, CookieJar, WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
 PASSWORD = auth_support.PASSWORD
@@ -146,6 +147,143 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             f"/api/projects/{created['id']}", json={'rev': 1, 'cards': [], 'edges': []},
             headers=bob_headers)).status, 404)
         self.assertTrue(teammate_session['csrf_token'])
+
+    async def test_collaborators_keep_independent_views_and_append_cards(self):
+        bob = self.auth.create_user('bob', PASSWORD)
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '协同画布'}, headers=self.headers)).json()
+        self.auth.set_project_shares(created['id'], [bob['id']], [], self.admin['id'])
+        project_url = f"/api/projects/{created['id']}"
+
+        response = await self.client.put(
+            project_url + '/view', json={'x': 120, 'y': -45, 'k': 1.25}, headers=self.headers)
+        self.assertEqual(response.status, 200, await response.text())
+        admin_project = await (await self.client.get(project_url)).json()
+        self.assertEqual(admin_project['view'], {'x': 120.0, 'y': -45.0, 'k': 1.25})
+        self.assertEqual(admin_project['rev'], created['rev'])
+
+        response = await self.client.post(
+            '/api/auth/login', json={'username': 'bob', 'password': PASSWORD},
+            headers={'Origin': self.origin})
+        bob_session = await response.json()
+        bob_headers = {'Origin': self.origin, 'X-CSRF-Token': bob_session['csrf_token']}
+        bob_project = await (await self.client.get(project_url)).json()
+        self.assertEqual(bob_project['view'], created['view'])
+        response = await self.client.put(
+            project_url + '/view', json={'x': -300, 'y': 80, 'k': 0.5}, headers=bob_headers)
+        self.assertEqual(response.status, 200, await response.text())
+
+        card_b = {'id': 'bob-card', 'type': 'card_image', 'cap': 'test',
+                  'x': 10, 'y': 20, 'params': {}, 'assets': {}, 'outputs': []}
+        response = await self.client.post(project_url + '/cards', json={'card': card_b}, headers=bob_headers)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())['card']['created_by'], bob['id'])
+
+        self.headers = await self.login()
+        admin_project = await (await self.client.get(project_url)).json()
+        self.assertEqual(admin_project['view'], {'x': 120.0, 'y': -45.0, 'k': 1.25})
+        card_a = {'id': 'admin-card', 'type': 'card_text', 'cap': 'text',
+                  'x': 30, 'y': 40, 'params': {}, 'assets': {}, 'outputs': []}
+        response = await self.client.post(project_url + '/cards', json={'card': card_a}, headers=self.headers)
+        self.assertEqual(response.status, 200, await response.text())
+        payload = await response.json()
+        cards = payload['project']['cards']
+        self.assertEqual({card['id'] for card in cards}, {'bob-card', 'admin-card'})
+        self.assertEqual({card['created_by'] for card in cards}, {bob['id'], self.admin['id']})
+
+        forged = [dict(card) for card in cards]
+        forged[0]['created_by'] = 'forged-user'
+        response = await self.client.put(
+            project_url, json={'rev': payload['project']['rev'], 'cards': forged}, headers=self.headers)
+        self.assertEqual(response.status, 200, await response.text())
+        current = await (await self.client.get(project_url)).json()
+        self.assertEqual({card['created_by'] for card in current['cards']}, {bob['id'], self.admin['id']})
+        response = await self.client.put(
+            project_url, json={'rev': current['rev'], 'cards': current['cards'] + [
+                {'id': 'bypass-card', 'type': 'card_text', 'params': {}, 'assets': {}}]},
+            headers=self.headers)
+        self.assertEqual(response.status, 409)
+
+    async def test_presence_shows_members_and_world_cursor(self):
+        bob = self.auth.create_user('bob', PASSWORD)
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '在线协同'}, headers=self.headers)).json()
+        self.auth.set_project_shares(created['id'], [bob['id']], [], self.admin['id'])
+        presence_url = f"/api/projects/{created['id']}/presence"
+        admin_socket = await self.client.ws_connect(presence_url)
+        bob_client = ClientSession(cookie_jar=CookieJar(unsafe=True))
+        bob_socket = None
+        try:
+            first = await admin_socket.receive_json(timeout=2)
+            self.assertEqual(first['type'], 'presence')
+            self.assertEqual(len(first['members']), 1)
+
+            response = await bob_client.post(
+                str(self.client.make_url('/api/auth/login')),
+                json={'username': 'bob', 'password': PASSWORD}, headers={'Origin': self.origin})
+            self.assertEqual(response.status, 200)
+            await response.read()
+            bob_socket = await bob_client.ws_connect(str(self.client.make_url(presence_url)))
+            admin_presence = await admin_socket.receive_json(timeout=2)
+            bob_presence = await bob_socket.receive_json(timeout=2)
+            self.assertEqual(len(admin_presence['members']), 2)
+            self.assertEqual(len(bob_presence['members']), 2)
+
+            await bob_socket.send_json({'type': 'cursor', 'x': 321.5, 'y': -42, 'visible': True})
+            cursor = await admin_socket.receive_json(timeout=2)
+            self.assertEqual(cursor['type'], 'cursor')
+            self.assertEqual((cursor['x'], cursor['y']), (321.5, -42.0))
+            self.assertEqual(cursor['user_id'], bob['id'])
+
+            self.auth.set_project_shares(created['id'], [], [], self.admin['id'])
+            removed = await controller_app.prune_presence_permissions(self.client.server.app, created['id'])
+            self.assertTrue(removed)
+            await controller_app.broadcast_presence(self.client.server.app, created['id'])
+            closed = await bob_socket.receive(timeout=2)
+            self.assertIn(closed.type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
+            bob_socket = None
+            left = await admin_socket.receive_json(timeout=2)
+            self.assertEqual(len(left['members']), 1)
+        finally:
+            if bob_socket is not None:
+                await bob_socket.close()
+            await bob_client.close()
+            await admin_socket.close()
+
+    async def test_removing_team_member_closes_presence_immediately(self):
+        bob = self.auth.create_user('bob', PASSWORD)
+        team = (await (await self.client.post(
+            '/api/teams', json={'name': '即时撤权组'}, headers=self.headers)).json())['team']
+        response = await self.client.post(
+            f"/api/teams/{team['id']}/members", json={'user_id': bob['id']}, headers=self.headers)
+        self.assertEqual(response.status, 201)
+        project = await (await self.client.post(
+            '/api/projects', json={'name': '团队协同', 'team_id': team['id']}, headers=self.headers)).json()
+
+        bob_client = ClientSession(cookie_jar=CookieJar(unsafe=True))
+        bob_socket = None
+        try:
+            response = await bob_client.post(
+                str(self.client.make_url('/api/auth/login')),
+                json={'username': 'bob', 'password': PASSWORD}, headers={'Origin': self.origin})
+            self.assertEqual(response.status, 200)
+            await response.read()
+            bob_socket = await bob_client.ws_connect(str(self.client.make_url(
+                f"/api/projects/{project['id']}/presence")))
+            self.assertEqual((await bob_socket.receive_json(timeout=2))['type'], 'presence')
+
+            response = await self.client.delete(
+                f"/api/teams/{team['id']}/members/{bob['id']}", headers=self.headers)
+            self.assertEqual(response.status, 200, await response.text())
+            closed = await bob_socket.receive(timeout=2)
+            self.assertIn(closed.type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
+            bob_socket = None
+            response = await bob_client.get(str(self.client.make_url(f"/api/projects/{project['id']}")))
+            self.assertEqual(response.status, 404)
+        finally:
+            if bob_socket is not None:
+                await bob_socket.close()
+            await bob_client.close()
 
     async def test_share_revoked_between_project_permission_checks_returns_not_found(self):
         bob = self.auth.create_user('bob', PASSWORD)
