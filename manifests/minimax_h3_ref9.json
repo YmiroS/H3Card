@@ -245,7 +245,7 @@
    "key": "sampling_mode",
    "label": "生成模式",
    "type": "select",
-   "default": "fast",
+   "default": "quality",
    "options": [
     {
      "value": "fast",
