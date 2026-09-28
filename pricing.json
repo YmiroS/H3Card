@@ -1,5 +1,5 @@
 {
-  "version": "2026-09-09",
+  "version": "2026-09-28",
   "currency": "CNY",
   "rates": {
     "electricity_per_gpu_hour": 0.6,
@@ -26,6 +26,7 @@
     "zimage_i2i": {"category": "image_generation", "estimated_min": 0.07, "estimated_max": 0.15, "retail_min": 0.30, "retail_max": 0.60},
     "krea2_i2i": {"category": "image_generation", "estimated_min": 0.05, "estimated_max": 0.09, "retail_min": 0.30, "retail_max": 0.60},
     "flux2_klein_edit": {"category": "image_edit", "estimated_min": 0.02, "estimated_max": 0.03, "retail_min": 0.20, "retail_max": 0.40},
+    "qwen_image_21_multi": {"category": "image_edit", "retail_min": 0.30, "retail_max": 0.60},
     "flux2_klein_storyboard9": {"category": "image_generation", "estimated_min": 0.14, "estimated_max": 0.25, "retail_min": 1.0, "retail_max": 2.0},
     "minimax_h3_i2v": {"category": "video_generation", "estimated_min": 0.10, "estimated_max": 0.31, "retail_min": 1.5, "retail_max": 2.5, "retail_basis": "per_segment", "retail_unit_seconds": 5},
     "minimax_h3_flf2v": {"category": "video_generation", "estimated_min": 0.10, "estimated_max": 0.32, "retail_min": 1.5, "retail_max": 2.5, "retail_basis": "per_segment", "retail_unit_seconds": 5},
