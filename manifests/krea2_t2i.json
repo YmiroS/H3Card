@@ -37,10 +37,26 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "",
+   "default": "极致大师极摄影人像，中国coser写真照，阳光打在面部，毛孔细微可见，调皮可爱活泼",
    "target": {
     "node": "61",
     "input": "prompt"
+   }
+  },
+  {
+   "key": "steps",
+   "label": "采样步数",
+   "type": "slider",
+   "min": 1,
+   "max": 40,
+   "step": 1,
+   "default": 8,
+   "hint": "推荐 8：模型带加速 LoRA，8 步就到位了。往下调会花，往上调基本白等",
+   "advanced": true,
+   "target": {
+    "node": "9",
+    "input": "steps",
+    "vtype": "INT"
    }
   },
   {
@@ -79,22 +95,6 @@
     "480x854 (9:16)",
     "854x480 (16:9)"
    ]
-  },
-  {
-   "key": "steps",
-   "label": "采样步数",
-   "type": "slider",
-   "min": 1,
-   "max": 40,
-   "step": 1,
-   "default": 8,
-   "hint": "推荐 8：模型带加速 LoRA，8 步就到位了。往下调会花，往上调基本白等",
-   "advanced": true,
-   "target": {
-    "node": "9",
-    "input": "steps",
-    "vtype": "INT"
-   }
   },
   {
    "key": "seed",
