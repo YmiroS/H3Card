@@ -63,7 +63,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "",
+   "default": "image1的女生在说唱",
    "target": {
     "node": "138",
     "input": "value"

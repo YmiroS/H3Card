@@ -80,7 +80,7 @@
    "key": "prompt",
    "label": "提示词",
    "type": "textarea",
-   "default": "",
+   "default": "电影近景镜头，image1的男武侠和image2的女子面对面对话，背景是一片竹林，高清",
    "target": {
     "node": "138",
     "input": "value"
