@@ -367,6 +367,7 @@ class CostLedgerTest(unittest.TestCase):
             "zimage_i2i": (0.30, 0.60),
             "krea2_i2i": (0.30, 0.60),
             "flux2_klein_edit": (0.20, 0.40),
+            "qwen_image_21_multi": (0.30, 0.60),
             "flux2_klein_storyboard9": (1.0, 2.0),
         }
         for capability, (low, high) in expected.items():
