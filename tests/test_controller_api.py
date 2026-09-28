@@ -220,7 +220,7 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
     def test_h3_reference_sampling_modes_override_conflicting_parameters(self):
         cap = controller_app.CAPS["minimax_h3_ref9"]
         mode = next(item for item in cap["inputs"] if item["key"] == "sampling_mode")
-        self.assertEqual(mode["default"], "fast")
+        self.assertEqual(mode["default"], "quality")
         self.assertEqual(mode["presets"]["quality"], {
             "steps": 20, "strength_model": 0, "processing_control_value": 0,
         })
