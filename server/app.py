@@ -50,7 +50,7 @@ from video_preview import VideoPreviews, preview_status, preview_file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.auth_store import AuthStore
 from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
-from server.auth import (auth_middleware, register_auth_routes, require_user, require_admin,
+from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_user, require_admin,
                          require_team_leader, require_project, require_job, call_store,
                          setup_local_test_auth)
 from server.resource_access import ResourceAccess
@@ -1925,6 +1925,9 @@ async def api_project_get(request):
     if details is None:
         raise web.HTTPNotFound(reason="项目不存在或不可访问")
     d = json.loads(p.read_text(encoding="utf-8"))
+    personal_view = await call_store(request.app, "get_project_view", user["id"], pid)
+    if personal_view is not None:
+        d["view"] = personal_view
     return web.json_response(d | {"owner_id": details["owner_id"],
                                   "owner_username": details["owner_username"],
                                   "team_id": details.get("team_id"),
@@ -1933,6 +1936,252 @@ async def api_project_get(request):
                                   "shared_team_ids": details.get("shared_team_ids", []),
                                   "shared_personally": bool(details.get("shared_personally")),
                                   "permission": details["permission"]})
+
+
+async def api_project_view(request):
+    pid = request.match_info["pid"]
+    await require_project(request, pid)
+    user = require_user(request)
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
+    if not isinstance(body, dict) or set(body) != {"x", "y", "k"}:
+        raise web.HTTPBadRequest(text="画布视图不正确")
+    values = (body["x"], body["y"], body["k"])
+    if any(isinstance(value, bool) or not isinstance(value, (int, float))
+           or not math.isfinite(value) for value in values):
+        raise web.HTTPBadRequest(text="画布视图不正确")
+    x, y, k = map(float, values)
+    if abs(x) > 10_000_000 or abs(y) > 10_000_000 or not 0.1 <= k <= 2:
+        raise web.HTTPBadRequest(text="画布视图超出范围")
+    await require_project(request, pid)
+    saved = await call_store(request.app, "set_project_view", user["id"], pid, x, y, k)
+    return web.json_response({"ok": True, "view": saved})
+
+
+def collaboration_project(project):
+    return {key: project.get(key)
+            for key in ("id", "name", "cards", "edges", "groups", "rev", "updated")}
+
+
+async def api_project_card_create(request):
+    pid = request.match_info["pid"]
+    await require_project(request, pid, operate=True)
+    path = proj_path(pid)
+    if not path.is_file():
+        raise web.HTTPNotFound(text="画布不存在")
+    project = json.loads(path.read_text(encoding="utf-8"))
+    if project.get("locked"):
+        raise web.HTTPForbidden(reason="locked project")
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
+    if not isinstance(body, dict) or set(body) != {"card"} or not isinstance(body["card"], dict):
+        raise web.HTTPBadRequest(text="卡片数据不正确")
+    card = copy.deepcopy(body["card"])
+    card_id = card.get("id")
+    if (not isinstance(card_id, str) or not card_id or len(card_id) > 128
+            or any(not (char.isalnum() or char in "_-") for char in card_id)):
+        raise web.HTTPBadRequest(text="卡片 ID 不正确")
+    existing = next((item for item in project.get("cards", []) if item.get("id") == card_id), None)
+    user = require_user(request)
+    if existing is not None:
+        if existing.get("created_by") == user["id"]:
+            return web.json_response({"ok": True, "card": existing,
+                                      "project": collaboration_project(project)})
+        raise web.HTTPConflict(reason="duplicate card id")
+    card["created_by"] = user["id"]
+    card["created_by_name"] = user.get("display_name") or user.get("username") or "协作者"
+    card["created_at"] = time.time()
+    await resource_call(request.app, "validate_document", user["id"], pid,
+                        {"cards": [card], "edges": []})
+    await require_project(request, pid, operate=True)
+    project.setdefault("cards", []).append(card)
+    project["rev"] = project.get("rev", 0) + 1
+    project["updated"] = time.time()
+    write_project(path, project)
+    payload = {"type": "card-added", "card": card, "rev": project["rev"],
+               "updated": project["updated"]}
+    await broadcast_collaboration(request.app, pid, payload, authorize=True)
+    return web.json_response({"ok": True, "card": card,
+                              "project": collaboration_project(project)})
+
+
+def presence_member(connection_id, entry):
+    return {
+        "connection_id": connection_id,
+        "user_id": entry["user_id"],
+        "name": entry["name"],
+        "x": entry.get("x"),
+        "y": entry.get("y"),
+        "visible": bool(entry.get("visible")),
+    }
+
+
+async def presence_authorized(app, pid, entry):
+    if not app.get("local_test"):
+        session = await call_store(app, "get_session", entry["session_token"])
+        if not session or session["user"]["id"] != entry["user_id"]:
+            return False
+    return await call_store(app, "project_permission", entry["user_id"], pid) is not None
+
+
+async def prune_presence_permissions(app, pid):
+    room = app["presence_rooms"].get(pid, {})
+    entries = list(room.items())
+    allowed = await asyncio.gather(
+        *(presence_authorized(app, pid, entry) for _, entry in entries),
+        return_exceptions=True)
+    removed = []
+    for (connection_id, entry), result in zip(entries, allowed):
+        if result is not True:
+            room.pop(connection_id, None)
+            removed.append(entry["ws"])
+    if removed:
+        app["presence_versions"][pid] += 1
+        await asyncio.gather(
+            *(socket.close(code=1008, message=b"access revoked") for socket in removed),
+            return_exceptions=True)
+    if not room:
+        app["presence_rooms"].pop(pid, None)
+    return bool(removed)
+
+
+async def send_collaboration(socket, payload):
+    try:
+        await asyncio.wait_for(socket.send_json(payload), timeout=0.5)
+        return True
+    except (asyncio.TimeoutError, ConnectionError, RuntimeError):
+        return False
+
+
+async def broadcast_collaboration(app, pid, payload, exclude=None, authorize=False):
+    if authorize:
+        changed = await prune_presence_permissions(app, pid)
+        if changed and app["presence_rooms"].get(pid):
+            await broadcast_presence(app, pid)
+    room = app["presence_rooms"].get(pid, {})
+    recipients = [(connection_id, entry) for connection_id, entry in list(room.items())
+                  if connection_id != exclude]
+    results = await asyncio.gather(
+        *(send_collaboration(entry["ws"], payload) for _, entry in recipients),
+        return_exceptions=True)
+    dead = [(connection_id, entry) for (connection_id, entry), result in zip(recipients, results)
+            if result is not True]
+    for connection_id, _ in dead:
+        room.pop(connection_id, None)
+    if dead:
+        app["presence_versions"][pid] += 1
+        await asyncio.gather(
+            *(entry["ws"].close(code=1011, message=b"collaboration send timeout")
+              for _, entry in dead), return_exceptions=True)
+    if not room:
+        app["presence_rooms"].pop(pid, None)
+
+
+async def handle_presence_access_changed(app, *, user_ids, project_ids):
+    for pid, room in list(app["presence_rooms"].items()):
+        if project_ids and pid not in project_ids:
+            continue
+        if user_ids and not any(entry["user_id"] in user_ids for entry in room.values()):
+            continue
+        if await prune_presence_permissions(app, pid) and app["presence_rooms"].get(pid):
+            await broadcast_presence(app, pid)
+
+
+async def close_presence_room(app, pid, code=1000, message=b"canvas closed"):
+    room = app["presence_rooms"].pop(pid, {})
+    if room:
+        app["presence_versions"][pid] += 1
+        await asyncio.gather(
+            *(entry["ws"].close(code=code, message=message) for entry in room.values()),
+            return_exceptions=True)
+
+
+async def broadcast_presence(app, pid):
+    room = app["presence_rooms"].get(pid, {})
+    members = [presence_member(connection_id, entry)
+               for connection_id, entry in room.items()]
+    version = app["presence_versions"][pid]
+    recipients = list(room.items())
+    results = await asyncio.gather(*(
+        send_collaboration(entry["ws"], {"type": "presence", "members": members,
+                                          "self": connection_id, "version": version})
+        for connection_id, entry in recipients), return_exceptions=True)
+    dead = [(connection_id, entry) for (connection_id, entry), result in zip(recipients, results)
+            if result is not True]
+    for connection_id, _ in dead:
+        room.pop(connection_id, None)
+    if dead:
+        app["presence_versions"][pid] += 1
+        await asyncio.gather(
+            *(entry["ws"].close(code=1011, message=b"collaboration send timeout")
+              for _, entry in dead), return_exceptions=True)
+    if not room:
+        app["presence_rooms"].pop(pid, None)
+
+
+async def api_project_presence(request):
+    pid = request.match_info["pid"]
+    await require_project(request, pid)
+    user = require_user(request)
+    socket = web.WebSocketResponse(heartbeat=25)
+    await socket.prepare(request)
+    connection_id = uuid.uuid4().hex
+    room = request.app["presence_rooms"][pid]
+    room[connection_id] = {
+        "ws": socket,
+        "user_id": user["id"],
+        "session_token": request.cookies.get(COOKIE, ""),
+        "permission_checked": time.monotonic(),
+        "name": user.get("display_name") or user.get("username") or "协作者",
+        "visible": False,
+    }
+    request.app["presence_versions"][pid] += 1
+    await broadcast_presence(request.app, pid)
+    try:
+        async for message in socket:
+            if message.type != aiohttp.WSMsgType.TEXT:
+                continue
+            try:
+                body = json.loads(message.data)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(body, dict) or body.get("type") != "cursor":
+                continue
+            visible = body.get("visible") is not False
+            x, y = body.get("x"), body.get("y")
+            if visible and (isinstance(x, bool) or isinstance(y, bool)
+                            or not isinstance(x, (int, float)) or not isinstance(y, (int, float))
+                            or not math.isfinite(x) or not math.isfinite(y)
+                            or abs(x) > 10_000_000 or abs(y) > 10_000_000):
+                continue
+            entry = room.get(connection_id)
+            if entry is None:
+                break
+            if time.monotonic() - entry["permission_checked"] >= 5:
+                if not await presence_authorized(request.app, pid, entry):
+                    await socket.close(code=1008, message=b"access revoked")
+                    break
+                entry["permission_checked"] = time.monotonic()
+            entry["visible"] = visible
+            if visible:
+                entry["x"], entry["y"] = float(x), float(y)
+            payload = {"type": "cursor", **presence_member(connection_id, entry)}
+            await broadcast_collaboration(request.app, pid, payload, exclude=connection_id)
+    finally:
+        current = request.app["presence_rooms"].get(pid)
+        if current is not None:
+            removed = current.pop(connection_id, None)
+            if removed is not None:
+                request.app["presence_versions"][pid] += 1
+            if current and removed is not None:
+                await broadcast_presence(request.app, pid)
+            elif not current:
+                request.app["presence_rooms"].pop(pid, None)
+    return socket
 
 
 async def api_project_shares(request):
@@ -1950,6 +2199,8 @@ async def api_project_shares(request):
         raise web.HTTPBadRequest(text="分享对象清单不正确")
     data = await call_store(request.app, "set_project_shares", pid,
                             body["user_ids"], body["team_ids"], user["id"])
+    if await prune_presence_permissions(request.app, pid) and request.app["presence_rooms"].get(pid):
+        await broadcast_presence(request.app, pid)
     return web.json_response(data)
 
 
@@ -1978,10 +2229,26 @@ async def api_project_save(request):
         body["name"] = str(body.get("name") or "").strip()[:40]
         if not body["name"]:
             raise web.HTTPBadRequest(reason="项目名不能为空")
+    if "cards" in body:
+        if not isinstance(body["cards"], list) or any(not isinstance(card, dict) for card in body["cards"]):
+            raise web.HTTPBadRequest(text="卡片数据不正确")
+        card_ids = [card.get("id") for card in body["cards"]]
+        if any(not isinstance(card_id, str) or not card_id for card_id in card_ids) or len(card_ids) != len(set(card_ids)):
+            raise web.HTTPBadRequest(text="卡片 ID 不正确或重复")
+        old_cards = {card.get("id"): card for card in old.get("cards", [])}
+        if any(card_id not in old_cards for card_id in card_ids):
+            raise web.HTTPConflict(reason="cards must be created separately")
+        for card in body["cards"]:
+            previous = old_cards[card["id"]]
+            for key in ("created_by", "created_by_name", "created_at"):
+                if key in previous:
+                    card[key] = previous[key]
+                else:
+                    card.pop(key, None)
     await resource_call(request.app, "validate_document", require_user(request)["id"], pid, body)
     await require_project(request, pid, operate=True)
     previous_name = old.get("name")
-    for k in ("name", "cards", "edges", "groups", "view"):
+    for k in ("name", "cards", "edges", "groups"):
         if k in body:
             old[k] = body[k]
     old["rev"] = rev + 1
@@ -1989,6 +2256,9 @@ async def api_project_save(request):
     write_project(p, old)
     if old.get("name") != previous_name:
         sync_project_name(request.app, pid, old.get("name") or "未命名")
+    await broadcast_collaboration(request.app, pid, {
+        "type": "project-changed", "project": collaboration_project(old),
+    }, authorize=True)
     return web.json_response({"ok": True, "updated": old["updated"], "rev": old["rev"]})
 
 
@@ -2012,6 +2282,9 @@ async def api_project_rename(request):
         await require_project(request, pid, operate=True)
         write_project(p, project)
         sync_project_name(request.app, pid, name)
+        await broadcast_collaboration(request.app, pid, {
+            "type": "project-changed", "project": collaboration_project(project),
+        }, authorize=True)
     return web.json_response({
         "ok": True, "name": project["name"], "updated": project.get("updated", 0),
         "rev": project.get("rev", 0),
@@ -2024,8 +2297,10 @@ async def api_project_delete(request):
     p = proj_path(pid)
     if p.exists() and json.loads(p.read_text(encoding="utf-8")).get("locked"):
         raise web.HTTPForbidden(reason="locked project")
+    await broadcast_collaboration(request.app, pid, {"type": "project-deleted"}, authorize=True)
     # 先封闭访问，再取消任务、移动文件；失败重试也不重新开放。
     await call_store(request.app, "set_project_state", pid, "deleted")
+    await close_presence_room(request.app, pid, code=1000, message=b"canvas deleted")
     jobs = await call_store(request.app, "list_project_jobs", pid)
     for jid in jobs:
         if CONTROLLER_MODE:
@@ -2191,6 +2466,11 @@ async def on_start(app):
 
 async def on_stop(app):
     await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
+    presence_rooms = app.get("presence_rooms", {})
+    sockets = [entry["ws"] for room in presence_rooms.values() for entry in room.values()]
+    await asyncio.gather(*(socket.close(code=1001, message=b"server shutdown")
+                           for socket in sockets), return_exceptions=True)
+    presence_rooms.clear()
     await app["video_previews"].close()
     task = app.get("ws_task")
     if task:
@@ -2269,6 +2549,9 @@ def make_app(auth_path=None):
     else:
         app["auth_path"] = Path(auth_path or os.environ.get("CHOUKA_AUTH_DB") or ROOT / "data" / "auth.db")
     app["project_locks"] = defaultdict(asyncio.Lock)
+    app["presence_rooms"] = defaultdict(dict)
+    app["presence_versions"] = defaultdict(int)
+    app["presence_access_changed"] = partial(handle_presence_access_changed, app)
     register_auth_routes(app, ROOT / "web")
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
@@ -2301,6 +2584,9 @@ def make_app(auth_path=None):
     app.router.add_get("/api/projects", api_projects)
     app.router.add_post("/api/projects", api_project_create)
     app.router.add_get("/api/projects/{pid}", api_project_get)
+    app.router.add_put("/api/projects/{pid}/view", api_project_view)
+    app.router.add_post("/api/projects/{pid}/cards", api_project_card_create)
+    app.router.add_get("/api/projects/{pid}/presence", api_project_presence)
     app.router.add_get("/api/projects/{pid}/shares", api_project_shares)
     app.router.add_put("/api/projects/{pid}/shares", api_project_shares)
     app.router.add_put("/api/projects/{pid}", api_project_save)

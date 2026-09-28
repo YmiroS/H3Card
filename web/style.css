@@ -102,6 +102,16 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   color: var(--warn); border: 1px solid #5c4300; background: #ffb00012;
 }
 #hint { color: var(--dim); font-size: 12px; margin-left: auto; font-family: var(--mono); }
+#presence-users { display: none; align-items: center; gap: 5px; white-space: nowrap; }
+#presence-users.on { display: flex; }
+#presence-users .presence-count {
+  color: var(--dim); font-size: 11px; margin-right: 2px;
+}
+#presence-users .presence-avatar {
+  width: 25px; height: 25px; border-radius: 50%; display: inline-flex;
+  align-items: center; justify-content: center; color: #07101c; font-size: 11px;
+  font-weight: 700; border: 2px solid #070a12; box-shadow: 0 0 0 1px currentColor;
+}
 
 /* 右上角「任务(n)」：颜色本身就是状态 —— 青色在跑、橙色在等、灰的没活儿 */
 #jobsbtn { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
@@ -177,6 +187,26 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 
 #world { position: absolute; top: 0; left: 0; transform-origin: 0 0; }
+#presence-layer {
+  position: absolute; left: 0; top: 0; width: 1px; height: 1px;
+  overflow: visible; transform-origin: 0 0; pointer-events: none; z-index: 12;
+}
+.collab-cursor {
+  position: absolute; left: 0; top: 0; transform-origin: 0 0;
+  transition: transform 45ms linear, opacity .12s; pointer-events: none;
+}
+.collab-cursor.hidden { opacity: 0; }
+.collab-cursor .pointer {
+  width: 0; height: 0; border-top: 13px solid currentColor;
+  border-right: 9px solid transparent; filter: drop-shadow(0 1px 2px #000b);
+}
+.collab-cursor .label {
+  display: inline-block; margin: -2px 0 0 8px; padding: 3px 6px;
+  border-radius: 3px; color: #07101c; background: currentColor;
+  font-size: 11px; font-weight: 700; line-height: 1.2; white-space: nowrap;
+  box-shadow: 0 2px 8px #0009;
+}
+.collab-cursor .label > span { color: #07101c; }
 
 /* ---------- 分组 / 框选 ---------- */
 /* 分组框层：跟 world 同一套 transform，垫在卡片底下（DOM 顺序在 world 之前）。

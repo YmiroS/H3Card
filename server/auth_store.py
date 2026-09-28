@@ -51,7 +51,10 @@ class AuthStore:
             if version == 3:
                 self.db.executescript(migrations.joinpath('004_project_shares.sql').read_text(encoding='utf-8'))
                 version = 4
-            elif version != 4:
+            if version == 4:
+                self.db.executescript(migrations.joinpath('005_project_user_views.sql').read_text(encoding='utf-8'))
+                version = 5
+            elif version != 5:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
                 'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader',
@@ -62,6 +65,7 @@ class AuthStore:
                 'team_members': 'team_id,user_id,joined_at',
                 'project_user_shares': 'project_id,user_id,created_at',
                 'project_team_shares': 'project_id,team_id,created_at',
+                'project_user_views': 'project_id,user_id,x,y,k,updated_at',
                 'job_acl': 'job_id,project_id,user_id', 'auth_meta': 'key,value',
                 'registration_requests': 'id,user_id,username,display_name,status,created_at,decided_at,decided_by,corp_id,out_track_id',
                 'notification_outbox': 'id,request_id,kind,dedupe_key,status,attempts,next_try_at,leased_until,created_at,last_error',
@@ -771,6 +775,26 @@ class AuthStore:
             sharing = ({'share_count': 0, 'shared_team_ids': [], 'shared_personally': False}
                        if row['team_id'] is not None else self._project_share_summary(user, row))
             return dict(row) | {'permission': permission} | sharing
+
+    def get_project_view(self, user_id, project_id):
+        self._identifier(user_id, '用户 ID')
+        self._identifier(project_id, '画布 ID')
+        with self.lock:
+            row = self.db.execute(
+                'SELECT x,y,k FROM project_user_views WHERE project_id=? AND user_id=?',
+                (project_id, user_id)).fetchone()
+            return dict(row) if row else None
+
+    def set_project_view(self, user_id, project_id, x, y, k):
+        self._identifier(user_id, '用户 ID')
+        self._identifier(project_id, '画布 ID')
+        with self._tx():
+            self.db.execute(
+                'INSERT INTO project_user_views(project_id,user_id,x,y,k,updated_at) '
+                'VALUES(?,?,?,?,?,?) ON CONFLICT(project_id,user_id) DO UPDATE SET '
+                'x=excluded.x,y=excluded.y,k=excluded.k,updated_at=excluded.updated_at',
+                (project_id, user_id, x, y, k, time.time()))
+        return {'x': x, 'y': y, 'k': k}
 
     def set_project_state(self, project_id, state):
         self._identifier(project_id, '画布 ID')

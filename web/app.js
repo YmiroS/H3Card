@@ -23,12 +23,25 @@ let view = { x: 60, y: 70, k: 1 };
 let selId = null;
 let selIds = new Set();    // 框选出来的多个节点（左键空白处拖一个框；Delete 全删、拖动整体移动）
 let saveTimer = null;
+let viewTimer = null;
+let presenceSocket = null;
+let presenceProject = null;
+let presenceSelf = null;
+let presenceRetry = null;
+let presenceMembers = new Map();
+let presenceVersion = -1;
+let pendingCursor = null;
+let cursorTimer = null;
+let contentSaving = false;
+let pendingCardCreates = 0;
+let pendingProjectSync = null;
 
 const el = {
   side: $("#side"), plist: $("#plist"), dot: $("#dot"),
   spaceSelect: $("#space-select"), spaceLabel: $("#space-label"), spaceStatus: $("#space-status"),
-  ptitle: $("#ptitle"), hint: $("#hint"), fit: $("#fit"),
+  ptitle: $("#ptitle"), hint: $("#hint"), fit: $("#fit"), presenceUsers: $("#presence-users"),
   stage: $("#stage"), world: $("#world"), wires: $("#wires"), groups: $("#groups"),
+  presenceLayer: $("#presence-layer"),
   lasso: $("#lasso"), selbar: $("#selbar"), dock: $("#dock"),
   empty: $("#empty"), panel: $("#panel"), hist: $("#hist"), menu: $("#menu"), tip: $("#tip"),
   toast: $("#toast"), picker: $("#picker"),
@@ -71,13 +84,14 @@ async function api(path, opt = {}) {
   return H3Auth.request(path, opt);
 }
 function clearProject() {
-  clearTimeout(saveTimer); PROJ = null; selId = null; selIds.clear();
+  clearTimeout(saveTimer); clearTimeout(viewTimer); saveTimer = null; viewTimer = null; disconnectPresence();
+  PROJ = null; selId = null; selIds.clear(); pendingProjectSync = null;
   closePanel(); closeHistory(); closeViewer(); closeMenu(); closeJobs(); closeResPop();
   el.groups.replaceChildren(); el.selbar.style.display = 'none'; showEmpty();
 }
 function syncPermissionUI() {
   document.body.classList.toggle('project-readonly', !!PROJ && !canOperate());
-  if (!canOperate()) { clearTimeout(saveTimer); closeMenu(); closeResPop(); }
+  if (!canOperate()) { clearTimeout(saveTimer); saveTimer = null; closeMenu(); closeResPop(); }
   el.dock.style.display = canOperate() ? '' : 'none';
   if (PROJ) { el.ptitle.textContent = PROJ.name; const badge = document.createElement('span'); badge.className = 'ro'; badge.textContent = !canOperate() ? '只读' : PROJ.locked ? '试玩画布 · 刷新还原' : ''; el.ptitle.append(badge); }
 }
@@ -1315,13 +1329,16 @@ async function renameProject(project) {
 
 let openingProject = 0;
 async function openProject(pid) {
-  clearTimeout(saveTimer);
+  clearTimeout(saveTimer); saveTimer = null;
+  clearTimeout(viewTimer); viewTimer = null;
+  disconnectPresence();
   const opening = ++openingProject;
   try { const project = await api(`/api/projects/${encodeURIComponent(pid)}`); if (opening !== openingProject || !H3Auth.active) return; PROJ = project; }
   catch (e) { return toast(e.message); }
   const spaces = projectSpaces(PROJ);
   if (!spaces.includes(selectedSpace)) selectedSpace = spaces[0] || 'personal';
   syncSpaceOptions();
+  pendingProjectSync = null;
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
   PROJ.groups = PROJ.groups || [];
@@ -1372,6 +1389,7 @@ async function openProject(pid) {
   }
   // 断线重连后可能有节点状态是 running，交给轮询自己收尾
   render();
+  connectPresence(PROJ.id);
   loadProjects();
 }
 
@@ -1388,6 +1406,24 @@ const plain = (c) => Object.fromEntries(Object.entries(c).filter(([k]) => k[0] !
 
 /** 保存串行化：两次 PUT 撞在一起会带同一个 rev，后一次要被服务端顶掉 */
 let saveChain = Promise.resolve();
+let viewSaveChain = Promise.resolve();
+
+function saveView() {
+  if (!H3Auth.active || !PROJ) return;
+  clearTimeout(viewTimer);
+  const expectedId = PROJ.id;
+  viewTimer = setTimeout(() => {
+    const snapshot = { x: view.x, y: view.y, k: view.k };
+    viewSaveChain = viewSaveChain.then(async () => {
+      if (!H3Auth.active) return;
+      try {
+        await jput(`/api/projects/${encodeURIComponent(expectedId)}/view`, snapshot);
+      } catch (error) {
+        if (PROJ?.id === expectedId) toast("视图保存失败：" + error.message);
+      }
+    });
+  }, 400);
+}
 
 function save() {
   if (!canSave()) return;
@@ -1396,19 +1432,22 @@ function save() {
   if (PROJ.locked) return;
   clearTimeout(saveTimer);
   const expectedId = PROJ.id;
-  saveTimer = setTimeout(() => { saveChain = saveChain.then(() => doSave(expectedId)); }, 700);
+  saveTimer = setTimeout(() => {
+    saveTimer = null;
+    saveChain = saveChain.then(() => doSave(expectedId));
+  }, 700);
 }
 
 async function doSave(expectedId = PROJ?.id) {
   if (!canSave() || PROJ.id !== expectedId) return;
   const id = PROJ.id;
-  PROJ.view = view;
+  contentSaving = true;
   try {
     const r = await jput(`/api/projects/${id}`, {
       rev: PROJ.rev || 0, name: PROJ.name,
-      cards: PROJ.cards.map(plain), edges: PROJ.edges, groups: PROJ.groups || [], view,
+      cards: PROJ.cards.map(plain), edges: PROJ.edges, groups: PROJ.groups || [],
     });
-    if (PROJ && PROJ.id === id) PROJ.rev = r.rev;
+    if (PROJ && PROJ.id === id) PROJ.rev = Math.max(PROJ.rev || 0, r.rev || 0);
   } catch (e) {
     // 409：画布在别处（另一个标签页 / 服务端脚本）被改过。这份内存快照已经是旧的，
     // 硬写会把别处的产物抹掉，所以丢掉本地这份、重新加载。
@@ -1417,7 +1456,189 @@ async function doSave(expectedId = PROJ?.id) {
       return openProject(id);
     }
     toast("保存失败：" + e.message);
+  } finally {
+    contentSaving = false;
+    flushPendingProjectSync();
   }
+}
+
+/* ================= 多人在线 ================= */
+const PRESENCE_COLORS = ["#00e5ff", "#ff5da2", "#9b7bff", "#55e68a", "#ffb84d", "#58a6ff", "#f778ba", "#d2e75b"];
+
+function presenceColor(userId) {
+  let hash = 0;
+  for (const char of String(userId || "")) hash = (hash * 31 + char.codePointAt(0)) >>> 0;
+  return PRESENCE_COLORS[hash % PRESENCE_COLORS.length];
+}
+
+function renderPresenceMembers() {
+  const users = new Map();
+  for (const member of presenceMembers.values()) if (!users.has(member.user_id)) users.set(member.user_id, member);
+  el.presenceUsers.replaceChildren();
+  el.presenceUsers.classList.toggle("on", users.size > 0);
+  if (!users.size) return;
+  const count = document.createElement("span");
+  count.className = "presence-count";
+  count.textContent = `${users.size} 人在线`;
+  el.presenceUsers.appendChild(count);
+  for (const member of users.values()) {
+    const avatar = document.createElement("span");
+    avatar.className = "presence-avatar";
+    const color = presenceColor(member.user_id);
+    avatar.style.background = color;
+    avatar.style.boxShadow = `0 0 0 1px ${color}`;
+    avatar.textContent = String(member.name || "协").trim().slice(0, 1).toUpperCase();
+    avatar.title = `${member.name || "协作者"} · 正在此画布`;
+    el.presenceUsers.appendChild(avatar);
+  }
+}
+
+function ensurePresenceCursor(member) {
+  if (member.connection_id === presenceSelf) return null;
+  let node = member._el;
+  if (node?.isConnected) return node;
+  node = document.createElement("div");
+  node.className = "collab-cursor";
+  node.style.color = presenceColor(member.user_id);
+  const pointer = document.createElement("div"); pointer.className = "pointer";
+  const label = document.createElement("div"); label.className = "label";
+  const text = document.createElement("span"); text.textContent = member.name || "协作者";
+  label.appendChild(text); node.append(pointer, label);
+  el.presenceLayer.appendChild(node);
+  member._el = node;
+  return node;
+}
+
+function updatePresenceCursor(member) {
+  if (member.connection_id === presenceSelf) {
+    member._el?.remove(); member._el = null; return;
+  }
+  const node = ensurePresenceCursor(member);
+  if (!node) return;
+  node.classList.toggle("hidden", !member.visible);
+  if (member.visible && Number.isFinite(member.x) && Number.isFinite(member.y)) {
+    node.style.transform = `translate(${member.x}px,${member.y}px) scale(${1 / view.k})`;
+  }
+}
+
+function updatePresenceCursors() {
+  for (const member of presenceMembers.values()) updatePresenceCursor(member);
+}
+
+function applyPresenceMembers(members, selfId, version) {
+  if (Number.isFinite(version) && version < presenceVersion) return;
+  if (Number.isFinite(version)) presenceVersion = version;
+  presenceSelf = selfId || presenceSelf;
+  const next = new Map();
+  for (const data of members || []) {
+    const previous = presenceMembers.get(data.connection_id);
+    next.set(data.connection_id, Object.assign(previous || {}, data));
+  }
+  for (const [connectionId, member] of presenceMembers) {
+    if (!next.has(connectionId)) member._el?.remove();
+  }
+  presenceMembers = next;
+  renderPresenceMembers();
+  updatePresenceCursors();
+}
+
+function syncCollaborativeProject(projectId, remoteRev) {
+  if (!PROJ || PROJ.id !== projectId || remoteRev <= (PROJ.rev || 0)) return;
+  api(`/api/projects/${encodeURIComponent(projectId)}`)
+    .then(project => applyCollaborativeProject(project))
+    .catch(() => {});
+}
+
+function applyCollaborativeProject(project) {
+  if (!PROJ || project.id !== PROJ.id || (project.rev || 0) <= (PROJ.rev || 0)) return;
+  if (saveTimer !== null || contentSaving || pendingCardCreates) {
+    if (!pendingProjectSync || (project.rev || 0) > (pendingProjectSync.rev || 0)) pendingProjectSync = project;
+    return;
+  }
+  const panelOpen = el.panel.style.display !== "none";
+  PROJ.name = project.name;
+  PROJ.cards = project.cards || [];
+  PROJ.edges = project.edges || [];
+  PROJ.groups = project.groups || [];
+  PROJ.rev = project.rev;
+  PROJ.updated = project.updated;
+  for (const card of PROJ.cards) seedHistory(card);
+  if (selId && !PROJ.cards.some(card => card.id === selId)) selId = null;
+  selIds = new Set([...selIds].filter(id => PROJ.cards.some(card => card.id === id)));
+  el.ptitle.textContent = PROJ.name;
+  render();
+  if (panelOpen && selId) openPanel(selId);
+  else if (!selId) closePanel();
+}
+
+function flushPendingProjectSync() {
+  if (!pendingProjectSync || saveTimer !== null || contentSaving || pendingCardCreates) return;
+  const project = pendingProjectSync;
+  pendingProjectSync = null;
+  applyCollaborativeProject(project);
+}
+
+function disconnectPresence() {
+  clearTimeout(presenceRetry); presenceRetry = null;
+  clearTimeout(cursorTimer); cursorTimer = null; pendingCursor = null;
+  presenceProject = null; presenceSelf = null; presenceVersion = -1;
+  if (presenceSocket) {
+    const socket = presenceSocket; presenceSocket = null;
+    try { socket.close(1000, "leave canvas"); } catch (_) {}
+  }
+  for (const member of presenceMembers.values()) member._el?.remove();
+  presenceMembers.clear();
+  el.presenceLayer?.replaceChildren();
+  el.presenceUsers?.replaceChildren();
+  el.presenceUsers?.classList.remove("on");
+}
+
+function connectPresence(projectId) {
+  disconnectPresence();
+  presenceProject = projectId;
+  const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+  const socket = new WebSocket(`${protocol}//${location.host}/api/projects/${encodeURIComponent(projectId)}/presence`);
+  presenceSocket = socket;
+  socket.onopen = () => syncCollaborativeProject(projectId, Infinity);
+  socket.onmessage = event => {
+    if (socket !== presenceSocket || presenceProject !== projectId) return;
+    let message;
+    try { message = JSON.parse(event.data); } catch (_) { return; }
+    if (message.type === "presence") {
+      applyPresenceMembers(message.members, message.self, message.version);
+    } else if (message.type === "cursor") {
+      const member = presenceMembers.get(message.connection_id);
+      if (!member) return;
+      Object.assign(member, message);
+      updatePresenceCursor(member);
+    } else if (message.type === "card-added") {
+      mergeCollaborativeCard(message.card, message.rev);
+    } else if (message.type === "project-changed") {
+      applyCollaborativeProject(message.project);
+    } else if (message.type === "project-deleted") {
+      toast("这张画布已被删除");
+      clearProject(); loadProjects();
+    }
+  };
+  socket.onclose = () => {
+    if (socket !== presenceSocket) return;
+    presenceSocket = null;
+    if (presenceProject === projectId && PROJ?.id === projectId && H3Auth.active) {
+      presenceRetry = setTimeout(() => connectPresence(projectId), 1500);
+    }
+  };
+}
+
+function queuePresenceCursor(x, y, visible = true) {
+  pendingCursor = { type: "cursor", x, y, visible };
+  if (cursorTimer !== null) return;
+  cursorTimer = setTimeout(() => {
+    cursorTimer = null;
+    if (presenceSocket?.readyState === WebSocket.OPEN && pendingCursor) {
+      presenceSocket.send(JSON.stringify(pendingCursor));
+    }
+    pendingCursor = null;
+  }, 50);
 }
 
 /* ================= 视图 ================= */
@@ -1425,6 +1646,8 @@ function applyView() {
   el.world.style.transform = `translate(${view.x}px,${view.y}px) scale(${view.k})`;
   el.wires.style.transform = el.world.style.transform;
   el.groups.style.transform = el.world.style.transform;
+  el.presenceLayer.style.transform = el.world.style.transform;
+  updatePresenceCursors();
   el.wires.setAttribute("width", 1); el.wires.setAttribute("height", 1);
   paintSel();               // 工具条跟着缩放/平移走，不然就飘走了
   updateMinimap();
@@ -1538,7 +1761,7 @@ function bindMinimapDrag() {
 
     applyView();
     placePanel();
-    save();
+    saveView();
   };
 
   el.minimapViewport.addEventListener("mousedown", (ev) => {
@@ -2474,7 +2697,7 @@ function bindGlobal() {
   };
   // 底部工具条：新建节点的唯一入口。上传直接建素材节点，图片/视频/工具箱摊开各自节点里的玩法
   buildDock();
-  el.fit.onclick = () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); };
+  el.fit.onclick = () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); saveView(); };
   el.jobsbtn.onclick = toggleJobs;
   // 框选后上方工具条里的「打组」：把选中的节点圈成一个组（虚线框，整体拖动）
   el.selbar.innerHTML = "";
@@ -2498,8 +2721,14 @@ function bindGlobal() {
   addEventListener("resize", () => { placePanel(); placeJobs(); paintSel(); });
 
   // Ctrl+V 粘在鼠标那儿，所以一直记着鼠标落在世界坐标的哪个位置
-  el.stage.addEventListener("mousemove", (ev) => { mouseW = toWorld(ev.clientX, ev.clientY); });
-  el.stage.addEventListener("mouseleave", () => { mouseW = null; });
+  el.stage.addEventListener("mousemove", (ev) => {
+    mouseW = toWorld(ev.clientX, ev.clientY);
+    queuePresenceCursor(mouseW.x, mouseW.y);
+  });
+  el.stage.addEventListener("mouseleave", () => {
+    mouseW = null;
+    queuePresenceCursor(0, 0, false);
+  });
 
   el.stage.addEventListener("mousedown", (ev) => {
     // 工具条自己管自己（打组这些按钮）：冒泡到画布会被当成"点空白"把选中清掉，
@@ -2522,8 +2751,7 @@ function bindGlobal() {
         el.stage.classList.remove("panning");
         document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
         // 拖动画布结束后恢复面板显示，并重新定位到节点下方
-        if (moved) { veilPanel(false); placePanel(); }
-        save();
+        if (moved) { veilPanel(false); placePanel(); saveView(); }
       };
       document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
       return;
@@ -2579,7 +2807,7 @@ function bindGlobal() {
     view.x = ev.clientX - r.left - w.x * k;
     view.y = ev.clientY - r.top - w.y * k;
     view.k = k;
-    applyView(); save();
+    applyView(); saveView();
   }, { passive: false });
 
   // 空白处右键：新建节点、上传、粘贴
@@ -2770,7 +2998,7 @@ function bindGlobal() {
         view.x = targetScreenX - cardCenterX * view.k;
         view.y = targetScreenY - cardCenterY * view.k;
 
-        applyView(); placePanel(); save();
+        applyView(); placePanel(); saveView();
         return;
       }
     }
@@ -2804,13 +3032,13 @@ function bindGlobal() {
 
   el.zoomMenu.onclick = (ev) => {
     const items = [
-      { icon: "+", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); save(); } },
-      { icon: "1:1", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); save(); } },
-      { icon: "−", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); save(); } },
-      { icon: "−", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); save(); } },
-      { icon: "−", text: "缩小 (25%)", run: () => { view.k = 0.25; applyView(); placePanel(); save(); } },
-      { icon: "−", text: "缩小 (10%)", run: () => { view.k = 0.1; applyView(); placePanel(); save(); } },
-      { icon: "□", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); save(); } },
+      { icon: "+", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); saveView(); } },
+      { icon: "1:1", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); saveView(); } },
+      { icon: "−", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); saveView(); } },
+      { icon: "−", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); saveView(); } },
+      { icon: "−", text: "缩小 (25%)", run: () => { view.k = 0.25; applyView(); placePanel(); saveView(); } },
+      { icon: "−", text: "缩小 (10%)", run: () => { view.k = 0.1; applyView(); placePanel(); saveView(); } },
+      { icon: "□", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); saveView(); } },
     ];
     showMenu(ev.clientX, ev.clientY - 200, "缩放", items);
   };
@@ -3187,6 +3415,82 @@ function cloneCard(c) {
   paintTitle(n); paint(n); openPanel(n.id); save();      // paint：风格节点的正文在画面区
 }
 
+function mergeCollaborativeCard(card, rev) {
+  if (!PROJ || !card?.id) return;
+  const existing = PROJ.cards.find(item => item.id === card.id);
+  if (existing) {
+    for (const key of ["created_by", "created_by_name", "created_at"]) {
+      if (card[key] !== undefined) existing[key] = card[key];
+    }
+  } else {
+    const added = JSON.parse(JSON.stringify(card));
+    seedHistory(added);
+    PROJ.cards.push(added);
+    el.world.appendChild(buildCard(added));
+    drawWires(); paintGroups(); updateMinimap();
+    el.hint.textContent = `${PROJ.cards.length} 个节点`;
+    toast(`${added.created_by_name || "协作者"} 添加了「${added.name || "新节点"}」`);
+  }
+  if (Number.isFinite(rev)) PROJ.rev = Math.max(PROJ.rev || 0, rev);
+}
+
+function reconcileCreatedCard(project, localCard) {
+  if (!PROJ || project.id !== PROJ.id) return;
+  const cardId = localCard.id;
+  const localEdges = PROJ.edges.filter(edge => edge.from === cardId || edge.to === cardId);
+  const localGroups = (PROJ.groups || []).filter(group => group.cards.includes(cardId));
+  const remoteCard = (project.cards || []).find(card => card.id === cardId);
+  if (remoteCard) {
+    for (const key of ["created_by", "created_by_name", "created_at"]) localCard[key] = remoteCard[key];
+  }
+  const cards = (project.cards || []).filter(card => card.id !== cardId);
+  cards.push(localCard);
+  const edges = project.edges || [];
+  const edgeKeys = new Set(edges.map(edge => JSON.stringify(edge)));
+  for (const edge of localEdges) {
+    const key = JSON.stringify(edge);
+    if (!edgeKeys.has(key)) { edges.push(edge); edgeKeys.add(key); }
+  }
+  const groups = (project.groups || []).filter(group => !group.cards.includes(cardId));
+  groups.push(...localGroups);
+  const panelOpen = el.panel.style.display !== "none";
+  Object.assign(PROJ, project, { cards, edges, groups });
+  if (pendingProjectSync && pendingProjectSync.rev <= PROJ.rev) pendingProjectSync = null;
+  render();
+  if (panelOpen && selId) openPanel(selId);
+}
+
+function rollbackFailedCard(card) {
+  if (!PROJ || card.created_by) return;
+  PROJ.cards = PROJ.cards.filter(item => item !== card);
+  PROJ.edges = PROJ.edges.filter(edge => edge.from !== card.id && edge.to !== card.id);
+  PROJ.groups = (PROJ.groups || []).map(group => ({ ...group, cards: group.cards.filter(id => id !== card.id) }))
+    .filter(group => group.cards.length);
+  selIds.delete(card.id);
+  if (selId === card.id) { selId = null; closePanel(); }
+  render();
+}
+
+function queueCardCreate(card) {
+  const projectId = PROJ.id;
+  pendingCardCreates += 1;
+  saveChain = saveChain.then(async () => {
+    try {
+      const result = await jpost(`/api/projects/${encodeURIComponent(projectId)}/cards`, { card: plain(card) });
+      if (PROJ?.id !== projectId) return;
+      reconcileCreatedCard(result.project, card);
+    } catch (error) {
+      if (PROJ?.id === projectId) {
+        rollbackFailedCard(card);
+        toast("卡片添加失败：" + error.message);
+      }
+    } finally {
+      pendingCardCreates = Math.max(0, pendingCardCreates - 1);
+      flushPendingProjectSync();
+    }
+  });
+}
+
 function addCard(type, x, y, cap) {
   if (!requireOperate()) return null;
   const def = cardDef(type);
@@ -3208,7 +3512,7 @@ function addCard(type, x, y, cap) {
 
   PROJ.cards.push(c);
   el.world.appendChild(buildCard(c));
-  pick(c.id); drawWires(); save();
+  pick(c.id); drawWires(); queueCardCreate(c);
   return c;
 }
 
@@ -6481,5 +6785,5 @@ async function focusTask(j) {
   applyView();
   selId = c.id;
   for (const o of PROJ.cards) if (o._el) o._el.classList.toggle("sel", o.id === c.id);
-  openPanel(c.id); placePanel(); placeJobs(); save();
+  openPanel(c.id); placePanel(); placeJobs(); saveView();
 }
