@@ -901,6 +901,10 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 .slot.filled .box { border-color: var(--acc); box-shadow: 0 0 10px #00e5ff2e; }
 .slot.req .box { border-color: var(--warn); }
+.slot.sortable { cursor: grab; }
+.slot.sortable:active { cursor: grabbing; }
+.slot.dragging { opacity: .35; }
+.slot.drop-target .box { border-color: var(--acc2); box-shadow: 0 0 14px #ff2d9570; }
 .slot img, .slot video { width: 100%; height: 100%; object-fit: cover; }
 .slot:hover .box { border-color: var(--acc2); box-shadow: 0 0 10px #ff2d9540; }
 #panel .slots .lbl { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
