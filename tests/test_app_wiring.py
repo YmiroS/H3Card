@@ -1,4 +1,5 @@
 """真实 make_app 装配冒烟：中间件、页面路由、静态兜底与基本权限闭环。"""
+import asyncio
 import sys
 import tempfile
 import unittest
@@ -11,7 +12,7 @@ sys.path.insert(0, str(ROOT / "tests"))
 
 import app as controller_app
 import auth_support
-from aiohttp import ClientSession, CookieJar, WSMsgType
+from aiohttp import ClientSession, CookieJar, ServerDisconnectedError, WSMsgType, WSServerHandshakeError
 from aiohttp.test_utils import TestClient, TestServer
 
 PASSWORD = auth_support.PASSWORD
@@ -249,6 +250,49 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                 await bob_socket.close()
             await bob_client.close()
             await admin_socket.close()
+
+    async def test_shutdown_rejects_new_presence_connections(self):
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '关机准入测试'}, headers=self.headers)).json()
+        self.client.server.app['lifecycle']['shutting_down'] = True
+        response = await self.client.get(f"/api/projects/{created['id']}/presence")
+        self.assertEqual(response.status, 503)
+
+    async def test_shutdown_rejects_presence_finishing_permission_check(self):
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '关机竞态测试'}, headers=self.headers)).json()
+        original = controller_app.require_project
+        arrived, release = asyncio.Event(), asyncio.Event()
+
+        async def delayed_require_project(request, pid, operate=False):
+            if request.path.endswith('/presence'):
+                arrived.set()
+                await release.wait()
+            return await original(request, pid, operate=operate)
+
+        with mock.patch.object(controller_app, 'require_project', side_effect=delayed_require_project):
+            connecting = asyncio.create_task(
+                self.client.ws_connect(f"/api/projects/{created['id']}/presence"))
+            await asyncio.wait_for(arrived.wait(), timeout=2)
+            closing = asyncio.create_task(self.client.server.close())
+            for _ in range(20):
+                if self.client.server.app['lifecycle']['shutting_down']:
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(self.client.server.app['lifecycle']['shutting_down'])
+            release.set()
+            await asyncio.wait_for(closing, timeout=2)
+            result = await asyncio.gather(connecting, return_exceptions=True)
+            self.assertIsInstance(result[0], (WSServerHandshakeError, ServerDisconnectedError))
+
+    async def test_shutdown_closes_presence_without_waiting_for_websocket_timeout(self):
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '关闭测试'}, headers=self.headers)).json()
+        socket = await self.client.ws_connect(f"/api/projects/{created['id']}/presence")
+        self.assertEqual((await socket.receive_json(timeout=2))['type'], 'presence')
+        await asyncio.wait_for(self.client.server.close(), timeout=2)
+        closed = await socket.receive(timeout=2)
+        self.assertIn(closed.type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
 
     async def test_removing_team_member_closes_presence_immediately(self):
         bob = self.auth.create_user('bob', PASSWORD)
