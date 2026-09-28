@@ -46,6 +46,12 @@ async def team_call(request, method, *args, **kwargs):
                             actor_id=user['id'], session_token=request.cookies.get(COOKIE, ''))
 
 
+async def notify_access_changed(request, *, user_ids=None, project_ids=None):
+    callback = request.app.get('presence_access_changed')
+    if callback:
+        await callback(user_ids=set(user_ids or ()), project_ids=set(project_ids or ()))
+
+
 def require_user(request):
     user = request.get('user')
     if not user or not user.get('enabled'):
@@ -269,8 +275,11 @@ async def login(request):
     _rate_limit(request, body['username'])
     result = await call_store(request.app, 'login', **body)
     previous = request.cookies.get(COOKIE)
+    previous_user = request.get('user')
     if previous:
         await call_store(request.app, 'logout', previous)
+        if previous_user:
+            await notify_access_changed(request, user_ids=[previous_user['id']])
     token = result.pop('token')
     response = web.json_response(result)
     response.set_cookie(COOKIE, token, httponly=True, secure=_secure_cookie(request), samesite='Lax', path='/')
@@ -298,8 +307,9 @@ async def me(request):
 
 
 async def logout(request):
-    require_user(request)
+    user = require_user(request)
     await call_store(request.app, 'logout', request.cookies.get(COOKIE, ''))
+    await notify_access_changed(request, user_ids=[user['id']])
     response = web.json_response({'ok': True})
     response.del_cookie(COOKIE, path='/')
     return response
@@ -310,6 +320,7 @@ async def password(request):
     body = await _body(request, ('current_password', 'new_password'))
     await call_store(request.app, 'change_password', user['id'], **body,
                      session_token=request.cookies.get(COOKIE, ''))
+    await notify_access_changed(request, user_ids=[user['id']])
     response = web.json_response({'ok': True})
     response.del_cookie(COOKIE, path='/')
     return response
@@ -328,13 +339,16 @@ async def update_user(request):
     body = await _body(request, optional=('role', 'enabled', 'team_leader'))
     if not body:
         raise web.HTTPBadRequest(text='至少提供一个修改字段')
-    return web.json_response({'user': await admin_call(request, 'set_user', request.match_info['uid'], **body)})
+    user = await admin_call(request, 'set_user', request.match_info['uid'], **body)
+    await notify_access_changed(request, user_ids=[request.match_info['uid']])
+    return web.json_response({'user': user})
 
 
 async def reset_password(request):
     require_admin(request)
     body = await _body(request, ('password',))
     await admin_call(request, 'reset_password', request.match_info['uid'], body['password'])
+    await notify_access_changed(request, user_ids=[request.match_info['uid']])
     return web.json_response({'ok': True})
 
 
@@ -359,6 +373,7 @@ async def team_members(request):
 
 async def delete_team_member(request):
     await team_call(request, 'remove_team_member', request.match_info['tid'], request.match_info['uid'])
+    await notify_access_changed(request, user_ids=[request.match_info['uid']])
     return web.json_response({'ok': True})
 
 
@@ -374,6 +389,7 @@ async def delete_grant(request):
     require_admin(request)
     await admin_call(request, 'delete_grant', request.match_info['viewer_id'],
                      request.match_info['owner_id'])
+    await notify_access_changed(request, user_ids=[request.match_info['viewer_id']])
     return web.json_response({'ok': True})
 
 
@@ -395,6 +411,8 @@ async def assign_projects(request):
         for pid in sorted({p['project_id'] for p in projects}):
             await stack.enter_async_context(request.app['project_locks'][pid])
         count = await admin_call(request, 'assign_projects', **body)
+    await notify_access_changed(
+        request, project_ids=[project['project_id'] for project in projects])
     return web.json_response({'ok': True, 'count': count})
 
 

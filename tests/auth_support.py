@@ -34,6 +34,8 @@ class AuthFixture:
         app['resource_access'] = self.access
         app['project_locks'] = __import__('collections').defaultdict(
             __import__('asyncio').Lock)
+        app['presence_rooms'] = __import__('collections').defaultdict(dict)
+        app['presence_versions'] = __import__('collections').defaultdict(int)
         register_auth_routes(app, ROOT / 'web')
         return app
 
