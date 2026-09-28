@@ -9,6 +9,7 @@ const { chromium } = require('playwright');
 const web = path.join(__dirname, '..', 'web');
 const source = readFileSync(path.join(web, 'app.js'), 'utf8');
 const helpers = source.slice(source.indexOf('const canOperate'), source.indexOf('const jpost ='));
+const presenceHelpers = source.slice(source.indexOf('const PRESENCE_COLORS'), source.indexOf('function updatePresenceCursor'));
 const browserOptions = process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {};
 
 test('readonly blocks save and operate while allowing view of granted projects', async () => {
@@ -46,6 +47,41 @@ test('readonly blocks save and operate while allowing view of granted projects',
     await page.evaluate(() => setProject({id:'demo', permission:'operate', locked:true}));
     assert.equal(await page.evaluate(() => gate.canSave()), false);
     assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
+test('collaborator cursor shows a readable member name', async () => {
+  const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/style.css">
+    <div id="presence-layer"></div><script>
+      const el = {presenceLayer:document.getElementById('presence-layer')};
+      let presenceSelf = 'self';
+      ${presenceHelpers}
+      ensurePresenceCursor({connection_id:'remote',user_id:'u2',name:'张三',visible:true});
+    </script>`;
+  const server = createServer((req, res) => {
+    if (req.url === '/style.css') {
+      res.setHeader('Content-Type', 'text/css'); return res.end(readFileSync(path.join(web, 'style.css')));
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(html);
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  let browser;
+  try {
+    browser = await chromium.launch(browserOptions);
+    const page = await browser.newPage();
+    await page.goto('http://127.0.0.1:' + server.address().port);
+    const label = page.locator('.collab-cursor .label');
+    assert.equal(await label.innerText(), '张三');
+    const colors = await label.evaluate(node => ({
+      background:getComputedStyle(node).backgroundColor,
+      text:getComputedStyle(node.querySelector('span')).color,
+    }));
+    assert.notEqual(colors.background, colors.text);
+    assert.notEqual(colors.background, 'rgb(7, 16, 28)');
   } finally {
     if (browser) await browser.close();
     server.closeAllConnections();
