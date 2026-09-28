@@ -400,3 +400,84 @@ test('filled asset slots preview on click and replace/download through the conte
     await new Promise(resolve => server.close(resolve));
   }
 });
+
+test('dragging a reference image reorders its slot, paired prompt and incoming edge', async () => {
+  const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/style.css">
+    <div id="fixture"></div><script>
+    const MEDIA = ['image','video','audio'], KIND_ZH = {image:'图片',video:'视频',audio:'音频'};
+    const cap = {inputs:[
+      {key:'images[0]',type:'image'},{key:'images[1]',type:'image'},{key:'images[2]',type:'image'},
+      {key:'prompt1',type:'textarea',pairWith:'images[0]'},
+      {key:'prompt2',type:'textarea',pairWith:'images[1]'},
+      {key:'prompt3',type:'textarea',pairWith:'images[2]'},
+    ]};
+    const card = {id:'card',assets:{
+      'images[0]':{kind:'image',url:'/a.png',origin:'A'},
+      'images[1]':{kind:'image',url:'/b.png',origin:'B'},
+      'images[2]':{kind:'image',url:'/c.png',origin:'C'},
+    },params:{prompt1:'A text',prompt2:'B text',prompt3:'C text'},
+      opt:{prompt1:'A opt',prompt2:'B opt',prompt3:'C opt'},
+      optUse:{prompt1:false,prompt2:true,prompt3:false},
+      optStyle:{prompt1:'A style',prompt2:'B style',prompt3:'C style'},_tab:2};
+    const PROJ = {cards:[card],edges:[
+      {from:'one',to:'card',slot:'images[1]'},
+      {from:'many',to:'card',slot:'images[1]',slots:['images[1]','images[2]']},
+      {from:'text',to:'card',slot:'@text'},
+    ]};
+    const capOf = () => cap, mediaLimit = () => 3, gridWord = () => '', modeOf = () => null;
+    const isTextEdge = e => String(e.slot || '').startsWith('@');
+    const slotName = (s,c) => '图片' + (cap.inputs.filter(x => x.type === s.type && c.assets[x.key]).findIndex(x => x.key === s.key) + 1);
+    const requireOperate = () => true, prepareVideos = () => {}, pickFile = () => {};
+    window.opened = 0; window.saved = 0;
+    const openAsset = () => opened++, showMenu = () => {}, downloadOut = () => {};
+    const detachSlotEdges = () => {}, paintKind = () => {}, drawWires = () => {}, paintStyles = () => {};
+    const save = () => saved++;
+    const openPanel = () => render();
+    ${block('const IMAGE_SLOT_DRAG =', '/* 时间码')}
+    function render() { document.getElementById('fixture').replaceChildren(referenceSlots(card,cap.inputs.filter(s => s.type === 'image'),null)); }
+    render();
+    </script>`;
+  const server = createServer((req, res) => {
+    if (req.url === '/style.css') {
+      res.setHeader('Content-Type', 'text/css'); res.end(readFileSync(path.join(web, 'style.css')));
+    } else {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8'); res.end(html);
+    }
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  let browser;
+  try {
+    browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
+    const page = await browser.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    await page.goto('http://127.0.0.1:' + server.address().port);
+    const second = page.locator('.slot[data-key="images[1]"]');
+    const third = page.locator('.slot[data-key="images[2]"]');
+    assert.equal(await third.getAttribute('draggable'), 'true');
+    await third.dragTo(second);
+    await page.waitForFunction(() => saved === 1);
+    assert.deepEqual(await page.evaluate(() => ({
+      order:Array.from(document.querySelectorAll('.slot')).map(d => card.assets[d.dataset.key].origin),
+      labels:Array.from(document.querySelectorAll('.slot .lbl')).map(d => d.textContent),
+      params:card.params,opt:card.opt,optUse:card.optUse,optStyle:card.optStyle,
+      tab:card._tab,edges:PROJ.edges,opened,saved,
+    })), {
+      order:['A','C','B'],labels:['图片1','图片2','图片3'],
+      params:{prompt1:'A text',prompt2:'C text',prompt3:'B text'},
+      opt:{prompt1:'A opt',prompt2:'C opt',prompt3:'B opt'},
+      optUse:{prompt1:false,prompt2:false,prompt3:true},
+      optStyle:{prompt1:'A style',prompt2:'C style',prompt3:'B style'},tab:1,
+      edges:[
+        {from:'one',to:'card',slot:'images[2]'},
+        {from:'many',to:'card',slot:'images[2]',slots:['images[2]','images[1]']},
+        {from:'text',to:'card',slot:'@text'},
+      ],opened:0,saved:1,
+    });
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
