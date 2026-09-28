@@ -1472,6 +1472,7 @@ function presenceColor(userId) {
 }
 
 function renderPresenceMembers() {
+  if (!el.presenceUsers) return;
   const users = new Map();
   for (const member of presenceMembers.values()) if (!users.has(member.user_id)) users.set(member.user_id, member);
   el.presenceUsers.replaceChildren();
@@ -1494,7 +1495,7 @@ function renderPresenceMembers() {
 }
 
 function ensurePresenceCursor(member) {
-  if (member.connection_id === presenceSelf) return null;
+  if (!el.presenceLayer || member.connection_id === presenceSelf) return null;
   let node = member._el;
   if (node?.isConnected) return node;
   node = document.createElement("div");
@@ -1646,8 +1647,8 @@ function applyView() {
   el.world.style.transform = `translate(${view.x}px,${view.y}px) scale(${view.k})`;
   el.wires.style.transform = el.world.style.transform;
   el.groups.style.transform = el.world.style.transform;
-  el.presenceLayer.style.transform = el.world.style.transform;
-  updatePresenceCursors();
+  if (el.presenceLayer) el.presenceLayer.style.transform = el.world.style.transform;
+  if (typeof updatePresenceCursors === "function") updatePresenceCursors();
   el.wires.setAttribute("width", 1); el.wires.setAttribute("height", 1);
   paintSel();               // 工具条跟着缩放/平移走，不然就飘走了
   updateMinimap();
@@ -2807,7 +2808,8 @@ function bindGlobal() {
     view.x = ev.clientX - r.left - w.x * k;
     view.y = ev.clientY - r.top - w.y * k;
     view.k = k;
-    applyView(); saveView();
+    applyView();
+    if (typeof saveView === "function") saveView(); else save();
   }, { passive: false });
 
   // 空白处右键：新建节点、上传、粘贴
@@ -3031,14 +3033,15 @@ function bindGlobal() {
   };
 
   el.zoomMenu.onclick = (ev) => {
+    const persist = () => { if (typeof saveView === "function") saveView(); else save(); };
     const items = [
-      { icon: "+", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); saveView(); } },
-      { icon: "1:1", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); saveView(); } },
-      { icon: "−", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); saveView(); } },
-      { icon: "−", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); saveView(); } },
-      { icon: "−", text: "缩小 (25%)", run: () => { view.k = 0.25; applyView(); placePanel(); saveView(); } },
-      { icon: "−", text: "缩小 (10%)", run: () => { view.k = 0.1; applyView(); placePanel(); saveView(); } },
-      { icon: "□", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); saveView(); } },
+      { icon: "+", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); persist(); } },
+      { icon: "1:1", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); persist(); } },
+      { icon: "−", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); persist(); } },
+      { icon: "−", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); persist(); } },
+      { icon: "−", text: "缩小 (25%)", run: () => { view.k = 0.25; applyView(); placePanel(); persist(); } },
+      { icon: "−", text: "缩小 (10%)", run: () => { view.k = 0.1; applyView(); placePanel(); persist(); } },
+      { icon: "□", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); persist(); } },
     ];
     showMenu(ev.clientX, ev.clientY - 200, "缩放", items);
   };
