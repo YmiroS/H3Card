@@ -1500,9 +1500,11 @@ function ensurePresenceCursor(member) {
   if (node?.isConnected) return node;
   node = document.createElement("div");
   node.className = "collab-cursor";
-  node.style.color = presenceColor(member.user_id);
+  const color = presenceColor(member.user_id);
+  node.style.color = color;
   const pointer = document.createElement("div"); pointer.className = "pointer";
   const label = document.createElement("div"); label.className = "label";
+  label.style.backgroundColor = color;
   const text = document.createElement("span"); text.textContent = member.name || "协作者";
   label.appendChild(text); node.append(pointer, label);
   el.presenceLayer.appendChild(node);
