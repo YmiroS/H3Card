@@ -13,7 +13,7 @@
   let jobs = new Map(), dirty = false, editVersion = 0, saving = null, saveTimer = null;
   let conflict = false, busy = false, polling = false, previewIndex = 0, toastTimer;
   let historySignature = '', pollSignature = '', dragging = null;
-  let editorOpening = false, editorClosing = false;
+  let editorOpening = false, editorClosing = false, serverReady = false;
   const editorOpen = () => $('node-dialog').open || editorOpening;
   function mergeDocument(next, keepEdits = false) {
     const previous = new Map(doc.shots.map(shot => [shot.id,shot]));
@@ -36,7 +36,7 @@
     }
     doc.rev = next.rev;
   }
-  const writable = () => project && project.permission === 'operate' && !project.locked && !conflict;
+  const writable = () => serverReady && project && project.permission === 'operate' && !project.locked && !conflict;
   const currentShot = () => doc?.shots.find(s => s.id === selected);
   const live = job => job && ['queued','running'].includes(job.status);
   const el = (tag, className, text) => {
@@ -73,7 +73,7 @@
     $('add-shot').disabled = !writable() || busy || doc.shots.length >= 200;
     $('import-canvas').disabled = !writable() || busy || doc.shots.length >= 200;
     $('projects').disabled = busy;
-    $('new-project').disabled = busy;
+    $('new-project').disabled = $('welcome-new').disabled = $('demo').disabled = busy || !serverReady;
     $('preview').disabled = !doc?.shots.length;
     $('readonly').hidden = !project || project.permission === 'operate' && !project.locked;
     $('conflict').hidden = !conflict;
@@ -263,7 +263,11 @@
       doc.shots.splice(index,1); selected = doc.shots[Math.min(index,doc.shots.length-1)]?.id || null;
       touch(); render();
     },'button small danger'); remove.disabled = !writable() || busy;
-    controls.append(prev,next,remove); head.append(controls); panel.append(head);
+    const phase = shot[type];
+    const params = button('参数 / 生成',() => phase.card ? openNodeEditor(shot,type) : createStage(shot,type));
+    params.dataset.shotParams = type;
+    params.disabled = !writable() || busy || !!phase.card && !project.cards?.some(c => c.id === phase.card);
+    controls.append(params,prev,next,remove); head.append(controls); panel.append(head);
     const body = el('div','inspector-body');
     body.append(field('镜头名称',shot.title,v => { shot.title = v; renderShots(); },{key:'title',maxLength:120}));
     body.append(field('画面描述 / 分镜提示词',shot.description,v => { shot.description = v; renderShots(); },{textarea:true,key:'description',maxLength:10000}));
@@ -288,8 +292,8 @@
         reference.disabled = !writable() || busy; body.append(reference);
       }
     } else {
-      body.append(el('p','model-note','此阶段尚未关联节点。只在你选择创建或加入时添加，不会自动补齐另一阶段。'));
-      const create = button(type === 'image' ? '创建图片节点' : '创建视频节点',() => createStage(shot,type),'button primary run-button');
+      body.append(el('p','model-note',config.capability ? '这是旧版导演镜头。打开参数时会关联真实节点，原模型、参数和历史产物均保留，不会重新生成。' : '此阶段尚未关联节点。只在你选择创建或加入时添加，不会自动补齐另一阶段。'));
+      const create = button(config.capability ? '打开参数面板' : type === 'image' ? '创建图片节点' : '创建视频节点',() => createStage(shot,type),'button primary run-button');
       create.disabled = !writable() || busy; body.append(create);
       const add = button('加入现有画布节点',() => showImport(shot,type),'button');
       add.disabled = !writable() || busy; body.append(add);
@@ -384,11 +388,12 @@
   }
   async function createStage(shot,type) {
     if (!writable() || busy || shot[type].card) return;
-    const mode = cardTypes.find(c => c.id === 'card_'+type)?.modes?.[0];
-    if (!mode || !caps[mode.id]) { toast('此类节点暂不可用'); return; }
+    const config = shot[type];
+    const capability = config.capability || cardTypes.find(c => c.id === 'card_'+type)?.modes?.[0]?.id;
+    if (!caps[capability]) { toast('此类节点暂不可用'); return; }
     busy = true; updateActions();
     try {
-      shot[type] = {capability:mode.id,params:{}}; touch(); await flush();
+      shot[type] = {...config,capability,params:structuredClone(config.params || {})}; touch(); await flush();
       busy = false; render(); await openNodeEditor(shot,type);
     } catch (error) { toast(error.message); }
     finally { busy = false; renderInspector(); updateActions(); }
@@ -562,10 +567,13 @@
       await auth.requireUser(); auth.mountAccount($('account'));
       const capabilities = await auth.request('/api/cards'); caps = capabilities.capabilities || {};
       cardTypes = capabilities.cards || [];
-      $('connection').textContent = capabilities.comfy_online ? '生成服务已连接' : '生成服务未就绪 · 可先编排';
+      serverReady = capabilities.director_schema === 1;
+      $('server-version').hidden = serverReady;
+      $('connection').textContent = !serverReady ? '服务版本较旧 · 请重启服务后刷新' : capabilities.comfy_online ? '生成服务已连接' : '生成服务未就绪 · 可先编排';
       await refreshProjects();
       const pid = new URL(location.href).searchParams.get('project');
       if (pid) await openProject(pid);
+      updateActions();
       auth.every(poll,1800);
     } catch (error) { toast(error.message); $('connection').textContent = '连接失败，请刷新重试'; }
   }
