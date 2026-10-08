@@ -536,7 +536,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 }
 .hrun .rg img, .hrun .rg video {
   width: 100%; aspect-ratio: 1; object-fit: cover; background: #070a12;
-  cursor: zoom-in; -webkit-user-drag: none; user-select: none;
+  cursor: zoom-in; -webkit-user-drag: element; user-select: none;
 }
 /* 只出一张时铺满整行，就别再裁成方块了 */
 .hrun .rg.one img, .hrun .rg.one video { aspect-ratio: 16 / 10; object-fit: contain; }
