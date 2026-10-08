@@ -4884,6 +4884,8 @@ function promptBlock(c, s, label) {
 
   const ta = document.createElement("textarea");
   ta.placeholder = `${label || s.label}：${negative ? "描述不希望出现的内容" : "描述你想要的画面/动作/镜头"}`;
+  const promptHeight = c.promptHeights?.[s.key];
+  if (Number.isFinite(promptHeight) && promptHeight > 0) ta.style.height = promptHeight + "px";
 
   // @ 标签高亮：textarea 底下垫一层排版完全一致的 div（文字透明、标签上色），
   // textarea 盖在上面接所有鼠标事件 —— 高亮层纯视觉，pointer-events: none
@@ -5177,8 +5179,17 @@ function promptBlock(c, s, label) {
   // ResizeObserver 挂上就会先触发一次（那时已在文档里、量的是真值），
   // 之后拖输入框右下角改尺寸也会跟着重抄
   const ro = new ResizeObserver(() => {
+    if (!ta.isConnected) { ro.disconnect(); return; }
+    if (!ta.offsetHeight) return;
     syncMetrics();
     highlightLayer.scrollTop = ta.scrollTop;
+    // 浏览器手动拉伸会写入内联高度；默认布局和面板宽度变化不应保存。
+    const height = parseFloat(ta.style.height);
+    if (Number.isFinite(height) && height > 0 && height !== c.promptHeights?.[s.key] && canOperate()) {
+      c.promptHeights = c.promptHeights || {};
+      c.promptHeights[s.key] = height;
+      save();
+    }
   });
   ro.observe(ta);
   // textarea 滚动时高亮层跟着滚（overflow:hidden 的层用 scrollTop 程序滚动）
