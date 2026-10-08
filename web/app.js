@@ -8,6 +8,10 @@ const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
 const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
 const IS_MAC = /Mac/.test(navigator.platform || navigator.userAgent || "");
+const EDITOR_TARGET = new URLSearchParams(location.search);
+const NODE_EDITOR = EDITOR_TARGET.get("editor") === "1";
+const EDITOR_PROJECT = EDITOR_TARGET.get("project"), EDITOR_CARD = EDITOR_TARGET.get("card");
+if (NODE_EDITOR) document.body.classList.add("node-editor");
 
 // 全站不弹浏览器原生右键菜单：素材操作走节点和素材格自己的菜单
 document.addEventListener("contextmenu", (ev) => ev.preventDefault());
@@ -34,7 +38,20 @@ let pendingCursor = null;
 let cursorTimer = null;
 let contentSaving = false;
 let pendingCardCreates = 0;
+let pendingDirectorRuns = 0;
 let pendingProjectSync = null;
+let pendingContentSaves = 0;
+let localFlushes = 0;
+let saveFailure = null;
+let workFailure = null;
+let editorMissing = false;
+const pendingNodeWork = new Set();
+function trackNodeWork(work) {
+  pendingNodeWork.add(work);
+  const done = () => { pendingNodeWork.delete(work); flushPendingProjectSync(); };
+  work.then(done, error => { workFailure = error; done(); });
+  return work;
+}
 
 const el = {
   side: $("#side"), plist: $("#plist"), dot: $("#dot"),
@@ -88,6 +105,7 @@ function clearProject() {
   PROJ = null; selId = null; selIds.clear(); pendingProjectSync = null;
   closePanel(); closeHistory(); closeViewer(); closeMenu(); closeJobs(); closeResPop();
   el.groups.replaceChildren(); el.selbar.style.display = 'none'; showEmpty();
+  if (NODE_EDITOR) restoreNodeEditor();
 }
 function syncPermissionUI() {
   document.body.classList.toggle('project-readonly', !!PROJ && !canOperate());
@@ -1111,7 +1129,7 @@ function hoverTip(node, contentGetter) {
 }
 
 /* ================= 启动 ================= */
-(async function boot() {
+const bootReady = (async function boot() {
   try {
     await H3Auth.requireUser();
     H3Auth.mountAccount(document.getElementById('account'));
@@ -1122,8 +1140,18 @@ function hoverTip(node, contentGetter) {
   await loadProjects();
   bindGlobal();
   // 一进来就打开示例（locked 那个），新用户不用先面对一张空画布
-  const demo = projects.find(p => p.locked);
-  if (demo) await openProject(demo.id);
+  const target = new URLSearchParams(location.search);
+  const projectId = target.get("project"), cardId = target.get("card");
+  if (projectId) {
+    await openProject(projectId);
+    if (NODE_EDITOR) restoreNodeEditor();
+    else if (cardId && PROJ?.id === projectId) await focusTask({project:projectId, card:cardId});
+  } else if (NODE_EDITOR) {
+    restoreNodeEditor();
+  } else {
+    const demo = projects.find(p => p.locked);
+    if (demo) await openProject(demo.id);
+  }
   await health();
   H3Auth.every(health, 5000);
   H3Auth.every(loadProjects, 5000);
@@ -1339,6 +1367,7 @@ async function openProject(pid) {
   if (!spaces.includes(selectedSpace)) selectedSpace = spaces[0] || 'personal';
   syncSpaceOptions();
   pendingProjectSync = null;
+  saveFailure = null; workFailure = null; editorMissing = false;
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
   PROJ.groups = PROJ.groups || [];
@@ -1377,6 +1406,7 @@ async function openProject(pid) {
   el.empty.style.display = "none";
   el.dock.style.display = ""; el.fit.style.display = "";
   el.ptitle.textContent = PROJ.name;
+  document.getElementById('directorbtn').href = `/director?project=${encodeURIComponent(PROJ.id)}`;
   // 示例上的改动不落盘，这件事必须写在明面上：不然用户在它上面搭了半天，
   // 刷新一下全没了，只会以为是丢数据了
   if (PROJ.locked) {
@@ -1409,7 +1439,7 @@ let saveChain = Promise.resolve();
 let viewSaveChain = Promise.resolve();
 
 function saveView() {
-  if (!H3Auth.active || !PROJ) return;
+  if (NODE_EDITOR || !H3Auth.active || !PROJ) return;
   clearTimeout(viewTimer);
   const expectedId = PROJ.id;
   viewTimer = setTimeout(() => {
@@ -1434,12 +1464,25 @@ function save() {
   const expectedId = PROJ.id;
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    saveChain = saveChain.then(() => doSave(expectedId));
+    enqueueSave(expectedId);
   }, 700);
 }
 
+function enqueueSave(expectedId = PROJ?.id) {
+  pendingContentSaves++;
+  saveChain = saveChain.then(() => doSave(expectedId)).finally(() => {
+    pendingContentSaves--;
+    flushPendingProjectSync();
+  });
+  return saveChain;
+}
+
 async function doSave(expectedId = PROJ?.id) {
-  if (!canSave() || PROJ.id !== expectedId) return;
+  if (!canSave() || PROJ.id !== expectedId) {
+    return { ok: false, error: new Error("画布不可保存或已切换") };
+  }
+  if (NODE_EDITOR && !editorCard()) return { ok: false, error: new Error("此节点已删除或不可访问") };
+  if (NODE_EDITOR && saveFailure?.status === 409) return { ok: false, error: saveFailure };
   const id = PROJ.id;
   contentSaving = true;
   try {
@@ -1447,20 +1490,87 @@ async function doSave(expectedId = PROJ?.id) {
       rev: PROJ.rev || 0, name: PROJ.name,
       cards: PROJ.cards.map(plain), edges: PROJ.edges, groups: PROJ.groups || [],
     });
-    if (PROJ && PROJ.id === id) PROJ.rev = Math.max(PROJ.rev || 0, r.rev || 0);
+    if (!PROJ || PROJ.id !== id) return { ok: false, error: new Error("保存期间画布已切换") };
+    PROJ.rev = Math.max(PROJ.rev || 0, r.rev || 0);
+    saveFailure = null;
+    return { ok: true };
   } catch (e) {
-    // 409：画布在别处（另一个标签页 / 服务端脚本）被改过。这份内存快照已经是旧的，
-    // 硬写会把别处的产物抹掉，所以丢掉本地这份、重新加载。
-    if (e.status === 409 && PROJ && PROJ.id === id) {
+    if (PROJ?.id === id) saveFailure = e;
+    // 普通画布保留原来的冲突提示/重载；嵌入编辑器和显式 flush 不丢弃本地编辑。
+    if (e.status === 409 && PROJ && PROJ.id === id && !NODE_EDITOR && !localFlushes) {
       toast("画布在别处被改过，已重新加载");
-      return openProject(id);
+      await openProject(id);
+    } else {
+      toast("保存失败：" + e.message);
     }
-    toast("保存失败：" + e.message);
+    return { ok: false, error: e };
   } finally {
     contentSaving = false;
     flushPendingProjectSync();
   }
 }
+
+/** 等待本地提交（不是等待 GPU 任务结束），并确认最后一次 PUT 真正成功。 */
+async function flushLocalChanges(expectedId = PROJ?.id) {
+  localFlushes++;
+  try {
+    // change/blur 才落值的控件也要先提交，父页关闭按钮不会自动让 iframe 内控件失焦。
+    if (document.activeElement?.closest?.("#panel, #respop")) document.activeElement.blur();
+    for (;;) {
+      const chain = saveChain;
+      await chain;
+      await Promise.all([...pendingNodeWork]);
+      if (!PROJ || PROJ.id !== expectedId) throw new Error("画布已关闭或切换");
+      if (workFailure) throw workFailure;
+      if (saveFailure && [403, 404, 409].includes(saveFailure.status)) throw saveFailure;
+      if (chain !== saveChain || pendingNodeWork.size || pendingCardCreates) continue;
+      if (!canSave()) throw new Error("此画布只读或已锁定，不能保存");
+      if (NODE_EDITOR && !editorCard()) throw new Error("此节点已删除，不能保存或重新创建");
+      clearTimeout(saveTimer); saveTimer = null;
+      const saved = await enqueueSave(expectedId);
+      if (!saved?.ok) throw saved?.error || new Error("保存未完成");
+      if (workFailure) throw workFailure;
+      if (!pendingNodeWork.size && !pendingCardCreates && !pendingContentSaves && saveTimer === null) return;
+    }
+  } catch (error) {
+    if (error === workFailure) workFailure = null;
+    throw error;
+  } finally {
+    localFlushes--;
+    flushPendingProjectSync();
+  }
+}
+
+function editorCard() {
+  return !editorMissing && PROJ?.id === EDITOR_PROJECT ? PROJ.cards.find(card => card.id === EDITOR_CARD) : null;
+}
+function restoreNodeEditor() {
+  if (!NODE_EDITOR) return;
+  const card = editorCard();
+  selIds.clear();
+  if (card) {
+    selId = card.id; selIds.add(card.id);
+    card._el?.classList.add("sel");
+    openPanel(card.id);
+  } else {
+    selId = null;
+    el.panel.replaceChildren(errBox("此节点已删除或不可访问；不会重新创建。请返回导演台刷新项目。"));
+    el.panel._id = null; el.panel.style.display = "";
+    placePanel();
+  }
+}
+if (NODE_EDITOR) window.ChoukaNodeEditor = {
+  async flush() {
+    await bootReady;
+    if (!editorCard()) throw new Error("此节点已删除或不可访问");
+    await flushLocalChanges(EDITOR_PROJECT);
+  },
+  payload() {
+    const card = editorCard();
+    if (!card) throw new Error("此节点已删除或不可访问");
+    return payloadOf(card);
+  },
+};
 
 /* ================= 多人在线 ================= */
 const PRESENCE_COLORS = ["#00e5ff", "#ff5da2", "#9b7bff", "#55e68a", "#ffb84d", "#58a6ff", "#f778ba", "#d2e75b"];
@@ -1554,7 +1664,12 @@ function syncCollaborativeProject(projectId, remoteRev) {
 
 function applyCollaborativeProject(project) {
   if (!PROJ || project.id !== PROJ.id || (project.rev || 0) <= (PROJ.rev || 0)) return;
-  if (saveTimer !== null || contentSaving || pendingCardCreates) {
+  if (NODE_EDITOR && !(project.cards || []).some(card => card.id === EDITOR_CARD)) {
+    editorMissing = true;
+    clearTimeout(saveTimer); saveTimer = null;
+    restoreNodeEditor();
+  }
+  if (saveTimer !== null || contentSaving || pendingContentSaves || pendingCardCreates || pendingDirectorRuns || pendingNodeWork.size || localFlushes || (NODE_EDITOR && saveFailure)) {
     if (!pendingProjectSync || (project.rev || 0) > (pendingProjectSync.rev || 0)) pendingProjectSync = project;
     return;
   }
@@ -1565,17 +1680,20 @@ function applyCollaborativeProject(project) {
   PROJ.groups = project.groups || [];
   PROJ.rev = project.rev;
   PROJ.updated = project.updated;
+  PROJ.director = project.director;
   for (const card of PROJ.cards) seedHistory(card);
   if (selId && !PROJ.cards.some(card => card.id === selId)) selId = null;
   selIds = new Set([...selIds].filter(id => PROJ.cards.some(card => card.id === id)));
   el.ptitle.textContent = PROJ.name;
   render();
-  if (panelOpen && selId) openPanel(selId);
-  else if (!selId) closePanel();
+  if (!NODE_EDITOR) {
+    if (panelOpen && selId) openPanel(selId);
+    else if (!selId) closePanel();
+  }
 }
 
 function flushPendingProjectSync() {
-  if (!pendingProjectSync || saveTimer !== null || contentSaving || pendingCardCreates) return;
+  if (!pendingProjectSync || saveTimer !== null || contentSaving || pendingContentSaves || pendingCardCreates || pendingDirectorRuns || pendingNodeWork.size || localFlushes || (NODE_EDITOR && saveFailure)) return;
   const project = pendingProjectSync;
   pendingProjectSync = null;
   applyCollaborativeProject(project);
@@ -1797,6 +1915,7 @@ function render() {
   paintGroups();
   el.hint.textContent = `${PROJ.cards.length} 个节点`;
   updateMinimap();
+  if (NODE_EDITOR) restoreNodeEditor();
 }
 
 /** 这个节点这一轮会出什么：认真正会跑的那条能力，不是节点定义。
@@ -2742,6 +2861,7 @@ function bindGlobal() {
   });
 
   el.stage.addEventListener("mousedown", (ev) => {
+    if (NODE_EDITOR) return;
     // 工具条自己管自己（打组这些按钮）：冒泡到画布会被当成"点空白"把选中清掉，
     // 按钮执行时手里就没节点了 —— 这就是打组点了没反应的原因
     // 参数面板也同理：点面板上的按钮不能关掉面板
@@ -2810,7 +2930,7 @@ function bindGlobal() {
   });
 
   el.stage.addEventListener("wheel", (ev) => {
-    if (!PROJ) return;
+    if (NODE_EDITOR || !PROJ) return;
     ev.preventDefault();
     const w = toWorld(ev.clientX, ev.clientY);
     const k = Math.min(2, Math.max(0.1, view.k * (ev.deltaY < 0 ? 1.1 : 1 / 1.1)));
@@ -2825,7 +2945,7 @@ function bindGlobal() {
   // 空白处右键：新建节点、上传、粘贴
   el.stage.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
-    if (!canOperate() || ev.target.closest(".card")) return;
+    if (NODE_EDITOR || !canOperate() || ev.target.closest(".card")) return;
     tipHide();
     const at = toWorld(ev.clientX, ev.clientY);
     const menu = [];
@@ -2925,12 +3045,12 @@ function bindGlobal() {
 
   // 拖拽文件到画布 → 自动上传并建素材节点（落在鼠标位置）
   el.stage.addEventListener("dragover", (ev) => {
-    if (!PROJ) return;
+    if (NODE_EDITOR || !PROJ) return;
     ev.preventDefault();
     ev.dataTransfer.dropEffect = "copy";
   });
   el.stage.addEventListener("drop", async (ev) => {
-    if (!canOperate()) return;
+    if (NODE_EDITOR || !canOperate()) return;
     ev.preventDefault();
     const files = [...(ev.dataTransfer?.files || [])];
     if (!files.length) return;
@@ -2979,7 +3099,7 @@ function bindGlobal() {
     // 画布快捷键：正在框里打字时一概不管（Ctrl+C 得留给复制文字，Delete 得留给删字）
     const t = ev.target, tag = (t.tagName || "").toLowerCase();
     const typing = tag === "input" || tag === "textarea" || tag === "select" || t.isContentEditable;
-    if (PROJ && !typing && el.view.style.display === "none") {
+    if (PROJ && !NODE_EDITOR && !typing && el.view.style.display === "none") {
       const c = cardOf(selId);
       if (!canOperate() && (['Delete','Backspace'].includes(ev.key) || ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'v'))) { ev.preventDefault(); return; }
       if (ev.key === "Delete" || ev.key === "Backspace") {
@@ -3021,7 +3141,9 @@ function bindGlobal() {
     if (el.view.style.display !== "none") { closeViewer(); return; }
     // 任务浮窗开着时 Esc 只关它，别顺手把选中的节点和参数面板一起清掉
     if (el.jobs.style.display !== "none") { closeJobs(); return; }
-    closeMenu(); tipHide(); selId = null; closePanel();
+    closeMenu(); tipHide();
+    if (NODE_EDITOR) return;
+    selId = null; closePanel();
     if (selEdge) { selEdge = null; drawWires(); }
     selIds.clear(); paintSel();                  // Esc 也收掉框选
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
@@ -3291,6 +3413,43 @@ function fmtDur(s) {
   return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, "0")}`;
 }
 
+const canDirectCard = c => canSave() && !c.locked && !c.readonly && !c.read_only
+  && ["card_image", "card_video"].includes(c.type) && capOf(c)?.kind === "gen";
+
+async function openDirectorCard(c) {
+  const projectId = PROJ?.id, cardId = c.id;
+  if (!canDirectCard(c)) return toast("此节点或画布不可加入导演台");
+  try {
+    await flushLocalChanges(projectId);
+    c = PROJ?.cards.find(card => card.id === cardId);
+    if (!c || !canDirectCard(c)) throw new Error("节点已删除、锁定或不可操作");
+    let shot = directorShotOf(c);
+    if (!shot) {
+      pendingDirectorRuns++;
+      try {
+        const result = await jpost(`/api/projects/${encodeURIComponent(projectId)}/director/import`, {
+          rev: PROJ.director?.rev || 0, canvas_rev: PROJ.rev || 0, cards: [cardId],
+        });
+        if (PROJ?.id !== projectId) throw new Error("画布已切换");
+        shot = directorShotOf(c, result.project);
+        if (!shot) throw new Error("导入接口未返回关联镜头");
+        // 导入不会改变视图；复用协作更新，若请求期间又有本地编辑则延后应用。
+        applyCollaborativeProject(result.project);
+      } finally {
+        pendingDirectorRuns = Math.max(0, pendingDirectorRuns - 1);
+        flushPendingProjectSync();
+      }
+    }
+    const url = `/director?project=${encodeURIComponent(projectId)}&shot=${encodeURIComponent(shot.id)}`;
+    // 异步保存后浏览器可能拦新窗口；保留可点击的同源链接作为后备。
+    window.open(url, "_blank", "noopener");
+    toast("导演镜头已就绪");
+    const link = document.createElement("a");
+    link.href = url; link.target = "_blank"; link.rel = "noopener"; link.textContent = "打开导演镜头";
+    el.toast.append(" · ", link);
+  } catch (error) { toast("导演台操作失败：" + error.message); }
+}
+
 function cardMenu(cx, cy, c) {
   if (!canOperate()) return showMenu(cx, cy, titleOf(c), [
     {text:'复制节点', run:() => copyCard(c)},
@@ -3343,9 +3502,11 @@ function cardMenu(cx, cy, c) {
   const vword = outs.length > 1 ? `逐张看大图（${outs.length} 张）` : (VIEW_WORD[out && out.kind] || "查看大图");
   const dlWord = outs.length > 1
     ? `下载全部 ${outs.length} 张${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`
-    : `下载${out.kind === "video" ? "视频" : out.kind === "audio" ? "音频" : "图片"}`;
+    : `下载${out?.kind === "video" ? "视频" : out?.kind === "audio" ? "音频" : "图片"}`;
 
   showMenu(cx, cy, c.name || (cap ? cap.name : "节点"), [
+    ...(!NODE_EDITOR && canDirectCard(c) ? [{ text: directorShotOf(c) ? "查看导演镜头" : "加入导演台",
+      run: () => openDirectorCard(c) }] : []),
     ...(out ? [{ icon: "⛶", text: vword, run: () => openViewer(c) }] : []),
     ...(out ? [{ icon: "⬇", text: dlWord, run: () => outs.forEach(o => downloadOut(o)) }] : []),
     renameItem,
@@ -3537,6 +3698,7 @@ function queueCardCreate(card) {
       reconcileCreatedCard(result.project, card);
     } catch (error) {
       if (PROJ?.id === projectId) {
+        workFailure = error;
         rollbackFailedCard(card);
         toast("卡片添加失败：" + error.message);
       }
@@ -4250,6 +4412,12 @@ function veilPanel(on) {
 
 function placePanel() {
   if (el.panel.style.display === "none") return;
+  if (NODE_EDITOR) {
+    el.panel.style.left = "0px"; el.panel.style.top = "0px";
+    el.panel.style.maxHeight = "100%";
+    el.panel.style.visibility = "";
+    return;
+  }
   const c = PROJ && PROJ.cards.find(x => x.id === el.panel._id);
   if (!c || !c._el) return closePanel();
 
@@ -4295,6 +4463,8 @@ function placePanel() {
 }
 
 function openPanel(id) {
+  if (NODE_EDITOR && id !== EDITOR_CARD) return;
+  if (NODE_EDITOR && editorMissing) return restoreNodeEditor();
   if (!canOperate()) {
     const card = cardOf(id); if (!card) return;
     el.panel.replaceChildren(); el.panel._id = id; el.panel.style.display = '';
@@ -4358,6 +4528,14 @@ function openPanel(id) {
   // 中间这坨才滚动：模式切换留在顶部、运行按钮留在底部，参数再多也不会被推出屏幕
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
+  if (NODE_EDITOR) {
+    const supplement = directorSupplement(c);
+    if (supplement.length) {
+      const note = document.createElement("div"); note.className = "director-supplement";
+      note.textContent = "导演补充（只读，提交时追加到提示词）\n" + supplement.join("\n");
+      body.appendChild(note);
+    }
+  }
 
   // --- 素材槽 ---
   // 放在提示词前面：漫剧那种一图一提示词的工作流，tab 是跟着图长出来的，
@@ -4805,6 +4983,7 @@ async function runText(c) {
     toast(textRunToast(r) + (downs ? `\n已连给 ${downs} 个节点，它们下次运行会用这份新文本` : ""));
   } catch (e) {
     c.status = "error"; c.error = e.message;
+    workFailure = e;
     paint(c);
     if (el.panel._id === c.id) openPanel(c.id);
     toast(e.message);
@@ -5589,7 +5768,8 @@ function rwToast(r) {
     先走 API（几秒），不通再落本地 27B —— 本地那条走 ComfyUI 队列、跟出图抢显存，
     前面有活儿还得排队，界面上就是按钮一直显示「优化中…」。 */
 /** 翻译提示词（中→英 / 英→中），调用有道翻译 API */
-async function doTranslate(c, s) {
+function doTranslate(c, s) { return trackNodeWork(translatePrompt(c, s)); }
+async function translatePrompt(c, s) {
   if (!requireOperate()) return;
   // 防止重复点击：已经在跑就不要再发请求
   if (c._rwBusy) return toast("翻译正在进行中，请稍候");
@@ -5622,6 +5802,7 @@ async function doTranslate(c, s) {
   } catch (e) {
     c._rwBusy = false;
     c._rwErr = { key: s.key, msg: e.message };
+    workFailure = e;
     repanel(c);
     toast("翻译失败：" + e.message);
   }
@@ -5732,7 +5913,8 @@ function buildCardInfo(card) {
   return info;
 }
 
-async function doRewrite(c, s, model) {
+function doRewrite(c, s, model) { return trackNodeWork(rewritePrompt(c, s, model)); }
+async function rewritePrompt(c, s, model) {
   if (!requireOperate()) return;
   const cap = CAPS[runCap(c)] || capOf(c);
   if (!cap || !cap.rewrite) return;
@@ -5786,6 +5968,7 @@ async function doRewrite(c, s, model) {
     toast(rwToast(r));
   } catch (e) {
     c._rwErr = { key: s.key, msg: e.message };
+    workFailure = e;
   }
   c._rwBusy = false;
   repanel(c);
@@ -6224,14 +6407,14 @@ function pickFile(c, s) {
     && Object.values(r.route).some(x => x.slot === s.key);
   el.picker.accept = both ? Object.keys(r.route).map(k => `${k}/*`).join(",")
     : s.type === "audio" ? "audio/*" : s.type === "video" ? "video/*" : "image/*";
-  el.picker.onchange = async () => {
+  el.picker.onchange = () => trackNodeWork((async () => {
     const f = el.picker.files[0]; el.picker.value = "";
     if (!f) return;
     try {
       putAsset(c, s, await uploadAsset(f));
       openPanel(c.id); save();
-    } catch (e) { toast("上传失败：" + e.message); }
-  };
+    } catch (e) { workFailure = e; toast("上传失败：" + e.message); }
+  })());
   el.picker.click();
 }
 
@@ -6241,15 +6424,15 @@ function pickFile(c, s) {
 function pickAsset(c, onItem) {
   if (!requireOperate()) return;
   el.picker.accept = "image/*,video/*,audio/*";   // 三种都收，别只写一种
-  el.picker.onchange = async () => {
+  el.picker.onchange = () => trackNodeWork((async () => {
     const f = el.picker.files[0]; el.picker.value = "";
     if (!f) return;
     try {
       const item = await uploadAsset(f);
-      if (onItem) onItem(item);
-      else setAssetItem(c, item);
-    } catch (e) { toast("上传失败：" + e.message); }
-  };
+      if (onItem) await onItem(item);
+      else await setAssetItem(c, item);
+    } catch (e) { workFailure = e; toast("上传失败：" + e.message); }
+  })());
   el.picker.click();
 }
 
@@ -6486,10 +6669,24 @@ function applyInputPresets(cap, params) {
 /** 所见即所得：面板里显示的值就是提交的值。
     以前没动过的输入框不会进 params，ComfyUI 于是用了模板里作者的演示值 —
     图生视频出鼠标广告就是这么来的。 */
+function directorShotOf(c, project = PROJ) {
+  return project?.director?.shots?.find(shot => shot.id === c.director_shot
+    || shot.image?.card === c.id || shot.video?.card === c.id);
+}
+function directorSupplement(c) {
+  const shot = directorShotOf(c);
+  if (!shot) return [];
+  const lines = [];
+  if (shot.shotSize) lines.push("景别：" + shot.shotSize);
+  if ((c.director_stage === "video" || shot.video?.card === c.id) && shot.movement) lines.push("运镜：" + shot.movement);
+  if (PROJ.director.style?.trim()) lines.push("统一画面风格：" + PROJ.director.style.trim());
+  return lines;
+}
 function payloadOf(c) {
   const cap = CAPS[runCap(c)] || capOf(c), params = {}, assets = {};
   // 风格节点是提交这一刻才并进提示词的（不写回 c.params，见 promptBlock）
   const styles = styleTexts(c);
+  const supplement = directorSupplement(c);
   const pkeys = new Set(promptSpecs(cap).map(s => s.key));
   for (const s of cap.inputs) {
     if (MEDIA.includes(s.type) || s.mirror) continue;
@@ -6510,6 +6707,7 @@ function payloadOf(c) {
       if (styles.length) resolved = withStyle(resolved, styles);
       params[s.key] = resolved;
     }
+    if (supplement.length && s.key === "prompt") params[s.key] += "\n" + supplement.join("\n");
   }
   applyInputPresets(cap, params);
   if (cap.imageControls) {
@@ -6529,13 +6727,27 @@ function payloadOf(c) {
            card: c.id, cardName: titleOf(c) };
 }
 
-async function run(c) {
+function run(c) {
+  if (c._runPromise) return c._runPromise;
+  c._runPromise = trackNodeWork(runCard(c).finally(() => { delete c._runPromise; }));
+  return c._runPromise;
+}
+async function runCard(c) {
   if (!requireOperate()) return;
   if (isStyle(c)) return toast("风格节点不用运行：它只把风格并进挂着的那几个节点的提示词");
   if (isText(c)) return runText(c);
   if (c.status === "queued" || c.status === "running") return;
   const cap = capOf(c);
   if (!cap) return toast("能力不可用");
+  if (c.director_shot) {
+    clearTimeout(saveTimer); saveTimer = null;
+    await saveChain;
+    const saved = await enqueueSave(PROJ.id);
+    if (!saved.ok) return;
+    if (!PROJ.cards.includes(c)) return;
+    pendingDirectorRuns++;
+    delete c.director_selected;
+  }
   c.job = null; c.queue_remaining = null;
   c.error = null; c.progress = 0; c.status = "queued"; c.outputs = []; c.ms = null; c.step = "";
   paint(c); openPanel(c.id);      // status 一进 queued，paint 就把画面区换成加载态
@@ -6543,12 +6755,15 @@ async function run(c) {
     const pl = payloadOf(c);
     const job = await jpost("/api/generate", pl);
     c.job = job.id; c.seed = job.seed; c.status = job.status;
+    if (job.project_rev != null && PROJ?.id === pl.project) PROJ.rev = Math.max(PROJ.rev || 0, job.project_rev);
   } catch (e) {
     c.status = "error"; c.error = e.message; c.job = null;
+    workFailure = e;
     toast(e.message);
   }
+  if (c.director_shot) pendingDirectorRuns = Math.max(0, pendingDirectorRuns - 1);
   paint(c); if (el.panel._id === c.id) openPanel(c.id);
-  save();
+  save(); flushPendingProjectSync();
 }
 
 async function cancel(c) {

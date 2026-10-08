@@ -1576,6 +1576,29 @@ button:focus-visible, a:focus-visible {
 }
 
 
+/* 同源 iframe 复用真正的节点面板；只隐藏画布层，不隐藏全局弹窗。 */
+body.node-editor #side, body.node-editor #topbar, body.node-editor #hist,
+body.node-editor #world, body.node-editor #wires, body.node-editor #groups,
+body.node-editor #presence-layer, body.node-editor #dock, body.node-editor #canvas-toolbar,
+body.node-editor #minimap, body.node-editor #lasso, body.node-editor #selbar,
+body.node-editor #empty { display: none !important; }
+body.node-editor #main { width: 100%; height: 100%; min-width: 0; }
+body.node-editor #stage { inset: 0; background: var(--panel); cursor: default; }
+body.node-editor #panel {
+  position: absolute; left: 0; top: 0; width: 100%; height: 100%; max-height: 100%;
+  box-sizing: border-box; border: 0; border-radius: 0; box-shadow: none; backdrop-filter: none;
+}
+body.node-editor #panel .pbody { flex: 1 1 0; min-height: 0; overflow-y: auto; }
+body.node-editor #panel > .modes, body.node-editor #panel > .foot { flex-shrink: 0; }
+body.node-editor #panel .foot { flex-wrap: wrap; }
+body.node-editor #panel .director-supplement {
+  margin-bottom: 12px; padding: 7px 9px; border: 1px solid var(--line);
+  border-radius: 6px; color: var(--dim); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere;
+}
+body.node-editor #respop { width: min(380px, calc(100vw - 16px)); max-height: calc(100vh - 16px); }
+body.node-editor #toast { max-width: calc(100vw - 24px); }
+#toast a { color: var(--acc); text-decoration: underline; }
+
 /* ================= 只读画布：允许看和平移缩放，改动入口全部收掉 ================= */
 body.project-readonly #dock, body.project-readonly #selbar .act,
 body.project-readonly .card .runbtn { display: none !important; }

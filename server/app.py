@@ -55,6 +55,7 @@ from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_
                          setup_local_test_auth)
 from server.resource_access import ResourceAccess
 from server.image_controls import image_controls, patch_image_controls
+from server.director_bridge import import_director, link_director, project_director, sync_card_job
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -946,6 +947,15 @@ async def generation_assets(request, assets, project_id=None):
 
 async def api_generate(request):
     body = await authorized_body(request)
+    project_path = proj_path(body["project"])
+    project = json.loads(project_path.read_text(encoding="utf-8"))
+    linked_card = next((card for card in project.get("cards", [])
+                        if card.get("id") == body.get("card") and card.get("director_shot")), None)
+    if linked_card:
+        # Snapshot the previous trusted completion before replacing its job ID.
+        sync_card_job(linked_card, JOBS, CAPS, body["project"])
+    if linked_card and not body.get("dry_run") and JOBS.get(linked_card.get("job"), {}).get("status") in LIVE:
+        raise web.HTTPConflict(text="此镜头已有生成任务，请等待完成或取消后再提交")
     if not CONTROLLER_MODE and not body.get("dry_run"):
         check_local_cleanup(request.app)
     cid = body.get("capability")
@@ -1038,7 +1048,19 @@ async def api_generate(request):
             cached_probe = lambda ref: video_metadata.get(ref) or probe_video(ref)
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
     save_jobs()
-    return web.json_response(JOBS[pid])
+    result = JOBS[pid]
+    if linked_card:
+        linked_card["job"] = pid
+        linked_card.pop("director_selected", None)
+        sync_card_job(linked_card, JOBS, CAPS, body["project"])
+        project["rev"] = project.get("rev", 0) + 1
+        project["updated"] = time.time()
+        write_project(project_path, project)
+        await broadcast_collaboration(request.app, body["project"], {
+            "type": "project-changed", "project": collaboration_project(project),
+        }, authorize=True)
+        result = result | {"project_rev": project["rev"]}
+    return web.json_response(result)
 
 
 REWRITE_TIMEOUT = 900      # 27B 在 CPU/低显存上第一次加载就要好几分钟，别掐太早
@@ -1879,7 +1901,8 @@ async def api_projects(request):
             continue
         out.append({"id": acl["project_id"], "name": d.get("name", "未命名"),
                     "updated": d.get("updated", 0), "cards": len(d.get("cards", [])),
-                    "locked": bool(d.get("locked")), "owner_id": acl["owner_id"],
+                    "locked": bool(d.get("locked")), "has_director": "director" in d,
+                    "owner_id": acl["owner_id"],
                     "owner_username": acl.get("owner_username", ""),
                     "team_id": acl.get("team_id"), "team_name": acl.get("team_name"),
                     "share_count": acl.get("share_count", 0),
@@ -1925,6 +1948,10 @@ async def api_project_get(request):
     if details is None:
         raise web.HTTPNotFound(reason="项目不存在或不可访问")
     d = json.loads(p.read_text(encoding="utf-8"))
+    for card in d.get("cards", []):
+        sync_card_job(card, JOBS, CAPS, pid)
+    if "director" in d:
+        d["director"] = project_director(d, CAPS, JOBS)
     personal_view = await call_store(request.app, "get_project_view", user["id"], pid)
     if personal_view is not None:
         d["view"] = personal_view
@@ -1936,6 +1963,186 @@ async def api_project_get(request):
                                   "shared_team_ids": details.get("shared_team_ids", []),
                                   "shared_personally": bool(details.get("shared_personally")),
                                   "permission": details["permission"]})
+
+
+def validate_director(document):
+    if (not isinstance(document, dict) or set(document) != {"rev", "script", "style", "shots"}
+            or type(document["rev"]) is not int or document["rev"] < 0
+            or not isinstance(document["script"], str) or len(document["script"]) > 100_000
+            or not isinstance(document["style"], str) or len(document["style"]) > 10_000
+            or not isinstance(document["shots"], list) or len(document["shots"]) > 200):
+        raise web.HTTPBadRequest(text="导演项目数据不正确（最多 200 个镜头）")
+    ids = set()
+    for shot in document["shots"]:
+        if not isinstance(shot, dict) or set(shot) != {
+                "id", "title", "description", "shotSize", "movement", "notes",
+                "image", "video", "assets", "history", "selected"}:
+            raise web.HTTPBadRequest(text="镜头数据不正确")
+        sid = shot["id"]
+        if (not isinstance(sid, str) or not sid or len(sid) > 128 or sid in ids
+                or any(not (c.isalnum() or c in "_-") for c in sid)):
+            raise web.HTTPBadRequest(text="镜头 ID 不正确或重复")
+        ids.add(sid)
+        for key in ("title", "description", "shotSize", "movement", "notes"):
+            if not isinstance(shot[key], str) or len(shot[key]) > 10_000:
+                raise web.HTTPBadRequest(text="镜头文字过长或格式不正确")
+        for stage in ("image", "video"):
+            settings = shot[stage]
+            if (not isinstance(settings, dict) or not {"capability", "params"} <= set(settings)
+                    or set(settings) - {"capability", "params", "card", "assets"}
+                    or not isinstance(settings["capability"], str)
+                    or not isinstance(settings["params"], dict)
+                    or len(settings["params"]) > 100):
+                raise web.HTTPBadRequest(text="生成设置不正确")
+            if "card" in settings and (not isinstance(settings["card"], str)
+                    or not 1 <= len(settings["card"]) <= 128):
+                raise web.HTTPBadRequest(text="关联卡片 ID 不正确")
+            if "assets" in settings and (not isinstance(settings["assets"], dict)
+                    or len(settings["assets"]) > 30
+                    or any(not isinstance(asset, dict) or not asset.get("ref") or not asset.get("url")
+                           for asset in settings["assets"].values())):
+                raise web.HTTPBadRequest(text="关联卡片素材不正确")
+            for key, value in settings["params"].items():
+                if (len(key) > 128 or not isinstance(value, (str, int, float, bool))
+                        or isinstance(value, str) and len(value) > 20_000
+                        or isinstance(value, float) and not math.isfinite(value)):
+                    raise web.HTTPBadRequest(text="生成参数不正确")
+        if not isinstance(shot["assets"], list) or len(shot["assets"]) > 9:
+            raise web.HTTPBadRequest(text="每个镜头最多 9 张参考图")
+        for asset in shot["assets"]:
+            if (not isinstance(asset, dict) or set(asset) - {"ref", "url", "kind", "origin"}
+                    or asset.get("kind") != "image"
+                    or any(not isinstance(asset.get(key), str) or not asset[key] for key in ("ref", "url", "origin"))):
+                raise web.HTTPBadRequest(text="参考图数据不正确")
+        if not isinstance(shot["history"], list) or len(shot["history"]) > 200:
+            raise web.HTTPBadRequest(text="每个镜头最多保存 200 次生成记录")
+        for item in shot["history"]:
+            if (not isinstance(item, dict) or not {"job", "stage"} <= set(item)
+                    or set(item) - {"job", "stage", "outputs"}
+                    or item["stage"] not in ("image", "video")
+                    or not isinstance(item["job"], str) or not 1 <= len(item["job"]) <= 128):
+                raise web.HTTPBadRequest(text="镜头任务记录不正确")
+            if "outputs" in item and (not isinstance(item["outputs"], list) or len(item["outputs"]) > 100
+                    or any(not isinstance(output, dict) for output in item["outputs"])):
+                raise web.HTTPBadRequest(text="镜头产物记录不正确")
+        if not isinstance(shot["selected"], dict) or set(shot["selected"]) - {"image", "video"}:
+            raise web.HTTPBadRequest(text="采用版本不正确")
+        for stage, selected in shot["selected"].items():
+            if (not isinstance(selected, dict) or set(selected) != {"job", "index"}
+                    or type(selected["index"]) is not int or selected["index"] < 0
+                    or not any(item["job"] == selected["job"] and item["stage"] == stage
+                               for item in shot["history"])):
+                raise web.HTTPBadRequest(text="采用版本不属于当前镜头")
+
+
+async def api_director_save(request):
+    pid = request.match_info["pid"]
+    await require_project(request, pid, operate=True)
+    path = proj_path(pid)
+    if not path.is_file():
+        raise web.HTTPNotFound(text="项目不存在")
+    project = json.loads(path.read_text(encoding="utf-8"))
+    if project.get("locked"):
+        raise web.HTTPForbidden(text="示例项目只读，请新建导演项目")
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
+    linked = "canvas_rev" in body
+    canvas_rev = body.pop("canvas_rev", None)
+    validate_director(body)
+    if linked and (type(canvas_rev) is not int or canvas_rev != project.get("rev", 0)):
+        raise web.HTTPConflict(text="画布已在其他页面修改，请先导出方案，再重新加载")
+    if not linked and any(shot[stage].get("card") for shot in project.get("director", {}).get("shots", [])
+                          for stage in ("image", "video")):
+        raise web.HTTPConflict(text="关联画布的导演项目必须提供画布版本号，请刷新页面")
+    if not linked and any(shot[stage].get("card") for shot in body["shots"] for stage in ("image", "video")):
+        raise web.HTTPBadRequest(text="创建卡片关联必须提供画布版本号")
+    rev = project.get("director", {}).get("rev", 0)
+    if body["rev"] != rev:
+        raise web.HTTPConflict(text="导演项目已在其他页面修改，请先导出本地方案，再重新加载")
+    await resource_call(request.app, "validate_document", require_user(request)["id"], pid, body)
+    jobs = set(await call_store(request.app, "list_project_jobs", pid))
+    if any(item["job"] not in jobs for shot in body["shots"] for item in shot["history"]):
+        raise web.HTTPBadRequest(text="任务不属于当前项目")
+    for shot in body["shots"]:
+        for stage, choice in shot["selected"].items():
+            entry = next(item for item in shot["history"] if item["job"] == choice["job"] and item["stage"] == stage)
+            outputs = JOBS.get(choice["job"], {}).get("outputs") or entry.get("outputs", [])
+            if choice["index"] >= len(outputs):
+                raise web.HTTPBadRequest(text="采用版本的产物序号超出范围")
+    if linked:
+        body = link_director(project, body, CAPS, require_user(request), JOBS)
+        await resource_call(request.app, "validate_document", require_user(request)["id"], pid, project)
+        project["rev"] = project.get("rev", 0) + 1
+    await require_project(request, pid, operate=True)
+    body["rev"] = rev + 1
+    project["director"] = body
+    project["updated"] = time.time()
+    write_project(path, project)
+    result = {"ok": True, "rev": body["rev"], "updated": project["updated"]}
+    if linked:
+        await broadcast_collaboration(request.app, pid, {
+            "type": "project-changed", "project": collaboration_project(project),
+        }, authorize=True)
+        result.update(canvas_rev=project["rev"], director=body, project=collaboration_project(project))
+    return web.json_response(result)
+
+
+async def api_director_import(request):
+    """Import explicit canvas members under project_write_lock and browser auth/CSRF."""
+    pid = request.match_info["pid"]
+    await require_project(request, pid, operate=True)
+    path = proj_path(pid)
+    if not path.is_file():
+        raise web.HTTPNotFound(text="项目不存在")
+    project = json.loads(path.read_text(encoding="utf-8"))
+    if project.get("locked"):
+        raise web.HTTPForbidden(text="示例项目只读，请新建导演项目")
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
+    if (not isinstance(body, dict) or not {"rev", "canvas_rev", "cards"} <= set(body)
+            or set(body) - {"rev", "canvas_rev", "cards", "shot"}
+            or any(type(body[key]) is not int or body[key] < 0 for key in ("rev", "canvas_rev"))
+            or not isinstance(body["cards"], list) or not 1 <= len(body["cards"]) <= 200
+            or any(not isinstance(cid, str) or not 1 <= len(cid) <= 128
+                   or any(not (c.isalnum() or c in "_-") for c in cid) for cid in body["cards"])
+            or len(set(body["cards"])) != len(body["cards"])
+            or "shot" in body and (not isinstance(body["shot"], str)
+                or not 1 <= len(body["shot"]) <= 128
+                or any(not (c.isalnum() or c in "_-") for c in body["shot"]))):
+        raise web.HTTPBadRequest(text="导入数据不正确：需要版本号和不重复的生成卡片 ID")
+    rev = (project.get("director") or {}).get("rev", 0)
+    if body["canvas_rev"] != project.get("rev", 0) or body["rev"] != rev:
+        raise web.HTTPConflict(text="画布或导演项目已在其他页面修改，请重新加载")
+    user = require_user(request)
+    work = import_director(project, body["cards"], body.get("shot"), CAPS, JOBS)
+    validate_director(work["director"])
+    await resource_call(request.app, "validate_document", user["id"], pid, work)
+    jobs = set(await call_store(request.app, "list_project_jobs", pid))
+    imported = [card for card in work["cards"] if card["id"] in body["cards"]]
+    referenced_jobs = {item["job"] for shot in work["director"]["shots"] for item in shot["history"]}
+    for card in imported:
+        if card.get("job"):
+            referenced_jobs.add(card["job"])
+        referenced_jobs.update(item["job"] for item in card.get("history") or [] if item.get("job"))
+    if referenced_jobs - jobs:
+        raise web.HTTPBadRequest(text="任务不属于当前项目")
+    await require_project(request, pid, operate=True)
+    work["rev"] = project.get("rev", 0) + 1
+    work["director"]["rev"] = rev + 1
+    work["updated"] = time.time()
+    write_project(path, work)
+    snapshot = collaboration_project(work)
+    await broadcast_collaboration(request.app, pid, {
+        "type": "project-changed", "project": snapshot,
+    }, authorize=True)
+    return web.json_response({"ok": True, "director": work["director"], "project": snapshot,
+                              "canvas_rev": work["rev"], "rev": rev + 1, "updated": work["updated"]})
 
 
 async def api_project_view(request):
@@ -1962,7 +2169,7 @@ async def api_project_view(request):
 
 def collaboration_project(project):
     return {key: project.get(key)
-            for key in ("id", "name", "cards", "edges", "groups", "rev", "updated")}
+            for key in ("id", "name", "cards", "edges", "groups", "rev", "updated", "director")}
 
 
 async def api_project_card_create(request):
@@ -2408,6 +2615,11 @@ async def index(request):
     return web.FileResponse(ROOT / "web" / "index.html")
 
 
+async def director_index(request):
+    require_user(request)
+    return web.FileResponse(ROOT / "web" / "director.html")
+
+
 async def controller_index(request):
     if not CONTROLLER_MODE:
         raise web.HTTPNotFound(reason="中间层运行面板只在 controller 模式提供")
@@ -2577,6 +2789,7 @@ def make_app(auth_path=None):
         app["costs"].backfill(JOBS.values())
     app.on_response_prepare.append(no_cache)
     app.router.add_get("/", index)
+    app.router.add_get("/director", director_index)
     app.router.add_get("/controller", controller_index)
     app.router.add_get("/controller/costs", controller_costs)
     app.router.add_get("/api/health", api_health)
@@ -2598,6 +2811,8 @@ def make_app(auth_path=None):
     app.router.add_get("/api/projects", api_projects)
     app.router.add_post("/api/projects", api_project_create)
     app.router.add_get("/api/projects/{pid}", api_project_get)
+    app.router.add_put("/api/projects/{pid}/director", api_director_save)
+    app.router.add_post("/api/projects/{pid}/director/import", api_director_import)
     app.router.add_put("/api/projects/{pid}/view", api_project_view)
     app.router.add_post("/api/projects/{pid}/cards", api_project_card_create)
     app.router.add_get("/api/projects/{pid}/presence", api_project_presence)
@@ -2629,7 +2844,7 @@ def make_app(auth_path=None):
     app.router.add_get("/admin/permissions", permissions_page)
     app.router.add_get("/teams", teams_page)
     # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
-    for name in ("app.js", "style.css"):
+    for name in ("app.js", "style.css", "director.js", "director.css"):
         app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
     app.on_shutdown.append(close_presence_connections)
