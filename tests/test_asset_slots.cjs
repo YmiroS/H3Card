@@ -33,6 +33,8 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
     const api = async (url, options) => { const r = await fetch(url, options); if (!r.ok) throw Error('HTTP ' + r.status); return r.json(); };
     ${block('const projectUploadUrl =', 'async function api(')}
     let view = {x:0,y:0,k:1};
+    const selIds = new Set();
+    ${block('function selectionMenu(', '/** 框选状态')}
     ${block('const CW =', 'document.addEventListener(')}
     const isAsset = () => true, isStyle = () => false, isText = () => false, isTextCard = () => false;
     const assetOf = c => c.outputs[0], titleOf = () => 'Asset', cmpSrc = () => null;
