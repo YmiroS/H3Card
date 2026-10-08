@@ -90,7 +90,9 @@ const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="
   const applySize = () => {}, paint = () => {}, bindCardVideo = () => {}, bindCompare = () => {}, hoverTip = () => {};
   const openHistory = () => {}, openPanel = () => {}, closePanel = () => {}, repanel = () => {};
   const tipHide = () => {}, closeJobs = () => {}, drawWires = () => {}, paintGroups = () => {}, toast = () => {};
-  const beginCardsMove = ev => { ev.stopPropagation(); }, save = () => { saved++; snapshot = PROJ.cards.map(({id,name,params}) => ({id,name,params})); };
+  const placePanel = () => {};
+  const save = () => { saved++; snapshot = PROJ.cards.map(({id,name,params}) => ({id,name,params})); };
+  ${block('function beginCardsMove(', '/** Delete')}
   const cardRect = c => ({x:c.x,y:c.y,w:268,h:220});
   const toWorld = (x,y) => { const r = el.stage.getBoundingClientRect(); return {x:x-r.left,y:y-r.top}; };
   const closeMenu = () => { el.menu.style.display = 'none'; };
