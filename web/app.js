@@ -2976,15 +2976,33 @@ function bindGlobal() {
     }
   });
 
-  // 拖拽文件到画布 → 自动上传并建素材节点（落在鼠标位置）
+  // 拖拽文件到画布 → 自动上传并建素材节点（落在鼠标位置）；历史产物使用专用拖拽类型。
   el.stage.addEventListener("dragover", (ev) => {
-    if (!PROJ) return;
+    if (!canOperate()) return;
     ev.preventDefault();
     ev.dataTransfer.dropEffect = "copy";
   });
   el.stage.addEventListener("drop", async (ev) => {
     if (!canOperate()) return;
     ev.preventDefault();
+    if ([...(ev.dataTransfer?.types || [])].includes(HISTORY_ASSET_DRAG)) {
+      ev.stopPropagation();
+      const drag = historyAssetDrag;
+      historyAssetDrag = null;
+      if (!drag || PROJ !== drag.project || ev.dataTransfer.getData(HISTORY_ASSET_DRAG) !== drag.token) return;
+      const at = toWorld(ev.clientX, ev.clientY);
+      try {
+        const item = await importOutput(drag.output);
+        if (PROJ !== drag.project || !canOperate()) return;
+        const card = addCard("card_asset", Math.round(at.x - 134), Math.round(at.y - 84));
+        if (!card) return;
+        await setAssetItem(card, item);
+        toast(`已建素材节点：${item.origin || drag.output.filename || "历史产物"}`);
+      } catch (error) {
+        if (PROJ === drag.project) toast("导入历史产物失败：" + error.message);
+      }
+      return;
+    }
     const files = [...(ev.dataTransfer?.files || [])];
     if (!files.length) return;
     // 只处理图片/视频/音频，其他类型忽略
@@ -4011,12 +4029,15 @@ async function spawnDownstream(from, at, cx, cy) {
 
 /** 把 ComfyUI 输出目录里的产物搬进 input 目录，得到可用的 LoadImage 值 */
 async function importOutput(out) {
+  const project = PROJ;
   if (!canOperate()) throw new Error('此画布只读，不能导入素材');
   // 二进制产物不走 JSON 包装，但必须带同源会话并明确检查响应。
   const download = await fetch(new URL(out.url, location.href), {credentials:'same-origin'});
   if (!download.ok) throw new Error(`读取产物失败（${download.status}）`);
   const blob = await download.blob();
-  const file = new File([blob], out.filename.split(/[\\/]/).pop(), {type:blob.type});
+  if (PROJ !== project || !canOperate()) throw new Error('画布已切换或权限已变化，导入已取消');
+  const filename = out.filename || new URL(out.url, location.href).pathname.split('/').pop() || '历史产物';
+  const file = new File([blob], filename.split(/[\\/]/).pop(), {type:blob.type});
   return uploadAsset(file);
 }
 
@@ -4191,6 +4212,9 @@ async function copyHistoryText(value, message) {
   }
 }
 
+const HISTORY_ASSET_DRAG = "application/x-chouka-history-output";
+let historyAssetDrag = null;
+
 function histRun(c, h, cur) {
   const outs = h.outputs || [];
   const box = document.createElement("div");
@@ -4214,7 +4238,30 @@ function histRun(c, h, cur) {
       ? `<div class="rg-a" data-i="${i}" title="${o.filename}">🎵</div>`
       : `<img src="${o.url}" data-i="${i}" alt="" draggable="false">`).join("");
   prepareVideos(rg);
+  for (const thumb of rg.querySelectorAll("[data-i]")) {
+    thumb.draggable = true;
+    thumb.title = "单击放大查看；拖到画布创建素材节点";
+  }
+  let dragged = false;
+  rg.ondragstart = (ev) => {
+    const thumb = ev.target.closest("[data-i]");
+    const output = thumb && outs[+thumb.dataset.i];
+    if (!canOperate() || !output || !["image", "video", "audio"].includes(output.kind)) {
+      ev.preventDefault(); return;
+    }
+    dragged = true;
+    historyAssetDrag = { token: uid(), project: PROJ, output: { ...output } };
+    // 清除浏览器给图片附带的默认文件/链接数据，仅使用内部拖拽协议。
+    ev.dataTransfer.items.clear();
+    ev.dataTransfer.effectAllowed = "copy";
+    ev.dataTransfer.setData(HISTORY_ASSET_DRAG, historyAssetDrag.token);
+  };
+  rg.ondragend = () => {
+    historyAssetDrag = null;
+    setTimeout(() => { dragged = false; }, 0);
+  };
   rg.onclick = (ev) => {
+    if (dragged) return;
     const t = ev.target.closest("[data-i]");
     if (t) openViewer(c, +t.dataset.i, outs, h.seed);
   };
