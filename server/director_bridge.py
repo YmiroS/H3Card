@@ -255,6 +255,41 @@ def _adopt(card, selection, jobs, caps, project_id):
     card["outputs"] = [copy.deepcopy(output)]
 
 
+def reference_storyboard(project, shot_id, version, slot, asset, caps, jobs):
+    """Bind one adopted image to one empty video slot, without touching other media."""
+    work = copy.deepcopy(project)
+    document = project_director(work, caps, jobs)
+    shot = next((s for s in (document or {}).get("shots", []) if s["id"] == shot_id), None)
+    if shot is None:
+        raise web.HTTPNotFound(text="镜头不存在")
+    cards = {c["id"]: c for c in work.get("cards") or []}
+    source = cards.get(shot["image"].get("card"))
+    target = cards.get(shot["video"].get("card"))
+    if any(card is None or card.get("director_shot") != shot_id
+           or card.get("director_stage") != stage
+           for card, stage in ((source, "image"), (target, "video"))):
+        raise web.HTTPConflict(text="分镜或视频节点不存在，请先关联真实节点")
+    sync_card_job(source, jobs, caps, work.get("id"))
+    output = _selected_output(source, version)
+    if shot["selected"].get("image") != version or not output or output.get("kind") != "image":
+        raise web.HTTPBadRequest(text="引用版本必须是当前采用的分镜产物")
+    cap = _capability(caps, target.get("cap"), "video")
+    if not any(s.get("key") == slot and s.get("type") == "image" for s in cap.get("inputs") or []):
+        raise web.HTTPBadRequest(text="目标不是当前视频模式的图片槽")
+    edges = work.setdefault("edges", [])
+    if (target.get("assets") or {}).get(slot) or any(
+            e.get("to") == target["id"] and slot in e.get("slots", [e.get("slot")]) for e in edges):
+        raise web.HTTPConflict(text="图片槽已被占用，不会覆盖已有素材或连线")
+    if any(e.get("from") == source["id"] and e.get("to") == target["id"]
+           and e.get("version") == version for e in edges):
+        raise web.HTTPConflict(text="此分镜版本已连接到视频参考")
+    target.setdefault("assets", {})[slot] = copy.deepcopy(asset)
+    edges.append({"from": source["id"], "to": target["id"], "slot": slot,
+                  "slots": [slot], "version": copy.deepcopy(version)})
+    work["director"] = project_director(work, caps, jobs)
+    return work
+
+
 def import_director(project, card_ids, shot_id, caps, jobs):
     """Explicitly attach existing generation cards, never create or scan for members.
 

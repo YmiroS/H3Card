@@ -55,7 +55,7 @@ from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_
                          setup_local_test_auth)
 from server.resource_access import ResourceAccess
 from server.image_controls import image_controls, patch_image_controls
-from server.director_bridge import import_director, link_director, project_director, sync_card_job
+from server.director_bridge import import_director, link_director, project_director, reference_storyboard, sync_card_job
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -2146,6 +2146,53 @@ async def api_director_import(request):
                               "canvas_rev": work["rev"], "rev": rev + 1, "updated": work["updated"]})
 
 
+async def api_director_reference(request):
+    pid = request.match_info["pid"]
+    await require_project(request, pid, operate=True)
+    path = proj_path(pid)
+    if not path.is_file():
+        raise web.HTTPNotFound(text="项目不存在")
+    project = json.loads(path.read_text(encoding="utf-8"))
+    if project.get("locked"):
+        raise web.HTTPForbidden(text="示例项目只读，请新建导演项目")
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
+    if (not isinstance(body, dict) or set(body) != {"rev", "canvas_rev", "shot", "version", "slot", "asset"}
+            or any(type(body[key]) is not int or body[key] < 0 for key in ("rev", "canvas_rev"))
+            or not isinstance(body["shot"], str) or not 1 <= len(body["shot"]) <= 128
+            or not isinstance(body["slot"], str) or not 1 <= len(body["slot"]) <= 128
+            or not isinstance(body["version"], dict) or set(body["version"]) != {"job", "index"}
+            or not isinstance(body["version"]["job"], str) or not 1 <= len(body["version"]["job"]) <= 128
+            or type(body["version"]["index"]) is not int or body["version"]["index"] < 0
+            or not isinstance(body["asset"], dict) or body["asset"].get("kind") != "image"
+            or any(not isinstance(body["asset"].get(key), str) or not body["asset"][key]
+                   for key in ("ref", "url"))):
+        raise web.HTTPBadRequest(text="分镜引用数据不正确")
+    rev = (project.get("director") or {}).get("rev", 0)
+    if body["canvas_rev"] != project.get("rev", 0) or body["rev"] != rev:
+        raise web.HTTPConflict(text="画布或导演项目已在其他页面修改，请重新加载")
+    user = require_user(request)
+    if body["version"]["job"] not in set(await call_store(request.app, "list_project_jobs", pid)):
+        raise web.HTTPBadRequest(text="任务不属于当前项目")
+    work = reference_storyboard(project, body["shot"], body["version"], body["slot"],
+                                body["asset"], CAPS, JOBS)
+    validate_director(work["director"])
+    await resource_call(request.app, "validate_document", user["id"], pid, work)
+    await require_project(request, pid, operate=True)
+    work["rev"] = project.get("rev", 0) + 1
+    work["director"]["rev"] = rev + 1
+    work["updated"] = time.time()
+    write_project(path, work)
+    snapshot = collaboration_project(work)
+    await broadcast_collaboration(request.app, pid, {
+        "type": "project-changed", "project": snapshot,
+    }, authorize=True)
+    return web.json_response({"ok": True, "director": work["director"], "project": snapshot,
+                              "canvas_rev": work["rev"], "rev": rev + 1, "updated": work["updated"]})
+
+
 async def api_project_view(request):
     pid = request.match_info["pid"]
     await require_project(request, pid)
@@ -2814,6 +2861,7 @@ def make_app(auth_path=None):
     app.router.add_get("/api/projects/{pid}", api_project_get)
     app.router.add_put("/api/projects/{pid}/director", api_director_save)
     app.router.add_post("/api/projects/{pid}/director/import", api_director_import)
+    app.router.add_post("/api/projects/{pid}/director/reference", api_director_reference)
     app.router.add_put("/api/projects/{pid}/view", api_project_view)
     app.router.add_post("/api/projects/{pid}/cards", api_project_card_create)
     app.router.add_get("/api/projects/{pid}/presence", api_project_presence)

@@ -2474,7 +2474,7 @@ function edgeWord(e) {
   const nm = (c) => c ? titleOf(c) : "?";
   return isTextEdge(e)
     ? (e.slot === TEXT_SLOT ? `文本：${nm(a)} → ${nm(b)}` : `风格：${nm(a)} → ${nm(b)}`)
-    : `${nm(a)} → ${nm(b)}`;
+    : `${nm(a)} → ${nm(b)}${e.version ? `（固定分镜版本 · ${e.version.job} · 第 ${e.version.index + 1} 张）` : ''}`;
 }
 
 function drawWires() {
@@ -6812,7 +6812,8 @@ async function pollJobs() {
         if (el.hist._id === c.id) openHistory(c.id);
         drawWires();
         // 下游已连线的节点自动吃掉新产物（风格线传的是文字，没有产物可搬，跳过）
-        for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e))) {
+        // 固定分镜线的素材已经落在目标槽中；上游重跑不能替换已采用版本。
+        for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version)) {
           const to = PROJ.cards.find(x => x.id === e.to);
           if (!to) continue;
 

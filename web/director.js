@@ -287,9 +287,8 @@
       edit.disabled = !writable() || busy; edit.dataset.nodeEditor = type; body.append(edit);
       const link = el('a','button','在画布中查看 ↗');
       link.href = `/?project=${encodeURIComponent(project.id)}&card=${encodeURIComponent(card.id)}`; link.target = '_blank'; link.rel = 'noopener'; body.append(link);
-      if (type === 'video' && chosen(shot,'image')) {
-        const reference = button('将采用的分镜图加入视频参考',() => applyStoryboard(shot),'button');
-        reference.disabled = !writable() || busy; body.append(reference);
+      if (type === 'video') {
+        const references = el('div'); references.id = 'storyboard-references'; body.append(references);
       }
     } else {
       body.append(el('p','model-note',config.capability ? '这是旧版导演镜头。打开参数时会关联真实节点，原模型、参数和历史产物均保留，不会重新生成。' : '此阶段尚未关联节点。只在你选择创建或加入时添加，不会自动补齐另一阶段。'));
@@ -299,7 +298,29 @@
       add.disabled = !writable() || busy; body.append(add);
     }
     body.append(el('hr'),el('h2','',type === 'image' ? '分镜版本' : '视频版本'));
-    const history = el('div'); history.id = 'versions'; body.append(history); panel.append(body); renderVersions();
+    const history = el('div'); history.id = 'versions'; body.append(history); panel.append(body); renderStoryboardReferences(); renderVersions();
+  }
+  function renderStoryboardReferences() {
+    const container = $('storyboard-references'), shot = currentShot();
+    if (!container || !shot) return;
+    container.replaceChildren();
+    const config = shot.video, adopted = chosen(shot,'image');
+    const inputs = caps[config.capability]?.inputs || [];
+    const edges = (project.edges || []).filter(e => e.to === config.card &&
+      (e.slots || [e.slot]).some(key => inputs.some(s => s.key === key && s.type === 'image')));
+    for (const edge of edges) {
+      const source = project.cards.find(c => c.id === edge.from);
+      const slots = (edge.slots || [edge.slot]).map(key => inputs.find(s => s.key === key)?.label || key);
+      const version = edge.version ? `固定版本 · ${edge.version.job} · 第 ${edge.version.index + 1} 张` : '跟随上游最新产物';
+      const note = el('p','model-note',`${source?.name || '缺失节点'} → ${slots.join('、')} · ${version}`);
+      note.dataset.referenceFrom = edge.from; container.append(note);
+    }
+    if (adopted) {
+      const connected = edges.some(e => e.from === shot.image.card && e.version?.job === adopted.job && e.version.index === adopted.index);
+      const reference = button(connected ? '已连接采用的分镜版本' : '将采用的分镜图加入视频参考',() => applyStoryboard(shot),'button');
+      reference.dataset.storyboardReference = '';
+      reference.disabled = !writable() || busy || connected; container.append(reference);
+    }
   }
   function renderVersions() {
     const container = $('versions'), shot = currentShot(); if (!container || !shot) return;
@@ -438,13 +459,22 @@
       await flush(); await refreshProject();
       shot = doc.shots.find(s => s.id === shot.id);
       const version = chosen(shot,'image'), config = shot.video;
-      if (!version || !project.cards.some(c => c.id === config.card)) throw new Error('分镜产物或视频节点不存在');
-      const slot = (caps[config.capability]?.inputs || []).find(s => s.type === 'image' && !config.assets?.[s.key]);
+      if (!version || !project.cards.some(c => c.id === shot.image.card) || !project.cards.some(c => c.id === config.card)) throw new Error('分镜产物或节点不存在，请先打开参数面板关联真实节点');
+      const slot = (caps[config.capability]?.inputs || []).find(s => s.type === 'image' && !config.assets?.[s.key] &&
+        !(project.edges || []).some(e => e.to === config.card && (e.slots || [e.slot]).includes(s.key)));
       if (!slot) throw new Error('当前模式没有空闲图片槽。请在节点面板中移除参考图或切换模式；不会替换已有素材。');
+      if (!shot.selected.image) {
+        shot.selected.image = {job:version.job,index:version.index}; touch(); await flush();
+      }
       const asset = await importFrame(version,project.id);
-      config.assets = {...config.assets,[slot.key]:asset}; touch(); await flush();
-      toast(`已加入${slot.label || '图片参考槽'}，已有图片、视频和音频均保留`);
-    } catch (error) { toast(error.message); }
+      const result = await auth.json(`/api/projects/${project.id}/director/reference`,'POST',{
+        rev:doc.rev, canvas_rev:project.rev || 0, shot:shot.id,
+        version:{job:version.job,index:version.index}, slot:slot.key, asset
+      });
+      project = {...project,...result.project}; mergeDocument(result.director);
+      $('save-status').textContent = '已保存';
+      toast(`已连线并加入${slot.label || '图片参考槽'}，固定采用的分镜版本，其他素材均保留`);
+    } catch (error) { toast(error.message); if (error.status === 409) await refreshProject(); }
     finally { busy = false; render(); }
   }
   async function poll() {
@@ -457,6 +487,7 @@
         await refreshProject();
         if (project?.id !== pid) return;
         if (before !== JSON.stringify(doc)) { renderShots(); renderInspector(); renderReview(); updateActions(); }
+        else renderStoryboardReferences();
       }
       const result = await auth.request('/api/jobs'); if (project?.id !== pid) return;
       const next = new Map(jobs);

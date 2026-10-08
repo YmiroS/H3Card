@@ -192,6 +192,52 @@ class DirectorBridgeApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthF
         }
         return output
 
+    def register_upload(self, name, pid="p", kind="image"):
+        self.register_asset(name, pid)
+        return {**legacy.reference(name), "kind": kind}
+
+    def reference_body(self, project=None, **changes):
+        project = self.read_project() if project is None else project
+        item = project["director"]["shots"][0]
+        body = {"rev": project["director"]["rev"], "canvas_rev": project["rev"],
+                "shot": item["id"], "version": copy.deepcopy(item["selected"]["image"]),
+                "slot": "images[0]", "asset": legacy.reference("storyboard-reference.png")}
+        body.update(changes)
+        return body
+
+    async def reference_request(self, body, status=200, **kwargs):
+        before = self.project_path.read_bytes()
+        response = await self.client.post(self.url + "/reference", json=body, **kwargs)
+        if status != 200:
+            self.assertEqual(self.project_path.read_bytes(), before,
+                             "引用拒绝必须保留逐字节一致的磁盘项目")
+        self.assertEqual(response.status, status, await response.text())
+        return response
+
+    async def prepare_reference(self, later_job=False, index=0):
+        project = await self.link()
+        card = self.stage_card(project)
+        old = self.snapshot_job("reference-old", card=card["id"])
+        outputs = [old]
+        if index:
+            locator = "reference-old/chosen.png"
+            self.access.register("p", "artifact", locator)
+            outputs.append({"kind": "image", "url": "/api/artifact/" + locator,
+                            "filename": "chosen.png"})
+            controller_app.JOBS["reference-old"]["outputs"] = copy.deepcopy(outputs)
+        card.update(job="reference-old", status="done", outputs=copy.deepcopy(outputs),
+                    history=[{"job": "reference-old", "outputs": copy.deepcopy(outputs)}])
+        if later_job:
+            latest = self.snapshot_job("reference-latest", card=card["id"])
+            card.update(job="reference-latest", outputs=[latest])
+            card["history"].insert(0, {"job": "reference-latest", "outputs": [latest]})
+        project = await self.canvas_save(project)
+        body = self.request_document(project)
+        body["shots"][0]["selected"] = {"image": {"job": "reference-old", "index": index}}
+        project = (await (await self.save(body)).json())["project"]
+        self.register_upload("storyboard-reference.png")
+        return project, copy.deepcopy(outputs[index])
+
     async def test_atomic_save_creates_requested_owned_gen_cards_without_auto_edge(self):
         project = await self.link()
         self.assertEqual(len(project["cards"]), 2)
@@ -574,6 +620,500 @@ class DirectorBridgeApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthF
         })
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(self.stage_card(self.read_project(), "image", sid)["history"], history)
+
+    async def test_reference_atomically_adds_edge_asset_projection_revisions_and_broadcast(self):
+        project, _ = await self.prepare_reference(index=1)
+        video = self.stage_card(project, "video")
+        video["assets"] = {
+            "images[1]": self.register_upload("keep-image.png"),
+            "audios[0]": self.register_upload("keep-audio.wav", kind="audio"),
+            "videos[0]": self.register_upload("keep-video.mp4", kind="video"),
+        }
+        project["edges"] = [{"from": self.stage_card(project)["id"], "to": video["id"],
+                             "slot": "@text", "custom": {"keep": True}}]
+        project = await self.canvas_save(project)
+        self.seed_project(view={"x": 17, "y": -20, "k": 1}, custom={"keep": [1, 2]})
+        before = self.read_project()
+        body = self.reference_body(project)
+        original_body = copy.deepcopy(body)
+        with mock.patch.object(controller_app, "broadcast_collaboration",
+                               wraps=controller_app.broadcast_collaboration) as broadcast:
+            payload = await (await self.reference_request(body)).json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(body, original_body)
+        self.assertEqual(payload["rev"], body["rev"] + 1)
+        self.assertEqual(payload["canvas_rev"], body["canvas_rev"] + 1)
+        disk = self.read_project()
+        self.assertEqual(payload["project"], controller_app.collaboration_project(disk))
+        self.assertEqual(payload["director"], disk["director"])
+        self.assertEqual(payload["updated"], disk["updated"])
+        self.assertEqual(disk["rev"], payload["canvas_rev"])
+        self.assertEqual(disk["director"]["rev"], payload["rev"])
+        expected_edge = {"from": self.stage_card(before)["id"], "to": video["id"],
+                         "slot": body["slot"], "slots": [body["slot"]],
+                         "version": body["version"]}
+        self.assertEqual(disk["edges"], before["edges"] + [expected_edge])
+        expected_assets = {**video["assets"], body["slot"]: body["asset"]}
+        self.assertEqual(self.stage_card(disk, "video")["assets"], expected_assets)
+        self.assertEqual(disk["director"]["shots"][0]["video"]["assets"], expected_assets)
+        self.assertEqual(self.stage_card(disk), self.stage_card(before))
+        self.assertEqual({k: v for k, v in self.stage_card(disk, "video").items() if k != "assets"},
+                         {k: v for k, v in video.items() if k != "assets"})
+        for key in ("groups", "view", "custom"):
+            self.assertEqual(disk.get(key), before.get(key))
+        broadcast.assert_awaited_once()
+        self.assertEqual(broadcast.call_args.args[1], "p")
+        self.assertEqual(broadcast.call_args.args[2],
+                         {"type": "project-changed", "project": payload["project"]})
+        self.assertTrue(broadcast.call_args.kwargs["authorize"])
+        self.assertEqual((await self.get_project())["director"], payload["director"])
+        self.submit.assert_not_awaited()
+
+    async def test_reference_uses_adopted_old_output_despite_later_done_job(self):
+        project, old = await self.prepare_reference(later_job=True)
+        payload = await (await self.reference_request(self.reference_body(project))).json()
+        for restored in (payload["project"], self.read_project(), await self.get_project()):
+            image = self.stage_card(restored)
+            self.assertEqual(image["job"], "reference-latest")
+            self.assertEqual(image["outputs"], [old])
+            self.assertEqual(image["director_selected"], {"job": "reference-old", "index": 0})
+            self.assertEqual(restored["edges"][-1]["version"], image["director_selected"])
+            self.assertEqual(restored["director"]["shots"][0]["selected"]["image"],
+                             image["director_selected"])
+            self.assertEqual(self.stage_card(restored, "video")["assets"]["images[0]"],
+                             legacy.reference("storyboard-reference.png"))
+        controller_app.JOBS.clear()
+        self.assertEqual(self.stage_card(await self.get_project())["outputs"], [old])
+
+    async def test_reference_accepts_registered_archival_job_after_cache_eviction(self):
+        project, old = await self.prepare_reference()
+        controller_app.JOBS.clear()
+        payload = await (await self.reference_request(self.reference_body(project))).json()
+        self.assertEqual(self.stage_card(payload["project"])["outputs"], [old])
+        self.assertEqual(payload["project"]["edges"][-1]["version"],
+                         {"job": "reference-old", "index": 0})
+        self.assertEqual(self.stage_card(await self.get_project(), "video")["assets"],
+                         {"images[0]": legacy.reference("storyboard-reference.png")})
+
+    async def test_reference_migrated_legacy_history_preserves_job_and_billing_identity(self):
+        from costs import CostLedger
+
+        item = legacy.shot()
+        jid = "reference-legacy-shot-job"
+        output = self.snapshot_job(jid, card=item["id"])
+        controller_app.JOBS[jid].update(projectName="历史项目名", cardName="历史镜头名")
+        original_job = copy.deepcopy(controller_app.JOBS[jid])
+        original_acl = copy.deepcopy(self.auth.get_job(jid))
+        ledger = CostLedger(self.root / "data" / "reference-costs.db", ROOT / "pricing.json")
+        self.addCleanup(ledger.close)
+        self.application["costs"] = ledger
+        ledger.record_job(original_job, historical=True)
+        original_bill = [dict(row) for row in ledger.db.execute("SELECT * FROM cost_events ORDER BY job_id")]
+        self.assertEqual(len(original_bill), 1)
+        self.assertEqual(original_bill[0]["card_id"], item["id"])
+        choice = {"job": jid, "index": 0}
+        item["history"] = [{"job": jid, "stage": "image", "outputs": [output]}]
+        item["selected"] = {"image": choice}
+        with mock.patch.object(controller_app, "save_jobs") as save_jobs:
+            await self.save(legacy.director([item]))
+            project = (await (await self.save(self.request_document())).json())["project"]
+            image = self.stage_card(project)
+            self.assertNotEqual(image["id"], original_job["card"])
+            self.assertEqual(image["director_selected"], choice)
+            self.assertEqual(next(h for h in image["history"] if h["job"] == jid)["outputs"], [output])
+            self.register_upload("storyboard-reference.png")
+            migrated_bytes = self.project_path.read_bytes()
+            for archived in (False, True):
+                with self.subTest(archived=archived):
+                    self.project_path.write_bytes(migrated_bytes)
+                    if archived:
+                        controller_app.JOBS.clear()
+                    payload = await (await self.reference_request(self.reference_body(project))).json()
+                    for source in (payload["project"], self.read_project(), await self.get_project()):
+                        card = self.stage_card(source)
+                        self.assertEqual(card["outputs"], [output])
+                        self.assertEqual(card["director_selected"], choice)
+                        self.assertEqual(next(h for h in card["history"] if h["job"] == jid)["outputs"], [output])
+                        self.assertEqual(source["edges"], [{"from": image["id"],
+                            "to": self.stage_card(project, "video")["id"], "slot": "images[0]",
+                            "slots": ["images[0]"], "version": choice}])
+                        self.assertEqual(self.stage_card(source, "video")["assets"],
+                                         {"images[0]": legacy.reference("storyboard-reference.png")})
+                    if not archived:
+                        self.assertEqual(controller_app.JOBS[jid], original_job)
+                    else:
+                        self.assertNotIn(jid, controller_app.JOBS, "引用不能重建或改写归档任务")
+                    self.assertEqual(self.auth.get_job(jid), original_acl)
+                    self.assertEqual([dict(row) for row in ledger.db.execute(
+                        "SELECT * FROM cost_events ORDER BY job_id")], original_bill,
+                        "迁移和引用不能重写历史账单的任务、卡片身份或费用")
+            save_jobs.assert_not_called()
+        self.submit.assert_not_awaited()
+
+    async def test_reference_explicitly_adopts_known_fallback_when_image_selection_absent(self):
+        project, output = await self.prepare_reference()
+        controller_app.JOBS.clear()
+        image = self.stage_card(project)
+        image.pop("director_selected", None)
+        image["outputs"] = []
+        project["director"]["shots"][0]["selected"] = {}
+        self.seed_project(cards=project["cards"], director=project["director"])
+        restored = await self.get_project()
+        self.assertNotIn("image", restored["director"]["shots"][0]["selected"])
+        choice = {"job": "reference-old", "index": 0}
+        initial_reference = {"rev": restored["director"]["rev"], "canvas_rev": restored["rev"],
+                             "shot": "shot-1", "version": choice, "slot": "images[0]",
+                             "asset": legacy.reference("storyboard-reference.png")}
+        await self.reference_request(initial_reference, 400)
+        body = self.request_document(restored)
+        body["shots"][0]["selected"]["image"] = choice
+        adopted = (await (await self.save(body)).json())["project"]
+        self.assertEqual(self.stage_card(adopted)["outputs"], [output])
+        self.assertEqual(self.stage_card(adopted)["director_selected"], choice)
+        await self.reference_request(initial_reference, 409)
+        payload = await (await self.reference_request(self.reference_body(adopted))).json()
+        self.assertEqual(payload["project"]["edges"][-1]["version"], choice)
+        self.assertEqual(self.stage_card(payload["project"], "video")["assets"],
+                         {"images[0]": initial_reference["asset"]})
+        self.submit.assert_not_awaited()
+
+    async def test_reference_rejects_asset_and_edge_owned_slots_without_disk_changes(self):
+        project, _ = await self.prepare_reference()
+        baseline = copy.deepcopy(project)
+        image, video = (self.stage_card(project, stage) for stage in ("image", "video"))
+        occupied = self.register_upload("occupied.png")
+        cases = [({"images[0]": occupied}, []),
+                 ({}, [{"from": image["id"], "to": video["id"], "slot": "images[0]"}]),
+                 ({}, [{"from": video["id"], "to": video["id"], "slot": "images[1]",
+                        "slots": ["images[1]", "images[0]"]}])]
+        for assets, edges in cases:
+            with self.subTest(assets=assets, edges=edges):
+                project = copy.deepcopy(baseline)
+                self.stage_card(project, "video")["assets"] = assets
+                self.seed_project(cards=project["cards"], edges=edges)
+                with mock.patch.object(controller_app, "broadcast_collaboration") as broadcast:
+                    await self.reference_request(self.reference_body(project), 409)
+                broadcast.assert_not_awaited()
+
+    async def test_reference_rejects_wrong_or_inactive_video_image_slot(self):
+        project, _ = await self.prepare_reference()
+        for slot in ("images[1]", "audios[0]", "videos[0]", "prompt", "@text", "unknown"):
+            with self.subTest(slot=slot):
+                await self.reference_request(self.reference_body(project, slot=slot), 400)
+        # 只以活动 capability 的 inputs 为准，不以另一视频模式的槽位为准。
+        self.caps["minimax_h3_flf2v"]["inputs"].append(
+            {"key": "images[1]", "type": "image", "target": {"node": "1", "input": "last"}})
+        await self.reference_request(self.reference_body(project, slot="images[1]"), 400)
+
+    async def test_reference_rejects_duplicate_version_even_in_another_empty_slot(self):
+        project, _ = await self.prepare_reference()
+        self.caps["minimax_h3_i2v"]["inputs"].append(
+            {"key": "images[1]", "type": "image", "target": {"node": "1", "input": "last"}})
+        body = self.reference_body(project)
+        payload = await (await self.reference_request(body)).json()
+        fresh = self.reference_body(payload["project"])
+        await self.reference_request(fresh, 409)
+        await self.reference_request({**fresh, "slot": "images[1]"}, 409)
+        self.assertEqual(len(self.read_project()["edges"]), 1)
+        self.assertNotIn("images[1]", self.stage_card(self.read_project(), "video")["assets"])
+
+    async def test_reference_conflicts_on_either_revision_and_replay(self):
+        project, _ = await self.prepare_reference()
+        body = self.reference_body(project)
+        for key in ("rev", "canvas_rev"):
+            for value in (body[key] - 1, body[key] + 1):
+                with self.subTest(revision=key, value=value):
+                    await self.reference_request({**body, key: value}, 409)
+        await self.reference_request(body)
+        await self.reference_request(body, 409)
+
+    async def test_reference_concurrent_requests_have_one_atomic_winner(self):
+        project, _ = await self.prepare_reference()
+        body = self.reference_body(project)
+        bodies = [body, {**body, "asset": self.register_upload("queued-other-reference.png")}]
+        before = self.project_path.read_bytes()
+        lock = legacy.ObservedLock()
+        self.application["project_locks"]["p"] = lock
+        await lock.acquire()
+        held_by_test = True
+        tasks = [asyncio.create_task(self.client.post(self.url + "/reference", json=request_body))
+                 for request_body in bodies]
+        try:
+            await asyncio.wait_for(lock.both_waiting.wait(), timeout=5)
+            self.assertEqual(self.project_path.read_bytes(), before)
+            lock.release()
+            held_by_test = False
+            responses = await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
+        finally:
+            if held_by_test:
+                lock.release()
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self.assertEqual(sorted(response.status for response in responses), [200, 409])
+        winner = next(i for i, response in enumerate(responses) if response.status == 200)
+        winning_body = bodies[winner]
+        payload = await responses[winner].json()
+        disk = self.read_project()
+        self.assertEqual(disk["rev"], body["canvas_rev"] + 1)
+        self.assertEqual(disk["director"]["rev"], body["rev"] + 1)
+        expected_edge = {"from": self.stage_card(project)["id"],
+                         "to": self.stage_card(project, "video")["id"],
+                         "slot": body["slot"], "slots": [body["slot"]], "version": body["version"]}
+        expected_assets = {body["slot"]: winning_body["asset"]}
+        for source in (disk, payload["project"], await self.get_project()):
+            self.assertEqual(source["edges"], [expected_edge], "并发引用只能产生一条连线")
+            self.assertEqual(self.stage_card(source, "video")["assets"], expected_assets,
+                             "失败请求不能覆盖成功请求的素材")
+            self.assertEqual(source["director"]["shots"][0]["video"]["assets"], expected_assets)
+        self.assertNotEqual(winning_body["asset"], bodies[1 - winner]["asset"])
+
+    async def test_reference_requires_strict_body_and_version_schema(self):
+        project, _ = await self.prepare_reference()
+        valid = self.reference_body(project)
+        cases = [None, [], {}, {**valid, "extra": 1}]
+        for key in valid:
+            invalid = copy.deepcopy(valid)
+            invalid.pop(key)
+            cases.append(invalid)
+        for key in ("rev", "canvas_rev"):
+            for value in (True, False, -1, "0", None, 0.5, {}, []):
+                cases.append({**valid, key: value})
+        for key in ("shot", "slot"):
+            for value in (None, True, 1, [], {}, "", "x" * 129):
+                cases.append({**valid, key: value})
+        for version in (None, [], {}, {"job": "reference-old"}, {"index": 0},
+                        {"job": "reference-old", "index": 0, "extra": 1}):
+            cases.append({**valid, "version": version})
+        for key, values in (("job", (None, True, 1, [], {}, "", "x" * 129)),
+                            ("index", (None, True, False, -1, "0", 0.5, {}, []))):
+            for value in values:
+                cases.append({**valid, "version": {**valid["version"], key: value}})
+        for asset in (None, [], {}, "chouka/storyboard-reference.png",
+                      {**valid["asset"], "kind": "video"},
+                      {**valid["asset"], "ref": ""}, {**valid["asset"], "url": None}):
+            cases.append({**valid, "asset": asset})
+        for body in cases:
+            with self.subTest(body=body):
+                await self.reference_request(body, 400)
+
+    async def test_reference_malformed_json_is_atomic_400(self):
+        await self.prepare_reference()
+        before = self.project_path.read_bytes()
+        response = await self.client.post(self.url + "/reference", data='{"rev":',
+                                          headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status, 400, await response.text())
+        self.assertEqual(self.project_path.read_bytes(), before)
+
+    async def test_reference_requires_current_selection_and_known_image_history_output(self):
+        project, _ = await self.prepare_reference(later_job=True)
+        body = self.reference_body(project)
+        await self.reference_request({**body, "version": {"job": "reference-latest", "index": 0}}, 400)
+        await self.reference_request({**body, "version": {"job": "reference-old", "index": 1}}, 400)
+        await self.reference_request({**body, "version": {"job": "missing-job", "index": 0}}, 400)
+        unrelated = self.snapshot_job("reference-unrelated", card="unrelated-card")
+        await self.reference_request({**body, "version": {"job": "reference-unrelated", "index": 0}}, 400)
+        controller_app.JOBS.clear()
+        baseline = copy.deepcopy(project)
+        for case in ("no-selection", "unknown-history", "non-image-output", "unrelated-source"):
+            with self.subTest(case=case):
+                damaged = copy.deepcopy(baseline)
+                card = self.stage_card(damaged)
+                if case == "no-selection":
+                    card.pop("director_selected", None)
+                    card["outputs"] = []
+                    damaged["director"]["shots"][0]["selected"] = {}
+                elif case == "unknown-history":
+                    card["history"] = []
+                    damaged["director"]["shots"][0]["history"] = []
+                elif case == "non-image-output":
+                    entry = next(h for h in card["history"] if h["job"] == body["version"]["job"])
+                    entry["outputs"][0]["kind"] = "video"
+                else:
+                    card["director_selected"] = {"job": "reference-unrelated", "index": 0}
+                    card["outputs"] = [unrelated]
+                    damaged["director"]["shots"][0]["selected"]["image"] = card["director_selected"]
+                self.seed_project(cards=damaged["cards"], director=damaged["director"])
+                request_body = {**body, "version": card.get("director_selected", body["version"])}
+                await self.reference_request(request_body, 400)
+
+    async def test_reference_requires_existing_same_shot_image_and_video_nodes(self):
+        project, _ = await self.prepare_reference()
+        body = self.reference_body(project)
+        await self.reference_request({**body, "shot": "missing-shot"}, 404)
+        for stage in ("image", "video"):
+            for case in ("deleted", "other-shot", "wrong-stage", "missing-link"):
+                with self.subTest(stage=stage, case=case):
+                    damaged = copy.deepcopy(project)
+                    card = self.stage_card(damaged, stage)
+                    if case == "deleted":
+                        damaged["cards"] = [c for c in damaged["cards"] if c["id"] != card["id"]]
+                    elif case == "other-shot":
+                        card["director_shot"] = "other-shot"
+                    elif case == "wrong-stage":
+                        card["director_stage"] = "video" if stage == "image" else "image"
+                    else:
+                        damaged["director"]["shots"][0][stage].pop("card")
+                        card.pop("director_shot")
+                        card.pop("director_stage")
+                    self.seed_project(cards=damaged["cards"], director=damaged["director"])
+                    await self.reference_request(body, 409)
+
+    async def test_reference_rejects_foreign_missing_and_mixed_resource_locators(self):
+        project, _ = await self.prepare_reference()
+        owner = self.auth.create_user("reference-resource-owner", auth_support.PASSWORD)
+        self.own_project("other", owner=owner)
+        foreign = self.register_upload("reference-foreign.png", "other")
+        local = legacy.reference("storyboard-reference.png")
+        for asset in (foreign, legacy.reference("reference-missing.png"),
+                      {**local, "url": foreign["url"]}, {**foreign, "url": local["url"]}):
+            with self.subTest(asset=asset):
+                await self.reference_request(self.reference_body(project, asset=asset), 404)
+        self.assertFalse(self.access.authorize(self.admin["id"], "upload", "reference-foreign.png", "p"))
+        self.assertTrue(self.access.authorize(owner["id"], "upload", "reference-foreign.png", "other"))
+        external = {**local, "ref": "https://foreign.invalid/a.png",
+                    "url": "https://foreign.invalid/a.png"}
+        await self.reference_request(self.reference_body(project, asset=external), 400)
+
+    async def test_reference_rejects_foreign_jobs_including_archival_local_output_snapshot(self):
+        project, old = await self.prepare_reference()
+        self.own_project("other")
+        foreign = self.snapshot_job("reference-foreign-job", pid="other")
+        other_path = self.root / "data" / "projects" / "other.json"
+        other_before = other_path.read_bytes()
+        for archived in (False, True):
+            with self.subTest(archived=archived):
+                if archived:
+                    controller_app.JOBS.clear()
+                for output in (foreign, old):
+                    # 本地资源快照也不能使外项目任务获得合法的项目归属。
+                    damaged = copy.deepcopy(project)
+                    card = self.stage_card(damaged)
+                    choice = {"job": "reference-foreign-job", "index": 0}
+                    card.update(job=choice["job"], outputs=[output], director_selected=choice,
+                                history=[{"job": choice["job"], "outputs": [output]}])
+                    damaged["director"]["shots"][0].update(
+                        selected={"image": choice},
+                        history=[{"job": choice["job"], "stage": "image", "outputs": [output]}])
+                    self.seed_project(cards=damaged["cards"], director=damaged["director"])
+                    await self.reference_request(self.reference_body(damaged), 400)
+        self.assertEqual(other_path.read_bytes(), other_before)
+        self.assertFalse(self.access.authorize(self.admin["id"], "artifact",
+                                               "reference-foreign-job/result.png", "p"))
+
+    async def test_reference_rejects_foreign_resource_in_selected_local_job_history(self):
+        project, _ = await self.prepare_reference()
+        self.own_project("other")
+        foreign = self.snapshot_job("reference-foreign-output", pid="other")
+        controller_app.JOBS.clear()
+        card = self.stage_card(project)
+        card["history"][0]["outputs"] = [foreign]
+        card["outputs"] = [foreign]
+        project["director"]["shots"][0]["history"] = [
+            {"job": "reference-old", "stage": "image", "outputs": [foreign]}]
+        self.seed_project(cards=project["cards"], director=project["director"])
+        await self.reference_request(self.reference_body(project), 404)
+
+    async def test_reference_authentication_csrf_permissions_and_locked_project(self):
+        project, _ = await self.prepare_reference()
+        body = self.reference_body(project)
+        self.client.session.headers.clear()
+        for headers in ({"Origin": self.origin},
+                        {"Origin": self.origin, "X-CSRF-Token": "wrong"},
+                        {"X-CSRF-Token": self.headers["X-CSRF-Token"]},
+                        {**self.headers, "Origin": "https://foreign.invalid"},
+                        {**self.headers, "Sec-Fetch-Site": "cross-site"}):
+            with self.subTest(headers=headers):
+                await self.reference_request(body, 403, headers=headers)
+        self.client.session.headers.update(self.headers)
+        self.seed_project(locked=True)
+        await self.reference_request(body, 403)
+        self.seed_project(locked=False)
+        reader = self.auth.create_user("reference-reader", auth_support.PASSWORD)
+        self.auth.set_grant(reader["id"], self.admin["id"], "read")
+        await self.switch_user("reference-reader")
+        await self.reference_request(body, 403)
+        self.auth.create_user("reference-stranger", auth_support.PASSWORD)
+        await self.switch_user("reference-stranger")
+        await self.reference_request(body, 404)
+        self.client.session.cookie_jar.clear()
+        await self.reference_request(body, 401)
+        operator = self.auth.create_user("reference-operator", auth_support.PASSWORD)
+        self.auth.set_grant(operator["id"], self.admin["id"], "operate")
+        await self.switch_user("reference-operator")
+        payload = await (await self.reference_request(body)).json()
+        self.assertEqual(self.stage_card(payload["project"], "video")["created_by"], self.admin["id"])
+        self.submit.assert_not_awaited()
+
+    async def test_reference_permission_is_rechecked_before_atomic_write(self):
+        project, _ = await self.prepare_reference()
+        original = controller_app.require_project
+        calls = 0
+
+        async def revoked(request, pid, operate=False):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                from aiohttp import web
+                raise web.HTTPForbidden(text="权限已撤销")
+            return await original(request, pid, operate=operate)
+
+        with mock.patch.object(controller_app, "require_project", side_effect=revoked), \
+                mock.patch.object(controller_app, "broadcast_collaboration") as broadcast:
+            await self.reference_request(self.reference_body(project), 403)
+        self.assertEqual(calls, 2)
+        broadcast.assert_not_awaited()
+
+    async def test_reference_manual_canvas_edge_and_asset_project_to_director_and_survive_save(self):
+        project, _ = await self.prepare_reference()
+        image, video = (self.stage_card(project, stage) for stage in ("image", "video"))
+        asset = self.register_upload("manual-reference.png")
+        video["assets"] = {"images[0]": asset,
+                           "audios[0]": self.register_upload("manual-audio.wav", kind="audio")}
+        project["edges"] = [
+            {"from": image["id"], "to": video["id"], "slot": "images[0]",
+             "slots": ["images[0]"], "version": {"job": "reference-old", "index": 0},
+             "manual": {"retain": True}},
+            {"from": video["id"], "to": image["id"], "slot": "@text", "custom": "keep"},
+        ]
+        restored = await self.canvas_save(project)
+        expected_edges = copy.deepcopy(project["edges"])
+        expected_assets = copy.deepcopy(video["assets"])
+        self.assertEqual(restored["director"]["shots"][0]["video"]["assets"], expected_assets)
+        self.assertEqual(restored["edges"], expected_edges)
+        await self.reference_request(self.reference_body(restored), 409)
+        saved = (await (await self.save(self.request_document(restored))).json())["project"]
+        for source in (saved, self.read_project(), await self.get_project()):
+            self.assertEqual(source["edges"], expected_edges)
+            self.assertEqual(self.stage_card(source, "video")["assets"], expected_assets)
+            self.assertEqual(source["director"]["shots"][0]["video"]["assets"], expected_assets)
+        self.submit.assert_not_awaited()
+
+    async def test_reference_storyboard_detaches_inputs_and_rejected_work(self):
+        from aiohttp import web
+        from server.director_bridge import reference_storyboard
+
+        project, _ = await self.prepare_reference()
+        body = self.reference_body(project)
+        before = copy.deepcopy(project)
+        version, asset = copy.deepcopy(body["version"]), copy.deepcopy(body["asset"])
+        work = reference_storyboard(project, body["shot"], version, body["slot"], asset,
+                                    self.caps, controller_app.JOBS)
+        self.assertEqual(project, before)
+        version["index"] = 999
+        asset["ref"] = "must-not-alias"
+        self.assertEqual(work["edges"][-1]["version"], body["version"])
+        self.assertEqual(self.stage_card(work, "video")["assets"][body["slot"]], body["asset"])
+        work["director"]["shots"][0]["video"]["assets"][body["slot"]]["ref"] = "projection-only"
+        self.assertEqual(self.stage_card(work, "video")["assets"][body["slot"]], body["asset"])
+        work["edges"][-1]["version"]["index"] = 123
+        self.assertEqual(project, before)
+        self.assertEqual(body["version"], {"job": "reference-old", "index": 0})
+        with self.assertRaises(web.HTTPBadRequest):
+            reference_storyboard(project, body["shot"], body["version"], "audios[0]",
+                                 body["asset"], self.caps, controller_app.JOBS)
+        self.assertEqual(project, before)
 
     async def test_unlinked_legacy_document_still_does_not_create_canvas_cards(self):
         before = self.seed_project(rev=7)
