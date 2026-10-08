@@ -1861,12 +1861,14 @@ function buildCard(c) {
     // 是画面，按下去却纹丝不动，每次挪节点都得回去瞄那一条。反过来列例外更省事（NODRAG）
     if (ev.button === 0 && !ev.target.closest(NODRAG)) return startDrag(ev, c, d);
     ev.stopPropagation();     // 右键别漏到画布上去
-    pick(c.id);
+    if (!(ev.button === 2 && selIds.size > 1 && selIds.has(c.id))) pick(c.id);
   };
   d.oncontextmenu = (ev) => {
     ev.stopPropagation();
     ev.preventDefault();
-    tipHide(); pick(c.id); cardMenu(ev.clientX, ev.clientY, c);
+    tipHide();
+    if (!(selIds.size > 1 && selIds.has(c.id))) pick(c.id);
+    cardMenu(ev.clientX, ev.clientY, c);
   };
   d.ondblclick = (ev) => {
     const body = ev.target.closest(".body");
@@ -2718,7 +2720,13 @@ function bindGlobal() {
     paintSel(); paintGroups(); save();
     toast("已打组：拖组里的节点或分组框 = 整组一起动；双击组名改名，右键框删组");
   };
-  el.selbar.appendChild(gb);
+  const rb = document.createElement("button");
+  rb.className = "renamecards act"; rb.textContent = "批量重命名";
+  rb.title = "一次填写所有选中节点的新名称，统一确认；留空恢复默认名称";
+  rb.onclick = () => {
+    if (selIds.size > 1) renameCard(cardOf([...selIds][0]));
+  };
+  el.selbar.append(gb, rb);
   // 双保险：工具条按下的那一漏到画布去（画布会把它当框选起点）
   el.selbar.onmousedown = (ev) => ev.stopPropagation();
   addEventListener("resize", () => { placePanel(); placeJobs(); paintSel(); });
@@ -2795,7 +2803,7 @@ function bindGlobal() {
         pick(id);
       } else {
         paintSel();
-        if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · Delete 全删 · 上方按钮打组`);
+        if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · Delete 全删 · 上方按钮打组 / 批量重命名`);
       }
     };
     document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
@@ -3289,10 +3297,13 @@ function cardMenu(cx, cy, c) {
     ...((c.outputs || []).length ? [{text:'预览产物', run:() => openViewer(c)}] : []),
   ]);
   const cap = capOf(c);
+  const renameItem = { icon: "✎",
+    text: selIds.size > 1 && selIds.has(c.id) ? `批量重命名（${selIds.size} 个节点）` : "重命名节点",
+    run: () => renameCard(c) };
   if (isStyle(c)) {
     const n = PROJ.edges.filter(e => e.from === c.id && isTextEdge(e)).length;
     return showMenu(cx, cy, c.name || "风格化提示词", [
-      { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
+      renameItem,
       { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
       { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
       // 挂错节点了想全撤掉，比一根根找线点开销小
@@ -3307,7 +3318,7 @@ function cardMenu(cx, cy, c) {
   if (isText(c)) {
     return showMenu(cx, cy, c.name || titleOf(c), [
       ...(textOp(c) ? [{ icon: "↑", text: "运行（加工文本）", run: () => run(c) }] : []),
-      { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
+      renameItem,
       { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
       { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
       ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
@@ -3320,7 +3331,7 @@ function cardMenu(cx, cy, c) {
       ...(a ? [{ icon: "⛶", text: VIEW_WORD[a.kind] || "查看大图", run: () => openAsset(a) }] : []),
       ...(a ? [{ icon: "⬇", text: `下载${KIND_ZH[a.kind] || "文件"}`, run: () => downloadOut(a) }] : []),
       { icon: "📁", text: "选择 / 换文件", run: () => pickAsset(c) },
-      { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
+      renameItem,
       { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
       { icon: "⎘", text: "复制，等下粘贴（Ctrl+C）", run: () => copyCard(c) },
       ...(c.w || c.h ? [{ icon: "⤡", text: "恢复默认大小", run: () => resetSize(c) }] : []),
@@ -3337,7 +3348,7 @@ function cardMenu(cx, cy, c) {
   showMenu(cx, cy, c.name || (cap ? cap.name : "节点"), [
     ...(out ? [{ icon: "⛶", text: vword, run: () => openViewer(c) }] : []),
     ...(out ? [{ icon: "⬇", text: dlWord, run: () => outs.forEach(o => downloadOut(o)) }] : []),
-    { icon: "✎", text: "重命名节点", run: () => renameCard(c) },
+    renameItem,
     { icon: "↑", text: "运行", run: () => run(c) },
     { icon: "⧉", text: "就地复制一张", run: () => cloneCard(c) },
     // Ctrl+C 是"拿在手上、想粘哪儿粘哪儿"，跟就地复制不是一件事，两条都留
@@ -3366,44 +3377,84 @@ function resetSize(c) {
 }
 
 function renameCard(c) {
-  if (!requireOperate()) return;
+  if (!c || !requireOperate()) return;
+  if (selIds.size > 1 && selIds.has(c.id)) {
+    const cards = PROJ.cards.filter(card => selIds.has(card.id))
+      .sort((a, b) => a.y - b.y || a.x - b.x);
+    if (cards.length > 1) return openRenameDialog(cards);
+  }
   const cap = capOf(c);
-  const oldName = titleOf(c);
   const n = prompt("节点名字（留空恢复成工作流名）", c.name || (cap ? cap.name : ""));
-  if (n === null) return;
-  const newName = n.trim().slice(0, 40) || null;
+  if (n !== null) applyCardNames([{card:c, name:n}]);
+}
 
-  // 旧名改新名：遍历所有节点的提示词，把 @旧名 替换成 @新名
-  if (oldName !== titleOf({ ...c, name: newName })) {
-    const oldTag = `@${oldName}`;
-    const newTag = newName ? `@${newName}` : `@${cap ? cap.name : ""}`;
-    const re = new RegExp(`@${oldName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\u4e00-\\u9fa5\\w])`, 'g');
+function openRenameDialog(cards) {
+  const project = PROJ;
+  const dialog = document.createElement("dialog");
+  dialog.className = "auth-dialog rename-dialog";
+  const form = document.createElement("form");
+  const title = document.createElement("h2");
+  title.id = "rename-heading"; title.textContent = `批量重命名（${cards.length} 个节点）`;
+  dialog.setAttribute("aria-labelledby", title.id);
+  const note = document.createElement("p"); note.className = "auth-note";
+  note.textContent = "按画布从上到下、从左到右排列。一次填好各节点名称后统一确认；留空恢复默认名称。";
+  const list = document.createElement("div"); list.className = "rename-list";
+  const fields = cards.map((card, index) => {
+    const label = document.createElement("label"); label.className = "fld";
+    const text = document.createElement("span"); text.textContent = `${index + 1}. ${titleOf(card)}`;
+    const input = document.createElement("input");
+    input.type = "text"; input.maxLength = 40; input.value = titleOf(card);
+    input.placeholder = titleOf({...card, name:null});
+    label.append(text, input); list.appendChild(label);
+    return {card, input};
+  });
+  const footer = document.createElement("footer");
+  const cancel = document.createElement("button");
+  cancel.type = "button"; cancel.className = "btn"; cancel.textContent = "取消";
+  const submit = document.createElement("button");
+  submit.type = "submit"; submit.className = "btn primary"; submit.textContent = "确认重命名";
+  footer.append(cancel, submit); form.append(title, note, list, footer); dialog.appendChild(form);
+  cancel.onclick = () => dialog.close();
+  dialog.addEventListener("close", () => dialog.remove());
+  // 弹窗内的 Delete / Esc 不应触发画布删除或清空框选。
+  dialog.addEventListener("keydown", event => event.stopPropagation());
+  form.onsubmit = event => {
+    event.preventDefault();
+    if (PROJ === project && requireOperate()) {
+      applyCardNames(fields.map(({card, input}) => ({card, name:input.value})));
+    }
+    dialog.close();
+  };
+  document.body.appendChild(dialog); dialog.showModal();
+  fields[0].input.focus(); fields[0].input.select();
+}
 
+function applyCardNames(entries) {
+  const changes = entries.map(({card, name}) => ({card, name:name.trim().slice(0, 40) || null}))
+    .filter(({card, name}) => PROJ.cards.includes(card) && name !== (card.name || null)
+      && !(name && name === titleOf(card)));
+  if (!changes.length) return;
+  const tags = new Map();
+  for (const {card, name} of changes) {
+    const oldName = titleOf(card), newName = titleOf({...card, name});
+    if (oldName !== newName) tags.set(`@${oldName}`, `@${newName}`);
+  }
+  if (tags.size) {
+    const names = [...tags.keys()].sort((a, b) => b.length - a.length)
+      .map(tag => tag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+    const re = new RegExp(`(?:${names.join('|')})(?![\\u4e00-\\u9fa5\\w])`, 'g');
+    // 同一遍替换所有引用，避免 A→B、B→C 时把 A 的引用连着改成 C。
     for (const card of PROJ.cards) {
-      const pcap = capOf(card);
-      if (!pcap) continue;
-      const specs = promptSpecs(pcap);
-      for (const s of specs) {
-        const v = card.params[s.key];
-        if (typeof v === 'string' && v.includes(oldTag)) {
-          card.params[s.key] = v.replace(re, newTag);
-        }
+      for (const spec of promptSpecs(capOf(card))) {
+        const value = card.params?.[spec.key];
+        if (typeof value === "string") card.params[spec.key] = value.replace(re, tag => tags.get(tag));
       }
-      // 优化后的词也要替换
-      if (card.opt) {
-        for (const key in card.opt) {
-          if (typeof card.opt[key] === 'string' && card.opt[key].includes(oldTag)) {
-            card.opt[key] = card.opt[key].replace(re, newTag);
-          }
-        }
+      for (const key in (card.opt || {})) {
+        if (typeof card.opt[key] === "string") card.opt[key] = card.opt[key].replace(re, tag => tags.get(tag));
       }
     }
   }
-
-  c.name = newName;
-  paintTitle(c);
-  // 重命名可能影响其他节点的面板显示（提示词里的 @标签文字变了），
-  // 如果当前打开的面板里有引用这个节点，需要刷新
+  for (const {card, name} of changes) { card.name = name; paintTitle(card); }
   if (selId) repanel(selId);
   save();
 }

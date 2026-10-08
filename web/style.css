@@ -237,7 +237,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   position: absolute; border: 1.5px dashed var(--acc); border-radius: 8px;
   pointer-events: none; box-shadow: 0 0 16px #00e5ff1c;
 }
-/* 框选后浮在包围盒上方的小工具条（目前只有「打组」） */
+/* 框选后浮在包围盒上方的小工具条（打组 / 批量重命名） */
 #selbar {
   position: absolute; z-index: 16; display: flex; gap: 4px; padding: 4px;
   background: #080c17f5; border: 1px solid var(--acc); border-radius: 4px;
@@ -1583,6 +1583,10 @@ body.project-readonly #world { cursor: default; }
 
 /* ================= 账号 / 登录 / 权限页（组件样式由 auth.js 注入） ================= */
 body.auth-page { display: block; overflow: auto; }
+
+.auth-dialog.rename-dialog { width: min(600px, 94vw); }
+.rename-dialog .rename-list { display: grid; gap: 12px; max-height: 50vh; overflow: auto; padding: 2px; }
+.rename-dialog .fld > span { overflow-wrap: anywhere; }
 
 .auth-dialog.project-share-dialog { width: min(720px, 94vw); }
 .project-share-dialog .share-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; min-height: 180px; }
