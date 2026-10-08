@@ -7,7 +7,6 @@ const CW = 268;            // 节点默认宽度，与 style.css 保持一致
 const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
 const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
-const IS_MAC = /Mac/.test(navigator.platform || navigator.userAgent || "");
 const EDITOR_TARGET = new URLSearchParams(location.search);
 const NODE_EDITOR = EDITOR_TARGET.get("editor") === "1";
 const EDITOR_PROJECT = EDITOR_TARGET.get("project"), EDITOR_CARD = EDITOR_TARGET.get("card");
@@ -1980,14 +1979,15 @@ function buildCard(c) {
     // 是画面，按下去却纹丝不动，每次挪节点都得回去瞄那一条。反过来列例外更省事（NODRAG）
     if (ev.button === 0 && !ev.target.closest(NODRAG)) return startDrag(ev, c, d);
     ev.stopPropagation();     // 右键别漏到画布上去
-    if (!(ev.button === 2 && selIds.size > 1 && selIds.has(c.id))) pick(c.id);
+    if (ev.button === 2 && selIds.has(c.id) && PROJ.cards.filter(card => selIds.has(card.id)).length > 1) return;
+    pick(c.id);
   };
   d.oncontextmenu = (ev) => {
     ev.stopPropagation();
     ev.preventDefault();
     tipHide();
-    if (!(selIds.size > 1 && selIds.has(c.id))) pick(c.id);
-    cardMenu(ev.clientX, ev.clientY, c);
+    if (selIds.has(c.id) && selectionMenu(ev.clientX, ev.clientY)) return;
+    pick(c.id); cardMenu(ev.clientX, ev.clientY, c);
   };
   d.ondblclick = (ev) => {
     const body = ev.target.closest(".body");
@@ -2555,6 +2555,54 @@ function bboxOf(ids) {
   return x1 === Infinity ? null : { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
 }
 
+/** 按操作前的边界排列选中节点，使用实际尺寸，保证选中节点之间留出间距。 */
+function alignSelectedCards(mode) {
+  if (!PROJ || !requireOperate()) return;
+  if (!["left", "right", "top", "bottom", "center"].includes(mode)) return;
+  const items = PROJ.cards.filter(c => selIds.has(c.id)).map(c => ({ c, ...cardRect(c) }));
+  if (items.length < 2) return;
+  const left = Math.min(...items.map(r => r.x)), top = Math.min(...items.map(r => r.y));
+  const right = Math.max(...items.map(r => r.x + r.w)), bottom = Math.max(...items.map(r => r.y + r.h));
+  const column = mode === "left" || mode === "right" || mode === "center";
+  // 稳定排序：完全同位置时保留项目中的原节点顺序。
+  items.sort((a, b) => column ? a.y - b.y || a.x - b.x : a.x - b.x || a.y - b.y);
+  let cursor = column ? top : left;
+  const positions = items.map(r => {
+    const x = column ? (mode === "left" ? left : mode === "right" ? right - r.w : (left + right - r.w) / 2) : cursor;
+    const y = column ? cursor : (mode === "top" ? top : bottom - r.h);
+    cursor += (column ? r.h : r.w) + 24;
+    return { ...r, nx: x, ny: y };
+  });
+  if (!positions.some(r => Math.abs(r.nx - r.x) > 1e-7 || Math.abs(r.ny - r.y) > 1e-7)) return;
+  for (const { c, nx, ny } of positions) {
+    c.x = nx; c.y = ny;
+    if (c._el) { c._el.style.left = nx + "px"; c._el.style.top = ny + "px"; }
+  }
+  drawWires(); placePanel(); updateMinimap(); save();
+}
+
+function selectionMenu(cx, cy) {
+  if (!canOperate() || !PROJ) return false;
+  const cards = PROJ.cards.filter(c => selIds.has(c.id));
+  if (cards.length < 2) return false;
+  const project = PROJ;
+  const items = [
+    ["left", "左对齐"], ["right", "右对齐"], ["top", "顶部对齐"],
+    ["bottom", "底部对齐"], ["center", "垂直居中对齐"],
+  ].map(([mode, text]) => ({ text, run: () => {
+    if (PROJ === project) alignSelectedCards(mode);
+  } }));
+  showMenu(cx, cy, "选中节点", [
+    { text: "对齐方式", children: items },
+    { text: `批量重命名（${cards.length} 个节点）`, run: () => {
+      if (PROJ !== project || !canOperate()) return;
+      const selected = PROJ.cards.filter(c => selIds.has(c.id));
+      if (selected.length > 1) renameCard(selected[0]);
+    } },
+  ]);
+  return true;
+}
+
 /** 框选状态：选中节点外圈的青色虚线框 + 上方的小工具条（≥2 张才有工具条）。 */
 function paintSel() {
   if (!el.groups) return;
@@ -2631,7 +2679,7 @@ function renameGroup(g) {
 }
 
 /** 按住一起拖动几个节点：单节点拖动、框选多张后拖、拖分组框，全走这里。 */
-function beginCardsMove(ev, cards) {
+function beginCardsMove(ev, cards, onClick) {
   if (!canOperate()) return;
   if (ev.button !== 0 || !cards.length) return;
   ev.stopPropagation(); ev.preventDefault();
@@ -2654,6 +2702,7 @@ function beginCardsMove(ev, cards) {
   const up = () => {
     document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
     if (moved) { placePanel(); save(); }
+    else if (onClick) onClick();
   };
   document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
 }
@@ -2721,7 +2770,8 @@ function startDrag(ev, c, d) {
   // 谁跟着这个节点一起动：先看框选（拖选中里的一张 = 整个选择动），
   // 没框选就看分组（组里的节点拖一张 = 整组动；同时在几个组里就全跟着），
   // 都没有才单张
-  let ids = (selIds.size > 1 && selIds.has(c.id)) ? [...selIds] : null;
+  const keepSelection = selIds.has(c.id) && PROJ.cards.filter(card => selIds.has(card.id)).length > 1;
+  let ids = keepSelection ? [...selIds] : null;
   if (!ids) {
     const union = new Set();
     for (const g of (PROJ.groups || [])) {
@@ -2729,8 +2779,10 @@ function startDrag(ev, c, d) {
     }
     if (union.size > 1) ids = [...union];
   }
-  pick(c.id);
-  beginCardsMove(ev, ids ? ids.map(cardOf).filter(Boolean) : [c]);
+  if (!keepSelection) pick(c.id);
+  else closeMenu();
+  // 真正拖动保留多选；只点击未拖动仍回到单选，保留单节点编辑入口。
+  beginCardsMove(ev, ids ? ids.map(cardOf).filter(Boolean) : [c], keepSelection ? () => pick(c.id) : undefined);
 }
 
 /** 拖角改大小。dir=1 是右下角（左上角钉住），dir=-1 是左上角（右下角钉住，
@@ -2771,7 +2823,7 @@ function startResize(ev, c, d, dir) {
 }
 
 function startWire(ev, c) {
-  if (!requireOperate()) return;
+  if (ev.button !== 0 || !requireOperate()) return;
   ev.stopPropagation(); ev.preventDefault();
   tipHide();
   const a = cardBox(c.id);
@@ -2866,10 +2918,9 @@ function bindGlobal() {
     // 按钮执行时手里就没节点了 —— 这就是打组点了没反应的原因
     // 参数面板也同理：点面板上的按钮不能关掉面板
     if (ev.target.closest("#selbar") || ev.target.closest("#panel")) return;
-    // 中键始终拖画布。macOS 的“三指拖移”会被浏览器报告成左键拖动，无法取得
-    // 实际触控点数量，因此在 Mac 空白画布上把普通左拖用于平移；Shift+左拖仍可框选。
-    if (ev.button === 1 || (IS_MAC && ev.button === 0 && !ev.shiftKey)) {
-      ev.preventDefault();          // 掐掉中键自动滚动及 macOS 合成拖拽的默认行为
+    // 中键拖画布；所有平台的普通左键拖动统一用于框选。
+    if (ev.button === 1) {
+      ev.preventDefault();          // 掐掉中键自动滚动
       const s = { mx: ev.clientX, my: ev.clientY, x: view.x, y: view.y };
       el.stage.classList.add("panning");
       let moved = false;
@@ -2888,7 +2939,8 @@ function bindGlobal() {
       return;
     }
     if (ev.button !== 0) return;
-    // 左键点空白：清掉选中；拖动框选节点（Mac 上需按住 Shift）
+    // 左键点空白：清掉选中；拖动框选节点。
+    ev.preventDefault();
     closeMenu(); closeJobs();
     selId = null; closePanel();
     if (selEdge) { selEdge = null; drawWires(); }
@@ -2923,7 +2975,7 @@ function bindGlobal() {
         pick(id);
       } else {
         paintSel();
-        if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · Delete 全删 · 上方按钮打组 / 批量重命名`);
+        if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · 右键排列对齐 · Delete 全删 · 上方按钮打组 / 批量重命名`);
       }
     };
     document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
@@ -2945,8 +2997,9 @@ function bindGlobal() {
   // 空白处右键：新建节点、上传、粘贴
   el.stage.addEventListener("contextmenu", (ev) => {
     ev.preventDefault();
-    if (NODE_EDITOR || !canOperate() || ev.target.closest(".card")) return;
+    if (NODE_EDITOR || !canOperate() || ev.target.closest(".card, #panel, #selbar, #dock, #respop")) return;
     tipHide();
+    if (selectionMenu(ev.clientX, ev.clientY)) return;
     const at = toWorld(ev.clientX, ev.clientY);
     const menu = [];
 
@@ -3043,15 +3096,33 @@ function bindGlobal() {
     }
   });
 
-  // 拖拽文件到画布 → 自动上传并建素材节点（落在鼠标位置）
+  // 拖拽文件到画布 → 自动上传并建素材节点（落在鼠标位置）；历史产物使用专用拖拽类型。
   el.stage.addEventListener("dragover", (ev) => {
-    if (NODE_EDITOR || !PROJ) return;
+    if (NODE_EDITOR || !canOperate()) return;
     ev.preventDefault();
     ev.dataTransfer.dropEffect = "copy";
   });
   el.stage.addEventListener("drop", async (ev) => {
     if (NODE_EDITOR || !canOperate()) return;
     ev.preventDefault();
+    if ([...(ev.dataTransfer?.types || [])].includes(HISTORY_ASSET_DRAG)) {
+      ev.stopPropagation();
+      const drag = historyAssetDrag;
+      historyAssetDrag = null;
+      if (!drag || PROJ !== drag.project || ev.dataTransfer.getData(HISTORY_ASSET_DRAG) !== drag.token) return;
+      const at = toWorld(ev.clientX, ev.clientY);
+      try {
+        const item = await importOutput(drag.output);
+        if (PROJ !== drag.project || !canOperate()) return;
+        const card = addCard("card_asset", Math.round(at.x - 134), Math.round(at.y - 84));
+        if (!card) return;
+        await setAssetItem(card, item);
+        toast(`已建素材节点：${item.origin || drag.output.filename || "历史产物"}`);
+      } catch (error) {
+        if (PROJ === drag.project) toast("导入历史产物失败：" + error.message);
+      }
+      return;
+    }
     const files = [...(ev.dataTransfer?.files || [])];
     if (!files.length) return;
     // 只处理图片/视频/音频，其他类型忽略
@@ -3180,7 +3251,7 @@ function bindGlobal() {
 }
 
 /* ================= 右键菜单 ================= */
-/** items: [{icon, text, danger, run}]，{group:"…"} 是一行分类小标题 */
+/** items: [{icon, text, danger, run, children}]，children 为二级菜单，{group:"…"} 为分类小标题。 */
 function showMenu(cx, cy, title, items) {
   el.menu.innerHTML = "";
   const hd = document.createElement("div"); hd.className = "hd";
@@ -3196,9 +3267,48 @@ function showMenu(cx, cy, title, items) {
     const i = document.createElement("span"); i.textContent = it.icon || "▸";
     const t = document.createElement("span"); t.textContent = it.text;
     b.append(i, t);
-    b.onclick = () => { closeMenu(); tipHide(); it.run(); };
+    const hideSubmenu = () => {
+      el.menu.querySelectorAll(".menu-submenu").forEach(menu => menu.style.display = "none");
+      el.menu.querySelectorAll('[aria-haspopup="menu"]').forEach(button => button.setAttribute("aria-expanded", "false"));
+    };
+    if (it.children) {
+      const arrow = document.createElement("span"); arrow.className = "submenu-arrow"; arrow.textContent = "›";
+      arrow.setAttribute("aria-hidden", "true"); b.appendChild(arrow);
+      b.setAttribute("aria-label", it.text);
+      b.setAttribute("aria-haspopup", "menu"); b.setAttribute("aria-expanded", "false");
+      const submenu = document.createElement("div"); submenu.className = "menu-submenu";
+      submenu.style.display = "none"; submenu.setAttribute("aria-label", it.text);
+      for (const child of it.children) {
+        const button = document.createElement("button");
+        const icon = document.createElement("span"); icon.textContent = child.icon || "▸";
+        const text = document.createElement("span"); text.textContent = child.text;
+        button.append(icon, text);
+        button.onclick = () => { closeMenu(); tipHide(); child.run(); };
+        submenu.appendChild(button);
+      }
+      const openSubmenu = () => {
+        hideSubmenu(); submenu.style.display = ""; b.setAttribute("aria-expanded", "true");
+        const parent = el.menu.getBoundingClientRect(), anchor = b.getBoundingClientRect();
+        const width = submenu.offsetWidth, height = submenu.offsetHeight;
+        // 子菜单与主菜单紧邻，右侧空间不足时改向左展开。
+        const x = parent.right + width > innerWidth - 8 ? parent.left - width + 1 : parent.right - 1;
+        submenu.style.left = Math.max(8, x) - parent.left - el.menu.clientLeft + "px";
+        submenu.style.top = Math.max(8, Math.min(anchor.top, innerHeight - height - 8)) - parent.top - el.menu.clientTop + "px";
+      };
+      b.onmouseenter = openSubmenu; b.onclick = openSubmenu;
+      b.onkeydown = ev => {
+        if (ev.key === "ArrowRight") { ev.preventDefault(); openSubmenu(); submenu.querySelector("button").focus(); }
+      };
+      submenu.onkeydown = ev => {
+        if (ev.key === "ArrowLeft") { ev.preventDefault(); hideSubmenu(); b.focus(); }
+      };
+      el.menu.append(b, submenu);
+    } else {
+      b.onmouseenter = hideSubmenu;
+      b.onclick = () => { closeMenu(); tipHide(); it.run(); };
+      el.menu.appendChild(b);
+    }
     if (it.tip) hoverTip(b, it.tip);
-    el.menu.appendChild(b);
   }
   el.menu.style.display = "";
   el.menu.style.left = Math.min(cx, innerWidth - el.menu.offsetWidth - 8) + "px";
@@ -4081,12 +4191,15 @@ async function spawnDownstream(from, at, cx, cy) {
 
 /** 把 ComfyUI 输出目录里的产物搬进 input 目录，得到可用的 LoadImage 值 */
 async function importOutput(out) {
+  const project = PROJ;
   if (!canOperate()) throw new Error('此画布只读，不能导入素材');
   // 二进制产物不走 JSON 包装，但必须带同源会话并明确检查响应。
   const download = await fetch(new URL(out.url, location.href), {credentials:'same-origin'});
   if (!download.ok) throw new Error(`读取产物失败（${download.status}）`);
   const blob = await download.blob();
-  const file = new File([blob], out.filename.split(/[\\/]/).pop(), {type:blob.type});
+  if (PROJ !== project || !canOperate()) throw new Error('画布已切换或权限已变化，导入已取消');
+  const filename = out.filename || new URL(out.url, location.href).pathname.split('/').pop() || '历史产物';
+  const file = new File([blob], filename.split(/[\\/]/).pop(), {type:blob.type});
   return uploadAsset(file);
 }
 
@@ -4261,6 +4374,9 @@ async function copyHistoryText(value, message) {
   }
 }
 
+const HISTORY_ASSET_DRAG = "application/x-chouka-history-output";
+let historyAssetDrag = null;
+
 function histRun(c, h, cur) {
   const outs = h.outputs || [];
   const box = document.createElement("div");
@@ -4284,7 +4400,30 @@ function histRun(c, h, cur) {
       ? `<div class="rg-a" data-i="${i}" title="${o.filename}">🎵</div>`
       : `<img src="${o.url}" data-i="${i}" alt="" draggable="false">`).join("");
   prepareVideos(rg);
+  for (const thumb of rg.querySelectorAll("[data-i]")) {
+    thumb.draggable = true;
+    thumb.title = "单击放大查看；拖到画布创建素材节点";
+  }
+  let dragged = false;
+  rg.ondragstart = (ev) => {
+    const thumb = ev.target.closest("[data-i]");
+    const output = thumb && outs[+thumb.dataset.i];
+    if (!canOperate() || !output || !["image", "video", "audio"].includes(output.kind)) {
+      ev.preventDefault(); return;
+    }
+    dragged = true;
+    historyAssetDrag = { token: uid(), project: PROJ, output: { ...output } };
+    // 清除浏览器给图片附带的默认文件/链接数据，仅使用内部拖拽协议。
+    ev.dataTransfer.items.clear();
+    ev.dataTransfer.effectAllowed = "copy";
+    ev.dataTransfer.setData(HISTORY_ASSET_DRAG, historyAssetDrag.token);
+  };
+  rg.ondragend = () => {
+    historyAssetDrag = null;
+    setTimeout(() => { dragged = false; }, 0);
+  };
   rg.onclick = (ev) => {
+    if (dragged) return;
     const t = ev.target.closest("[data-i]");
     if (t) openViewer(c, +t.dataset.i, outs, h.seed);
   };
