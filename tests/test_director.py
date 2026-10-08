@@ -177,6 +177,11 @@ class DirectorApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture
                 self.assertEqual(response.status, 302)
                 self.assertEqual(response.headers["Location"], "/login")
 
+    async def test_cards_advertises_linked_director_schema(self):
+        response = await self.client.get("/api/cards")
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())["director_schema"], 1)
+
     async def test_first_empty_save_round_trips_and_updates_listing(self):
         self.seed_project(updated=1)
         response = await self.save(director())

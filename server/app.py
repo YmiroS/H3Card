@@ -849,6 +849,7 @@ async def api_cards(request):
         "capabilities": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
                          for k, v in CAPS.items()},
         "comfy_online": controller_comfy_online(request.app),
+        "director_schema": 1,
     })
 
 
