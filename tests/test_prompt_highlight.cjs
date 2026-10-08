@@ -1,4 +1,4 @@
-// Requires Playwright and its Chromium browser; run node --test tests/test_prompt_highlight.cjs.
+// 需要 Playwright；可用 CHOUKA_TEST_BROWSER 指定浏览器，执行 node --test tests/test_prompt_highlight.cjs。
 const { test } = require('node:test');
 const assert = require('node:assert/strict');
 const { readFileSync } = require('node:fs');
@@ -30,36 +30,53 @@ test('prompt text has only one visible layer across variants, editing and scroll
     const transparent = element => getComputedStyle(element).color === 'rgba(0, 0, 0, 0)';
     const longText = ('The ambient sound of a quiet convenience store plays, featuring the low, steady hum of refrigeration units and a distant automatic sliding door. ').repeat(12);
     const card = {id:'test', params:{prompt:spec.default}, opt:{prompt:longText}, optUse:{prompt:true}};
-    async function verify(label, expectedLayerColor) {
+    async function verify(label, optimized, expectedColor) {
       await pause();
       const ta = fixture.querySelector('textarea');
       const layer = fixture.querySelector('.prompt-highlight-layer');
-      check(transparent(ta), label + ': native textarea text must stay transparent');
-      check(!transparent(layer), label + ': highlight text must remain visible');
-      if (expectedLayerColor) check(getComputedStyle(layer).color === expectedLayerColor, label + ': theme color lost');
+      const layerStyle = getComputedStyle(layer);
+      const layerVisible = layerStyle.display !== 'none' && layerStyle.visibility !== 'hidden' && !transparent(layer);
+      check(ta.getClientRects().length > 0 && getComputedStyle(ta).visibility !== 'hidden', label + ': textarea must remain displayed');
+      // 原词由镜像层显示 @标签；优化词由原生文本框显示，隐藏的镜像层不应参与可见性断言。
+      check(optimized ? !transparent(ta) && !layerVisible : transparent(ta) && layerVisible, label + ': exactly the intended text layer must be visible');
+      if (optimized) check(layerStyle.display === 'none', label + ': optimized mirror must be hidden');
+      if (expectedColor) check(getComputedStyle(optimized ? ta : layer).color === expectedColor, label + ': visible text color lost');
       check(layer.textContent === ta.value + '\\n', label + ': highlight content differs');
-      check(getComputedStyle(layer).lineHeight === getComputedStyle(ta).lineHeight, label + ': line height differs');
+      check(layerStyle.lineHeight === getComputedStyle(ta).lineHeight, label + ': line height differs');
       return {ta, layer};
     }
     (async () => {
       repanel(card);
-      let {ta, layer} = await verify('optimized', 'rgb(219, 234, 254)');
+      let {ta, layer} = await verify('optimized', true, 'rgb(205, 238, 245)');
+      check(ta.value === longText, 'optimized text content differs');
       ta.focus();
-      await verify('focused optimized');
+      await verify('focused optimized', true);
       ta.scrollTop = ta.scrollHeight;
       ta.dispatchEvent(new Event('scroll'));
-      check(ta.scrollTop > 0 && layer.scrollTop === ta.scrollTop, 'scroll must stay synchronized');
+      check(ta.scrollTop > 0, 'optimized native text must scroll');
+      await verify('scrolled optimized', true);
       document.getElementById('panel').style.width = '420px';
-      await verify('resized optimized');
-      fixture.querySelector('.opttabs button').click();
-      ({ta, layer} = await verify('original example', 'rgb(253, 230, 138)'));
-      ta.value = 'Edited prompt @image';
+      await verify('resized optimized', true);
+      ta.value = 'Edited optimized prompt ' + longText;
       ta.dispatchEvent(new Event('input'));
-      await verify('edited original');
+      await verify('edited optimized', true);
+      check(card.opt.prompt === ta.value && card.params.prompt === spec.default, 'optimized editing must not overwrite original text');
+      fixture.querySelector('.opttabs button').click();
+      ({ta, layer} = await verify('original example', false, 'rgb(253, 230, 138)'));
+      ta.value = ('Edited prompt @image ' + longText).trim();
+      ta.dispatchEvent(new Event('input'));
+      await verify('edited original', false);
       check(card.params.prompt === ta.value, 'editing must save the original prompt');
       check(layer.querySelector('.at-mention').textContent === '@image', 'mention highlight lost');
+      ta.scrollTop = ta.scrollHeight;
+      ta.dispatchEvent(new Event('scroll'));
+      check(ta.scrollTop > 0 && layer.scrollTop === ta.scrollTop, 'original mirror scroll must stay synchronized');
+      await verify('scrolled original', false);
+      document.getElementById('panel').style.width = '760px';
+      await verify('resized original', false);
       fixture.querySelectorAll('.opttabs button')[1].click();
-      await verify('switched back to optimized');
+      ({ta} = await verify('switched back to optimized', true));
+      check(ta.value === card.opt.prompt, 'switching tabs must retain optimized edits');
       document.getElementById('result').textContent = 'PASS';
     })().catch(error => { document.getElementById('result').textContent = 'FAIL: ' + error.message; });
     </script>`;
@@ -70,7 +87,7 @@ test('prompt text has only one visible layer across variants, editing and scroll
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
   try {
-    browser = await chromium.launch();
+    browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
     const page = await browser.newPage();
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
