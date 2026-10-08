@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>导演工作台 · Chouka</title>
+<link rel="icon" href="/favicon.png">
+<link rel="stylesheet" href="/director.css">
+</head>
+<body>
+<aside class="sidebar">
+  <a class="brand" href="/"><img src="/icon.png" alt=""><span>Chouka<small>DIRECTOR STUDIO</small></span></a>
+  <div class="workspace-label">创作空间</div>
+  <select id="projects" aria-label="选择导演项目"><option value="">选择项目</option></select>
+  <button id="new-project" class="new-project">＋ 新建导演项目</button>
+  <nav aria-label="制作流程">
+    <button data-stage="script"><span>01</span>故事与剧本<small>构建你的叙事</small></button>
+    <button data-stage="image" class="active"><span>02</span>镜头与分镜<small>让故事变成画面</small></button>
+    <button data-stage="video"><span>03</span>视频制作<small>让每个镜头动起来</small></button>
+    <button data-stage="review"><span>04</span>顺序预览<small>检查镜头与节奏</small></button>
+  </nav>
+  <div class="sidebar-foot"><span class="live-dot"></span><span id="connection">正在连接生成服务</span><a href="/">返回创作画布 ↗</a></div>
+</aside>
+<div class="workspace">
+  <header>
+    <div class="breadcrumb">导演工作台 <span>/</span> <b id="project-name">未打开项目</b></div>
+    <div class="header-actions"><span id="save-status" role="status">先创建一个故事</span><button id="save" class="button">保存</button><button id="export" class="button">导出方案</button><div id="account" class="account-bar"></div></div>
+  </header>
+  <main>
+    <section class="stage-heading"><div><div class="eyebrow">YOUR STORY, SHOT BY SHOT</div><h1 id="stage-title">镜头与分镜</h1><p id="stage-subtitle">用镜头组织故事，用参考图建立画面，再交给模型生成。</p></div><div class="heading-actions"><span id="summary" class="summary">0 个镜头</span><button id="preview" class="button">顺序预览</button><button id="import-canvas" class="button">从画布加入</button><button id="add-shot" class="button primary">＋ 添加镜头</button></div></section>
+    <div id="readonly" class="notice" hidden>此项目只读，可查看剧本、镜头和生成结果。</div>
+    <div id="conflict" class="notice warning" hidden>其他页面已修改此导演项目。你的编辑仍保留在本页，请先导出方案，再重新加载。<button id="reload-project" class="button">重新加载</button></div>
+    <section id="welcome" class="welcome"><div class="welcome-mark">D</div><div class="eyebrow">FROM IDEA TO MOTION</div><h2>每一个故事，从第一个镜头开始。</h2><p>写下剧本，编排分镜，生成视频。<br>不用摆放节点，也能逐镜头完成你的创作。</p><div><button id="welcome-new" class="button primary">创建我的故事</button><button id="demo" class="button">看看示例方案</button></div><small>示例只有剧本与镜头描述，不会自动提交生成任务。</small></section>
+    <section id="script-stage" class="script-stage" hidden><div class="section-card"><div class="section-heading"><h2>故事与剧本</h2><span>创作意图、场景、对白与叙事节奏</span></div><textarea id="script" placeholder="写下你的故事。可以从一句话开始，也可以粘贴完整剧本……" aria-label="故事与剧本"></textarea></div><div class="section-card"><div class="section-heading"><h2>统一画面风格</h2><span>作为补充加入每个镜头的画面提示词</span></div><textarea id="style" placeholder="例如：写实电影质感，低饱和色彩，柔和侧光，保持同一人物服装与场景设定。" aria-label="统一画面风格"></textarea><p class="muted">风格文字会随提示词提交，但不保证模型自动保持角色一致性。首版请手动编排镜头。</p></div></section>
+    <section id="shot-stage" class="shot-stage" hidden><div class="shots-column"><div class="section-heading"><h2 id="list-title">分镜清单</h2><span>拖动镜头调整顺序</span></div><div id="shots" class="shot-grid"></div></div><aside id="inspector" class="inspector" aria-label="镜头详情"></aside></section>
+    <section id="review-stage" class="review-stage" hidden><div class="notice">这里按镜头顺序预览已采用的视频，不会合并或导出成片。没有视频的镜头仍保留在清单中。</div><div id="review-list"></div></section>
+  </main>
+  <footer><span>DIRECTOR WORKSPACE · 首版</span><span>剧本 → 分镜 → 镜头视频 → 顺序预览</span></footer>
+</div>
+<dialog id="create-dialog"><form id="create-form"><div class="eyebrow">A NEW STORY</div><h2>新建导演项目</h2><label>项目名称<input id="create-name" required maxlength="40" placeholder="为你的故事起个名字" autocomplete="off"></label><p id="create-error" role="alert"></p><div class="dialog-actions"><button type="button" id="create-cancel" class="button">取消</button><button type="submit" class="button primary">创建项目</button></div></form></dialog>
+<dialog id="preview-dialog"><div class="preview-top"><h2 id="preview-title"></h2><button id="preview-close" class="button">关闭</button></div><div id="preview-media"></div><div class="dialog-actions"><button id="preview-prev" class="button">上一镜头</button><button id="preview-next" class="button primary">下一镜头</button></div></dialog>
+<dialog id="import-dialog"><h2>从画布加入</h2><p class="muted">关联现有生成节点，不复制、不移动节点；只有明确加入的节点才会成为导演镜头。</p><div id="import-list"></div><div class="dialog-actions"><button id="import-cancel" class="button">取消</button><button id="import-confirm" class="button primary">加入导演台</button></div></dialog>
+<dialog id="node-dialog"><div class="preview-top"><h2 id="node-title">节点参数</h2><div class="node-actions"><button id="node-discard" class="button danger" hidden>不保存并关闭</button><button id="node-close" class="button">保存并关闭</button></div></div><iframe id="node-frame" title="画布节点参数与生成面板" src="about:blank"></iframe></dialog>
+<div id="toast" role="status" hidden></div>
+<script src="/auth.js"></script>
+<script src="/director.js"></script>
+</body>
+</html>
