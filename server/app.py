@@ -42,6 +42,7 @@ import rewrite as rw
 import llm
 import translate as tr
 from costs import CostLedger
+from capacity import make_spec, export_csv
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     can_run_capability,
@@ -1039,16 +1040,26 @@ async def api_generate(request):
             if isinstance(nd, dict) and nd.get("class_type")
         }
         family = model_family(cid)
+        ledger = cost_ledger(request.app)
+        def cached_probe(ref):
+            if ref not in video_metadata:
+                video_metadata[ref] = probe_video(ref)
+            return video_metadata[ref]
+
+        dimensions = await asyncio.to_thread(
+            ledger.dimensions, cid, params, uploaded, graph, cached_probe,
+        ) if ledger else {}
         dispatch_payload = {
             "graph": graph, "assets": uploaded, "capability": cid,
             "model_family": family,
+            "capacity_spec": make_spec(
+                cid, {**params, "output_kind": cap.get("outputType")}, graph, dimensions,
+            ),
         }
         if gpu_policy:
             dispatch_payload["gpu_policy"] = gpu_policy
         distributed_store(request.app).enqueue(pid, dispatch_payload, required_nodes)
-        ledger = cost_ledger(request.app)
         if ledger:
-            cached_probe = lambda ref: video_metadata.get(ref) or probe_video(ref)
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
     save_jobs()
     result = JOBS[pid]
@@ -1467,6 +1478,7 @@ async def api_agent_heartbeat(request):
         local_busy=body.get("local_busy") if "local_busy" in body else None,
         current_job_id=body.get("current_job_id"),
         maintenance=body.get("maintenance") if isinstance(body.get("maintenance"), dict) else None,
+        capacity_released=body.get("capacity_released") is True,
     )
     if result is None:
         raise web.HTTPNotFound(reason="Worker 不存在")
@@ -1526,6 +1538,12 @@ async def api_agent_event(request):
         raise web.HTTPBadRequest(reason="事件 data 必须是 JSON 对象")
     data["prompt_id"] = pid
     event_type = event.get("type")
+    if event_type == "execution_cached":
+        nodes = data.get("nodes")
+        if isinstance(nodes, list):
+            distributed_store(request.app).record_capacity_cache(
+                pid, worker_id, lease_token, nodes[:4096],
+            )
 
     # 新 Worker 在显存清理确认后才补报 /failed；旧 Worker 保留即时终态语义。
     if event_type in ("execution_error", "execution_interrupted"):
@@ -1561,6 +1579,48 @@ async def api_agent_event(request):
     await execution_project(request.app, pid)
     await handle_event(None, event, remote=True, app=request.app)
     return web.json_response({"ok": True})
+
+
+def probe_capacity_output(path):
+    """只探测受控产物文件，不访问网络；缺少探测器时保留未知状态。"""
+    path = Path(path)
+    kind = kind_of(path.name)
+    result = {"kind": kind, "bytes": path.stat().st_size, "valid": False}
+    exe = ffmpeg_bin()
+    if not exe or kind not in {"image", "video", "audio"} or not result["bytes"]:
+        return result
+    command = [
+        str(exe), "-hide_banner", "-nostdin", "-protocol_whitelist", "file,pipe",
+        "-format_whitelist",
+        "mov,matroska,webm,avi,image2,png_pipe,jpeg_pipe,webp_pipe,bmp_pipe,gif,wav,mp3,flac,ogg,aac",
+        "-i", str(path),
+    ]
+    if kind == "audio":
+        command += ["-map", "0:a:0", "-t", "0.1"]
+    else:
+        command += ["-map", "0:v:0", "-frames:v", "1"]
+    try:
+        probed = subprocess.run(command + ["-f", "null", "-"], capture_output=True,
+                                text=True, errors="replace", timeout=8)
+    except (OSError, subprocess.SubprocessError):
+        return result
+    text = probed.stderr or ""
+    duration = DUR_RE.search(text)
+    if duration and kind in {"video", "audio"}:
+        h, m, sec = duration.groups()
+        result["duration"] = int(h) * 3600 + int(m) * 60 + float(sec)
+    video = next((line for line in text.splitlines() if "Video:" in line), "")
+    size = re.search(r"\b([1-9]\d{0,4})x([1-9]\d{0,4})\b", video)
+    if size:
+        result.update(width=int(size.group(1)), height=int(size.group(2)))
+    fps = FPS_RE.search(video)
+    if fps:
+        result["fps"] = float(fps.group(1))
+    result["valid"] = probed.returncode == 0 and (
+        bool(size) if kind == "image" else result.get("duration", 0) > 0
+        and (bool(size) if kind == "video" else True)
+    )
+    return result
 
 
 async def api_agent_artifact(request):
@@ -1599,6 +1659,10 @@ async def api_agent_artifact(request):
         await resource_call(request.app, "publish", "artifact", locator)
     finally:
         temporary.unlink(missing_ok=True)
+    metadata = await asyncio.to_thread(probe_capacity_output, target)
+    store = distributed_store(request.app)
+    with store.lock, store.db:
+        store.capacity.record_artifact(pid, locator, metadata)
     output = {
         "kind": request.query.get("kind") or kind_of(original),
         "filename": original,
@@ -1615,6 +1679,7 @@ async def api_agent_complete(request):
     body = await request.json()
     outputs = body.get("outputs") if isinstance(body.get("outputs"), list) else []
     project = await execution_project(request.app, pid)
+    output_keys = []
     for output in outputs:
         if not isinstance(output, dict):
             raise web.HTTPBadRequest(text="无效产物")
@@ -1624,12 +1689,21 @@ async def api_agent_complete(request):
         row = await resource_call(request.app, "lookup", *ref)
         if not row or row["state"] != "ready":
             raise web.HTTPBadRequest(text="产物尚未可信登记")
+        output_keys.append(ref[1])
     await execution_project(request.app, pid)
     if (JOBS.get(pid) or {}).get("cleanup_pending"):
         raise web.HTTPConflict(reason="正在释放显存，等待 Worker 确认")
     if distributed_store(request.app).dispatch_status(pid) == "cancel_requested":
         raise web.HTTPConflict(text="任务已取消")
-    if not distributed_store(request.app).finish(pid, worker_id, lease_token, "done"):
+    store = distributed_store(request.app)
+    with store.lock:
+        capacity_outputs = store.capacity.artifact_outputs(pid, output_keys)
+    if not store.finish(
+        pid, worker_id, lease_token, "done",
+        capacity_released=body.get("capacity_released") is True,
+        capacity_outputs=capacity_outputs,
+        capacity_measurements=body.get("capacity_measurements"),
+    ):
         raise web.HTTPConflict(reason="任务无法完成")
     ended_at = time.time()
     job = JOBS.get(pid)
@@ -1658,7 +1732,11 @@ async def api_agent_failed(request):
     if not already_terminal:
         if not store.validate_lease(pid, worker_id, lease_token):
             raise web.HTTPConflict(reason="任务租约已失效")
-        if not store.finish(pid, worker_id, lease_token, dispatch_status):
+        if not store.finish(
+            pid, worker_id, lease_token, dispatch_status,
+            capacity_released=body.get("capacity_released") is True,
+            capacity_measurements=body.get("capacity_measurements"),
+        ):
             raise web.HTTPConflict(reason="任务无法结束")
     job = JOBS.get(pid)
     ended_at = (job or {}).get("ended") or time.time()
@@ -2687,6 +2765,121 @@ async def controller_costs(request):
     return web.FileResponse(ROOT / "web" / "costs.html")
 
 
+async def controller_capacity(request):
+    require_admin(request)
+    if not CONTROLLER_MODE:
+        raise web.HTTPNotFound(reason="产能评估只在 controller 模式提供")
+    return web.FileResponse(ROOT / "web" / "capacity.html")
+
+
+def capacity_query(request):
+    try:
+        start = float(request.query["from"]) if request.query.get("from") else None
+        end = float(request.query["to"]) if request.query.get("to") else None
+        limit = int(request.query.get("limit", 100))
+        offset = int(request.query.get("offset", 0))
+    except ValueError:
+        raise web.HTTPBadRequest(text="时间范围、页大小和偏移量必须是数字")
+    if (any(value is not None and (not math.isfinite(value) or value < 0)
+            for value in (start, end))
+            or (start is not None and end is not None and start >= end)
+            or not 1 <= limit <= 200 or offset < 0):
+        raise web.HTTPBadRequest(text="统计时间范围或分页参数无效")
+    return {"start": start, "end": end, "limit": limit, "offset": offset,
+            "worker_id": request.query.get("worker_id") or None,
+            "capability": request.query.get("capability") or None}
+
+
+async def capacity_report(request):
+    require_admin(request)
+    query = capacity_query(request)
+    try:
+        report = await asyncio.to_thread(
+            distributed_store(request.app).capacity.report, **query,
+        )
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    for group in report["groups"]:
+        group["capability_name"] = (CAPS.get(group["capability"]) or {}).get(
+            "name", group["capability"],
+        )
+    return report
+
+
+async def api_capacity(request):
+    return web.json_response(await capacity_report(request))
+
+
+async def api_capacity_export(request):
+    report = await capacity_report(request)
+    content = await asyncio.to_thread(export_csv, report)
+    return web.Response(text=content, content_type="text/csv", charset="utf-8", headers={
+        "Content-Disposition": 'attachment; filename="machine-capacity.csv"',
+        "Cache-Control": "no-store",
+    })
+
+
+async def capacity_body(request):
+    require_admin(request)
+    if request.content_length is not None and request.content_length > 65536:
+        raise web.HTTPRequestEntityTooLarge(max_size=65536, actual_size=request.content_length)
+    try:
+        raw = bytearray()
+        async for chunk in request.content.iter_chunked(8192):
+            raw.extend(chunk)
+            if len(raw) > 65536:
+                raise web.HTTPRequestEntityTooLarge(max_size=65536, actual_size=len(raw))
+        body = json.loads(raw)
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text="请求必须是有效 JSON 对象")
+    if not isinstance(body, dict):
+        raise web.HTTPBadRequest(text="请求必须是 JSON 对象")
+    return body
+
+
+async def api_capacity_estimate(request):
+    body = await capacity_body(request)
+    try:
+        result = await asyncio.to_thread(distributed_store(request.app).capacity.estimate, body)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    except KeyError:
+        raise web.HTTPNotFound(text="所选产能样本已不存在，请刷新后重试")
+    return web.json_response(result)
+
+
+async def api_capacity_review(request):
+    body = await capacity_body(request)
+    store = distributed_store(request.app)
+
+    def update():
+        with store.lock, store.db:
+            return store.capacity.review(request.match_info["pid"], body)
+    try:
+        result = await asyncio.to_thread(update)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    except KeyError:
+        raise web.HTTPNotFound(text="没有可验收的采集记录")
+    return web.json_response(result)
+
+
+async def api_capacity_worker(request):
+    body = await capacity_body(request)
+    store = distributed_store(request.app)
+
+    def update():
+        with store.lock, store.db:
+            return store.capacity.update_worker(request.match_info["worker_id"], body)
+    try:
+        result = await asyncio.to_thread(update)
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    except KeyError:
+        raise web.HTTPNotFound(text="执行端不存在")
+    return web.json_response(result)
+
+
 async def api_costs(request):
     ledger = cost_ledger(request.app)
     if not ledger:
@@ -2849,6 +3042,7 @@ def make_app(auth_path=None):
     app.router.add_get("/director", director_index)
     app.router.add_get("/controller", controller_index)
     app.router.add_get("/controller/costs", controller_costs)
+    app.router.add_get("/controller/capacity", controller_capacity)
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/cards", api_cards)
@@ -2885,6 +3079,11 @@ def make_app(auth_path=None):
     if CONTROLLER_MODE:
         app.router.add_get("/api/workers", api_workers)
         app.router.add_get("/api/costs", api_costs)
+        app.router.add_get("/api/capacity", api_capacity)
+        app.router.add_get("/api/capacity/export", api_capacity_export)
+        app.router.add_post("/api/capacity/estimate", api_capacity_estimate)
+        app.router.add_post("/api/capacity/jobs/{pid}/review", api_capacity_review)
+        app.router.add_post("/api/capacity/workers/{worker_id}", api_capacity_worker)
         app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
         app.router.add_post("/api/admin/workers/sync-all", api_workers_sync_all)
         app.router.add_post("/agent/v1/register", api_agent_register)

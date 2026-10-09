@@ -41,6 +41,34 @@ class DistributedStoreTest(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def test_capacity_assignment_shares_dispatch_transaction(self):
+        self.store.enqueue("atomic-job", {"graph": {}, "capability": "test"})
+        with mock.patch.object(self.store.capacity, "assigned", side_effect=RuntimeError("write failed")):
+            with self.assertRaisesRegex(RuntimeError, "write failed"):
+                self.store.acquire(self.worker_id)
+        self.assertEqual(self.store.dispatch_status("atomic-job"), "queued")
+        self.assertEqual(self.store.list_workers()[0]["state"], "idle")
+        assignment = self.store.acquire(self.worker_id)
+        self.assertTrue(assignment["attempt_id"])
+
+    def test_capacity_terminal_shares_dispatch_transaction(self):
+        self.store.enqueue("atomic-job", {"graph": {}, "capability": "test"})
+        assignment = self.store.acquire(self.worker_id)
+        with mock.patch.object(self.store.capacity, "terminal", side_effect=RuntimeError("write failed")):
+            with self.assertRaisesRegex(RuntimeError, "write failed"):
+                self.store.finish("atomic-job", self.worker_id, assignment["lease_token"], "done")
+        self.assertEqual(self.store.dispatch_status("atomic-job"), "assigned")
+        self.assertEqual(self.store.list_workers()[0]["state"], "busy")
+
+    def test_capacity_release_requires_explicit_idle_confirmation(self):
+        with mock.patch.object(self.store.capacity, "observe_worker") as observe:
+            for kwargs in ({}, {"capacity_released": True, "busy": True},
+                           {"capacity_released": True, "current_job_id": "stale-job"}):
+                self.store.heartbeat(self.worker_id, comfy_online=True, **kwargs)
+                self.assertFalse(observe.call_args.kwargs["released"])
+            self.store.heartbeat(self.worker_id, comfy_online=True, capacity_released=True)
+            self.assertTrue(observe.call_args.kwargs["released"])
+
     def test_authentication_and_worker_state(self):
         self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
         self.assertFalse(self.store.authenticate(self.worker_id, "wrong"))
@@ -320,6 +348,21 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertFalse(self.store.validate_lease(
             "job-1", self.worker_id, first["lease_token"]
         ))
+
+    def test_expired_cancellation_keeps_capacity_terminal_without_claiming_release(self):
+        self.store.enqueue("cancel-expired", {"graph": {}}, [])
+        self.store.acquire(self.worker_id)
+        self.store.request_cancel("cancel-expired")
+        with self.store.lock, self.store.db:
+            self.store.db.execute("UPDATE dispatch_jobs SET lease_expires_at=0 WHERE job_id=?",
+                                  ("cancel-expired",))
+        self.store.heartbeat(self.worker_id, comfy_online=True)
+        self.assertEqual(self.store.dispatch_status("cancel-expired"), "canceled")
+        detail = self.store.capacity.report()["details"][0]
+        self.assertEqual(detail["status"], "canceled")
+        self.assertTrue(detail["attempts"][0]["gap"])
+        self.assertIsNone(detail["attempts"][0]["released_at"])
+        self.assertIsNone(detail["occupied_seconds"])
 
     def test_disabled_worker_cannot_acquire(self):
         self.store.enqueue("job-1", {"graph": {}}, [])
