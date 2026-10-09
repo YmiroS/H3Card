@@ -104,6 +104,11 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 .business-title { font-size:14px; font-weight:600; }
 .mean-time { display:block; font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
 .model-label { display:block; font-size:15px; font-weight:600; }
+.model-item + .model-item,.model-variant + .model-variant { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); }
+.model-role { display:block; color:var(--muted); font-size:12px; }
+.model-origin { margin-bottom:8px; color:var(--warn); }
+.model-reference { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.model-variant { overflow-wrap:anywhere; }
 .simple-table summary,.machine-more summary { color:var(--blue); }
 .simple-table .row-evidence { margin-top:7px; }
 .summary-evidence-row td { padding:0; }
@@ -333,22 +338,98 @@ function missingHardware(w) {
   if(!h.environment_id || !h.model_version)return '环境或模型版本的人工声明未填写，可在“详细统计与机器配置”中补录。';
   return '当前配置不代表历史任务的执行配置；历史依据见各业务详情。';
 }
-function summaryModel(g) {
-  const summary=g.model_summary;
-  if(!summary || summary.source!=='task_snapshot')return {label:g.source==='historical'?'历史未记录':'尚未采集',note:'不按业务名称推断'};
-  const models=Array.isArray(summary.models)?summary.models:[], sources=new Set(models.filter(m=>m.precision).map(m=>m.precision_source));
-  const origin=sources.has('filename') && sources.has('loader')?'文件标记 / 加载配置':sources.has('filename')?'模型文件标记':sources.has('loader')?'加载配置':'任务快照标记';
-  return {label:summary.precision_label || '尚未采集',note:summary.precision_label?`${origin}，非运行时检测`:'采样主模型未标注精度'};
+function modelEvidence(g) {
+  // 新合同即使为空也具有优先级，不能用旧汇总冒充已恢复的历史记录。
+  const hasEvidence=Object.hasOwn(g,'model_evidence'), evidence=g.model_evidence;
+  const variants=hasEvidence?(Array.isArray(evidence?.variants)?evidence.variants:[]).filter(v=>['task_snapshot','archived_task'].includes(v.source) && v.summary):
+    g.model_summary?.source==='task_snapshot'?[{source:'task_snapshot',summary:g.model_summary}]:[];
+  return {variants,hasEvidence,total:evidence?.total_samples,recorded:evidence?.recorded_samples,reference:g.current_model_reference?.source==='current_template'?g.current_model_reference:null};
+}
+const mainModels = summary => Array.isArray(summary?.models)?summary.models:[];
+function modelRole(model,index,count) {
+  const roles={high_noise:'高噪声',low_noise:'低噪声','高噪声':'高噪声','低噪声':'低噪声',base:'基础模型',refiner:'精修模型','生成主模型':'生成主模型','深度模型':'深度模型','放大模型':'放大模型','插帧模型':'插帧模型'};
+  const role=Object.hasOwn(roles,model.role)?roles[model.role]:null;
+  return role?`${role} · 主模型 ${index+1}`:count>1?`主模型 ${index+1}`:'';
+}
+function modelPrecision(model) {
+  const parts=[];
+  if(model.precision && model.precision_source==='filename')parts.push(`文件标记 ${text(model.precision)}`);
+  if(model.loader_dtype) {
+    const dtype=text(model.loader_dtype), tokens=dtype.split(/\s*\/\s*/).map(value=>value.match(/^(bfloat16|bf16|float(?:8|16|32|64)|fp(?:8|16|32|64))(?:_e4m3fn|_e5m2)?(?:_fast)?$/i)?.[1]);
+    const normalized=tokens.every(Boolean)?[...new Set(tokens.map(value=>value.toUpperCase().replace('BFLOAT16','BF16').replace('FLOAT','FP')))].join(' / '):null;
+    parts.push(`加载配置 ${normalized?`${normalized}（${dtype}）`:dtype}${['default','auto'].includes(dtype.toLowerCase())?'（实际精度未确认）':''}`);
+  } else if(model.precision && model.precision_source==='loader')parts.push(`加载配置 ${text(model.precision)}`);
+  if(!parts.length)parts.push('精度未记录 / 待确认');
+  return parts;
+}
+function modelColumns(summary,origin='') {
+  const names=el('div',null,'model-variant'), precision=el('div',null,'model-variant'), models=mainModels(summary);
+  for(const node of [names,precision]) {
+    if(origin)node.append(el('p',origin,'model-origin hint'));
+    if(summary?.complete===false)node.append(el('p','不完整 / 未确认完整主模型链','warn hint'));
+  }
+  models.forEach((model,index)=>{
+    const name=el('div',null,'model-item'), dtype=el('div',null,'model-item'), role=modelRole(model,index,models.length);
+    for(const node of [name,dtype])if(role)node.append(el('span',role,'model-role'));
+    name.append(el('p',model.name || '未获取到模型信息','model-name'));
+    for(const part of modelPrecision(model))dtype.append(el('p',part,'model-label'));
+    names.append(name);precision.append(dtype);
+  });
+  if(!models.length) {names.append(el('p','未获取到模型信息','muted'));precision.append(el('p','模型待确认，精度未确认','muted'));}
+  const sources=new Set(models.filter(m=>m.precision).map(m=>m.precision_source));
+  const originNote=sources.has('filename')?'模型文件标记':models.some(m=>m.loader_dtype || m.precision_source==='loader')?'加载配置':'精度未记录';
+  precision.append(el('p',`${originNote}，非运行时检测`,'hint'));
+  return [names,precision];
+}
+function renderModelCells(g,nameCell,precisionCell,timeCell) {
+  const evidence=modelEvidence(g), {variants,reference}=evidence;
+  nameCell.replaceChildren();precisionCell.replaceChildren();
+  if(evidence.hasEvidence)nameCell.append(el('p',`模型记录覆盖 ${num(evidence.recorded)} / ${num(evidence.total)} 次`,'hint model-coverage'));
+  if(variants.length) {
+    variants.forEach((variant,index)=>{
+      const origin=evidence.hasEvidence?`任务记录组合 ${index+1} · ${variant.source==='archived_task'?'保留的原任务记录':'任务提交记录'} · ${num(variant.samples)} 次记录 / ${num(variant.measured)} 次成功耗时`:'';
+      const [names,precision]=modelColumns(variant.summary,origin);nameCell.append(names);precisionCell.append(precision);
+    });
+    if(variants.length>1)nameCell.append(el('p','以上为不同任务的模型组合；不是每个任务同时使用全部模型。','warn hint'));
+    if(variants.length>1 || evidence.hasEvidence && evidence.recorded<evidence.total || variants.some(v=>v.summary.complete===false))timeCell.append(el('p','全组历史任务平均，非某个模型或组合专属速度。','warn hint'));
+  } else if(reference) {
+    const [names,precision]=modelColumns(reference,'当前工具默认配置（非历史执行记录）');
+    names.append(el('p',`工具：${text(reference.capability_name)}`,'hint'));nameCell.append(names);precisionCell.append(precision);
+    timeCell.append(el('p','此处耗时来自历史任务，不代表当前模型速度。','warn hint'));
+    precisionCell.append(el('p','历史未记录可用主模型证据；当前模板仅作参考，不补写历史精度。','hint'));
+  } else {
+    nameCell.append(el('span','未获取到模型信息','muted'));
+    precisionCell.append(el('p','历史未记录可用主模型证据；当前工具模板未提供、找不到或无法识别。','hint'),el('p','模型待确认，精度未确认；不按业务名称推断。','hint'));
+  }
+}
+function appendModelDetails(node,summary,origin) {
+  const section=el('div',null,'model-reference');section.append(el('p',origin,'model-origin'));
+  if(summary.complete===false)section.append(el('p','不完整 / 未确认完整主模型链；动态选择或未知链路不能推断全部主模型。','warn'));
+  const models=mainModels(summary);
+  if(!models.length)section.append(el('p','未获取到模型信息，模型待确认。'));
+  models.forEach((model,index)=>section.append(el('p',`${modelRole(model,index,models.length) || '主模型'}：${text(model.name)}；角色：${text(model.role)}；${modelPrecision(model).join('；')}；非运行时检测`)));
+  const auxiliary=Array.isArray(summary.auxiliary_models)?summary.auxiliary_models:[];
+  if(auxiliary.length) {
+    section.append(el('p','辅助模型（不计入主模型名称或精度）','hint'));
+    for(const model of auxiliary)section.append(el('p',`角色：${text(model.role)}；${text(model.name)}；${modelPrecision(model).join('；')}`,'hint'));
+  }
+  node.append(section);
 }
 function summaryEvidence(g) {
   const node=el('div',null,'pad');
   node.append(el('p',`来源：${source(g.source)}；有效耗时样本 ${num(g.measured)} / 总样本 ${num(g.samples)}；成功 ${num(g.done)} / 失败 ${num(g.error)} / 取消 ${num(g.canceled)}`),el('p',`P90：${friendlyTime(g.p90_seconds)}；最近成功样本：${when(g.last_sample_at)}`),el('p','平均值仅使用该组成功任务执行耗时；不包含排队，不等于纯 GPU 计算时间，也不是合格日产能。','hint'));
   node.append(el('p',`执行时配置：${hardwareSummary(g.config)}（${configSource(g.config_source)}）`),el('p',`缓存条件：${text(g.cache_condition)}`));
-  const models=g.model_summary?.source==='task_snapshot' && Array.isArray(g.model_summary.models)?g.model_summary.models:[];
-  node.append(el('p',models.length?'模型证据来自任务快照的采样主模型；文件标记 / 加载配置不等于运行时检测。':'此组没有采样主模型证据，不使用当前模板或其他模型补推。'));
-  for(const model of models)node.append(el('p',`${text(model.name)}；精度标记 ${text(model.precision)}；来源 ${{filename:'模型文件标记',loader:'加载配置'}[model.precision_source] || '未记录'}；加载类型 ${text(model.loader_dtype)}`));
+  const evidence=modelEvidence(g);
+  if(evidence.hasEvidence)node.append(el('p',`模型记录覆盖 ${num(evidence.recorded)} / ${num(evidence.total)} 次；覆盖数不是完整主模型链的确认。`));
+  if(evidence.variants.length>1)node.append(el('p','不同任务记录对应不同模型组合；每个组合内的主模型才属于同一个图。全组平均耗时不代表任一组合的专属速度。','warn'));
+  if(!evidence.variants.length)node.append(el('p','历史未记录可用主模型证据；不能用当前模板补写历史模型与精度。'));
+  evidence.variants.forEach((variant,index)=>appendModelDetails(node,variant.summary,`历史任务记录组合 ${index+1} · ${variant.source==='archived_task'?'保留的原任务记录':'任务提交记录'}${evidence.hasEvidence?` · ${num(variant.samples)} 次记录 / ${num(variant.measured)} 次成功耗时`:''}`));
+  if(evidence.reference) {
+    appendModelDetails(node,evidence.reference,`当前工具默认配置（非历史执行记录）· ${text(evidence.reference.capability_name)}`);
+    node.append(el('p','仅为工具模板默认值，不代表用户画布节点当前选中的模型。历史耗时不代表当前模型速度；参考信息不补齐历史覆盖，也不覆盖历史精度。','warn hint'));
+  } else if(!evidence.variants.length)node.append(el('p','未获取到模型信息：当前工具模板未提供、找不到或无法识别。','hint'));
   node.append(list(groupWarnings(g)),el('p',`采样日期：${text(g.days)}；配置编号：${text(g.config_id)}；采样编号：${text(g.id)}`,'hint'));
-  const raw=el('details');raw.append(el('summary','原始规格与证据'),el('pre',text({dimensions:g.dimensions,spec:g.spec,model_summary:g.model_summary,cache_condition:g.cache_condition})));node.append(raw);
+  const raw=el('details');raw.append(el('summary','原始规格与证据'),el('pre',text({dimensions:g.dimensions,spec:g.spec,model_summary:g.model_summary,model_evidence:g.model_evidence,current_model_reference:g.current_model_reference,cache_condition:g.cache_condition})));node.append(raw);
   return node;
 }
 function renderMachineSummary() {
@@ -376,12 +457,10 @@ function renderMachineSummary() {
       const count=el('p'), button=el('button','查看详情','summary-detail-toggle');button.type='button';button.setAttribute('aria-expanded','false');button.setAttribute('aria-controls',evidenceRow.id);cells[5].append(count,button);
       button.onclick=()=>{evidenceRow.hidden=!evidenceRow.hidden;button.setAttribute('aria-expanded',String(!evidenceRow.hidden));button.textContent=evidenceRow.hidden?'查看详情':'收起详情';};
       const update=()=>{
-        const g=entries.find(item=>item.id===select.value), model=summaryModel(g);row.dataset.selectedGroupId=g.id;
+        const g=entries.find(item=>item.id===select.value);row.dataset.selectedGroupId=g.id;
         selectedSpec.textContent=simpleSpec(g);
-        const models=g.model_summary?.source==='task_snapshot' && Array.isArray(g.model_summary.models)?g.model_summary.models:[];
-        cells[2].replaceChildren(...(models.length?models.map(item=>el('p',text(item.name))):[el('span',g.source==='historical'?'历史未记录':'尚未采集','muted')]));
-        cells[3].replaceChildren(el('span',model.label,'model-label'),el('p',model.note,'hint'));
         cells[4].replaceChildren(el('span',hasMean(g)?friendlyTime(g.mean_seconds):'暂无成功耗时',hasMean(g)?'mean-time':'muted'));
+        renderModelCells(g,cells[2],cells[3],cells[4]);
         if(hasMean(g) && (g.mean_seconds<1 || g.mean_seconds>3600))cells[4].append(el('p','耗时异常，请核对详情','warn hint'));
         count.textContent=numeric(g.measured)?g.measured<30?`仅 ${num(g.measured)} 次 / 仅供参考`:`${num(g.measured)} 次成功实测`:'样本数未记录';
         count.className=!numeric(g.measured) || g.measured<30?'warn hint':'hint';

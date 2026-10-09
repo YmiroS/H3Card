@@ -40,6 +40,14 @@ PERFORMANCE = DIMENSIONS | {
 }
 MODEL_KEYS = {"ckpt_name", "model_name", "unet_name", "vae_name", "clip_name",
               "clip_name1", "clip_name2", "lora_name", "control_net_name"}
+# 只有这些明确的加载器使用 model 字面量表示模型文件，其他节点不得借此保存任意文本。
+MODEL_VALUE_LOADERS = {"SeedVR2LoadDiTModel", "SeedVR2LoadVAEModel", "DownloadAndLoadGIMMVFIModel"}
+
+
+def _model_key(key, kind):
+    return key in MODEL_KEYS or (key == "model" and isinstance(kind, str) and kind in MODEL_VALUE_LOADERS)
+
+
 PRIVATE_KEYS = {"prompt", "text", "negative_prompt", "positive_prompt", "seed",
                 "noise_seed", "filename", "filename_prefix", "image", "video",
                 "audio", "path", "file", "url", "input", "text_positive", "text_negative"}
@@ -121,6 +129,8 @@ def _image_contract(graph):
         if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
             break
         kind, inputs = node.get("class_type"), node["inputs"]
+        if not isinstance(kind, str):
+            break
         if kind in {"EmptyLatentImage", "EmptySD3LatentImage"}:
             values = {"width": inputs.get("width"), "height": inputs.get("height"), "count": inputs.get("batch_size")}
             return values if all(type(v) is int and v > 0 for v in values.values()) else {}
@@ -159,7 +169,7 @@ def make_spec(capability, params, graph, dimensions):
                 safe_inputs[key] = [str(value[0]), value[1]]
             elif key in PRIVATE_KEYS or "seed" in key.lower() or "prompt" in key.lower():
                 continue
-            elif key in MODEL_KEYS and isinstance(value, str):
+            elif _model_key(key, node.get("class_type")) and isinstance(value, str):
                 model = _token(value.replace("\\", "/").rsplit("/", 1)[-1])
                 if model:
                     models.add(model)
@@ -226,43 +236,71 @@ def make_spec(capability, params, graph, dimensions):
 
 
 def model_summary(spec):
-    """仅解释已保存的安全任务图；文件/加载声明不代表运行时精度验证。"""
-    result = {"models": [], "precision_label": None, "source": "unrecorded", "runtime_verified": False}
+    """仅解释已保存的安全任务图；路径完整不代表精度已知或运行时验证。"""
+    result = {"models": [], "auxiliary_models": [], "complete": False,
+              "precision_label": None, "source": "unrecorded", "runtime_verified": False}
     graph = spec.get("graph") if isinstance(spec, dict) else None
     if not isinstance(graph, dict):
         return result
 
-    # 精确类型白名单，不能凭节点名含 Loader 或遍历 spec.models 猜主模型。
-    loaders = {"UNETLoader": ("unet_name",), "CheckpointLoaderSimple": ("ckpt_name",),
-               "CheckpointLoader": ("ckpt_name",), "UnetLoaderGGUF": ("unet_name",),
-               "UnetLoaderGGUFAdvanced": ("unet_name",)}
+    # 精确类型及角色白名单，不能凭 Loader 名称或 spec.models 猜主模型。
+    loaders = {"UNETLoader": ("unet_name", "生成主模型"),
+               "CheckpointLoaderSimple": ("ckpt_name", "生成主模型"),
+               "CheckpointLoader": ("ckpt_name", "生成主模型"),
+               "UnetLoaderGGUF": ("unet_name", "生成主模型"),
+               "UnetLoaderGGUFAdvanced": ("unet_name", "生成主模型"),
+               "LoadDA3Model": ("model_name", "深度模型"),
+               "SeedVR2LoadDiTModel": ("model", "放大模型"),
+               "DownloadAndLoadGIMMVFIModel": ("model", "插帧模型")}
     model_links = {kind: ("model",) for kind in (
         "LoraLoader", "LoraLoaderModelOnly", "ModelSamplingAuraFlow", "ModelSamplingSD3",
         "ModelSamplingFlux", "ModelSamplingDiscrete", "ModelSamplingContinuousEDM",
         "ModelAttentionBackend", "QwenImage21Cache", "CFGNorm",
-        "BasicGuider", "CFGGuider", "DualCFGGuider")}
+        "PathchSageAttentionKJ", "TESpeedMiniMaxH3", "MiniMaxLowVRAMAttention",
+        "MiniMaxChunkFeedForward", "BasicGuider", "CFGGuider", "DualCFGGuider")}
     model_links.update({"ModelMergeSimple": ("model1", "model2"),
                         "ModelMergeBlocks": ("model1", "model2")})
     samplers = {"KSampler": "model", "KSamplerAdvanced": "model", "SamplerCustom": "model",
                 "SamplerCustomAdvanced": "guider"}
-    # 从交付节点沿明确的数据链回溯，不把游离采样器或条件编码分支算作生成模型。
+    operations = {kind: (key, "生成主模型") for kind, key in samplers.items()}
+    operations.update({"MiniMaxH3LatentUpscaleCombined": ("model", "生成主模型"),
+                       "DA3Inference": ("da3_model", "深度模型"),
+                       "SeedVR2VideoUpscaler": ("dit", "放大模型"),
+                       "GIMMVFI_interpolate": ("gimmvfi_model", "插帧模型")})
     outputs = {"SaveImage": ("images",), "PreviewImage": ("images",),
                "SaveVideo": ("video",), "VHS_VideoCombine": ("images",)}
     data_links = {**outputs, "VAEDecode": ("samples",), "VAEDecodeTiled": ("samples",),
-                  "CreateVideo": ("images",), "LatentUpscale": ("samples",),
-                  "LatentUpscaleBy": ("samples",), "ImageScale": ("image",),
-                  "ImageScaleBy": ("image",), "ImageBatch": ("image1", "image2"),
+                  "CreateVideo": ("images",), "GetVideoComponents": ("video",), "Video Slice": ("video",),
+                  "LatentUpscale": ("samples",), "LatentUpscaleBy": ("samples",),
+                  "ImageScale": ("image",), "ImageScaleBy": ("image",), "ImageFromBatch": ("image",),
+                  "ImageBatch": ("image1", "image2"), "ImageConcanate": ("image1", "image2"),
                   "VAEEncode": ("pixels",), "VAEEncodeTiled": ("pixels",),
-                  "VAEEncodeForInpaint": ("pixels",),
+                  "VAEEncodeForInpaint": ("pixels",), "DA3Render": ("da3_geometry",),
+                  "DA3Inference": ("image",), "SeedVR2VideoUpscaler": ("image",),
+                  "GIMMVFI_interpolate": ("images",), "MiniMaxH3LatentUpscaleCombined": ("samples",),
+                  "VRGDG_MiniMaxH3AudioDrive": ("av_latent",),
+                  "easy cleanGpuUsed": ("anything",), "easy clearCacheAll": ("anything",),
                   **{kind: ("latent_image",) for kind in samplers}}
     data_leaves = {"EmptyLatentImage", "EmptySD3LatentImage", "EmptyHunyuanLatentVideo",
-                   "EmptyLTXVLatentVideo", "LoadImage", "LoadVideo"}
+                   "EmptyLTXVLatentVideo", "LoadImage", "LoadVideo", "VHS_LoadVideo", "VHS_LoadVideoFFmpeg"}
+    # 这些节点构造初始 latent/条件，本身不加载生成模型；不遍历其任意引用素材分支。
+    latent_builders = {"MiniMaxH3ReferenceToVideo", "MiniMaxH3ImageToVideo"}
+    aux_loaders = {"VAELoader": (("vae_name",), "辅助VAE"),
+                   "SeedVR2LoadVAEModel": (("model",), "辅助VAE"),
+                   "CLIPLoader": (("clip_name",), "辅助文本编码器"),
+                   "DualCLIPLoader": (("clip_name1", "clip_name2"), "辅助文本编码器")}
+    aux_links = {"CLIPTextEncode": ("clip",), "TextEncodeQwenImage21": ("clip", "vae"),
+                 "ConditioningZeroOut": ("conditioning",),
+                 "ConditioningCombine": ("conditioning_1", "conditioning_2"),
+                 "ConditioningConcat": ("conditioning_to", "conditioning_from"),
+                 **{kind: ("clip", "vae", "audio_vae") for kind in latent_builders}}
 
     def node_parts(node_id):
         node = graph.get(node_id)
         if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
             return None, {}
-        return node.get("type"), node["inputs"]
+        kind = node.get("type")
+        return kind if isinstance(kind, str) else None, node["inputs"]
 
     def edge(value):
         if (isinstance(value, list) and len(value) == 2 and type(value[1]) is int
@@ -270,50 +308,109 @@ def model_summary(spec):
             return str(value[0]), value[1]
         return None
 
-    pending = [node_id for node_id in graph if node_parts(node_id)[0] in outputs]
-    seen, model_edges = set(), []
-    unresolved = False
-    while pending:
-        node_id = pending.pop()
-        if node_id in seen:
-            continue
-        seen.add(node_id)
+    unresolved, main_nodes, auxiliary_nodes = False, set(), set()
+    model_edges, aux_edges = [], []
+
+    def collect_aux(inputs):
+        for key in ("vae", "audio_vae", "clip", "positive", "negative", "conditioning"):
+            if link := edge(inputs.get(key)):
+                aux_edges.append(link)
+
+    def walk(starts, resolve):
+        # 区分共享上游与真正回环；迭代遍历避免历史长图触发递归上限。
+        nonlocal unresolved
+        pending = [(item, False) for item in starts]
+        active, done = set(), set()
+        while pending:
+            item, leaving = pending.pop()
+            if leaving:
+                active.remove(item)
+                done.add(item)
+            elif item in active:
+                unresolved = True
+            elif item not in done:
+                active.add(item)
+                pending.append((item, True))
+                pending.extend((link, False) for link in resolve(item))
+
+    def data_upstream(item):
+        nonlocal unresolved
+        node_id, slot = item
         kind, inputs = node_parts(node_id)
-        if kind not in data_links and kind not in data_leaves:
+        keys = data_links.get(kind)
+        if kind == "VRAM_Debug":
+            keys = {0: ("any_input",), 1: ("image_pass",)}.get(slot)
+        elif kind in latent_builders:
+            if slot == 1:
+                collect_aux(inputs)
+                return []
+        elif slot != 0 and not (kind in {"SamplerCustom", "SamplerCustomAdvanced"} and slot == 1):
+            keys = None
+        if kind in data_leaves and slot == 0:
+            return []
+        if keys is None:
             unresolved = True
-        if kind in samplers:
-            link = edge(inputs.get(samplers[kind]))
-            if link:
-                model_edges.append(link)
+            return []
+        collect_aux(inputs)
+        if kind in operations:
+            key, role = operations[kind]
+            if link := edge(inputs.get(key)):
+                model_edges.append((*link, role))
             else:
                 unresolved = True
-        for key in data_links.get(kind, ()):
-            link = edge(inputs.get(key))
-            if link:
-                pending.append(link[0])
+        links = []
+        for key in keys:
+            if link := edge(inputs.get(key)):
+                links.append(link)
+            elif kind not in samplers or key in inputs:
+                # 旧安全快照可省略初始 latent；存在但无法解释的连接不能当已知。
+                unresolved = True
+        return links
 
-    seen, main_nodes = set(), set()
-    while model_edges:
-        node_id, slot = model_edges.pop()
-        if (node_id, slot) in seen:
-            continue
-        seen.add((node_id, slot))
+    def model_upstream(item):
+        nonlocal unresolved
+        node_id, slot, role = item
         kind, inputs = node_parts(node_id)
-        # checkpoint 的 CLIP/VAE 输出和 LoRA 的 CLIP 输出绝不作为主模型。
         if slot != 0:
             unresolved = True
-        elif kind in loaders:
-            main_nodes.add(node_id)
-        elif kind in model_links:
-            for key in model_links[kind]:
-                link = edge(inputs.get(key))
-                if link:
-                    model_edges.append(link)
-                else:
-                    unresolved = True
-        else:
-            # 自定义切换/路由语义未知，不能把所有上游 loader 当成已执行。
+            return []
+        if kind in loaders and loaders[kind][1] == role:
+            main_nodes.add((node_id, role))
+            return []
+        if kind not in model_links or role != "生成主模型":
             unresolved = True
+            return []
+        collect_aux(inputs)
+        if kind in {"LoraLoader", "LoraLoaderModelOnly"}:
+            auxiliary_nodes.add((node_id, "lora_name", "辅助LoRA"))
+        links = []
+        for key in model_links[kind]:
+            if link := edge(inputs.get(key)):
+                links.append((*link, role))
+            else:
+                unresolved = True
+        return links
+
+    walk([(node_id, 0) for node_id in graph if node_parts(node_id)[0] in outputs], data_upstream)
+    walk(model_edges, model_upstream)
+    seen_aux = set()
+    while aux_edges:
+        node_id, slot = aux_edges.pop()
+        if (node_id, slot) in seen_aux:
+            continue
+        seen_aux.add((node_id, slot))
+        kind, inputs = node_parts(node_id)
+        if kind in aux_loaders and slot == 0:
+            keys, role = aux_loaders[kind]
+            auxiliary_nodes.update((node_id, key, role) for key in keys)
+        elif kind in {"CheckpointLoader", "CheckpointLoaderSimple"} and slot in {1, 2}:
+            auxiliary_nodes.add((node_id, "ckpt_name", "辅助文本编码器" if slot == 1 else "辅助VAE"))
+        elif kind == "LoraLoader" and slot == 1:
+            auxiliary_nodes.add((node_id, "lora_name", "辅助LoRA"))
+            if link := edge(inputs.get("clip")):
+                aux_edges.append(link)
+        elif kind in aux_links and (slot == 0 or kind == "TextEncodeQwenImage21" and slot == 1):
+            aux_edges.extend(link for key in aux_links[kind] if (link := edge(inputs.get(key))))
 
     precision_tokens = re.compile(
         r"(?<![a-z0-9])(?:bfloat16|float(?:8|16|32|64)|bf16|fp(?:4|8|16|32|64)|"
@@ -324,32 +421,67 @@ def model_summary(spec):
                   for token in precision_tokens.findall(value)}
         return " / ".join(sorted(tokens)) or None
 
-    for node_id in sorted(main_nodes):
-        kind, inputs = node_parts(node_id)
-        names = [inputs.get(key) for key in loaders[kind]]
-        names = [value.get("name") for value in names if isinstance(value, dict)]
-        names = [name for name in names if _token(name)]
-        if not names:
-            unresolved = True
+    def describe(node_id, key, role):
+        _, inputs = node_parts(node_id)
+        value = inputs.get(key)
+        name = value.get("name") if isinstance(value, dict) else None
+        if not _token(name):
+            return None
         # dtype 只保留明确声明，default/auto 不提供已知精度证据。
         dtypes = sorted({value for key in ("weight_dtype", "dtype", "precision")
                          if isinstance(value := inputs.get(key), str)
                          and re.fullmatch(r"(?:bfloat16|float(?:16|32|64)|bf16|fp(?:16|32|64)|"
                                           r"(?:fp8|float8)(?:_e4m3fn|_e5m2)?(?:_fast)?)", value, re.I)})
         loader_dtype = " / ".join(dtypes) or None
-        for name in names:
-            filename_precision = precisions(name)
-            precision = filename_precision or (precisions(loader_dtype) if loader_dtype else None)
-            result["models"].append({"name": name, "precision": precision,
-                                     "precision_source": "filename" if filename_precision else "loader" if precision else None,
-                                     "loader_dtype": loader_dtype})
+        filename_precision = precisions(name)
+        precision = filename_precision or (precisions(loader_dtype) if loader_dtype else None)
+        return {"name": name, "role": role, "precision": precision,
+                "precision_source": "filename" if filename_precision else "loader" if precision else None,
+                "loader_dtype": loader_dtype}
+
+    for node_id, role in sorted(main_nodes):
+        model = describe(node_id, loaders[node_parts(node_id)[0]][0], role)
+        if model:
+            result["models"].append(model)
+        else:
+            unresolved = True
+    for node_id, key, role in sorted(auxiliary_nodes):
+        if model := describe(node_id, key, role):
+            result["auxiliary_models"].append(model)
     if result["models"]:
         result["source"] = "task_snapshot"
+        result["complete"] = not unresolved
         # 部分主模型精度未知时，组级不冒充统一精度；逐模型证据仍完整保留。
-        if not unresolved and all(model["precision"] for model in result["models"]):
+        if result["complete"] and all(model["precision"] for model in result["models"]):
             result["precision_label"] = " / ".join(sorted({
                 token for model in result["models"] for token in model["precision"].split(" / ")}))
     return result
+
+
+def model_summary_from_graph(graph):
+    """原始 Comfy 图仅在内存转为安全规格，返回摘要而不返回图或任务私密输入。"""
+    return model_summary(make_spec("unknown", {}, graph, {}))
+
+
+def _task_model_evidence(summary, archived_payload, capability):
+    """归档只补本任务缺口；已知快照事实不被不同模型或较少模型覆盖。"""
+    if not summary.get("complete"):
+        payload = _load(archived_payload, {})
+        if isinstance(payload, dict) and payload.get("capability") == capability:
+            recovered = model_summary_from_graph(payload.get("graph"))
+            previous, remaining = summary.get("models", []), list(recovered["models"])
+            preserves_snapshot = True
+            for model in previous:
+                match = next((item for item in remaining if all(
+                    value is None or item.get(key) == value for key, value in model.items())), None)
+                if match is None:
+                    preserves_snapshot = False
+                    break
+                remaining.remove(match)
+            if (recovered["models"] and preserves_snapshot and
+                    (not previous or recovered["complete"] or len(recovered["models"]) > len(previous))):
+                summary = dict(recovered, source="archived_task")
+    return summary
 
 
 def _safe_spec(value, capability):
@@ -369,7 +501,7 @@ def _safe_spec(value, capability):
                 continue
             if isinstance(val, list) and len(val) == 2 and _token(str(val[0])) and type(val[1]) is int:
                 ins[key] = [str(val[0]), val[1]]
-            elif key in MODEL_KEYS and isinstance(val, dict):
+            elif _model_key(key, node.get("type")) and isinstance(val, dict):
                 if _token(val.get("name")) and re.fullmatch(r"[0-9a-f]{64}", str(val.get("identity", ""))):
                     ins[key] = {"name": val["name"], "identity": val["identity"]}
             elif key in PERFORMANCE and _scalar(val) is not None:
@@ -401,7 +533,7 @@ def _safe_spec(value, capability):
               "model_version": _version(value.get("model_version")),
               "workflow_version": _version(value.get("workflow_version")),
               "models": sorted({v["name"] for n in graph.values() for k, v in n["inputs"].items()
-                                if k in MODEL_KEYS and isinstance(v, dict)}),
+                                if _model_key(k, n["type"]) and isinstance(v, dict)}),
               "expected": expected, "warnings": warnings, "complete": not warnings}
     result["spec_key"] = _hash({k: v for k, v in result.items() if k != "warnings"})
     return result
@@ -921,6 +1053,11 @@ class CapacityStore:
                 attempts.setdefault(attempt["job_id"], []).append(attempt)
             metadata = self._rows("capacity_worker_metadata")
             historical_reviews = {r["job_id"]: _load(r["review_json"], {}) for r in self._rows("capacity_reviews")}
+            # 与账本/快照在同一把锁内读取；精简测试库可能没有调度表，不创建或伪造历史。
+            archived = {}
+            if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_jobs'").fetchone():
+                archived = {r["job_id"]: r["payload_json"] for r in
+                            self.db.execute("SELECT job_id,payload_json FROM dispatch_jobs")}
         def selected(row):
             return ((start is None or row["created_at"] >= start)
                     and (end is None or row["created_at"] < end)
@@ -947,6 +1084,8 @@ class CapacityStore:
                           "status": task["status"], "worker_id": current["worker_id"] if current else event.get("worker_id")})
             events[job_id] = event
         details, buckets, worker_stats = [], {}, {}
+        # 仅本次查询内按完整保存快照复用，不按能力/机器推断，也不跨请求缓存。
+        snapshot_summaries = {}
         overview = {"tasks": 0, "done": 0, "error": 0, "canceled": 0, "unknown_worker": 0,
                     "historical_tasks": 0, "captured_tasks": 0, "excluded_api": excluded_api,
                     "output_images": None, "output_videos": None, "output_seconds": None, "unknown_outputs": 0}
@@ -1075,9 +1214,24 @@ class CapacityStore:
                       "output_count": count, "occupied_seconds": occupied, "spec": spec, "config_id": config_id,
                       "cache_condition": cache_condition}
             details.append(detail)
-            bucket = buckets.setdefault(group_id, {"rows": [], "spec": spec, "valid": [], "evidence_key": evidence_key})
+            snapshot_key = task["spec_json"] if task else None
+            if snapshot_key not in snapshot_summaries:
+                snapshot_summaries[snapshot_key] = model_summary(spec)
+            snapshot_summary = snapshot_summaries[snapshot_key]
+            bucket = buckets.setdefault(group_id, {"rows": [], "spec": spec, "valid": [],
+                "evidence_key": evidence_key, "model_summary": snapshot_summary, "model_variants": {}})
             bucket["rows"].append(detail)
             bucket["valid"].extend(valid)
+            # 仅展示证据；恢复图不进入 spec、分组键、缓存条件、资格或公式，也不写库。
+            summary = _task_model_evidence(snapshot_summary, archived.get(job_id), event["capability"])
+            if summary.get("models"):
+                canonical = dict(summary)
+                for key in ("models", "auxiliary_models"):
+                    canonical[key] = sorted(summary.get(key, []), key=_json)
+                variant = bucket["model_variants"].setdefault(_json(canonical), {
+                    "source": summary["source"], "summary": summary, "samples": 0, "measured": 0})
+                variant["samples"] += 1
+                variant["measured"] += int(status == "done" and runtime is not None)
             overview["tasks"] += 1
             if status in TERMINAL:
                 overview[status] += 1
@@ -1156,7 +1310,10 @@ class CapacityStore:
                 "occupied_seconds": occupied, "seconds_per_unit": seconds_per_unit,
                 "qualified_seconds_per_unit": qualified, "eligible": eligible, "warnings": warnings,
                 "days": days, "config_id": config_id, "spec": spec,
-                "model_summary": model_summary(spec),
+                "model_summary": bucket["model_summary"],
+                "model_evidence": {"total_samples": len(rows),
+                    "recorded_samples": sum(v["samples"] for v in bucket["model_variants"].values()),
+                    "variants": [bucket["model_variants"][key] for key in sorted(bucket["model_variants"])]},
                 "last_sample_at": max((r["created_at"] for r in successful if r["runtime_seconds"] is not None), default=None),
                 "config": _load(configs.get(config_id, {}).get("hardware_json")),
                 "config_source": configs.get(config_id, {}).get("source"),
@@ -1293,7 +1450,8 @@ def export_csv(report):
     """导出全部分组证据，而非分页明细；字符串防止电子表格公式注入。"""
     fields = ["from", "to", "id", "worker_id", "worker_name", "capability", "source", "benchmark_id",
               "dimensions", "spec_key", "spec", "config_id", "config", "config_source", "cache_condition",
-              "model_summary", "last_sample_at", "agent_version", "supports_capacity_telemetry",
+              "model_summary", "model_evidence", "current_model_reference", "last_sample_at",
+              "agent_version", "supports_capacity_telemetry",
               "days", "samples", "done", "error", "canceled", "measured", "mean_seconds",
               "p50_seconds", "p90_seconds", "runtime_seconds", "reference_per_hour", "output_count",
               "unit", "occupied_seconds", "seconds_per_unit", "qualified_seconds_per_unit", "eligible", "warnings"]
