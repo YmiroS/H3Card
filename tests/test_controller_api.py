@@ -1431,9 +1431,10 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtur
         self.assertEqual(self.job["status"], "queued")
         session = mock.Mock(close=mock.AsyncMock())
         previews = mock.Mock(close=mock.AsyncMock())
+        exports = mock.Mock(close=mock.AsyncMock())
         shutdown = asyncio.create_task(controller_app.on_stop({
             "cleanup_tasks": self.app["cleanup_tasks"], "session": session,
-            "video_previews": previews,
+            "video_previews": previews, "edit_exports": exports,
         }))
         await self.assert_generation_blocked()
         self.assertFalse(shutdown.done())
@@ -1442,6 +1443,7 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtur
         await stopping
         await shutdown
         session.close.assert_awaited_once()
+        exports.close.assert_awaited_once()
         self.assertEqual(self.job["status"], "canceled")
 
     async def test_inflight_output_collection_cannot_override_cancel(self):

@@ -18,6 +18,7 @@
     <button data-stage="image" class="active"><span>02</span>镜头与分镜<small>让故事变成画面</small></button>
     <button data-stage="video"><span>03</span>视频制作<small>让每个镜头动起来</small></button>
     <button data-stage="review"><span>04</span>顺序预览<small>检查镜头与节奏</small></button>
+    <button data-stage="edit"><span>05</span>剪辑与导出<small>编排时间线与导出成片</small></button>
   </nav>
   <div class="sidebar-foot"><span class="live-dot"></span><span id="connection">正在连接生成服务</span><a href="/">返回创作画布 ↗</a></div>
 </aside>
@@ -35,8 +36,9 @@
     <section id="script-stage" class="script-stage" hidden><div class="section-card"><div class="section-heading"><h2>故事与剧本</h2><span>创作意图、场景、对白与叙事节奏</span></div><textarea id="script" placeholder="写下你的故事。可以从一句话开始，也可以粘贴完整剧本……" aria-label="故事与剧本"></textarea></div><div class="section-card"><div class="section-heading"><h2>统一画面风格</h2><span>作为补充加入每个镜头的画面提示词</span></div><textarea id="style" placeholder="例如：写实电影质感，低饱和色彩，柔和侧光，保持同一人物服装与场景设定。" aria-label="统一画面风格"></textarea><p class="muted">风格文字会随提示词提交，但不保证模型自动保持角色一致性。首版请手动编排镜头。</p></div></section>
     <section id="shot-stage" class="shot-stage" hidden><div class="shots-column"><div class="section-heading"><h2 id="list-title">分镜清单</h2><span>拖动镜头调整顺序</span></div><div id="shots" class="shot-grid"></div></div><aside id="inspector" class="inspector" aria-label="镜头详情"></aside></section>
     <section id="review-stage" class="review-stage" hidden><div class="notice">这里按镜头顺序预览已采用的视频，不会合并或导出成片。没有视频的镜头仍保留在清单中。</div><div id="review-list"></div></section>
+    <section id="edit-stage" class="edit-stage" aria-label="剪辑与导出" hidden></section>
   </main>
-  <footer><span>DIRECTOR WORKSPACE · 首版</span><span>剧本 → 分镜 → 镜头视频 → 顺序预览</span></footer>
+  <footer><span>DIRECTOR WORKSPACE</span><span>剧本 → 分镜 → 镜头视频 → 顺序预览 → 剪辑与导出</span></footer>
 </div>
 <dialog id="create-dialog"><form id="create-form"><div class="eyebrow">A NEW STORY</div><h2>新建导演项目</h2><label>项目名称<input id="create-name" required maxlength="40" placeholder="为你的故事起个名字" autocomplete="off"></label><p id="create-error" role="alert"></p><div class="dialog-actions"><button type="button" id="create-cancel" class="button">取消</button><button type="submit" class="button primary">创建项目</button></div></form></dialog>
 <dialog id="preview-dialog"><div class="preview-top"><h2 id="preview-title"></h2><button id="preview-close" class="button">关闭</button></div><div id="preview-media"></div><div class="dialog-actions"><button id="preview-prev" class="button">上一镜头</button><button id="preview-next" class="button primary">下一镜头</button></div></dialog>
@@ -44,6 +46,7 @@
 <dialog id="node-dialog"><div class="preview-top"><h2 id="node-title">节点参数</h2><div class="node-actions"><button id="node-discard" class="button danger" hidden>不保存并关闭</button><button id="node-close" class="button">保存并关闭</button></div></div><iframe id="node-frame" title="画布节点参数与生成面板" src="about:blank"></iframe></dialog>
 <div id="toast" role="status" hidden></div>
 <script src="/auth.js"></script>
+<script src="/director_edit.js"></script>
 <script src="/director.js"></script>
 </body>
 </html>
