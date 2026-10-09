@@ -3158,10 +3158,8 @@ function bindGlobal() {
       const at = toWorld(ev.clientX, ev.clientY);
       try {
         const item = await importOutput(drag.output);
-        if (PROJ !== drag.project || !canOperate()) return;
-        const card = addCard("card_asset", Math.round(at.x - 134), Math.round(at.y - 84));
+        const card = await createDroppedAsset(drag.project, item, Math.round(at.x - 134), Math.round(at.y - 84));
         if (!card) return;
-        await setAssetItem(card, item);
         toast(`已建素材节点：${item.origin || drag.output.filename || "历史产物"}`);
       } catch (error) {
         if (PROJ === drag.project) toast("导入历史产物失败：" + error.message);
@@ -3173,18 +3171,18 @@ function bindGlobal() {
     // 只处理图片/视频/音频，其他类型忽略
     const valid = files.filter(f => f.type.startsWith("image/") || f.type.startsWith("video/") || f.type.startsWith("audio/"));
     if (!valid.length) return toast("只支持图片、视频、音频文件");
-    const at = toWorld(ev.clientX, ev.clientY);
+    const at = toWorld(ev.clientX, ev.clientY), project = PROJ;
     for (const f of valid) {
+      if (PROJ !== project || !canOperate()) return;
       try {
         const item = await uploadAsset(f);
         const p = { x: Math.round(at.x - 134), y: Math.round(at.y - 84) };   // 节点中心对齐鼠标位置
-        const c = addCard("card_asset", p.x, p.y);
-        if (!c) continue;
-        await setAssetItem(c, item);
+        const c = await createDroppedAsset(project, item, p.x, p.y);
+        if (!c) return;
         toast(`已建素材节点：${item.origin || f.name}`);
         at.x += 50; at.y += 50;   // 多个文件时错开位置
       } catch (e) {
-        toast(`上传失败 ${f.name}：${e.message}`);
+        if (PROJ === project) toast(`上传失败 ${f.name}：${e.message}`);
       }
     }
   });
@@ -3809,6 +3807,27 @@ function mergeCollaborativeCard(card, rev) {
     toast(`${added.created_by_name || "协作者"} 添加了「${added.name || "新节点"}」`);
   }
   if (Number.isFinite(rev)) PROJ.rev = Math.max(PROJ.rev || 0, rev);
+}
+
+function createDroppedAsset(project, item, x, y) {
+  return trackNodeWork((async () => {
+    const valid = () => PROJ === project && canOperate();
+    if (!valid()) return null;
+    // 旧 PUT 读取执行时的 cards，必须在新素材进入画布之前排空，避免 409 重载。
+    for (;;) {
+      const chain = saveChain;
+      await chain;
+      if (!valid()) return null;
+      if (chain === saveChain) break;
+    }
+    // 只合并建卡元数据，不能让建卡响应覆盖当前画布尚未保存的参数。
+    const card = addCard("card_asset", x, y, null, false);
+    if (!card) return null;
+    pick(card.id);
+    await setAssetItem(card, item);
+    if (!await card._create || !valid() || !project.cards.includes(card)) return null;
+    return card;
+  })());
 }
 
 function reconcileCreatedCard(project, localCard) {

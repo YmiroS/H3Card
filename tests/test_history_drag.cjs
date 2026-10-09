@@ -65,7 +65,8 @@ function fixture() {
     function render() { el.world.replaceChildren(...PROJ.cards.map(buildCard)); }
     const openViewer = (c, index, outputs, seed) => viewers.push({id:c.id,index,outputs:JSON.parse(JSON.stringify(outputs)),seed});
     ${block('function toWorld(', '/* ================= 小地图')}
-    ${block('function reconcileCreatedCard(', 'function delCard(')}
+    ${block('const pendingNodeWork =', 'const el =')}
+    ${block('function mergeCollaborativeCard(', 'function delCard(')}
     ${block('async function importOutput(', '/** 素材格里的图')}
     ${block('const HIST_MAX', '/* ================= 参数面板')}
     ${block('function showMenu(', '/** 面板底部工具条')}
