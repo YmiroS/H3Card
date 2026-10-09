@@ -198,6 +198,210 @@ test('菜单：保留批量重命名入口，并在点击时重新核对选择�
   }
 });
 
+// 连通用例仍执行上面抽取的生产函数；预期几何均独立手算。
+function connectedFixture(definitions, edges, selected) {
+  const fixture = geometryFixture();
+  const cards = definitions.map(c => ({...c, h:999, params:{prompt:c.id},
+    outputs:[{url:`/${c.id}.png`}], history:[{id:`history-${c.id}`}]}));
+  const reads = [];
+  for (const c of cards) {
+    c._el = {style:{left:c.x + 'px',top:c.y + 'px'}};
+    Object.defineProperty(c._el, 'offsetHeight', {get() {
+      reads.push({id:c.id,positions:cards.map(c => [c.x,c.y])});
+      return c.actualHeight;
+    }});
+  }
+  fixture.context.PROJ.cards = cards;
+  fixture.context.PROJ.edges = edges;
+  fixture.context.PROJ.groups = [{id:'connected-group',name:'跨选区分组',cards:[cards[0].id,'outside']}];
+  fixture.context.selIds = new Set(selected || cards.filter(c => c.id !== 'outside').map(c => c.id).reverse());
+  return {...fixture,cards,reads};
+}
+const connectedCards = [
+  {id:'a',x:300,y:40,w:100,actualHeight:80},
+  {id:'b',x:0,y:100,w:140,actualHeight:120},
+  {id:'c',x:-80,y:220,w:90,actualHeight:60},
+  {id:'d',x:180,y:260,w:110,actualHeight:100},
+  {id:'e',x:-40,y:-20,w:70,actualHeight:50},
+  {id:'outside',x:900,y:800,w:268,actualHeight:230},
+];
+const connectedEdges = [
+  {from:'a',to:'b',slot:'image',metadata:{keep:true}},
+  {from:'a',to:'b',slot:'image'}, // 重复边不能改变连通分量或拓扑结果。
+  {from:'c',to:'d',slot:'@text'},
+  {from:'c',to:'d',slot:'@style'},
+  {from:'b',to:'b',slot:'image'}, {from:'d',to:'d',slot:'@text'},
+  {from:'ghost',to:'a',slot:'@text'}, {from:'d',to:'missing',slot:'image'},
+  {from:'a',to:'outside',slot:'image'}, {from:'outside',to:'c',slot:'@style'},
+];
+// 原边界 [-80,-20]—[400,360]；A 行 264×120，B 行 224×100，单张 E 70×50。
+// 纵向行序 E/A/B，y=-20/54/198；横向行序 B/E/A，x=-80/168/262。
+const connectedExpected = {
+  left:   [[-80,54],[44,54],[-80,198],[34,198],[-80,-20]],
+  right:  [[136,54],[260,54],[176,198],[290,198],[330,-20]],
+  center: [[28,54],[152,54],[48,198],[162,198],[125,-20]],
+  top:    [[262,-20],[386,-20],[-80,-20],[34,-20],[168,-20]],
+  bottom: [[262,280],[386,240],[-80,300],[34,260],[168,310]],
+};
+function preservedData(s) {
+  return plain({project:Object.fromEntries(Object.entries(s.PROJ).filter(([k]) => k !== 'cards')),
+    cards:s.PROJ.cards.map(({x,y,_el,...rest}) => rest),selection:[...s.selIds]});
+}
+for (const mode of modes) test(`连通几何：${mode} 两条多卡横排加单卡、反向原 x、真实尺寸及重复无保存`, () => {
+  const {context:s,cards,calls,reads} = connectedFixture(connectedCards, plain(connectedEdges));
+  const before = cards.map(c => [c.x,c.y]), data = preservedData(s), outside = plain(cards.at(-1));
+  s.alignSelectedCards(mode);
+  assert.deepEqual(cards.slice(0,5).map(c => [c.x,c.y]), connectedExpected[mode]);
+  assert.deepEqual(reads.map(r => r.id), ['a','b','c','d','e']);
+  for (const read of reads) assert.deepEqual(read.positions, before, '连通行的整卡尺寸须先快照');
+  assert.deepEqual(effects(calls), once);
+  assert.equal(calls.guard, 1);
+  for (const [from,to] of [[0,1],[2,3]]) {
+    assert.equal(cards[to].x - cards[from].x - cards[from].w, 24, '有向上游应排在下游左侧');
+    if (mode === 'bottom') {
+      assert.equal(cards[from].y + cards[from].actualHeight, 360);
+      assert.equal(cards[to].y + cards[to].actualHeight, 360, '底部对齐必须对齐每张卡而非仅行');
+    } else assert.equal(cards[from].y, cards[to].y, '同行顶部一致');
+  }
+  for (const c of cards.slice(0,5)) {
+    assert.equal(c._el.style.left, c.x + 'px');
+    assert.equal(c._el.style.top, c.y + 'px');
+  }
+  assert.deepEqual(plain(cards.at(-1)), outside, '未选桥接节点不得移动');
+  assert.deepEqual(preservedData(s), data, '除位置外项目、尺寸、参数、产物、历史、边、组和选择均保留');
+  for (let i = 0; i < 3; i++) s.alignSelectedCards(mode);
+  assert.deepEqual(cards.slice(0,5).map(c => [c.x,c.y]), connectedExpected[mode]);
+  assert.deepEqual(effects(calls), once, '连通行重复排列不得刷新或保存');
+  assert.deepEqual(preservedData(s), data);
+});
+
+for (const slot of ['image','@text','@style']) test(`连通几何：单独 ${slot} 边也构成横排，反向原坐标仍上游优先`, () => {
+  const {context:s,cards,calls} = connectedFixture(connectedCards.slice(0,2), [{from:'a',to:'b',slot}]);
+  s.alignSelectedCards('left');
+  assert.deepEqual(cards.map(c => [c.x,c.y]), [[0,40],[124,40]]);
+  s.alignSelectedCards('left');
+  assert.deepEqual(effects(calls), once);
+});
+
+test('连通几何：分支拓扑的可用节点按 x、y、项目顺序排序而非选择顺序', () => {
+  const definitions = [
+    {id:'d',x:100,y:10,w:110,actualHeight:60},
+    {id:'a',x:300,y:0,w:80,actualHeight:70},
+    {id:'c',x:100,y:10,w:100,actualHeight:90},
+    {id:'b',x:100,y:30,w:90,actualHeight:80},
+    {id:'e',x:50,y:10,w:120,actualHeight:100},
+  ];
+  const edges = ['b','c','d','e'].map(to => ({from:'a',to,slot:'image'}));
+  edges.push({from:'c',to:'b',slot:'@text'});
+  const {context:s,cards,calls} = connectedFixture(definitions, edges, ['b','c','a','e','d']);
+  s.alignSelectedCards('left');
+  // 唯一源 a；随后 e(x 最小)、d/c(同位置按项目顺序)、最后 b(y 更大且依赖 c)。
+  assert.deepEqual(cards.map(c => [c.x,c.y]), [[298,0],[50,0],[432,0],[556,0],[154,0]]);
+  s.alignSelectedCards('left');
+  assert.deepEqual(effects(calls), once);
+});
+
+test('连通几何：环无零入度时确定性坐标回退，解环后恢复源优先且幂等', () => {
+  const definitions = [
+    {id:'b',x:100,y:10,w:80,actualHeight:80},
+    {id:'a',x:100,y:10,w:90,actualHeight:70},
+    {id:'c',x:0,y:20,w:70,actualHeight:60},
+    {id:'d',x:-50,y:0,w:60,actualHeight:90},
+  ];
+  const edges = [
+    {from:'a',to:'b',slot:'image'}, {from:'b',to:'c',slot:'@text'},
+    {from:'c',to:'a',slot:'@style'}, {from:'c',to:'d',slot:'image'},
+  ];
+  const {context:s,cards,calls} = connectedFixture(definitions, edges);
+  s.alignSelectedCards('left');
+  // 无源：先回退 d、再 c；c 移除后 a 入度为零，必须先于原同位置的 b。
+  assert.deepEqual(cards.map(c => [c.x,c.y]), [[242,0],[128,0],[34,0],[-50,0]]);
+  for (let i = 0; i < 3; i++) s.alignSelectedCards('left');
+  assert.deepEqual(effects(calls), once);
+});
+
+test('连通几何：环回退同 x 时按 y、同 x/y 时按项目顺序，不依赖选择顺序', () => {
+  const edges = [{from:'a',to:'b',slot:'image'},{from:'b',to:'c',slot:'@text'},{from:'c',to:'a',slot:'@style'}];
+  for (const tied of [false,true]) {
+    const definitions = [
+      {id:'b',x:100,y:tied ? 10 : 20,w:120,actualHeight:80},
+      {id:'a',x:100,y:tied ? 10 : 0,w:160,actualHeight:60},
+      {id:'c',x:100,y:10,w:180,actualHeight:90},
+    ];
+    const {context:s,cards,calls} = connectedFixture(definitions, plain(edges), ['c','a','b']);
+    s.alignSelectedCards('left');
+    // 同 x：先 a(y 最小)，随后 b/c；完全相同位置：先项目里的 b，随后 c/a。
+    const positions = tied ? [[100,10],[448,10],[244,10]] : [[284,0],[100,0],[428,0]];
+    assert.deepEqual(cards.map(c => [c.x,c.y]), positions);
+    for (let i = 0; i < 3; i++) s.alignSelectedCards('left');
+    assert.deepEqual(cards.map(c => [c.x,c.y]), positions);
+    assert.deepEqual(effects(calls), once);
+  }
+});
+
+for (const mode of ['left','top']) test(`连通几何：${mode} 行排序完全同 min x/min y 时保留项目顺序`, () => {
+  const definitions = [
+    {id:'t1',x:100,y:40,w:40,actualHeight:60},
+    {id:'s2',x:0,y:0,w:60,actualHeight:70},
+    {id:'s1',x:0,y:0,w:80,actualHeight:50},
+    {id:'t2',x:100,y:40,w:50,actualHeight:80},
+  ];
+  const {context:s,cards,calls} = connectedFixture(definitions,
+    [{from:'s1',to:'t1',slot:'image'},{from:'s2',to:'t2',slot:'@text'}]);
+  s.alignSelectedCards(mode);
+  // 行 s1/t1 的首个项目节点是 t1；两行原始最小坐标都是 (0,0)。
+  assert.deepEqual(cards.map(c => [c.x,c.y]), mode === 'left'
+    ? [[104,0],[0,84],[0,0],[84,84]] : [[104,0],[168,0],[0,0],[252,0]]);
+  s.alignSelectedCards(mode);
+  assert.deepEqual(effects(calls), once);
+});
+
+test('连通几何：空边集合及只有未选桥、悬空边、自环时仍是单卡行', () => {
+  for (const edges of [[], [
+    {from:'a',to:'outside',slot:'image'},{from:'outside',to:'c',slot:'@text'},
+    {from:'ghost',to:'b',slot:'@style'},{from:'d',to:'missing',slot:'image'},
+    {from:'b',to:'b',slot:'image'},
+  ]]) {
+    const {context:s,cards,calls} = geometryFixture();
+    s.PROJ.edges = edges;
+    s.alignSelectedCards('left');
+    assert.deepEqual(cards.slice(0,4).map(c => [c.x,c.y]), expected.left);
+    s.alignSelectedCards('left');
+    assert.deepEqual(effects(calls), once);
+  }
+});
+
+test('连通几何：无 DOM 横排使用 cardRect 默认宽高而非持久化 h', () => {
+  const {context:s,calls} = geometryFixture();
+  s.PROJ.cards = [{id:'a',x:20,y:40},{id:'b',x:-10,y:0,w:180,h:999}];
+  s.PROJ.edges = [{from:'a',to:'b',slot:'@text'}];
+  s.alignSelectedCards('right');
+  // 宽 268+24+180=472，原右边界 288，故行左边界 -184。
+  assert.deepEqual(s.PROJ.cards.map(c => [c.x,c.y]), [[-184,0],[108,0]]);
+  s.alignSelectedCards('right');
+  assert.deepEqual(effects(calls), once);
+});
+
+test('连通守卫：五种模式只读不读尺寸不写入，菜单回调撤权及减少选择亦然', () => {
+  for (const mode of modes) for (const change of ['readonly','menu-permission','menu-selection']) {
+    const {context:s,cards,calls,reads} = connectedFixture(connectedCards, plain(connectedEdges));
+    const before = plain(cards);
+    if (change === 'readonly') {
+      s.allowed = false;
+      s.alignSelectedCards(mode);
+    } else {
+      s.selectionMenu(10,20);
+      if (change === 'menu-permission') s.allowed = false;
+      else s.selIds = new Set(['a','missing']);
+      s.menus[0].items[0].children[modes.indexOf(mode)].run();
+    }
+    assert.deepEqual(plain(cards), before, `${mode}/${change}`);
+    assert.deepEqual(effects(calls), never);
+    assert.equal(calls.guard, 1);
+    if (change !== 'menu-selection') assert.deepEqual(reads, [], '撤权后不得读取尺寸');
+  }
+});
+
 function browserFixture(platform) {
   // 仅替换外围渲染及持久化；节点构建、鼠标处理、选择、几何、菜单均抽取生产代码。
   return `
@@ -358,6 +562,95 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
             await openAlignment();
             await page.getByRole('button',{name:'垂直居中对齐'}).click();
             assert.equal(await page.evaluate(() => saved), 1);
+          }
+        });
+
+        for (const [index,mode] of modes.entries()) await t.test(`连通横排 ${mode}：真实框选、菜单点击、DOM 边界及重复无保存`, async () => {
+          await reset();
+          await page.evaluate(edges => {
+            el.world.replaceChildren(); el.groups.replaceChildren();
+            PROJ = {id:'connected-interaction',permission:'operate',custom:{keep:'项目元数据'},cards:[
+              {id:'a',x:400,y:100,w:200,h:90}, {id:'b',x:80,y:180,w:240,h:140},
+              {id:'c',x:120,y:430,w:220,h:110}, {id:'d',x:460,y:480,w:180,h:90},
+              {id:'e',x:760,y:60,w:200,h:100}, {id:'outside',x:1600,y:1000,w:268,h:120},
+            ],edges,groups:[{id:'g',name:'保留原组',cards:['a','outside']}]};
+            for (const c of PROJ.cards) {
+              c.params = {prompt:c.id,seed:123};
+              c.outputs = [{kind:'image',url:'/fixture.png'}]; c.history = [{id:`past-${c.id}`}];
+              el.world.appendChild(buildCard(c));
+            }
+            view = {x:20,y:20,k:0.6}; applyView();
+          }, plain(connectedEdges));
+          // 用实际鼠标框选 a/b/c/d/e，未选 outside 仅作桥；不直接调用 choose 或排列函数。
+          await drag([90,68],[654,530]);
+          assert.deepEqual(await selection(), ['a','b','c','d','e']);
+          const snapshot = () => page.evaluate(() => {
+            const stage = el.stage.getBoundingClientRect();
+            return {saved,selection:[...selIds],selId,view:{...view},
+              project:Object.fromEntries(Object.entries(PROJ).filter(([key]) => key !== 'cards')),
+              metadata:PROJ.cards.map(({x,y,_el,...rest}) => rest),
+              positions:PROJ.cards.map(c => [c.x,c.y]),
+              styles:PROJ.cards.map(c => [c._el.style.left,c._el.style.top]),
+              rects:PROJ.cards.map(c => {
+                const r = c._el.getBoundingClientRect();
+                return {id:c.id,x:(r.left-stage.left-view.x)/view.k,y:(r.top-stage.top-view.y)/view.k,
+                  w:r.width/view.k,h:r.height/view.k,offsetHeight:c._el.offsetHeight};
+              })};
+          });
+          const near = (actual,expected,message) => assert.ok(Math.abs(actual-expected) < 0.001,
+            `${message}: ${actual} != ${expected}`);
+          const before = await snapshot();
+          assert.equal(before.saved, 0);
+          const [a0,b0,c0,d0,e0] = before.rects;
+          for (const r of before.rects) near(r.h,r.offsetHeight,`${r.id} 实际矩形与整卡高度`);
+          assert.ok(a0.h > 90 && b0.h > 140, '实际整卡高度包括标题和页脚，而不是持久化正文 h');
+          const bottom = d0.y + d0.h; // 此夹具原选区底部由 d 决定。
+          const targetX = {
+            left:[80,304,80,324,80], right:[496,720,536,780,760],
+            center:[288,512,308,552,420], top:[80,304,568,812,1016], bottom:[80,304,568,812,1016],
+          }[mode];
+          const rowAY = 60 + e0.h + 24, rowBY = rowAY + b0.h + 24;
+          const targetY = ['left','right','center'].includes(mode) ? [rowAY,rowAY,rowBY,rowBY,60]
+            : mode === 'top' ? [60,60,60,60,60] : [a0,b0,c0,d0,e0].map(r => bottom-r.h);
+          await rightClick('.card[data-id="a"] .body');
+          assert.deepEqual(await menuLabels(), ['对齐方式','批量重命名（5 个节点）']);
+          await openAlignment();
+          await page.getByRole('button',{name:labels[index],exact:false}).click();
+          const after = await snapshot();
+          assert.equal(after.saved, 1);
+          assert.deepEqual(after.selection, before.selection);
+          assert.equal(after.selId, before.selId);
+          assert.deepEqual(after.view, before.view);
+          assert.deepEqual(after.project, before.project);
+          assert.deepEqual(after.metadata, before.metadata);
+          assert.deepEqual(after.rects[5], before.rects[5], '未选桥的实际矩形不变');
+          assert.deepEqual(after.positions[5], before.positions[5]);
+          const [a,b,c,d,e] = after.rects;
+          for (const [i,r] of after.rects.slice(0,5).entries()) {
+            near(r.x,targetX[i],`${r.id} 实际 x`); near(r.y,targetY[i],`${r.id} 实际 y`);
+            near(after.positions[i][0],targetX[i],`${r.id} 数据 x`);
+            near(after.positions[i][1],targetY[i],`${r.id} 数据 y`);
+            assert.deepEqual(after.styles[i], after.positions[i].map(v => v + 'px'));
+            near(r.w,before.rects[i].w,`${r.id} 宽度不变`);
+            near(r.h,before.rects[i].h,`${r.id} 高度不变`);
+          }
+          near(b.x-a.x-a.w,24,'A 行内部邻接'); near(d.x-c.x-c.w,24,'B 行内部邻接');
+          if (['left','right','center'].includes(mode)) {
+            near(a.y,b.y,'A 行顶齐'); near(c.y,d.y,'B 行顶齐');
+            near(a.y-e.y-e.h,24,'E/A 行纵向间隔');
+            near(c.y-a.y-Math.max(a.h,b.h),24,'A/B 行纵向间隔');
+            if (mode === 'left') for (const r of [a,c,e]) near(r.x,80,'行左边界');
+            if (mode === 'right') for (const edge of [b.x+b.w,d.x+d.w,e.x+e.w]) near(edge,960,'行右边界');
+            if (mode === 'center') for (const center of [(a.x+b.x+b.w)/2,(c.x+d.x+d.w)/2,e.x+e.w/2]) near(center,520,'行水平中心');
+          } else {
+            near(c.x-b.x-b.w,24,'A/B 行横向间隔'); near(e.x-d.x-d.w,24,'B/E 行横向间隔');
+            for (const r of [a,b,c,d,e]) near(mode === 'top' ? r.y : r.y+r.h,mode === 'top' ? 60 : bottom,'原选区上下边界');
+          }
+          for (let repeat = 0; repeat < 2; repeat++) {
+            await rightClick('.card[data-id="a"] .body');
+            await openAlignment();
+            await page.getByRole('button',{name:labels[index],exact:false}).click();
+            assert.deepEqual(await snapshot(), after, '重复真实菜单点击不改变矩形、数据或保存次数');
           }
         });
 
