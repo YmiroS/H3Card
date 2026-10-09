@@ -6,7 +6,8 @@
   const q = value => Math.round(Number(value) * FPS) / FPS;
   const clamp = (value, min, max) => Math.min(max, Math.max(min, value));
   const finite = value => Number.isFinite(Number(value));
-  const uid = prefix => prefix + '_' + crypto.randomUUID().replaceAll('-', '');
+  // 局域网 HTTP 不提供 randomUUID，但允许 getRandomValues。
+  const uid = prefix => prefix + '_' + Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
   const statuses = {queued:'排队中', running:'导出中', done:'已完成', error:'失败', canceled:'已取消'};
   const kinds = {video:'视频', image:'图片', audio:'音频'};
   let config, root, ui = {}, pid = null, epoch = 0, documentEdit = null, exports = [];

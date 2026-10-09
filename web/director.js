@@ -152,7 +152,9 @@
     } catch (error) { busy = false; $('projects').value = project?.id || ''; if (project) renderInspector(); updateActions(); toast(error.message); }
   }
   function makeShot(title = '', description = '') {
-    return {id:'shot_'+crypto.randomUUID().replaceAll('-',''), title:title || `镜头 ${doc.shots.length + 1}`,
+    // 局域网 HTTP 不提供 randomUUID，但允许 getRandomValues。
+    const id = 'shot_' + Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+    return {id, title:title || `镜头 ${doc.shots.length + 1}`,
       description, shotSize:'中景', movement:'固定镜头', notes:'',
       image:{capability:'',params:{}}, video:{capability:'',params:{}},
       assets:[], history:[], selected:{}};
