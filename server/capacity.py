@@ -225,6 +225,133 @@ def make_spec(capability, params, graph, dimensions):
     return result
 
 
+def model_summary(spec):
+    """仅解释已保存的安全任务图；文件/加载声明不代表运行时精度验证。"""
+    result = {"models": [], "precision_label": None, "source": "unrecorded", "runtime_verified": False}
+    graph = spec.get("graph") if isinstance(spec, dict) else None
+    if not isinstance(graph, dict):
+        return result
+
+    # 精确类型白名单，不能凭节点名含 Loader 或遍历 spec.models 猜主模型。
+    loaders = {"UNETLoader": ("unet_name",), "CheckpointLoaderSimple": ("ckpt_name",),
+               "CheckpointLoader": ("ckpt_name",), "UnetLoaderGGUF": ("unet_name",),
+               "UnetLoaderGGUFAdvanced": ("unet_name",)}
+    model_links = {kind: ("model",) for kind in (
+        "LoraLoader", "LoraLoaderModelOnly", "ModelSamplingAuraFlow", "ModelSamplingSD3",
+        "ModelSamplingFlux", "ModelSamplingDiscrete", "ModelSamplingContinuousEDM",
+        "ModelAttentionBackend", "QwenImage21Cache", "CFGNorm",
+        "BasicGuider", "CFGGuider", "DualCFGGuider")}
+    model_links.update({"ModelMergeSimple": ("model1", "model2"),
+                        "ModelMergeBlocks": ("model1", "model2")})
+    samplers = {"KSampler": "model", "KSamplerAdvanced": "model", "SamplerCustom": "model",
+                "SamplerCustomAdvanced": "guider"}
+    # 从交付节点沿明确的数据链回溯，不把游离采样器或条件编码分支算作生成模型。
+    outputs = {"SaveImage": ("images",), "PreviewImage": ("images",),
+               "SaveVideo": ("video",), "VHS_VideoCombine": ("images",)}
+    data_links = {**outputs, "VAEDecode": ("samples",), "VAEDecodeTiled": ("samples",),
+                  "CreateVideo": ("images",), "LatentUpscale": ("samples",),
+                  "LatentUpscaleBy": ("samples",), "ImageScale": ("image",),
+                  "ImageScaleBy": ("image",), "ImageBatch": ("image1", "image2"),
+                  "VAEEncode": ("pixels",), "VAEEncodeTiled": ("pixels",),
+                  "VAEEncodeForInpaint": ("pixels",),
+                  **{kind: ("latent_image",) for kind in samplers}}
+    data_leaves = {"EmptyLatentImage", "EmptySD3LatentImage", "EmptyHunyuanLatentVideo",
+                   "EmptyLTXVLatentVideo", "LoadImage", "LoadVideo"}
+
+    def node_parts(node_id):
+        node = graph.get(node_id)
+        if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+            return None, {}
+        return node.get("type"), node["inputs"]
+
+    def edge(value):
+        if (isinstance(value, list) and len(value) == 2 and type(value[1]) is int
+                and value[1] >= 0 and str(value[0]) in graph):
+            return str(value[0]), value[1]
+        return None
+
+    pending = [node_id for node_id in graph if node_parts(node_id)[0] in outputs]
+    seen, model_edges = set(), []
+    unresolved = False
+    while pending:
+        node_id = pending.pop()
+        if node_id in seen:
+            continue
+        seen.add(node_id)
+        kind, inputs = node_parts(node_id)
+        if kind not in data_links and kind not in data_leaves:
+            unresolved = True
+        if kind in samplers:
+            link = edge(inputs.get(samplers[kind]))
+            if link:
+                model_edges.append(link)
+            else:
+                unresolved = True
+        for key in data_links.get(kind, ()):
+            link = edge(inputs.get(key))
+            if link:
+                pending.append(link[0])
+
+    seen, main_nodes = set(), set()
+    while model_edges:
+        node_id, slot = model_edges.pop()
+        if (node_id, slot) in seen:
+            continue
+        seen.add((node_id, slot))
+        kind, inputs = node_parts(node_id)
+        # checkpoint 的 CLIP/VAE 输出和 LoRA 的 CLIP 输出绝不作为主模型。
+        if slot != 0:
+            unresolved = True
+        elif kind in loaders:
+            main_nodes.add(node_id)
+        elif kind in model_links:
+            for key in model_links[kind]:
+                link = edge(inputs.get(key))
+                if link:
+                    model_edges.append(link)
+                else:
+                    unresolved = True
+        else:
+            # 自定义切换/路由语义未知，不能把所有上游 loader 当成已执行。
+            unresolved = True
+
+    precision_tokens = re.compile(
+        r"(?<![a-z0-9])(?:bfloat16|float(?:8|16|32|64)|bf16|fp(?:4|8|16|32|64)|"
+        r"int(?:4|8|16)|nf4|q[2-8]_(?:k(?:_[sml])?|[01]))(?![a-z0-9])", re.I)
+
+    def precisions(value):
+        tokens = {token.upper().replace("BFLOAT16", "BF16").replace("FLOAT", "FP")
+                  for token in precision_tokens.findall(value)}
+        return " / ".join(sorted(tokens)) or None
+
+    for node_id in sorted(main_nodes):
+        kind, inputs = node_parts(node_id)
+        names = [inputs.get(key) for key in loaders[kind]]
+        names = [value.get("name") for value in names if isinstance(value, dict)]
+        names = [name for name in names if _token(name)]
+        if not names:
+            unresolved = True
+        # dtype 只保留明确声明，default/auto 不提供已知精度证据。
+        dtypes = sorted({value for key in ("weight_dtype", "dtype", "precision")
+                         if isinstance(value := inputs.get(key), str)
+                         and re.fullmatch(r"(?:bfloat16|float(?:16|32|64)|bf16|fp(?:16|32|64)|"
+                                          r"(?:fp8|float8)(?:_e4m3fn|_e5m2)?(?:_fast)?)", value, re.I)})
+        loader_dtype = " / ".join(dtypes) or None
+        for name in names:
+            filename_precision = precisions(name)
+            precision = filename_precision or (precisions(loader_dtype) if loader_dtype else None)
+            result["models"].append({"name": name, "precision": precision,
+                                     "precision_source": "filename" if filename_precision else "loader" if precision else None,
+                                     "loader_dtype": loader_dtype})
+    if result["models"]:
+        result["source"] = "task_snapshot"
+        # 部分主模型精度未知时，组级不冒充统一精度；逐模型证据仍完整保留。
+        if not unresolved and all(model["precision"] for model in result["models"]):
+            result["precision_label"] = " / ".join(sorted({
+                token for model in result["models"] for token in model["precision"].split(" / ")}))
+    return result
+
+
 def _safe_spec(value, capability):
     """再次重建白名单，避免队列里的伪造快照携带原始提示词。"""
     if not isinstance(value, dict) or value.get("version") != 1:
@@ -839,12 +966,19 @@ class CapacityStore:
             else:
                 state = "busy" if worker.get("busy") or worker.get("current_job_id") else "idle"
             hardware = _hardware(worker)
+            caps = _load(worker.get("capabilities_json"), {})
+            caps = caps if isinstance(caps, dict) else {}
+            agent_version = _num(caps.get("agent_version"))
+            flag = caps.get("supports_capacity_telemetry")
+            supports_capacity_telemetry = bool(agent_version is not None and agent_version >= 4
+                                               and (flag is True or type(flag) is int and flag == 1))
             metas = [m for m in metadata if m["worker_id"] == wid]
             if metas:
                 # 当前清单可展示人工备注；执行快照和 CSV 分组不携带备注。
                 hardware.update(_load(max(metas, key=lambda m: m["valid_from"])["hardware_json"], {}))
             worker_stats[wid] = {"id": wid, "name": _text(worker.get("name")), "state": state,
                                  "last_seen": last_seen, "hardware": hardware, "tasks": 0,
+                                 "agent_version": agent_version, "supports_capacity_telemetry": supports_capacity_telemetry,
                                  "done": 0, "error": 0, "canceled": 0, "runtime_seconds": None,
                                  "config_state": "current_or_last_reported", "hardware_source": "manual+reported" if metas else "reported"}
         for event in sorted(events.values(), key=lambda r: (r["created_at"], r["job_id"]), reverse=True):
@@ -961,7 +1095,8 @@ class CapacityStore:
                 stats = worker_stats.setdefault(wid, {"id": wid, "name": name, "state": "historical", "last_seen": None,
                     "hardware": {"host_id": None, "gpus": [], "memory_total_bytes": None, "cpu": None, "os": None, "environment_id": None},
                     "tasks": 0, "done": 0, "error": 0, "canceled": 0, "runtime_seconds": None,
-                    "config_state": "historical_unknown", "hardware_source": "unknown"})
+                    "config_state": "historical_unknown", "hardware_source": "unknown",
+                    "agent_version": None, "supports_capacity_telemetry": False})
                 stats["tasks"] += 1
                 if status in TERMINAL:
                     stats[status] += 1
@@ -1021,6 +1156,8 @@ class CapacityStore:
                 "occupied_seconds": occupied, "seconds_per_unit": seconds_per_unit,
                 "qualified_seconds_per_unit": qualified, "eligible": eligible, "warnings": warnings,
                 "days": days, "config_id": config_id, "spec": spec,
+                "model_summary": model_summary(spec),
+                "last_sample_at": max((r["created_at"] for r in successful if r["runtime_seconds"] is not None), default=None),
                 "config": _load(configs.get(config_id, {}).get("hardware_json")),
                 "config_source": configs.get(config_id, {}).get("source"),
                 "reviewed": sum(r["review"]["accepted"] is not None for r in terminal_rows),
@@ -1156,6 +1293,7 @@ def export_csv(report):
     """导出全部分组证据，而非分页明细；字符串防止电子表格公式注入。"""
     fields = ["from", "to", "id", "worker_id", "worker_name", "capability", "source", "benchmark_id",
               "dimensions", "spec_key", "spec", "config_id", "config", "config_source", "cache_condition",
+              "model_summary", "last_sample_at", "agent_version", "supports_capacity_telemetry",
               "days", "samples", "done", "error", "canceled", "measured", "mean_seconds",
               "p50_seconds", "p90_seconds", "runtime_seconds", "reference_per_hour", "output_count",
               "unit", "occupied_seconds", "seconds_per_unit", "qualified_seconds_per_unit", "eligible", "warnings"]
@@ -1172,7 +1310,12 @@ def export_csv(report):
     stream = io.StringIO(newline="")
     writer = csv.writer(stream)
     writer.writerow(fields)
+    workers = {worker["id"]: worker for worker in report.get("workers", [])}
     for group in report.get("groups", []):
         row = dict(group, **report.get("period", {}))
+        # 版本/支持标记来自当前 Worker 清单，不是该历史任务执行时的配置证据。
+        worker = workers.get(group.get("worker_id"), {})
+        row.update({"agent_version": worker.get("agent_version"),
+                    "supports_capacity_telemetry": worker.get("supports_capacity_telemetry", False)})
         writer.writerow([cell(row.get(field)) for field in fields])
     return "\ufeff" + stream.getvalue()
