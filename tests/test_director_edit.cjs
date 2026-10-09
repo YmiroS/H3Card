@@ -151,6 +151,126 @@ function fixtures(folder, executable) {
   return {video, image, audio};
 }
 
+// Simulate the missing secure-context API on loopback HTTP; this is not a LAN-origin test.
+// All project/editor handlers, uploads and persistence remain the actual application.
+test('director missing randomUUID real Edge regression', {timeout: 60000}, async t => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'chouka-director-no-uuid-'));
+  let fixture, browser;
+  const errors = [], writes = [];
+  try {
+    fixture = await bootFixture(folder);
+    const image = path.join(folder, 'uuid-image.png');
+    ffmpeg(fixture.ffmpeg, ['-y', '-f', 'lavfi', '-i', 'color=c=blue:size=240x320', '-frames:v', '1', image]);
+    browser = await chromium.launch({channel: process.env.CHOUKA_TEST_BROWSER || 'msedge', headless: true});
+    const context = await browser.newContext({viewport: {width: 1600, height: 1100}});
+    await context.addInitScript(() => {
+      Object.defineProperty(crypto, 'randomUUID', {value: undefined, configurable: true});
+    });
+    await context.route('**/*', route => {
+      const url = new URL(route.request().url());
+      if (url.origin !== fixture.origin && !['blob:', 'data:', 'about:'].includes(url.protocol)) {
+        errors.push('External request: ' + url.href);
+        return route.abort();
+      }
+      return route.continue();
+    });
+    const page = await context.newPage();
+    page.setDefaultTimeout(10000);
+    page.on('pageerror', error => errors.push(error.message));
+    page.on('console', entry => { if (entry.type() === 'error') errors.push(entry.text()); });
+    page.on('response', response => {
+      if (response.status() >= 400) errors.push(`${response.status()} ${response.url()}`);
+    });
+    page.on('request', request => {
+      if (request.method() === 'PUT') writes.push({url: request.url(), data: request.postDataJSON()});
+    });
+    async function api(suffix, method = 'GET', data) {
+      return page.evaluate(async ({suffix, method, data}) => method === 'GET'
+        ? H3Auth.request(suffix) : H3Auth.json(suffix, method, data), {suffix, method, data});
+    }
+    async function assertMissingUUID() {
+      assert.deepEqual(await page.evaluate(() => ({uuid: typeof crypto.randomUUID, random: typeof crypto.getRandomValues})),
+        {uuid: 'undefined', random: 'function'});
+    }
+    await page.goto(fixture.origin + '/director');
+    await expect(page.locator('#connection')).not.toHaveText('正在连接生成服务');
+    const project = await api('/api/projects', 'POST', {name: 'Missing randomUUID isolated regression'});
+    const projectPath = '/api/projects/' + project.id;
+    await page.goto(`${fixture.origin}/director?project=${project.id}`);
+    await expect(page.locator('#project-name')).toHaveText(project.name);
+    await assertMissingUUID();
+    const canvas = await api(projectPath);
+    const directorPath = projectPath + '/director';
+    const before = await api(projectPath);
+    assert.deepEqual(before.director?.shots || [], []);
+    for (let index = 0; index < 3; index++) await page.locator('#add-shot').click();
+    await expect.poll(async () => (await api(projectPath)).director?.shots.length || 0).toBe(3);
+    const shots = (await api(projectPath)).director.shots;
+    const shotIds = shots.map(shot => shot.id);
+    for (const id of shotIds) assert.match(id, /^shot_[a-f0-9]{32}$/);
+    assert.equal(new Set(shotIds).size, 3);
+    assert.ok(writes.some(write => write.url === fixture.origin + directorPath &&
+      write.data.shots?.length === 3), 'Add-shot must persist through an actual director PUT');
+    await page.reload();
+    await expect(page.locator('#project-name')).toHaveText(project.name);
+    await assertMissingUUID();
+    assert.deepEqual((await api(projectPath)).director.shots, shots);
+    const afterShots = await api(projectPath);
+    for (const key of ['cards', 'edges']) assert.deepEqual(afterShots[key], canvas[key], `Adding shots changed canvas ${key}`);
+    const shotAudit = await (await context.request.get(fixture.origin + '/__fixture/audit')).json();
+    for (const key of ['generation', 'outbound', 'jobs']) assert.deepEqual(shotAudit[key], []);
+
+    await page.locator('[data-stage="edit"]').click();
+    const edit = page.locator('#edit-stage');
+    await expect(edit.locator('.edit-status')).toContainText('剪辑已保存');
+    const editPath = projectPath + '/edit';
+    const upload = page.waitForResponse(response => response.url() === fixture.origin + editPath + '/upload' && response.request().method() === 'POST');
+    await edit.getByLabel('上传视频、图片或音频素材').setInputFiles(image);
+    assert.equal((await upload).status(), 200);
+    await expect(edit.locator('.edit-library .edit-asset')).toHaveCount(1);
+    await edit.getByRole('button', {name: '加入主轨', exact: true}).click();
+    const clips = edit.locator('.edit-track-clips .edit-block');
+    await expect(clips).toHaveCount(1);
+    await edit.locator('.edit-inspector').getByRole('button', {name: '复制', exact: true}).click();
+    await expect(clips).toHaveCount(2);
+    await clips.first().click();
+    const slider = edit.getByRole('slider', {name: '预览播放头（秒）'});
+    await slider.focus(); await slider.press('Home');
+    for (let frame = 0; frame < 15; frame++) await slider.press('ArrowRight');
+    await edit.locator('.edit-inspector').getByRole('button', {name: '在播放头分割', exact: true}).click();
+    await expect(clips).toHaveCount(3);
+    await edit.getByRole('button', {name: '添加文字', exact: true}).click();
+    await expect(edit.locator('.edit-track-texts .edit-block')).toHaveCount(1);
+    await expect.poll(() => page.evaluate(() => !DirectorEdit.dirty && !DirectorEdit.pending)).toBe(true);
+    const saved = (await api(editPath)).edit;
+    assert.equal(saved.clips.length, 3); assert.equal(saved.texts.length, 1);
+    const editIds = [...saved.clips.map(item => item.id), ...saved.texts.map(item => item.id)];
+    for (const item of saved.clips) assert.match(item.id, /^clip_[a-f0-9]{32}$/);
+    for (const item of saved.texts) assert.match(item.id, /^text_[a-f0-9]{32}$/);
+    assert.equal(new Set([...shotIds, ...editIds]).size, 7);
+    assert.ok(writes.some(write => write.url === fixture.origin + editPath &&
+      write.data.clips?.length === 3 && write.data.texts?.length === 1), 'Edit IDs must reach the real edit PUT');
+    await page.reload();
+    await expect(page.locator('#project-name')).toHaveText(project.name);
+    await assertMissingUUID();
+    await page.locator('[data-stage="edit"]').click();
+    await expect(clips).toHaveCount(3);
+    await expect(edit.locator('.edit-track-texts .edit-block')).toHaveCount(1);
+    assert.deepEqual((await api(editPath)).edit, saved);
+    assert.deepEqual((await api(projectPath)).director.shots, shots);
+    const after = await api(projectPath);
+    for (const key of ['cards', 'edges']) assert.deepEqual(after[key], canvas[key], `Editor changed canvas ${key}`);
+    const audit = await (await context.request.get(fixture.origin + '/__fixture/audit')).json();
+    assert.equal(path.resolve(audit.root), path.resolve(folder));
+    for (const key of ['generation', 'outbound', 'jobs']) assert.deepEqual(audit[key], []);
+    assert.deepEqual(errors, [], 'Unexpected browser or HTTP errors');
+    t.diagnostic(`Persisted ${shotIds.length} shot IDs and ${editIds.length} edit IDs without randomUUID; evidence: ${folder}`);
+  } finally {
+    if (browser) await browser.close();
+    if (fixture) await fixture.stop();
+  }
+});
+
 // Small, independently reported cases share one real session and project. Assertions
 // observe the DOM and persisted HTTP data, never private editor state or fake routes.
 test('director fifth-step real Edge smoke', {timeout: 600000}, async t => {
