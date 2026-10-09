@@ -12,12 +12,12 @@
   let config, root, ui = {}, pid = null, epoch = 0, documentEdit = null, exports = [];
   let visible = false, dirty = false, version = 0, saving = null, loading = null, operation = false;
   let blocked = false, message = '', saveTimer, pollTimer, pollBusy = false, operationTask = null, pollDenied = false;
-  let undoStack = [], redoStack = [], selection = null, dragging = null, zoom = 36;
+  let undoStack = [], redoStack = [], selection = null, dragging = null, trimming = null, zoom = 36;
   let playhead = 0, playing = false, playStarting = false, playGeneration = 0, raf = 0, clockTime = 0, clockStart = 0;
   let mediaKey = '', musicKey = '', audioContext, videoGain, musicGain, resizeObserver;
   const current = token => token === epoch && pid === config?.getContext()?.project?.id;
   const context = () => config?.getContext() || {};
-  const canWrite = () => !!documentEdit && !blocked && !!context().writable && !context().busy && !operation && !saving && !loading;
+  const canWrite = () => !!documentEdit && !blocked && !!context().writable && !context().busy && !operation && !saving && !loading && !trimming;
   const active = record => ['queued','running'].includes(record.status);
   const asset = item => documentEdit?.assets?.[item.asset];
   const duration = clip => Math.max(1, Math.round((clip.out - clip.in) / clip.speed * FPS)) / FPS;
@@ -122,6 +122,7 @@
     loading = task; renderStatus(); return task;
   }
   async function flush() {
+    if (trimming) return;
     const token = epoch;
     clearTimeout(saveTimer);
     if (saving) { await saving; if (!current(token)) return; }
@@ -161,6 +162,7 @@
     operationTask = task; return task;
   }
   async function flushAll() {
+    if (trimming) finishTrim(false);
     const token = epoch;
     if (operationTask) await operationTask;
     if (!current(token)) return;
@@ -185,23 +187,25 @@
   }
   function renderStatus() {
     if (!root) return;
-    ui.status.textContent = message || (loading ? '正在读取剪辑文档…' : operation ? '正在处理…' : saving ? '剪辑保存中…' : dirty ? '剪辑有修改 · 即将保存' : documentEdit ? `剪辑已保存 · 修订 ${documentEdit.rev}` : '打开项目后开始剪辑');
+    if (trimming && (!context().writable || context().busy || blocked)) finishTrim(true);
+    ui.status.textContent = message || (loading ? '正在读取剪辑文档…' : trimming ? '正在裁剪 · 松开保存，Esc 取消' : operation ? '正在处理…' : saving ? '剪辑保存中…' : dirty ? '剪辑有修改 · 即将保存' : documentEdit ? `剪辑已保存 · 修订 ${documentEdit.rev}` : '打开项目后开始剪辑');
     ui.status.classList.toggle('error', blocked || message.includes('失败') || message.includes('冲突'));
     ui.recovery.hidden = !blocked;
     root.querySelectorAll('[data-edit-write]').forEach(control => { control.disabled = !canWrite() || control.dataset.editInvalid === '1'; });
     root.querySelectorAll('.edit-track-clips .edit-block').forEach(control => { control.draggable = canWrite(); });
     ui.undo.disabled = !canWrite() || !undoStack.length; ui.redo.disabled = !canWrite() || !redoStack.length;
-    ui.save.disabled = !dirty || blocked || operation || !!saving || !context().writable;
+    root.querySelectorAll('.edit-trim-handle').forEach(handle => handle.setAttribute('aria-disabled', String(!canWrite())));
+    ui.save.disabled = !dirty || blocked || operation || !!saving || !!trimming || !context().writable;
     ui.draft.disabled = !documentEdit;
     ui.play.disabled = !documentEdit || totalDuration() <= 0;
     ui.reload.disabled = operation || !!saving || !!loading;
     ui.order.disabled = !canWrite() || !orderedAdopted().length;
     ui.exportButton.disabled = !canWrite() || totalDuration() <= 0;
-    config?.onStateChange?.({dirty, pending:!!saving || operation});
+    config?.onStateChange?.({dirty, pending:!!saving || operation || !!trimming});
   }
   function init(container) {
     if (root) return;
-    root = container;
+    root = container; root.tabIndex = -1;
     const toolbar = node('div','edit-toolbar');
     ui.status = node('span','edit-status'); ui.status.setAttribute('role','status');
     ui.undo = button('撤销', () => restore(undoStack, redoStack));
@@ -253,8 +257,15 @@
     zoomLabel.append(zoomInput); timelineTools.append(zoomLabel);
     ui.timelineScroll = node('div','edit-timeline-scroll'); ui.timeline = node('div','edit-timeline'); ui.timelineScroll.append(ui.timeline);
     ui.rangeWarning = node('p','notice warning'); ui.rangeWarning.hidden = true;
+    const shortcuts = node('div','edit-shortcuts');
+    shortcuts.setAttribute('aria-label','时间轨快捷键说明');
+    shortcuts.append(node('b','','选中片段后使用快捷键（输入框内不触发）'),
+      node('p','','空格：播放 / 暂停 · ← / →：−1 / +1 帧 · Shift + ← / →：−10 / +10 帧 · Home / End：片头 / 片尾'),
+      node('p','','Delete / Backspace：删除 · S 或 Ctrl / Cmd + B：在播放头分割画面片段 · Q：裁掉播放头之前 · W：裁掉播放头之后'),
+      node('p','','Ctrl / Cmd + Z：撤销 · Ctrl / Cmd + Shift + Z 或 Ctrl + Y：重做 · Esc：取消边缘拖拽'),
+      node('p','','拖拽片段左右边缘调整片长 / 裁剪；视频保持速度，图片调整停留时长。主轨裁剪后连续收拢，拖拽片段中部排序。短片段请先放大时间线。'));
     center.append(settings, ui.canvas, ui.music, ui.mediaStatus, transport, timelineTools, ui.timelineScroll,
-      ui.rangeWarning, node('p','muted','主轨连续排列，拖动片段或用前移 / 后移排序；音频仅一轨，可有间隔但不可重叠。文字可叠加。成片长度只取画面主轨，超出部分不会导出。'));
+      shortcuts, ui.rangeWarning, node('p','muted','音频仅一轨，可有间隔但不可重叠。文字可叠加。成片长度只取画面主轨，超出部分不会导出。'));
     ui.inspector = node('aside','edit-inspector section-card'); ui.inspector.setAttribute('aria-label','剪辑片段参数');
     grid.append(library, center, ui.inspector);
     const exportPanel = node('section','section-card edit-exports');
@@ -270,14 +281,29 @@
     root.append(toolbar, ui.recovery, grid, exportPanel, ui.resultDialog);
     resizeObserver = new ResizeObserver(() => renderOverlay()); resizeObserver.observe(ui.canvas);
     document.addEventListener('visibilitychange', () => {
-      if (document.hidden) { pause(); clearTimeout(pollTimer); }
+      if (document.hidden) { finishTrim(true); pause(); clearTimeout(pollTimer); }
       else if (visible) schedulePoll();
     });
-    window.addEventListener('h3auth:expired', () => { blocked = true; pause(); clearTimeout(pollTimer); renderStatus(); });
+    window.addEventListener('h3auth:expired', () => { finishTrim(true); blocked = true; pause(); clearTimeout(pollTimer); renderStatus(); });
+    window.addEventListener('blur', () => finishTrim(true));
     root.addEventListener('keydown', event => {
-      if (event.target.matches('input,textarea,select') || !visible || ui.resultDialog.open) return;
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'z') { event.preventDefault(); restore(event.shiftKey ? redoStack : undoStack, event.shiftKey ? undoStack : redoStack); }
-      if (event.code === 'Space') { event.preventDefault(); togglePlay(); }
+      if (!visible || root.hidden || event.isComposing || event.target.closest('input,textarea,select,[contenteditable]:not([contenteditable="false"])') || document.querySelector('dialog[open]')) return;
+      if (trimming) {
+        if (event.key === 'Escape') { event.preventDefault(); finishTrim(true); }
+        return;
+      }
+      const key = event.key.toLowerCase(), command = event.ctrlKey || event.metaKey;
+      if (event.altKey) return;
+      if (command && key === 'z') { event.preventDefault(); if (!event.repeat) restore(event.shiftKey ? redoStack : undoStack, event.shiftKey ? undoStack : redoStack); return; }
+      if (event.ctrlKey && key === 'y') { event.preventDefault(); if (!event.repeat) restore(redoStack, undoStack); return; }
+      if (command && key !== 'b') return;
+      if (event.code === 'Space') { event.preventDefault(); if (!event.repeat) togglePlay(); return; }
+      if (['ArrowLeft','ArrowRight'].includes(event.key)) { event.preventDefault(); seek(playhead + (event.key === 'ArrowLeft' ? -1 : 1) * (event.shiftKey ? 10 : 1) / FPS); return; }
+      if (event.key === 'Home' || event.key === 'End') { event.preventDefault(); seek(event.key === 'Home' ? 0 : totalDuration()); return; }
+      if (!canWrite() || !selection || event.repeat) return;
+      if (key === 'delete' || key === 'backspace') { event.preventDefault(); deleteSelection(); }
+      else if ((!command && key === 's' || command && key === 'b') && selection.track === 'clips') { event.preventDefault(); splitClip(selection.id); }
+      else if (!command && (key === 'q' || key === 'w')) { event.preventDefault(); cropSelection(key === 'q' ? 'start' : 'end'); }
     });
     renderStatus();
   }
@@ -286,7 +312,7 @@
     if (!documentEdit) load(); else { render(); schedulePoll(); }
   }
   function hide() {
-    visible = false; pause(); clearTimeout(pollTimer);
+    finishTrim(true); visible = false; pause(); clearTimeout(pollTimer);
     if (root) { root.hidden = true; if (ui.resultDialog.open) ui.resultDialog.close(); }
   }
   function adopted() { return context().outputs || []; }
@@ -435,6 +461,118 @@
       Math.round(item.start * FPS) < Math.round((other.start + other.out - other.in) * FPS) &&
       Math.round(end * FPS) > Math.round(other.start * FPS))) throw new Error('同一音频轨不能重叠，请调整开始时间或裁剪范围');
   }
+  function itemRange(track, item) {
+    if (track === 'clips') {
+      const position = clipPositions().find(value => value.clip.id === item.id);
+      return {start:position.start, end:position.end};
+    }
+    return {start:item.start, end:track === 'audio' ? q(item.start + item.out - item.in) : item.end};
+  }
+  function trimEdge(track, item, original, side, delta) {
+    const frame = 1 / FPS;
+    const bounded = (value, low, high) => clamp(q(value), Math.ceil((low - 1e-7) * FPS) / FPS, Math.floor((high + 1e-7) * FPS) / FPS);
+    if (track === 'clips') {
+      const available = Math.min(3600, 3600 - q(totalDuration() - duration(item)));
+      if (asset(item).kind === 'image') {
+        item.in = 0; item.speed = 1;
+        item.out = bounded(original.out + (side === 'start' ? -delta : delta), frame, available);
+      } else if (side === 'start') {
+        item.in = bounded(original.in + delta * original.speed, Math.max(0, original.out - available * original.speed), original.out - frame);
+      } else {
+        item.out = bounded(original.out + delta * original.speed, original.in + frame, Math.min(sourceEnd(item), original.in + available * original.speed));
+      }
+    } else if (track === 'audio') {
+      const end = q(original.start + original.out - original.in);
+      const others = documentEdit.audio.filter(other => other.id !== item.id);
+      const previous = Math.max(0, ...others.filter(other => other.start < original.start).map(other => q(other.start + other.out - other.in)));
+      const next = Math.min(Infinity, ...others.filter(other => other.start >= end - 1e-7).map(other => other.start));
+      if (side === 'start') {
+        const start = bounded(original.start + delta, Math.max(previous, original.start - original.in), Math.min(3600, end - frame));
+        item.start = start; item.in = q(original.in + start - original.start);
+      } else {
+        item.out = bounded(original.out + delta, original.in + frame, Math.min(sourceEnd(item), original.in + next - original.start));
+      }
+    } else if (side === 'start') item.start = bounded(original.start + delta, 0, original.end - frame);
+    else item.end = bounded(original.end + delta, original.start + frame, 3600);
+  }
+  function cropSelection(side) {
+    mutate(() => {
+      const item = documentEdit[selection.track].find(value => value.id === selection.id);
+      if (!item) return;
+      const range = itemRange(selection.track, item);
+      if (playhead <= range.start || playhead >= range.end) throw new Error('请把播放头移到选中片段内部');
+      trimEdge(selection.track, item, clone(item), side, playhead - range[side]);
+    });
+  }
+  function focusTimeline() {
+    (ui.timeline.querySelector('.edit-block.selected') || root).focus({preventScroll:true});
+  }
+  function beginTrim(event, track, item, side, handle) {
+    event.stopPropagation(); event.preventDefault();
+    if (event.button !== 0 || !canWrite()) return;
+    pause(); clearTimeout(saveTimer); dragging = null;
+    selection = {track,id:item.id};
+    trimming = {track,id:item.id,side,original:clone(item),before:editableSnapshot(),pointer:event.pointerId,
+      x:event.clientX,scroll:ui.timelineScroll.scrollLeft,zoom,handle,token:epoch};
+    ui.timeline.querySelectorAll('.edit-block').forEach(block => block.classList.toggle('selected', block.dataset.track === track && block.dataset.id === item.id));
+    handle.parentElement.focus({preventScroll:true});
+    handle.setPointerCapture(event.pointerId);
+    window.addEventListener('pointermove', moveTrim);
+    window.addEventListener('pointerup', endTrim);
+    window.addEventListener('pointercancel', cancelTrim);
+    handle.addEventListener('lostpointercapture', cancelTrim);
+    root.classList.add('edit-trimming'); renderInspector(); renderStatus();
+  }
+  function moveTrim(event) {
+    const gesture = trimming;
+    if (!gesture || event.pointerId !== gesture.pointer) return;
+    if (!current(gesture.token) || !visible || blocked || !context().writable || context().busy) { finishTrim(true); return; }
+    event.preventDefault();
+    const item = documentEdit[gesture.track].find(value => value.id === gesture.id);
+    const delta = (event.clientX - gesture.x + ui.timelineScroll.scrollLeft - gesture.scroll) / gesture.zoom;
+    const previous = clone(item);
+    try { trimEdge(gesture.track, item, gesture.original, gesture.side, delta); validateLocal(); }
+    catch { Object.assign(item, previous); }
+    playhead = q(clamp(playhead,0,totalDuration()));
+    paintTimeline(); renderInspector(); syncPreview(true); updateTransport();
+  }
+  function endTrim(event) {
+    if (event.pointerId !== trimming?.pointer) return;
+    moveTrim(event); finishTrim(false);
+  }
+  function cancelTrim(event) { if (!event || event.pointerId === trimming?.pointer) finishTrim(true); }
+  function finishTrim(cancel) {
+    const gesture = trimming; if (!gesture) return;
+    trimming = null;
+    window.removeEventListener('pointermove', moveTrim); window.removeEventListener('pointerup', endTrim); window.removeEventListener('pointercancel', cancelTrim);
+    gesture.handle.removeEventListener('lostpointercapture', cancelTrim);
+    if (gesture.handle.hasPointerCapture(gesture.pointer)) gesture.handle.releasePointerCapture(gesture.pointer);
+    root.classList.remove('edit-trimming');
+    if (cancel || !current(gesture.token) || blocked || !context().writable || context().busy) {
+      Object.assign(documentEdit, gesture.before);
+      if (dirty) saveTimer = setTimeout(() => flush().catch(() => {}),900);
+      render();
+    } else if (JSON.stringify(gesture.before) !== JSON.stringify(editableSnapshot())) {
+      undoStack.push(gesture.before); if (undoStack.length > HISTORY_LIMIT) undoStack.shift();
+      redoStack = []; changed();
+    } else {
+      if (dirty) saveTimer = setTimeout(() => flush().catch(() => {}),900);
+      render();
+    }
+    focusTimeline();
+  }
+  function paintTimeline() {
+    const total = totalDuration();
+    ui.timeline.style.width = `${Math.max(450,Math.max(10,timelineDuration()) * zoom)}px`;
+    ui.rangeWarning.hidden = timelineDuration() <= total + 1e-7;
+    ui.rangeWarning.textContent = `成片长度 ${total.toFixed(2)} 秒：部分音频或文字超出画面主轨，预览与导出会在成片末尾截断。`;
+    for (const block of ui.timeline.querySelectorAll('.edit-block')) {
+      const item = documentEdit[block.dataset.track].find(value => value.id === block.dataset.id);
+      const {start,end} = itemRange(block.dataset.track,item);
+      block.style.left = `${start * zoom}px`; block.style.width = `${Math.max(2,(end - start) * zoom)}px`;
+      block.title = `${block.dataset.track === 'texts' ? item.text : assetName(item.asset)} · ${start.toFixed(2)}–${end.toFixed(2)} 秒`;
+    }
+  }
   function moveClip(id, offset) {
     mutate(() => {
       const index = documentEdit.clips.findIndex(item => item.id === id), target = index + offset;
@@ -537,6 +675,8 @@
   }
   function renderTimeline() {
     if (!documentEdit) return;
+    if (trimming) { paintTimeline(); return; }
+    const focused = ui.timeline.contains(document.activeElement) || document.activeElement === root;
     const total = totalDuration(), length = Math.max(10, timelineDuration()), width = Math.max(450, length * zoom);
     ui.rangeWarning.hidden = timelineDuration() <= total + 1e-7;
     ui.rangeWarning.textContent = `成片长度 ${total.toFixed(2)} 秒：部分音频或文字超出画面主轨，预览与导出会在成片末尾截断。`;
@@ -549,9 +689,10 @@
       const tick = node('span','edit-tick',`${time}s`); tick.style.left = `${time * zoom}px`; ruler.append(tick);
     }
     ruler.onpointerdown = event => {
-      if (event.button !== 0) return;
+      if (event.button !== 0 || trimming) return;
+      event.preventDefault();
       const update = e => seek((e.clientX - ruler.getBoundingClientRect().left) / zoom);
-      update(event); ruler.setPointerCapture(event.pointerId);
+      update(event); focusTimeline(); ruler.setPointerCapture(event.pointerId);
       ruler.onpointermove = update;
       ruler.onpointerup = ruler.onpointercancel = () => { ruler.onpointermove = null; };
     };
@@ -576,7 +717,17 @@
         block.title = `${block.textContent} · ${start.toFixed(2)}–${end.toFixed(2)} 秒`;
         block.style.left = `${start * zoom}px`; block.style.width = `${Math.max(2,(end - start) * zoom)}px`;
         block.style.top = `${26 + lane * 38}px`;
-        block.onclick = () => { selection = {track:track.key,id:item.id}; renderTimeline(); renderInspector(); renderStatus(); };
+        block.dataset.track = track.key; block.dataset.id = item.id;
+        for (const side of ['start','end']) {
+          const handle = node('span','edit-trim-handle'); handle.dataset.side = side;
+          handle.title = side === 'start' ? '拖拽裁剪左边缘' : '拖拽裁剪右边缘';
+          handle.setAttribute('aria-label',handle.title);
+          handle.onpointerdown = event => beginTrim(event, track.key, item, side, handle);
+          handle.onclick = event => { event.preventDefault(); event.stopPropagation(); };
+          handle.ondragstart = event => event.preventDefault();
+          block.append(handle);
+        }
+        block.onclick = () => { if (trimming) return; selection = {track:track.key,id:item.id}; renderTimeline(); renderInspector(); renderStatus(); focusTimeline(); };
         if (track.key === 'clips') {
           block.draggable = canWrite();
           block.ondragstart = event => { if (!canWrite()) { event.preventDefault(); return; } dragging = item.id; event.dataTransfer.setData('text/plain',item.id); event.dataTransfer.effectAllowed = 'move'; };
@@ -592,11 +743,12 @@
         row.append(block);
       }
       row.style.height = `${Math.max(1,lanes.length) * 38 + 30}px`;
-      row.onclick = event => { if (event.target === row) seek((event.clientX - row.getBoundingClientRect().left) / zoom); };
+      row.onclick = event => { if (event.target === row) { seek((event.clientX - row.getBoundingClientRect().left) / zoom); focusTimeline(); } };
       ui.timeline.append(row);
     }
     ui.playheadLine = node('div','edit-playhead'); ui.timeline.append(ui.playheadLine);
     updateTransport();
+    if (focused) focusTimeline();
   }
   function outputSize() {
     const side = Number(documentEdit?.resolution || 720), wide = side === 1080 ? 1920 : 1280;
@@ -781,6 +933,6 @@
   window.DirectorEdit = {
     configure(options) { config = options; }, init, setContext, mount, hide, flush:flushAll,
     refresh() { if (visible && documentEdit) { renderLibrary(); renderStatus(); } },
-    get dirty() { return dirty; }, get pending() { return !!saving || operation; }
+    get dirty() { return dirty; }, get pending() { return !!saving || operation || !!trimming; }
   };
 })();
