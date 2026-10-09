@@ -3162,6 +3162,7 @@ function bindGlobal() {
     if (!el.menu.contains(ev.target) && !ev.target.closest(".tcap")) closeMenu();
   }, true);
 
+  document.addEventListener('paste', handleClipboardPaste);
   document.addEventListener("keydown", (ev) => {
     // 大图开着时左右键翻同一个节点的下一个产物（分镜九宫格）
     if (el.view.style.display !== "none" && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) {
@@ -3183,7 +3184,11 @@ function bindGlobal() {
       if ((ev.ctrlKey || ev.metaKey) && !ev.shiftKey && !ev.altKey) {
         const k = ev.key.toLowerCase();
         if (k === "c" && c) { ev.preventDefault(); copyCard(c); return; }
-        if (k === "v") { ev.preventDefault(); pasteCard(); return; }
+        if (k === "v") {
+          // 参数面板开着时让原生 paste 先读取文件；没有媒体再粘贴复制的节点。
+          if (clipboardPasteTarget()) return;
+          ev.preventDefault(); pasteCard(); return;
+        }
       }
       // H键：将选中的节点定位到屏幕中上方
       if (ev.key.toLowerCase() === "h" && c && !ev.ctrlKey && !ev.metaKey && !ev.shiftKey && !ev.altKey) {
@@ -3798,16 +3803,24 @@ function rollbackFailedCard(card) {
   render();
 }
 
-function queueCardCreate(card) {
-  const projectId = PROJ.id;
+function queueCardCreate(card, preserveLocal = false) {
+  const project = PROJ, projectId = project.id;
   pendingCardCreates += 1;
   saveChain = saveChain.then(async () => {
     try {
       const result = await jpost(`/api/projects/${encodeURIComponent(projectId)}/cards`, { card: plain(card) });
-      if (PROJ?.id !== projectId) return;
-      reconcileCreatedCard(result.project, card);
+      if (preserveLocal) {
+        if (PROJ !== project || !project.cards.includes(card)) return false;
+        // 后台添加素材不能用建卡响应替换正在编辑的节点及其未保存参数。
+        const remote = result.project.cards.find(item => item.id === card.id);
+        mergeCollaborativeCard(remote, result.project.rev);
+      } else {
+        if (PROJ?.id !== projectId) return false;
+        reconcileCreatedCard(result.project, card);
+      }
+      return true;
     } catch (error) {
-      if (PROJ?.id === projectId) {
+      if (preserveLocal ? PROJ === project : PROJ?.id === projectId) {
         workFailure = error;
         rollbackFailedCard(card);
         toast("卡片添加失败：" + error.message);
@@ -3817,9 +3830,10 @@ function queueCardCreate(card) {
       flushPendingProjectSync();
     }
   });
+  return saveChain;
 }
 
-function addCard(type, x, y, cap) {
+function addCard(type, x, y, cap, select = true) {
   if (!requireOperate()) return null;
   const def = cardDef(type);
   if (!def || !def.modes || !def.modes.length) {
@@ -3840,7 +3854,8 @@ function addCard(type, x, y, cap) {
 
   PROJ.cards.push(c);
   el.world.appendChild(buildCard(c));
-  pick(c.id); drawWires(); queueCardCreate(c);
+  if (select) pick(c.id);
+  drawWires(); c._create = queueCardCreate(c, !select);
   return c;
 }
 
@@ -3924,6 +3939,122 @@ async function pasteCard() {
     if (!result.card) throw new Error('复制接口未返回节点');
     insertPastedCard(result.card, at);
   } catch (error) { toast(`粘贴失败：${error.message}`); }
+}
+
+const CLIPBOARD_MEDIA_EXT = {png:'image',jpg:'image',jpeg:'image',webp:'image',gif:'image',bmp:'image',mp4:'video',webm:'video',mkv:'video',mov:'video',avi:'video'};
+const CLIPBOARD_MEDIA_MIME = {'image/png':'png','image/jpeg':'jpg','image/webp':'webp','image/gif':'gif','image/bmp':'bmp',
+  'video/mp4':'mp4','video/webm':'webm','video/x-matroska':'mkv','video/quicktime':'mov','video/x-msvideo':'avi'};
+let clipboardMediaChain = Promise.resolve();
+function clipboardMediaKind(file) {
+  return CLIPBOARD_MEDIA_EXT[/\.([a-z0-9]+)$/i.exec(file.name || '')?.[1].toLowerCase()] || CLIPBOARD_MEDIA_EXT[CLIPBOARD_MEDIA_MIME[file.type]] || null;
+}
+function clipboardPasteTarget() {
+  if (!PROJ || el.panel.style.display === 'none' || el.panel.style.visibility === 'hidden' ||
+      el.view.style.display !== 'none' || document.querySelector('dialog[open]')) return null;
+  const target = NODE_EDITOR ? editorCard() : cardOf(el.panel._id);
+  return target && target.id === el.panel._id ? target : null;
+}
+function clipboardReferencePlan(target, kind) {
+  if (isTextCard(target) || isAsset(target)) throw new Error('当前节点不接收图片 / 视频引用，请先打开生成或工具节点的参数面板');
+  const def = defOf(target), current = capOf(target), route = routeFor(target,kind);
+  let cap = target.cap;
+  if (route) cap = route.cap;
+  else if (def?.id === 'card_image' && kind === 'image' && ['zimage_t2i','krea2_t2i'].includes(cap)) cap = cap.replace('_t2i','_i2i');
+  else if (def?.id === 'card_video' && kind === 'video' && !current?.inputs.some(spec => spec.type === kind)) {
+    const mode = def.modes.find(item => modeTakes(item,kind));
+    if (mode) cap = modeCap(mode);
+  }
+  const incoming = PROJ.edges.filter(edge => edge.to === target.id && !isTextEdge(edge));
+  if (cap !== target.cap && (Object.values(target.assets || {}).some(Boolean) || incoming.length)) {
+    throw new Error('引用此素材需要切换模式；为保留已有引用，请先手动选择对应模式');
+  }
+  const capability = CAPS[cap];
+  const slots = capability?.inputs.filter(spec => spec.type === kind) || [];
+  const limit = mediaLimit(capability,kind);
+  const occupied = spec => !!target.assets?.[spec.key] || incoming.some(edge => edgeSlots(edge).includes(spec.key));
+  const slot = slots.find(spec => !occupied(spec));
+  if (!slot || slots.filter(occupied).length >= limit) {
+    throw new Error(slots.length ? `${KIND_ZH[kind]}引用已满，不会覆盖已有素材` : `当前节点没有可接收的${KIND_ZH[kind]}槽位`);
+  }
+  return {cap,slot};
+}
+async function pasteClipboardMedia(files, project, target) {
+  let expectedCap = target.cap;
+  const valid = () => PROJ === project && canSave() && project.cards.includes(target) &&
+    clipboardPasteTarget() === target && target.cap === expectedCap;
+  try {
+    if (!valid()) return;
+    if (!cardDef('card_asset')) throw new Error('找不到素材节点定义');
+    // 整批先检查容量，避免最后一个文件没有槽位时留下半批引用。
+    const planned = {...target,assets:{...target.assets}};
+    for (const file of files) {
+      const plan = clipboardReferencePlan(planned,clipboardMediaKind(file));
+      planned.cap = plan.cap; planned.assets[plan.slot.key] = true;
+    }
+    for (const file of files) {
+      if (!valid()) return;
+      const kind = clipboardMediaKind(file);
+      clipboardReferencePlan(target,kind);
+      const ext = /\.([a-z0-9]+)$/i.exec(file.name || '')?.[1].toLowerCase();
+      const upload = CLIPBOARD_MEDIA_EXT[ext] ? file : new File([file],`${file.name || '剪贴板素材'}.${CLIPBOARD_MEDIA_MIME[file.type]}`,{type:file.type});
+      const item = await uploadAsset(upload);
+      if (!valid()) return;
+      if (item.kind !== kind) throw new Error('上传素材类型不匹配，未创建节点或引用');
+      // 旧的排队 PUT 会读取届时的 cards；先排空，避免把尚未建卡的素材 ID 提前提交。
+      for (;;) {
+        const chain = saveChain;
+        await chain;
+        if (!valid()) return;
+        if (chain === saveChain) break;
+      }
+      clipboardReferencePlan(target,kind);
+      const at = blankSpot();
+      const material = addCard('card_asset',at.x,at.y,null,false);
+      if (!material) return;
+      await setAssetItem(material,item,false);
+      if (!await material._create) return;
+      if (!valid() || !project.cards.includes(material)) {
+        if (PROJ === project) toast('素材已导入，但当前节点已改变，未添加引用');
+        return;
+      }
+      const plan = clipboardReferencePlan(target,kind);
+      if (plan.cap !== target.cap) {
+        if (defOf(target)?.id === 'card_image') {
+          switchImageCapability(target,plan.cap);
+          if (!target._model) target._model = plan.cap.startsWith('krea2') ? 'krea2' : 'zimage';
+        } else target.cap = plan.cap;
+        expectedCap = target.cap; paintTitle(target);
+      }
+      target.assets[plan.slot.key] = JSON.parse(JSON.stringify(material.outputs[0]));
+      project.edges.push({from:material.id,to:target.id,slot:plan.slot.key,slots:[plan.slot.key]});
+      drawWires(); paintStyles(); paintKind(target); openPanel(target.id); save();
+      toast(`已导入${KIND_ZH[kind]}素材并引用到「${titleOf(target)}」的${slotName(plan.slot,target)}`);
+    }
+  } catch (error) {
+    if (PROJ === project) toast('剪贴板导入失败：' + error.message);
+  }
+}
+function handleClipboardPaste(event) {
+  if (event.defaultPrevented) return;
+  const target = clipboardPasteTarget();
+  if (!target) return;
+  const data = event.clipboardData;
+  const items = [...(data?.items || [])].filter(item => item.kind === 'file').map(item => item.getAsFile()).filter(Boolean);
+  const files = items.length ? items : [...(data?.files || [])];
+  if (files.length) {
+    event.preventDefault();
+    if (!canSave()) return toast('此画布只读或已锁定，不能导入剪贴板素材');
+    const media = files.filter(file => clipboardMediaKind(file));
+    if (!media.length) return toast('剪贴板仅支持图片或视频文件');
+    const project = PROJ;
+    clipboardMediaChain = clipboardMediaChain.then(() => pasteClipboardMedia(media,project,target));
+    trackNodeWork(clipboardMediaChain);
+    return;
+  }
+  const typing = event.target.closest('input,textarea,select') || event.target.isContentEditable;
+  if (typing || NODE_EDITOR) return;
+  if (CLIP) { event.preventDefault(); pasteCard(); }
+  else if (data?.types.length) toast('剪贴板未提供可读取的图片 / 视频文件；复制路径不能导入，请拖入文件或上传');
 }
 
 /* ================= 连线传产物 ================= */
@@ -4667,6 +4798,9 @@ function openPanel(id) {
   // 中间这坨才滚动：模式切换留在顶部、运行按钮留在底部，参数再多也不会被推出屏幕
   const body = document.createElement("div"); body.className = "pbody";
   el.panel.appendChild(body);
+  const clipboardHint = document.createElement('div'); clipboardHint.className = 'knobnote clipboard-media-hint';
+  clipboardHint.textContent = 'Ctrl / Cmd + V：粘贴截图或图片 / 视频文件，自动创建素材节点并引用到空槽；不覆盖已有引用。复制文件需浏览器提供文件数据，仅路径文字无法导入。';
+  body.appendChild(clipboardHint);
   if (NODE_EDITOR) {
     const supplement = directorSupplement(c);
     if (supplement.length) {
@@ -6578,12 +6712,14 @@ function pickAsset(c, onItem) {
 /** 把上传接口回来的那一份（无 filename 键）抄进素材节点的 outputs[0]，
     并补一个 filename —— 画面区 meta 行、下载都按产物那套读它。
     卡片保持默认尺寸，图片/视频在画面区内等比例完整显示。 */
-async function setAssetItem(c, item) {
+async function setAssetItem(c, item, showPanel = true) {
   if (!requireOperate() || !PROJ.cards.includes(c)) return;
   c.outputs = [{ ...item, filename: (item.origin || item.url).split(/[\\/]/).pop() }];
   delete c.w; delete c.h;
   applySize(c);
-  paint(c); paintTitle(c); openPanel(c.id); drawWires(); save();
+  paint(c); paintTitle(c);
+  if (showPanel) openPanel(c.id);
+  drawWires(); save();
 
   // 同步更新所有引用这个素材节点的下游节点。上游曾清空过时下游格也会是空的，
   // 不能拿“当前有值”当条件，否则重新选择文件后连线还在、引用却恢复不了。
@@ -6601,7 +6737,7 @@ async function setAssetItem(c, item) {
   if (item.kind === "image") {
     const img = new Image();
     img.onload = () => {
-      if (c.outputs[0]?.url !== item.url) return;
+      if (!PROJ?.cards.includes(c) || c.outputs[0]?.url !== item.url) return;
       const w0 = img.naturalWidth, h0 = img.naturalHeight;
       c.outputs[0].width = w0;   // 存原始尺寸，paintKind 会读它
       c.outputs[0].height = h0;
@@ -6611,7 +6747,7 @@ async function setAssetItem(c, item) {
   } else if (item.kind === "video") {
     const v = document.createElement("video");
     v.onloadedmetadata = () => {
-      if (c.outputs[0]?.url !== item.url) return;
+      if (!PROJ?.cards.includes(c) || c.outputs[0]?.url !== item.url) return;
       const w0 = v.videoWidth, h0 = v.videoHeight;
       c.outputs[0].width = w0;
       c.outputs[0].height = h0;
