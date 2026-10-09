@@ -683,6 +683,55 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         payload["mode"] = "verified"
         self.assertEqual((await self.client.post("/api/capacity/estimate", json=payload)).status, 400)
 
+    async def test_capacity_readable_summary_preserves_model_and_hardware_sources(self):
+        import time
+        now = time.time()
+        credentials = self.store.register_worker("可读性测试机器", {
+            "agent_version": 3,
+            "devices": [{"name": "RTX 4090", "type": "cuda", "vram_total": 24 * 1024 ** 3}],
+            "system": {"ram_total": 96 * 1024 ** 3, "os": "win32"},
+        })
+        worker_id = credentials["worker_id"]
+        self.store.heartbeat(worker_id, comfy_online=True)
+        graph = json.loads((ROOT / "graphs/qwen_image_21_t2i.api.json").read_text())
+        payload = {"capability": "qwen_image_21_t2i", "capacity_spec": controller_app.make_spec(
+            "qwen_image_21_t2i", {"output_kind": "image"}, graph, {})}
+        with self.store.lock, self.store.db:
+            worker = dict(self.store.db.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone())
+            self.store.capacity.enqueue("readable-captured", payload, now - 200)
+            self.store.capacity.assigned("readable-captured", worker, "synthetic-lease-hash", now - 199)
+            self.store.capacity.running("readable-captured", worker_id, "synthetic-lease-hash", now - 198)
+            self.store.capacity.terminal("readable-captured", worker_id, "synthetic-lease-hash",
+                                         "done", now - 120, released=True)
+        historical = {"id": "readable-history", "capability": "qwen_image_21_t2i",
+                      "status": "queued", "created": now - 500, "worker_id": worker_id}
+        self.ledger.record_job(historical)
+        self.ledger.start_job(historical["id"], worker_id, now - 499)
+        self.ledger.finish_job(historical["id"], "done", now - 450, worker_id)
+        response = await self.client.get("/api/capacity")
+        self.assertEqual(response.status, 200)
+        report = await response.json()
+        machine = report["workers"][0]
+        self.assertEqual(machine["agent_version"], 3)
+        self.assertFalse(machine["supports_capacity_telemetry"])
+        self.assertEqual(machine["hardware"]["gpus"][0]["memory_total_bytes"], 24 * 1024 ** 3)
+        self.assertEqual(machine["hardware"]["memory_total_bytes"], 96 * 1024 ** 3)
+        self.assertIsNone(machine["hardware"]["cpu"])
+        groups = {group["source"]: group for group in report["groups"]}
+        summary = groups["captured"]["model_summary"]
+        self.assertEqual(summary["precision_label"], "INT8")
+        self.assertEqual(summary["source"], "task_snapshot")
+        self.assertFalse(summary["runtime_verified"])
+        self.assertEqual([item["name"] for item in summary["models"]],
+                         ["qwen_image_2.1_int8_convrot.safetensors"])
+        self.assertEqual(groups["captured"]["mean_seconds"], 78)
+        self.assertEqual(groups["captured"]["last_sample_at"], now - 200)
+        self.assertIsNone(groups["historical"]["model_summary"]["precision_label"])
+        self.assertEqual(groups["historical"]["model_summary"]["source"], "unrecorded")
+        encoded = json.dumps(report)
+        for secret in (credentials["worker_token"], "synthetic-lease-hash"):
+            self.assertNotIn(secret, encoded)
+
     async def test_capacity_attempt_and_artifact_capture_do_not_trust_worker_metadata(self):
         import time
         credentials = self.store.register_worker("产能测试节点", {})
