@@ -153,7 +153,7 @@ function fixtures(folder, executable) {
 
 // Small, independently reported cases share one real session and project. Assertions
 // observe the DOM and persisted HTTP data, never private editor state or fake routes.
-test('director fifth-step real Edge smoke', {timeout: 300000}, async t => {
+test('director fifth-step real Edge smoke', {timeout: 600000}, async t => {
   const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'chouka-director-edit-'));
   const report = {folder, cases: [], browserErrors: [], failedRequests: [], generation: [], httpErrors: []};
   let fixture, browser, context, page, project, media, initialCanvas;
@@ -205,6 +205,106 @@ test('director fifth-step real Edge smoke', {timeout: 300000}, async t => {
   }
   const near = (actual, expected, tolerance = 0.034) => assert.ok(Math.abs(actual - expected) <= tolerance, `${actual} != ${expected}`);
   const clipLength = clip => Math.round((clip.out - clip.in) / clip.speed * 30) / 30;
+  const content = data => { const copy = structuredClone(data); delete copy.rev; return copy; };
+  const block = (track, id) => edit().locator(`.edit-block[data-track="${track}"][data-id="${id}"]`);
+  const editWrites = [];
+  async function openEdit() {
+    await page.reload();
+    await expect(page.locator('#project-name')).toHaveText(project.name);
+    await page.locator('[data-stage="edit"]').click();
+    await expect(edit().locator('.edit-status')).toContainText('剪辑已保存');
+  }
+  async function restoreEdit(snapshot) {
+    await waitSaved();
+    const latest = await saved();
+    const restored = (await api(endpoint(), 'PUT', {...structuredClone(snapshot), rev: latest.rev})).edit;
+    await openEdit();
+    assert.deepEqual(await saved(), restored, 'Real PUT + reload must restore the case fixture');
+    return restored;
+  }
+  async function geometry(track, id) {
+    return block(track, id).evaluate(node => ({left: parseFloat(node.style.left), width: parseFloat(node.style.width)}));
+  }
+  async function assertTimeline(data, scale = 36) {
+    let start = 0;
+    assert.deepEqual(await clips().evaluateAll(nodes => nodes.map(node => node.dataset.id)), data.clips.map(item => item.id), 'Resizing must not HTML-reorder clips');
+    for (const item of data.clips) {
+      const node = block('clips', item.id), box = await geometry('clips', item.id);
+      await expect(node).toContainText(data.assets[item.asset].filename);
+      near(box.left, start * scale, 0.15); near(box.width, Math.max(2, clipLength(item) * scale), 0.15);
+      start += clipLength(item);
+    }
+    for (const track of ['audio', 'texts']) for (const item of data[track]) {
+      const box = await geometry(track, item.id);
+      const length = track === 'audio' ? item.out - item.in : item.end - item.start;
+      near(box.left, item.start * scale, 0.15); near(box.width, Math.max(2, length * scale), 0.15);
+      await expect(block(track, item.id)).toContainText(track === 'texts' ? item.text : data.assets[item.asset].filename);
+    }
+  }
+  async function selectBlock(track, id) {
+    await block(track, id).click();
+    await expect(block(track, id)).toHaveClass(/selected/);
+  }
+  async function beginEdge(track, id, side, seconds, scale = 36) {
+    const handle = block(track, id).locator(`.edit-trim-handle[data-side="${side}"]`);
+    await expect(handle).toBeVisible();
+    await handle.scrollIntoViewIfNeeded();
+    const box = await handle.boundingBox(); assert.ok(box, 'Edge handle must have real mouse geometry');
+    const x = box.x + box.width / 2, y = box.y + box.height / 2;
+    assert.equal(await handle.evaluate((node, {x, y}) => node.contains(document.elementFromPoint(x, y)), {x, y}), true, 'The mouse must hit the handle, not another block');
+    await page.mouse.move(x, y); await page.mouse.down();
+    await page.mouse.move(x + seconds * scale, y, {steps: 8});
+    return {handle, x, y};
+  }
+  async function dragEdge(track, id, side, seconds, scale = 36) {
+    await beginEdge(track, id, side, seconds, scale);
+    await page.mouse.up();
+    return waitSaved();
+  }
+  async function focusTimeline(track, id) {
+    await block(track, id).focus();
+    await expect(block(track, id)).toBeFocused();
+  }
+  // Negative assertions deliberately cross the 900 ms autosave debounce. No
+  // production handlers/state are replaced, and every actual PUT is recorded.
+  async function assertNoShortcutMutation(before, keys, target) {
+    const count = editWrites.length;
+    for (const key of keys) {
+      if (target) await target.focus();
+      await page.keyboard.press(key);
+    }
+    await page.waitForTimeout(1200);
+    assert.deepEqual(await saved(), before, 'Guarded shortcuts must not mutate or save the edit');
+    assert.equal(editWrites.length, count, 'Guarded shortcuts must send no edit PUT');
+  }
+  async function regression(name, snapshot, action) {
+    if (failed) return check(name, action);
+    // A regression failure must not suppress independent cases or the original
+    // export smoke. Each case starts/ends with a real latest-revision restore.
+    await t.test(name, async () => {
+      const record = {name, status: 'running'}; report.cases.push(record);
+      try {
+        const before = await restoreEdit(snapshot);
+        record.before = before;
+        await action(before);
+        record.after = await saved(); record.status = 'passed';
+      } catch (error) {
+        record.status = 'failed'; record.error = error.stack;
+        record.persisted = await saved().catch(error => ({error: error.message}));
+        record.focus = await page.evaluate(() => ({tag: document.activeElement?.tagName, id: document.activeElement?.id, className: document.activeElement?.className, html: document.activeElement?.outerHTML?.slice(0, 600)}));
+        record.playhead = await edit().getByRole('slider', {name: '预览播放头（秒）'}).inputValue();
+        record.blocks = await edit().locator('.edit-block').evaluateAll(nodes => nodes.map(node => ({text: node.textContent, track: node.dataset.track, id: node.dataset.id, left: node.style.left, width: node.style.width, handles: node.querySelectorAll('.edit-trim-handle').length})));
+        const evidence = path.join(folder, `timeline-failure-${report.cases.length}.png`);
+        await page.screenshot({path: evidence, fullPage: true}); record.screenshot = evidence;
+        fs.writeFileSync(path.join(folder, 'report.json'), JSON.stringify(report, null, 2));
+        t.diagnostic(`${name}: ${error.message}\nEvidence: ${evidence}`);
+        throw error;
+      } finally {
+        await page.keyboard.press('Escape'); await page.mouse.up();
+        await restoreEdit(snapshot);
+      }
+    });
+  }
   try {
     fixture = await bootFixture(folder); report.origin = fixture.origin;
     media = fixtures(folder, fixture.ffmpeg);
@@ -223,6 +323,12 @@ test('director fifth-step real Edge smoke', {timeout: 300000}, async t => {
     });
     page = await context.newPage();
     page.setDefaultTimeout(15000);
+    page.on('request', request => {
+      if (project && request.method() === 'PUT' && request.url() === fixture.origin + endpoint()) {
+        editWrites.push({at: Date.now(), edit: request.postDataJSON()});
+      }
+    });
+    report.editWrites = editWrites;
     page.on('pageerror', error => report.browserErrors.push(error.stack));
     page.on('console', entry => {
       if (entry.type() !== 'error') return;
@@ -309,6 +415,444 @@ test('director fifth-step real Edge smoke', {timeout: 300000}, async t => {
       assert.equal(data.texts[0].text, '导演剪辑冒烟\n真实导出');
       near(data.audio[0].in, 0.5); near(data.audio[0].out, 2.5); near(data.audio[0].start, 8 / 30);
     });
+    if (!failed) {
+      const originalEdit = await waitSaved();
+      const timelineEdit = structuredClone(originalEdit);
+      Object.assign(timelineEdit.clips[0], {in: 1, out: 3, speed: 2});
+      Object.assign(timelineEdit.clips[1], {in: 0, out: 3, speed: 1});
+      timelineEdit.clips.push({...structuredClone(timelineEdit.clips[0]), id: 'clip_regression_slow', in: 0.5, out: 3.5, speed: 0.5});
+      Object.assign(timelineEdit.audio[0], {in: 1, out: 4, start: 1});
+      Object.assign(timelineEdit.texts[0], {start: 1, end: 3});
+      await regression('timeline handle selectors, asset labels and shortcuts below timeline', timelineEdit, async before => {
+        await expect(edit().locator('.edit-trim-handle')).toHaveCount(10);
+        for (const track of ['clips', 'audio', 'texts']) for (const item of before[track]) {
+          await expect(block(track, item.id).locator('.edit-trim-handle[data-side="start"]')).toHaveCount(1);
+          await expect(block(track, item.id).locator('.edit-trim-handle[data-side="end"]')).toHaveCount(1);
+        }
+        await assertTimeline(before);
+        const shortcuts = edit().locator('.edit-shortcuts');
+        await expect(shortcuts).toBeVisible();
+        await expect(shortcuts).toContainText(/Delete|删除/);
+        await expect(shortcuts).toContainText(/Q/); await expect(shortcuts).toContainText(/W/);
+        const bottom = await edit().locator('.edit-timeline-scroll').boundingBox();
+        const help = await shortcuts.boundingBox();
+        assert.ok(help.y >= bottom.y + bottom.height - 1, 'Shortcut help must be below the timeline');
+      });
+      for (const index of [0, 2]) for (const side of ['start', 'end']) {
+        await regression(`video ${timelineEdit.clips[index].speed}x ${side} edge uses timeline delta times original speed and ripples`, timelineEdit, async before => {
+          const item = before.clips[index], expected = structuredClone(before), delta = item.speed === 2 ? 0.5 : 2 / 3;
+          await selectBlock('clips', item.id);
+          const old = await geometry('clips', item.id);
+          const after = await dragEdge('clips', item.id, side, delta);
+          expected.clips[index][side === 'start' ? 'in' : 'out'] = Math.round((item[side === 'start' ? 'in' : 'out'] + delta * item.speed) * 30) / 30;
+          near(after.clips[index][side === 'start' ? 'in' : 'out'], expected.clips[index][side === 'start' ? 'in' : 'out'], 0.001);
+          assert.deepEqual(after.clips.map(clip => clip.speed), before.clips.map(clip => clip.speed), 'Each video retains its own speed');
+          assert.deepEqual(after.clips.map(clip => clip.id), before.clips.map(clip => clip.id));
+          near((await geometry('clips', item.id)).width - old.width, (side === 'start' ? -delta : delta) * 36, 0.15);
+          assert.deepEqual(content(after), content(expected));
+          await assertTimeline(after);
+        });
+      }
+      for (const side of ['start', 'end']) {
+        await regression(`image ${side} edge changes hold duration only and keeps contiguous main track`, timelineEdit, async before => {
+          const item = before.clips[1], expected = structuredClone(before);
+          await selectBlock('clips', item.id);
+          const after = await dragEdge('clips', item.id, side, 0.5);
+          expected.clips[1].out += side === 'start' ? -0.5 : 0.5;
+          assert.equal(after.clips[1].in, 0); assert.equal(after.clips[1].speed, 1);
+          assert.deepEqual(content(after), content(expected)); await assertTimeline(after);
+          near(Number(await field('图片停留时长（秒）').inputValue()), expected.clips[1].out, 0.001);
+        });
+      }
+      for (const track of ['audio', 'texts']) for (const side of ['start', 'end']) {
+        await regression(`${track} ${side} edge updates only the intended times`, timelineEdit, async before => {
+          const item = before[track][0], expected = structuredClone(before), delta = 0.5;
+          await selectBlock(track, item.id);
+          const after = await dragEdge(track, item.id, side, delta), result = after[track][0];
+          if (track === 'audio') {
+            if (side === 'start') {
+              expected.audio[0].in += delta; expected.audio[0].start += delta;
+              near(result.start + result.out - result.in, item.start + item.out - item.in, 0.001);
+              assert.equal(result.out, item.out);
+            } else { expected.audio[0].out += delta; assert.equal(result.start, item.start); assert.equal(result.in, item.in); }
+          } else expected.texts[0][side === 'start' ? 'start' : 'end'] += delta;
+          assert.deepEqual(content(after), content(expected)); await assertTimeline(after);
+        });
+      }
+      await regression('video/image source bounds and minimum one-frame duration clamp instead of reorder', timelineEdit, async before => {
+        const video = before.clips[0], image = before.clips[1];
+        await selectBlock('clips', video.id);
+        let after = await dragEdge('clips', video.id, 'start', -4);
+        near(after.clips[0].in, 0, 0.001); assert.equal(after.clips[0].speed, 2);
+        after = await dragEdge('clips', video.id, 'end', 8);
+        near(after.clips[0].out, before.assets[video.asset].duration, 0.034);
+        after = await dragEdge('clips', video.id, 'end', -4);
+        assert.ok(after.clips[0].out - after.clips[0].in >= 1 / 30 - 1e-7);
+        near(clipLength(after.clips[0]), 1 / 30, 0.001);
+        await selectBlock('clips', image.id);
+        after = await dragEdge('clips', image.id, 'end', -8);
+        assert.equal(after.clips[1].in, 0); assert.equal(after.clips[1].speed, 1);
+        near(after.clips[1].out, 1 / 30, 0.001);
+        assert.deepEqual(after.clips.map(item => item.id), before.clips.map(item => item.id));
+        await assertTimeline(after);
+      });
+      const adjacentAudio = structuredClone(timelineEdit);
+      adjacentAudio.audio.unshift({...structuredClone(adjacentAudio.audio[0]), id: 'audio_regression_previous', start: 0, in: 0, out: 0.5});
+      adjacentAudio.audio.push({...structuredClone(adjacentAudio.audio[1]), id: 'audio_regression_next', start: 5, in: 0, out: 2});
+      for (const side of ['start', 'end']) {
+        await regression(`audio ${side} extension clamps against adjacent segment without moving neighbours`, adjacentAudio, async before => {
+          const item = before.audio[1]; await selectBlock('audio', item.id);
+          const after = await dragEdge('audio', item.id, side, side === 'start' ? -3 : 4);
+          assert.deepEqual(after.audio[0], before.audio[0]); assert.deepEqual(after.audio[2], before.audio[2]);
+          if (side === 'start') {
+            near(after.audio[1].start, 0.5, 0.001); near(after.audio[1].in, 0.5, 0.001);
+            near(after.audio[1].start + after.audio[1].out - after.audio[1].in, 4, 0.001);
+          }
+          else { near(after.audio[1].out, 5, 0.001); near(after.audio[1].start + after.audio[1].out - after.audio[1].in, 5, 0.001); }
+          const spans = after.audio.map(item => [item.start, item.start + item.out - item.in]).sort((a, b) => a[0] - b[0]);
+          assert.ok(spans.every((span, index) => !index || spans[index - 1][1] <= span[0] + 1e-7));
+          await assertTimeline(after);
+        });
+      }
+      await regression('audio clamps source bounds, timeline zero and minimum one frame', timelineEdit, async before => {
+        const item = before.audio[0]; await selectBlock('audio', item.id);
+        let after = await dragEdge('audio', item.id, 'start', -4);
+        near(after.audio[0].in, 0, 0.001); near(after.audio[0].start, 0, 0.001);
+        near(after.audio[0].start + after.audio[0].out - after.audio[0].in, 4, 0.001);
+        after = await dragEdge('audio', item.id, 'end', 8);
+        near(after.audio[0].out, before.assets[item.asset].duration, 0.034);
+        after = await dragEdge('audio', item.id, 'start', 10);
+        near(after.audio[0].out - after.audio[0].in, 1 / 30, 0.001);
+        await assertTimeline(after);
+        const early = structuredClone(before); early.audio[0].start = 0.5;
+        await restoreEdit(early); await selectBlock('audio', item.id);
+        after = await dragEdge('audio', item.id, 'start', -4);
+        near(after.audio[0].start, 0, 0.001); near(after.audio[0].in, 0.5, 0.001);
+        near(after.audio[0].start + after.audio[0].out - after.audio[0].in, 3.5, 0.001);
+      });
+      for (const side of ['start', 'end']) {
+        await regression(`text ${side} edge clamps to one frame and zero without changing text or style`, timelineEdit, async before => {
+          const item = before.texts[0]; await selectBlock('texts', item.id);
+          if (side === 'start') {
+            const extended = await dragEdge('texts', item.id, side, -4);
+            near(extended.texts[0].start, 0, 0.001); assert.equal(extended.texts[0].end, item.end);
+          }
+          const after = await dragEdge('texts', item.id, side, side === 'start' ? 6 : -6);
+          near(after.texts[0].end - after.texts[0].start, 1 / 30, 0.001);
+          for (const key of ['text', 'x', 'y', 'size', 'color']) assert.equal(after.texts[0][key], item[key]);
+          await assertTimeline(after);
+        });
+      }
+      await regression('edge gesture previews without PUT, saves only after release and is one undo item', timelineEdit, async before => {
+        const item = before.clips[1]; await selectBlock('clips', item.id);
+        const count = editWrites.length, old = await geometry('clips', item.id);
+        const gesture = await beginEdge('clips', item.id, 'end', 0.5);
+        near((await geometry('clips', item.id)).width, old.width + 18, 0.15);
+        await page.mouse.move(gesture.x + 36, gesture.y, {steps: 8});
+        near((await geometry('clips', item.id)).width, old.width + 36, 0.15);
+        await page.waitForTimeout(1200);
+        assert.deepEqual(await saved(), before, 'Holding the edge beyond debounce must not autosave');
+        assert.equal(editWrites.length, count);
+        await page.mouse.up(); const after = await waitSaved();
+        near(after.clips[1].out, item.out + 1, 0.001);
+        assert.equal(editWrites.length, count + 1, 'One release must send exactly one autosave');
+        await expect(block('clips', item.id)).toBeFocused();
+        await page.keyboard.press('Control+z');
+        assert.deepEqual(content(await waitSaved()), content(before), 'One keyboard undo restores the whole multi-move gesture');
+        await expect(edit().getByRole('button', {name: '撤销', exact: true})).toBeDisabled();
+        await expect(block('clips', item.id)).toBeFocused();
+        await page.keyboard.press('Control+Shift+z');
+        assert.deepEqual(content(await waitSaved()), content(after));
+        await expect(block('clips', item.id)).toBeFocused();
+        await page.keyboard.press('Control+z'); await waitSaved();
+        await page.keyboard.press('Control+y');
+        assert.deepEqual(content(await waitSaved()), content(after));
+        await page.keyboard.press('Meta+z');
+        assert.deepEqual(content(await waitSaved()), content(before));
+        await page.keyboard.press('Meta+Shift+z');
+        assert.deepEqual(content(await waitSaved()), content(after));
+      });
+      await regression('Escape during a real mouse edge drag rolls back without save or undo history', timelineEdit, async before => {
+        const item = before.clips[1]; await selectBlock('clips', item.id);
+        const old = await geometry('clips', item.id), count = editWrites.length;
+        await beginEdge('clips', item.id, 'end', 0.5);
+        near((await geometry('clips', item.id)).width, old.width + 18, 0.15);
+        await page.keyboard.press('Escape'); await page.mouse.up();
+        await page.waitForTimeout(1200);
+        assert.deepEqual(await saved(), before); assert.equal(editWrites.length, count);
+        assert.deepEqual(await geometry('clips', item.id), old);
+        await expect(edit().getByRole('button', {name: '撤销', exact: true})).toBeDisabled();
+      });
+      await regression('browser-native pointercancel rolls back edge preview without saving', timelineEdit, async before => {
+        const item = before.clips[1]; await selectBlock('clips', item.id);
+        const handle = block('clips', item.id).locator('.edit-trim-handle[data-side="end"]');
+        await handle.scrollIntoViewIfNeeded();
+        const box = await handle.boundingBox(); assert.ok(box);
+        const old = await geometry('clips', item.id), count = editWrites.length;
+        const cdp = await context.newCDPSession(page);
+        let touchActive = false;
+        // Browser-level touchCancel produces a trusted PointerEvent. It is not
+        // dispatchEvent(), a mocked handler, or a direct editor-state mutation.
+        try {
+          const x = box.x + box.width / 2, y = box.y + box.height / 2;
+          await cdp.send('Input.dispatchTouchEvent', {type: 'touchStart', touchPoints: [{x, y, id: 1}]});
+          touchActive = true;
+          await cdp.send('Input.dispatchTouchEvent', {type: 'touchMove', touchPoints: [{x: x + 18, y, id: 1}]});
+          near((await geometry('clips', item.id)).width, old.width + 18, 0.15);
+          const canceled = page.evaluate(() => new Promise(resolve => {
+            const listener = event => { clearTimeout(timer); resolve({trusted: event.isTrusted, type: event.pointerType}); };
+            const timer = setTimeout(() => { document.removeEventListener('pointercancel', listener, true); resolve({error: 'No browser pointercancel within 5 seconds'}); }, 5000);
+            document.addEventListener('pointercancel', listener, {once: true, capture: true});
+          }));
+          // A separate round-trip ensures the observation listener is installed.
+          await page.evaluate(() => document.readyState);
+          await cdp.send('Input.dispatchTouchEvent', {type: 'touchCancel', touchPoints: []});
+          touchActive = false;
+          assert.deepEqual(await canceled, {trusted: true, type: 'touch'});
+          await page.waitForTimeout(1200);
+          assert.deepEqual(await saved(), before); assert.equal(editWrites.length, count);
+          assert.deepEqual(await geometry('clips', item.id), old);
+          await expect(edit().getByRole('button', {name: '撤销', exact: true})).toBeDisabled();
+        } finally {
+          try { if (touchActive) await cdp.send('Input.dispatchTouchEvent', {type: 'touchCancel', touchPoints: []}); }
+          finally { await cdp.detach(); }
+        }
+      });
+      await regression('alternate timeline zoom plus horizontal scroll preserves drag delta and ripple geometry', timelineEdit, async before => {
+        const zoomControl = edit().getByRole('slider', {name: '时间线缩放'});
+        await zoomControl.focus(); await zoomControl.press('End');
+        for (let n = 0; n < 40; n++) await zoomControl.press('ArrowLeft');
+        await expect(zoomControl).toHaveValue('120');
+        const scroller = edit().locator('.edit-timeline-scroll');
+        await scroller.evaluate(node => { node.scrollLeft = 300; });
+        assert.ok(await scroller.evaluate(node => node.scrollLeft) > 0, 'Exercise an actually scrolled timeline');
+        const item = before.clips[2]; await selectBlock('clips', item.id);
+        assert.ok(await scroller.evaluate(node => node.scrollLeft) > 0);
+        const after = await dragEdge('clips', item.id, 'start', 2 / 3, 120);
+        near(after.clips[2].in - item.in, 1 / 3, 0.001); assert.equal(after.clips[2].speed, 0.5);
+        assert.deepEqual(after.clips.slice(0, 2), before.clips.slice(0, 2));
+        await assertTimeline(after, 120);
+      });
+      for (const track of ['clips', 'audio', 'texts']) for (const key of ['Delete', 'Backspace']) {
+        await regression(`${key} removes only the selected ${track} segment`, timelineEdit, async before => {
+          const item = before[track][0]; await selectBlock(track, item.id); await focusTimeline(track, item.id);
+          await page.keyboard.press(key);
+          const after = await waitSaved(), expected = structuredClone(before);
+          expected[track] = expected[track].filter(candidate => candidate.id !== item.id);
+          assert.deepEqual(content(after), content(expected));
+          await expect(block(track, item.id)).toHaveCount(0); await assertTimeline(after);
+          const count = editWrites.length;
+          await page.keyboard.press(key); await page.waitForTimeout(1200);
+          assert.deepEqual(await saved(), after, 'Delete without a selection must not remove a neighbouring segment');
+          assert.equal(editWrites.length, count);
+        });
+      }
+      for (const key of ['s', 'Control+b', 'Meta+b']) {
+        await regression(`${key} splits only selected non-first video at playhead with its original speed`, timelineEdit, async before => {
+          const item = before.clips[2]; await selectBlock('clips', item.id); await seek(5); await focusTimeline('clips', item.id);
+          await page.keyboard.press(key);
+          await expect(clips()).toHaveCount(4);
+          const after = await waitSaved();
+          assert.deepEqual(after.clips.slice(0, 2), before.clips.slice(0, 2));
+          const left = after.clips[2], right = after.clips[3];
+          assert.equal(left.id, item.id); assert.notEqual(right.id, item.id);
+          near(left.out, item.in + (5 - 4) * item.speed, 0.001); near(right.in, left.out, 0.001);
+          near(clipLength(left), 1, 0.001); near(clipLength(right), 5, 0.001);
+          for (const clip of [left, right]) {
+            assert.equal(clip.speed, item.speed); assert.equal(clip.asset, item.asset);
+            assert.equal(clip.volume, item.volume); assert.equal(clip.fit, item.fit);
+          }
+          assert.deepEqual(after.audio, before.audio); assert.deepEqual(after.texts, before.texts);
+          await assertTimeline(after);
+          await expect(edit().locator('.edit-block.selected')).toBeFocused();
+          await page.keyboard.press('Control+z');
+          assert.deepEqual(content(await waitSaved()), content(before));
+          await page.keyboard.press('Control+Shift+z');
+          assert.deepEqual(content(await waitSaved()), content(after));
+        });
+      }
+      for (const index of [0, 1]) for (const key of ['q', 'w']) {
+        await regression(`${key.toUpperCase()} trims selected ${index ? 'image' : '2x video'} to playhead with ripple`, timelineEdit, async before => {
+          const item = before.clips[index], expected = structuredClone(before);
+          const position = index ? 1 : 0, cut = position + 2 / 3;
+          await selectBlock('clips', item.id); await seek(cut); await focusTimeline('clips', item.id);
+          await page.keyboard.press(key);
+          const after = await waitSaved();
+          if (index) expected.clips[index].out = key === 'q' ? item.out - 2 / 3 : 2 / 3;
+          else expected.clips[index][key === 'q' ? 'in' : 'out'] = Math.round((item.in + 2 / 3 * item.speed) * 30) / 30;
+          assert.deepEqual(content(after), content(expected)); await assertTimeline(after);
+          await expect(block('clips', item.id)).toBeFocused();
+          await page.keyboard.press('Control+z');
+          assert.deepEqual(content(await waitSaved()), content(before));
+        });
+      }
+      await regression('Space toggles real media playback, arrows step one frame, transport never saves edit', timelineEdit, async before => {
+        const item = before.clips[0], slider = edit().getByRole('slider', {name: '预览播放头（秒）'});
+        await selectBlock('clips', item.id); await seek(0.2); await focusTimeline('clips', item.id);
+        await page.keyboard.press('ArrowRight'); near(Number(await slider.inputValue()), 7 / 30, 0.001);
+        await page.keyboard.press('ArrowLeft'); near(Number(await slider.inputValue()), 0.2, 0.001);
+        await page.keyboard.press('Shift+ArrowRight'); near(Number(await slider.inputValue()), 16 / 30, 0.001);
+        await page.keyboard.press('Shift+ArrowLeft'); near(Number(await slider.inputValue()), 0.2, 0.001);
+        await page.keyboard.press('Home'); near(Number(await slider.inputValue()), 0, 0.001);
+        await page.keyboard.press('ArrowLeft'); near(Number(await slider.inputValue()), 0, 0.001);
+        await page.keyboard.press('End'); near(Number(await slider.inputValue()), 10, 0.001);
+        await page.keyboard.press('ArrowRight'); near(Number(await slider.inputValue()), 10, 0.001);
+        await seek(0.2); await focusTimeline('clips', item.id);
+        const video = edit().locator('.edit-preview video');
+        await expect.poll(() => video.evaluate(node => node.readyState)).toBeGreaterThanOrEqual(2);
+        near(await video.evaluate(node => node.currentTime), 1.4, 0.08);
+        const count = editWrites.length;
+        await page.keyboard.press('Space');
+        await expect(edit().getByRole('button', {name: '暂停', exact: true})).toBeVisible();
+        await expect.poll(() => video.evaluate(node => !node.paused)).toBe(true);
+        await expect.poll(async () => Number(await slider.inputValue())).toBeGreaterThan(0.2);
+        await page.keyboard.press('Space');
+        await expect(edit().getByRole('button', {name: '播放', exact: true})).toBeVisible();
+        assert.equal(await video.evaluate(node => node.paused), true);
+        const stopped = Number(await slider.inputValue());
+        await page.waitForTimeout(150); near(Number(await slider.inputValue()), stopped, 0.001);
+        assert.deepEqual(await saved(), before); assert.equal(editWrites.length, count);
+      });
+      await regression('ruler mouse seek restores selected video focus for arrows, Space and S without reselecting', timelineEdit, async before => {
+        const item = before.clips[2], ruler = edit().locator('.edit-ruler');
+        const slider = edit().getByRole('slider', {name: '预览播放头（秒）'});
+        await selectBlock('clips', item.id);
+        await ruler.click({position: {x: 5 * 36, y: 15}});
+        near(Number(await slider.inputValue()), 5, 0.001);
+        await expect(block('clips', item.id)).toBeFocused();
+        await page.keyboard.press('ArrowRight'); near(Number(await slider.inputValue()), 5 + 1 / 30, 0.001);
+        await page.keyboard.press('ArrowLeft'); near(Number(await slider.inputValue()), 5, 0.001);
+        const video = edit().locator('.edit-preview video');
+        await expect.poll(() => video.evaluate(node => node.readyState)).toBeGreaterThanOrEqual(2);
+        await page.keyboard.press('Space');
+        await expect(edit().getByRole('button', {name: '暂停', exact: true})).toBeVisible();
+        await expect.poll(() => video.evaluate(node => !node.paused)).toBe(true);
+        await page.keyboard.press('Space');
+        await expect(edit().getByRole('button', {name: '播放', exact: true})).toBeVisible();
+        await ruler.click({position: {x: 5 * 36, y: 15}});
+        await page.keyboard.press('s');
+        await expect(clips()).toHaveCount(4);
+        const after = await waitSaved();
+        assert.deepEqual(after.clips.slice(0, 2), before.clips.slice(0, 2));
+        near(after.clips[2].out, 1, 0.001); near(after.clips[3].in, 1, 0.001);
+        near(clipLength(after.clips[2]), 1, 0.001); near(clipLength(after.clips[3]), 5, 0.001);
+        assert.equal(after.clips[2].speed, 0.5); assert.equal(after.clips[3].speed, 0.5);
+        assert.deepEqual(after.audio, before.audio); assert.deepEqual(after.texts, before.texts);
+        await assertTimeline(after); await expect(edit().locator('.edit-block.selected')).toBeFocused();
+      });
+      await regression('empty track mouse seek restores selection focus for frame stepping and crop without reselecting', timelineEdit, async before => {
+        const item = before.audio[0], expected = structuredClone(before);
+        await selectBlock('audio', item.id);
+        // Below the 32 px block, but inside the real 68 px track row.
+        await edit().locator('.edit-track-audio').click({position: {x: 2 * 36, y: 62}});
+        const slider = edit().getByRole('slider', {name: '预览播放头（秒）'});
+        near(Number(await slider.inputValue()), 2, 0.001);
+        await expect(block('audio', item.id)).toBeFocused();
+        await page.keyboard.press('ArrowRight'); near(Number(await slider.inputValue()), 2 + 1 / 30, 0.001);
+        await page.keyboard.press('ArrowLeft');
+        await page.keyboard.press('w');
+        expected.audio[0].out = 2;
+        const after = await waitSaved(); assert.deepEqual(content(after), content(expected));
+        await assertTimeline(after); await expect(block('audio', item.id)).toBeFocused();
+      });
+      for (const track of ['audio', 'texts']) for (const key of ['q', 'w']) {
+        await regression(`${key.toUpperCase()} trims selected ${track} to playhead without changing other tracks`, timelineEdit, async before => {
+          const item = before[track][0], expected = structuredClone(before);
+          await selectBlock(track, item.id); await seek(2); await focusTimeline(track, item.id);
+          await page.keyboard.press(key);
+          const after = await waitSaved();
+          if (track === 'texts') expected.texts[0][key === 'q' ? 'start' : 'end'] = 2;
+          else if (key === 'q') { expected.audio[0].in = 2; expected.audio[0].start = 2; }
+          else expected.audio[0].out = 2;
+          assert.deepEqual(content(after), content(expected)); await assertTimeline(after);
+          await expect(block(track, item.id)).toBeFocused();
+          await page.keyboard.press('Control+z');
+          assert.deepEqual(content(await waitSaved()), content(before));
+        });
+      }
+      const destructiveKeys = ['Delete', 'Backspace', 's', 'Control+b', 'Meta+b', 'q', 'w', 'Control+z', 'Meta+z', 'Control+Shift+z', 'Meta+Shift+z', 'Control+y'];
+      await regression('delete, split and crop shortcuts with no selected segment are harmless', timelineEdit, async before => {
+        await seek(0.5);
+        await expect(edit().locator('.edit-block.selected')).toHaveCount(0);
+        await assertNoShortcutMutation(before, destructiveKeys, edit().getByRole('button', {name: '播放', exact: true}));
+        await assertTimeline(before);
+      });
+      for (const controlType of ['input', 'select', 'textarea', 'contenteditable descendant']) {
+        await regression(`destructive shortcuts ignore focused ${controlType}, including undo/redo with actual history`, timelineEdit, async before => {
+          const image = before.clips[1]; await selectBlock('clips', image.id);
+          await dragEdge('clips', image.id, 'end', 0.5);
+          await dragEdge('clips', image.id, 'end', 0.5);
+          // Retain real undo/redo history so guards cannot pass merely because
+          // there is nothing to undo. S/Q/W also have an interior playhead.
+          await focusTimeline('clips', image.id); await page.keyboard.press('Control+z'); await waitSaved();
+          const changed = await waitSaved();
+          let target;
+          if (controlType === 'input') { await selectBlock('clips', before.clips[0].id); target = field('源入点（秒）'); }
+          else if (controlType === 'select') { await selectBlock('clips', before.clips[0].id); target = field('画面适配'); }
+          else if (controlType === 'textarea') { await selectBlock('texts', before.texts[0].id); target = field('文字内容'); }
+          else {
+            await selectBlock('clips', before.clips[0].id);
+            // A test-only nested editable DOM surface exercises inherited
+            // isContentEditable; all shortcut listeners remain production.
+            await inspector().evaluate(node => {
+              const surface = document.createElement('div'); surface.contentEditable = 'true';
+              const child = document.createElement('span'); child.id = 'shortcut-editable-child'; child.tabIndex = 0; child.textContent = '可编辑文字';
+              surface.append(child); node.append(surface);
+            });
+            target = page.locator('#shortcut-editable-child');
+          }
+          await seek(controlType === 'textarea' ? 2 : 0.5);
+          const originalValue = controlType !== 'contenteditable descendant' ? await target.inputValue() : null;
+          await target.focus();
+          await assertNoShortcutMutation(changed, destructiveKeys, target);
+          // Native Delete/typing may legitimately edit a field's unsaved value;
+          // restore it before blur so the test does not save native text edits.
+          if (controlType === 'select') await target.selectOption(originalValue);
+          else if (originalValue !== null) await target.fill(originalValue);
+          await target.press('Tab');
+          assert.deepEqual(await waitSaved(), changed);
+        });
+      }
+      await regression('hidden edit stage ignores destructive shortcuts while another stage has focus', timelineEdit, async before => {
+        const item = before.clips[0]; await selectBlock('clips', item.id); await seek(0.5);
+        await page.locator('[data-stage="review"]').click(); await expect(edit()).toBeHidden();
+        await assertNoShortcutMutation(before, destructiveKeys, page.locator('[data-stage="review"]'));
+        await page.locator('[data-stage="edit"]').click(); await assertTimeline(before);
+      });
+      await regression('open real modal dialog ignores destructive shortcuts on a non-input target', timelineEdit, async before => {
+        const item = before.clips[0]; await selectBlock('clips', item.id); await seek(0.5);
+        await page.locator('#new-project').click();
+        await expect(page.locator('#create-dialog')).toBeVisible();
+        await assertNoShortcutMutation(before, destructiveKeys, page.locator('#create-cancel'));
+        await expect(page.locator('#create-dialog')).toBeVisible();
+        await page.locator('#create-cancel').click();
+        await expect(page.locator('#create-dialog')).not.toBeVisible(); await assertTimeline(before);
+      });
+      await regression('locked readonly project ignores destructive keyboard shortcuts and edge resize', timelineEdit, async before => {
+        const projectFile = path.join(folder, 'data', 'projects', project.id + '.json');
+        const backup = fs.readFileSync(projectFile, 'utf8');
+        try {
+          const locked = JSON.parse(backup); locked.locked = true;
+          fs.writeFileSync(projectFile, JSON.stringify(locked)); // Only the isolated fixture project.
+          await openEdit();
+          assert.equal((await api('/api/projects/' + project.id)).locked, true);
+          await expect(edit().getByLabel('上传视频、图片或音频素材')).toBeDisabled();
+          const item = before.clips[1]; await selectBlock('clips', item.id);
+          await seek(2); await focusTimeline('clips', item.id);
+          await assertNoShortcutMutation(before, destructiveKeys, block('clips', item.id));
+          const handle = block('clips', item.id).locator('.edit-trim-handle[data-side="end"]');
+          if (await handle.isVisible()) {
+            const count = editWrites.length, old = await geometry('clips', item.id);
+            await beginEdge('clips', item.id, 'end', 0.5); await page.mouse.up();
+            await page.waitForTimeout(1200);
+            assert.deepEqual(await saved(), before); assert.equal(editWrites.length, count);
+            assert.deepEqual(await geometry('clips', item.id), old);
+          }
+          await assertTimeline(before);
+        } finally { fs.writeFileSync(projectFile, backup); await openEdit(); }
+      });
+      await restoreEdit(originalEdit);
+    }
     await check('video trim, 0.5× and 2× speed, linked target duration', async () => {
       await clips().first().click();
       await setField('源入点（秒）', 0.5);
