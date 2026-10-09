@@ -211,6 +211,88 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
     return {data:media[kind].toString('base64'),name:name || (kind === 'video' ? 'copied.mp4' : 'copied.' + kind),
       type:type === undefined ? {png:'image/png',jpg:'image/jpeg',video:'video/mp4'}[kind] : type};
   }
+  // Exercise the actual canvas drop listener with real encoded MP4 bytes. This is
+  // synthetic HTML drag/drop, not a claim of native Explorer drag coverage.
+  async function canvasVideoDrop(count = 1) {
+    return page.evaluate(files => {
+      const transfer = new DataTransfer();
+      for (const file of files) transfer.items.add(new File([Uint8Array.from(atob(file.data), c => c.charCodeAt(0))],
+        file.name,{type:file.type}));
+      const bounds = el.stage.getBoundingClientRect();
+      const options = {bubbles:true,cancelable:true,dataTransfer:transfer,
+        clientX:bounds.left + bounds.width / 2,clientY:bounds.top + bounds.height / 2};
+      el.stage.dispatchEvent(new DragEvent('dragover',options));
+      const event = new DragEvent('drop',options);
+      el.stage.dispatchEvent(event);
+      return {prevented:event.defaultPrevented,trusted:event.isTrusted,
+        files:[...transfer.files].map(f => ({name:f.name,type:f.type,size:f.size}))};
+    },Array.from({length:count},(_, i) => file('video',i ? `canvas-drop-${i + 1}.mp4` : 'canvas-drop.mp4')));
+  }
+  async function seedVideoHistory() {
+    const upload = await page.evaluate(async ({file,projectId}) => {
+      const form = new FormData();
+      form.append('file',new File([Uint8Array.from(atob(file.data), c => c.charCodeAt(0))],file.name,{type:file.type}));
+      return H3Auth.request('/api/upload?project=' + projectId,{method:'POST',body:form});
+    },{file:file('video','history-source.mp4'),projectId:project.id});
+    const saved = await api(`/api/projects/${project.id}`);
+    const target = saved.cards.find(c => c.id === 'target');
+    target.outputs = [{...upload.files[0],filename:'history-source.mp4'}];
+    await api(`/api/projects/${project.id}`,'PUT',{rev:saved.rev,cards:saved.cards,edges:saved.edges,groups:[]});
+    await page.evaluate(async id => { await openProject(id); pick('target'); },project.id);
+    await settle(); baseline = await state(); requests = [];
+  }
+  async function historyVideoDrop() {
+    return page.evaluate(() => {
+      openHistory('target');
+      const thumb = el.hist.querySelector('video[data-i]');
+      if (!thumb) throw new Error('Seeded real video must appear in production history UI');
+      const transfer = new DataTransfer();
+      const start = new DragEvent('dragstart',{bubbles:true,cancelable:true,dataTransfer:transfer});
+      thumb.dispatchEvent(start);
+      if (!transfer.types.includes(HISTORY_ASSET_DRAG)) throw new Error('Production history dragstart did not set its token');
+      const bounds = el.stage.getBoundingClientRect();
+      const options = {bubbles:true,cancelable:true,dataTransfer:transfer,
+        clientX:bounds.left + bounds.width / 2,clientY:bounds.top + bounds.height / 2};
+      el.stage.dispatchEvent(new DragEvent('dragover',options));
+      const event = new DragEvent('drop',options); el.stage.dispatchEvent(event);
+      thumb.dispatchEvent(new DragEvent('dragend',{bubbles:true,dataTransfer:transfer}));
+      return {prevented:event.defaultPrevented,trusted:event.isTrusted,types:[...transfer.types]};
+    });
+  }
+  async function observeDropNotices() {
+    await page.evaluate(() => {
+      window.dropNotices = [];
+      window.dropNoticeObserver = new MutationObserver(() => window.dropNotices.push(el.toast.textContent));
+      window.dropNoticeObserver.observe(el.toast,{childList:true,subtree:true,characterData:true});
+    });
+  }
+  async function assertNoDropSuccess() {
+    const notices = await page.evaluate(() => window.dropNotices);
+    assert.ok(!notices.some(text => text.startsWith('已建素材节点：')),
+      'Never report successful creation before confirmed success in the original context: ' + JSON.stringify(notices));
+  }
+  async function assertCanvasVideo() {
+    const actual = await state(), saved = await api(`/api/projects/${project.id}`);
+    const added = actual.project.cards.filter(c => !baseline.project.cards.some(old => old.id === c.id));
+    assert.equal(added.length,1,'Canvas video drop must preserve exactly one new material');
+    assert.equal(actual.project.cards.length,baseline.project.cards.length + 1);
+    assert.equal(await page.locator('#world .card').count(),actual.project.cards.length);
+    const card = added[0];
+    assert.equal(card.type,'card_asset'); assert.equal(card.outputs.length,1);
+    assert.equal(card.outputs[0].kind,'video');
+    assert.ok(card.outputs[0].ref); assert.ok(card.outputs[0].url);
+    assert.deepEqual(saved.cards.find(c => c.id === card.id)?.outputs,card.outputs,
+      'Dropped MP4 must persist through the real backend, not just appear in DOM');
+    assert.deepEqual(actual.project.edges,baseline.project.edges,'Canvas drop must not create parameter links');
+    assert.deepEqual(saved.edges,baseline.project.edges);
+    assert.equal(uploads().length,1); assert.equal(creates().length,1);
+    assert.equal(uploads()[0].query,'?project=' + project.id);
+    assert.match(uploads()[0].type,/^multipart\/form-data; boundary=/);
+    const response = await page.request.get(fixture.origin + card.outputs[0].url);
+    assert.equal(response.status(),200);
+    assert.deepEqual(await response.body(),media.video,'Serve the exact uploaded MP4 bytes');
+    return {actual,saved,card};
+  }
   async function nativeScreenshot(keepFocus = false) {
     await page.bringToFront();
     await page.evaluate(async ({b64,keepFocus}) => {
@@ -269,7 +351,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
     assert.deepEqual(saved.edges,actual.project.edges,'Real saved edges, not DOM-only links');
     for (const c of added) assert.deepEqual(saved.cards.find(s => s.id === c.id).outputs,c.outputs);
   }
-  async function hold(endpoint, action) {
+  async function hold(endpoint, action, trigger = () => synthetic([file()])) {
     let release, hit;
     const gate = new Promise(resolve => { release = resolve; });
     const reached = new Promise(resolve => { hit = resolve; });
@@ -287,9 +369,9 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
     };
     await page.route(pattern,handler);
     try {
-      await synthetic([file()]);
+      await trigger();
       await Promise.race([reached,new Promise((_,reject) => {
-        const timer = setTimeout(() => reject(new Error('Paste never reached real ' + endpoint)),8000);
+        const timer = setTimeout(() => reject(new Error('Media import never reached real ' + endpoint)),8000);
         reached.then(() => clearTimeout(timer));
       })]);
       await action();
@@ -298,6 +380,8 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
       await page.unroute(pattern,handler);
     }
     if (handledError) throw handledError;
+    // Allow the released fetch/json continuation to start before testing idleness.
+    await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
     await settle();
   }
   async function check(name, action) {
@@ -438,6 +522,276 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
         await expect(page.locator('#panel textarea').first()).toHaveValue('LATEST UNSAVED EDIT');
         report.queuedSaveRegression = {conflicts,uploadCount:uploads().length,createCount:creates().length,
           prompt:saved.cards.find(c => c.id === 'target').params.prompt,edges:saved.edges};
+      } finally { page.off('response',observeResponse); }
+    });
+    await check('canvas VIDEO DROP with valid MIME and no pending save persists real MP4',async () => {
+      await reset(); await settle();
+      assert.equal(await page.evaluate(() => pendingContentSaves),0);
+      const endpoint = `/api/projects/${project.id}`, conflicts = [];
+      const observeResponse = response => {
+        if (new URL(response.url()).pathname === endpoint && response.status() === 409) conflicts.push(409);
+      };
+      page.on('response',observeResponse);
+      try {
+        const event = await canvasVideoDrop();
+        assert.equal(event.prevented,true); assert.equal(event.trusted,false);
+        assert.deepEqual(event.files,[{name:'canvas-drop.mp4',type:'video/mp4',size:media.video.length}]);
+        await expect.poll(() => creates().length,{timeout:10000}).toBe(1);
+        await settle();
+        const {saved,card} = await assertCanvasVideo();
+        assert.deepEqual(conflicts,[]);
+        assert.equal(saved.cards.find(c => c.id === 'target').params.prompt,'原文字');
+        report.canvasVideoBaseline = {event,conflicts,cardId:card.id,output:card.outputs[0]};
+      } finally { page.off('response',observeResponse); }
+    });
+    for (const source of ['canvas','history']) await check(`${source} VIDEO DROP drains older queued saves, preserving material and latest prompt without 409`,async () => {
+      await reset(source === 'history' ? {type:'card_video',cap:'minimax_h3_ref9'} : {}); await settle();
+      if (source === 'history') await seedVideoHistory();
+      const endpoint = `/api/projects/${project.id}`, pattern = fixture.origin + endpoint;
+      const evidence = {responses:[],timeline:[]};
+      report[source + 'VideoQueuedSaveRegression'] = evidence;
+      const responseTasks = [];
+      const observeResponse = response => {
+        if (new URL(response.url()).pathname !== endpoint || response.request().method() !== 'PUT') return;
+        responseTasks.push((async () => {
+          const body = await response.text();
+          const sent = response.request().postDataJSON();
+          evidence.responses.push({status:response.status(),body,
+            sentCardIds:sent.cards.map(c => c.id),sentPrompt:sent.cards.find(c => c.id === 'target')?.params.prompt});
+        })());
+      };
+      page.on('response',observeResponse);
+      let release, firstHeld = false, firstStarted = false, finish, routeError;
+      const gate = new Promise(resolve => { release = resolve; });
+      const handled = new Promise(resolve => { finish = resolve; });
+      const handler = async route => {
+        if (route.request().method() !== 'PUT' || firstStarted) return route.continue();
+        firstStarted = true;
+        try {
+          // The server has committed the first save; only its network response is
+          // blocked. A second real textarea save queues BEFORE the drop/create.
+          const response = await route.fetch();
+          assert.equal(response.status(),200,await response.text());
+          firstHeld = true;
+          await gate;
+          await route.fulfill({response});
+        } catch (error) { routeError = error; }
+        finally { finish(); }
+      };
+      await page.route(pattern,handler);
+      try {
+        await page.evaluate(() => {
+          window.canvasDropTimeline = [];
+          const record = () => window.canvasDropTimeline.push({
+            ids:[...el.world.querySelectorAll('.card')].map(node => node.dataset.id),
+            prompt:cardOf('target')?.params.prompt,
+            materials:PROJ.cards.filter(c => c.type === 'card_asset').map(c => ({id:c.id,outputs:c.outputs.length})),
+          });
+          window.canvasDropObserver = new MutationObserver(record);
+          window.canvasDropObserver.observe(el.world,{childList:true,subtree:true});
+          record();
+          cardOf('target').params.prompt = 'first'; openPanel('target'); enqueueSave();
+        });
+        await expect.poll(() => firstHeld,{timeout:10000}).toBe(true);
+        const committed = await api(endpoint);
+        assert.equal(committed.cards.find(c => c.id === 'target').params.prompt,'first');
+        const input = page.locator('#panel textarea').first();
+        await expect(input).toHaveValue('first');
+        await input.fill('LATEST UNSAVED VIDEO DROP EDIT');
+        await expect.poll(() => page.evaluate(() => ({pending:pendingContentSaves,timer:saveTimer === null})),
+          {timeout:10000}).toEqual({pending:2,timer:true});
+        const uploaded = page.waitForResponse(response => new URL(response.url()).pathname === '/api/upload' &&
+          response.request().method() === 'POST',{timeout:10000});
+        evidence.event = await (source === 'history' ? historyVideoDrop() : canvasVideoDrop());
+        assert.equal(evidence.event.prevented,true);
+        const response = await uploaded;
+        assert.equal(response.status(),200,await response.text());
+        await response.finished();
+        await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+        evidence.blocked = await state();
+        evidence.blockedCreateCount = creates().length;
+        assert.equal(evidence.blockedCreateCount,0,'No create POST before older saves drain');
+        assert.equal(evidence.blocked.project.cards.length,baseline.project.cards.length,
+          'Do not expose any provisional material while an older save is queued');
+        assert.equal(await page.locator('#world .card').count(),baseline.project.cards.length);
+        assert.equal(evidence.blocked.project.cards.find(c => c.id === 'target').params.prompt,'LATEST UNSAVED VIDEO DROP EDIT');
+      } finally {
+        release(); if (firstStarted) await handled;
+        await page.unroute(pattern,handler);
+      }
+      try {
+        if (routeError) throw routeError;
+        await settle();
+        await Promise.all(responseTasks);
+        evidence.final = await state();
+        evidence.saved = await api(endpoint);
+        evidence.timeline = await page.evaluate(() => {
+          window.canvasDropObserver.disconnect(); return window.canvasDropTimeline;
+        });
+        evidence.conflicts = evidence.responses.filter(r => r.status === 409);
+        evidence.uploadCount = uploads().length; evidence.createCount = creates().length;
+        const provisional = evidence.blocked.project.cards.find(c => c.type === 'card_asset');
+        evidence.temporaryMaterial = provisional && {id:provisional.id,outputs:provisional.outputs.length};
+        const materialId = provisional?.id || evidence.final.project.cards.find(c => c.type === 'card_asset')?.id;
+        const firstVisible = materialId ? evidence.timeline.findIndex(snapshot => snapshot.ids.includes(materialId)) : -1;
+        evidence.disappearedAfterReload = firstVisible >= 0 &&
+          evidence.timeline.slice(firstVisible + 1).some(snapshot => !snapshot.ids.includes(materialId));
+        const summary = {conflicts:evidence.conflicts,temporaryMaterial:evidence.temporaryMaterial,
+          disappearedAfterReload:evidence.disappearedAfterReload,
+          finalPrompt:evidence.final.project.cards.find(c => c.id === 'target')?.params.prompt,
+          savedPrompt:evidence.saved.cards.find(c => c.id === 'target')?.params.prompt,
+          finalMaterials:evidence.final.project.cards.filter(c => c.type === 'card_asset').length};
+        t.diagnostic(source + ' VIDEO DROP queued-save evidence: ' + JSON.stringify(summary));
+        // Never accept the reproduced 409/reload/lost-edit behavior as success.
+        assert.deepEqual(evidence.conflicts,[],
+          'Canvas video drop must not expose an uncreated card ID to an older queued PUT');
+        assert.equal(evidence.disappearedAfterReload,false,'An already-visible material must not disappear during save reconciliation');
+        assert.equal(evidence.final.project.cards.find(c => c.id === 'target').params.prompt,'LATEST UNSAVED VIDEO DROP EDIT');
+        assert.equal(evidence.saved.cards.find(c => c.id === 'target').params.prompt,'LATEST UNSAVED VIDEO DROP EDIT');
+        await assertCanvasVideo();
+      } finally {
+        page.off('response',observeResponse);
+        await page.evaluate(() => window.canvasDropObserver?.disconnect());
+      }
+    });
+    for (const endpoint of ['upload','create']) {
+      for (const change of ['other-project','same-id-reopen','readonly']) {
+        await check(`canvas VIDEO DROP ${change} during real ${endpoint} stops batch without stale success`,async () => {
+          await reset(); await settle(); await observeDropNotices();
+          let next;
+          await hold(endpoint,async () => {
+            await assertNoDropSuccess();
+            if (change === 'other-project') {
+              next = await api('/api/projects','POST',{name:'Other isolated drop target'});
+              await page.evaluate(id => openProject(id),next.id);
+            } else if (change === 'same-id-reopen') {
+              await page.evaluate(id => openProject(id),project.id);
+            } else {
+              // Simulate the production permission-update state while the network
+              // response is pending; this tests the UI guard, not ACL revocation.
+              await page.evaluate(() => { PROJ.permission = 'read'; syncPermissionUI(); });
+            }
+          },() => canvasVideoDrop(2));
+          const actual = await state(), original = await api(`/api/projects/${project.id}`);
+          assert.equal(uploads().length,1,'The second batch file must not upload after context invalidation');
+          assert.equal(creates().length,endpoint === 'create' ? 1 : 0);
+          assert.equal(original.cards.filter(c => c.type === 'card_asset').length,endpoint === 'create' ? 1 : 0,
+            'A committed create may remain in its original project; upload alone must never create');
+          assert.deepEqual(original.edges,[]);
+          assert.equal(original.cards.find(c => c.id === 'target').params.prompt,'原文字');
+          if (next) {
+            assert.equal(actual.project.id,next.id);
+            assert.deepEqual(actual.project.cards,[],'Never put the old upload into the newly active project');
+            assert.deepEqual((await api(`/api/projects/${next.id}`)).cards,[]);
+          } else {
+            assert.equal(actual.project.id,project.id);
+            assert.equal(actual.project.cards.filter(c => c.type === 'card_asset').length,endpoint === 'create' ? 1 : 0);
+          }
+          if (change === 'readonly') assert.equal(await page.evaluate(() => PROJ.permission),'read',
+            'Late create response must not restore stale write permission');
+          await assertNoDropSuccess();
+        });
+      }
+    }
+    for (const failure of ['network-abort','backend-rejection']) {
+      await check(`canvas VIDEO DROP create ${failure} rolls back material without false success`,async () => {
+        await reset(); await settle(); await observeDropNotices();
+        const pattern = '**/api/projects/*/cards';
+        let result, routeError;
+        const handler = async route => {
+          try {
+            if (failure === 'network-abort') {
+              await route.abort('failed'); result = {failure};
+            } else {
+              // Deliberately invalidate this request, then forward it to the real
+              // create endpoint. The HTTP 400/body are backend-generated, not mocked.
+              const body = route.request().postDataJSON(); body.card.id = '';
+              const response = await route.fetch({postData:body});
+              result = {status:response.status(),body:await response.text()};
+              await route.fulfill({response});
+            }
+          } catch (error) { routeError = error; }
+        };
+        await page.route(pattern,handler);
+        try {
+          await canvasVideoDrop();
+          await expect.poll(() => result || routeError,{timeout:10000}).toBeTruthy();
+          if (routeError) throw routeError;
+          await expect.poll(() => page.evaluate(() => workFailure?.message || ''),{timeout:10000}).not.toBe('');
+          await settle();
+          if (failure === 'backend-rejection') {
+            assert.equal(result.status,400); assert.match(result.body,/卡片 ID 不正确/);
+          }
+          await unchanged({uploadCount:1,createCount:1});
+          assert.equal(await page.locator('#world .card').count(),1);
+          const saved = await api(`/api/projects/${project.id}`);
+          assert.equal(saved.cards.length,1); assert.deepEqual(saved.edges,[]);
+          await assertNoDropSuccess();
+          assert.ok((await state()).notice.includes('卡片添加失败'),'Show a failure instead of a success toast');
+          (report.canvasDropCreateFailures ||= []).push({failure,...result});
+        } finally { await page.unroute(pattern,handler); }
+      });
+    }
+    await check('canvas VIDEO DROP preserves latest textarea edit while real create response is held',async () => {
+      await reset(); await settle(); await observeDropNotices();
+      const conflicts = [], endpoint = `/api/projects/${project.id}`;
+      const observeResponse = response => {
+        if (new URL(response.url()).pathname === endpoint && response.status() === 409) conflicts.push(409);
+      };
+      page.on('response',observeResponse);
+      try {
+        await hold('create',async () => {
+          await assertNoDropSuccess();
+          const committed = await api(endpoint);
+          assert.equal(committed.cards.filter(c => c.type === 'card_asset').length,1);
+          assert.equal(committed.cards.find(c => c.id === 'target').params.prompt,'原文字');
+          await page.evaluate(() => pick('target'));
+          await page.locator('#panel textarea').first().fill('LATEST EDIT DURING DROP CREATE');
+          await expect.poll(() => page.evaluate(() => ({pending:pendingContentSaves,timer:saveTimer === null})),
+            {timeout:10000}).toEqual({pending:1,timer:true});
+          assert.equal((await state()).project.cards.find(c => c.id === 'target').params.prompt,'LATEST EDIT DURING DROP CREATE');
+        },() => canvasVideoDrop());
+        const {actual,saved} = await assertCanvasVideo();
+        assert.deepEqual(conflicts,[]);
+        assert.equal(actual.project.cards.find(c => c.id === 'target').params.prompt,'LATEST EDIT DURING DROP CREATE');
+        assert.equal(saved.cards.find(c => c.id === 'target').params.prompt,'LATEST EDIT DURING DROP CREATE');
+        assert.equal(actual.selected,'target','Late create completion must not steal the newer selection');
+        await expect(page.locator('#panel textarea').first()).toHaveValue('LATEST EDIT DURING DROP CREATE');
+        assert.ok((await page.evaluate(() => window.dropNotices)).some(text => text.startsWith('已建素材节点：')));
+      } finally { page.off('response',observeResponse); }
+    });
+    await check('canvas VIDEO DROP parallel events serialize creation without 409 or material loss',async () => {
+      await reset(); await settle();
+      const conflicts = [], endpoint = `/api/projects/${project.id}`;
+      const observeResponse = response => {
+        if (new URL(response.url()).pathname === endpoint && response.status() === 409) conflicts.push(409);
+      };
+      page.on('response',observeResponse);
+      try {
+        // Hold the first committed create, then finish the second real upload.
+        // Its material must remain private while the first create is pending.
+        await hold('create',async () => {
+          const uploaded = page.waitForResponse(response => new URL(response.url()).pathname === '/api/upload' &&
+            response.request().method() === 'POST',{timeout:10000});
+          await canvasVideoDrop();
+          const response = await uploaded; assert.equal(response.status(),200); await response.finished();
+          await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
+          assert.equal(uploads().length,2); assert.equal(creates().length,1);
+          assert.equal((await state()).project.cards.filter(c => c.type === 'card_asset').length,1);
+        },() => canvasVideoDrop());
+        const actual = await state(), saved = await api(endpoint);
+        const assets = actual.project.cards.filter(c => c.type === 'card_asset');
+        assert.equal(assets.length,2); assert.equal(new Set(assets.map(c => c.id)).size,2);
+        assert.equal(creates().length,2); assert.equal(uploads().length,2);
+        assert.equal(saved.cards.length,3); assert.equal(await page.locator('#world .card').count(),3);
+        assert.deepEqual(conflicts,[]); assert.deepEqual(saved.edges,[]);
+        assert.equal(saved.cards.find(c => c.id === 'target').params.prompt,'原文字');
+        for (const card of assets) {
+          assert.equal(card.outputs.length,1); assert.equal(card.outputs[0].kind,'video');
+          assert.deepEqual(saved.cards.find(c => c.id === card.id).outputs,card.outputs);
+          const response = await page.request.get(fixture.origin + card.outputs[0].url);
+          assert.equal(response.status(),200); assert.deepEqual(await response.body(),media.video);
+        }
       } finally { page.off('response',observeResponse); }
     });
     await check('full slots reject before HTTP upload',async () => {
