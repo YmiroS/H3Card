@@ -8,6 +8,7 @@
     image:['镜头与分镜','用镜头组织故事，用参考图建立画面，再交给模型生成。'],
     video:['视频制作','使用真实视频节点生成；需要时手动将采用的分镜加入参考。'],
     review:['顺序预览','按故事顺序检查已采用的镜头视频与缺失片段。'],
+    edit:['剪辑与导出','明确加入采用的产物或上传素材，剪辑画面、配乐与文字，导出成片。'],
   };
   let project = null, doc = null, caps = {}, cardTypes = [], stage = 'image', selected = null;
   let jobs = new Map(), dirty = false, editVersion = 0, saving = null, saveTimer = null;
@@ -68,7 +69,8 @@
     updateActions();
   }
   function updateActions() {
-    $('save').disabled = !writable() || busy || !dirty;
+    $('save').disabled = !writable() || busy || (!dirty && !window.DirectorEdit.dirty);
+    window.DirectorEdit.refresh();
     $('export').disabled = !doc;
     $('add-shot').disabled = !writable() || busy || doc.shots.length >= 200;
     $('import-canvas').disabled = !writable() || busy || doc.shots.length >= 200;
@@ -106,7 +108,21 @@
     }).finally(() => { saving = null; updateActions(); });
     return saving;
   }
-  async function flush() { while (dirty) await save(); }
+  async function flushDirector() { while (dirty) await save(); }
+  async function flush() { await window.DirectorEdit.flush(); await flushDirector(); }
+  window.DirectorEdit.configure({
+    auth, toast, flushDirector,
+    onStateChange:state => { $('save').disabled = !writable() || busy || (!dirty && !state.dirty); },
+    getContext: () => ({
+      project, writable:!!writable(), busy,
+      outputs:(doc?.shots || []).flatMap((shot, order) => ['image','video'].flatMap(type => {
+        const version = chosen(shot,type);
+        return version ? [{order, title:shot.title, output:structuredClone(version.output),
+          source:{shot:shot.id, card:shot[type].card || null, job:version.job, index:version.index}}] : [];
+      }))
+    })
+  });
+  window.DirectorEdit.init($('edit-stage'));
   async function refreshProjects() {
     const data = await auth.request('/api/projects');
     const select = $('projects'); select.replaceChildren(new Option('选择项目', ''));
@@ -123,6 +139,7 @@
       const next = await auth.request(`/api/projects/${pid}`);
       clearTimeout(saveTimer);
       project = next; doc = structuredClone(next.director || {rev:0, script:'', style:'', shots:[]});
+      window.DirectorEdit.setContext(pid);
       const targetShot = new URL(location.href).searchParams.get('shot');
       selected = doc.shots.find(s => s.id === targetShot)?.id || doc.shots[0]?.id || null; dirty = false; conflict = false;
       jobs = new Map(); historySignature = ''; pollSignature = '';
@@ -188,6 +205,9 @@
     $('script-stage').hidden = !project || stage !== 'script';
     $('shot-stage').hidden = !project || !['image','video'].includes(stage);
     $('review-stage').hidden = !project || stage !== 'review';
+    if (project && stage === 'edit') window.DirectorEdit.mount($('edit-stage'));
+    else window.DirectorEdit.hide();
+    for (const id of ['preview','import-canvas','add-shot']) $(id).hidden = stage === 'edit';
     $('stage-title').textContent = stageInfo[stage][0]; $('stage-subtitle').textContent = stageInfo[stage][1];
     document.querySelectorAll('[data-stage]').forEach(node => node.classList.toggle('active', node.dataset.stage === stage));
     $('script').disabled = $('style').disabled = !writable();
@@ -566,8 +586,10 @@
   };
   $('save').onclick = () => flush().catch(() => {});
   $('reload-project').onclick = () => { if (confirm('重新加载会放弃本页未保存的编辑。请确认已导出备份。')) openProject(project.id,true); };
-  $('export').onclick = () => {
+  $('export').onclick = async () => {
     if (!doc) return;
+    // 冲突时仍允许下载本页导演草稿；剪辑草稿在第五步单独下载。
+    try { await flush(); } catch (error) { toast(`未能保存，仍将导出本页方案备份：${error.message}`); }
     const blob = new Blob([JSON.stringify({name:project.name,director:doc},null,2)],{type:'application/json'});
     const link = el('a'); link.href = URL.createObjectURL(blob); link.download = `${project.name.replace(/[\\/:*?"<>|]/g,'_')}-导演方案.json`;
     link.click(); setTimeout(() => URL.revokeObjectURL(link.href),1000);
@@ -590,7 +612,7 @@
   $('preview-dialog').onclose = () => { $('preview-media').querySelector('video')?.pause(); $('preview-media').replaceChildren(); };
   $('preview-prev').onclick = () => { if (previewIndex > 0) { previewIndex--; showPreview(); } };
   $('preview-next').onclick = () => { if (previewIndex < doc.shots.length-1) { previewIndex++; showPreview(); } };
-  window.addEventListener('beforeunload',event => { if (dirty || busy || saving) { event.preventDefault(); event.returnValue = ''; } });
+  window.addEventListener('beforeunload',event => { if (dirty || busy || saving || window.DirectorEdit.dirty || window.DirectorEdit.pending) { event.preventDefault(); event.returnValue = ''; } });
   window.addEventListener('h3auth:expired',() => { conflict = true; updateActions(); });
   async function boot() {
     updateActions();

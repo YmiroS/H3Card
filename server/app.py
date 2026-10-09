@@ -54,6 +54,8 @@ from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_
                          require_team_leader, require_project, require_job, call_store,
                          setup_local_test_auth)
 from server.resource_access import ResourceAccess
+from server.edit_api import register_edit_routes
+from server.edit_export import ExportBusyError
 from server.image_controls import image_controls, patch_image_controls
 from server.director_bridge import import_director, link_director, project_director, reference_storyboard, sync_card_job
 
@@ -2561,6 +2563,11 @@ async def api_project_delete(request):
     # 先封闭访问，再取消任务、移动文件；失败重试也不重新开放。
     await call_store(request.app, "set_project_state", pid, "deleted")
     await close_presence_room(request.app, pid, code=1000, message=b"canvas deleted")
+    try:
+        await request.app["edit_exports"].cancel_project(pid)
+    except ExportBusyError:
+        # Other instances cannot publish after project access has been revoked above.
+        pass
     jobs = await call_store(request.app, "list_project_jobs", pid)
     for jid in jobs:
         if CONTROLLER_MODE:
@@ -2745,6 +2752,7 @@ async def on_stop(app):
     await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
     await close_presence_connections(app)
     await app["video_previews"].close()
+    await app["edit_exports"].close()
     task = app.get("ws_task")
     if task:
         task.cancel()
@@ -2827,6 +2835,7 @@ def make_app(auth_path=None):
     app["presence_versions"] = defaultdict(int)
     app["presence_access_changed"] = partial(handle_presence_access_changed, app)
     register_auth_routes(app, ROOT / "web")
+    register_edit_routes(app, sys.modules[__name__])
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
     )
@@ -2893,7 +2902,7 @@ def make_app(auth_path=None):
     app.router.add_get("/admin/permissions", permissions_page)
     app.router.add_get("/teams", teams_page)
     # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
-    for name in ("app.js", "style.css", "director.js", "director.css"):
+    for name in ("app.js", "style.css", "director.js", "director.css", "director_edit.js"):
         app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
     app.on_shutdown.append(close_presence_connections)
