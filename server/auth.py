@@ -16,9 +16,10 @@ from .auth_store import AuthError
 COOKIE = 'h3card_session'
 PUBLIC = {'/login', '/login.html', '/auth.js', '/style.css', '/favicon.png', '/icon.png'}
 ADMIN_PAGES = {'/controller', '/controller.html', '/controller/costs', '/costs.html',
+               '/controller/capacity', '/capacity.html',
                '/admin/permissions', '/permissions.html'}
 TEAM_PAGES = {'/teams', '/teams.html'}
-ADMIN_APIS = ('/api/admin', '/api/workers', '/api/costs', '/api/reload', '/api/status')
+ADMIN_APIS = ('/api/admin', '/api/workers', '/api/costs', '/api/capacity', '/api/reload', '/api/status')
 
 
 async def call_store(app, method, *args, **kwargs):
