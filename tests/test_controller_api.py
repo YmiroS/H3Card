@@ -413,6 +413,52 @@ class CostLedgerTest(unittest.TestCase):
 
 
 class FfmpegDiscoveryTest(unittest.TestCase):
+    def test_capacity_output_probe_reads_real_synthetic_media(self):
+        executable = controller_app.ffmpeg_bin()
+        if executable is None:
+            self.skipTest("本机未安装媒体探测器")
+        with tempfile.TemporaryDirectory() as directory:
+            for filename, extra in (("image.png", ["-frames:v", "1"]),
+                                    ("video.mp4", ["-t", "1", "-c:v", "mpeg4"])):
+                with self.subTest(filename=filename):
+                    path = Path(directory) / filename
+                    controller_app.subprocess.run(
+                        [str(executable), "-hide_banner", "-loglevel", "error", "-nostdin",
+                         "-f", "lavfi", "-i", "color=c=blue:s=64x48:r=24", *extra, str(path)],
+                        check=True, capture_output=True, timeout=8,
+                    )
+                    metadata = controller_app.probe_capacity_output(path)
+                    self.assertTrue(metadata["valid"], metadata)
+                    self.assertEqual((metadata["width"], metadata["height"]), (64, 48))
+                    if filename.endswith("mp4"):
+                        self.assertAlmostEqual(metadata["duration"], 1)
+                        self.assertAlmostEqual(metadata["fps"], 24)
+
+    def test_capacity_output_probe_is_bounded_and_local_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "output.mp4"
+            path.write_bytes(b"test-video")
+            result = types.SimpleNamespace(returncode=0, stderr=(
+                "Duration: 00:00:05.02, start: 0.0\n"
+                "Stream #0:0: Video: h264, yuv420p, 832x480, 24 fps\n"))
+            with mock.patch.object(controller_app, "ffmpeg_bin", return_value=Path("/ffmpeg")), \
+                 mock.patch.object(controller_app.subprocess, "run", return_value=result) as run:
+                metadata = controller_app.probe_capacity_output(path)
+            self.assertTrue(metadata["valid"])
+            self.assertEqual(metadata["duration"], 5.02)
+            self.assertEqual(metadata["width"], 832)
+            self.assertEqual(metadata["height"], 480)
+            self.assertEqual(metadata["fps"], 24)
+            self.assertEqual(run.call_args.kwargs["timeout"], 8)
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file,pipe")
+            self.assertIn("-format_whitelist", command)
+            with mock.patch.object(controller_app, "ffmpeg_bin", return_value=None):
+                self.assertFalse(controller_app.probe_capacity_output(path)["valid"])
+            with mock.patch.object(controller_app, "ffmpeg_bin", return_value=Path("/ffmpeg")), \
+                 mock.patch.object(controller_app.subprocess, "run", side_effect=OSError("unavailable")):
+                self.assertFalse(controller_app.probe_capacity_output(path)["valid"])
+
     def test_falls_back_to_linux_system_ffmpeg(self):
         with mock.patch.dict(sys.modules, {"imageio_ffmpeg": None}), \
              mock.patch.object(controller_app.shutil, "which", return_value="/usr/bin/ffmpeg"):
@@ -539,6 +585,12 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             "/api/admin/workers/sync-all", controller_app.api_workers_sync_all
         )
         application.router.add_get("/api/costs", controller_app.api_costs)
+        application.router.add_get("/controller/capacity", controller_app.controller_capacity)
+        application.router.add_get("/api/capacity", controller_app.api_capacity)
+        application.router.add_get("/api/capacity/export", controller_app.api_capacity_export)
+        application.router.add_post("/api/capacity/estimate", controller_app.api_capacity_estimate)
+        application.router.add_post("/api/capacity/jobs/{pid}/review", controller_app.api_capacity_review)
+        application.router.add_post("/api/capacity/workers/{worker_id}", controller_app.api_capacity_worker)
         await self.start_client(application)
 
     async def asyncTearDown(self):
@@ -554,6 +606,154 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
         controller_app.WEIGHTS.clear()
+
+    async def test_capacity_permissions_and_navigation(self):
+        response = await self.client.get("/controller/capacity")
+        self.assertEqual(response.status, 200)
+        self.assertIn("产能评估", await response.text())
+        dashboard = await (await self.client.get("/controller")).text()
+        self.assertLess(dashboard.index('href="/controller/costs"'),
+                        dashboard.index('href="/controller/capacity"'))
+        report = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(report["overview"]["tasks"], 0)
+        self.assertEqual((await self.client.get("/capacity.html")).status, 404)
+        self.auth.create_user("capacity-reader", auth_support.PASSWORD)
+        headers = await self.login("capacity-reader")
+        self.client.session.headers.update(headers)
+        for path in ("/controller/capacity", "/capacity.html", "/api/capacity",
+                     "/api/capacity/export"):
+            with self.subTest(path=path):
+                self.assertEqual((await self.client.get(path)).status, 403)
+        self.assertEqual((await self.client.post("/api/capacity/estimate", json={})).status, 403)
+        self.assertEqual((await self.client.post("/api/capacity/jobs/j/review", json={})).status, 403)
+        self.client.session.cookie_jar.clear()
+        self.assertEqual((await self.client.get("/api/capacity")).status, 401)
+
+    async def test_capacity_query_and_body_validation(self):
+        for query in ("from=nan", "to=inf", "from=2&to=1", "from=1&to=1", "from=-1", "to=1e100",
+                      "limit=201", "offset=-1", "limit=invalid"):
+            self.assertEqual((await self.client.get("/api/capacity?" + query)).status, 400)
+        for body in ([], None, "wrong"):
+            response = await self.client.post("/api/capacity/estimate", json=body)
+            self.assertEqual(response.status, 400)
+        response = await self.client.post("/api/capacity/estimate", data="x" * 65537,
+                                          headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status, 413)
+        response = await self.client.post("/api/capacity/estimate", json={})
+        self.assertEqual(response.status, 400)
+        response = await self.client.post("/api/capacity/jobs/missing/review",
+                                          json={"accepted": 0})
+        self.assertEqual(response.status, 404)
+        response = await self.client.post("/api/capacity/estimate", json={},
+                                          headers={"X-CSRF-Token": "invalid"})
+        self.assertEqual(response.status, 403)
+
+    async def test_capacity_history_and_csv_keep_worker_identity(self):
+        import time
+        workers = [self.store.register_worker("=重复机器") for _ in range(2)]
+        for i, worker in enumerate(workers):
+            job = {"id": f"capacity-history-{i}", "capability": "qwen_image_21_multi",
+                   "status": "queued", "created": time.time() - 200,
+                   "worker_id": worker["worker_id"]}
+            self.ledger.record_job(job, {"width": 1024}, {}, {})
+            self.ledger.start_job(job["id"], worker["worker_id"], job["created"] + 10)
+            self.ledger.finish_job(job["id"], "done", job["created"] + 70, worker["worker_id"])
+        response = await self.client.get("/api/capacity?limit=1")
+        self.assertEqual(response.status, 200)
+        report = await response.json()
+        self.assertEqual(report["overview"]["tasks"], 2)
+        self.assertEqual(report["details_total"], 2)
+        self.assertEqual(len(report["details"]), 1)
+        self.assertEqual(len({g["worker_id"] for g in report["groups"]}), 2)
+        self.assertTrue(all(g["source"] == "historical" for g in report["groups"]))
+        response = await self.client.get("/api/capacity/export")
+        self.assertEqual(response.status, 200)
+        self.assertIn("text/csv", response.headers["Content-Type"])
+        self.assertIn("attachment", response.headers["Content-Disposition"])
+        self.assertNotIn("\n=重复机器", await response.text())
+        group = report["groups"][0]
+        payload = {"worker_id": group["worker_id"], "mode": "historical",
+                   "quality": "technical", "hours": 8, "availability": 1,
+                   "utilization": 0.75, "demands": [{"group_id": group["id"], "quantity": 1000}]}
+        response = await self.client.post("/api/capacity/estimate", json=payload)
+        self.assertEqual(response.status, 200, await response.text())
+        estimate = await response.json()
+        self.assertEqual(estimate["machines"], 3)
+        self.assertTrue(estimate["warnings"])
+        payload["mode"] = "verified"
+        self.assertEqual((await self.client.post("/api/capacity/estimate", json=payload)).status, 400)
+
+    async def test_capacity_attempt_and_artifact_capture_do_not_trust_worker_metadata(self):
+        import time
+        credentials = self.store.register_worker("产能测试节点", {})
+        worker_id = credentials["worker_id"]
+        headers = {"X-Worker-ID": worker_id,
+                   "Authorization": f"Bearer {credentials['worker_token']}"}
+        self.store.heartbeat(worker_id, comfy_online=True)
+        pid = "capacity-captured"
+        self.register_job(pid)
+        graph = {"1": {"class_type": "KSampler", "inputs": {"steps": 20}}}
+        controller_app.JOBS[pid] = {"id": pid, "capability": "qwen_image_21_multi",
+                                     "status": "queued", "created": time.time(), "outputs": []}
+        self.ledger.record_job(controller_app.JOBS[pid])
+        self.store.enqueue(pid, {"capability": "qwen_image_21_multi", "graph": graph,
+                                  "capacity_spec": controller_app.make_spec(
+                                      "qwen_image_21_multi", {"width": 1024}, graph, {"width": 1024})})
+        assignment = await (await self.client.post("/agent/v1/jobs/acquire",
+                                                    headers=headers, json={})).json()
+        self.assertTrue(assignment["attempt_id"])
+        headers["X-Lease-Token"] = assignment["lease_token"]
+        await self.client.post(f"/agent/v1/jobs/{pid}/start", headers=headers, json={})
+        response = await self.client.post(f"/agent/v1/jobs/{pid}/event", headers=headers,
+                                          json={"type": "execution_cached", "data": {"nodes": ["1"]}})
+        self.assertEqual(response.status, 200)
+        data = aiohttp.FormData()
+        data.add_field("file", b"fake", filename="output.png", content_type="image/png")
+        metadata = {"kind": "image", "bytes": 4, "width": 1024, "height": 1024, "valid": True}
+        with mock.patch.object(controller_app, "probe_capacity_output", return_value=metadata):
+            response = await self.client.post(f"/agent/v1/jobs/{pid}/artifact", headers=headers, data=data)
+        self.assertEqual(response.status, 201)
+        artifact = await response.json()
+        # 重复引用和伪造元数据不应增加产量或覆盖服务器探测结果。
+        artifact["duration"] = 99999
+        artifact["width"] = 1
+        response = await self.client.post(f"/agent/v1/jobs/{pid}/complete", headers=headers,
+                                          json={"outputs": [artifact, artifact], "capacity_released": True,
+                                                "capacity_measurements": {"graph_changed": False}})
+        self.assertEqual(response.status, 200, await response.text())
+        report = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(report["overview"]["tasks"], 1)
+        self.assertEqual(report["details_total"], 1)
+        detail = report["details"][0]
+        self.assertEqual(len(detail["attempts"]), 1)
+        self.assertEqual(len(detail["outputs"]), 1)
+        self.assertEqual(detail["outputs"][0]["width"], 1024)
+        self.assertNotIn(assignment["lease_token"], json.dumps(report))
+        self.assertFalse(report["groups"][0]["eligible"])
+        # 终态重复请求由现有租约守卫拒绝，持久统计保持一次。
+        response = await self.client.post(f"/agent/v1/jobs/{pid}/complete", headers=headers,
+                                          json={"outputs": [artifact]})
+        self.assertEqual(response.status, 409)
+        self.assertEqual(self.ledger.report()["overview"]["tasks"], 1)
+        # 补录仅改变当前清单和后续执行配置，不能回填旧 attempt。
+        profile = {"host_id": "manual-host", "cpu": "人工确认 CPU",
+                   "memory_total_bytes": 96 * 1024 ** 3, "environment_id": "env-001",
+                   "model_version": "models-001", "disk": "2 TB SSD", "note": "合成配置声明"}
+        response = await self.client.post(f"/api/capacity/workers/{worker_id}", json=profile)
+        self.assertEqual(response.status, 200, await response.text())
+        updated = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(updated["workers"][0]["hardware"]["disk"], "2 TB SSD")
+        self.assertEqual(updated["groups"][0]["config_id"], report["groups"][0]["config_id"])
+        self.assertNotEqual(updated["groups"][0]["config"]["host_id"], "manual-host")
+        response = await self.client.post(f"/api/capacity/jobs/{pid}/review", json={
+            "accepted": None, "source": "standard", "benchmark_id": "synthetic-bench",
+            "note": "仅为人工归档标签，不自动成为标准跑分",
+        })
+        self.assertEqual(response.status, 200, await response.text())
+        reviewed = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(reviewed["groups"][0]["source"], "standard")
+        self.assertEqual(reviewed["groups"][0]["benchmark_id"], "synthetic-bench")
+        self.assertFalse(reviewed["groups"][0]["eligible"])
 
     async def test_reload_exposes_one_text_to_image_mode(self):
         response = await self.client.post("/api/reload", headers=self.headers)
