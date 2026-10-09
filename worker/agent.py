@@ -2,6 +2,7 @@
 """Windows pull worker for a Linux-hosted chouka controller."""
 import argparse
 import asyncio
+import copy
 import csv
 import ctypes
 import json
@@ -43,6 +44,13 @@ class WorkerAgent:
         state_path = Path(state_value)
         self.state_path = state_path if state_path.is_absolute() else self.config_path.parent / state_path
         self.state = self._load_state()
+        # 安装标识不依赖 hostname；同机多个 Worker 由管理员显式配置相同标识。
+        host_id = (str(self.config.get("capacity_host_id") or "").strip()
+                   or self.state.get("host_id") or uuid.uuid4().hex)
+        if self.state.get("host_id") != host_id:
+            self.state["host_id"] = host_id
+            # 已注册的旧安装同样需要立即落盘，不能等下一次注册。
+            self._save_state()
         self.session = None
         self.current = None
         self.comfy_lock = asyncio.Lock()
@@ -170,6 +178,33 @@ class WorkerAgent:
         available = int(status.ullAvailPhys)
         return {"used_bytes": total - available, "total_bytes": total}
 
+    def capacity_hardware(self, memory=None, devices=None):
+        # 只读取明确允许的配置项，不猜测完整环境版本或复制配置/凭据。
+        # __new__ 构造的探针测试没有 state 时，身份明确为未知；不临时生成 UUID。
+        state = getattr(self, "state", None)
+        return {
+            "host_id": state.get("host_id") if state is not None else None,
+            "cpu": {
+                "model": platform.processor() or None,
+                "architecture": platform.machine() or None,
+                "logical_cores": os.cpu_count(),
+            },
+            "os": {
+                "name": platform.system(),
+                "release": platform.release(),
+                "version": platform.version(),
+            },
+            "memory_total_bytes": (memory or {}).get("total_bytes"),
+            "environment_id": self.config.get("capacity_environment_id") or None,
+            "model_version": self.config.get("capacity_model_version") or None,
+            # ComfyUI 返回的是实际执行设备，不用 nvidia-smi 的第一张卡代替。
+            "execution_device": [
+                {key: device[key] for key in ("name", "type", "index", "vram_total")
+                 if key in device}
+                for device in (devices or []) if isinstance(device, dict)
+            ] or None,
+        }
+
     def collect_telemetry(self):
         try:
             gpus = self._nvidia_gpus()
@@ -179,7 +214,11 @@ class WorkerAgent:
             memory = self._system_memory()
         except Exception:
             memory = None
+        hardware = self.capacity_hardware(
+            memory, (getattr(self, "capabilities", None) or {}).get("devices"),
+        )
         return {
+            **hardware,
             "hostname": os.environ.get("COMPUTERNAME") or platform.node()
                         or self.config.get("worker_name") or "windows-worker",
             "gpus": gpus,
@@ -205,12 +244,16 @@ class WorkerAgent:
             print(f"[Worker] ComfyUI 不可用：{exc}")
             return self.capabilities or None
         self.comfy_online = True
+        hardware = self.capacity_hardware(self.telemetry.get("memory"), stats.get("devices"))
+        self.telemetry.update(hardware)
         self.capabilities = {
+            "hardware": hardware,
             "node_classes": sorted(nodes.keys()),
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 3,
+            "agent_version": 4,
+            "supports_capacity_telemetry": 1,
             "supports_file_sync": True,
         }
         self.last_capability_scan = time.time()
@@ -362,6 +405,10 @@ class WorkerAgent:
                                    or bool(self.current and self.current.get("_cleanup_task"))
                                    or sync_running),
                     "current_job_id": self.current["job_id"] if self.current else None,
+                    "capacity_released": bool(
+                        self.current is None and not self.release_failed
+                        and self.comfy_online and not self.local_busy
+                    ),
                 }
                 if self.telemetry:
                     body["telemetry"] = self.telemetry
@@ -640,6 +687,18 @@ class WorkerAgent:
                 if data.get("prompt_id") != job_id:
                     continue
                 event_type = event.get("type")
+                if event_type == "execution_cached":
+                    measurements = assignment.setdefault("_capacity_measurements", {})
+                    cached = measurements.setdefault("cached_nodes", [])
+                    graph = assignment["payload"]["graph"]
+                    known_ids = {node["id"] for node in cached}
+                    for node_id in data.get("nodes") or []:
+                        node_id = str(node_id)
+                        if node_id not in known_ids:
+                            node = graph.get(node_id) or {}
+                            cached.append({"id": node_id, "type": node.get("class_type")})
+                            known_ids.add(node_id)
+                    # 部分节点缓存并不代表整个生成命中缓存，不派生全命中标志。
                 if event_type in ("execution_error", "execution_interrupted"):
                     data["cleanup_pending"] = True
                     self.start_cleanup(assignment)
@@ -724,37 +783,61 @@ class WorkerAgent:
         return "file"
 
     async def execute(self, assignment):
+        started = time.monotonic()
         ttl = max(float(assignment.get("lease_expires_at", 0)) - time.time(), 1.0)
-        assignment["_lease_deadline"] = time.monotonic() + ttl
+        assignment["_lease_deadline"] = started + ttl
         self.current = assignment
         job_id = assignment["job_id"]
+        measurements = {}
+        assignment["_capacity_measurements"] = measurements
+        # 旧 Controller 没有 attempt_id，仍按原租约正常执行和回报。
+        attempt = {"attempt_id": assignment["attempt_id"]} if assignment.get("attempt_id") else {}
         print(f"[Worker] 领取任务 {job_id}")
         try:
+            # 准备过程会原地改图，必须先做独立快照；只回报差异布尔值。
+            original_graph = copy.deepcopy(assignment["payload"].get("graph") or {})
             await self.prepare_inputs(assignment)
             await self.patch_silent_video_audio(assignment)
+            measurements["graph_changed"] = (
+                original_graph != (assignment["payload"].get("graph") or {})
+            )
+            prepared = time.monotonic()
+            measurements["prepare_seconds"] = prepared - started
             await self.execute_comfy(assignment)
+            executed = time.monotonic()
+            measurements["execute_seconds"] = executed - prepared
             if assignment.get("cancel_requested"):
                 raise JobFailed("任务已取消", canceled=True)
             outputs = await self.collect_outputs(assignment)
+            uploaded = time.monotonic()
+            measurements["upload_seconds"] = uploaded - executed
             if assignment.get("cancel_requested"):
                 raise JobFailed("任务已取消", canceled=True)
+            measurements["total_seconds"] = uploaded - started
             await self._json_request(
                 "POST", self.server + f"/agent/v1/jobs/{job_id}/complete",
                 headers=self._agent_headers(assignment["lease_token"]),
-                json={"outputs": outputs},
+                json={"outputs": outputs, **attempt,
+                      "capacity_measurements": dict(measurements),
+                      "capacity_released": (assignment.get("_cleanup_task") is None
+                                            and not self.release_failed)},
             )
             print(f"[Worker] 任务完成 {job_id}，产物 {len(outputs)} 个")
         except (Exception, asyncio.CancelledError) as exc:
             canceled = (isinstance(exc, JobFailed) and exc.canceled
                         or bool(assignment.get("cancel_requested")))
             released = await asyncio.shield(self.start_cleanup(assignment))
+            # 未完成阶段保持缺失；总时长记录到清理返回，释放失败仍明确标为未释放。
+            measurements["total_seconds"] = time.monotonic() - started
             error = str(exc) if released else self.release_failed
             print(f"[Worker] 任务失败 {job_id}：{error}")
             try:
                 await self._json_request(
                     "POST", self.server + f"/agent/v1/jobs/{job_id}/failed",
                     headers=self._agent_headers(assignment["lease_token"]),
-                    json={"error": error, "canceled": bool(canceled and released)},
+                    json={"error": error, "canceled": bool(canceled and released),
+                          **attempt, "capacity_measurements": dict(measurements),
+                          "capacity_released": bool(released)},
                 )
             except Exception as report_error:
                 print(f"[Worker] 上报失败状态失败：{report_error}")

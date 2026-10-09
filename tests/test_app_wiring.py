@@ -52,6 +52,8 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         # 根目录静态兜底已移除：直呼 .html 不再绕过页面权限。
         self.assertEqual((await self.client.get('/controller.html')).status, 404)
         self.assertEqual((await self.client.get('/costs.html')).status, 404)
+        self.assertEqual((await self.client.get('/capacity.html')).status, 404)
+        self.assertEqual((await self.client.get('/controller/capacity')).status, 404)
         self.assertEqual((await self.client.get('/permissions.html')).status, 404)
         self.assertEqual((await self.client.get('/app.js')).status, 200)
 

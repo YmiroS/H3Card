@@ -10,6 +10,8 @@ import time
 import uuid
 from pathlib import Path
 
+from capacity import CapacityStore
+
 
 LIVE_DISPATCH = ("assigned", "running", "cancel_requested")
 FINISHED_DISPATCH = ("done", "error", "canceled")
@@ -67,6 +69,7 @@ class DistributedStore:
         self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
         self._create_schema()
+        self.capacity = CapacityStore(self)
 
     def close(self):
         with self.lock:
@@ -207,7 +210,7 @@ class DistributedStore:
 
     def heartbeat(self, worker_id, *, capabilities=None, telemetry=None,
                   comfy_online=False, busy=False, local_busy=None,
-                  current_job_id=None, maintenance=None):
+                  current_job_id=None, maintenance=None, capacity_released=False):
         now = time.time()
         with self.lock, self.db:
             self._requeue_expired_locked(now)
@@ -295,6 +298,16 @@ class DistributedStore:
             self.db.execute(
                 f"UPDATE workers SET {', '.join(fields)} WHERE id = ?", values
             )
+            observed = self.db.execute(
+                "SELECT * FROM workers WHERE id = ?", (worker_id,),
+            ).fetchone()
+            snapshot = dict(observed)
+            snapshot.pop("token_hash", None)
+            self.capacity.observe_worker(
+                snapshot, now,
+                released=(capacity_released is True and not current_job_id
+                          and not effective_busy and bool(comfy_online)),
+            )
             return {
                 "commands": commands,
                 "server_time": now,
@@ -361,6 +374,7 @@ class DistributedStore:
                    VALUES (?, ?, ?, 'queued', ?, ?)""",
                 (job_id, _json(payload), _json(sorted(set(required_nodes or []))), now, now),
             )
+            self.capacity.enqueue(job_id, payload, now)
 
     def acquire(self, worker_id):
         now = time.time()
@@ -447,7 +461,13 @@ class DistributedStore:
                 "UPDATE workers SET busy = 1, current_job_id = ?, updated_at = ? WHERE id = ?",
                 (selected["job_id"], now, worker_id),
             )
+            snapshot = dict(worker)
+            snapshot.pop("token_hash", None)
+            attempt_id = self.capacity.assigned(
+                selected["job_id"], snapshot, _hash_token(lease_token), now,
+            )
             return {
+                "attempt_id": attempt_id,
                 "job_id": selected["job_id"],
                 "lease_token": lease_token,
                 "lease_expires_at": expires,
@@ -482,9 +502,12 @@ class DistributedStore:
                    WHERE job_id = ? AND worker_id = ?""",
                 (status, now + self.lease_seconds, now, job_id, worker_id),
             )
+            if cur.rowcount == 1 and status == "running":
+                self.capacity.running(job_id, worker_id, _hash_token(lease_token), now)
         return cur.rowcount == 1
 
-    def finish(self, job_id, worker_id, lease_token, status):
+    def finish(self, job_id, worker_id, lease_token, status, *,
+               capacity_released=False, capacity_outputs=None, capacity_measurements=None):
         if status not in FINISHED_DISPATCH:
             raise ValueError(f"invalid terminal status: {status}")
         if not self.validate_lease(job_id, worker_id, lease_token):
@@ -523,7 +546,18 @@ class DistributedStore:
                        WHERE id = ? AND current_job_id = ?""",
                     (now, worker_id, job_id),
                 )
+            if cur.rowcount == 1:
+                self.capacity.terminal(
+                    job_id, worker_id, _hash_token(lease_token), status, now,
+                    released=capacity_released is True, outputs=capacity_outputs,
+                    measurements=capacity_measurements,
+                )
         return cur.rowcount == 1
+
+    def record_capacity_cache(self, job_id, worker_id, lease_token, nodes):
+        with self.lock, self.db:
+            if self.validate_lease(job_id, worker_id, lease_token):
+                self.capacity.cache(job_id, worker_id, _hash_token(lease_token), nodes)
 
     def dispatch_status(self, job_id, worker_id=None):
         query = "SELECT status FROM dispatch_jobs WHERE job_id = ?"
@@ -548,6 +582,7 @@ class DistributedStore:
                     "UPDATE dispatch_jobs SET status = 'canceled', updated_at = ? WHERE job_id = ?",
                     (now, job_id),
                 )
+                self.capacity.canceled_queued(job_id, now)
                 return "canceled"
             if row["status"] in LIVE_DISPATCH:
                 self.db.execute(
@@ -578,7 +613,10 @@ class DistributedStore:
             (now,),
         ).fetchall()
         for row in expired:
+            self.capacity.expired(row["job_id"], row["worker_id"], now)
             next_status = "canceled" if row["cancel_requested"] else "queued"
+            if next_status == "canceled":
+                self.capacity.canceled_queued(row["job_id"], now)
             self.db.execute(
                 """UPDATE dispatch_jobs
                    SET status = ?, worker_id = NULL, lease_token_hash = NULL,
