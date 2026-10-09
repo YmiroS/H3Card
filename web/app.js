@@ -2555,24 +2555,69 @@ function bboxOf(ids) {
   return x1 === Infinity ? null : { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
 }
 
-/** 按操作前的边界排列选中节点，使用实际尺寸，保证选中节点之间留出间距。 */
+/** 按操作前的边界对齐整行：选中且相连的节点横向排列，不移动未选节点。 */
 function alignSelectedCards(mode) {
   if (!PROJ || !requireOperate()) return;
   if (!["left", "right", "top", "bottom", "center"].includes(mode)) return;
-  const items = PROJ.cards.filter(c => selIds.has(c.id)).map(c => ({ c, ...cardRect(c) }));
+  const items = PROJ.cards.filter(c => selIds.has(c.id)).map((c, index) => ({ c, index, ...cardRect(c) }));
   if (items.length < 2) return;
   const left = Math.min(...items.map(r => r.x)), top = Math.min(...items.map(r => r.y));
   const right = Math.max(...items.map(r => r.x + r.w)), bottom = Math.max(...items.map(r => r.y + r.h));
   const column = mode === "left" || mode === "right" || mode === "center";
-  // 稳定排序：完全同位置时保留项目中的原节点顺序。
-  items.sort((a, b) => column ? a.y - b.y || a.x - b.x : a.x - b.x || a.y - b.y);
+  const byId = new Map(items.map(r => [r.c.id, r]));
+  const neighbors = new Map(items.map(r => [r.c.id, new Set()]));
+  const outgoing = new Map(items.map(r => [r.c.id, new Set()]));
+  const incoming = new Map(items.map(r => [r.c.id, 0]));
+  for (const edge of PROJ.edges) {
+    if (edge.from === edge.to || !byId.has(edge.from) || !byId.has(edge.to)) continue;
+    neighbors.get(edge.from).add(edge.to);
+    neighbors.get(edge.to).add(edge.from);
+    if (!outgoing.get(edge.from).has(edge.to)) {
+      outgoing.get(edge.from).add(edge.to);
+      incoming.set(edge.to, incoming.get(edge.to) + 1);
+    }
+  }
+  const seen = new Set(), rows = [];
+  const horizontalOrder = (a, b) => a.x - b.x || a.y - b.y || a.index - b.index;
+  for (const item of items) {
+    if (seen.has(item.c.id)) continue;
+    const members = [], pending = [item.c.id];
+    seen.add(item.c.id);
+    for (let i = 0; i < pending.length; i++) {
+      const id = pending[i];
+      members.push(byId.get(id));
+      for (const next of neighbors.get(id)) {
+        if (!seen.has(next)) { seen.add(next); pending.push(next); }
+      }
+    }
+    // 优先从引用来源排到下游；分支按原位置排序，环路按同一规则稳定展开。
+    const remaining = new Set(members), ordered = [];
+    while (remaining.size) {
+      const ready = [...remaining].filter(r => incoming.get(r.c.id) === 0);
+      const next = (ready.length ? ready : [...remaining]).sort(horizontalOrder)[0];
+      remaining.delete(next);
+      ordered.push(next);
+      for (const id of outgoing.get(next.c.id)) incoming.set(id, incoming.get(id) - 1);
+    }
+    rows.push({
+      items: ordered,
+      x: Math.min(...members.map(r => r.x)), y: Math.min(...members.map(r => r.y)),
+      w: members.reduce((sum, r) => sum + r.w, 0) + 24 * (members.length - 1),
+      h: Math.max(...members.map(r => r.h)),
+    });
+  }
+  rows.sort((a, b) => column ? a.y - b.y || a.x - b.x : a.x - b.x || a.y - b.y);
   let cursor = column ? top : left;
-  const positions = items.map(r => {
-    const x = column ? (mode === "left" ? left : mode === "right" ? right - r.w : (left + right - r.w) / 2) : cursor;
-    const y = column ? cursor : (mode === "top" ? top : bottom - r.h);
-    cursor += (column ? r.h : r.w) + 24;
-    return { ...r, nx: x, ny: y };
-  });
+  const positions = [];
+  for (const row of rows) {
+    let x = column ? (mode === "left" ? left : mode === "right" ? right - row.w : (left + right - row.w) / 2) : cursor;
+    const y = column ? cursor : (mode === "top" ? top : bottom - row.h);
+    for (const r of row.items) {
+      positions.push({ ...r, nx: x, ny: mode === "bottom" ? y + row.h - r.h : y });
+      x += r.w + 24;
+    }
+    cursor += (column ? row.h : row.w) + 24;
+  }
   if (!positions.some(r => Math.abs(r.nx - r.x) > 1e-7 || Math.abs(r.ny - r.y) > 1e-7)) return;
   for (const { c, nx, ny } of positions) {
     c.x = nx; c.y = ny;
