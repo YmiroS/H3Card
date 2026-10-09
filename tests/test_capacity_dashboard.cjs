@@ -38,7 +38,28 @@ function summaryFixture() {
   input.groups=[input.groups[0],captured,{...captured,id:'warm',mean_seconds:32,cache_condition:{kind:'loaders',nodes:[{type:'UNETLoader',id:'1'}]},last_sample_at:captured.last_sample_at-30}, {...captured,id:'image',capability:'qwen_image_21_multi',capability_name:'Qwen 多图',dimensions:{width:1024,height:1024,image_count:2,steps:8},mean_seconds:14,model_summary:{models:[{name:'sample-fp8.safetensors',precision:'FP8',precision_source:'loader',loader_dtype:'fp8_e4m3fn'}],precision_label:'FP8',source:'task_snapshot',runtime_verified:false}}, {...captured,id:'other-worker',worker_id:'w2'}, {...captured,id:'worker3',worker_id:'w3',mean_seconds:61,measured:1,model_summary:undefined}];
   return input;
 }
-function realStoreReport() {
+function modelSummary(models,extra={}) {
+  return {models,auxiliary_models:[],source:'task_snapshot',runtime_verified:false,complete:true,precision_label:null,...extra};
+}
+function evidenceFixture() {
+  const input=fixture(), historical=input.groups[0];
+  const pair=modelSummary([
+    {name:'history-high-bf16.safetensors',role:'high_noise',precision:'BF16',precision_source:'filename',loader_dtype:'fp8_e4m3fn'},
+    {name:'history-low-int8.safetensors',role:'low_noise',precision:'INT8',precision_source:'filename',loader_dtype:'default'},
+  ],{auxiliary_models:[{name:'aux-vae-fp16.safetensors',role:'VAE',precision:'FP16',precision_source:'filename'},{name:'aux-clip.safetensors',role:'CLIP'},{name:'aux-lora.safetensors',role:'LoRA'}],precision_label:'不得用统一精度替代各模型'});
+  const reference=modelSummary([{name:'current-main-fp8.safetensors',role:'main',precision:'FP8',precision_source:'filename'}],{source:'current_template',capability_name:'深度视频'});
+  const empty={total_samples:3201,recorded_samples:0,variants:[]};
+  const variant={source:'archived_task',summary:pair,samples:20,measured:18};
+  input.groups=[
+    {...historical,id:'unknown-reference',model_summary:modelSummary([],{source:'unrecorded',complete:false}),model_evidence:empty,current_model_reference:reference},
+    {...historical,id:'pair',model_evidence:{total_samples:3201,recorded_samples:3201,variants:[{...variant,samples:3201,measured:2900}]},current_model_reference:reference},
+    {...historical,id:'partial',model_evidence:{total_samples:3201,recorded_samples:30,variants:[variant,{source:'task_snapshot',summary:modelSummary([{name:'other-task-fp16.safetensors',role:'unrecognized',precision:'FP16',precision_source:'filename'}],{complete:false}),samples:10,measured:7}]},current_model_reference:reference},
+    {...historical,id:'empty-reference',model_evidence:empty,current_model_reference:modelSummary([],{source:'current_template',capability_name:'动态模型工具',complete:false})},
+    {...historical,id:'no-reference',model_evidence:empty},
+  ];
+  return input;
+}
+function realStoreReport(withModelEvidence=false) {
   // 真正调用 CapacityStore，只创建内存 SQLite；不启动服务、不读取项目数据库。
   const script = `
 import json, sqlite3, sys, threading, time
@@ -70,11 +91,35 @@ for index, benchmark in enumerate([None,'contract-bench-a','contract-bench-b']):
     if benchmark:
         store.review(job,{'accepted':1,'source':'standard','benchmark_id':benchmark,'note':'人工标签'})
 connection.execute('INSERT INTO cost_events VALUES (?,?,?,?,?,?,?,?)',('contract-history','generation','contract_image',worker['id'],'done',now-100,20,json.dumps({'width':512,'height':512})))
-report = store.report()
-print(json.dumps({'report':report,'write':profile},ensure_ascii=False))
+baseline = None
+if sys.argv[2] == 'evidence':
+    import copy
+    from unittest.mock import patch
+    from server import app
+    connection.execute('CREATE TABLE dispatch_jobs (job_id TEXT PRIMARY KEY, payload_json TEXT)')
+    for job, runtime in [('contract-history-other', 40), ('contract-history-unknown', 60)]:
+        connection.execute('INSERT INTO cost_events VALUES (?,?,?,?,?,?,?,?)',(job,'generation','contract_image',worker['id'],'done',now-100,runtime,json.dumps({'width':512,'height':512})))
+    baseline = store.report()
+    pair = copy.deepcopy(graph)
+    pair['1']['inputs'].update(ckpt_name='contract-first-bf16.safetensors',weight_dtype='fp8_e4m3fn')
+    pair['4'] = {'class_type':'UNETLoader','inputs':{'unet_name':'contract-second-int8.safetensors'}}
+    pair['5'] = {'class_type':'KSampler','inputs':{'model':['4',0],'latent_image':['2',0]}}
+    pair['3']['inputs']['images'] = ['5',0]
+    other = copy.deepcopy(graph)
+    other['1']['inputs']['ckpt_name'] = 'contract-other-fp16.safetensors'
+    for job, archived_graph in [('contract-history', pair), ('contract-history-other', other)]:
+        connection.execute('INSERT INTO dispatch_jobs VALUES (?,?)',(job,json.dumps({'capability':'contract_image','graph':archived_graph})))
+    report = store.report()
+    template = copy.deepcopy(graph)
+    template['1']['inputs']['ckpt_name'] = 'contract-current-fp8.safetensors'
+    with patch.dict(app.CAPS, {'contract_image':{'name':'契约图像工具','graph':'graphs/contract-template.json'}}, clear=True), patch('pathlib.Path.read_text', return_value=json.dumps(template)):
+        report = app.capacity_model_references(report)
+else:
+    report = store.report()
+print(json.dumps({'report':report,'write':profile,'baseline':baseline},ensure_ascii=False))
 connection.close()
 `;
-  return JSON.parse(execFileSync(process.env.CHOUKA_TEST_PYTHON || 'python3',['-c',script,path.join(__dirname,'..')],{encoding:'utf8'}));
+  return JSON.parse(execFileSync(process.env.CHOUKA_TEST_PYTHON || 'python3',['-c',script,path.join(__dirname,'..'),withModelEvidence?'evidence':'basic'],{encoding:'utf8'}));
 }
 const estimateResponse = {mode:'historical',quality:'technical',worker_id:'w1',total_seconds:12000,daily_capacity_seconds:19440,machines:1,price_total:null,lines:[{group_id:'h1',quantity:100,seconds_per_unit:60,daily_units:324},{group_id:'h2',quantity:100,seconds_per_unit:60,daily_units:324}],warnings:['测算响应警告一','测算响应警告二'],assumptions:['未包含模型切换','单机并发槽位为一']};
 const tick = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -199,17 +244,119 @@ test('产能看板语法与离线路由专项', async t => {
       const row=page.locator('[data-summary-worker-id=w1] [data-capability=depth_video]'),names=row.locator('[data-label="模型名称"]');
       assert.equal(await names.innerText(),'sample-main-int8.safetensors');
       await row.locator('select').selectOption('warm');
-      assert.deepEqual(await names.locator('p').allTextContents(),['main-high-noise.safetensors','main-low-noise.safetensors']);
+      assert.deepEqual(await names.locator('.model-name').allTextContents(),['main-high-noise.safetensors','main-low-noise.safetensors']);
+      assert.deepEqual(await names.locator('.model-role').allTextContents(),['主模型 1','主模型 2']);
+      assert.doesNotMatch(await names.innerText(),/高噪声|低噪声/);
       assert.doesNotMatch(await names.innerText(),/sample-main-int8/);
       await row.locator('button').click();
       assert.equal(await page.locator('#'+await row.locator('button').getAttribute('aria-controls')+' > td').getAttribute('colspan'),'6');
-      await row.locator('select').selectOption('h1');assert.equal(await names.innerText(),'历史未记录');
-      assert.equal(await page.locator('[data-summary-worker-id=w3] [data-label="模型名称"]').innerText(),'尚未采集');
+      await row.locator('select').selectOption('h1');assert.equal(await names.innerText(),'未获取到模型信息');
+      assert.equal(await page.locator('[data-summary-worker-id=w3] [data-label="模型名称"]').innerText(),'未获取到模型信息');
       assert.equal(await page.locator('[data-capability=qwen_image_21_multi] [data-label="模型名称"]').innerText(),'sample-fp8.safetensors');
       assert.deepEqual(state.errors,[]);
       input.groups[1].model_summary.source='unrecorded';
       const unknown=await setup({data:input});
-      assert.equal(await unknown.page.locator('[data-summary-worker-id=w1] [data-capability=depth_video] [data-label="模型名称"]').innerText(),'尚未采集');
+      assert.equal(await unknown.page.locator('[data-summary-worker-id=w1] [data-capability=depth_video] [data-label="模型名称"]').innerText(),'未获取到模型信息');
+    });
+    await t.test('全历史无证据时默认工具配置与耗时免责声明直接可见，不冒充历史精度',async()=>{
+      const {page,state}=await setup({data:evidenceFixture()});const row=page.locator('.business-row');
+      assert.equal(await row.locator('select').inputValue(),'unknown-reference');
+      assert.equal(await row.locator('button').getAttribute('aria-expanded'),'false');
+      for(const label of ['模型名称','模型精度']) {
+        const cell=row.locator(`[data-label="${label}"]`);
+        assert.match(await cell.innerText(),/当前工具默认配置（非历史执行记录）/);
+        assert.equal(await cell.getByText('当前工具默认配置（非历史执行记录）',{exact:true}).isVisible(),true);
+      }
+      assert.match(await row.locator('[data-label="模型名称"]').innerText(),/current-main-fp8/);
+      assert.match(await row.locator('[data-label="模型精度"]').innerText(),/文件标记 FP8/);
+      assert.match(await row.innerText(),/模型记录覆盖 0 \/ 3,201 次/);
+      assert.match(await row.locator('[data-label="平均生成时间"]').innerText(),/1 分 0 秒.*此处耗时来自历史任务，不代表当前模型速度/s);
+      assert.equal(await row.locator('[data-label="平均生成时间"] .warn').isVisible(),true);
+      assert.equal(await page.locator('#technical-details').evaluate(n=>n.open),false);
+      const marker=await row.locator('.model-origin').first().boundingBox();assert.ok(marker.y+marker.height<1000,'桌面首屏即可看到参考来源');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/不代表用户画布节点当前选中的模型/);
+      assert.match(await detail.innerText(),/不覆盖历史精度/);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('同图两主模型名称精度角色逐项对应，文件标记与加载配置冲突分别保留，历史优先',async()=>{
+      const {page,state}=await setup({data:evidenceFixture()});const row=page.locator('.business-row');await row.locator('select').selectOption('pair');
+      const names=row.locator('[data-label="模型名称"]'),precision=row.locator('[data-label="模型精度"]');
+      assert.deepEqual(await names.locator('.model-role').allTextContents(),['高噪声 · 主模型 1','低噪声 · 主模型 2']);
+      assert.deepEqual(await precision.locator('.model-role').allTextContents(),await names.locator('.model-role').allTextContents());
+      assert.match(await names.locator('.model-item').nth(0).innerText(),/history-high-bf16/);assert.match(await names.locator('.model-item').nth(1).innerText(),/history-low-int8/);
+      assert.match(await precision.locator('.model-item').nth(0).innerText(),/文件标记 BF16.*加载配置 FP8（fp8_e4m3fn）/s);
+      assert.match(await precision.locator('.model-item').nth(1).innerText(),/文件标记 INT8.*加载配置 default（实际精度未确认）/s);
+      assert.doesNotMatch(await precision.locator('.model-item').nth(1).innerText(),/BF16|FP8/);
+      assert.doesNotMatch(await row.innerText(),/current-main|当前工具默认配置|aux-|统一精度/);
+      assert.match(await row.innerText(),/非运行时检测/);
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const role of ['VAE','CLIP','LoRA'])assert.match(await detail.innerText(),new RegExp('角色：'+role));
+      assert.match(await detail.innerText(),/辅助模型（不计入主模型名称或精度）/);assert.match(await detail.innerText(),/当前工具默认配置（非历史执行记录）/);
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('部分覆盖和多个变体是不同任务组合，不把全组均值归给任一模型；切换同步清除旧证据',async()=>{
+      const {page,state}=await setup({data:evidenceFixture()});const row=page.locator('.business-row');await row.locator('select').selectOption('partial');
+      assert.match(await row.innerText(),/模型记录覆盖 30 \/ 3,201 次/);
+      assert.match(await row.innerText(),/不同任务的模型组合；不是每个任务同时使用全部模型/);
+      assert.match(await row.innerText(),/20 次记录 \/ 18 次成功耗时/);assert.match(await row.innerText(),/10 次记录 \/ 7 次成功耗时/);
+      assert.match(await row.innerText(),/不完整 \/ 未确认完整主模型链/);
+      assert.match(await row.locator('[data-label="平均生成时间"]').innerText(),/全组历史任务平均，非某个模型或组合专属速度/);
+      assert.doesNotMatch(await row.innerText(),/current-main|当前工具默认配置/);
+      assert.equal(await row.locator('[data-label="模型名称"] .model-variant').count(),2);
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/每个组合内的主模型才属于同一个图/);assert.match(await detail.innerText(),/参考信息不补齐历史覆盖/);
+      await row.locator('select').selectOption('unknown-reference');assert.doesNotMatch(await row.innerText(),/history-high|history-low|INT8|BF16|other-task|全组历史任务平均/);
+      assert.match(await row.innerText(),/current-main-fp8/);assert.match(await row.innerText(),/文件标记 FP8/);
+      await row.locator('select').selectOption('pair');assert.doesNotMatch(await row.innerText(),/current-main|不完整|不代表当前模型速度/);
+      await purchase(page);await calculate(page);assert.equal(state.posts.at(-1).body.demands[0].group_id,'unknown-reference');assert.equal((await page.locator('#estimate-result').innerText()).includes('60 秒'),true);
+      assertHistoryQuery(state.gets[0]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('真实新证据为空不回退旧汇总；模板缺失或动态选择不可识别仍明确未知',async()=>{
+      const input=evidenceFixture();input.groups[0].model_summary=modelSummary([{name:'stale-summary-int8.safetensors',precision:'INT8',precision_source:'filename'}]);
+      const {page,state}=await setup({data:input});const row=page.locator('.business-row');
+      assert.doesNotMatch(await row.innerText(),/stale-summary|INT8/);
+      await row.locator('select').selectOption('empty-reference');
+      assert.match(await row.innerText(),/未获取到模型信息/);assert.match(await row.innerText(),/当前工具默认配置（非历史执行记录）/);
+      assert.match(await row.innerText(),/不完整 \/ 未确认完整主模型链/);assert.match(await row.innerText(),/模型待确认，精度未确认/);
+      assert.doesNotMatch(await row.innerText(),/current-main|FP8|INT8|loader/);
+      await row.locator('select').selectOption('no-reference');assert.match(await row.innerText(),/未获取到模型信息/);
+      assert.match(await row.innerText(),/历史未记录.*当前工具模板未提供、找不到或无法识别/s);assert.doesNotMatch(await row.innerText(),/当前工具默认配置|FP8|INT8/);
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('历史和模板的名称、角色、精度与dtype均按纯文本渲染，辅助模型仅在详情',async()=>{
+      const input=evidenceFixture();const model={name:ATTACK,role:ATTACK,precision:ATTACK,precision_source:'filename',loader_dtype:ATTACK};
+      input.groups[0].current_model_reference=modelSummary([model,{...model}],{source:'current_template',capability_name:ATTACK,auxiliary_models:[model]});
+      input.groups[1].model_evidence.variants[0].summary=modelSummary([model,model],{auxiliary_models:[model]});
+      const {page,state}=await setup({data:input});const row=page.locator('.business-row');
+      for(const id of ['unknown-reference','pair']) {
+        await row.locator('select').selectOption(id);
+        const names=row.locator('[data-label="模型名称"]'),precision=row.locator('[data-label="模型精度"]');
+        assert.deepEqual(await names.locator('.model-name').allTextContents(),[ATTACK,ATTACK]);
+        assert.deepEqual(await names.locator('.model-role').allTextContents(),['主模型 1','主模型 2']);
+        assert.ok((await precision.innerText()).includes('文件标记 '+ATTACK));assert.ok((await precision.innerText()).includes('加载配置 '+ATTACK));
+        if(id==='unknown-reference')assert.ok((await names.innerText()).includes('工具：'+ATTACK));
+        if(await row.locator('button').getAttribute('aria-expanded')==='false')await row.locator('button').click();
+        assert.ok((await page.locator('#'+await row.locator('button').getAttribute('aria-controls')).innerText()).includes('角色：'+ATTACK));
+        assert.equal(await page.locator('main img').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);
+      }
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('新模型证据在三页签与390/320px可操作，长名称多变体不产生整页横滚',async()=>{
+      const input=evidenceFixture();input.groups[1].model_evidence.variants[0].summary.models[0].name='long-model-name-'.repeat(16)+'.safetensors';
+      const {page,state}=await setup({data:input});const row=page.locator('.business-row');
+      if(process.env.CHOUKA_TEST_SCREENSHOT)await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT,fullPage:true});
+      for(const width of [390,320]) {
+        await page.setViewportSize({width,height:844});
+        for(const id of ['unknown-reference','pair','partial','empty-reference','no-reference']) {
+          await row.locator('select').selectOption(id);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${width}px ${id}`);
+          await row.locator('button').click();assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await row.locator('button').click();
+        }
+        for(const tab of ['scenarios','purchase','machines']) {await page.locator('#tab-'+tab).click();assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);}
+        await row.locator('select').selectOption('partial');
+        assert.deepEqual(await row.locator('[data-label="模型名称"] .model-role').allTextContents(),await row.locator('[data-label="模型精度"] .model-role').allTextContents());
+        if(process.env.CHOUKA_TEST_SCREENSHOT){const file=path.parse(process.env.CHOUKA_TEST_SCREENSHOT);await page.screenshot({path:path.join(file.dir,file.name+`-evidence-${width}.png`),fullPage:true});}
+      }
+      assert.deepEqual(state.errors,[]);
     });
     await t.test('默认优先成功实测最新采集，其次历史最多样本，失败和未完成不计速度',async()=>{
       const input=fixture(),base=input.groups[0];input.groups=[{...base,id:'older',measured:20,samples:30}, {...base,id:'many',measured:40,samples:50}, {...base,id:'pending',source:'captured',last_sample_at:NOW.getTime()/1000,mean_seconds:null,measured:0,done:0,error:100,samples:100,runtime_seconds:9900}];
@@ -221,7 +368,7 @@ test('产能看板语法与离线路由专项', async t => {
     });
     await t.test('未知模型不从业务或无关模型文件推断，旧 Worker 与人工版本缺失指引区分',async()=>{
       const input=summaryFixture();input.groups[1].model_summary=undefined;input.groups[1].spec={models:[{name:'not-main-fp8.safetensors'}]};
-      const {page}=await setup({data:input});const machine=page.locator('[data-summary-worker-id=w1]');assert.match(await machine.innerText(),/尚未采集/);assert.doesNotMatch(await machine.locator('[data-capability=depth_video]').innerText(),/FP8|INT8|not-main-fp8/);assert.equal(await machine.locator('[data-capability=depth_video] [data-label="模型名称"]').innerText(),'尚未采集');
+      const {page}=await setup({data:input});const machine=page.locator('[data-summary-worker-id=w1]');assert.match(await machine.innerText(),/未获取到模型信息/);assert.doesNotMatch(await machine.locator('[data-capability=depth_video]').innerText(),/FP8|INT8|not-main-fp8/);assert.equal(await machine.locator('[data-capability=depth_video] [data-label="模型名称"]').innerText(),'未获取到模型信息');
       assert.match(await machine.locator('.machine-hardware').innerText(),/RTX 4090 \/ 24 GiB；系统内存 95.7 GiB/);assert.doesNotMatch(await machine.locator('.machine-hardware').innerText(),/未知|CPU/);
       await machine.locator('.machine-more summary').click();assert.match(await machine.innerText(),/升级该 Worker 后补采/);
       const modern=page.locator('[data-summary-worker-id=w3]');await modern.locator('.machine-more summary').click();assert.match(await modern.innerText(),/人工声明未填写/);assert.doesNotMatch(await modern.innerText(),/升级该 Worker|整机配置未知/);
@@ -401,7 +548,7 @@ test('产能看板语法与离线路由专项', async t => {
       const {page,state}=await setupAdvanced();
       for(const width of [390,320]) {await page.setViewportSize({width,height:844});for(const id of ['machines','scenarios','purchase']){await page.locator('#tab-'+id).click();assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${width}px ${id} 不应产生整页横向滚动`);}}
       await page.setViewportSize({width:390,height:844});await page.locator('.demand-quantity').fill('15');await calculate(page);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
-      if(process.env.CHOUKA_TEST_SCREENSHOT)await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT,fullPage:true});assert.deepEqual(state.errors,[]);
+      if(process.env.CHOUKA_TEST_SCREENSHOT){const file=path.parse(process.env.CHOUKA_TEST_SCREENSHOT);await page.screenshot({path:path.join(file.dir,file.name+'-purchase-390.png'),fullPage:true});}assert.deepEqual(state.errors,[]);
     });
     await t.test('后端日期列表、配置快照和人工来源按实际口径展示',async()=>{
       const input=fixture();input.groups[3].days=['2026-10-01','2026-10-02','2026-10-03'];input.groups[3].samples=35;input.groups[3].config={cpu:'执行时 CPU',gpus:[{name:'执行时 GPU',memory_total_bytes:8*1024**3}]};input.groups[3].config_source='manual+reported';input.groups[3].reviewed=30;input.workers[0].hardware_source='manual+reported';
@@ -515,6 +662,29 @@ test('产能看板语法与离线路由专项', async t => {
       await page.locator('#tab-machines').click();await page.setViewportSize({width:390,height:844});await page.locator('.profile-details summary').click();
       assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);assert.equal(await page.locator('.profile-form [name=note]').inputValue(),'契约备注不进入配置快照');assert.match(await page.locator('.profile-form [name=cpu]').inputValue(),/契约 CPU/);assert.doesNotMatch(await page.locator('#workers').innerText(),/"logical_cores"/);
       if(process.env.CHOUKA_TEST_SCREENSHOT){const file=path.parse(process.env.CHOUKA_TEST_SCREENSHOT);await page.screenshot({path:path.join(file.dir,file.name+'-contract.png'),fullPage:true});}
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('真实模型合同：提交快照、job归档多变体和默认模板分离，不改变分组均值与测算依据',async()=>{
+      const {report,baseline}=realStoreReport(true),history=report.groups.find(g=>g.source==='historical');
+      assert.deepEqual(report.groups.map(g=>[g.id,g.mean_seconds,g.eligible,g.spec_key,g.measured]),baseline.groups.map(g=>[g.id,g.mean_seconds,g.eligible,g.spec_key,g.measured]));
+      assert.equal(history.model_summary.source,'unrecorded');assert.deepEqual(history.model_summary.models,[]);
+      assert.equal(history.model_evidence.total_samples,3);assert.equal(history.model_evidence.recorded_samples,2);assert.equal(history.model_evidence.variants.length,2);
+      assert.deepEqual(history.model_evidence.variants.map(v=>v.summary.models.length).sort(),[1,2]);
+      assert.ok(history.model_evidence.variants.every(v=>v.source==='archived_task' && v.samples===1 && v.measured===1 && v.summary.runtime_verified===false));
+      assert.equal(history.current_model_reference.source,'current_template');assert.equal(history.current_model_reference.capability_name,'契约图像工具');
+      for(const group of report.groups.filter(g=>g.source!=='historical')) {
+        assert.equal(group.model_evidence.variants[0].source,'task_snapshot');
+        assert.equal(group.model_evidence.variants[0].summary.models[0].name,'contract-model.safetensors');
+      }
+      const {page,state}=await setup({data:report});const row=page.locator('.business-row');await row.locator('select').selectOption(history.id);
+      assert.match(await row.innerText(),/模型记录覆盖 2 \/ 3 次/);assert.match(await row.innerText(),/保留的原任务记录/);
+      for(const name of ['contract-first-bf16','contract-second-int8','contract-other-fp16'])assert.ok((await row.innerText()).includes(name));
+      assert.match(await row.innerText(),/文件标记 BF16/);assert.match(await row.innerText(),/加载配置 FP8/);assert.match(await row.innerText(),/文件标记 INT8/);assert.match(await row.innerText(),/文件标记 FP16/);
+      assert.doesNotMatch(await row.innerText(),/contract-current|高噪声|低噪声/);assert.match(await row.innerText(),/40 秒/);
+      assert.match(await row.innerText(),/全组历史任务平均，非某个模型或组合专属速度/);
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/当前工具默认配置（非历史执行记录）/);assert.match(await detail.innerText(),/contract-current-fp8/);
+      for(const warning of history.warnings)assert.ok((await detail.innerText()).includes(warning));
       assert.deepEqual(state.errors,[]);
     });
     await t.test('普通身份不能读取产能 API',async()=>{const {page,state}=await setupAdvanced({role:'user'});await page.waitForURL('http://capacity.test/');assert.equal(state.gets.length,0);});

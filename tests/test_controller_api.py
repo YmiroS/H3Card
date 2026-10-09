@@ -529,6 +529,64 @@ class H3CharacterTransferPatchTest(unittest.TestCase):
         )
 
 
+class CapacityModelReferenceTest(unittest.TestCase):
+    def report(self, recorded=0, complete=True):
+        return {"groups": [{"capability": "reference-test", "model_evidence": {
+            "total_samples": 2, "recorded_samples": recorded,
+            "variants": [{"summary": {"complete": complete}}] if recorded else [],
+        }}]}
+
+    def test_complete_task_evidence_does_not_read_current_template(self):
+        report = self.report(recorded=2)
+        with mock.patch.dict(controller_app.CAPS, {"reference-test": {
+            "name": "模型测试", "graph": "graphs/qwen_image_21_t2i.api.json"}}), \
+             mock.patch.object(Path, "read_text", side_effect=AssertionError("不应读取模板")):
+            controller_app.capacity_model_references(report)
+        self.assertNotIn("current_model_reference", report["groups"][0])
+
+    def test_partial_or_unresolved_evidence_retains_current_default_reference(self):
+        for recorded, complete in ((1, True), (2, False)):
+            with self.subTest(recorded=recorded, complete=complete):
+                report = self.report(recorded, complete)
+                with mock.patch.dict(controller_app.CAPS, {"reference-test": {
+                    "graph": "graphs/qwen_image_21_t2i.api.json"}}):
+                    controller_app.capacity_model_references(report)
+                group = report["groups"][0]
+                self.assertEqual(group["current_model_reference"]["source"], "current_template")
+                self.assertEqual(group["model_evidence"]["recorded_samples"], recorded)
+                self.assertEqual(group["model_evidence"]["variants"][0]["summary"]["complete"], complete)
+
+    def test_template_read_once_per_capability_and_not_cached_across_reports(self):
+        report = self.report()
+        report["groups"].append(self.report()["groups"][0])
+        graph = {"1": {"class_type": "UNETLoader", "inputs": {"unet_name": "original_fp8.safetensors"}},
+                 "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+                 "3": {"class_type": "SaveImage", "inputs": {"images": ["2", 0]}}}
+        with mock.patch.dict(controller_app.CAPS, {"reference-test": {"graph": "graphs/current.api.json"}}), \
+             mock.patch.object(Path, "read_text", return_value=json.dumps(graph)) as reader:
+            controller_app.capacity_model_references(report)
+            self.assertEqual(reader.call_count, 1)
+            first = report["groups"][0]["current_model_reference"]
+            graph["1"]["inputs"]["unet_name"] = "updated_bf16.safetensors"
+            reader.return_value = json.dumps(graph)
+            refreshed = controller_app.capacity_model_references(self.report())
+            second = refreshed["groups"][0]["current_model_reference"]
+        self.assertEqual(first["models"][0]["name"], "original_fp8.safetensors")
+        self.assertEqual(second["models"][0]["name"], "updated_bf16.safetensors")
+
+    def test_missing_invalid_and_outside_templates_do_not_fail_report(self):
+        for graph in (None, "", "graphs/not-present.api.json", "../outside.json", str(ROOT / "pricing.json")):
+            with self.subTest(graph=graph), mock.patch.dict(controller_app.CAPS, {"reference-test": {"graph": graph}}):
+                report = controller_app.capacity_model_references(self.report())
+                self.assertNotIn("current_model_reference", report["groups"][0])
+        for content in ("not-json", "[]", "null"):
+            with self.subTest(content=content), \
+                 mock.patch.dict(controller_app.CAPS, {"reference-test": {"graph": "graphs/broken.api.json"}}), \
+                 mock.patch.object(Path, "read_text", return_value=content):
+                report = controller_app.capacity_model_references(self.report())
+                self.assertNotIn("current_model_reference", report["groups"][0])
+
+
 class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def asyncSetUp(self):
         self.auth_setup()
@@ -731,6 +789,47 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         encoded = json.dumps(report)
         for secret in (credentials["worker_token"], "synthetic-lease-hash"):
             self.assertNotIn(secret, encoded)
+
+    async def test_capacity_current_template_is_reference_only_and_does_not_change_estimate(self):
+        import time
+        now = time.time()
+        worker = self.store.register_worker("模型参考测试机器", {})
+        job = {"id": "model-reference-history", "capability": "qwen_image_21_t2i",
+               "status": "queued", "created": now - 200, "worker_id": worker["worker_id"]}
+        self.ledger.record_job(job)
+        self.ledger.start_job(job["id"], worker["worker_id"], now - 199)
+        self.ledger.finish_job(job["id"], "done", now - 121, worker["worker_id"])
+        before = self.store.capacity.report()
+        group = before["groups"][0]
+        payload = {"worker_id": worker["worker_id"], "mode": "historical", "quality": "technical",
+                   "hours": 8, "availability": 1, "utilization": 0.75,
+                   "demands": [{"group_id": group["id"], "quantity": 100}]}
+        estimate = self.store.capacity.estimate(payload)
+        database = "\n".join(self.store.db.iterdump())
+        cap = {"name": "测试文生图", "graph": "graphs/qwen_image_21_t2i.api.json"}
+        with mock.patch.dict(controller_app.CAPS, {job["capability"]: cap}):
+            response = await self.client.get("/api/capacity")
+            self.assertEqual(response.status, 200)
+            report = await response.json()
+            displayed = report["groups"][0]
+            reference = displayed.pop("current_model_reference")
+            self.assertEqual(reference["source"], "current_template")
+            self.assertEqual(reference["capability_name"], "测试文生图")
+            self.assertEqual([item["name"] for item in reference["models"]],
+                             ["qwen_image_2.1_int8_convrot.safetensors"])
+            self.assertFalse(reference["runtime_verified"])
+            self.assertEqual(displayed["model_summary"]["source"], "unrecorded")
+            self.assertEqual(displayed["model_evidence"]["recorded_samples"], 0)
+            self.assertFalse(displayed["eligible"])
+            displayed["capability_name"] = group["capability_name"]
+            self.assertEqual(displayed, group)
+            self.assertEqual((await self.client.post("/api/capacity/estimate", json=payload)).status, 200)
+            exported = await (await self.client.get("/api/capacity/export")).text()
+            self.assertIn("current_model_reference", exported)
+            self.assertIn("current_template", exported)
+            self.assertIn("qwen_image_2.1_int8_convrot.safetensors", exported)
+        self.assertEqual(self.store.capacity.estimate(payload), estimate)
+        self.assertEqual("\n".join(self.store.db.iterdump()), database)
 
     async def test_capacity_attempt_and_artifact_capture_do_not_trust_worker_metadata(self):
         import time
