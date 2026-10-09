@@ -13,7 +13,166 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from server.capacity import CapacityStore, export_csv, make_spec
+from server.capacity import CapacityStore, export_csv, make_spec, model_summary
+
+
+class ModelSummaryTests(unittest.TestCase):
+    @staticmethod
+    def graph(name="model.safetensors", kind="UNETLoader", **inputs):
+        key = "ckpt_name" if kind in {"CheckpointLoaderSimple", "CheckpointLoader"} else "unet_name"
+        return {
+            "1": {"class_type": kind, "inputs": {key: name, **inputs}},
+            "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+            "3": {"class_type": "VAEDecode", "inputs": {"samples": ["2", 0]}},
+            "4": {"class_type": "SaveImage", "inputs": {"images": ["3", 0]}},
+        }
+
+    @staticmethod
+    def summarize(graph):
+        return model_summary(make_spec("image", {}, graph, {}))
+
+    def test_real_qwen21_int8_excludes_fp8_encoder_bf16_vae_and_lora(self):
+        path = Path(__file__).resolve().parents[1] / "graphs" / "qwen_image_21_t2i.api.json"
+        graph = json.loads(path.read_text(encoding="utf-8"))
+        for with_lora in (False, True):
+            if with_lora:
+                graph["lora"] = {"class_type": "LoraLoaderModelOnly", "inputs": {
+                    "model": ["2", 0], "lora_name": "adapter_bf16.safetensors", "strength_model": 1}}
+                graph["14"]["inputs"]["model"] = ["lora", 0]
+            with self.subTest(with_lora=with_lora):
+                self.assertEqual(self.summarize(graph), {
+                    "models": [{"name": "qwen_image_2.1_int8_convrot.safetensors", "precision": "INT8",
+                                "precision_source": "filename", "loader_dtype": None}],
+                    "precision_label": "INT8", "source": "task_snapshot", "runtime_verified": False})
+
+    def test_real_fp8_filename_with_default_dtype(self):
+        path = Path(__file__).resolve().parents[1] / "graphs" / "qwen_image_2512_t2i.api.json"
+        result = self.summarize(json.loads(path.read_text(encoding="utf-8")))
+        self.assertEqual(len(result["models"]), 1)
+        self.assertEqual(result["precision_label"], "FP8")
+        self.assertEqual(result["models"][0]["precision_source"], "filename")
+        self.assertIsNone(result["models"][0]["loader_dtype"])
+
+    def test_no_precision_does_not_infer_from_model_family_or_default_auto(self):
+        for name in ("qwen_image_2.1.safetensors", "model_fp80.safetensors", "notfp8.safetensors"):
+            for dtype in (None, "default", "auto", "unknown", "my_fp8", True):
+                with self.subTest(name=name, dtype=dtype):
+                    result = self.summarize(self.graph(name, weight_dtype=dtype))
+                    self.assertEqual(result["source"], "task_snapshot")
+                    self.assertIsNone(result["precision_label"])
+                    self.assertEqual(result["models"], [{"name": name, "precision": None,
+                                                       "precision_source": None, "loader_dtype": None}])
+
+    def test_loader_dtype_is_explicit_and_filename_evidence_has_priority(self):
+        for dtype, precision in (("fp8_e4m3fn", "FP8"), ("fp8_e5m2_fast", "FP8"),
+                                 ("float16", "FP16"), ("bfloat16", "BF16"), ("fp32", "FP32")):
+            for key in ("weight_dtype", "dtype", "precision"):
+                with self.subTest(dtype=dtype, key=key):
+                    result = self.summarize(self.graph(**{key: dtype}))
+                    self.assertEqual(result["models"][0], {"name": "model.safetensors", "precision": precision,
+                                                           "precision_source": "loader", "loader_dtype": dtype})
+                    self.assertEqual(result["precision_label"], precision)
+                    result = self.summarize(self.graph("model_int8.safetensors", **{key: dtype}))
+                    self.assertEqual(result["models"][0], {"name": "model_int8.safetensors", "precision": "INT8",
+                                                           "precision_source": "filename", "loader_dtype": dtype})
+                    self.assertFalse(result["runtime_verified"])
+
+    def test_exact_main_loader_allowlist_and_gguf_quantization(self):
+        for kind in ("UNETLoader", "CheckpointLoaderSimple", "CheckpointLoader",
+                     "UnetLoaderGGUF", "UnetLoaderGGUFAdvanced"):
+            with self.subTest(kind=kind):
+                result = self.summarize(self.graph("model_FP16.safetensors", kind))
+                self.assertEqual(result["precision_label"], "FP16")
+        self.assertEqual(self.summarize(self.graph("model-Q4_K_M.gguf", "UnetLoaderGGUF"))["precision_label"], "Q4_K_M")
+        for kind in ("UnknownModelLoader", "CLIPLoader", "VAELoader", "LoraLoaderModelOnly"):
+            self.assertEqual(self.summarize(self.graph("model_fp8.safetensors", kind))["source"], "unrecorded")
+
+    def test_mixed_models_preserve_all_precisions_and_unknowns(self):
+        for second_name, label in (("second_bf16.safetensors", "BF16 / INT8"),
+                                   ("second.safetensors", None)):
+            graph = self.graph("first_int8.safetensors")
+            graph["5"] = {"class_type": "UNETLoader", "inputs": {"unet_name": second_name}}
+            graph["6"] = {"class_type": "KSampler", "inputs": {"model": ["5", 0], "latent_image": ["2", 0]}}
+            graph["3"]["inputs"]["samples"] = ["6", 0]
+            result = self.summarize(graph)
+            self.assertEqual([m["name"] for m in result["models"]], ["first_int8.safetensors", second_name])
+            self.assertEqual(result["precision_label"], label)
+            graph["5"]["inputs"]["unet_name"] = "first_int8.safetensors"
+            graph["5"]["inputs"]["weight_dtype"] = "float16"
+            result = self.summarize(graph)
+            self.assertEqual(len(result["models"]), 2)
+            self.assertEqual([m["loader_dtype"] for m in result["models"]], [None, "float16"])
+
+    def test_mixed_loader_dtypes_and_partly_unknown_generation_paths(self):
+        graph = self.graph("first.safetensors", weight_dtype="float16")
+        graph["5"] = {"class_type": "UNETLoader", "inputs": {"unet_name": "second.safetensors", "dtype": "bfloat16"}}
+        graph["6"] = {"class_type": "KSampler", "inputs": {"model": ["5", 0], "latent_image": ["2", 0]}}
+        graph["3"]["inputs"]["samples"] = ["6", 0]
+        result = self.summarize(graph)
+        self.assertEqual(result["precision_label"], "BF16 / FP16")
+        self.assertEqual([m["loader_dtype"] for m in result["models"]], ["float16", "bfloat16"])
+        graph["7"] = {"class_type": "UnknownGenerator", "inputs": {"model": ["5", 0]}}
+        graph["8"] = {"class_type": "SaveImage", "inputs": {"images": ["7", 0]}}
+        result = self.summarize(graph)
+        self.assertEqual(len(result["models"]), 2)
+        self.assertIsNone(result["precision_label"])
+        self.assertEqual(result["source"], "task_snapshot")
+
+    def test_model_merge_and_custom_sampler_guider(self):
+        graph = self.graph("first_fp16.safetensors")
+        graph.update({
+            "5": {"class_type": "UNETLoader", "inputs": {"unet_name": "second_bf16.safetensors"}},
+            "6": {"class_type": "ModelMergeSimple", "inputs": {"model1": ["1", 0], "model2": ["5", 0]}},
+            "7": {"class_type": "CFGGuider", "inputs": {"model": ["6", 0]}},
+        })
+        graph["2"] = {"class_type": "SamplerCustomAdvanced", "inputs": {"guider": ["7", 0]}}
+        self.assertEqual(self.summarize(graph)["precision_label"], "BF16 / FP16")
+
+    def test_disconnected_loader_sampler_and_auxiliary_checkpoint_are_excluded(self):
+        graph = self.graph("main_int8.safetensors")
+        graph["5"] = {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "unused_fp8.safetensors"}}
+        graph["6"] = {"class_type": "KSampler", "inputs": {"model": ["5", 0]}}
+        graph["7"] = {"class_type": "CLIPTextEncode", "inputs": {"clip": ["5", 1]}}
+        graph["2"]["inputs"]["positive"] = ["7", 0]
+        graph["3"]["inputs"]["vae"] = ["5", 2]
+        result = self.summarize(graph)
+        self.assertEqual([m["name"] for m in result["models"]], ["main_int8.safetensors"])
+        self.assertEqual(result["precision_label"], "INT8")
+
+    def test_unknown_routes_missing_output_wrong_slots_and_cycles_stay_unknown(self):
+        variants = []
+        graph = self.graph("main_fp8.safetensors")
+        graph.pop("4")
+        variants.append(graph)
+        for kind in ("UnknownModelSwitch", "UnknownTransform"):
+            graph = self.graph("main_fp8.safetensors")
+            graph["5"] = {"class_type": kind, "inputs": {"model": ["1", 0], "images": ["3", 0]}}
+            graph["2" if kind == "UnknownModelSwitch" else "4"]["inputs"] = {
+                "model" if kind == "UnknownModelSwitch" else "images": ["5", 0]}
+            variants.append(graph)
+        graph = self.graph("main_fp8.safetensors", "CheckpointLoaderSimple")
+        graph["2"]["inputs"]["model"] = ["1", 1]
+        variants.append(graph)
+        graph = self.graph()
+        graph["1"] = {"class_type": "LoraLoaderModelOnly", "inputs": {"model": ["1", 0]}}
+        variants.append(graph)
+        for graph in variants:
+            with self.subTest(graph=graph):
+                self.assertEqual(self.summarize(graph), {"models": [], "precision_label": None,
+                                                        "source": "unrecorded", "runtime_verified": False})
+
+    def test_only_snapshot_graph_is_used_without_paths_or_mutation(self):
+        spec = make_spec("image", {}, self.graph("/private/fp8/model.safetensors"), {})
+        spec["models"] = ["fake_fp8.safetensors"]
+        spec["model_version"] = "bf16"
+        original = copy.deepcopy(spec)
+        result = model_summary(spec)
+        self.assertEqual(spec, original)
+        self.assertEqual(result["models"][0]["name"], "model.safetensors")
+        self.assertIsNone(result["precision_label"])
+        self.assertNotIn("/private", json.dumps(result))
+        for value in (None, {}, {"models": ["fake_fp8.safetensors"]}, {"graph": []}):
+            self.assertEqual(model_summary(value)["source"], "unrecorded")
 
 
 class CapacityTests(unittest.TestCase):
@@ -839,6 +998,115 @@ class CapacityTests(unittest.TestCase):
         self.assertIsNone(report["details"][0]["output_count"])
         self.assertIsNone(report["details"][0]["outputs"])
         self.assertIsNone(report["groups"][0]["output_count"])
+
+    def test_group_summary_uses_frozen_spec_without_changing_evidence_or_estimates(self):
+        graph = ModelSummaryTests.graph("frozen_int8.safetensors", weight_dtype="default")
+        payload = self.make_payload(graph=graph)
+        self.capture(payload=payload)
+        self.historical("j1", runtime=10, created=1000)
+        stored = self.db.execute("SELECT spec_json FROM capacity_tasks").fetchone()[0]
+        database = list(self.db.iterdump())
+        group = self.group()
+        self.assertEqual(group["model_summary"], model_summary(json.loads(stored)))
+        self.assertEqual(group["last_sample_at"], 1000)
+        self.assertEqual(group["spec_key"], json.loads(stored)["spec_key"])
+        self.assertTrue(group["eligible"])
+        estimate = self.capacity.estimate(self.estimate_payload())
+        with patch("server.capacity.model_summary", return_value={"display_only": True}):
+            other = self.group()
+            self.assertEqual({k: v for k, v in group.items() if k != "model_summary"},
+                             {k: v for k, v in other.items() if k != "model_summary"})
+            self.assertEqual(self.capacity.estimate(self.estimate_payload()), estimate)
+        # 当前调用方模板修改不影响已冻结摘要，报表也不写入任何历史表。
+        payload["capacity_spec"]["graph"]["1"]["inputs"]["unet_name"]["name"] = "current_fp8.safetensors"
+        self.assertEqual(self.group()["model_summary"]["precision_label"], "INT8")
+        self.assertEqual(list(self.db.iterdump()), database)
+
+    def test_historical_and_legacy_groups_never_backfill_models_from_current_worker(self):
+        self.historical("historical")
+        self.capacity.assigned("legacy", self.worker, "legacy-lease", 1001)
+        self.capacity.terminal("legacy", "w1", "legacy-lease", "done", 1010)
+        self.capacity.update_worker("w1", {"model_version": "current-fp8-models", "cpu": "New CPU"})
+        for group in self.capacity.report()["groups"]:
+            self.assertEqual(group["model_summary"], {"models": [], "precision_label": None,
+                                                     "source": "unrecorded", "runtime_verified": False})
+            self.assertFalse(group["eligible"])
+
+    def test_last_sample_at_uses_group_successful_runtime_not_latest_task_or_page(self):
+        self.historical("success-a", created=1000, runtime=10)
+        self.historical("success-b", created=2000, runtime=20)
+        for index, value in enumerate((None, -1, math.inf)):
+            self.historical("invalid-" + str(index), created=3000 + index, runtime=value)
+        self.historical("error", created=4000, status="error", runtime=20)
+        self.historical("cancel", created=5000, status="canceled", runtime=20)
+        self.historical("running", created=6000, status="running", runtime=20)
+        self.historical("other-group", created=7000, capability="other", runtime=10)
+        report = self.capacity.report(limit=1)
+        group = next(g for g in report["groups"] if g["capability"] == "image")
+        self.assertEqual(group["last_sample_at"], 2000)
+        self.assertEqual(self.capacity.report(end=2000)["groups"][0]["last_sample_at"], 1000)
+        self.assertIsNone(self.capacity.report(start=3000, capability="image")["groups"][0]["last_sample_at"])
+        # 与既有 measured 口径一致：零耗时/异常耗时保留，不能为展示字段偷偷过滤样本。
+        self.historical("zero", created=8000, runtime=0)
+        self.assertEqual(self.capacity.report(capability="image")["groups"][0]["last_sample_at"], 8000)
+        self.capture("captured", now=9000)
+        self.assertEqual(next(g for g in self.capacity.report()["groups"] if g["source"] == "captured")["last_sample_at"], 9000)
+
+    def test_old_worker_preserves_reported_gpu_ram_without_inventing_cpu_or_telemetry(self):
+        old = {"agent_version": 3, "devices": [{"name": "Old GPU", "vram_total": 24 * 1024 ** 3,
+                                                "type": "cuda", "index": 0}],
+               "system": {"ram_total": 64 * 1024 ** 3}}
+        self.db.execute("UPDATE workers SET capabilities_json=? WHERE id='w1'", (json.dumps(old),))
+        worker = self.capacity.report()["workers"][0]
+        self.assertEqual(worker["agent_version"], 3)
+        self.assertFalse(worker["supports_capacity_telemetry"])
+        self.assertEqual(worker["hardware"]["gpus"], [{"name": "Old GPU", "memory_total_bytes": 24 * 1024 ** 3}])
+        self.assertEqual(worker["hardware"]["memory_total_bytes"], 64 * 1024 ** 3)
+        self.assertIsNone(worker["hardware"]["cpu"])
+        self.historical("removed", worker="deleted")
+        removed = next(w for w in self.capacity.report()["workers"] if w["id"] == "deleted")
+        self.assertIsNone(removed["agent_version"])
+        self.assertFalse(removed["supports_capacity_telemetry"])
+
+    def test_worker_version_and_support_require_strict_reported_values(self):
+        cases = [({}, None, False), ({"agent_version": 4}, 4, False),
+                 ({"supports_capacity_telemetry": 1}, None, False)]
+        for version in (True, "4", "v4", -1, math.inf, math.nan, [], {}):
+            cases.append(({"agent_version": version, "supports_capacity_telemetry": 1}, None, False))
+        for flag in (True, 1, False, 0, "1", "true", 1.0, [], {}):
+            cases.append(({"agent_version": 4, "supports_capacity_telemetry": flag}, 4,
+                          flag is True or type(flag) is int and flag == 1))
+        cases.extend([({"agent_version": 3, "supports_capacity_telemetry": 1}, 3, False),
+                      ({"agent_version": 5, "supports_capacity_telemetry": True}, 5, True)])
+        for caps, version, supported in cases:
+            with self.subTest(caps=caps):
+                self.db.execute("UPDATE workers SET capabilities_json=? WHERE id='w1'", (json.dumps(caps),))
+                worker = self.capacity.report()["workers"][0]
+                self.assertEqual(worker["agent_version"], version)
+                self.assertIs(worker["supports_capacity_telemetry"], supported)
+                self.assertIsNone(worker["hardware"]["cpu"])
+                json.dumps(worker, allow_nan=False)
+
+    def test_csv_display_fields_match_api_and_keep_existing_formulas(self):
+        caps = json.loads(self.worker["capabilities_json"])
+        caps.update(agent_version=4, supports_capacity_telemetry=1)
+        self.db.execute("UPDATE workers SET capabilities_json=? WHERE id='w1'", (json.dumps(caps),))
+        self.capture(payload=self.make_payload(graph=ModelSummaryTests.graph("=model_int8.safetensors")))
+        report = self.capacity.report()
+        group = report["groups"][0]
+        row = list(csv.DictReader(io.StringIO(export_csv(report).lstrip("\ufeff"))))[0]
+        self.assertEqual(json.loads(row["model_summary"]), group["model_summary"])
+        self.assertEqual(float(row["last_sample_at"]), group["last_sample_at"])
+        self.assertEqual(float(row["agent_version"]), 4)
+        self.assertEqual(row["supports_capacity_telemetry"], "True")
+        self.assertEqual(float(row["seconds_per_unit"]), group["seconds_per_unit"])
+        self.assertEqual(row["spec_key"], group["spec_key"])
+        self.assertEqual(row["config_id"], group["config_id"])
+        self.historical("old", status="error")
+        rows = list(csv.DictReader(io.StringIO(export_csv(self.capacity.report()).lstrip("\ufeff"))))
+        historical = next(row for row in rows if row["source"] == "historical")
+        self.assertEqual(historical["last_sample_at"], "")
+        self.assertEqual(json.loads(historical["model_summary"])["source"], "unrecorded")
 
     def test_restart_keeps_attempts_and_schema_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
