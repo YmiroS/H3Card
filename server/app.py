@@ -42,7 +42,7 @@ import rewrite as rw
 import llm
 import translate as tr
 from costs import CostLedger
-from capacity import make_spec, export_csv
+from capacity import make_spec, export_csv, model_summary_from_graph
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     can_run_capability,
@@ -2790,20 +2790,52 @@ def capacity_query(request):
             "capability": request.query.get("capability") or None}
 
 
+def capacity_model_references(report):
+    """当前默认模板只作展示参考，不写回历史快照或参与采购计算。"""
+    references = {}
+    graph_root = (ROOT / "graphs").resolve()
+    for group in report["groups"]:
+        capability = group["capability"]
+        cap = CAPS.get(capability) or {}
+        group["capability_name"] = cap.get("name", capability)
+        evidence = group["model_evidence"]
+        if (evidence["recorded_samples"] == evidence["total_samples"]
+                and all(item["summary"].get("complete") for item in evidence["variants"])):
+            continue
+        if capability not in references:
+            references[capability] = None
+            graph_file = cap.get("graph")
+            if not isinstance(graph_file, str) or not graph_file:
+                continue
+            try:
+                path = (ROOT / graph_file).resolve()
+                if not path.is_relative_to(graph_root):
+                    continue
+                graph = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeError):
+                continue
+            if not isinstance(graph, dict):
+                continue
+            summary = model_summary_from_graph(graph)
+            references[capability] = {**summary, "source": "current_template",
+                                     "capability_name": group["capability_name"]}
+        if references[capability] is not None:
+            group["current_model_reference"] = references[capability]
+    return report
+
+
 async def capacity_report(request):
     require_admin(request)
     query = capacity_query(request)
+    store = distributed_store(request.app)
+
+    def build_report():
+        return capacity_model_references(store.capacity.report(**query))
+
     try:
-        report = await asyncio.to_thread(
-            distributed_store(request.app).capacity.report, **query,
-        )
+        return await asyncio.to_thread(build_report)
     except ValueError as exc:
         raise web.HTTPBadRequest(text=str(exc))
-    for group in report["groups"]:
-        group["capability_name"] = (CAPS.get(group["capability"]) or {}).get(
-            "name", group["capability"],
-        )
-    return report
 
 
 async def api_capacity(request):
