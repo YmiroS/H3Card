@@ -2644,6 +2644,10 @@ function selectionMenu(cx, cy) {
       const selected = PROJ.cards.filter(c => selIds.has(c.id));
       if (selected.length > 1) renameCard(selected[0]);
     } },
+    { text: `批量删除（${cards.length} 个节点）`, danger: true, run: () => {
+      if (PROJ !== project || !canOperate()) return;
+      if (PROJ.cards.filter(c => selIds.has(c.id)).length > 1) askDelMany();
+    } },
   ]);
   return true;
 }
@@ -2755,14 +2759,15 @@ function beginCardsMove(ev, cards, onClick) {
 /** Delete 删掉框选的一堆节点（会问一句 —— 没有撤销）。 */
 function askDelMany() {
   if (!requireOperate()) return;
-  const cards = [...selIds].map(cardOf).filter(Boolean);
+  const project = PROJ, cards = [...selIds].map(cardOf).filter(Boolean);
   if (!cards.length) return;
   const n = cards.filter(c => (c.history || []).length || (c.outputs || []).length).length;
-  if (!confirm(`删除选中的 ${cards.length} 个节点？`
-      + (n ? `其中 ${n} 张有生成记录，删了找不回来（产物文件还在 ComfyUI 输出目录）。` : ""))) return;
-  for (const c of cards) delCard(c.id);
-  selIds.clear(); paintSel();
-  toast(`已删除 ${cards.length} 个节点`);
+  if (!confirm(`删除选中的 ${cards.length} 个节点？\n`
+      + (n ? `其中 ${n} 个节点有历史记录或产物。\n` : "")
+      + "相关连线和节点内记录会一并移除，此操作不能撤销；不会删除素材文件。")) return;
+  if (PROJ !== project || !canOperate()) return;
+  const count = delCards(cards.map(c => c.id));
+  if (count) toast(`已删除 ${count} 个节点`);
 }
 
 function pickEdge(e) {
@@ -2942,7 +2947,11 @@ function bindGlobal() {
   rb.onclick = () => {
     if (selIds.size > 1) renameCard(cardOf([...selIds][0]));
   };
-  el.selbar.append(gb, rb);
+  const db = document.createElement("button");
+  db.className = "deletecards act danger"; db.textContent = "批量删除";
+  db.title = "删除框选的所有节点（Delete / Backspace），操作前统一确认";
+  db.onclick = askDelMany;
+  el.selbar.append(gb, rb, db);
   // 双保险：工具条按下的那一漏到画布去（画布会把它当框选起点）
   el.selbar.onmousedown = (ev) => ev.stopPropagation();
   addEventListener("resize", () => { placePanel(); placeJobs(); paintSel(); });
@@ -3020,7 +3029,7 @@ function bindGlobal() {
         pick(id);
       } else {
         paintSel();
-        if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · 右键排列对齐 · Delete 全删 · 上方按钮打组 / 批量重命名`);
+        if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · 右键对齐 / 批量删除 · Delete 全删 · 上方按钮打组 / 批量重命名 / 批量删除`);
       }
     };
     document.addEventListener("mousemove", mv); document.addEventListener("mouseup", up);
@@ -3923,25 +3932,27 @@ function addCard(type, x, y, cap, select = true) {
   return c;
 }
 
-function delCard(id) {
-  if (!requireOperate()) return;
-  // 删上游节点等同于删掉它的所有出口线：下游里由这些线带入的引用也必须清掉。
-  removeEdges(PROJ.edges.filter(e => e.from === id));
-  PROJ.cards = PROJ.cards.filter(c => c.id !== id);
-  PROJ.edges = PROJ.edges.filter(e => e.to !== id);
-  // 组里少一张；空组直接散掉
-  selIds.delete(id);
+function delCard(id) { return delCards([id]); }
+
+function delCards(ids) {
+  if (!PROJ || !requireOperate()) return 0;
+  const requested = new Set(ids), gone = new Set(PROJ.cards.filter(c => requested.has(c.id)).map(c => c.id));
+  if (!gone.size) return 0;
+  // 先清理出线拥有的下游引用，再移除节点，保留手动上传和其他节点的引用。
+  removeEdges(PROJ.edges.filter(e => gone.has(e.from)));
+  PROJ.cards = PROJ.cards.filter(c => !gone.has(c.id));
+  PROJ.edges = PROJ.edges.filter(e => !gone.has(e.to));
+  for (const id of gone) selIds.delete(id);
   if (PROJ.groups) {
-    for (const g of PROJ.groups) g.cards = g.cards.filter(x => x !== id);
+    for (const g of PROJ.groups) g.cards = g.cards.filter(id => !gone.has(id));
     PROJ.groups = PROJ.groups.filter(g => g.cards.length);
   }
-  if (selId === id) { selId = null; closePanel(); }
-  // 介绍浮层（悬停标题出的那段说明）和历史产物栏可能正开着这个节点：
-  // 元素一删 mouseleave 永远不会来，不手动收掉就一直浮在那儿
+  if (gone.has(selId)) { selId = null; closePanel(); }
   tipHide();
-  if (el.hist._id === id) closeHistory();
-  selEdge = null;                    // 连着它的线跟着没了，选中记号不能留成野指针
+  if (gone.has(el.hist._id)) closeHistory();
+  selEdge = null;
   render(); save();
+  return gone.size;
 }
 
 /** Delete 键删节点。菜单里那条不问就删（点菜单是有意的），键盘容易手滑，

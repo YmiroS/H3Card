@@ -78,6 +78,7 @@ const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="
   </div><div id="menu" style="display:none"></div><script>
   const el = Object.fromEntries(['stage','world','groups','lasso','selbar','menu'].map(id => [id,document.getElementById(id)]));
   const PROJ = {cards:[],edges:[],groups:[]};
+  const NODE_EDITOR = false;
   let selIds = new Set(), selId = null, selEdge = null, view = {x:0,y:0,k:1};
   window.saved = 0; window.snapshot = []; window.allowed = true;
   const canOperate = () => allowed, requireOperate = () => allowed;
@@ -104,6 +105,7 @@ const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="
   ${block('function showMenu(', 'const closeMenu =')}
   ${block('function cardMenu(', '/** 把一份产物下载到本地')}
   ${rename}
+  ${block('function askDelMany(', '\nfunction pickEdge(')}
   ${block('  el.selbar.innerHTML =', '  addEventListener("resize",')}
   ${block('  el.stage.addEventListener("mousedown",', '  el.stage.addEventListener("wheel",')}
   function reset() {
