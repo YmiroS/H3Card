@@ -31,12 +31,8 @@ h3 { font-size:13px; font-weight:600; }
 .section { margin-top:16px; background:var(--panel); border:1px solid var(--line); border-radius:12px; overflow:hidden; }
 .section-head { display:flex; flex-wrap:wrap; align-items:center; justify-content:space-between; gap:10px; padding:14px 16px; border-bottom:1px solid var(--line); }
 .pad { padding:16px; }
-.filters { display:flex; flex-wrap:wrap; align-items:end; gap:12px; padding:16px; background:var(--panel); border:1px solid var(--line); border-radius:12px; }
 .field { display:grid; align-content:start; gap:5px; min-width:0; }
 .field>span { color:var(--muted); font-size:12px; }
-.filters .field { flex:1 1 160px; max-width:300px; }
-#custom-range { display:flex; flex-wrap:wrap; gap:12px; }
-#custom-range .field { flex:1 1 180px; }
 .tabs { display:flex; gap:8px; margin-top:22px; border-bottom:1px solid var(--line); }
 .tabs button { border:0; border-bottom:2px solid transparent; border-radius:6px 6px 0 0; padding:12px 18px; background:transparent; }
 .tabs [aria-selected="true"] { color:var(--blue); border-bottom-color:var(--blue); background:#38bdf808; }
@@ -98,15 +94,21 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 .machine-hardware { color:var(--muted); font-variant-numeric:tabular-nums; }
 .machine-caption { padding:0 16px 10px; color:var(--muted); }
 .simple-table { table-layout:fixed; }
-.simple-table th:nth-child(1) { width:17%; }
-.simple-table th:nth-child(2) { width:30%; }
-.simple-table th:nth-child(3) { width:19%; }
-.simple-table th:nth-child(4) { width:18%; }
+.simple-table th:nth-child(1) { width:15%; }
+.simple-table th:nth-child(2) { width:23%; }
+.simple-table th:nth-child(3) { width:22%; }
+.simple-table th:nth-child(4) { width:14%; }
+.simple-table th:nth-child(5) { width:14%; }
 .simple-table td { min-width:0; overflow-wrap:anywhere; }
 .simple-table select { max-width:100%; }
 .business-title { font-size:14px; font-weight:600; }
 .mean-time { display:block; font-size:22px; font-weight:600; font-variant-numeric:tabular-nums; }
 .model-label { display:block; font-size:15px; font-weight:600; }
+.model-item + .model-item,.model-variant + .model-variant { margin-top:12px; padding-top:10px; border-top:1px solid var(--line); }
+.model-role { display:block; color:var(--muted); font-size:12px; }
+.model-origin { margin-bottom:8px; color:var(--warn); }
+.model-reference { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.model-variant { overflow-wrap:anywhere; }
 .simple-table summary,.machine-more summary { color:var(--blue); }
 .simple-table .row-evidence { margin-top:7px; }
 .summary-evidence-row td { padding:0; }
@@ -129,7 +131,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
   .machine-heading { align-items:flex-start; }
 }
 @media(max-width:1100px) { .worker-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .summary,.procurement { grid-template-columns:1fr; } }
-@media(max-width:700px) { main { padding:12px; } header { padding:12px; } header .state { width:100%; order:5; } .worker-grid { grid-template-columns:1fr; padding:10px; } .metrics { grid-template-columns:1fr 1fr; } .tabs button { flex:1; padding:12px 4px; } .form-grid,.review-fields { grid-template-columns:1fr; } .demand { grid-template-columns:minmax(0,1fr) 90px; } .demand>button { grid-column:2; } .filters .field { max-width:none; } }
+@media(max-width:700px) { main { padding:12px; } header { padding:12px; } header .state { width:100%; order:5; } .worker-grid { grid-template-columns:1fr; padding:10px; } .metrics { grid-template-columns:1fr 1fr; } .tabs button { flex:1; padding:12px 4px; } .form-grid,.review-fields { grid-template-columns:1fr; } .demand { grid-template-columns:minmax(0,1fr) 90px; } .demand>button { grid-column:2; } }
 @media(prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; transition:none !important; } }
 </style>
 </head>
@@ -142,14 +144,6 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 <main>
   <div id="error" class="error" role="alert" hidden></div>
   <div id="write-status" class="write-status" role="status" hidden></div>
-  <form id="filters" class="filters">
-    <label class="field"><span>统计周期（本地时区）</span><select id="period"><option value="today">今日</option><option value="7" selected>最近 7 天</option><option value="30">最近 30 天</option><option value="all">全部记录</option><option value="custom">自定义时间</option></select></label>
-    <div id="custom-range" hidden><label class="field"><span>开始时间（含）</span><input id="from" type="datetime-local"></label><label class="field"><span>结束时间（不含）</span><input id="to" type="datetime-local"></label></div>
-    <label class="field"><span>机器</span><select id="worker-filter"><option value="">全部机器</option></select></label>
-    <label class="field"><span>业务能力</span><select id="capability-filter"><option value="">全部业务</option></select></label>
-    <button type="submit">应用筛选</button><a id="export" href="/api/capacity/export">导出分组依据 CSV</a>
-    <p id="period-note" class="hint">最近 7 / 30 天包含今日，按本地日历计算。明细分页不影响全量聚合。</p><p class="hint">CSV 导出当前筛选下的全部分组依据，不限于本页任务明细。</p>
-  </form>
   <div class="tabs" role="tablist" aria-label="产能评估视图">
     <button id="tab-machines" role="tab" aria-selected="true" aria-controls="panel-machines" tabindex="0">机器产能</button>
     <button id="tab-scenarios" role="tab" aria-selected="false" aria-controls="panel-scenarios" tabindex="-1">场景对比</button>
@@ -158,7 +152,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
   <section id="panel-machines" role="tabpanel" aria-labelledby="tab-machines" tabindex="0">
     <section id="machine-summary" aria-label="在线机器业务简览">
       <div class="summary-toolbar"><h2 id="online-count">当前在线 — 台</h2><label class="offline-toggle"><input id="include-offline" type="checkbox">包含离线</label></div>
-      <p class="summary-note hint">在线状态是当前状态；业务为所选时间段跑过的业务，不代表当前均可执行。平均生成时间仅计成功任务执行耗时，不含排队，非纯 GPU 耗时，也不是合格日产能。</p>
+      <p class="summary-note hint">在线状态是当前状态；业务为全部历史记录中跑过的业务，不代表当前均可执行。平均生成时间仅计成功任务执行耗时，不含排队，非纯 GPU 耗时，也不是合格日产能。</p>
       <div id="summary-machines"></div>
     </section>
     <details id="technical-details" class="section advanced"><summary>详细统计与机器配置</summary>
@@ -175,21 +169,16 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
   </section>
   <section id="panel-purchase" role="tabpanel" aria-labelledby="tab-purchase" tabindex="0" hidden>
     <div class="procurement">
-      <section class="section"><div class="section-head"><h2>每日多场景需求</h2><span class="hint">同一 Worker、配置及证据来源</span></div>
+      <section class="section"><div class="section-head"><h2>每日多场景需求</h2></div>
         <form id="estimate-form" class="pad">
           <div class="form-grid">
-            <label class="field"><span>测算证据等级</span><select id="mode"><option value="historical">运行参考（成功任务 runtime）</option><option value="verified">已验证基线测算</option></select></label>
-            <label class="field"><span>交付质量口径</span><select id="quality"><option value="technical">技术交付</option><option value="accepted">人工合格</option></select></label>
-            <label class="field"><span>候选执行端</span><select id="estimate-worker" required></select></label>
-            <label class="field"><span>配置与样本来源</span><select id="baseline" required></select></label>
+            <label class="field"><span>电脑显卡配置选择</span><select id="estimate-worker" required></select></label>
             <label class="field"><span>每日计划生产小时</span><input id="hours" type="number" min="0.1" max="24" step="0.1" value="8" required></label>
-            <label class="field"><span>可用时间比例（%）</span><input id="availability" type="number" min="0.1" max="100" step="0.1" value="90" required></label>
-            <label class="field"><span>生产容量比例（%，余量用于波动）</span><input id="utilization" type="number" min="0.1" max="100" step="0.1" value="75" required></label>
             <label class="field"><span>整机报价（元，可选）</span><input id="price" type="number" min="0" step="0.01" placeholder="未填写则不计价格"></label>
           </div>
-          <p id="mode-note" class="notice"></p><p id="baseline-note" class="hint"></p>
-          <div><h3>每日需求</h3><div id="demands"></div><button id="add-demand" type="button">增加场景</button></div>
-          <p class="hint">台数 = 向上取整〔各场景需求 × 单位耗时之和 ÷（小时 × 3600 × 可用时间比例 × 生产容量比例）〕。比例不是 GPU 利用率；已计入样本的失败或质量损耗不重复扣除。模型切换与业务组合改变可能增加损耗，日总量不保证峰值 SLA。</p>
+          <p id="mode-note" class="notice">按成功任务平均执行耗时参考，不是合格产物日产量或采购承诺。</p>
+          <p class="hint">固定按 100% 可用时间、75% 生产容量计算（预留 25% 应对波动）；每日数量按任务/天填写。</p>
+          <div><h3>每日需求</h3><p id="demand-note" class="hint" role="status"></p><div id="demands"></div><button id="add-demand" type="button" disabled>增加场景</button></div>
           <button id="estimate-submit" class="primary" type="submit" disabled>计算机器需求</button>
         </form>
       </section>
@@ -205,8 +194,22 @@ const $ = id => document.getElementById(id);
 const SOURCE = {historical:'历史运行参考',captured:'采集业务样本',standard:'标准样本（人工标签）'};
 const STATUS = {idle:'在线空闲',online:'在线',busy:'运行中',running:'运行中',offline:'离线',disabled:'已禁用',syncing:'同步中',unavailable:'执行环境不可用',historical:'历史执行端',error:'异常',done:'已完成',canceled:'已取消',queued:'排队中',assigned:'已分配'};
 const UNIT = {task:'任务',tasks:'任务',image:'张图片',images:'张图片',video:'条视频',videos:'条视频',second:'视频秒',seconds:'视频秒',video_seconds:'视频秒'};
+const PURCHASE_DEFAULTS = {mode:'historical',quality:'technical',availability:1,utilization:.75};
+const PURCHASE_MODES = [
+  {id:'zimage_t2i',type:'生图模式',label:'文生图',capabilities:['zimage_t2i','krea2_t2i','qwen_image_2512_t2i','qwen_image_21_t2i']},
+  {id:'zimage_i2i',type:'生图模式',label:'图生图',capabilities:['zimage_i2i','krea2_i2i','qwen_image_edit_2511_i2i','qwen_image_21_multi','qwen_image_21_i2i']},
+  {id:'flux2_klein_storyboard9',type:'生图模式',label:'多宫格故事分镜',capabilities:['flux2_klein_storyboard9']},
+  {id:'flux2_klein_edit',type:'生图模式',label:'参考图编辑(保人物)',capabilities:['flux2_klein_edit']},
+  {id:'minimax_h3_character_transfer',type:'生视频模式',label:'H3人物迁移',capabilities:['minimax_h3_character_transfer']},
+  {id:'minimax_h3_flf2v',type:'生视频模式',label:'H3 图生视频',capabilities:['minimax_h3_i2v','minimax_h3_flf2v']},
+  {id:'minimax_h3_talk2',type:'生视频模式',label:'H3 说话唱歌',capabilities:['minimax_h3_talk1','minimax_h3_talk2']},
+  {id:'minimax_h3_ref4',type:'生视频模式',label:'H3图片参考',capabilities:['minimax_h3_ref4']},
+  {id:'minimax_h3_comic20',type:'生视频模式',label:'漫剧4宫格',capabilities:['minimax_h3_comic20']},
+  {id:'minimax_h3_ref9',type:'生视频模式',label:'H3全能参考',capabilities:['minimax_h3_ref9']},
+  {id:'minimax_h3_ref_2pass',type:'生视频模式',label:'H3全能参考(高质量)',capabilities:['minimax_h3_ref_2pass']}
+];
 let data = null, applied = null, offset = 0, loadVersion = 0, estimateVersion = 0, revision = 0, ready = false, lastEstimate = null;
-const workers = new Map(), capabilities = new Map();
+const workers = new Map();
 const capabilityTitle = g => typeof g?.capability_name==='string' && g.capability_name.trim() ? g.capability_name : text(g?.capability);
 const capabilityLabel = g => capabilityTitle(g)===g?.capability ? capabilityTitle(g) : `${capabilityTitle(g)}（${text(g?.capability)}）`;
 const numeric = v => typeof v === 'number' && Number.isFinite(v);
@@ -230,7 +233,7 @@ function hardwareSummary(h) {
   return `GPU ${gpu}；CPU ${hardwareDescription(h.cpu,'cpu')}；内存 ${bytes(h.memory_total_bytes)}；系统 ${hardwareDescription(h.os,'os')}；环境 ${text(h.environment_id)}；模型版本 ${text(h.model_version)}；磁盘 ${text(h.disk)}；主机 ID ${text(h.host_id)}`;
 }
 const unit = g => g.source === 'historical' ? '任务' : UNIT[g.unit] || text(g.unit);
-const estimateUnit = (g,mode=$('mode').value) => mode==='historical' ? '任务' : g ? unit(g) : '单位未知';
+const estimateUnit = () => '任务';
 function el(tag, value, cls) { const node=document.createElement(tag); if(value != null) node.textContent=value; if(cls) node.className=cls; return node; }
 function message(id, value) { $(id).textContent=value; $(id).hidden=!value; }
 function list(values, cls='warn') { const root=el('ul',null,cls); for(const value of values || []) root.append(el('li',text(value))); return root; }
@@ -258,8 +261,9 @@ function renderOverview() {
 async function mutationSaved(version,label) {
   if(version===loadVersion) await load(false);
   else {
-    // 写入期间切换筛选或分页时，新页面也可能已读到旧数据；不恢复旧筛选。
-    draftChanged();$('refresh-state').textContent=`${label}已更新，请重新应用当前筛选`;
+    // 写入期间刷新或分页时，新页面也可能已读到旧数据；丢弃在途旧响应。
+    loadVersion++;clearData();invalidateEstimate('证据已更新，请点击立即刷新后重新计算。');
+    $('refresh-state').textContent=`${label}已更新，请点击立即刷新`;
   }
   message('write-status',`${label}已保存。人工声明不回写历史快照，也不代表自动验证通过。`);
 }
@@ -343,22 +347,98 @@ function missingHardware(w) {
   if(!h.environment_id || !h.model_version)return '环境或模型版本的人工声明未填写，可在“详细统计与机器配置”中补录。';
   return '当前配置不代表历史任务的执行配置；历史依据见各业务详情。';
 }
-function summaryModel(g) {
-  const summary=g.model_summary;
-  if(!summary || summary.source!=='task_snapshot')return {label:g.source==='historical'?'历史未记录':'尚未采集',note:'不按业务名称推断'};
-  const models=Array.isArray(summary.models)?summary.models:[], sources=new Set(models.filter(m=>m.precision).map(m=>m.precision_source));
-  const origin=sources.has('filename') && sources.has('loader')?'文件标记 / 加载配置':sources.has('filename')?'模型文件标记':sources.has('loader')?'加载配置':'任务快照标记';
-  return {label:summary.precision_label || '尚未采集',note:summary.precision_label?`${origin}，非运行时检测`:'采样主模型未标注精度'};
+function modelEvidence(g) {
+  // 新合同即使为空也具有优先级，不能用旧汇总冒充已恢复的历史记录。
+  const hasEvidence=Object.hasOwn(g,'model_evidence'), evidence=g.model_evidence;
+  const variants=hasEvidence?(Array.isArray(evidence?.variants)?evidence.variants:[]).filter(v=>['task_snapshot','archived_task'].includes(v.source) && v.summary):
+    g.model_summary?.source==='task_snapshot'?[{source:'task_snapshot',summary:g.model_summary}]:[];
+  return {variants,hasEvidence,total:evidence?.total_samples,recorded:evidence?.recorded_samples,reference:g.current_model_reference?.source==='current_template'?g.current_model_reference:null};
+}
+const mainModels = summary => Array.isArray(summary?.models)?summary.models:[];
+function modelRole(model,index,count) {
+  const roles={high_noise:'高噪声',low_noise:'低噪声','高噪声':'高噪声','低噪声':'低噪声',base:'基础模型',refiner:'精修模型','生成主模型':'生成主模型','深度模型':'深度模型','放大模型':'放大模型','插帧模型':'插帧模型'};
+  const role=Object.hasOwn(roles,model.role)?roles[model.role]:null;
+  return role?`${role} · 主模型 ${index+1}`:count>1?`主模型 ${index+1}`:'';
+}
+function modelPrecision(model) {
+  const parts=[];
+  if(model.precision && model.precision_source==='filename')parts.push(`文件标记 ${text(model.precision)}`);
+  if(model.loader_dtype) {
+    const dtype=text(model.loader_dtype), tokens=dtype.split(/\s*\/\s*/).map(value=>value.match(/^(bfloat16|bf16|float(?:8|16|32|64)|fp(?:8|16|32|64))(?:_e4m3fn|_e5m2)?(?:_fast)?$/i)?.[1]);
+    const normalized=tokens.every(Boolean)?[...new Set(tokens.map(value=>value.toUpperCase().replace('BFLOAT16','BF16').replace('FLOAT','FP')))].join(' / '):null;
+    parts.push(`加载配置 ${normalized?`${normalized}（${dtype}）`:dtype}${['default','auto'].includes(dtype.toLowerCase())?'（实际精度未确认）':''}`);
+  } else if(model.precision && model.precision_source==='loader')parts.push(`加载配置 ${text(model.precision)}`);
+  if(!parts.length)parts.push('精度未记录 / 待确认');
+  return parts;
+}
+function modelColumns(summary,origin='') {
+  const names=el('div',null,'model-variant'), precision=el('div',null,'model-variant'), models=mainModels(summary);
+  for(const node of [names,precision]) {
+    if(origin)node.append(el('p',origin,'model-origin hint'));
+    if(summary?.complete===false)node.append(el('p','不完整 / 未确认完整主模型链','warn hint'));
+  }
+  models.forEach((model,index)=>{
+    const name=el('div',null,'model-item'), dtype=el('div',null,'model-item'), role=modelRole(model,index,models.length);
+    for(const node of [name,dtype])if(role)node.append(el('span',role,'model-role'));
+    name.append(el('p',model.name || '未获取到模型信息','model-name'));
+    for(const part of modelPrecision(model))dtype.append(el('p',part,'model-label'));
+    names.append(name);precision.append(dtype);
+  });
+  if(!models.length) {names.append(el('p','未获取到模型信息','muted'));precision.append(el('p','模型待确认，精度未确认','muted'));}
+  const sources=new Set(models.filter(m=>m.precision).map(m=>m.precision_source));
+  const originNote=sources.has('filename')?'模型文件标记':models.some(m=>m.loader_dtype || m.precision_source==='loader')?'加载配置':'精度未记录';
+  precision.append(el('p',`${originNote}，非运行时检测`,'hint'));
+  return [names,precision];
+}
+function renderModelCells(g,nameCell,precisionCell,timeCell) {
+  const evidence=modelEvidence(g), {variants,reference}=evidence;
+  nameCell.replaceChildren();precisionCell.replaceChildren();
+  if(evidence.hasEvidence)nameCell.append(el('p',`模型记录覆盖 ${num(evidence.recorded)} / ${num(evidence.total)} 次`,'hint model-coverage'));
+  if(variants.length) {
+    variants.forEach((variant,index)=>{
+      const origin=evidence.hasEvidence?`任务记录组合 ${index+1} · ${variant.source==='archived_task'?'保留的原任务记录':'任务提交记录'} · ${num(variant.samples)} 次记录 / ${num(variant.measured)} 次成功耗时`:'';
+      const [names,precision]=modelColumns(variant.summary,origin);nameCell.append(names);precisionCell.append(precision);
+    });
+    if(variants.length>1)nameCell.append(el('p','以上为不同任务的模型组合；不是每个任务同时使用全部模型。','warn hint'));
+    if(variants.length>1 || evidence.hasEvidence && evidence.recorded<evidence.total || variants.some(v=>v.summary.complete===false))timeCell.append(el('p','全组历史任务平均，非某个模型或组合专属速度。','warn hint'));
+  } else if(reference) {
+    const [names,precision]=modelColumns(reference,'当前工具默认配置（非历史执行记录）');
+    names.append(el('p',`工具：${text(reference.capability_name)}`,'hint'));nameCell.append(names);precisionCell.append(precision);
+    timeCell.append(el('p','此处耗时来自历史任务，不代表当前模型速度。','warn hint'));
+    precisionCell.append(el('p','历史未记录可用主模型证据；当前模板仅作参考，不补写历史精度。','hint'));
+  } else {
+    nameCell.append(el('span','未获取到模型信息','muted'));
+    precisionCell.append(el('p','历史未记录可用主模型证据；当前工具模板未提供、找不到或无法识别。','hint'),el('p','模型待确认，精度未确认；不按业务名称推断。','hint'));
+  }
+}
+function appendModelDetails(node,summary,origin) {
+  const section=el('div',null,'model-reference');section.append(el('p',origin,'model-origin'));
+  if(summary.complete===false)section.append(el('p','不完整 / 未确认完整主模型链；动态选择或未知链路不能推断全部主模型。','warn'));
+  const models=mainModels(summary);
+  if(!models.length)section.append(el('p','未获取到模型信息，模型待确认。'));
+  models.forEach((model,index)=>section.append(el('p',`${modelRole(model,index,models.length) || '主模型'}：${text(model.name)}；角色：${text(model.role)}；${modelPrecision(model).join('；')}；非运行时检测`)));
+  const auxiliary=Array.isArray(summary.auxiliary_models)?summary.auxiliary_models:[];
+  if(auxiliary.length) {
+    section.append(el('p','辅助模型（不计入主模型名称或精度）','hint'));
+    for(const model of auxiliary)section.append(el('p',`角色：${text(model.role)}；${text(model.name)}；${modelPrecision(model).join('；')}`,'hint'));
+  }
+  node.append(section);
 }
 function summaryEvidence(g) {
   const node=el('div',null,'pad');
   node.append(el('p',`来源：${source(g.source)}；有效耗时样本 ${num(g.measured)} / 总样本 ${num(g.samples)}；成功 ${num(g.done)} / 失败 ${num(g.error)} / 取消 ${num(g.canceled)}`),el('p',`P90：${friendlyTime(g.p90_seconds)}；最近成功样本：${when(g.last_sample_at)}`),el('p','平均值仅使用该组成功任务执行耗时；不包含排队，不等于纯 GPU 计算时间，也不是合格日产能。','hint'));
   node.append(el('p',`执行时配置：${hardwareSummary(g.config)}（${configSource(g.config_source)}）`),el('p',`缓存条件：${text(g.cache_condition)}`));
-  const models=g.model_summary?.source==='task_snapshot' && Array.isArray(g.model_summary.models)?g.model_summary.models:[];
-  node.append(el('p',models.length?'模型证据来自任务快照的采样主模型；文件标记 / 加载配置不等于运行时检测。':'此组没有采样主模型证据，不使用当前模板或其他模型补推。'));
-  for(const model of models)node.append(el('p',`${text(model.name)}；精度标记 ${text(model.precision)}；来源 ${{filename:'模型文件标记',loader:'加载配置'}[model.precision_source] || '未记录'}；加载类型 ${text(model.loader_dtype)}`));
+  const evidence=modelEvidence(g);
+  if(evidence.hasEvidence)node.append(el('p',`模型记录覆盖 ${num(evidence.recorded)} / ${num(evidence.total)} 次；覆盖数不是完整主模型链的确认。`));
+  if(evidence.variants.length>1)node.append(el('p','不同任务记录对应不同模型组合；每个组合内的主模型才属于同一个图。全组平均耗时不代表任一组合的专属速度。','warn'));
+  if(!evidence.variants.length)node.append(el('p','历史未记录可用主模型证据；不能用当前模板补写历史模型与精度。'));
+  evidence.variants.forEach((variant,index)=>appendModelDetails(node,variant.summary,`历史任务记录组合 ${index+1} · ${variant.source==='archived_task'?'保留的原任务记录':'任务提交记录'}${evidence.hasEvidence?` · ${num(variant.samples)} 次记录 / ${num(variant.measured)} 次成功耗时`:''}`));
+  if(evidence.reference) {
+    appendModelDetails(node,evidence.reference,`当前工具默认配置（非历史执行记录）· ${text(evidence.reference.capability_name)}`);
+    node.append(el('p','仅为工具模板默认值，不代表用户画布节点当前选中的模型。历史耗时不代表当前模型速度；参考信息不补齐历史覆盖，也不覆盖历史精度。','warn hint'));
+  } else if(!evidence.variants.length)node.append(el('p','未获取到模型信息：当前工具模板未提供、找不到或无法识别。','hint'));
   node.append(list(groupWarnings(g)),el('p',`采样日期：${text(g.days)}；配置编号：${text(g.config_id)}；采样编号：${text(g.id)}`,'hint'));
-  const raw=el('details');raw.append(el('summary','原始规格与证据'),el('pre',text({dimensions:g.dimensions,spec:g.spec,model_summary:g.model_summary,cache_condition:g.cache_condition})));node.append(raw);
+  const raw=el('details');raw.append(el('summary','原始规格与证据'),el('pre',text({dimensions:g.dimensions,spec:g.spec,model_summary:g.model_summary,model_evidence:g.model_evidence,current_model_reference:g.current_model_reference,cache_condition:g.cache_condition})));node.append(raw);
   return node;
 }
 function renderMachineSummary() {
@@ -370,10 +450,10 @@ function renderMachineSummary() {
     const machine=el('article',null,'machine-strip');machine.dataset.summaryWorkerId=w.id;
     const heading=el('div',null,'machine-heading'), identity=el('div',null,'machine-identity');
     identity.append(el('h3',w.name || '未命名机器'),el('span',STATUS[w.state] || '状态待确认',isOnline(w)?'online-state':'muted'));
-    heading.append(identity,el('p',knownHardware(w),'machine-hardware'));machine.append(heading,el('p','所选时间段跑过的业务','machine-caption'));
+    heading.append(identity,el('p',knownHardware(w),'machine-hardware'));machine.append(heading,el('p','全部历史记录中跑过的业务','machine-caption'));
     const groups=new Map();
-    for(const g of data?.groups || [])if(g.worker_id===w.id && (!applied?.capability || g.capability===applied.capability)) {if(!groups.has(g.capability))groups.set(g.capability,[]);groups.get(g.capability).push(g);}
-    const tableNode=el('table',null,'simple-table'), thead=el('thead'), header=el('tr'), body=el('tbody'), labels=['业务能力','任务规格','模型精度','平均生成时间','样本 / 详情'];
+    for(const g of data?.groups || [])if(g.worker_id===w.id) {if(!groups.has(g.capability))groups.set(g.capability,[]);groups.get(g.capability).push(g);}
+    const tableNode=el('table',null,'simple-table'), thead=el('thead'), header=el('tr'), body=el('tbody'), labels=['业务能力','任务规格','模型名称','模型精度','平均生成时间','样本 / 详情'];
     for(const label of labels){const th=el('th',label);th.scope='col';header.append(th);}thead.append(header);tableNode.append(thead,body);
     for(const entries of groups.values()) {
       const row=el('tr',null,'business-row'), cells=labels.map(label=>{const td=el('td');td.dataset.label=label;row.append(td);return td;}), select=el('select',null,'summary-spec');
@@ -382,27 +462,27 @@ function renderMachineSummary() {
       entries.forEach((g,index)=>option(select,g.id,`${names[index]}${names.filter(name=>name===names[index]).length>1?` · ${source(g.source)} · ${numeric(g.last_sample_at)?when(g.last_sample_at):'日期未记录'} · 采样 ${index+1}`:''}`));
       const selectedSpec=el('p',null,'hint selected-spec');
       select.value=preferredGroup(entries).id;cells[1].append(select,selectedSpec);
-      const evidenceRow=el('tr',null,'summary-evidence-row'), evidenceCell=el('td');evidenceCell.colSpan=5;evidenceRow.append(evidenceCell);evidenceRow.hidden=true;evidenceRow.id=`summary-evidence-${++rowNumber}`;
-      const count=el('p'), button=el('button','查看详情','summary-detail-toggle');button.type='button';button.setAttribute('aria-expanded','false');button.setAttribute('aria-controls',evidenceRow.id);cells[4].append(count,button);
+      const evidenceRow=el('tr',null,'summary-evidence-row'), evidenceCell=el('td');evidenceCell.colSpan=labels.length;evidenceRow.append(evidenceCell);evidenceRow.hidden=true;evidenceRow.id=`summary-evidence-${++rowNumber}`;
+      const count=el('p'), button=el('button','查看详情','summary-detail-toggle');button.type='button';button.setAttribute('aria-expanded','false');button.setAttribute('aria-controls',evidenceRow.id);cells[5].append(count,button);
       button.onclick=()=>{evidenceRow.hidden=!evidenceRow.hidden;button.setAttribute('aria-expanded',String(!evidenceRow.hidden));button.textContent=evidenceRow.hidden?'查看详情':'收起详情';};
       const update=()=>{
-        const g=entries.find(item=>item.id===select.value), model=summaryModel(g);row.dataset.selectedGroupId=g.id;
+        const g=entries.find(item=>item.id===select.value);row.dataset.selectedGroupId=g.id;
         selectedSpec.textContent=simpleSpec(g);
-        cells[2].replaceChildren(el('span',model.label,'model-label'),el('p',model.note,'hint'));
-        cells[3].replaceChildren(el('span',hasMean(g)?friendlyTime(g.mean_seconds):'暂无成功耗时',hasMean(g)?'mean-time':'muted'));
-        if(hasMean(g) && (g.mean_seconds<1 || g.mean_seconds>3600))cells[3].append(el('p','耗时异常，请核对详情','warn hint'));
+        cells[4].replaceChildren(el('span',hasMean(g)?friendlyTime(g.mean_seconds):'暂无成功耗时',hasMean(g)?'mean-time':'muted'));
+        renderModelCells(g,cells[2],cells[3],cells[4]);
+        if(hasMean(g) && (g.mean_seconds<1 || g.mean_seconds>3600))cells[4].append(el('p','耗时异常，请核对详情','warn hint'));
         count.textContent=numeric(g.measured)?g.measured<30?`仅 ${num(g.measured)} 次 / 仅供参考`:`${num(g.measured)} 次成功实测`:'样本数未记录';
         count.className=!numeric(g.measured) || g.measured<30?'warn hint':'hint';
         evidenceCell.replaceChildren(summaryEvidence(g));
       };
       select.onchange=update;update();body.append(row,evidenceRow);
     }
-    if(groups.size)machine.append(tableNode);else machine.append(el('p','暂无该时间范围记录，可调整时间或业务筛选；不据此推断支持哪些业务。','pad muted'));
+    if(groups.size)machine.append(tableNode);else machine.append(el('p','暂无历史任务记录；不据此推断支持哪些业务。','pad muted'));
     const details=el('details',null,'machine-more');details.append(el('summary','机器详情'),el('p',missingHardware(w)),el('p',`最后上报：${when(w.last_seen)}；Worker ID：${text(w.id)}；采集程序版本：${text(w.agent_version)}`,'hint'));
     if(!isOnline(w))details.append(el('p','此记录当前不可用，配置为最后上报信息，历史速度不代表现在能执行。','hint'));
     machine.append(details);root.append(machine);
   }
-  if(!visible.length)root.append(el('p',$('include-offline').checked?'当前筛选暂无机器记录。':'当前筛选没有在线机器，可勾选“包含离线”查看已登记记录。','empty'));
+  if(!visible.length)root.append(el('p',$('include-offline').checked?'暂无机器记录。':'当前没有在线机器，可勾选“包含离线”查看已登记记录。','empty'));
 }
 function renderWorkers() {
   $('workers').replaceChildren();
@@ -418,7 +498,7 @@ function renderWorkers() {
     else card.append(el('p','历史执行端未关联现存注册记录，不能补录配置。','hint'));
     $('workers').append(card);
   }
-  if(!(data.workers || []).length) $('workers').append(el('p','当前范围暂无执行端信息，请更换筛选；无法关联的历史任务不会按名称猜测机器。','empty'));
+  if(!(data.workers || []).length) $('workers').append(el('p','暂无执行端信息；无法关联的历史任务不会按名称猜测机器。','empty'));
 }
 function table(headers, rows) {
   const wrap=el('div',null,'scroll'); wrap.tabIndex=0; wrap.setAttribute('role','region'); wrap.setAttribute('aria-label',headers.join(' / '));
@@ -429,7 +509,7 @@ function table(headers, rows) {
 function cell(row, value, cls) { const td=el('td',null,cls); td.append(value instanceof Node?value:el('span',text(value)));row.append(td);return td; }
 function renderGroups(id, groups) {
   const root=$(id); root.replaceChildren();
-  if(!groups.length) {root.append(el('p','此范围暂无业务规格样本。调整日期或业务筛选；未测试场景不能推算产能。','empty'));return;}
+  if(!groups.length) {root.append(el('p','暂无业务规格样本；未测试场景不能推算产能。','empty'));return;}
   const rows=groups.map(g=>{
     const row=el('tr'); row.dataset.groupId=g.id;
     const identity=el('div'); identity.append(el('strong',capabilityTitle(g)),el('p',`能力 ID：${text(g.capability)}`,'hint'),el('p',workerName(g.worker_id,g.worker_name),'hint'),el('span',source(g.source),'badge'),el('p',`配置：${text(g.config_id)}`,'hint'));
@@ -494,7 +574,7 @@ function renderDetails() {
     if(['captured','standard'].includes(d.source)) node.append(reviewForm(d));
     $('details').append(node);
   }
-  if(!details.length) $('details').append(el('p','当前页没有任务证据。请更换筛选，或返回上一页。','empty'));
+  if(!details.length) $('details').append(el('p','当前页没有任务证据。可立即刷新，或返回上一页。','empty'));
   $('detail-count').textContent=`当前 ${details.length} / 总计 ${num(data.details_total)} 条；聚合不受分页截断`;
   $('page-note').textContent=`第 ${Math.floor(offset/100)+1} 页`;
   $('previous').disabled=offset===0;
@@ -508,111 +588,127 @@ function clearData() {
 }
 function invalidateEstimate(note='输入或证据已变更，请重新计算。') {
   estimateVersion++;lastEstimate=null;$('export-estimate').disabled=true;message('estimate-error','');
-  $('estimate-result').replaceChildren(el('p',note,'muted'));$('estimate-submit').disabled=!ready || !selectedGroups().some(usable);
-}
-function draftChanged() {
-  loadVersion++;clearData();invalidateEstimate('筛选尚未应用，旧测算已清除。请应用筛选后重新计算。');
-  $('refresh-state').textContent='筛选已更改，待应用';$('export').removeAttribute('href');$('export').setAttribute('aria-disabled','true');
-}
-function readPeriod() {
-  const now=new Date(), period=$('period').value; let from, to=Math.floor(now.getTime()/1000);
-  if(period==='custom') {
-    if(!$('from').value || !$('to').value) throw Error('自定义时间需要同时填写开始和结束时间。');
-    from=new Date($('from').value).getTime()/1000;to=new Date($('to').value).getTime()/1000;
-    if(!numeric(from) || !numeric(to) || from>=to) throw Error('开始时间必须早于结束时间。');
-  } else if(period!=='all') {
-    const start=new Date(now.getFullYear(),now.getMonth(),now.getDate());
-    if(period!=='today') start.setDate(start.getDate()-(Number(period)-1));
-    from=start.getTime()/1000;
-  }
-  return {...(from===undefined?{}:{from}),to,worker_id:$('worker-filter').value,capability:$('capability-filter').value};
+  $('estimate-result').replaceChildren(el('p',note,'muted'));updateDemandControls();
 }
 async function load(reset=true) {
   const version=++loadVersion;ready=false;invalidateEstimate('证据正在刷新，旧测算已清除。');message('error','');
-  let filter;
-  try {filter=reset?readPeriod():applied;if(!filter)throw Error('请先应用有效筛选。');}
-  catch(error) {clearData();message('error',error.message);$('refresh-state').textContent='筛选无效';return;}
+  // 不限制历史起点；翻页与测算沿用同一截止时间，刷新时再纳入新任务。
+  const range=reset?{to:Math.floor(Date.now()/1000)}:applied;
   if(reset)offset=0;
-  $('previous').disabled=true;$('next').disabled=true;$('export').removeAttribute('href');$('export').setAttribute('aria-disabled','true');
-  $('refresh-state').textContent='正在读取完整聚合与本页证据…';
+  $('previous').disabled=true;$('next').disabled=true;
+  $('refresh-state').textContent='正在读取全部历史聚合与本页证据…';
   try {
-    const result=await H3Auth.request(`/api/capacity?${new URLSearchParams({...filter,limit:100,offset})}`,{cache:'no-store'});
-    // H3Auth.request 返回已解析数据；请求序号同时保护筛选与分页，旧响应不能覆盖新状态。
+    const result=await H3Auth.request(`/api/capacity?${new URLSearchParams({...range,limit:100,offset})}`,{cache:'no-store'});
+    // H3Auth.request 返回已解析数据；请求序号保护刷新与分页，旧响应不能覆盖新状态。
     if(version!==loadVersion)return;
-    data=result;applied={...filter};revision++;ready=true;
+    data=result;applied={...range};revision++;ready=true;
+    workers.clear();
     for(const w of data.workers || [])workers.set(w.id,w);
-    for(const g of data.groups || []) {if(g.capability)capabilities.set(g.capability,capabilityLabel(g));if(g.worker_id && !workers.has(g.worker_id))workers.set(g.worker_id,{id:g.worker_id,name:g.worker_name});}
-    choose($('worker-filter'),[...workers.values()].map(w=>[w.id,workerName(w.id,w.name)]),'全部机器',filter.worker_id);
-    choose($('capability-filter'),[...capabilities].sort(([a],[b])=>a.localeCompare(b)),'全部业务',filter.capability);
+    for(const g of data.groups || [])if(g.worker_id && !workers.has(g.worker_id))workers.set(g.worker_id,{id:g.worker_id,name:g.worker_name});
     renderMachineSummary();renderOverview();renderWorkers();renderGroups('machine-groups',data.groups || []);renderScenarios();renderDetails();setupEstimate();
-    $('export').href=`/api/capacity/export?${new URLSearchParams(applied)}`;$('export').removeAttribute('aria-disabled');
-    $('period-note').textContent=`本地时间：${applied.from===undefined?'最早记录':when(applied.from)} 至 ${when(applied.to)}（结束不含）；明细分页不影响全量聚合。`;
     $('refresh-state').textContent=`最后刷新：${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
   } catch(error) {
     if(version!==loadVersion)return;clearData();message('error',`读取产能数据失败：${error.message}。请点击立即刷新重试。`);$('refresh-state').textContent='读取失败';
   }
 }
 function baselineKey(g) {return JSON.stringify(g.source==='standard'?[g.config_id || null,g.source,g.benchmark_id || `unknown:${g.id}`]:[g.config_id || null,g.source]);}
-function candidateGroups() {
-  const sources=$('mode').value==='historical'?['historical','captured','standard']:['captured','standard'];
-  return (data?.groups || []).filter(g=>g.worker_id===$('estimate-worker').value && sources.includes(g.source));
+const purchaseMode = capability => PURCHASE_MODES.find(mode=>mode.capabilities.includes(capability));
+const onlineWorker = id => (data?.workers || []).find(w=>w.id===id && isOnline(w));
+function usable(g) {return numeric(g.mean_seconds) && g.mean_seconds>0 && numeric(g.measured) && g.measured>0;}
+function purchaseGroups(workerId) {
+  if(!onlineWorker(workerId))return [];
+  return (data?.groups || []).filter(g=>g.worker_id===workerId && ['historical','captured','standard'].includes(g.source) && purchaseMode(g.capability) && usable(g));
 }
-function selectedGroups() {return candidateGroups().filter(g=>baselineKey(g)===$('baseline').value);}
-function usable(g) {
-  if($('mode').value==='historical')return numeric(g.mean_seconds) && g.mean_seconds>0;
-  const value=$('quality').value==='accepted'?g.qualified_seconds_per_unit:g.seconds_per_unit;
-  return g.eligible===true && !!g.config_id && numeric(value) && value>0;
-}
+function candidateGroups() {return purchaseGroups($('estimate-worker').value);}
+function hasUsableMode(mode,groups=candidateGroups()) {return groups.some(g=>mode.capabilities.includes(g.capability) && usable(g));}
 function setupEstimate() {
-  const ids=[...new Set((data?.groups || []).map(g=>g.worker_id).filter(Boolean))];
-  choose($('estimate-worker'),ids.map(id=>[id,workerName(id)]),ids.length?null:'暂无有样本的执行端');
-  setupBaselines();
-}
-function setupBaselines() {
-  const historical=$('mode').value==='historical';$('quality').disabled=historical;if(historical)$('quality').value='technical';
-  $('mode-note').textContent=historical?'运行参考可选历史、采集或标准标签样本，仅使用成功任务平均 runtime，需求单位统一为任务。证据不完整也可作受限参考；未包含完整失败、准备、重试或质量损耗，不称合格日产能，也不是采购承诺。':'已验证口径由服务端校验证据完整性。技术交付不代表审美或业务合格；人工合格仅使用完整验收依据，不把未验收当作合格。';
-  const baselines=new Map();for(const g of candidateGroups())baselines.set(baselineKey(g),`${text(g.config_id)} / ${source(g.source)}${g.source==='standard'?` / 基准 ${text(g.benchmark_id)}`:''}${historical?' / 仅任务运行参考':''}`);
-  choose($('baseline'),[...baselines],baselines.size?null:'暂无该证据等级样本');
+  const online=(data?.workers || []).filter(isOnline), previous=$('estimate-worker').value;
+  const selected=online.some(w=>w.id===previous)?previous:(online.find(w=>purchaseGroups(w.id).length) || online[0])?.id || '';
+  choose($('estimate-worker'),online.map(w=>[w.id,w.name || '未命名电脑']),online.length?null:'暂无在线电脑',selected);
   resetDemands();
 }
+function updateDemandControls() {
+  const groups=candidateGroups(), selects=[...$('demands').querySelectorAll('select')], used=new Set(selects.map(select=>select.value));
+  for(const select of selects)for(const item of select.options) {
+    const mode=PURCHASE_MODES.find(mode=>mode.id===item.value);
+    item.disabled=!mode || !hasUsableMode(mode,groups) || selects.some(other=>other!==select && other.value===item.value);
+  }
+  $('add-demand').disabled=!ready || !PURCHASE_MODES.some(mode=>!used.has(mode.id) && hasUsableMode(mode,groups));
+  $('estimate-submit').disabled=!ready || !groups.length || !selects.length;
+  $('demand-note').textContent=!ready?'请先刷新并读取电脑状态。':!onlineWorker($('estimate-worker').value)?'当前没有在线电脑，请稍后刷新。':!groups.length?'这台电脑暂无这些模式的成功耗时记录，请换一台电脑。':'';
+}
 function resetDemands() {
-  $('demands').replaceChildren();addDemand();
-  const w=workers.get($('estimate-worker').value), h=w?.hardware || {};
-  const baseline=selectedGroups()[0];
-  $('baseline-note').textContent=`候选 Worker ID：${text(w?.id)}。执行时配置：${hardwareSummary(baseline?.config)}（${configSource(baseline?.config_source)}）。当前配置仅作清单参考：${hardwareSummary(h)}。历史未知配置不可追认成完整基线。`;
-  $('estimate-submit').disabled=!ready || !selectedGroups().some(usable);$('add-demand').disabled=!selectedGroups().length;
+  $('demands').replaceChildren();addDemand();invalidateEstimate();
 }
 function addDemand() {
-  const row=el('div',null,'demand'), select=el('select');select.className='demand-group';select.required=true;select.setAttribute('aria-label','需求业务规格');
-  const used=new Set([...$('demands').querySelectorAll('select')].map(s=>s.value));
-  for(const g of selectedGroups()) {option(select,g.id,`${capabilityLabel(g)} / ${text(g.spec_key)} / ${estimateUnit(g)}${$('mode').value==='historical'?'（仅运行参考）':''}${usable(g)?'':'（缺少可用耗时或证据）'}`);select.lastChild.disabled=!usable(g);}
-  const first=selectedGroups().find(g=>usable(g) && !used.has(g.id));select.value=first?.id || '';
-  const quantity=el('input');quantity.className='demand-quantity';quantity.type='number';quantity.min='0.01';quantity.step='any';quantity.required=true;quantity.placeholder='每日数量';quantity.setAttribute('aria-label','每日需求数量');
+  const groups=candidateGroups(), used=new Set([...$('demands').querySelectorAll('select')].map(select=>select.value));
+  const first=PURCHASE_MODES.find(mode=>!used.has(mode.id) && hasUsableMode(mode,groups));
+  if(!ready || !first && $('demands').children.length){updateDemandControls();return;}
+  const row=el('div',null,'demand'), select=el('select');select.className='demand-group';select.required=true;select.setAttribute('aria-label','需求业务模式');
+  for(const type of ['生图模式','生视频模式']) {
+    const category=el('optgroup');category.label=type;
+    for(const mode of PURCHASE_MODES.filter(mode=>mode.type===type))option(category,mode.id,`${mode.type} · ${mode.label}`);
+    select.append(category);
+  }
+  select.value=first?.id || '';select.disabled=!first;select.onchange=()=>invalidateEstimate();
+  const quantity=el('input');quantity.className='demand-quantity';quantity.type='number';quantity.min='0.01';quantity.step='any';quantity.required=true;quantity.placeholder='任务/天';quantity.setAttribute('aria-label','每日需求数量（任务/天）');quantity.disabled=!first;
   const remove=el('button','移除');remove.type='button';remove.onclick=()=>{row.remove();invalidateEstimate();};
-  row.append(select,quantity,remove);$('demands').append(row);
+  row.append(select,quantity,remove);$('demands').append(row);updateDemandControls();
+}
+const stableCompare = (a,b) => a<b?-1:a>b?1:0;
+function comparePurchaseGroups(a,b) {
+  const value=(g,key)=>numeric(g[key])?g[key]:0;
+  return b.measured-a.measured || value(b,'samples')-value(a,'samples') || value(b,'last_sample_at')-value(a,'last_sample_at') || b.mean_seconds-a.mean_seconds || stableCompare(a.id,b.id);
+}
+function selectDemandGroups(demands,groups=candidateGroups()) {
+  // 同配置、来源与基准编号内选择具体原分组，绝不融合不同模型、尺寸或缓存的均值。
+  const buckets=new Map();
+  for(const g of groups) {const key=baselineKey(g);if(!buckets.has(key))buckets.set(key,[]);buckets.get(key).push(g);}
+  const choices=[];
+  for(const [key,entries] of buckets) {
+    const selected=demands.map(demand=>{
+      const mode=PURCHASE_MODES.find(mode=>mode.id===demand.mode_id);
+      return entries.filter(g=>mode.capabilities.includes(g.capability)).sort(comparePurchaseGroups)[0];
+    });
+    if(selected.every(Boolean))choices.push({key,groups:selected,measured:selected.reduce((sum,g)=>sum+g.measured,0)});
+  }
+  choices.sort((a,b)=>b.measured-a.measured || stableCompare(a.key,b.key));
+  if(!choices.length)throw Error('所选模式没有同一电脑、同一配置和来源的共同实测记录，请减少模式或换一台电脑');
+  return choices[0].groups;
 }
 function estimatePayload() {
-  if(!ready || !applied)throw Error('请先应用筛选并成功读取证据。');
-  const groups=selectedGroups(), seen=new Set();
-  const demands=[...$('demands').children].map(row=>{
-    const group_id=row.querySelector('select').value, quantity=Number(row.querySelector('input').value), g=groups.find(item=>item.id===group_id);
-    if(!g || !usable(g))throw Error('需求包含未验证或缺少耗时的场景，不能按零耗时计算。');
-    if(seen.has(group_id))throw Error('同一场景请合并每日需求，不能重复选择。');seen.add(group_id);
-    if(!numeric(quantity) || quantity<=0)throw Error('每日需求必须大于零。');return {group_id,quantity};
+  if(!ready || !applied)throw Error('请先点击立即刷新并成功读取证据。');
+  const worker_id=$('estimate-worker').value;
+  if(!onlineWorker(worker_id))throw Error('所选电脑当前不在线，请刷新后重新选择。');
+  const groups=candidateGroups(), seen=new Set();
+  const requested=[...$('demands').children].map(row=>{
+    const mode_id=row.querySelector('select').value, quantity=Number(row.querySelector('input').value), mode=PURCHASE_MODES.find(mode=>mode.id===mode_id);
+    if(!mode || !hasUsableMode(mode,groups))throw Error('所选模式没有成功耗时记录，请换一个模式或电脑。');
+    if(seen.has(mode_id))throw Error('同一模式请合并每日需求，不能重复选择。');seen.add(mode_id);
+    if(!numeric(quantity) || quantity<=0)throw Error('每日需求必须是大于零的有限任务数量。');return {mode_id,quantity};
   });
-  if(!demands.length)throw Error('请至少添加一个有样本的业务场景。');
-  const payload={...applied,mode:$('mode').value,quality:$('quality').value,worker_id:$('estimate-worker').value,hours:Number($('hours').value),availability:Number($('availability').value)/100,utilization:Number($('utilization').value)/100,demands};
-  delete payload.capability;
+  if(!requested.length)throw Error('请至少添加一个有样本的业务模式。');
+  const selected=selectDemandGroups(requested,groups), demands=requested.map((demand,index)=>({group_id:selected[index].id,quantity:demand.quantity}));
+  const payload={...applied,...PURCHASE_DEFAULTS,worker_id,hours:Number($('hours').value),demands};
   if($('price').value!=='')payload.price=Number($('price').value);
   return payload;
 }
 function renderEstimate(result,payload) {
   const root=$('estimate-result');root.replaceChildren();
-  root.append(el('p',payload.mode==='historical'?'历史任务处理参考，不是合格日产能或采购承诺':'基于完整证据的条件测算，仍需代表性整机验收','warn'),el('p',`参考机器数：${num(result.machines)} 台`,'result-number'),el('p',`每日所需占机 / 参考运行时间：${sec(result.total_seconds)}`),el('p',`单机每日可用容量时间：${sec(result.daily_capacity_seconds)}`),el('p',`整机采购小计：${numeric(result.price_total)?`¥${num(result.price_total)}`:'未计价'}`));
-  const rows=(result.lines || []).map(line=>{const row=el('tr'),g=(data.groups || []).find(g=>g.id===line.group_id);cell(row,`${capabilityLabel(g)} / ${text(g?.spec_key)} / ${text(line.group_id)}`,'wide');cell(row,`${num(line.quantity)} ${estimateUnit(g,payload.mode)}`);cell(row,sec(line.seconds_per_unit));cell(row,`${num(line.daily_units)} ${estimateUnit(g,payload.mode)}`);return row;});
-  root.append(table(['场景 / 分组 ID','每日需求','单位耗时','单机场景参考日处理量'],rows),el('h3','警告与覆盖限制'),list(result.warnings));
-  for(const demand of payload.demands) {const g=(data.groups || []).find(g=>g.id===demand.group_id);if(g)root.append(el('p',`${capabilityLabel(g)} / ${text(g.spec_key)}：${source(g.source)}；样本 ${num(g.samples)}；${num(dayCount(g))} 天；配置 ${text(g.config_id)}${g.source==='standard'?`；标准场景编号 ${text(g.benchmark_id)}`:''}`),list(groupWarnings(g)));}
-  root.append(el('h3','计算假设'),el('pre',text(result.assumptions)),el('p',`Worker ID：${payload.worker_id}；时间：${payload.from===undefined?'全部历史':when(payload.from)} 至 ${when(payload.to)}；${payload.hours} 小时 / 可用 ${num(payload.availability*100)}% / 生产容量 ${num(payload.utilization*100)}%`,'hint'));
+  root.append(el('p','成功任务处理参考，不是合格产物日产量或采购承诺','warn'),el('p',`参考机器数：${num(result.machines)} 台`,'result-number'),el('p',`每日所需参考运行时间：${sec(result.total_seconds)}`),el('p',`单机每日可用容量时间：${sec(result.daily_capacity_seconds)}`),el('p',`整机采购小计：${numeric(result.price_total)?`¥${num(result.price_total)}`:'未计价'}`));
+  const rows=(result.lines || []).map(line=>{
+    const row=el('tr'), g=(data.groups || []).find(g=>g.id===line.group_id), mode=purchaseMode(g?.capability);
+    cell(row,mode?`${mode.type} · ${mode.label}`:'业务模式','wide');cell(row,`${num(line.quantity)} ${estimateUnit()}/天`);cell(row,sec(line.seconds_per_unit));cell(row,`${num(line.daily_units)} ${estimateUnit()}/天`);return row;
+  });
+  root.append(table(['业务模式','每日需求','平均任务耗时','单机场景参考日处理量'],rows),el('p','每个模式只参考自动选中的一个实测分组，不保证任意模型、尺寸或缓存规格的产能。','hint'));
+  const basis=el('details');basis.append(el('summary','计算依据'),el('h3','警告与覆盖限制'),list(result.warnings));
+  basis.append(el('p','仅按成功任务平均 runtime 估算；不含完整失败、准备、重试或质量损耗。按同一电脑、配置和来源选择具体原分组，不合并均值。','hint'),el('p','台数 = 向上取整〔各模式任务数量 × 平均任务耗时之和 ÷（小时 × 3600 × 可用时间比例 × 生产容量比例）〕。容量预留不是 GPU 利用率；业务组合与模型切换可能增加损耗，不保证峰值 SLA。','hint'));
+  for(const demand of payload.demands) {
+    const g=(data.groups || []).find(g=>g.id===demand.group_id);
+    if(g)basis.append(el('h3',purchaseMode(g.capability)?.label || '业务模式'),el('p',`${capabilityLabel(g)} / ${text(g.spec_key)}：${source(g.source)}；样本 ${num(g.samples)}；${num(dayCount(g))} 天；配置 ${text(g.config_id)}${g.source==='standard'?`；标准场景编号 ${text(g.benchmark_id)}`:''}`),summaryEvidence(g));
+  }
+  basis.append(el('h3','计算假设'),el('pre',text(result.assumptions)),el('p',`Worker ID：${payload.worker_id}；当前在线仅为本次数据快照，不承诺未来状态；当前配置仅作清单参考：${hardwareSummary(workers.get(payload.worker_id)?.hardware)}；时间：全部历史 至 ${when(payload.to)}；${payload.hours} 小时 / 可用 ${num(payload.availability*100)}% / 生产容量 ${num(payload.utilization*100)}%`,'hint'));
+  root.append(basis);
 }
 $('estimate-form').onsubmit=async event=>{
   event.preventDefault();invalidateEstimate('正在计算…');let payload;
@@ -624,7 +720,7 @@ $('estimate-form').onsubmit=async event=>{
     if(version!==estimateVersion || evidenceRevision!==revision || !ready)return;
     renderEstimate(result,payload);lastEstimate={result,payload,groups:(data.groups || []).filter(g=>payload.demands.some(d=>d.group_id===g.id)),hardware:Object.fromEntries(Object.entries(workers.get(payload.worker_id)?.hardware || {}).filter(([key])=>key!=='note'))};$('export-estimate').disabled=false;
   } catch(error) {if(version===estimateVersion){$('estimate-result').replaceChildren(el('p','本次未产生测算结果，请检查证据与输入后重试。','muted'));message('estimate-error',`测算失败：${error.message}`);}}
-  finally {if(version===estimateVersion)$('estimate-submit').disabled=!ready || !selectedGroups().some(usable);}
+  finally {if(version===estimateVersion)updateDemandControls();}
 };
 function csvCell(value) {
   let string=value==null?'':typeof value==='object'?JSON.stringify(value):String(value);
@@ -642,15 +738,13 @@ for(const tab of document.querySelectorAll('[role="tab"]')) {
   tab.onclick=()=>{for(const other of document.querySelectorAll('[role="tab"]')){const active=other===tab;other.setAttribute('aria-selected',String(active));other.tabIndex=active?0:-1;$(other.getAttribute('aria-controls')).hidden=!active;}};
   tab.onkeydown=event=>{const tabs=[...document.querySelectorAll('[role="tab"]')],index=tabs.indexOf(tab);let next;if(event.key==='ArrowRight')next=(index+1)%tabs.length;if(event.key==='ArrowLeft')next=(index+tabs.length-1)%tabs.length;if(event.key==='Home')next=0;if(event.key==='End')next=tabs.length-1;if(next!==undefined){event.preventDefault();tabs[next].click();tabs[next].focus();}};
 }
-$('filters').onsubmit=event=>{event.preventDefault();load();};
-$('filters').addEventListener('input',draftChanged);
-$('period').onchange=()=>{const custom=$('period').value==='custom';$('custom-range').hidden=!custom;$('from').required=custom;$('to').required=custom;};
 $('refresh').onclick=()=>load();
 $('include-offline').onchange=renderMachineSummary;
 $('previous').onclick=()=>{offset=Math.max(0,offset-100);load(false);};$('next').onclick=()=>{offset+=100;load(false);};
 $('scenario-filter').onchange=()=>renderGroups('scenario-groups',(data?.groups || []).filter(g=>scenarioKey(g)===$('scenario-filter').value));
 $('estimate-form').addEventListener('input',()=>invalidateEstimate());
-$('mode').onchange=setupBaselines;$('estimate-worker').onchange=setupBaselines;$('baseline').onchange=resetDemands;$('quality').onchange=resetDemands;
+$('estimate-form').addEventListener('change',()=>invalidateEstimate());
+$('estimate-worker').onchange=resetDemands;
 $('add-demand').onclick=()=>{addDemand();invalidateEstimate();};
 window.addEventListener('h3auth:expired',()=>{loadVersion++;clearData();invalidateEstimate('登录已失效，请重新登录。');});
 H3Auth.requireUser(true).then(()=>{H3Auth.mountAccount($('account'));load();}).catch(error=>message('error',error.message));
