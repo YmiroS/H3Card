@@ -150,7 +150,7 @@ test('菜单：五项映射、布尔返回值以及回调重新校验权限和�
     assert.equal(s.selectionMenu(123,456), true);
     const menu = s.menus[0];
     assert.deepEqual([menu.x,menu.y,menu.title], [123,456,'选中节点']);
-    assert.deepEqual(Array.from(menu.items, item => item.text), ['对齐方式', '批量重命名（4 个节点）']);
+    assert.deepEqual(Array.from(menu.items, item => item.text), ['对齐方式', '批量重命名（4 个节点）', '批量删除（4 个节点）']);
     assert.deepEqual(Array.from(menu.items[0].children, item => item.text), labels);
     menu.items[0].children[index].run();
     assert.deepEqual(cards.slice(0,4).map(c => [c.x,c.y]), expected[mode]);
@@ -176,7 +176,7 @@ test('菜单：按 PROJ 对象身份阻止切换项目后的旧回调，包括�
     const original = s.PROJ, before = plain(original);
     s.selectionMenu(10,20);
     s.PROJ = replacement === 'closed' ? null : {...original,id:replacement === 'same-id' ? original.id : 'other'};
-    for (const item of [...s.menus[0].items[0].children, s.menus[0].items[1]]) item.run();
+    for (const item of [...s.menus[0].items[0].children, ...s.menus[0].items.slice(1)]) item.run();
     assert.deepEqual(plain(original), before);
     assert.deepEqual(effects(calls), never);
     assert.equal(calls.guard, 0, '旧项目回调不得执行排列函数');
@@ -192,7 +192,7 @@ test('菜单：保留批量重命名入口，并在点击时重新核对选择�
     if (change === 'permission') s.allowed = false;
     if (change === 'selection') s.selIds = new Set(['a','missing']);
     if (change === 'project') s.PROJ = {...s.PROJ};
-    s.menus[0].items.at(-1).run();
+    s.menus[0].items.find(item => item.text.startsWith('批量重命名')).run();
     assert.deepEqual(renamed, change === 'unchanged' ? ['a'] : []);
     assert.deepEqual(effects(calls), never);
   }
@@ -402,19 +402,207 @@ test('连通守卫：五种模式只读不读尺寸不写入，菜单回调撤�
   }
 });
 
+// 删除和素材引用清理也直接抽取生产实现，不在夹具里复刻删除算法。
+const deletion = [
+  block('const STYLE_SLOT =', '/* ================= 文本节点片'),
+  block('function mediaSlotsForOutputs(', '/** 用户手动换掉某一格'),
+  block('function askDelMany(', '\nfunction pickEdge('),
+  block('function delCard(', '/** Delete 键删节点'),
+].join('\n');
+function deletionFixture() {
+  const fixture = geometryFixture(), s = fixture.context, calls = fixture.calls;
+  s.PROJ = {id:'delete-fixture',custom:{keep:'项目元数据'},files:['/a.png','/b.png','/manual.png'],cards:[
+    {id:'a',x:10,y:20,params:{prompt:'删除 a'},outputs:[{kind:'image',url:'/a.png'}],history:[{id:'past-a'}]},
+    {id:'b',x:30,y:40,params:{prompt:'删除 b'},outputs:[{kind:'image',url:'/b.png'},{kind:'image',url:'/b2.png'}]},
+    {id:'c',x:500,y:600,params:{prompt:'用户提示词必须保留',seed:123},outputs:[{url:'/c.png'}],history:[{id:'past-c'}],
+      assets:{'image[0]':{url:'/a.png'},'image[1]':{url:'/a2.png'},'image[2]':{url:'/b.png'},
+        'image[3]':{url:'/b2.png'},manual:{url:'/manual.png'},other:{url:'/outside.png'},ghost:{url:'/ghost.png'}}},
+    {id:'outside',x:900,y:800,params:{prompt:'不动'},assets:{manual:{url:'/outside-input.png'}},outputs:[{url:'/outside.png'}]},
+  ],edges:[
+    {from:'a',to:'c',slot:'image[0]',slots:['image[0]','image[1]','image[1]']},
+    {from:'b',to:'c',slot:'image[2]'}, // 旧边无 slots，必须在上游仍存在时由产物数计算两格。
+    {from:'a',to:'c',slot:'@text'}, {from:'b',to:'c',slot:'@style'},
+    {from:'outside',to:'a',slot:'image'}, {from:'a',to:'b',slot:'image'},
+    {from:'outside',to:'c',slot:'other'}, {from:'missing',to:'c',slot:'ghost'},
+  ],groups:[{id:'mixed',name:'跨选区',cards:['a','c','b']},{id:'empty',cards:['a','b']},
+    {id:'keep',name:'不动组',cards:['outside','c']}]};
+  Object.assign(s, {selIds:new Set(['b','a','missing']),selId:'a',selEdge:s.PROJ.edges[0],
+    el:{hist:{_id:'b'}},confirmations:[],toasts:[],painted:[]});
+  for (const name of ['render','closePanel','closeHistory','tipHide','paintSel']) {
+    calls[name] = 0; s[name] = () => calls[name]++;
+  }
+  s.cardOf = id => s.PROJ?.cards.find(c => c.id === id) || null;
+  s.capOf = () => ({inputs:[0,1,2,3,4].map(i => ({key:`image[${i}]`,type:'image'}))});
+  s.paintKind = c => s.painted.push(c.id);
+  s.toast = text => s.toasts.push(text);
+  s.confirm = text => { s.confirmations.push(text); return true; };
+  vm.runInContext(deletion, s, {filename:'app.js:节点批量删除与真实边清理'});
+  return fixture;
+}
+const deletionState = s => plain({project:s.PROJ,selection:[...s.selIds],selId:s.selId,selEdge:s.selEdge});
+
+test('批量删除：有效 ID 去重、真实边引用清理、分组与界面收尾，只 render/save 一次', () => {
+  const {context:s,calls} = deletionFixture();
+  const before = plain(s.PROJ), outside = s.PROJ.cards[3];
+  assert.equal(s.delCards(['a','b','a','missing']), 2);
+  assert.deepEqual(Array.from(s.PROJ.cards, c => c.id), ['c','outside']);
+  assert.deepEqual(plain(s.PROJ.cards[0]), {...before.cards[2],assets:{
+    manual:{url:'/manual.png'},other:{url:'/outside.png'},ghost:{url:'/ghost.png'}}});
+  assert.equal(s.PROJ.cards[1], outside, '未选节点保留对象身份');
+  assert.deepEqual(plain(outside), before.cards[3]);
+  assert.deepEqual(plain(s.PROJ.edges), before.edges.slice(-2), '只移除被删有效节点的入边和出边');
+  assert.deepEqual(plain(s.PROJ.groups), [{id:'mixed',name:'跨选区',cards:['c']},before.groups[2]]);
+  assert.deepEqual(plain(s.PROJ.files), before.files, '产物文件清单不删');
+  assert.deepEqual(plain(s.PROJ.custom), before.custom);
+  assert.ok(!s.selIds.has('a') && !s.selIds.has('b'));
+  assert.deepEqual([s.selId,s.selEdge], [null,null]);
+  assert.deepEqual([calls.render,calls.save,calls.closePanel,calls.closeHistory,calls.tipHide], [1,1,1,1,1]);
+  assert.deepEqual(plain(s.painted), ['c','c']);
+  assert.equal(s.delCards(['a','b','missing']), 0);
+  assert.deepEqual([calls.render,calls.save], [1,1], '重复/失效 ID 不触发写入');
+});
+
+test('批量删除：旧边可从上游历史恢复多素材槽，手动上传及提示词不受影响', () => {
+  const {context:s,calls} = deletionFixture();
+  const b = s.cardOf('b'); b.history = [{outputs:b.outputs}]; b.outputs = [];
+  assert.equal(s.delCards(['b']), 1);
+  assert.equal(s.cardOf('c').assets['image[2]'], undefined);
+  assert.equal(s.cardOf('c').assets['image[3]'], undefined);
+  assert.deepEqual(plain(s.cardOf('c').assets.manual), {url:'/manual.png'});
+  assert.equal(s.cardOf('c').params.prompt, '用户提示词必须保留');
+  assert.deepEqual([calls.render,calls.save,calls.closePanel,calls.closeHistory], [1,1,0,1]);
+});
+
+test('批量删除：空 ID、全失效、无项目、只读不清理引用或写入', () => {
+  for (const condition of ['empty','missing','no-project','readonly']) {
+    const {context:s,calls} = deletionFixture();
+    if (condition === 'no-project') s.PROJ = null;
+    if (condition === 'readonly') s.allowed = false;
+    const before = deletionState(s);
+    assert.equal(s.delCards(condition === 'empty' ? [] : condition === 'missing' ? ['missing','missing'] : ['a','b']), 0);
+    assert.deepEqual(deletionState(s), before, condition);
+    assert.deepEqual([calls.render,calls.save,calls.closePanel,calls.closeHistory,calls.tipHide], [0,0,0,0,0]);
+    assert.deepEqual(plain(s.painted), []);
+  }
+});
+
+test('单节点删除：委托同一批量函数，仅移除指定节点，保留未删面板及历史', () => {
+  const {context:s,calls} = deletionFixture();
+  s.selId = 'c'; s.el.hist._id = 'outside';
+  assert.equal(s.delCard('a'), 1);
+  assert.deepEqual(Array.from(s.PROJ.cards, c => c.id), ['b','c','outside']);
+  assert.equal(s.selId, 'c');
+  assert.deepEqual([calls.render,calls.save,calls.closePanel,calls.closeHistory], [1,1,0,0]);
+  const delegated = [];
+  s.delCards = ids => { delegated.push([...ids]); return 7; };
+  assert.equal(s.delCard('b'), 7);
+  assert.deepEqual(delegated, [['b']], '单节点入口必须调用批量原语');
+});
+
+test('批量确认：一次确认按有效节点计数，取消完全不改项目和选择', () => {
+  for (const accept of [false,true]) {
+    const {context:s,calls} = deletionFixture(), before = deletionState(s);
+    s.confirm = message => { s.confirmations.push(message); return accept; };
+    s.askDelMany();
+    assert.equal(s.confirmations.length, 1);
+    assert.match(s.confirmations[0], /选中的 2 个节点/);
+    assert.match(s.confirmations[0], /其中 2 个节点有历史记录或产物/);
+    assert.match(s.confirmations[0], /不能撤销/);
+    assert.match(s.confirmations[0], /不会删除素材文件/);
+    assert.deepEqual([calls.render,calls.save], accept ? [1,1] : [0,0]);
+    if (!accept) assert.deepEqual(deletionState(s), before);
+    else assert.deepEqual(Array.from(s.PROJ.cards, c => c.id), ['c','outside']);
+    assert.deepEqual(plain(s.toasts), accept ? ['已删除 2 个节点'] : []);
+  }
+});
+
+test('批量确认：空选择、失效选择、只读及关闭项目不弹确认', () => {
+  for (const condition of ['empty','missing','readonly','no-project']) {
+    const {context:s,calls} = deletionFixture();
+    if (condition === 'empty') s.selIds.clear();
+    if (condition === 'missing') s.selIds = new Set(['missing']);
+    if (condition === 'readonly') s.allowed = false;
+    if (condition === 'no-project') s.PROJ = null;
+    const before = deletionState(s);
+    s.askDelMany();
+    assert.deepEqual(deletionState(s), before);
+    assert.deepEqual(plain(s.confirmations), []);
+    assert.deepEqual([calls.render,calls.save], [0,0]);
+  }
+});
+
+test('批量确认：确认期间撤权或更换同 id 项目，原项目与新项目都不删除', () => {
+  for (const change of ['permission','different-id','same-id','closed']) {
+    const {context:s,calls} = deletionFixture(), original = s.PROJ, before = plain(s.PROJ);
+    let replacement;
+    s.confirm = () => {
+      if (change === 'permission') s.allowed = false;
+      else s.PROJ = change === 'closed' ? null : {...s.PROJ,id:change === 'same-id' ? s.PROJ.id : 'other'};
+      replacement = plain(s.PROJ);
+      return true;
+    };
+    s.askDelMany();
+    assert.deepEqual(plain(original), before, change);
+    assert.deepEqual(plain(s.PROJ), replacement, change);
+    assert.deepEqual([calls.render,calls.save,calls.closePanel,calls.closeHistory], [0,0,0,0]);
+    assert.deepEqual(plain(s.toasts), []);
+  }
+});
+
+test('批量确认：删除确认前的选择快照，结果提示使用仍存在节点的实际数量', () => {
+  for (const disappear of [false,true]) {
+    const {context:s,calls} = deletionFixture();
+    s.confirm = () => {
+      s.selIds = new Set(['c','outside']);
+      if (disappear) s.PROJ.cards = s.PROJ.cards.filter(c => c.id !== 'b');
+      return true;
+    };
+    s.askDelMany();
+    assert.deepEqual(Array.from(s.PROJ.cards, c => c.id), ['c','outside']);
+    assert.deepEqual([...s.selIds], ['c','outside'], '不得删除确认后新选的节点或清空其选择');
+    assert.deepEqual([calls.render,calls.save], [1,1]);
+    assert.deepEqual(plain(s.toasts), [`已删除 ${disappear ? 1 : 2} 个节点`]);
+  }
+});
+
+test('批量菜单：危险项重新验证项目、权限及至少两个当前有效选择', () => {
+  for (const change of ['unchanged','permission','one','missing','deleted','project','closed']) {
+    const {context:s,calls} = deletionFixture();
+    s.selectionMenu(10,20);
+    const item = s.menus[0].items[2];
+    assert.equal(item.text, '批量删除（2 个节点）');
+    assert.equal(item.danger, true);
+    if (change === 'permission') s.allowed = false;
+    if (change === 'one') s.selIds = new Set(['a','missing']);
+    if (change === 'missing') s.selIds = new Set(['missing','gone']);
+    if (change === 'deleted') s.PROJ.cards = s.PROJ.cards.filter(c => c.id !== 'a');
+    if (change === 'project') s.PROJ = {...s.PROJ};
+    if (change === 'closed') s.PROJ = null;
+    const before = deletionState(s);
+    item.run();
+    if (change !== 'unchanged') assert.deepEqual(deletionState(s), before, change);
+    assert.equal(s.confirmations.length, change === 'unchanged' ? 1 : 0, change);
+    assert.deepEqual([calls.render,calls.save], change === 'unchanged' ? [1,1] : [0,0]);
+  }
+});
+
 function browserFixture(platform) {
   // 仅替换外围渲染及持久化；节点构建、鼠标处理、选择、几何、菜单均抽取生产代码。
   return `
     Object.defineProperty(navigator, 'platform', {value:${JSON.stringify(platform)},configurable:true});
     const el = Object.fromEntries(['stage','world','wires','groups','lasso','selbar','menu'].map(id => [id,document.getElementById(id)]));
-    const NODE_EDITOR = false;
+    let NODE_EDITOR = false;
+    for (const id of ['hist','view','respop','jobs']) el[id] = {style:{display:'none'}};
     let PROJ = {id:'interaction',cards:[],edges:[],groups:[]};
     let selIds = new Set(), selId = null, selEdge = null, view = {x:0,y:0,k:1}, mouseW = null;
-    let allowed = true, saved = 0, viewSaved = 0, linked = 0, spawned = 0;
+    let allowed = true, saved = 0, viewSaved = 0, linked = 0, spawned = 0, rendered = 0;
+    let panelClosed = 0, historyClosed = 0;
+    const closeHistory = () => { historyClosed++; el.hist._id = null; };
+    const paintKind = () => {};
     const canOperate = () => allowed, requireOperate = () => allowed;
     const save = () => saved++, saveView = () => viewSaved++;
     const placePanel = () => {}, updateMinimap = () => {}, tipHide = () => {}, toast = () => {};
-    const closeJobs = () => {}, closePanel = () => {}, openPanel = () => {}, openHistory = () => {}, veilPanel = () => {};
+    const closeJobs = () => {}, closePanel = () => panelClosed++, openPanel = () => {}, openHistory = () => {}, veilPanel = () => {};
     const cardOf = id => PROJ.cards.find(c => c.id === id);
     const defOf = () => ({icon:'A'}), phHTML = () => '', paintTitle = () => {}, paint = () => {};
     const bindCardVideo = () => {}, bindCompare = () => {}, hoverTip = () => {};
@@ -436,7 +624,16 @@ function browserFixture(platform) {
     ${block('function cardBox(', '/** 选中的连线')}
     ${block('function showMenu(', '/** 面板底部工具条')}
     ${block('function cardMenu(', '/** 把一份产物下载到本地')}
+    ${deletion}
+    ${block('function askDelCard(', '/** Ctrl+C 存下的那个节点')}
     const drawWires = () => paintSel();
+    const render = () => {
+      rendered++; el.world.replaceChildren();
+      for (const c of PROJ.cards) el.world.appendChild(buildCard(c));
+      paintSel();
+    };
+    ${block('  // 框选后上方工具条里的', '  addEventListener("resize",')}
+    ${block('  document.addEventListener("keydown",', '  // 画布工具条按钮事件')}
     ${block('  el.stage.addEventListener("mousedown",', '  // 拖拽文件到画布')}
     const events = [];
     for (const type of ['mousedown','contextmenu']) document.addEventListener(type, ev => {
@@ -444,7 +641,10 @@ function browserFixture(platform) {
     }, true);
     function reset() {
       closeMenu(); el.world.replaceChildren(); el.wires.replaceChildren(); el.groups.replaceChildren();
-      allowed = true; selId = null; selIds = new Set(); selEdge = null;
+      allowed = true; NODE_EDITOR = false; selId = null; selIds = new Set(); selEdge = null;
+      rendered = 0; panelClosed = 0; historyClosed = 0; el.hist._id = null; el.view.style.display = 'none';
+      document.querySelectorAll('[data-typing-fixture]').forEach(e => e.remove());
+      if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
       view = {x:0,y:0,k:1}; saved = 0; viewSaved = 0; linked = 0; spawned = 0; events.length = 0;
       PROJ = {id:'interaction',cards:[
         {id:'a',x:80,y:100,w:200,h:90}, {id:'b',x:330,y:150,w:240,h:140}, {id:'c',x:720,y:450,w:200,h:100},
@@ -544,7 +744,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
             if (target === 'node') await rightClick('.card[data-id="a"] .body');
             else await page.mouse.click(650,700,{button:'right'});
             assert.deepEqual(await selection(), ['a','b']);
-            assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）']);
+            assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
             assert.deepEqual(await page.evaluate(() => events), [
               {type:'mousedown',button:2,trusted:true},{type:'contextmenu',button:2,trusted:true},
             ]);
@@ -613,7 +813,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           const targetY = ['left','right','center'].includes(mode) ? [rowAY,rowAY,rowBY,rowBY,60]
             : mode === 'top' ? [60,60,60,60,60] : [a0,b0,c0,d0,e0].map(r => bottom-r.h);
           await rightClick('.card[data-id="a"] .body');
-          assert.deepEqual(await menuLabels(), ['对齐方式','批量重命名（5 个节点）']);
+          assert.deepEqual(await menuLabels(), ['对齐方式','批量重命名（5 个节点）','批量删除（5 个节点）']);
           await openAlignment();
           await page.getByRole('button',{name:labels[index],exact:false}).click();
           const after = await snapshot();
@@ -672,7 +872,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           await reset(); await page.evaluate(() => choose());
           await rightClick('.card[data-id="a"] .port');
           assert.deepEqual(await selection(), ['a','b']);
-          assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）']);
+          assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
           assert.deepEqual(await page.evaluate(() => [el.world.classList.contains('wiring'),el.wires.querySelectorAll('.tmp').length,linked,spawned]), [false,0,0,0]);
           await page.evaluate(() => closeMenu());
           const port = await page.locator('.card[data-id="a"] .port').boundingBox();
@@ -693,7 +893,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           assert.deepEqual(await page.evaluate(() => PROJ.cards.map(c => [c.x,c.y])), [[140,140],[390,190],[720,450]]);
           assert.equal(await page.evaluate(() => saved), 1);
           await rightClick('.card[data-id="a"] .body');
-          assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）']);
+          assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
           await openAlignment();
           await page.getByRole('button',{name:'左对齐',exact:false}).click();
           assert.deepEqual(await selection(), ['b','a','missing']);
@@ -736,6 +936,140 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           assert.deepEqual(await page.evaluate(() => [selId,[...selIds]]), ['a',[]]);
           assert.deepEqual(await page.evaluate(() => PROJ.cards.map(c => [c.x,c.y])), before);
           assert.equal(await page.evaluate(() => saved), 0);
+        });
+
+        const deletionSnapshot = () => page.evaluate(() => ({
+          project:{...PROJ,cards:PROJ.cards.map(({_el,...c}) => c)},selection:[...selIds],selId,selEdge,
+          saved,rendered,viewSaved,panelClosed,historyClosed,view:{...view},
+          domIds:[...el.world.querySelectorAll('.card')].map(c => c.dataset.id),
+        }));
+        async function lassoDeletionFixture() {
+          await reset();
+          await page.evaluate(() => {
+            PROJ.custom = {keep:'项目元数据'}; PROJ.files = ['/fixture.png','/manual.png'];
+            for (const c of PROJ.cards) { c.params = {prompt:'保留提示词 ' + c.id,seed:123}; c.history = [{id:'history-' + c.id}]; }
+            cardOf('c').assets = {'image[0]':{url:'/fixture.png'},'image[1]':{url:'/second.png'},
+              manual:{url:'/manual.png'},other:{url:'/other.png'}};
+            PROJ.edges = [
+              {from:'a',to:'c',slot:'image[0]',slots:['image[0]','image[1]']},
+              {from:'b',to:'c',slot:'@style'}, {from:'a',to:'c',slot:'@text'},
+              {from:'c',to:'a',slot:'image'}, {from:'a',to:'b',slot:'image'},
+              {from:'c',to:'c',slot:'other'},
+            ];
+            PROJ.groups = [{id:'g',name:'跨选区',cards:['a','c']},{id:'gone',cards:['a','b']}];
+            el.hist._id = 'b';
+          });
+          await drag([90,90],[690,430]);
+          assert.deepEqual(await selection(), ['a','b']);
+          assert.equal(await page.locator('#selbar').isVisible(), true);
+        }
+        async function confirmAction(action, accept) {
+          const dialogs = [], pending = [];
+          const handle = dialog => {
+            dialogs.push({type:dialog.type(),message:dialog.message()});
+            pending.push(accept ? dialog.accept() : dialog.dismiss());
+          };
+          page.on('dialog', handle);
+          try { await action(); await Promise.all(pending); }
+          finally { page.off('dialog', handle); }
+          assert.equal(dialogs.length, 1, '每次批量操作恰好一个真实确认框');
+          assert.equal(dialogs[0].type, 'confirm');
+          assert.match(dialogs[0].message, /选中的 2 个节点/);
+          assert.match(dialogs[0].message, /不能撤销/);
+          assert.match(dialogs[0].message, /不会删除素材文件/);
+        }
+        for (const entry of ['toolbar','node-menu','blank-menu','Delete','Backspace']) {
+          await t.test(`批量删除 ${entry}：真实框选后取消和确认、真实边清理及单次保存`, async () => {
+            await lassoDeletionFixture();
+            const before = await deletionSnapshot();
+            const trigger = async () => {
+              if (entry === 'toolbar') {
+                const button = page.locator('#selbar .deletecards.act.danger');
+                assert.equal(await button.textContent(), '批量删除');
+                assert.match(await button.getAttribute('title'), /Delete.*Backspace/);
+                await button.click();
+              } else if (entry.endsWith('menu')) {
+                if (entry === 'node-menu') await rightClick('.card[data-id="a"] .body');
+                else await page.mouse.click(650,700,{button:'right'});
+                const item = page.getByRole('button',{name:'批量删除（2 个节点）',exact:false});
+                assert.equal(await item.evaluate(b => b.classList.contains('danger')), true);
+                await item.click();
+              } else await page.keyboard.press(entry);
+            };
+            await confirmAction(trigger, false);
+            assert.deepEqual(await deletionSnapshot(), before, '取消不得更改数据、引用、选择、DOM 或保存次数');
+            assert.equal(await page.locator('#selbar').isVisible(), true, '工具条按下不得穿透到画布清空框选');
+            await confirmAction(trigger, true);
+            const after = await deletionSnapshot();
+            assert.deepEqual(after.project.cards, [{...before.project.cards[2],assets:{
+              manual:{url:'/manual.png'},other:{url:'/other.png'}}}]);
+            assert.deepEqual(after.project.edges, before.project.edges.slice(-1));
+            assert.deepEqual(after.project.groups, [{id:'g',name:'跨选区',cards:['c']}]);
+            assert.deepEqual(after.project.custom, before.project.custom);
+            assert.deepEqual(after.project.files, before.project.files);
+            assert.deepEqual([after.saved,after.rendered,after.viewSaved], [1,1,0]);
+            assert.equal(after.historyClosed, before.historyClosed + 1);
+            assert.deepEqual(after.view, before.view);
+            assert.deepEqual([after.selection,after.selId,after.selEdge], [[],null,null]);
+            assert.deepEqual(after.domIds, ['c']);
+            assert.equal(await page.locator('#selbar').isVisible(), false);
+            assert.equal(await page.locator('#groups .selbox').count(), 0);
+            assert.ok((await page.evaluate(() => events)).every(event => event.trusted));
+          });
+        }
+
+        await t.test('删除快捷键：输入框、文本域、下拉框、可编辑文字、节点编辑器、只读及预览均受保护', async () => {
+          let dialogs = 0;
+          const dismiss = dialog => { dialogs++; void dialog.dismiss(); };
+          page.on('dialog', dismiss);
+          try {
+            for (const key of ['Delete','Backspace']) for (const guard of ['input','textarea','select','contenteditable','node-editor','readonly','viewer']) {
+              await lassoDeletionFixture();
+              await page.evaluate(guard => {
+                if (guard === 'node-editor') NODE_EDITOR = true;
+                else if (guard === 'readonly') allowed = false;
+                else if (guard === 'viewer') el.view.style.display = '';
+                else {
+                  const field = document.createElement(guard === 'contenteditable' ? 'div' : guard);
+                  field.dataset.typingFixture = 'true';
+                  if (guard === 'contenteditable') { field.contentEditable = 'true'; field.textContent = 'abc'; }
+                  else if (guard === 'select') field.innerHTML = '<option>abc</option>';
+                  else field.value = 'abc';
+                  document.body.appendChild(field); field.focus();
+                }
+              }, guard);
+              const before = await deletionSnapshot();
+              await page.keyboard.press(key);
+              assert.deepEqual(await deletionSnapshot(), before, `${key}/${guard}`);
+            }
+            assert.equal(dialogs, 0, '受保护快捷键不得打开确认框');
+          } finally { page.off('dialog', dismiss); }
+        });
+
+        await t.test('批量删除：真实工具条撤权、已打开右键菜单撤权/换项目/缩减选择均不确认', async () => {
+          let dialogs = 0;
+          const dismiss = dialog => { dialogs++; void dialog.dismiss(); };
+          page.on('dialog', dismiss);
+          try {
+            await lassoDeletionFixture();
+            await page.evaluate(() => { allowed = false; });
+            let before = await deletionSnapshot();
+            await page.locator('#selbar .deletecards').click();
+            assert.deepEqual(await deletionSnapshot(), before);
+            for (const change of ['permission','project','selection']) {
+              await lassoDeletionFixture();
+              await page.mouse.click(650,700,{button:'right'});
+              await page.evaluate(change => {
+                if (change === 'permission') allowed = false;
+                if (change === 'project') PROJ = {...PROJ};
+                if (change === 'selection') selIds = new Set(['a','missing']);
+              }, change);
+              before = await deletionSnapshot();
+              await page.getByRole('button',{name:'批量删除（2 个节点）',exact:false}).click();
+              assert.deepEqual(await deletionSnapshot(), before, change);
+            }
+            assert.equal(dialogs, 0);
+          } finally { page.off('dialog', dismiss); }
         });
 
         await t.test('只读不开放排列菜单，已打开菜单撤权或换同 id 项目不能执行', async () => {
