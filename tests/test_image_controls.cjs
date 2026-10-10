@@ -266,7 +266,14 @@ test('all image models share real runtime controls without changing video parame
         assert.equal(await page.locator('#world .cmp, #world .cmpx, #world .cmptip').count(),0,cap);
         const result=page.locator('#world .body > img');
         assert.equal(await result.count(),1,cap);
-        assert.equal(await result.getAttribute('src'),png+'#result',cap);
+        await page.waitForFunction(() => {
+          const img = document.querySelector('#world .body > img');
+          return img?.complete && img.naturalWidth === 1;
+        });
+        const displayed = await result.evaluate(async img =>
+          [...new Uint8Array(await (await fetch(img.currentSrc)).arrayBuffer())]);
+        assert.deepEqual(displayed, [...Buffer.from(png.split(',')[1], 'base64')], cap);
+        assert.equal(await page.evaluate(() => PROJ.cards[0].outputs[0].url), png+'#result', cap);
         await result.dblclick();
         assert.equal(await page.evaluate(()=>el.view.style.display!=='none' && VIEW.outs[0].url.endsWith('#result')),true,cap);
       }
