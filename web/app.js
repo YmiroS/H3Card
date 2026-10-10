@@ -115,10 +115,11 @@ function syncPermissionUI() {
 window.addEventListener('h3auth:expired', () => { CLIP = null; TASKS = []; projects = []; clearProject(); el.plist.replaceChildren(); });
 let refreshingAccess = false;
 window.addEventListener('h3auth:denied', async ({detail}) => {
-  if (refreshingAccess || !H3Auth.active || !/^\/api\/(projects|job|upload|generate|text|rewrite|media)/.test(detail.path)) return;
+  if (refreshingAccess || !H3Auth.active || !/^\/api\/(projects|job|upload|generate|text|rewrite|media|thumbnail)/.test(detail.path)) return;
   refreshingAccess = true;
   // 403 不登出；先冻结写操作，再读取最新权限。404 则同时清理已撤权内容。
-  if (PROJ) { PROJ.permission = 'read'; syncPermissionUI(); }
+  // 缩略图 404 也可能只是原文件缺失，不能因此反复冻结、重绘整张画布。
+  if (PROJ && detail.path !== '/api/thumbnail') { PROJ.permission = 'read'; syncPermissionUI(); }
   try { await loadProjects(); await pollJobs(); } finally { refreshingAccess = false; }
 });
 const jpost = (p, b) => api(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
@@ -1423,6 +1424,7 @@ async function openProject(pid) {
 }
 
 function showEmpty() {
+  resetCardMedia();
   el.empty.style.display = "";
   el.world.innerHTML = ""; el.wires.innerHTML = "";
   el.ptitle.textContent = "";
@@ -1907,8 +1909,11 @@ function bindMinimapDrag() {
 
 /* ================= 渲染 ================= */
 function render() {
+  resetCardMedia();
   el.world.innerHTML = "";
-  for (const c of PROJ.cards) el.world.appendChild(buildCard(c));
+  const fragment = document.createDocumentFragment();
+  for (const c of PROJ.cards) fragment.appendChild(buildCard(c));
+  el.world.appendChild(fragment);
   applyView();
   drawWires();
   paintGroups();
@@ -2001,7 +2006,7 @@ function buildCard(c) {
       if (ev.clientY > r.bottom - 34 * view.k) return;
     }
     // 大窗口里那份才是带播放条的，节点里这份别在背后接着响
-    for (const v of body.querySelectorAll("video")) v.pause();
+    for (const v of body.querySelectorAll("video")) { cancelCardPlayback(v); v.pause(); }
     // 宫格里双击哪一格就从哪一张开始看
     openViewer(c, +(ev.target.dataset.i || 0));
   };
@@ -2024,7 +2029,12 @@ function buildCard(c) {
    大窗口里的视频和音频全走这一条，各处不用自己记着关别人。 */
 let NOWPLAYING = null;
 document.addEventListener("play", (ev) => {
-  for (const o of document.querySelectorAll("video, audio")) if (o !== ev.target) o.pause();
+  // pause 不会撤销已排队的 play 事件，旧事件不能反过来暂停新播放器。
+  if (ev.target.paused || !ev.target.isConnected) return;
+  for (const o of document.querySelectorAll("video, audio")) if (o !== ev.target) {
+    cancelCardPlayback(o);
+    o.pause();
+  }
   NOWPLAYING = ev.target;
 }, true);
 document.addEventListener("pause", (ev) => {
@@ -2033,6 +2043,9 @@ document.addEventListener("pause", (ev) => {
 // 点到别处就停。范围按「它所在的那一块」算而不是按媒体元素本身：进度条、选区手柄都是
 // 它的兄弟节点，按元素算的话一按进度条就先被这里停掉，拖完也就不会接着放了
 document.addEventListener("mousedown", (ev) => {
+  for (const video of document.querySelectorAll('video')) {
+    if (video._playRequest && !video.closest('.body, .vbox')?.contains(ev.target)) cancelCardPlayback(video);
+  }
   if (!NOWPLAYING) return;
   const box = NOWPLAYING.closest(".body, .vbox, .arange");
   if (!box || !box.contains(ev.target)) NOWPLAYING.pause();
@@ -2081,7 +2094,9 @@ function bindCardVideo(body) {
       document.removeEventListener("mouseup", up);
       // 挪过了就是在拖节点，别顺手把视频放起来
       if (Math.abs(e.clientX - x0) + Math.abs(e.clientY - y0) >= 4) return;
-      if (v.paused) v.play().catch(() => {}); else v.pause();
+      if (v._previewController) cancelCardPlayback(v);
+      else if (v.paused) playCardVideo(v);
+      else { cancelCardPlayback(v); v.pause(); }
     };
     document.addEventListener("mouseup", up);
   };
@@ -2210,26 +2225,26 @@ function paint(c) {
       // 一组产物铺成宫格，data-i 供双击时定位到具体哪一张
       body.style.setProperty("--cols", outs.length <= 4 ? 2 : outs.length <= 9 ? 3 : 4);
       body.innerHTML = outs.map((o, i) => o.kind === "video"
-        ? `<video data-video-url="${o.url}" data-i="${i}" loop preload="metadata" draggable="false"></video>`
-        : `<img src="${o.url}" data-i="${i}" alt="" draggable="false">`).join("");
+        ? `<video data-video-url="" data-i="${i}" loop preload="none" draggable="false"></video>`
+        : `<img data-i="${i}" alt="" draggable="false">`).join("");
     } else {
       // .vprog 是自己画的进度条：不给 controls 就没有任何进度反馈，按住拖也没了准头
       body.innerHTML = out.kind === "video"
-        ? `<video data-video-url="${out.url}" loop preload="metadata" draggable="false"></video>`
+        ? `<video data-video-url="" data-i="0" loop preload="none" draggable="false"></video>`
           + `<div class="vprog" title="按住左右拖 → 定位进度（画面上按住是挪节点）"><i></i></div>`
         : out.kind === "audio"
-          ? `<audio src="${out.url}" controls style="width:92%"></audio>`
+          ? `<audio preload="none" controls style="width:92%"></audio>`
           : cmp
             // 原图压在结果上面，按 --x 从左边裁开：往右拖 = 原图一点点长回来。
             // 文案不说"还原背景"：抠出背景那个节点拖回来的是主体，两个节点共用这一段
             ? `<div class="cmp" title="按住左右拖：跟原图对比，看边缘抠干净了没有">`
-              + `<img class="new" src="${out.url}" alt="" draggable="false" data-i="0">`
-              + `<img class="old" src="${cmp}" alt="" draggable="false">`
+              + `<img class="new" alt="" draggable="false" data-i="0">`
+              + `<img class="old" alt="" draggable="false">`
               + `<div class="cmpx"><i>⇔</i></div>`
               + `<div class="cmptip">按住往右拖 → 回到原图</div></div>`
-            : `<img src="${out.url}" alt="" draggable="false">`;
+            : `<img data-i="0" alt="" draggable="false">`;
     }
-    prepareVideos(body);
+    prepareCardMedia(body, outs, cmp);
     if (cmp) applyCmp(c);
     // seed 不再压在画面上，改由右侧「历史产物」栏单独一行展示
     // 探测产物的真实尺寸（图片/视频），存回 outputs 里，paintKind 会读它显示分辨率
@@ -2238,14 +2253,16 @@ function paint(c) {
         const o = outs[i];
         if (o.kind === "image" && !o.width) {
           const img = body.querySelector(`img[data-i="${i}"]`) || body.querySelector("img");
-          if (img && img.complete) {
-            o.width = img.naturalWidth; o.height = img.naturalHeight;
-            paintKind(c); save();
-          } else if (img) {
-            img.onload = () => {
+          // 缩略图的分辨率不是原产物分辨率，不能写回 outputs。
+          if (img && !img.dataset.thumbnail) {
+            const measure = () => {
+              if (!d.isConnected || c._el !== d || !PROJ?.cards.includes(c)
+                || c.outputs?.[i] !== o || !img.naturalWidth) return;
               o.width = img.naturalWidth; o.height = img.naturalHeight;
               paintKind(c); save();
             };
+            if (img.complete && img.naturalWidth) measure();
+            else img.onload = measure;
           }
         } else if (o.kind === "video" && !o.width) {
           const v = body.querySelector(`video[data-i="${i}"]`) || body.querySelector("video");
@@ -2254,6 +2271,7 @@ function paint(c) {
             paintKind(c); save();
           } else if (v) {
             v.onloadedmetadata = () => {
+              if (!d.isConnected || c._el !== d || !PROJ?.cards.includes(c) || c.outputs?.[i] !== o) return;
               o.width = v.videoWidth; o.height = v.videoHeight;
               paintKind(c); save();
             };
@@ -2269,7 +2287,7 @@ function paint(c) {
     st.textContent = out ? "已就绪" : "点节点选文件";
     st.title = out ? "把右边的出口拖到别的节点 → 这份素材就进那个节点的格子里" : st.textContent;
     bar.style.width = "0%";
-    meta.textContent = out ? out.filename.slice(-22) : "";
+    meta.textContent = out ? String(out.filename || out.origin || out.url || "").split(/[\\/]/).pop().slice(-22) : "";
     meta.title = out ? (out.origin || "") : "";
     return;
   }
@@ -2286,7 +2304,7 @@ function paint(c) {
   bar.style.width = (s === "running" || s === "queued" ? (c.progress || 0.02) * 100 : s === "done" ? 100 : 0) + "%";
   meta.textContent = c.error ? String(c.error).slice(0, 40)
     : outs.length > 1 ? `${outs.length} 张`
-    : out ? out.filename.slice(-22) : "";
+    : out ? String(out.filename || out.origin || out.url || "").split(/[\\/]/).pop().slice(-22) : "";
   meta.title = c.error || "";
 }
 
@@ -4382,25 +4400,51 @@ async function importOutput(out) {
 // 项目保留原片 url/ref 用于备份下载；播放器和后端实际提交的工作流使用转码 MP4。
 const VIDEO_PREVIEWS = new Map();
 
-function videoPreviewSource(url) {
+function videoPreviewSource(url, signal) {
+  if (signal?.aborted) return Promise.reject(signal.reason);
   const match = /^\/api\/upload\/([^/?#]+)$/.exec(url);
   if (!match) return Promise.resolve(url);
   if (!VIDEO_PREVIEWS.has(url)) {
-    const pending = (async () => {
+    const entry = {controller:new AbortController(), users:new Set(), ready:false};
+    entry.promise = (async () => {
+      const shared = entry.controller.signal;
       for (;;) {
-        const state = await api(`/api/preview/${match[1]}`);
-        if (state.status === "ready") return state.url;
+        shared.throwIfAborted();
+        const state = await api(`/api/preview/${match[1]}`, {signal:shared});
+        shared.throwIfAborted();
+        if (state.status === "ready") { entry.ready = true; return state.url; }
         if (state.status === "error") throw new Error(state.error);
-        await new Promise(resolve => setTimeout(resolve, 1500));
+        await new Promise((resolve, reject) => {
+          const abort = () => { clearTimeout(timer); reject(shared.reason); };
+          const timer = setTimeout(() => { shared.removeEventListener('abort', abort); resolve(); }, 1500);
+          shared.addEventListener('abort', abort, {once:true});
+        });
       }
     })();
-    VIDEO_PREVIEWS.set(url, pending);
-    pending.catch(() => VIDEO_PREVIEWS.delete(url));
+    VIDEO_PREVIEWS.set(url, entry);
+    entry.promise.catch(() => {
+      if (VIDEO_PREVIEWS.get(url) === entry) VIDEO_PREVIEWS.delete(url);
+    });
   }
-  return VIDEO_PREVIEWS.get(url);
+  const entry = VIDEO_PREVIEWS.get(url), user = {};
+  entry.users.add(user);
+  // 同一原片共享轮询；只有最后一个等待者离开，才取消服务请求及重试定时器。
+  return new Promise((resolve, reject) => {
+    const release = () => {
+      signal?.removeEventListener('abort', abort);
+      entry.users.delete(user);
+      if (!entry.ready && !entry.users.size) {
+        if (VIDEO_PREVIEWS.get(url) === entry) VIDEO_PREVIEWS.delete(url);
+        entry.controller.abort();
+      }
+    };
+    const abort = () => { release(); reject(signal.reason); };
+    signal?.addEventListener('abort', abort, {once:true});
+    entry.promise.then(source => { release(); resolve(source); }, error => { release(); reject(error); });
+  });
 }
 
-function prepareVideo(video, url) {
+function prepareVideo(video, url, isCurrent = () => true, signal) {
   video.playsInline = true;
   if (!/^\/api\/upload\//.test(url)) { video.src = url; return; }
   video.dataset.previewOriginal = url;
@@ -4416,15 +4460,15 @@ function prepareVideo(video, url) {
       + `<text x="320" y="168">${lines[0]}</text><text x="320" y="208" font-size="19">${lines[1]}</text></g></svg>`);
   };
   notice(false, "服务器正在生成兼容 MP4；原片已备份，转码完成后下游节点使用 MP4 生成。");
-  return videoPreviewSource(url).then(source => {
-    if (video.dataset.previewOriginal !== url) return;
+  return videoPreviewSource(url, signal).then(source => {
+    if (video.dataset.previewOriginal !== url || !isCurrent()) return;
     video.dataset.previewState = "ready";
     video.title = title || "MP4 转码已完成，预览和后续生成均使用此版本；原片已备份。";
     if (poster) video.poster = poster;
     else video.removeAttribute("poster");
     video.src = source;
   }).catch(error => {
-    if (video.dataset.previewOriginal !== url) return;
+    if (signal?.aborted || video.dataset.previewOriginal !== url || !isCurrent()) return;
     notice(true, error.message || "转码状态加载失败；请检查服务器后重试生成。");
     video.removeAttribute("src");
     video.load();
@@ -4435,6 +4479,134 @@ function prepareVideos(root) {
   root.querySelectorAll("video[data-video-url]").forEach(video => {
     prepareVideo(video, video.dataset.videoUrl);
   });
+}
+
+// 只给进入视口的卡片请求预览；卡片本身仍完整保留，连线和框选不受影响。
+const CARD_MEDIA = new Map();
+let cardMediaObserver = null, cardMediaMutations = null, cardMediaActive = 0;
+function cardThumbnailURL(url) {
+  return /^\/api\/(upload|artifact)\//.test(url)
+    ? `/api/thumbnail?url=${encodeURIComponent(url)}` : null;
+}
+function releaseCardMedia(node, state) {
+  state.controller?.abort();
+  if (state.blob) URL.revokeObjectURL(state.blob);
+  cancelCardPlayback(node);
+  if (node.tagName === 'VIDEO') { node.pause(); node.removeAttribute('src'); node.load(); }
+  cardMediaObserver?.unobserve(node);
+  CARD_MEDIA.delete(node);
+}
+function resetCardMedia() {
+  for (const [node, state] of CARD_MEDIA) releaseCardMedia(node, state);
+  cardMediaObserver?.disconnect(); cardMediaMutations?.disconnect();
+  cardMediaObserver = null; cardMediaMutations = null;
+}
+function pumpCardMedia() {
+  for (const [node, state] of CARD_MEDIA) {
+    if (cardMediaActive >= 4) break;
+    if (!state.visible || state.loading || state.done || !node.isConnected
+      || state.project !== PROJ || !H3Auth.active) continue;
+    const controller = new AbortController();
+    state.controller = controller; state.loading = true; cardMediaActive++;
+    (async () => {
+      try {
+        const response = await fetch(state.url, {credentials:'same-origin', signal:controller.signal});
+        if (controller.signal.aborted || CARD_MEDIA.get(node) !== state || state.project !== PROJ || !H3Auth.active) return;
+        if (!response.ok) {
+          if (response.status === 401) await H3Auth.me();
+          if ([403,404].includes(response.status)) window.dispatchEvent(new CustomEvent('h3auth:denied',
+            {detail:{path:'/api/thumbnail', method:'GET', error:{status:response.status}}}));
+          throw new Error(`预览加载失败（${response.status}）；可双击查看原文件`);
+        }
+        const blob = await response.blob();
+        if (controller.signal.aborted || CARD_MEDIA.get(node) !== state || !node.isConnected
+          || state.project !== PROJ || !H3Auth.active) return;
+        state.blob = URL.createObjectURL(blob);
+        if (node.tagName === 'VIDEO') node.poster = state.blob;
+        else node.src = state.blob;
+        state.done = true;
+      } catch (error) {
+        if (!controller.signal.aborted && CARD_MEDIA.get(node) === state) {
+          state.done = true;
+          node.title = error.message;
+        }
+      } finally {
+        state.loading = false; state.controller = null; cardMediaActive--;
+        pumpCardMedia();
+      }
+    })();
+  }
+}
+function observeCardMedia(node, url) {
+  const thumbnail = cardThumbnailURL(url);
+  if (node.tagName === 'VIDEO') {
+    node.dataset.videoUrl = url;
+    node.preload = 'none';
+    node.title = '单击播放；双击放大查看原视频';
+    node.poster = 'data:image/svg+xml;charset=utf-8,' + encodeURIComponent(
+      '<svg xmlns="http://www.w3.org/2000/svg" width="512" height="288"><rect width="512" height="288" fill="#111318"/><path d="M238 121v46l40-23z" fill="#b7bbc3"/></svg>');
+    // 无本地缩略图的 Comfy 视频也不在首屏下载，点击时沿用原播放器。
+  } else {
+    node.decoding = 'async';
+    if (thumbnail) node.dataset.thumbnail = 'true';
+  }
+  if (!cardMediaObserver) {
+    cardMediaObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) {
+        const state = CARD_MEDIA.get(entry.target);
+        if (!state) continue;
+        state.visible = entry.isIntersecting;
+        if (!state.visible && state.loading) state.controller?.abort();
+      }
+      pumpCardMedia();
+    }, {root:el.stage, rootMargin:'120px'});
+    cardMediaMutations = new MutationObserver(() => {
+      for (const [node, state] of CARD_MEDIA) {
+        if (!node.isConnected) releaseCardMedia(node, state);
+      }
+    });
+    cardMediaMutations.observe(el.world, {childList:true, subtree:true});
+  }
+  CARD_MEDIA.set(node, {url:thumbnail || url, project:PROJ, visible:false, loading:false,
+    done:node.tagName === 'VIDEO' && !thumbnail});
+  cardMediaObserver.observe(node);
+}
+function prepareCardMedia(body, outputs, compare) {
+  for (const node of body.querySelectorAll('img, video')) {
+    const url = node.classList.contains('old') ? compare : outputs[+(node.dataset.i || 0)]?.url;
+    if (url) observeCardMedia(node, url);
+  }
+  const audio = body.querySelector('audio');
+  if (audio) audio.src = outputs[0].url;
+}
+function cancelCardPlayback(video) {
+  if (video._playRequest) video.pause();
+  video._playRequest = null;
+  video._previewController?.abort();
+  video._previewController = null;
+}
+async function playCardVideo(video) {
+  if (!video.isConnected || !H3Auth.active) return;
+  for (const other of document.querySelectorAll('video')) cancelCardPlayback(other);
+  const project = PROJ, request = {}, controller = new AbortController();
+  video._playRequest = request;
+  video._previewController = controller;
+  try {
+    if (!video.getAttribute('src')) {
+      video.preload = 'metadata';
+      await prepareVideo(video, video.dataset.videoUrl,
+        () => video._playRequest === request && video.isConnected && PROJ === project && H3Auth.active,
+        controller.signal);
+    }
+    if (video._playRequest !== request || !video.isConnected || PROJ !== project || !H3Auth.active
+      || video.dataset.previewState === 'error') return;
+    await video.play();
+  } catch (error) {
+    if (!controller.signal.aborted && video._playRequest === request && video.isConnected && PROJ === project)
+      video.title = error.message || '视频暂时无法播放';
+  } finally {
+    if (video._previewController === controller) video._previewController = null;
+  }
 }
 
 /** 素材格里的图/视频/音频：复用产物大图那套查看器，不用为它再写一个 */

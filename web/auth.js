@@ -79,6 +79,9 @@
       headers.set('X-CSRF-Token', csrf);
     }
     const controller = new AbortController(); controllers.add(controller);
+    const abort = () => controller.abort(options.signal.reason);
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener('abort', abort, {once:true});
     try {
       const response = await fetch(url, {...options, method, headers, credentials:'same-origin', signal:controller.signal});
       const type = response.headers.get('content-type') || '';
@@ -92,7 +95,10 @@
       }
       if (stopped && !anonymous) throw new Error('登录已失效');
       return data;
-    } finally { controllers.delete(controller); }
+    } finally {
+      options.signal?.removeEventListener('abort', abort);
+      controllers.delete(controller);
+    }
   }
   const json = (path, method, body) => request(path, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body || {})});
   async function me() {

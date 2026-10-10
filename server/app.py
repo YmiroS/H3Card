@@ -47,7 +47,7 @@ from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     can_run_capability,
 )
-from video_preview import VideoPreviews, preview_status, preview_file
+from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.auth_store import AuthStore
 from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
@@ -2719,6 +2719,32 @@ async def api_upload_file(request):
     return private_file(path)
 
 
+async def api_thumbnail(request):
+    query = request.rel_url.query
+    if set(query) != {"url"} or len(query.getall("url")) != 1:
+        raise web.HTTPBadRequest(text="缩略图必须且只能提供一个 url 参数")
+    url = query["url"]
+    ref = await resource_call(request.app, "reference", url)
+    if (not ref or ref[0] not in ("upload", "artifact")
+            or not url.startswith(("/api/upload/", "/api/artifact/"))):
+        raise web.HTTPBadRequest(text="缩略图仅支持本地上传或产物 URL")
+    await require_resource(request, *ref)
+    path = await resource_call(request.app, "local_path", *ref)
+    if path.suffix.lower() not in IMG_EXT | VID_EXT:
+        raise web.HTTPBadRequest(text="缩略图仅支持图片或视频")
+    thumbnails = request.app["media_thumbnails"]
+    target = await thumbnails.get(path)
+    # 等待期间可能撤权、删除素材或替换路径；条件请求同样要经过这次核验。
+    await require_resource(request, *ref)
+    current = await resource_call(request.app, "local_path", *ref)
+    if thumbnails.source_key(current)[1] != target.stem:
+        raise web.HTTPConflict(text="素材已变化，请重试")
+    return web.FileResponse(target, headers={
+        "Content-Type": "image/png", "Cache-Control": "private, no-cache",
+        "X-Content-Type-Options": "nosniff",
+    })
+
+
 async def api_preview_status(request):
     await require_resource(request, "upload", request.match_info["name"])
     return await preview_status(request)
@@ -2977,6 +3003,7 @@ async def on_stop(app):
     await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
     await close_presence_connections(app)
     await app["video_previews"].close()
+    await app["media_thumbnails"].close()
     await app["edit_exports"].close()
     task = app.get("ws_task")
     if task:
@@ -3064,6 +3091,9 @@ def make_app(auth_path=None):
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
     )
+    app["media_thumbnails"] = MediaThumbnails(
+        ROOT / "data" / "thumbnails", ffmpeg_bin, IMG_EXT | VID_EXT,
+    )
     if CONTROLLER_MODE:
         database_path = ROOT / "data" / "control.db"
         app["distributed"] = DistributedStore(database_path)
@@ -3082,6 +3112,7 @@ def make_app(auth_path=None):
     app.router.add_post("/api/upload", api_upload)
     app.router.add_get("/api/preview/{name}/file", api_preview_file)
     app.router.add_get("/api/preview/{name}", api_preview_status)
+    app.router.add_get("/api/thumbnail", api_thumbnail)
     app.router.add_get("/api/media", api_media)
     app.router.add_post("/api/generate", api_generate)
     app.router.add_post("/api/rewrite", api_rewrite)
