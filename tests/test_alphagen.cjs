@@ -57,7 +57,7 @@ test('AlphaGen toolbox mode, editable parameters and isolated submissions in com
   assert.deepEqual(alpha.slotLimits, {
     image:{min:0, max:0}, audio:{min:0, max:0}, video:{min:1, max:1},
   });
-  assert.deepEqual(numericKeys.map(key => specOf(key).default), [1088, 241, 0, 42, 1, 1]);
+  assert.deepEqual(numericKeys.map(key => specOf(key).default), [576, 241, 0, 42, 1, 1]);
   for (const key of presetKeys) {
     assert.equal(specOf(key).default, 'off');
     assert.deepEqual(specOf(key).options.map(option => option.value), ['off', 'on']);
@@ -259,6 +259,40 @@ test('AlphaGen toolbox mode, editable parameters and isolated submissions in com
       assert.equal(payload.params.use_tiled_encode, false);
       assert.equal(await page.locator('#panel .slot.filled').count(), 1);
       assert.equal(await page.locator('#panel .refadd').count(), 0);
+    });
+
+    await t.test('canvas Ctrl+Z and Mac Cmd+Z undo; redo restores parameter, move and deletion', async () => {
+      await paramsButton.click();
+      await number('shorter_size').fill('640');
+      await page.locator('#respop .x').click();
+      await card.locator('.ch .t').click();
+      await page.keyboard.press('Control+z');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].params.shorter_size), 768);
+      await page.keyboard.press('Control+Shift+z');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].params.shorter_size), 640);
+      await page.evaluate(() => Object.defineProperty(navigator, 'platform', {configurable:true, value:'MacIntel'}));
+      await page.keyboard.press('Control+z');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].params.shorter_size), 640);
+      await page.keyboard.press('Meta+z');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].params.shorter_size), 768);
+      await page.keyboard.press('Meta+Shift+z');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].params.shorter_size), 640);
+      await page.evaluate(() => Object.defineProperty(navigator, 'platform', {configurable:true, value:'Win32'}));
+      const before = await page.evaluate(() => [PROJ.cards[0].x, PROJ.cards[0].y]);
+      const title = await card.locator('.ch .t').boundingBox();
+      await page.mouse.move(title.x + title.width / 2, title.y + title.height / 2);
+      await page.mouse.down();
+      await page.mouse.move(title.x + title.width / 2 + 80, title.y + title.height / 2 + 40, {steps:4});
+      await page.mouse.up();
+      assert.notDeepEqual(await page.evaluate(() => [PROJ.cards[0].x, PROJ.cards[0].y]), before);
+      await page.keyboard.press('Control+z');
+      assert.deepEqual(await page.evaluate(() => [PROJ.cards[0].x, PROJ.cards[0].y]), before);
+      await card.locator('.ch .x').click();
+      assert.equal(await page.locator('#world .card').count(), 0);
+      await page.keyboard.press('Control+z');
+      assert.equal(await page.locator('#world .card').count(), 1);
+      await page.keyboard.press('Control+Shift+z');
+      assert.equal(await page.locator('#world .card').count(), 0);
     });
 
     assert.equal(generated.length, 4);

@@ -198,6 +198,50 @@ test('菜单：保留批量重命名入口，并在点击时重新核对选择�
   }
 });
 
+test('画布撤销恢复节点、连线、分组和参数，但不回滚生成产物', () => {
+  const events = {};
+  const cards = [{id:'a', type:'card_tools', x:10, y:20, name:'原名', params:{prompt:'old'},
+    assets:{}, outputs:[{filename:'old.mp4'}], history:[{id:'first'}], status:'done'}];
+  const project = {id:'p', cards, edges:[], groups:[]};
+  let saves = 0, renders = 0;
+  const context = vm.createContext({
+    PROJ:project, NODE_EDITOR:false, selId:null, selIds:new Set(), selEdge:null,
+    document:{addEventListener:(name, handler) => { events[name] = handler; }},
+    canOperate:() => true, plain:c => Object.fromEntries(Object.entries(c).filter(([key]) => !key.startsWith('_'))),
+    render:() => { renders++; }, closePanel:() => {}, openPanel:() => {}, save:() => { saves++; },
+  });
+  vm.runInContext(block('const EDIT_FIELDS =', '/** 保存串行化'), context);
+  const act = () => events.pointerdown({type:'pointerdown'});
+  act(); cards[0].x = 75; cards[0].params.prompt = 'new';
+  project.edges.push({from:'a', to:'b', slot:'video'});
+  project.groups.push({id:'g', name:'组', cards:['a']});
+  context.recordCanvasEdit();
+  cards[0].outputs = [{filename:'generated.mp4'}];
+  cards[0].history.push({id:'second'});
+  context.canvasHistoryStep();
+  assert.equal(project.cards[0].x, 10);
+  assert.equal(project.cards[0].params.prompt, 'old');
+  assert.equal(project.cards[0].outputs[0].filename, 'generated.mp4');
+  assert.equal(project.cards[0].history.length, 2);
+  assert.equal(project.edges.length, 0);
+  assert.equal(project.groups.length, 0);
+  context.canvasHistoryStep(true);
+  assert.equal(project.cards[0].x, 75);
+  assert.equal(project.edges.length, 1);
+  assert.equal(project.groups.length, 1);
+  act(); project.cards = []; project.edges = []; project.groups = [];
+  context.recordCanvasEdit();
+  context.canvasHistoryStep();
+  assert.equal(project.cards.length, 1);
+  assert.deepEqual(plain(project.cards[0].history), [{id:'first'},{id:'second'}]);
+  assert.equal(project.cards[0].outputs[0].filename, 'generated.mp4');
+  assert.equal(saves, 3);
+  assert.equal(renders, 3);
+  context.resetCanvasHistory();
+  context.canvasHistoryStep();
+  assert.equal(project.cards.length, 1, '远端同步后不能重放旧的本地历史');
+});
+
 // 连通用例仍执行上面抽取的生产函数；预期几何均独立手算。
 function connectedFixture(definitions, edges, selected) {
   const fixture = geometryFixture();

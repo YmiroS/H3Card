@@ -11,7 +11,7 @@
  },
  "9069": {
   "class_type": "PrimitiveInt",
-  "inputs": {"value": 1088},
+  "inputs": {"value": 576},
   "_meta": {"title": "处理短边分辨率"}
  },
  "9022": {

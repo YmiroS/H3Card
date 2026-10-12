@@ -1632,9 +1632,11 @@ class LocalOutputEventOrderTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(controller_app, "collect_outputs", new=mock.AsyncMock(return_value=[{"filename": "late.png"}])), \
              mock.patch.object(controller_app, "call_store", new=mock.AsyncMock(side_effect=[{"project_id": "p"}, {"state": "active"}])), \
              mock.patch.object(controller_app, "resource_call", side_effect=register):
+            app = {"local_output_tasks": {}}
             await controller_app.handle_event(None, {
                 "type": "execution_success", "data": {"prompt_id": "acl-cancel"},
-            }, app={})
+            }, app=app)
+            await asyncio.gather(*app["local_output_tasks"].values())
         self.assertEqual(job["status"], "running")
         self.assertEqual(job["outputs"], [])
         self.assertEqual(job["step"], "正在停止并释放显存")
@@ -1651,6 +1653,318 @@ class LocalOutputEventOrderTest(unittest.IsolatedAsyncioTestCase):
             })
         self.assertEqual(job["status"], "done")
         self.assertEqual(job["outputs"], output)
+
+
+class LocalOutputCompletionTest(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.pid = "2233618a-0676-49f4-bf0f-c3498f09abe0"
+        self.job = {"id": self.pid, "status": "running", "progress": 0.8,
+                    "outputs": [], "created": 1}
+        self.app = {"local_output_tasks": {}, "lifecycle": {"shutting_down": False}}
+        self.session = mock.MagicMock()
+        self.response = self.session.get.return_value.__aenter__.return_value
+        self.response.raise_for_status = mock.Mock()
+        self.output = {"filename": "result.png", "type": "output"}
+        self.history = {self.pid: {"status": {"completed": True},
+                                   "outputs": {"1": {"images": [self.output]}}}}
+        self.response.json = mock.AsyncMock(return_value=self.history)
+        self.save = self.enterContext(mock.patch.object(controller_app, "save_jobs"))
+        self.enterContext(mock.patch.object(controller_app, "JOBS", {self.pid: self.job}))
+        self.enterContext(mock.patch.object(controller_app, "STEPS", {self.pid: {"1": "采样"}}))
+        self.enterContext(mock.patch.object(controller_app, "WEIGHTS", {self.pid: {"1": 1}}))
+        self.enterContext(mock.patch.object(controller_app, "CONTROLLER_MODE", False))
+        self.enterContext(mock.patch.object(controller_app, "LOCAL_OUTPUT_BACKOFF", 0))
+        self.enterContext(mock.patch.object(controller_app, "LOCAL_OUTPUT_ATTEMPTS", 3))
+        self.enterContext(mock.patch.object(controller_app, "LOCAL_OUTPUT_TIMEOUT", 0.03))
+        self.store = self.enterContext(mock.patch.object(
+            controller_app, "call_store", new=mock.AsyncMock(side_effect=self.active_project)))
+        self.register = self.enterContext(mock.patch.object(
+            controller_app, "resource_call", new_callable=mock.AsyncMock))
+
+    async def asyncTearDown(self):
+        await controller_app.close_presence_connections(self.app)
+
+    async def active_project(self, _app, method, _id):
+        return {"project_id": "p"} if method == "get_job" else {"state": "active"}
+
+    async def event(self, kind="execution_success", **data):
+        await controller_app.handle_event(self.session, {
+            "type": kind, "data": {"prompt_id": self.pid, **data},
+        }, app=self.app)
+
+    async def drain(self):
+        await asyncio.wait_for(asyncio.gather(*self.app["local_output_tasks"].values()), 2)
+        self.assertEqual(self.app["local_output_tasks"], {})
+
+    async def test_success_without_final_executing_retries_delayed_history(self):
+        self.response.json.side_effect = [{}, {self.pid: {"status": {"completed": False}}}, self.history]
+        await self.event()
+        self.assertEqual(self.job["step"], "正在取回产物")
+        self.assertTrue(self.job["completion_pending"])
+        self.assertEqual(self.response.json.await_count, 0, "WS must not wait for history")
+        await self.drain()
+        self.assertEqual(self.job["status"], "done")
+        self.assertEqual(self.job["progress"], 1)
+        self.assertEqual(self.job["outputs"][0]["filename"], "result.png")
+        self.assertNotIn("completion_pending", self.job)
+        self.assertNotIn(self.pid, controller_app.STEPS)
+        self.assertNotIn(self.pid, controller_app.WEIGHTS)
+        self.assertEqual(self.response.json.await_count, 3)
+        self.register.assert_awaited_once()
+
+    async def test_windows_vhs_subfolder_registers_and_uses_normalized_url(self):
+        self.output.update(filename="ltx25_ag_alpha_00003.mp4",
+                           subfolder="LTX_2.5\\Alpha_Generation")
+        await self.event()
+        await self.drain()
+        self.assertEqual(self.job["status"], "done")
+        output = self.job["outputs"][0]
+        self.assertEqual(output["subfolder"], "LTX_2.5/Alpha_Generation")
+        self.assertIn("subfolder=LTX_2.5%2FAlpha_Generation", output["url"])
+        self.assertNotIn("%5C", output["url"])
+        self.assertEqual(json.loads(controller_app.ResourceAccess.normalize("comfy", output))["subfolder"],
+                         "LTX_2.5/Alpha_Generation")
+        self.assertEqual(self.register.await_args.args[-1], output)
+        with self.assertRaises(ValueError):
+            controller_app.ResourceAccess.normalize("comfy", {
+                **output, "subfolder": "..\\outside".replace("\\", "/")})
+
+    async def test_transient_network_http_and_timeout_errors_retry(self):
+        errors = [aiohttp.ClientConnectionError("reset"),
+                  aiohttp.ClientResponseError(mock.Mock(real_url="history"), (), status=503),
+                  asyncio.TimeoutError()]
+        for error in errors:
+            with self.subTest(error=type(error).__name__):
+                self.job.update(status="running", outputs=[])
+                self.response.json.side_effect = [error, self.history]
+                await self.event()
+                await self.drain()
+                self.assertEqual(self.job["status"], "done")
+
+    async def test_missing_history_exhausts_retries_and_late_success_stays_error(self):
+        self.response.json.return_value = {}
+        await self.event()
+        await self.drain()
+        self.assertEqual(self.response.json.await_count, 3)
+        self.assertEqual(self.job["status"], "error")
+        self.assertIn("history 尚未入库", self.job["error"])
+        self.assertEqual(self.job["outputs"], [])
+        await self.event("executing", node=None)
+        await self.event()
+        self.assertEqual(self.app["local_output_tasks"], {})
+        self.assertEqual(self.response.json.await_count, 3)
+
+    async def test_hung_history_has_per_attempt_timeout_and_finite_budget(self):
+        canceled = []
+
+        async def hung():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                canceled.append(True)
+
+        self.response.json.side_effect = hung
+        await self.event()
+        await self.drain()
+        self.assertEqual(len(canceled), 3)
+        self.assertEqual(self.job["status"], "error")
+        self.assertIn("TimeoutError", self.job["error"])
+        self.register.assert_not_awaited()
+
+    async def test_completed_empty_is_failure_not_done(self):
+        self.response.json.return_value = {self.pid: {"status": {"completed": True}, "outputs": {}}}
+        await self.event()
+        await self.drain()
+        self.assertEqual(self.response.json.await_count, 1)
+        self.assertEqual(self.job["status"], "error")
+        self.assertIn("没有可用产物", self.job["error"])
+        self.register.assert_not_awaited()
+
+    async def test_duplicate_completion_events_share_one_task(self):
+        await self.event()
+        task = self.app["local_output_tasks"][self.pid]
+        await self.event()
+        await self.event("executing", node=None)
+        await self.event("executing", node="1")
+        await self.event("progress_state", nodes={"1": {"state": "running", "max": 8, "value": 7}})
+        self.assertIs(self.app["local_output_tasks"][self.pid], task)
+        self.assertEqual(self.job["step"], "正在取回产物")
+        self.save.assert_called_once()
+        await self.drain()
+        await self.event()
+        self.assertEqual(self.response.json.await_count, 1)
+        self.register.assert_awaited_once()
+
+
+    async def test_inflight_history_cannot_overwrite_terminal_cleanup_or_removed_job(self):
+        for change in ("canceled", "error", "done", "cleanup", "removed", "replaced"):
+            with self.subTest(change=change):
+                controller_app.JOBS[self.pid] = self.job
+                self.job.clear()
+                self.job.update(status="running", outputs=[])
+                entered, release = asyncio.Event(), asyncio.Event()
+
+                async def history():
+                    entered.set()
+                    await release.wait()
+                    return self.history
+
+                self.response.json.side_effect = history
+                await self.event()
+                await asyncio.wait_for(entered.wait(), 1)
+                if change == "cleanup":
+                    self.job.update(cleanup_pending=True, step="正在停止并释放显存")
+                elif change == "removed":
+                    controller_app.JOBS.pop(self.pid)
+                elif change == "replaced":
+                    controller_app.JOBS[self.pid] = {"status": "running"}
+                else:
+                    self.job["status"] = change
+                snapshot = dict(self.job)
+                self.save.reset_mock()
+                release.set()
+                await self.drain()
+                self.assertEqual(self.job, snapshot)
+                self.save.assert_not_called()
+        self.register.assert_not_awaited()
+
+    async def test_acl_checks_cannot_overwrite_concurrent_terminal_or_cleanup(self):
+        for stage in ("lookup", "register"):
+            for state in ("canceled", "error", "done", "cleanup", "shutdown"):
+                with self.subTest(stage=stage, state=state):
+                    self.app["lifecycle"]["shutting_down"] = False
+                    self.job.clear()
+                    self.job.update(status="running", outputs=[])
+
+                    def change():
+                        if state == "cleanup":
+                            self.job["cleanup_pending"] = True
+                        elif state == "shutdown":
+                            self.app["lifecycle"]["shutting_down"] = True
+                        else:
+                            self.job["status"] = state
+                        self.save.reset_mock()
+
+                    async def store(app, method, pid):
+                        if stage == "lookup" and method == "get_project":
+                            change()
+                        return await self.active_project(app, method, pid)
+
+                    async def register(*_args):
+                        if stage == "register":
+                            change()
+
+                    self.store.side_effect = store
+                    self.register.side_effect = register
+                    await self.event()
+                    await self.drain()
+                    self.assertEqual(self.job["outputs"], [])
+                    self.assertNotIn("ended", self.job)
+                    self.save.assert_not_called()
+                    self.assertEqual(self.job["status"], state if state in ("done", "error", "canceled") else "running")
+
+    async def test_deleted_project_before_or_during_registration_is_canceled(self):
+        for results, registrations in (([None], 0),
+                ([{"project_id": "p"}, {"state": "deleted"}], 0),
+                ([{"project_id": "p"}, {"state": "active"}, {"state": "deleted"}], 1)):
+            with self.subTest(results=results):
+                self.job.update(status="running", outputs=[])
+                self.store.side_effect = results
+                self.register.reset_mock()
+                await self.event()
+                await self.drain()
+                self.assertEqual(self.job["status"], "canceled")
+                self.assertEqual(self.job["outputs"], [])
+                self.assertEqual(self.register.await_count, registrations)
+
+    async def test_registration_failure_is_reported_and_task_reclaimed(self):
+        self.register.side_effect = PermissionError("resource belongs to another project")
+        await self.event()
+        await self.drain()
+        self.assertEqual(self.job["status"], "error")
+        self.assertIn("PermissionError", self.job["error"])
+        self.assertEqual(self.job["outputs"], [])
+
+    async def test_shutdown_cancels_collection_without_writing_and_blocks_new_tasks(self):
+        entered = asyncio.Event()
+
+        async def hung():
+            entered.set()
+            await asyncio.Event().wait()
+
+        self.response.json.side_effect = hung
+        await self.event()
+        task = self.app["local_output_tasks"][self.pid]
+        await asyncio.wait_for(entered.wait(), 1)
+        snapshot = dict(self.job)
+        self.save.reset_mock()
+        await controller_app.close_presence_connections(self.app)
+        self.assertTrue(task.cancelled())
+        self.assertEqual(self.job, snapshot)
+        self.save.assert_not_called()
+        await self.event()
+        self.assertEqual(self.app["local_output_tasks"], {})
+        self.register.assert_not_awaited()
+
+    async def test_remote_completion_is_left_to_complete_api(self):
+        await controller_app.handle_event(self.session, {
+            "type": "execution_success", "data": {"prompt_id": self.pid},
+        }, remote=True, app=self.app)
+        self.assertEqual(self.job["status"], "running")
+        self.assertEqual(self.job["step"], "正在归集产物")
+        self.assertEqual(self.app["local_output_tasks"], {})
+        self.job["worker_id"] = "worker-1"
+        await self.event()
+        self.assertEqual(self.app["local_output_tasks"], {})
+        self.session.get.assert_not_called()
+
+
+    async def test_restart_only_recovers_local_completion_waiters(self):
+        rows = [
+            {"id": self.pid, "status": "running", "step": "正在取回产物"},
+            {"id": "marked", "status": "running", "completion_pending": True},
+            {"id": "sampling", "status": "running", "step": "采样", "progress": 0.99},
+            {"id": "queued", "status": "queued", "completion_pending": True},
+            {"id": "cleanup", "status": "running", "step": "正在取回产物", "cleanup_pending": True},
+            {"id": "remote", "status": "running", "step": "正在取回产物", "worker_id": "w"},
+            {"id": "finished", "status": "done", "completion_pending": True},
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "jobs.json"
+            path.write_text(json.dumps(rows), encoding="utf-8")
+            with mock.patch.object(controller_app, "JOBS_FILE", path):
+                controller_app.JOBS.clear()
+                controller_app.load_jobs()
+        jobs = controller_app.JOBS
+        self.assertEqual({pid for pid, job in jobs.items() if controller_app.local_completion_waiting(job)},
+                         {self.pid, "marked"})
+        for pid in ("sampling", "queued", "remote"):
+            self.assertEqual(jobs[pid]["status"], "canceled")
+        self.assertEqual(jobs["finished"]["status"], "done")
+        self.assertTrue(jobs["cleanup"]["cleanup_pending"])
+        self.assertEqual(jobs["cleanup"]["step"], "显存释放未确认，请重试取消")
+        self.app.update(auth_path="unused", local_test=False)
+        with mock.patch.object(controller_app, "AuthStore"), \
+             mock.patch.object(controller_app, "ResourceAccess"), \
+             mock.patch.object(controller_app, "setup_dingtalk"), \
+             mock.patch.object(controller_app.aiohttp, "ClientSession", return_value=self.session), \
+             mock.patch.object(controller_app, "ws_loop", new_callable=mock.AsyncMock), \
+             mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock) as submit:
+            await controller_app.on_start(self.app)
+            self.assertEqual(set(self.app["local_output_tasks"]), {self.pid, "marked"})
+            await self.drain()
+            await self.app["ws_task"]
+            submit.assert_not_awaited()
+        self.assertEqual(jobs[self.pid]["status"], "done")
+        self.assertEqual(jobs["marked"]["status"], "error", "missing history has a finite recovery budget")
+
+    async def test_controller_restart_never_schedules_local_recovery(self):
+        self.job.update(completion_pending=True, step="正在取回产物")
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", True):
+            self.assertFalse(controller_app.local_completion_waiting(self.job))
+            await self.event()
+        self.assertEqual(self.app["local_output_tasks"], {})
+        self.session.get.assert_not_called()
 
 
 class LocalCleanupTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
