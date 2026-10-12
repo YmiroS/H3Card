@@ -59,7 +59,7 @@ class AlphaGenWorkflowTest(unittest.TestCase):
             ("5602", "unet_name"): "ltx-2.5-22b-distilled-transformer-bf16.safetensors",
             ("5604", "clip_name"): "gemma4_e2b_it_bf16.safetensors",
             ("5605", "clip_name"): "gemma4-12b-with-proj-ltx-2.5-bf16.safetensors",
-            ("5606", "lora_name"): "ltx-2.5_ic_lora_alpha_v5_s17500.safetensors",
+            ("5606", "lora_name"): "ltx-2.5-22b-ic-lora-alpha-gen-0.9.safetensors",
         }
         for (nid, field), value in expected.items():
             self.assertEqual(self.graph[nid]["inputs"][field], value)
