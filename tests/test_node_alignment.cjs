@@ -242,6 +242,78 @@ test('画布撤销恢复节点、连线、分组和参数，但不回滚生成�
   assert.equal(project.cards.length, 1, '远端同步后不能重放旧的本地历史');
 });
 
+const saveCode = block('/** 保存串行化', '/** 等待本地提交');
+function saveFixture(remote) {
+  const calls = {puts:[],posts:[],toasts:[],opened:0,flushed:0};
+  const restored = {id:'a',type:'card_tools',name:'恢复节点',x:10,y:20,params:{prompt:'保留'},assets:{},outputs:[]};
+  const context = vm.createContext({
+    PROJ:{id:'p',name:'画布',permission:'operate',rev:2,cards:[restored],edges:[{from:'a',to:'b',slot:'image'}],groups:[{id:'g',cards:['a']}]},
+    NODE_EDITOR:false, localFlushes:0, contentSaving:false, saveFailure:null,
+    canSave:() => true,
+    plain:c => Object.fromEntries(Object.entries(c).filter(([key]) => !key.startsWith('_'))),
+    api:async () => plain(remote),
+    jpost:async (path,body) => {
+      calls.posts.push({path,body:plain(body)});
+      const card = {...plain(body.card),created_by:'user',created_by_name:'测试用户',created_at:123};
+      return {card,project:{...plain(remote),rev:3,cards:[...(remote.cards || []),card]}};
+    },
+    jput:async (path,payload) => {
+      calls.puts.push({path,payload:plain(payload)});
+      if (calls.puts.length === 1) throw Object.assign(new Error('409'),{status:409});
+      return {ok:true,rev:4};
+    },
+    toast:message => calls.toasts.push(message),
+    openProject:async () => { calls.opened++; },
+    flushPendingProjectSync:() => { calls.flushed++; },
+  });
+  vm.runInContext(saveCode,context,{filename:'app.js:画布保存真实函数'});
+  return {context,calls,restored};
+}
+
+test('撤销已落盘的节点删除时经建卡接口恢复，不误报远端冲突或丢节点', async () => {
+  const {context:s,calls,restored} = saveFixture({id:'p',name:'画布',rev:2,cards:[],edges:[],groups:[]});
+  const result = await s.doSave('p');
+  assert.equal(result.ok,true);
+  assert.equal(calls.opened,0);
+  assert.deepEqual(calls.toasts,[]);
+  assert.equal(calls.posts.length,1);
+  assert.equal(calls.posts[0].path,'/api/projects/p/cards');
+  assert.equal(calls.posts[0].body.card.id,'a');
+  assert.equal(calls.posts[0].body.rev,2,'恢复建卡必须锁定 GET 时看到的远端版本');
+  assert.equal(calls.puts.length,2);
+  assert.equal(calls.puts[1].payload.rev,3);
+  assert.deepEqual(calls.puts[1].payload.edges,[{from:'a',to:'b',slot:'image'}]);
+  assert.deepEqual(calls.puts[1].payload.groups,[{id:'g',cards:['a']}]);
+  assert.equal(s.PROJ.cards[0],restored,'恢复后保留正在显示的节点对象');
+  assert.equal(restored.created_by,'user');
+  assert.equal(s.PROJ.rev,4);
+  assert.equal(calls.flushed,1);
+});
+
+test('真正的远端版本冲突仍重新加载，不把本地整图盲目覆盖远端', async () => {
+  const {context:s,calls} = saveFixture({id:'p',name:'画布',rev:3,cards:[],edges:[],groups:[]});
+  const result = await s.doSave('p');
+  assert.equal(result.ok,false);
+  assert.equal(calls.posts.length,0);
+  assert.equal(calls.puts.length,1);
+  assert.equal(calls.opened,1);
+  assert.deepEqual(calls.toasts,['画布在别处被改过，已重新加载']);
+});
+
+test('恢复节点的 GET 与 POST 之间出现协作者修改时停止整图重试', async () => {
+  const {context:s,calls} = saveFixture({id:'p',name:'画布',rev:2,cards:[],edges:[],groups:[]});
+  s.jpost = async (path,body) => {
+    calls.posts.push({path,body:plain(body)});
+    throw Object.assign(new Error('stale rev'),{status:409});
+  };
+  const result = await s.doSave('p');
+  assert.equal(result.ok,false);
+  assert.equal(calls.posts[0].body.rev,2);
+  assert.equal(calls.puts.length,1,'版本化建卡被拒后不能再提交旧整图');
+  assert.equal(calls.opened,1);
+  assert.deepEqual(calls.toasts,['画布在别处被改过，已重新加载']);
+});
+
 // 连通用例仍执行上面抽取的生产函数；预期几何均独立手算。
 function connectedFixture(definitions, edges, selected) {
   const fixture = geometryFixture();

@@ -1554,6 +1554,30 @@ function enqueueSave(expectedId = PROJ?.id) {
   return saveChain;
 }
 
+async function restoreDeletedCardsAndRetry(id, payload) {
+  const remote = await api(`/api/projects/${encodeURIComponent(id)}`);
+  if (!PROJ || PROJ.id !== id || (remote.rev || 0) !== payload.rev) return null;
+  const remoteIds = new Set((remote.cards || []).map(card => card.id));
+  const missing = payload.cards.filter(card => !remoteIds.has(card.id));
+  if (!missing.length) return null;
+
+  let latest = remote;
+  for (const card of missing) {
+    const result = await jpost(`/api/projects/${encodeURIComponent(id)}/cards`, {
+      card, rev: latest.rev || 0,
+    });
+    if (!PROJ || PROJ.id !== id) throw new Error("恢复节点期间画布已切换");
+    latest = result.project;
+    const saved = result.card || (latest.cards || []).find(item => item.id === card.id);
+    const live = PROJ.cards.find(item => item.id === card.id);
+    if (saved && live) for (const key of ["created_by", "created_by_name", "created_at"])
+      if (saved[key] !== undefined) live[key] = card[key] = saved[key];
+  }
+  payload.rev = latest.rev || 0;
+  PROJ.rev = Math.max(PROJ.rev || 0, payload.rev);
+  return jput(`/api/projects/${id}`, payload);
+}
+
 async function doSave(expectedId = PROJ?.id) {
   if (!canSave() || PROJ.id !== expectedId) {
     return { ok: false, error: new Error("画布不可保存或已切换") };
@@ -1561,19 +1585,34 @@ async function doSave(expectedId = PROJ?.id) {
   if (NODE_EDITOR && !editorCard()) return { ok: false, error: new Error("此节点已删除或不可访问") };
   if (NODE_EDITOR && saveFailure?.status === 409) return { ok: false, error: saveFailure };
   const id = PROJ.id;
+  const payload = {
+    rev: PROJ.rev || 0, name: PROJ.name,
+    cards: PROJ.cards.map(plain), edges: PROJ.edges, groups: PROJ.groups || [],
+  };
   contentSaving = true;
   try {
-    const r = await jput(`/api/projects/${id}`, {
-      rev: PROJ.rev || 0, name: PROJ.name,
-      cards: PROJ.cards.map(plain), edges: PROJ.edges, groups: PROJ.groups || [],
-    });
+    const r = await jput(`/api/projects/${id}`, payload);
     if (!PROJ || PROJ.id !== id) return { ok: false, error: new Error("保存期间画布已切换") };
     PROJ.rev = Math.max(PROJ.rev || 0, r.rev || 0);
     saveFailure = null;
     return { ok: true };
-  } catch (e) {
+  } catch (caught) {
+    let e = caught;
+    if (e.status === 409 && PROJ && PROJ.id === id && !NODE_EDITOR && !localFlushes) {
+      try {
+        const r = await restoreDeletedCardsAndRetry(id, payload);
+        if (r) {
+          if (!PROJ || PROJ.id !== id) return { ok: false, error: new Error("保存期间画布已切换") };
+          PROJ.rev = Math.max(PROJ.rev || 0, r.rev || 0);
+          saveFailure = null;
+          return { ok: true };
+        }
+      } catch (retryError) {
+        e = retryError;
+      }
+    }
     if (PROJ?.id === id) saveFailure = e;
-    // 普通画布保留原来的冲突提示/重载；嵌入编辑器和显式 flush 不丢弃本地编辑。
+    // 普通画布的真正版本冲突仍重新加载；撤销恢复已落盘删除的节点会先走建卡接口重建。
     if (e.status === 409 && PROJ && PROJ.id === id && !NODE_EDITOR && !localFlushes) {
       toast("画布在别处被改过，已重新加载");
       await openProject(id);
