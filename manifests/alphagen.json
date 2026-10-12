@@ -1,0 +1,84 @@
+{
+ "id": "alphagen",
+ "name": "AlphaGen",
+ "file": "LTX 2.5 Alpha Gen Beta",
+ "source": "D:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\0-工具箱\\LTX 2.5 Alpha Gen Beta.json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "tool",
+ "card": "card_tools",
+ "slots": "img0+aud0+vid1",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 1, "max": 1}},
+ "graph": "graphs/alphagen.api.json",
+ "output": {"node": "9048"},
+ "note": "LTX 2.5 AlphaGen 视频抠像：上传一个视频，只输出黑白遮罩 MP4（白色为前景、黑色为背景），不生成对比、绿幕或黑底视频，不带音轨。提示词可留空。保留原工作流 BF16 模型、八步蒸馏采样、1088 短边和 241 帧上限；显存不足时先降低短边与帧数。作者建议优先使用 97/121/145 帧，超过 145 帧可能降低稳定性；实际时长取决于源视频帧率。提示词增强默认关闭。只输出遮罩仍需音频 VAE 来构建 LTX 音视频联合潜空间。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "video[0]", "label": "源视频", "type": "video", "required": true,
+   "target": {"node": "9021", "input": "video", "kind": "upload_video"}
+  },
+  {
+   "key": "prompt", "label": "正向提示词（可留空）", "type": "textarea", "default": "",
+   "target": {"node": "5508", "input": "value", "vtype": "STRING"}
+  },
+  {
+   "key": "negative_prompt", "label": "负向提示词（可留空）", "type": "textarea", "default": "",
+   "target": {"node": "5509", "input": "value", "vtype": "STRING"}
+  },
+  {
+   "key": "shorter_size", "label": "处理短边", "type": "slider", "min": 256, "max": 1536, "step": 32, "default": 1088,
+   "hint": "按源视频比例缩放，宽高由实际视频帧决定；数值越大越占显存。",
+   "target": {"node": "9069", "input": "value", "vtype": "INT"}
+  },
+  {
+   "key": "frame_load_cap", "label": "处理帧数上限", "type": "slider", "min": 1, "max": 241, "step": 8, "default": 241,
+   "hint": "优先尝试 97、121、145 帧；241 为原工作流默认值。短视频使用实际帧数。",
+   "warnAbove": 145, "warning": "超过作者建议的 145 帧范围，遮罩稳定性可能下降。",
+   "target": {"node": "9075", "input": "value", "vtype": "INT"}
+  },
+  {
+   "key": "skip_first_frames", "label": "跳过开头帧数", "type": "number", "min": 0, "default": 0,
+   "target": {"node": "9021", "input": "skip_first_frames", "vtype": "INT"}
+  },
+  {
+   "key": "noise_seed", "label": "采样种子", "type": "number", "min": 0, "max": 9007199254740991, "default": 42,
+   "hint": "保留原工作流种子 42；改成其他整数可尝试不同结果。",
+   "target": {"node": "4832", "input": "noise_seed", "vtype": "INT"}
+  },
+  {
+   "key": "cfg", "label": "提示词引导", "type": "slider", "min": 0, "max": 3, "step": 0.1, "default": 1,
+   "hint": "原工作流为 1，作者建议保持在 1 附近。",
+   "target": {"node": "4828", "input": "cfg", "vtype": "FLOAT"}
+  },
+  {
+   "key": "strength_model", "label": "Alpha LoRA 强度", "type": "slider", "min": 0, "max": 2, "step": 0.05, "default": 1,
+   "target": {"node": "5606", "input": "strength_model", "vtype": "FLOAT"}
+  },
+  {
+   "key": "enhance_prompt", "label": "提示词增强", "type": "select", "default": "off",
+   "options": [{"value": "off", "label": "关闭（原工作流默认）"}, {"value": "on", "label": "开启 Gemma 4 增强"}],
+   "presets": {"off": {"enhance_enabled": false}, "on": {"enhance_enabled": true}},
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "enhance_enabled", "label": "提示词增强开关", "type": "boolean", "default": false, "mirror": true, "advanced": true,
+   "target": {"node": "5556", "input": "switch", "vtype": "BOOLEAN"}
+  },
+  {
+   "key": "tiled_encode", "label": "分块编码（省显存）", "type": "select", "default": "off",
+   "options": [{"value": "off", "label": "关闭（原工作流默认）"}, {"value": "on", "label": "开启"}],
+   "presets": {"off": {"use_tiled_encode": false}, "on": {"use_tiled_encode": true}},
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "use_tiled_encode", "label": "分块编码开关", "type": "boolean", "default": false, "mirror": true, "advanced": true,
+   "target": {"node": "5012", "input": "use_tiled_encode", "vtype": "BOOLEAN"}
+  }
+ ],
+ "warnings": []
+}

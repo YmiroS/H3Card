@@ -107,7 +107,7 @@ SOLO = set()
 # card_enhance（画质增强）走 ROUTE_CARDS，是"放图/放视频切到对应那一路"，这里一并收进来当模式。
 TOOLS = {
     "grid4_stitch", "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "gimmvfi_interp",
-    "depth_image", "depth_video",
+    "depth_image", "depth_video", "alphagen",
 }
 TOOLS_CARD = {"id": "card_tools", "name": "工具箱", "icon": "🧩"}
 
@@ -146,6 +146,7 @@ MODEL_SWITCHES = {
 # Qwen 图生图固定编辑分支；文生图保留双阶段和独立负向输入，防止重扫合并两阶段步数。
 # Qwen 2.1 的图生图模型直接使用16图编辑能力；旧单图能力只保留给历史任务和项目迁移。
 BUNDLED_CAPABILITIES = {
+    "alphagen",
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
 }
@@ -1792,7 +1793,7 @@ def build_tools_card(ms, by_id):
     """
     order = [
         "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "grid4_stitch", "gimmvfi_interp",
-        "depth_image", "depth_video",
+        "depth_image", "depth_video", "alphagen",
     ]
     modes = []
     for wid in order:
@@ -1805,7 +1806,8 @@ def build_tools_card(ms, by_id):
                 mode["modelSwitch"] = choices
             modes.append(mode)
     # 画质增强：那张合并卡的 mode 已经带 route，直接复用
-    if "card_enhance" in ROUTE_CARDS:
+    if "card_enhance" in ROUTE_CARDS and any(
+            wid in by_id for wid in ROUTE_CARDS["card_enhance"]["route"].values()):
         card = route_card_def("card_enhance", ROUTE_CARDS["card_enhance"], by_id)
         if card:
             modes.append(card["modes"][0])

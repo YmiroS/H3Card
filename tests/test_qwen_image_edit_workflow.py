@@ -123,7 +123,10 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
             cards = json.loads((root / "manifests/_cards.json").read_text(encoding="utf-8"))
             image_card = next(c for c in cards if c["id"] == "card_image")
             self.assertEqual({m["id"] for m in image_card["modes"]},
-                             scan_workflows.BUNDLED_CAPABILITIES - {"qwen_image_21_i2i"})
+                             {wid for wid in scan_workflows.BUNDLED_CAPABILITIES
+                              if json.loads((root / "manifests" / f"{wid}.json").read_text(
+                                  encoding="utf-8"))["card"] == "image"}
+                             - {"qwen_image_21_i2i"})
             self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), self.cap)
             self.assertEqual(graph_path.read_bytes(), (ROOT / self.cap["graph"]).read_bytes())
 
