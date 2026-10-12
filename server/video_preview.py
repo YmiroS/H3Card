@@ -163,6 +163,9 @@ class MediaThumbnails:
                 raise web.HTTPServiceUnavailable(text="服务器未找到 FFmpeg")
             if self.source_key(source)[1] != key:
                 raise web.HTTPConflict(text="素材已变化，请重试")
+            # 普通 JPEG 自动探测可能落到 image2；按文件头强制单图解码，不放开序列读取。
+            with source.open("rb") as file:
+                input_format = ["-f", "jpeg_pipe"] if file.read(3) == b"\xff\xd8\xff" else []
             self.directory.mkdir(parents=True, exist_ok=True)
             # 默认 autorotate 在缩放前应用方向元数据；RGBA 保留透明度，尺寸不会放大小图。
             spawn = asyncio.create_task(asyncio.create_subprocess_exec(
@@ -170,7 +173,7 @@ class MediaThumbnails:
                 "-protocol_whitelist", "file,pipe",
                 # 不允许伪装成媒体的播放列表再读取其他本地文件或网络素材。
                 "-format_whitelist", "png_pipe,jpeg_pipe,webp_pipe,bmp_pipe,gif,mov,matroska,webm,avi",
-                "-threads", "1", "-i", str(source),
+                *input_format, "-threads", "1", "-i", str(source),
                 "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
                 "-vf", "scale=w='min(512,iw)':h='min(512,ih)':force_original_aspect_ratio=decrease,setsar=1",
                 "-filter_threads", "1", "-c:v", "png", "-pix_fmt", "rgba", "-threads", "1",
