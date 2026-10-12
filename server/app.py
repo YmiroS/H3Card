@@ -2410,8 +2410,13 @@ async def api_project_card_create(request):
         body = await request.json()
     except (ValueError, UnicodeError):
         raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
-    if not isinstance(body, dict) or set(body) != {"card"} or not isinstance(body["card"], dict):
+    if (not isinstance(body, dict) or set(body) not in ({"card"}, {"card", "rev"})
+            or not isinstance(body["card"], dict)
+            or "rev" in body and (type(body["rev"]) is not int or body["rev"] < 0)):
         raise web.HTTPBadRequest(text="卡片数据不正确")
+    expected_rev = body.get("rev")
+    if expected_rev is not None and expected_rev != project.get("rev", 0):
+        raise web.HTTPConflict(reason="stale rev")
     card = copy.deepcopy(body["card"])
     card_id = card.get("id")
     if (not isinstance(card_id, str) or not card_id or len(card_id) > 128
