@@ -1779,18 +1779,22 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtur
         self.assertEqual(self.job["status"], "queued")
         session = mock.Mock(close=mock.AsyncMock())
         previews = mock.Mock(close=mock.AsyncMock())
+        thumbnails = mock.Mock(close=mock.AsyncMock())
         exports = mock.Mock(close=mock.AsyncMock())
         shutdown = asyncio.create_task(controller_app.on_stop({
             "cleanup_tasks": self.app["cleanup_tasks"], "session": session,
-            "video_previews": previews, "edit_exports": exports,
+            "video_previews": previews, "media_thumbnails": thumbnails,
+            "edit_exports": exports,
         }))
         await self.assert_generation_blocked()
         self.assertFalse(shutdown.done())
         session.close.assert_not_awaited()
+        thumbnails.close.assert_not_awaited()
         self.confirmed.set()
         await stopping
         await shutdown
         session.close.assert_awaited_once()
+        thumbnails.close.assert_awaited_once()
         exports.close.assert_awaited_once()
         self.assertEqual(self.job["status"], "canceled")
 

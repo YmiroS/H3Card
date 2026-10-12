@@ -207,7 +207,11 @@ async def auth_middleware(request, handler):
         response = web.json_response({'error': str(exc)}, status=exc.status)
     except web.HTTPException as exc:
         response = exc
-    response.headers['Cache-Control'] = 'private, no-store'
+    # 只有已经过资源鉴权的缩略图文件允许私有重验证缓存，错误响应仍禁止存储。
+    if request.path == '/api/thumbnail' and isinstance(response, web.FileResponse):
+        response.headers['Cache-Control'] = 'private, no-cache'
+    else:
+        response.headers['Cache-Control'] = 'private, no-store'
     response.headers['Pragma'] = 'no-cache'
     return response
 
