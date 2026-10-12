@@ -684,10 +684,15 @@ async def local_submit(app, graph, prompt_id=None):
             "无法连接本地 ComfyUI，请确认生成后端已启动且能够响应。"))
 
 
-async def collect_outputs(session, pid):
+async def collect_outputs(session, pid, *, wait_history=False):
     async with session.get(f"{COMFY_HTTP}/history/{pid}") as r:
+        r.raise_for_status()
         hist = await r.json()
     entry = hist.get(pid) or {}
+    # None 表示尚未入库；[] 表示已完成但没有可用产物，不能报成功。
+    if wait_history and (pid not in hist or
+                         (entry.get("status") or {}).get("completed") is False):
+        return None
     files = []
     for _node, out in (entry.get("outputs") or {}).items():
         for _k, arr in out.items():
@@ -695,19 +700,117 @@ async def collect_outputs(session, pid):
                 continue
             for it in arr:
                 if isinstance(it, dict) and it.get("filename"):
+                    subfolder = (it.get("subfolder") or "").replace("\\", "/")
                     files.append({
                         "kind": kind_of(it["filename"]),
                         "filename": it["filename"],
-                        "subfolder": it.get("subfolder", ""),
+                        "subfolder": subfolder,
                         "type": it.get("type", "output"),
                         "url": "/api/file?" + urlencode({
                             "filename": it["filename"],
-                            "subfolder": it.get("subfolder", ""),
+                            "subfolder": subfolder,
                             "type": it.get("type", "output")}),
                     })
     # 过滤 ComfyUI 的临时预览
     real = [f for f in files if f["type"] == "output"]
     return real or files
+
+
+LOCAL_OUTPUT_ATTEMPTS = 8
+LOCAL_OUTPUT_TIMEOUT = 5
+LOCAL_OUTPUT_BACKOFF = 0.25
+
+
+def local_completion_live(app, pid, job):
+    return (JOBS.get(pid) is job and job.get("status") in LIVE
+            and not job.get("cleanup_pending")
+            and not (app is not None and app.get("lifecycle", {}).get("shutting_down")))
+
+
+def finish_local_job(app, pid, job, status, outputs=None, error=None):
+    if not local_completion_live(app, pid, job):
+        return
+    job.update(status=status, outputs=outputs or [], ended=time.time(), step="", error=error)
+    if status == "done":
+        job["progress"] = 1.0
+    job.pop("completion_pending", None)
+    STEPS.pop(pid, None)
+    WEIGHTS.pop(pid, None)
+    save_jobs()
+
+
+async def finalize_local_outputs(app, pid, job, outputs):
+    if not local_completion_live(app, pid, job):
+        return
+    if app is not None:
+        acl = await call_store(app, "get_job", pid)
+        project = await call_store(app, "get_project", acl["project_id"]) if acl else None
+        if not local_completion_live(app, pid, job):
+            return
+        if not project or project["state"] != "active":
+            finish_local_job(app, pid, job, "canceled")
+            return
+        for output in outputs:
+            if not local_completion_live(app, pid, job):
+                return
+            await resource_call(app, "register", acl["project_id"], "comfy", output)
+        if not local_completion_live(app, pid, job):
+            return
+        # 登记期间项目可能被删除；回写完成之前再确认项目状态。
+        project = await call_store(app, "get_project", acl["project_id"])
+        if not project or project["state"] != "active":
+            finish_local_job(app, pid, job, "canceled")
+            return
+    finish_local_job(app, pid, job, "done" if outputs else "error", outputs,
+                     None if outputs else "ComfyUI 已完成，但 history 中没有可用产物")
+
+
+def local_completion_waiting(job):
+    return (not CONTROLLER_MODE and not job.get("worker_id")
+            and job.get("status") == "running" and not job.get("cleanup_pending")
+            and (job.get("completion_pending") is True or job.get("step") == "正在取回产物"))
+
+
+def schedule_local_completion(app, session, pid, job):
+    if CONTROLLER_MODE or job.get("worker_id") or not local_completion_live(app, pid, job):
+        return
+    tasks = app.setdefault("local_output_tasks", {})
+    if pid in tasks:
+        return
+    job.update(status="running", progress=max(job.get("progress") or 0.0, 0.99),
+               step="正在取回产物", completion_pending=True)
+    save_jobs()  # 重启只恢复这一类已收到完成事件的任务，不重提生成。
+    tasks[pid] = asyncio.create_task(sync_local_outputs(app, session, pid, job))
+
+
+async def sync_local_outputs(app, session, pid, job):
+    last_error = "history 尚未入库"
+    try:
+        for attempt in range(LOCAL_OUTPUT_ATTEMPTS):
+            if not local_completion_live(app, pid, job):
+                return
+            try:
+                async with asyncio.timeout(LOCAL_OUTPUT_TIMEOUT):
+                    outputs = await collect_outputs(session, pid, wait_history=True)
+            except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+            else:
+                if outputs is not None:
+                    await finalize_local_outputs(app, pid, job, outputs)
+                    return
+                last_error = "history 尚未入库"
+            if not local_completion_live(app, pid, job):
+                return
+            if attempt + 1 < LOCAL_OUTPUT_ATTEMPTS:
+                await asyncio.sleep(LOCAL_OUTPUT_BACKOFF * min(attempt + 1, 4))
+        finish_local_job(app, pid, job, "error",
+                         error=f"取回产物失败（已重试 {LOCAL_OUTPUT_ATTEMPTS} 次）：{last_error}")
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        finish_local_job(app, pid, job, "error", error=f"产物归集失败：{type(exc).__name__}: {exc}")
+    finally:
+        app["local_output_tasks"].pop(pid, None)
 
 
 # =====================================================================
@@ -752,6 +855,12 @@ async def handle_event(session, ev, remote=False, app=None):
             "execution_error", "execution_interrupted", "execution_cached"):
         return
 
+    if job and job.get("completion_pending") and t in (
+            "execution_start", "progress_state", "execution_cached"):
+        return
+    if job and job.get("completion_pending") and t == "executing" and d.get("node") is not None:
+        return
+
     if t == "execution_start" and job:
         job.update(status="running", started=time.time())
         save_jobs()
@@ -761,31 +870,18 @@ async def handle_event(session, ev, remote=False, app=None):
             if remote:
                 job.update(progress=max(job.get("progress") or 0.0, 0.99), step="正在归集产物")
                 return
-            outputs = await collect_outputs(session, pid)
-            if job.get("cleanup_pending") or job["status"] in ("canceled", "error"):
-                return
             if app is not None:
-                acl = await call_store(app, "get_job", pid)
-                project = await call_store(app, "get_project", acl["project_id"]) if acl else None
-                if not project or project["state"] != "active":
-                    job.update(status="canceled", outputs=[], ended=time.time(), step="")
-                    save_jobs()
-                    return
-                for output in outputs:
-                    await resource_call(app, "register", acl["project_id"], "comfy", output)
-            # 权限查询与产物登记期间也可能收到取消，不能把清理中的任务改回完成。
-            if job.get("cleanup_pending") or job["status"] in ("canceled", "error"):
+                schedule_local_completion(app, session, pid, job)
+                return
+            # 无 app 的旧调用者保留一次即时查询；生产 WS 始终走后台同步器。
+            outputs = await collect_outputs(session, pid)
+            if not local_completion_live(app, pid, job):
                 return
             if not outputs and t == "execution_success":
-                # execution_success 可能早于 history 入库；后续 executing(None) 才确认任务已收尾。
                 job.update(status="running", progress=max(job.get("progress") or 0.0, 0.99),
                            step="正在取回产物")
                 return
-            job["outputs"] = outputs
-            job.update(status="done", progress=1.0, ended=time.time(), step="")
-            STEPS.pop(pid, None)
-            WEIGHTS.pop(pid, None)
-            save_jobs()
+            await finalize_local_outputs(app, pid, job, outputs)
         else:
             nid = str(d.get("display_node") or d["node"])
             job["node"] = nid
@@ -1809,9 +1905,8 @@ def save_jobs():
 def load_jobs():
     """启动时读回任务列表。
 
-    当时还在排队 / 运行的一律改成「已取消」+ 一句说明：那个进程已经没了，
-    ComfyUI 那边也早断开，不可能还在跑；留着 running 的话前端会对着一个
-    永远不动的进度条一直轮询。前端认得 canceled，卡片会自己跟着落地。
+    普通排队 / 运行任务仍按中断取消。仅本地已收到完成事件、等待取回产物的
+    任务留给 on_start 的有限重试同步器查 history；绝不重新提交生成。
     """
     if not JOBS_FILE.exists():
         return
@@ -1824,6 +1919,8 @@ def load_jobs():
     for j in rows:
         if j.get("cleanup_pending") and not CONTROLLER_MODE:
             j.update(step="显存释放未确认，请重试取消")
+        elif local_completion_waiting(j):
+            j.update(completion_pending=True, step="正在取回产物")
         elif j.get("status") in LIVE and not CONTROLLER_MODE:
             j.update(status="canceled", step="", ended=j.get("ended") or time.time(),
                      error="抽卡系统重启了，这一轮没跑完（重启前的进度不留，重跑一次就行）")
@@ -2959,13 +3056,19 @@ async def on_start(app):
     else:
         setup_dingtalk(app, app["auth_store"])
     if not CONTROLLER_MODE:
+        for pid, job in JOBS.items():
+            if local_completion_waiting(job):
+                schedule_local_completion(app, app["session"], pid, job)
         app["ws_task"] = asyncio.create_task(ws_loop(app))
 
 
 async def close_presence_connections(app):
-    lifecycle = app.get("lifecycle")
-    if lifecycle is not None:
-        lifecycle["shutting_down"] = True
+    app.setdefault("lifecycle", {})["shutting_down"] = True
+    tasks = app.get("local_output_tasks", {})
+    for task in list(tasks.values()):
+        task.cancel()
+    await asyncio.gather(*list(tasks.values()), return_exceptions=True)
+    tasks.clear()
     presence_rooms = app.get("presence_rooms", {})
     sockets = [entry["ws"] for room in presence_rooms.values() for entry in room.values()]
     presence_rooms.clear()
@@ -2974,8 +3077,8 @@ async def close_presence_connections(app):
 
 
 async def on_stop(app):
-    await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
     await close_presence_connections(app)
+    await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
     await app["video_previews"].close()
     await app["edit_exports"].close()
     task = app.get("ws_task")
@@ -3048,6 +3151,7 @@ def make_app(auth_path=None):
     app["cleanup_pending"] = {pid for pid, job in JOBS.items()
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
+    app["local_output_tasks"] = {}
     app["lifecycle"] = {"shutting_down": False}
     app["local_test"] = local_test
     app["bind_host"] = "127.0.0.1" if local_test else "0.0.0.0"
