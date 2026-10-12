@@ -29,6 +29,7 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
     const el = Object.fromEntries(['stage','world','wires','groups','menu'].map(id => [id,document.getElementById(id)]));
     el.zoomMenu = document.getElementById('zoom-menu'); el.zoomPercent = document.getElementById('zoom-percent');
     const PROJ = {id:'asset-test',cards:[],edges:[]}, CARDS = [{id:'card_asset',kind:'asset',modes:[{id:'asset'}]}], CLIP = null;
+    const H3Auth = {active:true};
     const canOperate = () => true, requireOperate = () => true;
     const api = async (url, options) => { const r = await fetch(url, options); if (!r.ok) throw Error('HTTP ' + r.status); return r.json(); };
     ${block('const projectUploadUrl =', 'async function api(')}
@@ -124,7 +125,10 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
       await page.evaluate(name => setAssetItem(card, {kind:'image',origin:name + '.png',url:'/media/' + name + '.png'}), name);
     }
     async function loaded(name) {
-      await page.waitForFunction(name => imageLoads.includes('/media/' + name + '.png'), name);
+      await page.waitForFunction(name => {
+        const url = '/media/' + name + '.png', img = card._el.querySelector('img');
+        return imageLoads.includes(url) && (card.outputs[0]?.url !== url || (img?.complete && img.naturalWidth > 0));
+      }, name);
     }
 
     for (const [name,width,height] of sizes) await t.test(name + ' image keeps default DOM size and real resolution', async () => {
@@ -199,6 +203,9 @@ test('asset card sizing, metadata, canvas upload and zoom regressions', async (t
       ], {timeout:20000}));
       await page.goto(url);
       await page.evaluate(() => setAssetItem(card, {kind:'video',origin:'clip.mp4',url:'/media/clip.mp4'}));
+      assert.equal(await page.locator('.card video').getAttribute('src'), null, '卡片视频不在首屏预加载');
+      await page.locator('.card video').click();
+      await page.evaluate(() => playCardVideo(card._el.querySelector('video')));
       await page.waitForFunction(() => card.outputs[0].width === 1280 && card._el.querySelector('video').readyState >= 1);
       await checkSize();
       assert.deepEqual(await page.evaluate(() => {
@@ -288,6 +295,7 @@ test('filled asset slots preview on click and replace/download through the conte
       vbox:document.querySelector('.vbox'), picker:document.getElementById('picker')};
     const api = async (url, options) => { const r = await fetch(url, options); if (!r.ok) throw Error('HTTP ' + r.status); return r.json(); };
     const PROJ = {id:'asset-test'}, canOperate = () => true, requireOperate = () => true;
+    const trackNodeWork = work => work;
     ${block('const projectUploadUrl =', 'async function api(')}
     const slotName = s => s.label, gridWord = () => false, modeOf = () => null, tipHide = () => {};
     const toast = message => { throw Error(message); };

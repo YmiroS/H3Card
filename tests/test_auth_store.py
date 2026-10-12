@@ -19,6 +19,29 @@ from server.auth_store import AuthError, AuthStore
 PASSWORD = 'a-long-test-password'
 
 
+class PasswordPolicyTests(unittest.TestCase):
+    def test_length_and_type_limits(self):
+        for value in (None, 12345678, [], '', 'riverpa', 'riverpath' * 114):
+            with self.subTest(value=value), self.assertRaisesRegex(AuthError, '8 至 1024'):
+                AuthStore._password(value)
+        AuthStore._password('riverpath' * 113 + 'abcdefg')
+
+    def test_no_character_class_requirements(self):
+        for value in ('riverpad', 'RIVERPAD', '58294716', '!@#$!@#$',
+                      '今天一起去公园吧', 'Riverpad', ' riverpad '):
+            with self.subTest(value=value):
+                AuthStore._password(value)
+
+    def test_common_sequences_and_repeated_characters_rejected(self):
+        for value in ('12345678', '87654321', '123456789', '0123456789',
+                      '9876543210', 'abcdefgh', 'HGFEDCBA', 'qwertyui',
+                      'asdfghjkl', '11111111', 'AAAAAAAA', '!!!!!!!!',
+                      '        ', 'Password', 'PASSWORD123', 'admin123',
+                      '12341234', '123123123', ' password ', ' 12345678 '):
+            with self.subTest(value=value), self.assertRaisesRegex(AuthError, '密码过于简单'):
+                AuthStore._password(value)
+
+
 class StoreTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -31,6 +54,50 @@ class StoreTests(unittest.TestCase):
     def tearDown(self):
         self.store.close()
         self.tmp.cleanup()
+
+    def test_password_policy_applies_to_all_writes_without_side_effects(self):
+        session = self.store.login('owner', PASSWORD)
+        for value in ('riverpa', '12345678', 'Password', '111111111111'):
+            operations = (
+                lambda: self.store.create_user('new-user', value),
+                lambda: self.store.create_registration('new-user', value, '新人'),
+                lambda: self.store.reset_password(self.owner, value),
+                lambda: self.store.change_password(self.owner, PASSWORD, value, session['token']),
+            )
+            for operation in operations:
+                with self.subTest(value=value), self.assertRaises(AuthError):
+                    operation()
+            self.assertEqual(len(self.store.list_users()), 3)
+            self.assertEqual(self.store.list_registrations(), [])
+            self.assertEqual(self.store.outbox_backlog()['pending'], 0)
+            self.assertIsNotNone(self.store.get_session(session['token']))
+        self.store.login('owner', PASSWORD)
+
+    def test_eight_character_passwords_work_for_all_writes(self):
+        user = self.store.create_user('new-user', 'riverpad')
+        session = self.store.login('new-user', 'riverpad')
+        self.store.change_password(user['id'], 'riverpad', '58294716', session['token'])
+        self.assertIsNone(self.store.get_session(session['token']))
+        session = self.store.login('new-user', '58294716')
+        self.store.reset_password(user['id'], 'mountain')
+        self.assertIsNone(self.store.get_session(session['token']))
+        self.store.login('new-user', 'mountain')
+        request = self.store.create_registration('new-registration', 'riverpad', '新人')
+        self.assertEqual(request['status'], 'pending')
+        card = self.store.registration_card_data(request['request_id'])
+        self.store.decide_registration(card['out_track_id'], 'approved', 'corp', 'approver')
+        self.store.login('new-registration', 'riverpad')
+
+    def test_existing_weak_password_still_logs_in_and_input_is_not_normalized(self):
+        with self.store.lock:
+            self.store.db.execute('UPDATE users SET password_hash=? WHERE id=?',
+                                  (self.store.hasher.hash('111111111111'), self.owner))
+        self.store.login('owner', '111111111111')
+        self.store.change_password(self.owner, '111111111111', ' Riverpad ')
+        self.store.login('owner', ' Riverpad ')
+        for value in ('Riverpad', ' riverpad '):
+            with self.assertRaises(AuthError):
+                self.store.login('owner', value)
 
     def test_sessions_restart_expiry_and_revoke(self):
         session = self.store.login('ADMIN', PASSWORD)
@@ -553,6 +620,34 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         # 测试内没有发件箱 worker：send + update 两条任务保持待投递状态
         self.assertEqual(payload['outbox']['pending'], 2)
         self.client.server.app['dingtalk'] = None
+
+    async def test_eight_character_password_policy_over_http(self):
+        self.client.server.app['dingtalk'] = {'stub': True}
+        session = await self.login()
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        for value, expected in (('12345678', 400), ('riverpad', 201)):
+            response = await self.client.post('/api/auth/register', json={
+                'username': 'new-registration', 'display_name': '新人', 'password': value,
+            }, headers=headers)
+            self.assertEqual(response.status, expected)
+            response = await self.client.post('/api/admin/users', json={
+                'username': 'new-user', 'password': value, 'role': 'user',
+            }, headers=headers)
+            self.assertEqual(response.status, expected)
+        for value, expected in (('Password', 400), ('58294716', 200)):
+            response = await self.client.post(f'/api/admin/users/{self.uid}/password',
+                                              json={'password': value}, headers=headers)
+            self.assertEqual(response.status, expected)
+        for value, expected in (('11111111', 400), ('mountain', 200)):
+            response = await self.client.post('/api/auth/password', json={
+                'current_password': PASSWORD, 'new_password': value,
+            }, headers=headers)
+            self.assertEqual(response.status, expected)
+        self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
+        response = await self.client.post('/api/auth/login', json={
+            'username': 'admin', 'password': 'mountain',
+        }, headers={'Origin': self.origin})
+        self.assertEqual(response.status, 200)
 
     async def test_register_duplicate_and_casefold(self):
         self.client.server.app['dingtalk'] = {'stub': True}

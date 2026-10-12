@@ -79,6 +79,9 @@
       headers.set('X-CSRF-Token', csrf);
     }
     const controller = new AbortController(); controllers.add(controller);
+    const abort = () => controller.abort(options.signal.reason);
+    if (options.signal?.aborted) abort();
+    else options.signal?.addEventListener('abort', abort, {once:true});
     try {
       const response = await fetch(url, {...options, method, headers, credentials:'same-origin', signal:controller.signal});
       const type = response.headers.get('content-type') || '';
@@ -92,7 +95,10 @@
       }
       if (stopped && !anonymous) throw new Error('登录已失效');
       return data;
-    } finally { controllers.delete(controller); }
+    } finally {
+      options.signal?.removeEventListener('abort', abort);
+      controllers.delete(controller);
+    }
   }
   const json = (path, method, body) => request(path, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body || {})});
   async function me() {
@@ -141,9 +147,9 @@
       const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog';
       dialog.innerHTML = '<form><h2>修改密码</h2>'
         + '<label class="fld"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label>'
-        + '<label class="fld"><span>新密码（至少 12 位）</span><input name="new_password" type="password" autocomplete="new-password" required minlength="12"></label>'
-        + '<label class="fld"><span>再输一次新密码</span><input name="confirm_password" type="password" autocomplete="new-password" required minlength="12"></label>'
-        + '<p class="auth-note">保存后当前登录会失效，需要重新登录。</p>'
+        + '<label class="fld"><span>新密码（至少 8 位）</span><input name="new_password" type="password" autocomplete="new-password" required minlength="8"></label>'
+        + '<label class="fld"><span>再输一次新密码</span><input name="confirm_password" type="password" autocomplete="new-password" required minlength="8"></label>'
+        + '<p class="auth-note">密码无需组合大小写、数字或符号，请勿使用 12345678 等常见弱密码。保存后需要重新登录。</p>'
         + '<p role="alert"></p>'
         + '<footer><button type="button" class="btn">取消</button><button type="submit" class="btn primary">保存</button></footer></form>';
       dialog.querySelector('[type=button]').onclick = () => dialog.remove();
