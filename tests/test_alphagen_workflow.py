@@ -71,7 +71,8 @@ class AlphaGenWorkflowTest(unittest.TestCase):
         self.assertEqual(self.graph["5538"]["inputs"]["temporal_size"], 128)
         self.assertEqual(self.graph["5538"]["inputs"]["temporal_overlap"], 32)
         self.assertEqual(self.graph["9075"]["inputs"]["value"], 241)
-        self.assertEqual(self.graph["9069"]["inputs"]["value"], 1088)
+        self.assertEqual(self.graph["9069"]["inputs"]["value"], 576)
+        self.assertEqual(next(s for s in self.cap["inputs"] if s["key"] == "shorter_size")["default"], 576)
         self.assertNotIn("GemmaAPITextEncode", {n["class_type"] for n in self.graph.values()})
 
     def test_parameters_reach_actual_connected_nodes(self):

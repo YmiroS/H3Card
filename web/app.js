@@ -101,7 +101,7 @@ async function api(path, opt = {}) {
 }
 function clearProject() {
   clearTimeout(saveTimer); clearTimeout(viewTimer); saveTimer = null; viewTimer = null; disconnectPresence();
-  PROJ = null; selId = null; selIds.clear(); pendingProjectSync = null;
+  PROJ = null; selId = null; selIds.clear(); pendingProjectSync = null; resetCanvasHistory();
   closePanel(); closeHistory(); closeViewer(); closeMenu(); closeJobs(); closeResPop();
   el.groups.replaceChildren(); el.selbar.style.display = 'none'; showEmpty();
   if (NODE_EDITOR) restoreNodeEditor();
@@ -1398,6 +1398,7 @@ async function openProject(pid) {
       c.params.text = c.out;
     }
   }
+  resetCanvasHistory();
   view = Object.assign({ x: 60, y: 70, k: 1 }, PROJ.view || {});
   selId = null;
   selIds.clear();
@@ -1433,6 +1434,80 @@ function showEmpty() {
 /** 节点对象上挂了 _el（DOM），序列化前必须剥掉，否则 JSON 循环引用 */
 const plain = (c) => Object.fromEntries(Object.entries(c).filter(([k]) => k[0] !== "_"));
 
+// Only canvas edits enter this history. Job polling, generated output and collaborator updates do not.
+const EDIT_FIELDS = ["type", "cap", "name", "x", "y", "w", "h", "params", "assets", "opt"];
+let canvasUndo = [], canvasRedo = [], editBefore = null, editKind = null;
+function resetCanvasHistory() { canvasUndo = []; canvasRedo = []; editBefore = null; editKind = null; }
+function canvasSnapshot() {
+  return { cards: PROJ.cards.map(c => JSON.parse(JSON.stringify(plain(c)))),
+    edges: JSON.parse(JSON.stringify(PROJ.edges)), groups: JSON.parse(JSON.stringify(PROJ.groups || [])) };
+}
+function editableSnapshot(snapshot) {
+  return JSON.stringify({ cards: snapshot.cards.map(c => {
+    const fields = Object.fromEntries(EDIT_FIELDS.filter(k => c[k] !== undefined).map(k => [k, c[k]]));
+    fields.id = c.id;
+    if (c.type === "card_asset") fields.outputs = c.outputs;
+    return fields;
+  }), edges: snapshot.edges, groups: snapshot.groups });
+}
+function beginCanvasEdit(kind = "action") {
+  if (!PROJ || !canOperate() || NODE_EDITOR || editBefore) return;
+  editBefore = canvasSnapshot(); editKind = kind;
+}
+function recordCanvasEdit() {
+  if (!editBefore || !PROJ) return;
+  const after = canvasSnapshot(), before = editBefore, kind = editKind;
+  editBefore = null; editKind = null;
+  if (editableSnapshot(before) === editableSnapshot(after)) return;
+  const last = canvasUndo[canvasUndo.length - 1];
+  if (kind === "typing" && last?.kind === "typing" && Date.now() - last.at < 1000)
+    last.after = after;
+  else {
+    canvasUndo.push({ before, after, kind, at: Date.now() });
+    if (canvasUndo.length > 80) canvasUndo.shift();
+  }
+  canvasRedo = [];
+}
+function applyCanvasSnapshot(snapshot) {
+  const current = new Map(PROJ.cards.map(c => [c.id, c]));
+  PROJ.cards = snapshot.cards.map(saved => {
+    const live = current.get(saved.id);
+    if (!live) return JSON.parse(JSON.stringify(saved));
+    const restored = live;
+    for (const field of EDIT_FIELDS) {
+      if (field in saved) restored[field] = JSON.parse(JSON.stringify(saved[field]));
+      else delete restored[field];
+    }
+    if (saved.type === "card_asset") restored.outputs = JSON.parse(JSON.stringify(saved.outputs || []));
+    return restored;
+  });
+  PROJ.edges = JSON.parse(JSON.stringify(snapshot.edges));
+  PROJ.groups = JSON.parse(JSON.stringify(snapshot.groups));
+  selEdge = null;
+  selIds = new Set([...selIds].filter(id => PROJ.cards.some(c => c.id === id)));
+  if (selId && !PROJ.cards.some(c => c.id === selId)) { selId = null; closePanel(); }
+  render();
+  if (selId) openPanel(selId);
+  save();
+}
+function canvasHistoryStep(redo = false) {
+  if (!PROJ || !canOperate() || NODE_EDITOR) return;
+  recordCanvasEdit();
+  const source = redo ? canvasRedo : canvasUndo, target = redo ? canvasUndo : canvasRedo;
+  const entry = source.pop();
+  if (!entry) return;
+  target.push(entry);
+  applyCanvasSnapshot(redo ? entry.after : entry.before);
+}
+// Capture before browser controls and canvas gestures mutate the model, not in save():
+// save() is also called by asynchronous GPU completion.
+for (const event of ["pointerdown", "keydown", "beforeinput", "paste", "drop", "change"]) {
+  document.addEventListener(event, ev => {
+    if (!PROJ || NODE_EDITOR || !canOperate() || (ev.type === "keydown" && ((ev.ctrlKey || ev.metaKey) && /^(z|y)$/i.test(ev.key)))) return;
+    beginCanvasEdit(ev.type === "beforeinput" ? "typing" : "action");
+  }, true);
+}
+
 /** 保存串行化：两次 PUT 撞在一起会带同一个 rev，后一次要被服务端顶掉 */
 let saveChain = Promise.resolve();
 let viewSaveChain = Promise.resolve();
@@ -1454,7 +1529,8 @@ function saveView() {
   }, 400);
 }
 
-function save() {
+function save(userEdit = true) {
+  if (userEdit) recordCanvasEdit();
   if (!canSave()) return;
   // 示例是只读的：拖节点、改参数、重跑都随便，但只活在这一次打开里，刷新就回到那份固定的示例。
   // 这里直接不发请求（服务端也会回 403），否则每动一下就弹一次「保存失败」
@@ -1680,6 +1756,8 @@ function applyCollaborativeProject(project) {
   PROJ.rev = project.rev;
   PROJ.updated = project.updated;
   PROJ.director = project.director;
+  // 远端版本不是本地用户操作，旧快照不能覆盖协作者刚提交的内容。
+  resetCanvasHistory();
   for (const card of PROJ.cards) seedHistory(card);
   if (selId && !PROJ.cards.some(card => card.id === selId)) selId = null;
   selIds = new Set([...selIds].filter(id => PROJ.cards.some(card => card.id === id)));
@@ -3224,6 +3302,12 @@ function bindGlobal() {
     const t = ev.target, tag = (t.tagName || "").toLowerCase();
     const typing = tag === "input" || tag === "textarea" || tag === "select" || t.isContentEditable;
     if (PROJ && !NODE_EDITOR && !typing && el.view.style.display === "none") {
+      const canvasModifier = /Mac/i.test(navigator.platform) ? ev.metaKey && !ev.ctrlKey : ev.ctrlKey && !ev.metaKey;
+      if (canvasModifier && !ev.altKey && ['z', 'y'].includes(ev.key.toLowerCase())) {
+        ev.preventDefault();
+        canvasHistoryStep(ev.key.toLowerCase() === 'y' || ev.shiftKey);
+        return;
+      }
       const c = cardOf(selId);
       if (!canOperate() && (['Delete','Backspace'].includes(ev.key) || ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'v'))) { ev.preventDefault(); return; }
       if (ev.key === "Delete" || ev.key === "Backspace") {
@@ -3889,6 +3973,15 @@ function queueCardCreate(card, preserveLocal = false) {
         mergeCollaborativeCard(remote, result.project.rev);
       } else {
         if (PROJ?.id !== projectId) return false;
+        if (!project.cards.includes(card)) {
+          // Undo may have removed the optimistic card (or redo restored a new object)
+          // while the creation request was in flight. Keep the server revision without
+          // resurrecting the old object, so the queued undo save can succeed.
+          const remote = result.project.cards.find(item => item.id === card.id);
+          if (project.cards.some(item => item.id === card.id)) mergeCollaborativeCard(remote, result.project.rev);
+          else PROJ.rev = Math.max(PROJ.rev || 0, result.project.rev || 0);
+          return false;
+        }
         reconcileCreatedCard(result.project, card);
       }
       return true;
@@ -3925,10 +4018,12 @@ function addCard(type, x, y, cap, select = true) {
   const baseLabel = def.name || def.modes[0].name;
   c.name = `${baseLabel}${maxNum + 1}`;
 
+  beginCanvasEdit();
   PROJ.cards.push(c);
   el.world.appendChild(buildCard(c));
   if (select) pick(c.id);
   drawWires(); c._create = queueCardCreate(c, !select);
+  queueMicrotask(recordCanvasEdit);
   return c;
 }
 
@@ -7113,7 +7208,7 @@ async function runCard(c) {
   }
   if (c.director_shot) pendingDirectorRuns = Math.max(0, pendingDirectorRuns - 1);
   paint(c); if (el.panel._id === c.id) openPanel(c.id);
-  save(); flushPendingProjectSync();
+  save(false); flushPendingProjectSync();
 }
 
 async function cancel(c) {
@@ -7193,7 +7288,7 @@ async function pollJobs() {
       if (c.status === "error") toast(c.error || "生成失败");
     }
   }
-  if (dirty) save();
+  if (dirty) save(false);
 }
 
 /* ================= 任务浮窗 ================= */
