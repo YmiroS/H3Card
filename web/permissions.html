@@ -21,12 +21,12 @@
 <section class="perm-section" aria-labelledby="accounts-heading">
   <div class="perm-description">
     <h2 id="accounts-heading">账号</h2>
-    <p class="auth-note">创建后把初始密码告诉本人；密码在本人首次登录后可自行修改。</p>
+    <p class="auth-note">密码至少 8 位，无需组合大小写、数字或符号，请勿使用 12345678 等常见弱密码。创建后把初始密码告诉本人，登录后可自行修改。</p>
   </div>
   <div class="perm-content">
   <form id="create" class="form-row">
     <label class="fld"><span>账号名</span><input name="username" autocomplete="off" required></label>
-    <label class="fld"><span>初始密码</span><input name="password" type="password" autocomplete="new-password" required minlength="12"></label>
+    <label class="fld"><span>初始密码</span><input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
     <label class="fld"><span>角色</span><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
     <label class="fld"><span>项目组权限</span><span><input name="team_leader" type="checkbox"> 组长</span></label>
     <button class="btn primary">创建账号</button>
@@ -180,7 +180,7 @@ async function refresh() {
     button(acts,'重置密码', async () => {
       const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog';
       dialog.innerHTML = '<form><h2>重置 <b></b> 的密码</h2>'
-        + '<label class="fld"><span>新密码（至少 12 位）</span><input type="password" name="password" autocomplete="new-password" required minlength="12"></label>'
+        + '<label class="fld"><span>新密码（至少 8 位）</span><input type="password" name="password" autocomplete="new-password" required minlength="8"></label>'
         + '<p role="alert"></p><footer><button type="button" class="btn">取消</button><button class="btn primary">确认重置</button></footer></form>';
       dialog.querySelector('h2 b').textContent = user.username;
       dialog.querySelector('[type=button]').onclick = () => dialog.remove();
