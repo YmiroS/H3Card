@@ -139,6 +139,11 @@
     }
    },
    {
+    "id": "alphagen",
+    "name": "AlphaGen",
+    "slots": "img0+aud0+vid1"
+   },
+   {
     "id": "card_enhance",
     "name": "画质增强",
     "slots": "image/video",
