@@ -1630,6 +1630,30 @@ class DirectorBridgeApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthF
             self.assertEqual(project["cards"], [])
             self.assertNotIn("director", project)
 
+    async def test_card_restore_create_requires_current_expected_revision(self):
+        response = await self.client.put("/api/projects/p", json={
+            "rev": 0, "cards": [], "edges": [], "groups": [],
+        })
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())["rev"], 1)
+        card = {
+            "id": "restored-card", "type": "card_image", "cap": "zimage_t2i",
+            "name": "撤销恢复", "x": 10, "y": 20,
+            "params": {"prompt": "必须保留"}, "assets": {}, "outputs": [],
+        }
+        before = self.project_path.read_bytes()
+        stale = await self.client.post("/api/projects/p/cards", json={"card": card, "rev": 0})
+        self.assertEqual(stale.status, 409, await stale.text())
+        self.assertEqual(self.project_path.read_bytes(), before)
+
+        restored = await self.client.post("/api/projects/p/cards", json={"card": card, "rev": 1})
+        self.assertEqual(restored.status, 200, await restored.text())
+        payload = await restored.json()
+        self.assertEqual(payload["project"]["rev"], 2)
+        self.assertEqual(payload["card"]["id"], card["id"])
+        self.assertEqual(payload["card"]["params"], card["params"])
+        self.assertEqual(self.read_project()["cards"][0]["id"], card["id"])
+
     async def test_operator_is_recorded_as_new_card_author_not_project_owner(self):
         operator = self.auth.create_user("operator", auth_support.PASSWORD)
         self.auth.set_grant(operator["id"], self.admin["id"], "operate")

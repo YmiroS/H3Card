@@ -159,7 +159,27 @@ async function fixtureServer(videoBytes, audioBytes) {
     if (!['GET','HEAD','OPTIONS'].includes(req.method)) {
       state.writes.push(record);
       let body = ''; req.on('data', bytes => { body += bytes; });
-      req.on('end', () => { record.body = body; json(res,{ok:true,rev:2}); });
+      req.on('end', () => {
+        record.body = body;
+        const project = state.projects.find(item => item.id === 'undo_restore');
+        if (project && url.pathname === '/api/projects/undo_restore' && req.method === 'PUT') {
+          const update = JSON.parse(body);
+          if (update.rev !== project.rev) return json(res,{error:'stale rev'},409);
+          const current = new Set(project.cards.map(card => card.id));
+          if (update.cards.some(card => !current.has(card.id))) return json(res,{error:'cards must be created separately'},409);
+          Object.assign(project,{cards:clone(update.cards),edges:clone(update.edges),groups:clone(update.groups),rev:project.rev+1});
+          return json(res,{ok:true,rev:project.rev});
+        }
+        if (project && url.pathname === '/api/projects/undo_restore/cards' && req.method === 'POST') {
+          const update = JSON.parse(body);
+          if (update.rev !== project.rev) return json(res,{error:'stale rev'},409);
+          const incoming = update.card;
+          const card = {...clone(incoming),created_by:'tester',created_by_name:'tester',created_at:123};
+          project.cards.push(card); project.rev++;
+          return json(res,{ok:true,card,project:clone(project)});
+        }
+        json(res,{ok:true,rev:2});
+      });
       return;
     }
     const delayed = callback => {
@@ -462,6 +482,44 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
         assert.equal(await page.locator('#world .card').count(),2);
         assert.deepEqual(await outputs(page),before);
         await quietWrites(page,state);
+      });
+    });
+
+    await t.test('删除保存后真实 Ctrl+Z 恢复节点，不被建卡约束误判为远端冲突', async () => {
+      const p = smallProject('undo_restore',['image','image']);
+      p.cards[0].params.prompt = '撤销必须保留';
+      p.edges = [{from:p.cards[0].id,to:p.cards[1].id,slot:'image'}];
+      p.groups = [{id:'undo_group',name:'撤销组',cards:p.cards.map(card => card.id)}];
+      await withPage([p],async (page,state) => {
+        await settle(page);
+        const projectPath = '/api/projects/undo_restore';
+        const deleted = page.waitForResponse(response => new URL(response.url()).pathname === projectPath
+          && response.request().method() === 'PUT' && response.status() === 200);
+        await page.locator(`[data-id="${p.cards[0].id}"] .x`).click();
+        await deleted;
+        assert.equal(state.projects[0].cards.length,1,'删除必须先真实落盘，才能覆盖本次竞态');
+        assert.equal(state.projects[0].rev,2);
+
+        const restored = page.waitForResponse(response => new URL(response.url()).pathname === projectPath
+          && response.request().method() === 'PUT' && response.status() === 200);
+        await page.keyboard.press('Control+z');
+        await restored;
+        await page.waitForFunction(() => PROJ.rev === 4 && cardOf('undo_restore_0')?.params.prompt === '撤销必须保留');
+        await settle(page);
+
+        assert.equal(await page.locator('#world .card').count(),2);
+        assert.equal(await page.locator(`[data-id="${p.cards[0].id}"]`).count(),1);
+        assert.deepEqual(await page.evaluate(() => ({
+          prompt:cardOf('undo_restore_0').params.prompt,
+          edges:PROJ.edges,groups:PROJ.groups,
+          conflict:el.toast.textContent.includes('画布在别处被改过'),
+        })),{prompt:'撤销必须保留',edges:p.edges,groups:p.groups,conflict:false});
+        assert.deepEqual(state.projects[0].cards.map(card => card.id),p.cards.map(card => card.id));
+        assert.deepEqual(state.projects[0].edges,p.edges);
+        assert.deepEqual(state.projects[0].groups,p.groups);
+        assert.deepEqual(state.writes.map(write => [write.method,write.path]),[
+          ['PUT',projectPath],['PUT',projectPath],['POST',projectPath+'/cards'],['PUT',projectPath],
+        ]);
       });
     });
 
