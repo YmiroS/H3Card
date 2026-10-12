@@ -134,8 +134,23 @@ class AuthStore:
 
     @staticmethod
     def _password(password):
-        if not isinstance(password, str) or not 12 <= len(password) <= 1024:
-            raise AuthError('密码长度须为 12 至 1024 个字符')
+        if not isinstance(password, str) or not 8 <= len(password) <= 1024:
+            raise AuthError('密码长度须为 8 至 1024 个字符')
+        # 仅在弱密码检查时忽略大小写和首尾空白，哈希及登录仍使用原始密码。
+        candidate = password.strip().casefold()
+        common = {
+            'password', 'password1', 'password123', 'password1234', 'passw0rd',
+            'admin123', 'admin1234', 'admin12345', 'admin123456',
+            'qwerty123', 'qwertyuiop', 'abc12345', 'abc123456',
+            '123456abc', '123456789a', '1234567890', '123123123', '12341234',
+            'iloveyou', 'letmein123', 'welcome1', 'welcome123',
+        }
+        sequences = ('01234567890', 'abcdefghijklmnopqrstuvwxyz',
+                     'qwertyuiop', 'asdfghjkl', 'zxcvbnm')
+        if (not candidate or len(set(candidate)) == 1 or candidate in common
+                or any(candidate in sequence or candidate in sequence[::-1]
+                       for sequence in sequences)):
+            raise AuthError('密码过于简单，请勿使用常见弱密码、连续序列或全相同字符')
 
     @staticmethod
     def _role(role):

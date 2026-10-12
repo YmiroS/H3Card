@@ -104,7 +104,7 @@ test('video previews play in browser while assets keep original URLs and refs', 
 
 test('all video entry points use the shared preview loader', () => {
   assert.equal((source.match(/<video data-video-url=/g) || []).length, 4);
-  for (const call of ['prepareVideos(body)', 'prepareVideos(rg)', 'prepareVideos(box)',
+  for (const call of ['prepareCardMedia(body, outs, cmp)', 'prepareVideos(rg)', 'prepareVideos(box)',
     'prepareVideo(m, out.url)', 'prepareVideo(video, data.url)', 'prepareVideo(v, item.url)']) {
     assert.ok(source.includes(call), call);
   }
