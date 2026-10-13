@@ -57,6 +57,37 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.get('/permissions.html')).status, 404)
         self.assertEqual((await self.client.get('/app.js')).status, 200)
 
+    async def test_auth_page_assets_are_explicitly_public(self):
+        self.client.session.cookie_jar.clear()
+        for route in ('/login', '/login.html'):
+            response = await self.client.get(route, allow_redirects=False)
+            self.assertEqual(response.status, 200)
+            html = await response.text()
+            self.assertIn('id="register-panel"', html)
+            self.assertIn('/auth-page.css', html)
+            self.assertNotIn('id="register-dialog"', html)
+        assets = {
+            '/auth-page.css': 'text/css',
+            '/auth-art.webp': 'image/webp',
+            '/auth-logo.png': 'image/png',
+            '/icon.png': 'image/png',
+            '/favicon.png?v=ck05': 'image/png',
+        }
+        for route, content_type in assets.items():
+            with self.subTest(route=route):
+                response = await self.client.get(route, allow_redirects=False)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.content_type, content_type)
+                self.assertGreater(len(await response.read()), 0)
+        # 只开放精确资源名，目录及其它页面仍需鉴权。
+        for route in ('/web/auth-art.webp', '/auth-page.css.map', '/auth_store.py', '/app.js'):
+            with self.subTest(route=route):
+                response = await self.client.get(route, allow_redirects=False)
+                self.assertIn(response.status, (302, 401, 404))
+                self.assertNotEqual(response.status, 200)
+        self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
+        self.assertEqual((await self.client.get('/api/projects')).status, 401)
+
     async def test_project_crud_permission_flow(self):
         bob = self.auth.create_user('bob', PASSWORD)
         created = await (await self.client.post(
