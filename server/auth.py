@@ -14,7 +14,14 @@ from aiohttp import web
 from .auth_store import AuthError
 
 COOKIE = 'h3card_session'
-PUBLIC = {'/login', '/login.html', '/auth.js', '/style.css', '/favicon.png', '/icon.png'}
+AUTH_ASSETS = {
+    '/favicon.png': 'image/png',
+    '/icon.png': 'image/png',
+    '/auth-page.css': 'text/css',
+    '/auth-art.webp': 'image/webp',
+    '/auth-logo.png': 'image/png',
+}
+PUBLIC = {'/login', '/login.html', '/auth.js', '/style.css', *AUTH_ASSETS}
 ADMIN_PAGES = {'/controller', '/controller.html', '/controller/costs', '/costs.html',
                '/controller/capacity', '/capacity.html',
                '/admin/permissions', '/permissions.html'}
@@ -436,14 +443,14 @@ def register_auth_routes(app, web_root):
     async def public_asset(request):
         # 白名单内的公共静态资源（图标等）；根目录静态兜底已移除，必须有显式路由。
         name = request.path.lstrip('/')
-        if '/' + name not in PUBLIC:
+        if request.path not in AUTH_ASSETS:
             raise web.HTTPNotFound()
-        return web.FileResponse(root / name)
+        return web.FileResponse(root / name, headers={'Content-Type': AUTH_ASSETS[request.path]})
 
     app.router.add_get('/login', login_page)
     app.router.add_get('/login.html', login_page)
     app.router.add_get('/auth.js', auth_script)
-    for asset in ('/favicon.png', '/icon.png'):
+    for asset in AUTH_ASSETS:
         app.router.add_get(asset, public_asset)
     app.router.add_get('/api/auth/me', me)
     app.router.add_post('/api/auth/login', login)
