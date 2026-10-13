@@ -523,7 +523,8 @@ const deletion = [
   block('const STYLE_SLOT =', '/* ================= 文本节点片'),
   block('function mediaSlotsForOutputs(', '/** 用户手动换掉某一格'),
   block('function askDelMany(', '\nfunction pickEdge('),
-  block('function delCard(', '/** Delete 键删节点'),
+  block('function delCard(', '/** 单节点删除统一确认'),
+  block('function askDelCard(', '/** Ctrl+C 存下的那个节点'),
 ].join('\n');
 function deletionFixture() {
   const fixture = geometryFixture(), s = fixture.context, calls = fixture.calls;
@@ -548,6 +549,7 @@ function deletionFixture() {
     calls[name] = 0; s[name] = () => calls[name]++;
   }
   s.cardOf = id => s.PROJ?.cards.find(c => c.id === id) || null;
+  s.titleOf = c => c.id;
   s.capOf = () => ({inputs:[0,1,2,3,4].map(i => ({key:`image[${i}]`,type:'image'}))});
   s.paintKind = c => s.painted.push(c.id);
   s.toast = text => s.toasts.push(text);
@@ -613,6 +615,40 @@ test('单节点删除：委托同一批量函数，仅移除指定节点，保�
   s.delCards = ids => { delegated.push([...ids]); return 7; };
   assert.equal(s.delCard('b'), 7);
   assert.deepEqual(delegated, [['b']], '单节点入口必须调用批量原语');
+});
+
+test('单节点确认：无产物节点也必须确认，取消不删、确认后才删除', () => {
+  for (const accept of [false,true]) {
+    const {context:s,calls} = deletionFixture(), card = s.cardOf('a');
+    card.outputs = []; card.history = [];
+    const before = deletionState(s);
+    s.confirm = message => { s.confirmations.push(message); return accept; };
+    s.askDelCard(card);
+    assert.equal(s.confirmations.length,1);
+    assert.match(s.confirmations[0],/删除「a」/);
+    assert.match(s.confirmations[0],/不能撤销/);
+    assert.match(s.confirmations[0],/不会删除素材文件/);
+    assert.deepEqual([calls.render,calls.save],accept ? [1,1] : [0,0]);
+    if (!accept) assert.deepEqual(deletionState(s),before);
+    else assert.deepEqual(Array.from(s.PROJ.cards,c => c.id),['b','c','outside']);
+    assert.deepEqual(plain(s.toasts),accept ? ['已删除「a」'] : []);
+  }
+});
+
+test('单节点确认：确认期间撤权、换画布或节点消失时不得误删', () => {
+  for (const change of ['permission','project','deleted']) {
+    const {context:s,calls} = deletionFixture(), original = s.PROJ, card = s.cardOf('a'), before = plain(s.PROJ);
+    s.confirm = () => {
+      if (change === 'permission') s.allowed = false;
+      if (change === 'project') s.PROJ = {...s.PROJ};
+      if (change === 'deleted') s.PROJ.cards = s.PROJ.cards.filter(item => item !== card);
+      return true;
+    };
+    s.askDelCard(card);
+    if (change !== 'deleted') assert.deepEqual(plain(original),before,change);
+    assert.deepEqual([calls.render,calls.save], [0,0]);
+    assert.deepEqual(plain(s.toasts),[]);
+  }
 });
 
 test('批量确认：一次确认按有效节点计数，取消完全不改项目和选择', () => {
@@ -1059,6 +1095,28 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           saved,rendered,viewSaved,panelClosed,historyClosed,view:{...view},
           domIds:[...el.world.querySelectorAll('.card')].map(c => c.dataset.id),
         }));
+        await t.test('节点右上角删除按钮：无产物也确认，取消保留、确认才删除', async () => {
+          await reset();
+          await page.evaluate(() => { cardOf('a').outputs = []; cardOf('a').history = []; });
+          const before = await deletionSnapshot();
+          const button = page.locator('.card[data-id="a"] .ch .x');
+          const resolveDelete = async accept => {
+            const dialogPromise = page.waitForEvent('dialog'), pending = button.click();
+            const dialog = await dialogPromise;
+            assert.equal(dialog.type(),'confirm');
+            assert.match(dialog.message(),/删除「a」/);
+            assert.match(dialog.message(),/不能撤销/);
+            assert.match(dialog.message(),/不会删除素材文件/);
+            await (accept ? dialog.accept() : dialog.dismiss());
+            await pending;
+          };
+          await resolveDelete(false);
+          assert.deepEqual(await deletionSnapshot(),before,'取消后画布和节点必须保持不变');
+          await resolveDelete(true);
+          assert.deepEqual(await page.evaluate(() => ({ids:PROJ.cards.map(c => c.id),dom:[...el.world.querySelectorAll('.card')].map(c => c.dataset.id),saved})),
+            {ids:['b','c'],dom:['b','c'],saved:1});
+        });
+
         async function lassoDeletionFixture() {
           await reset();
           await page.evaluate(() => {
