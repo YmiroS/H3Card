@@ -258,13 +258,24 @@ async function positionMatrix(page,end=false) {
 async function assertQuietModelCells(page) {
   const cells=page.locator('#summary-machines .business-row [data-label="模型名称"], #summary-machines .business-row [data-label="模型精度"]');
   assert.ok(await cells.count()>0);
-  assert.equal(await cells.locator('.warn, .model-origin').count(),0,'模型两列不能保留黄色来源或警告节点');
-  const colors=await cells.evaluateAll(cells=>cells.flatMap(cell=>[cell,...cell.querySelectorAll('*')].filter(node=>node.textContent.trim()).map(node=>({text:node.textContent,color:getComputedStyle(node).color,context:node.classList.contains('model-context')}))));
+  assert.equal(await cells.locator('.warn, .model-origin, .model-role, .model-context, .model-coverage').count(),0,'模型两列不能残留来源、角色、组合、覆盖或警告节点，包括隐藏节点');
+  for(const cell of await cells.all()) {
+    const leaves=cell.locator('.model-name, .model-label, .muted');
+    assert.equal(await cell.textContent(),(await leaves.allTextContents()).join(''),'名称和精度之外不能存在可见或隐藏的说明文字');
+    assert.ok(await leaves.evaluateAll(nodes=>nodes.every(node=>node.childElementCount===0)),'名称和精度须为纯文本叶节点');
+  }
+  const colors=await cells.evaluateAll(cells=>cells.flatMap(cell=>[cell,...cell.querySelectorAll('*')].filter(node=>node.textContent.trim()).map(node=>({text:node.textContent,color:getComputedStyle(node).color}))));
   for(const item of colors) {
     const rgb=item.color.match(/[\d.]+/g).slice(0,3).map(Number),[r,g,b]=rgb;
     assert.equal(r>140 && g>90 && b<Math.min(r,g)*.85,false,'模型列不得计算成黄色：'+item.color+' '+item.text);
-    if(item.context)assert.ok(Math.max(...rgb)-Math.min(...rgb)<=32,'简短模型上下文应使用灰色：'+item.color);
   }
+}
+async function assertModelLabels(row,names,labels) {
+  const nameCell=row.locator('[data-label="模型名称"]'),precisionCell=row.locator('[data-label="模型精度"]');
+  assert.deepEqual(await nameCell.locator('.model-name').allTextContents(),names);
+  assert.deepEqual(await precisionCell.locator('.model-item').evaluateAll(nodes=>nodes.map(node=>[...node.querySelectorAll('.model-label')].map(label=>label.textContent))),labels);
+  assert.equal(await nameCell.textContent(),names.length?names.join(''):'未获取到模型信息');
+  assert.equal(await precisionCell.textContent(),labels.length?labels.flat().join(''):'无');
 }
 
 test('产能看板语法与离线路由专项', async t => {
@@ -447,15 +458,16 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(await page.locator('#summary-machines table').count(),0);assert.match(await page.locator('#summary-machines .empty').innerText(),/当前没有在线机器/);
       await page.locator('#include-offline').check();assert.equal(await page.locator('#summary-machines thead .machine-heading').count(),4);await assertComparisonTable(page);assert.deepEqual(state.errors,[]);
     });
-    await t.test('所有模型状态两列均无黄色警告，单一部分历史链仍灰色标明且详情保留原文',async()=>{
+    await t.test('所有模型状态两列仅名称与精度，部分历史链说明只在详情保留原文',async()=>{
       const input=evidenceFixture();
       input.groups.push({...input.groups[2],id:'single-incomplete',model_evidence:{total_samples:3201,recorded_samples:10,variants:[input.groups[2].model_evidence.variants[1]]}});
       const {page,state}=await setup({data:input}),row=page.locator('.business-row');
       for(const group of input.groups) {await row.locator('select').selectOption(group.id);await assertQuietModelCells(page);}
-      for(const label of ['模型名称','模型精度'])assert.deepEqual(await row.locator(`[data-label="${label}"] .model-context`).allTextContents(),['部分模型，详见详情']);
-      assert.match(await row.innerText(),/模型记录覆盖 10 \/ 3,201 次/);assert.doesNotMatch(await row.innerText(),/任务组合|不完整 \/ 未确认完整主模型链/);
+      await assertModelLabels(row,['other-task-fp16.safetensors'],[['FP16']]);
+      assert.doesNotMatch(await row.textContent(),/模型记录覆盖|部分模型|任务组合|不完整 \/ 未确认完整主模型链/);
       assert.match(await row.locator('[data-label="平均生成时间"] .warn').innerText(),/全组历史任务平均，非某个模型或组合专属速度/);
       await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/模型记录覆盖 10 \/ 3,201 次/);
       assert.match(await detail.innerText(),/历史任务记录组合 1 · 任务提交记录 · 10 次记录 \/ 7 次成功耗时/);
       assert.match(await detail.innerText(),/不完整 \/ 未确认完整主模型链；动态选择或未知链路不能推断全部主模型/);
       await assertQuietModelCells(page);assert.deepEqual(state.errors,[]);
@@ -473,12 +485,14 @@ test('产能看板语法与离线路由专项', async t => {
       const row=page.locator('td.machine-result[data-summary-worker-id=w1] .business-row[data-capability=depth_video]'),select=row.locator('select');
       assert.equal(await select.inputValue(),'c1');assert.equal(await select.locator('option').count(),3);
       const names=await select.locator('option').allTextContents();assert.equal(new Set(names).size,3);assert.ok(names.every(n=>!n.includes('depth-5s')));assert.match(names[0],/规格未完整记录/);
-      assert.match(await row.innerText(),/1 分 18 秒/);assert.match(await row.innerText(),/INT8/);assert.match(await row.innerText(),/仅 10 次 \/ 仅供参考/);assert.match(await row.innerText(),/模型文件标记，非运行时检测/);
+      assert.match(await row.innerText(),/1 分 18 秒/);await assertModelLabels(row,['sample-main-int8.safetensors'],[['INT8']]);assert.match(await row.innerText(),/仅 10 次 \/ 仅供参考/);
       await row.locator('button').click();let detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
-      for(const value of ['P90：1 分 38 秒','采集业务样本','sample-main-int8.safetensors','警告一','警告二','总样本 12','失败 1','取消 1','缓存条件','配置编号：config-1'])assert.ok((await detail.innerText()).includes(value),value);
+      for(const value of ['P90：1 分 38 秒','采集业务样本','sample-main-int8.safetensors','文件标记 INT8','非运行时检测','警告一','警告二','总样本 12','失败 1','取消 1','缓存条件','配置编号：config-1'])assert.ok((await detail.innerText()).includes(value),value);
       await select.selectOption('warm');assert.match(await row.innerText(),/32 秒/);assert.match(await detail.innerText(),/UNETLoader/);
-      await select.selectOption('h1');assert.match(await row.innerText(),/1 分 0 秒/);assert.match(await row.innerText(),/历史未记录/);assert.match(await detail.innerText(),/历史运行参考/);assert.doesNotMatch(await detail.innerText(),/sample-main-int8/);
-      const image=page.locator('.business-row[data-capability=qwen_image_21_multi]');assert.match(await image.innerText(),/FP8/);assert.match(await image.innerText(),/加载配置，非运行时检测/);
+      await select.selectOption('h1');assert.match(await row.innerText(),/1 分 0 秒/);await assertModelLabels(row,[],[]);assert.match(await detail.innerText(),/历史未记录/);assert.match(await detail.innerText(),/历史运行参考/);assert.doesNotMatch(await detail.innerText(),/sample-main-int8/);
+      const image=page.locator('.business-row[data-capability=qwen_image_21_multi]');await assertModelLabels(image,['sample-fp8.safetensors'],[['FP8']]);
+      await image.locator('button').click();const imageDetail=page.locator('#'+await image.locator('button').getAttribute('aria-controls'));
+      assert.match(await imageDetail.innerText(),/加载配置 FP8（fp8_e4m3fn）.*非运行时检测/);await assertQuietModelCells(page);
     });
     await t.test('模型名称跟随规格切换，多主模型完整展示，缺失来源不推断',async()=>{
       const input=summaryFixture();
@@ -488,10 +502,12 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(await names.innerText(),'sample-main-int8.safetensors');
       await row.locator('select').selectOption('warm');
       assert.deepEqual(await names.locator('.model-name').allTextContents(),['main-high-noise.safetensors','main-low-noise.safetensors']);
-      assert.deepEqual(await names.locator('.model-role').allTextContents(),['主模型 1','主模型 2']);
+      await assertModelLabels(row,['main-high-noise.safetensors','main-low-noise.safetensors'],[['无'],['无']]);await assertQuietModelCells(page);
       assert.doesNotMatch(await names.innerText(),/高噪声|低噪声/);
       assert.doesNotMatch(await names.innerText(),/sample-main-int8/);
       await row.locator('button').click();
+      const modelDetail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const index of [1,2])assert.match(await modelDetail.innerText(),new RegExp(`主模型 ${index}：main-.*；精度未记录 / 待确认；非运行时检测`));
       assert.equal(await page.locator('#'+await row.locator('button').getAttribute('aria-controls')).evaluate(node=>node.matches('div.summary-evidence') && node.previousElementSibling.matches('.business-row') && node.parentElement.matches('td.machine-result') && !node.hasAttribute('colspan')),true);
       await row.locator('select').selectOption('h1');assert.equal(await names.innerText(),'未获取到模型信息');
       assert.equal(await page.locator('[data-summary-worker-id=w3] [data-label="模型名称"]').innerText(),'未获取到模型信息');
@@ -501,72 +517,69 @@ test('产能看板语法与离线路由专项', async t => {
       const unknown=await setup({data:input});
       assert.equal(await unknown.page.locator('td.machine-result[data-summary-worker-id=w1] .business-row[data-capability=depth_video] [data-label="模型名称"]').innerText(),'未获取到模型信息');
     });
-    await t.test('全历史无证据时灰色模板参考与耗时免责声明直接可见，长来源收进详情且不冒充历史精度',async()=>{
+    await t.test('无历史证据时模板仅展示名称精度，时间警告仍可见且完整来源覆盖保留详情',async()=>{
       const {page,state}=await setup({data:evidenceFixture()});const row=page.locator('.business-row');
       assert.equal(await row.locator('select').inputValue(),'unknown-reference');
       assert.equal(await row.locator('button').getAttribute('aria-expanded'),'false');
-      for(const label of ['模型名称','模型精度']) {
-        const cell=row.locator(`[data-label="${label}"]`);
-        assert.equal(await cell.locator('.model-context').innerText(),'模板参考（非历史）');
-        assert.equal(await cell.getByText('模板参考（非历史）',{exact:true}).isVisible(),true);
-        assert.doesNotMatch(await cell.innerText(),/当前工具默认配置（非历史执行记录）|工具：/);
-      }
-      assert.match(await row.locator('[data-label="模型名称"]').innerText(),/current-main-fp8/);
-      assert.match(await row.locator('[data-label="模型精度"]').innerText(),/文件标记 FP8/);
-      assert.equal(await row.locator('.model-coverage').innerText(),'模型记录覆盖 0 / 3,201 次');
+      await assertModelLabels(row,['current-main-fp8.safetensors'],[['FP8']]);
+      assert.doesNotMatch(await row.textContent(),/模板参考|当前工具默认配置|模型记录覆盖|工具：/);
       assert.match(await row.locator('[data-label="平均生成时间"]').innerText(),/1 分 0 秒.*此处耗时来自历史任务，不代表当前模型速度/s);
       assert.equal(await row.locator('[data-label="平均生成时间"] .warn').isVisible(),true);
       assert.equal(await page.locator('#technical-details').evaluate(n=>n.open),false);
-      const marker=await row.locator('.model-context').first().boundingBox();assert.ok(marker.y+marker.height<1000,'桌面首屏即可看到简短参考来源');
+      const marker=await row.locator('[data-label="平均生成时间"] .warn').boundingBox();assert.ok(marker.y+marker.height<1000,'桌面首屏仍可看到历史时间警告');
       await assertQuietModelCells(page);
       const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));assert.equal(await detail.isVisible(),false);
       await row.locator('button').click();assert.equal(await detail.isVisible(),true);
+      assert.match(await detail.innerText(),/模型记录覆盖 0 \/ 3,201 次/);assert.match(await detail.innerText(),/文件标记 FP8.*非运行时检测/);
       assert.match(await detail.innerText(),/当前工具默认配置（非历史执行记录）· 深度视频/);
       assert.match(await detail.innerText(),/不代表用户画布节点当前选中的模型/);
       assert.match(await detail.innerText(),/不覆盖历史精度/);assert.deepEqual(state.errors,[]);
     });
-    await t.test('同图两主模型名称精度角色逐项对应，文件标记与加载配置冲突分别保留，历史优先',async()=>{
+    await t.test('同图两主模型名称精度逐项对应，冲突精度分别保留，角色移入详情且历史优先',async()=>{
       const {page,state}=await setup({data:evidenceFixture()});const row=page.locator('.business-row');await row.locator('select').selectOption('pair');
       const names=row.locator('[data-label="模型名称"]'),precision=row.locator('[data-label="模型精度"]');
-      assert.deepEqual(await names.locator('.model-role').allTextContents(),['高噪声 · 主模型 1','低噪声 · 主模型 2']);
-      assert.deepEqual(await precision.locator('.model-role').allTextContents(),await names.locator('.model-role').allTextContents());
+      await assertModelLabels(row,['history-high-bf16.safetensors','history-low-int8.safetensors'],[['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）'],['INT8']]);
       assert.match(await names.locator('.model-item').nth(0).innerText(),/history-high-bf16/);assert.match(await names.locator('.model-item').nth(1).innerText(),/history-low-int8/);
-      assert.match(await precision.locator('.model-item').nth(0).innerText(),/文件标记 BF16.*加载配置 FP8（fp8_e4m3fn）/s);
-      assert.match(await precision.locator('.model-item').nth(1).innerText(),/文件标记 INT8.*加载配置 default（实际精度未确认）/s);
       assert.doesNotMatch(await precision.locator('.model-item').nth(1).innerText(),/BF16|FP8/);
       assert.doesNotMatch(await row.innerText(),/current-main|当前工具默认配置|aux-|统一精度/);
-      assert.match(await row.innerText(),/非运行时检测/);
+      assert.doesNotMatch(await row.textContent(),/非运行时检测|高噪声|低噪声|default/);
       assert.equal(await row.locator('.model-context').count(),0,'单一完整历史组合不显示长来源或组合编号');
       assert.doesNotMatch(await row.innerText(),/保留的原任务记录|任务记录组合|次记录 \/ .*次成功耗时/);
       await assertQuietModelCells(page);
       await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
       assert.match(await detail.innerText(),/历史任务记录组合 1 · 保留的原任务记录 · 3,201 次记录 \/ 2,900 次成功耗时/);
+      assert.match(await detail.innerText(),/高噪声 · 主模型 1：history-high-bf16.*文件标记 BF16；加载配置 FP8（fp8_e4m3fn）；非运行时检测/);
+      assert.match(await detail.innerText(),/低噪声 · 主模型 2：history-low-int8.*文件标记 INT8；加载配置 default（实际精度未确认）；非运行时检测/);
       for(const role of ['VAE','CLIP','LoRA'])assert.match(await detail.innerText(),new RegExp('角色：'+role));
       assert.match(await detail.innerText(),/辅助模型（不计入主模型名称或精度）/);assert.match(await detail.innerText(),/当前工具默认配置（非历史执行记录）/);
       assert.deepEqual(state.errors,[]);
     });
     await t.test('部分覆盖和多个变体是不同任务组合，不把全组均值归给任一模型；切换同步清除旧证据',async()=>{
       const {page,state}=await setup({data:evidenceFixture()});const row=page.locator('.business-row');await row.locator('select').selectOption('partial');
-      assert.match(await row.innerText(),/模型记录覆盖 30 \/ 3,201 次/);
+      assert.doesNotMatch(await row.textContent(),/模型记录覆盖|任务组合|部分模型/);
+      await assertModelLabels(row,['history-high-bf16.safetensors','history-low-int8.safetensors','other-task-fp16.safetensors'],[['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）'],['INT8'],['FP16']]);
       assert.doesNotMatch(await row.innerText(),/不同任务的模型组合|次记录 \/ .*次成功耗时|不完整 \/ 未确认完整主模型链|保留的原任务记录|任务提交记录/);
       for(const label of ['模型名称','模型精度']) {
         const variants=row.locator(`[data-label="${label}"] .model-variant`);
         assert.equal(await variants.count(),2);
-        assert.deepEqual(await variants.nth(0).locator('.model-context').allTextContents(),['任务组合 1']);
-        assert.deepEqual(await variants.nth(1).locator('.model-context').allTextContents(),['任务组合 2','部分模型，详见详情']);
+        assert.equal(await variants.nth(0).locator('.model-item').count(),2,'第一个历史组合保留同图两个模型');
+        assert.equal(await variants.nth(1).locator('.model-item').count(),1,'第二个历史组合独立保留模型');
+        assert.equal(await variants.locator('.model-context').count(),0,'组合和完整度不能以隐藏节点残留');
       }
       await assertQuietModelCells(page);
       assert.match(await row.locator('[data-label="平均生成时间"]').innerText(),/全组历史任务平均，非某个模型或组合专属速度/);
       assert.doesNotMatch(await row.innerText(),/current-main|当前工具默认配置/);
       assert.equal(await row.locator('[data-label="模型名称"] .model-variant').count(),2);
       await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/模型记录覆盖 30 \/ 3,201 次/);
       assert.match(await detail.innerText(),/不同任务记录对应不同模型组合；每个组合内的主模型才属于同一个图/);assert.match(await detail.innerText(),/参考信息不补齐历史覆盖/);
       assert.match(await detail.innerText(),/历史任务记录组合 1 · 保留的原任务记录 · 20 次记录 \/ 18 次成功耗时/);
       assert.match(await detail.innerText(),/历史任务记录组合 2 · 任务提交记录 · 10 次记录 \/ 7 次成功耗时/);
       assert.match(await detail.innerText(),/不完整 \/ 未确认完整主模型链；动态选择或未知链路不能推断全部主模型/);
       await row.locator('select').selectOption('unknown-reference');assert.doesNotMatch(await row.innerText(),/history-high|history-low|INT8|BF16|other-task|全组历史任务平均/);
-      assert.match(await row.innerText(),/current-main-fp8/);assert.match(await row.innerText(),/文件标记 FP8/);
-      await row.locator('select').selectOption('pair');assert.doesNotMatch(await row.innerText(),/current-main|不完整|不代表当前模型速度/);
+      await assertModelLabels(row,['current-main-fp8.safetensors'],[['FP8']]);await assertQuietModelCells(page);
+      assert.doesNotMatch(await detail.innerText(),/history-high|history-low|other-task|历史任务记录组合/);
+      await row.locator('select').selectOption('pair');assert.doesNotMatch(await row.innerText(),/current-main|不完整|不代表当前模型速度/);await assertQuietModelCells(page);
       // 展示仍用原工具 capability；采购另用真实生成路由，不让工具箱继续参与采购。
       await page.locator('#tab-purchase').click();assert.equal(await page.locator('#estimate-submit').isDisabled(),true);
       const procurement=structuredClone(state.data);procurement.groups=procurement.groups.map(g=>({...g,capability:'zimage_t2i',measured:g.id==='unknown-reference'?3000:g.measured}));
@@ -580,16 +593,18 @@ test('产能看板语法与离线路由专项', async t => {
       assert.doesNotMatch(await row.innerText(),/stale-summary|INT8/);
       await row.locator('select').selectOption('empty-reference');
       assert.match(await row.innerText(),/未获取到模型信息/);
-      for(const label of ['模型名称','模型精度'])assert.deepEqual(await row.locator(`[data-label="${label}"] .model-context`).allTextContents(),['模板参考（非历史）','部分模型，详见详情']);
-      assert.match(await row.innerText(),/模型待确认，精度未确认/);
+      await assertModelLabels(row,[],[]);
+      assert.doesNotMatch(await row.textContent(),/模板参考|部分模型|模型待确认|精度未确认/);
       assert.doesNotMatch(await row.innerText(),/current-main|FP8|INT8|loader|当前工具默认配置|动态模型工具|不完整 \/ 未确认完整主模型链/);
       await assertQuietModelCells(page);
       await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/未获取到模型信息，模型待确认/);
       assert.match(await detail.innerText(),/当前工具默认配置（非历史执行记录）· 动态模型工具/);
       assert.match(await detail.innerText(),/不完整 \/ 未确认完整主模型链；动态选择或未知链路不能推断全部主模型/);
       await row.locator('select').selectOption('no-reference');assert.match(await row.innerText(),/未获取到模型信息/);
       assert.doesNotMatch(await detail.innerText(),/动态模型工具|当前工具默认配置|不完整 \/ 未确认完整主模型链/);
-      assert.match(await row.innerText(),/历史未记录.*当前工具模板未提供、找不到或无法识别/s);assert.doesNotMatch(await row.innerText(),/当前工具默认配置|FP8|INT8/);
+      await assertModelLabels(row,[],[]);await assertQuietModelCells(page);
+      assert.match(await detail.innerText(),/历史未记录.*当前工具模板未提供、找不到或无法识别/s);assert.doesNotMatch(await row.innerText(),/当前工具默认配置|FP8|INT8/);
       assert.deepEqual(state.errors,[]);
     });
     await t.test('历史和模板的名称、角色、精度与dtype均按纯文本渲染，辅助模型仅在详情',async()=>{
@@ -601,14 +616,92 @@ test('产能看板语法与离线路由专项', async t => {
         await row.locator('select').selectOption(id);
         const names=row.locator('[data-label="模型名称"]'),precision=row.locator('[data-label="模型精度"]');
         assert.deepEqual(await names.locator('.model-name').allTextContents(),[ATTACK,ATTACK]);
-        assert.deepEqual(await names.locator('.model-role').allTextContents(),['主模型 1','主模型 2']);
-        assert.ok((await precision.innerText()).includes('文件标记 '+ATTACK));assert.ok((await precision.innerText()).includes('加载配置 '+ATTACK));
+        await assertModelLabels(row,[ATTACK,ATTACK],[['无'],['无']]);await assertQuietModelCells(page);
+        assert.equal((await precision.textContent()).includes(ATTACK),false,'恶意精度不是标准白名单值，简明区必须显示无');
         assert.equal((await names.innerText()).includes('工具：'+ATTACK),false,'模板工具名称不铺在首屏');
         if(await row.locator('button').getAttribute('aria-expanded')==='false')await row.locator('button').click();
         const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
         if(id==='unknown-reference')assert.ok((await detail.innerText()).includes('当前工具默认配置（非历史执行记录）· '+ATTACK),'模板工具名称在详情仍按纯文本保留');
-        assert.ok((await detail.innerText()).includes('角色：'+ATTACK));
+        for(const text of ['主模型 1：'+ATTACK,'主模型 2：'+ATTACK,'角色：'+ATTACK,'文件标记 '+ATTACK,'加载配置 '+ATTACK,'辅助模型（不计入主模型名称或精度）','非运行时检测'])assert.ok((await detail.innerText()).includes(text),text);
+        assert.ok(await detail.locator('.model-reference p').evaluateAll(nodes=>nodes.every(node=>node.childElementCount===0)),'完整原始证据只通过纯文本展示');
         assert.equal(await page.locator('main img').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);
+      }
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('模型精简合同1：文件与加载精度白名单、别名去重、不同值双项和未知值',async()=>{
+      const cases=[
+        ['filename-only',{precision:'INT8',precision_source:'filename'},['INT8'],['文件标记 INT8']],
+        ['loader-only',{loader_dtype:'bfloat16'},['BF16'],['加载配置 BF16（bfloat16）']],
+        ['loader-without-dtype',{precision:'FP8',precision_source:'loader'},['FP8'],['加载配置 FP8']],
+        ['same-bf16',{precision:'BF16',precision_source:'filename',loader_dtype:'bfloat16'},['BF16'],['文件标记 BF16','加载配置 BF16（bfloat16）']],
+        ['same-fp8-alias',{precision:'float8_e5m2_fast',precision_source:'filename',loader_dtype:'fp8_e4m3fn'},['FP8'],['文件标记 float8_e5m2_fast','加载配置 FP8（fp8_e4m3fn）']],
+        ['fp8-suffix',{loader_dtype:'fp8_e5m2_fast'},['FP8'],['加载配置 FP8（fp8_e5m2_fast）']],
+        ['fp8-alias-list',{loader_dtype:'float8_e4m3fn / fp8_e5m2_fast'},['FP8'],['加载配置 FP8（float8_e4m3fn / fp8_e5m2_fast）']],
+        ['different-sources',{precision:'BF16',precision_source:'filename',loader_dtype:'fp8_e4m3fn'},['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）'],['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）']],
+        ['known-with-default',{precision:'INT8',precision_source:'filename',loader_dtype:'default'},['INT8'],['文件标记 INT8','加载配置 default（实际精度未确认）']],
+        ['default',{loader_dtype:'default'},['无'],['加载配置 default（实际精度未确认）']],
+        ['auto',{loader_dtype:'auto'},['无'],['加载配置 auto（实际精度未确认）']],
+        ['filename-default',{precision:'default',precision_source:'filename'},['无'],['文件标记 default']],
+        ['loader-auto',{precision:'auto',precision_source:'loader'},['无'],['加载配置 auto']],
+        ['empty',{precision:'',precision_source:'filename',loader_dtype:''},['无'],['精度未记录 / 待确认']],
+        ['unknown',{},['无'],['精度未记录 / 待确认']],
+        ['no-source',{precision:'FP8'},['无'],['精度未记录 / 待确认']],
+        ['unrecognized',{loader_dtype:'not-a-dtype'},['无'],['加载配置 not-a-dtype']],
+        ['not-standard',{precision:'INT8 arbitrary',precision_source:'filename'},['无'],['文件标记 INT8 arbitrary']],
+        ['numeric',{precision:8,precision_source:'filename'},['无'],['文件标记 8']],
+        ['int4',{precision:'int4',precision_source:'filename'},['INT4'],['文件标记 int4']],
+        ['nf4',{loader_dtype:'nf4'},['NF4'],['加载配置 nf4']],
+        ['q4-k-m',{precision:'q4_k_m',precision_source:'filename'},['Q4_K_M'],['文件标记 q4_k_m']],
+        ['fp16',{loader_dtype:'float16'},['FP16'],['加载配置 FP16（float16）']],
+      ];
+      const input=fixture(),base=input.groups[0];
+      input.groups=cases.map(([id,model])=>({...base,id,model_summary:modelSummary([{name:id+'.safetensors',role:'main',...model}])}));
+      input.groups.push({...base,id:'unknown-name',model_summary:modelSummary([{name:''}])},{...base,id:'no-models',model_summary:modelSummary([])});
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const [id,,labels,full] of cases) {
+        await row.locator('select').selectOption(id);
+        await assertModelLabels(row,[id+'.safetensors'],[labels]);await assertQuietModelCells(page);
+        assert.equal(await detail.isVisible(),true,'切规格保持详情展开');
+        const modelDetail=detail.locator('.model-reference');assert.equal(await modelDetail.count(),1);
+        for(const value of [id+'.safetensors',...full,'非运行时检测'])assert.ok((await modelDetail.innerText()).includes(value),id+'：'+value);
+        assert.equal(await modelDetail.locator('p').last().textContent(),`主模型：${id}.safetensors；角色：main；${full.join('；')}；非运行时检测`,'完整精度详情不随精简展示改变');
+      }
+      await row.locator('select').selectOption('unknown-name');await assertModelLabels(row,['未获取到模型信息'],[['无']]);
+      await row.locator('select').selectOption('no-models');await assertModelLabels(row,[],[]);await assertQuietModelCells(page);
+      assert.doesNotMatch(await detail.innerText(),/fp16.safetensors|加载配置 FP16/);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('模型精简合同2：同图双模型逐项精度、多历史块和切规格清理，桌面手机批量截图',async()=>{
+      const input=evidenceFixture();
+      input.groups[2].model_evidence.variants[1].summary.models.push({name:'other-task-q4_k_m.gguf',precision:'Q4_K_M',precision_source:'filename'});
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      const pairNames=['history-high-bf16.safetensors','history-low-int8.safetensors'],pairLabels=[['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）'],['INT8']];
+      for(const width of [1440,390,320]) {
+        await page.setViewportSize({width,height:width===1440?1000:844});
+        await row.locator('select').selectOption('partial');
+        await assertModelLabels(row,[...pairNames,'other-task-fp16.safetensors','other-task-q4_k_m.gguf'],[...pairLabels,['FP16'],['Q4_K_M']]);
+        for(const label of ['模型名称','模型精度']) {
+          const variants=row.locator(`[data-label="${label}"] .model-variant`);assert.equal(await variants.count(),2);
+          assert.deepEqual(await variants.evaluateAll(nodes=>nodes.map(n=>n.querySelectorAll('.model-item').length)),[2,2]);
+        }
+        await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+        assert.match(await detail.innerText(),/模型记录覆盖 30 \/ 3,201 次/);assert.match(await detail.innerText(),/不完整 \/ 未确认完整主模型链/);
+        for(const name of [...pairNames,'other-task-fp16.safetensors','other-task-q4_k_m.gguf'])assert.ok((await detail.innerText()).includes(name));
+        await row.locator('select').selectOption('unknown-reference');await assertModelLabels(row,['current-main-fp8.safetensors'],[['FP8']]);
+        assert.doesNotMatch(await detail.innerText(),/history-high|history-low|other-task|历史任务记录组合|不完整/);
+        assert.match(await row.locator('[data-label="平均生成时间"]').innerText(),/此处耗时来自历史任务，不代表当前模型速度/);
+        await row.locator('select').selectOption('no-reference');await assertModelLabels(row,[],[]);
+        assert.doesNotMatch(await detail.innerText(),/current-main|当前工具默认配置|历史任务记录组合/);
+        await row.locator('select').selectOption('pair');await assertModelLabels(row,pairNames,pairLabels);
+        assert.doesNotMatch(await row.textContent(),/模板参考|任务组合|部分模型|模型记录覆盖|非运行时检测|不代表当前模型速度/);
+        await assertQuietModelCells(page);await assertComparisonTable(page);
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,`${width}px不产生整页横滚`);
+        await row.locator('button').click();
+        // 单独的截图开关仅生成这一组桌面、390、320图，避免重复截取原套件所有场景。
+        if(process.env.CHOUKA_TEST_MODEL_SCREENSHOT) {
+          await positionMatrix(page);const file=path.parse(process.env.CHOUKA_TEST_MODEL_SCREENSHOT);
+          await page.screenshot({path:path.join(file.dir,file.name+`-${width===1440?'desktop':width}.png`),fullPage:true});
+        }
       }
       assert.deepEqual(state.errors,[]);
     });
@@ -624,7 +717,7 @@ test('产能看板语法与离线路由专项', async t => {
         }
         for(const tab of ['scenarios','purchase','machines']) {await page.locator('#tab-'+tab).click();assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);}
         await row.locator('select').selectOption('partial');
-        assert.deepEqual(await row.locator('[data-label="模型名称"] .model-role').allTextContents(),await row.locator('[data-label="模型精度"] .model-role').allTextContents());
+        await assertModelLabels(row,input.groups[2].model_evidence.variants.flatMap(v=>v.summary.models.map(m=>m.name)),[['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）'],['INT8'],['FP16']]);await assertQuietModelCells(page);
         if(process.env.CHOUKA_TEST_SCREENSHOT){await positionMatrix(page);const file=path.parse(process.env.CHOUKA_TEST_SCREENSHOT);await page.screenshot({path:path.join(file.dir,file.name+`-evidence-${width}.png`),fullPage:true});}
       }
       assert.deepEqual(state.errors,[]);
@@ -1045,14 +1138,18 @@ test('产能看板语法与离线路由专项', async t => {
         assert.equal(group.model_evidence.variants[0].summary.models[0].name,'contract-model.safetensors');
       }
       const {page,state}=await setup({data:report});const row=page.locator('.business-row');await row.locator('select').selectOption(history.id);
-      assert.match(await row.innerText(),/模型记录覆盖 2 \/ 3 次/);assert.doesNotMatch(await row.innerText(),/保留的原任务记录/);
-      for(const label of ['模型名称','模型精度'])assert.deepEqual(await row.locator(`[data-label="${label}"] .model-context`).allTextContents(),['任务组合 1','任务组合 2']);
+      assert.doesNotMatch(await row.textContent(),/模型记录覆盖|保留的原任务记录|任务组合/);
+      for(const label of ['模型名称','模型精度'])assert.equal(await row.locator(`[data-label="${label}"] .model-variant`).count(),2);
       await assertQuietModelCells(page);
-      for(const name of ['contract-first-bf16','contract-second-int8','contract-other-fp16'])assert.ok((await row.innerText()).includes(name));
-      assert.match(await row.innerText(),/文件标记 BF16/);assert.match(await row.innerText(),/加载配置 FP8/);assert.match(await row.innerText(),/文件标记 INT8/);assert.match(await row.innerText(),/文件标记 FP16/);
+      const precisionByName={'contract-first-bf16.safetensors':['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）'],'contract-second-int8.safetensors':['INT8'],'contract-other-fp16.safetensors':['FP16']};
+      const recordedNames=history.model_evidence.variants.flatMap(v=>v.summary.models.map(m=>m.name));
+      assert.deepEqual([...recordedNames].sort(),Object.keys(precisionByName).sort());
+      await assertModelLabels(row,recordedNames,recordedNames.map(name=>precisionByName[name]));
       assert.doesNotMatch(await row.innerText(),/contract-current|高噪声|低噪声/);assert.match(await row.innerText(),/40 秒/);
       assert.match(await row.innerText(),/全组历史任务平均，非某个模型或组合专属速度/);
       await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/模型记录覆盖 2 \/ 3 次/);
+      for(const text of ['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）','文件标记 INT8','文件标记 FP16'])assert.ok((await detail.innerText()).includes(text),text);
       assert.match(await detail.innerText(),/当前工具默认配置（非历史执行记录）/);assert.match(await detail.innerText(),/contract-current-fp8/);
       for(const index of [1,2])assert.ok((await detail.innerText()).includes(`历史任务记录组合 ${index} · 保留的原任务记录 · 1 次记录 / 1 次成功耗时`));
       assert.match(await detail.innerText(),/不同任务记录对应不同模型组合；每个组合内的主模型才属于同一个图/);
