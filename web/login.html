@@ -1,74 +1,188 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>登录 · 抽卡系统</title><link rel="icon" type="image/png" href="favicon.png"><link rel="stylesheet" href="/style.css"></head>
-<body class="auth-page auth-login">
-<main class="login-card">
-  <div class="brandmark"><img src="icon.png" alt=""><b>抽卡系统</b></div>
-  <p class="login-sub">账号由管理员创建或审批开通</p>
-  <form id="login">
-    <label class="fld"><span>账号</span><input name="username" autocomplete="username" required autofocus></label>
-    <label class="fld"><span>密码</span><input name="password" type="password" autocomplete="current-password" required></label>
-    <p id="error" role="alert"></p>
-    <button class="btn primary" type="submit" disabled>登录</button>
-    <button class="btn" type="button" id="to-register">注册账号</button>
-  </form>
-  <p id="register-done" class="login-sub" role="status" hidden></p>
-</main>
-<dialog id="register-dialog" class="auth-dialog" aria-labelledby="register-heading">
-  <form id="register">
-    <h2 id="register-heading">注册账号</h2>
-    <label class="fld"><span>登录账号</span><input name="username" autocomplete="username" required></label>
-    <label class="fld"><span>真实姓名 / 花名</span><input name="display_name" required maxlength="64"></label>
-    <label class="fld"><span>密码（至少 8 位）</span><input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
-    <label class="fld"><span>再输一次密码</span><input name="confirm_password" type="password" autocomplete="new-password" required minlength="8"></label>
-    <p id="register-error" role="alert"></p>
-    <p class="auth-note">密码无需组合大小写、数字或符号，请勿使用 12345678 等常见弱密码。请填写真实姓名或花名，审批通过后才能登录。</p>
-    <footer>
-      <button class="btn" type="button" id="to-login">取消</button>
-      <button class="btn primary" type="submit">提交注册申请</button>
-    </footer>
-  </form>
-</dialog>
-<script src="/auth.js"></script><script>
-const registerDialog = document.getElementById('register-dialog');
-const loginForm = document.getElementById('login'), error = document.getElementById('error'), loginButton = loginForm.querySelector('button');
-const registerForm = document.getElementById('register'), registerError = document.getElementById('register-error');
-const done = document.getElementById('register-done');
-H3Auth.me().then(() => location.replace('/')).catch(e => { if (e.status !== 401) error.textContent = e.message; loginButton.disabled = false; });
-loginForm.onsubmit = async event => {
-  event.preventDefault(); loginButton.disabled = true; error.textContent = '';
-  try { await H3Auth.login(loginForm.elements.username.value, loginForm.elements.password.value); loginForm.reset(); location.replace('/'); }
-  catch (e) { error.textContent = e.message; loginButton.disabled = false; }
-};
-document.getElementById('to-register').onclick = () => {
-  registerError.textContent = '';
-  registerDialog.showModal();
-  registerForm.elements.username.focus();
-};
-document.getElementById('to-login').onclick = () => registerDialog.close();
-registerDialog.addEventListener('close', () => {
-  registerForm.elements.password.value = '';
-  registerForm.elements.confirm_password.value = '';
-});
-registerForm.onsubmit = async event => {
-  event.preventDefault(); registerError.textContent = '';
-  const data = Object.fromEntries(new FormData(registerForm));
-  if (data.password !== data.confirm_password) {
-    registerError.textContent = '两次输入的密码不一致';
-    registerForm.elements.confirm_password.focus();
-    return;
-  }
-  const button = registerForm.querySelector('button[type=submit]');
-  button.disabled = true;
-  try {
-    const result = await H3Auth.register(data.username, data.display_name, data.password);
-    registerForm.reset(); registerDialog.close();
-    loginForm.elements.username.value = result.username;
-    done.hidden = false;
-    done.textContent = `注册申请已提交（${result.display_name}），等待审批通过后即可登录。`;
-  } catch (e) {
-    registerError.textContent = e.message;
-  } finally {
-    button.disabled = false;
-  }
-};
-</script></body></html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>登录 · 抽卡系统</title>
+  <link rel="icon" type="image/png" href="/auth-logo.png">
+  <link rel="stylesheet" href="/auth-page.css">
+</head>
+<body class="auth-screen">
+  <div class="auth-backdrop" aria-hidden="true">
+    <img src="/auth-art.webp" width="1672" height="941" alt="" fetchpriority="high">
+  </div>
+  <header class="auth-brand">
+    <img src="/auth-logo.png" width="152" height="120" alt="">
+    <span>抽卡系统</span>
+  </header>
+  <main class="auth-layout">
+    <div class="auth-intro">
+      <h1><span>让想法，</span><span>成为作品</span></h1>
+    </div>
+    <div class="auth-forms">
+      <section id="login-panel" class="auth-panel" aria-labelledby="login-heading">
+        <header class="auth-panel-heading">
+          <h2 id="login-heading" tabindex="-1">登录</h2>
+          <p class="auth-description">账号由管理员创建或审批开通</p>
+        </header>
+        <p id="register-done" class="auth-notice" role="status" tabindex="-1" hidden></p>
+        <form id="login" class="auth-form">
+          <label class="auth-field">
+            <span>账号</span>
+            <input name="username" autocomplete="username" required placeholder="请输入账号" autocapitalize="none" spellcheck="false">
+          </label>
+          <label class="auth-field">
+            <span>密码</span>
+            <input name="password" type="password" autocomplete="current-password" required placeholder="请输入密码">
+          </label>
+          <p id="error" class="auth-error" role="alert" tabindex="-1"></p>
+          <div class="auth-actions">
+            <button class="auth-button auth-primary" type="submit" disabled>正在检查登录状态…</button>
+            <button class="auth-button auth-secondary" type="button" id="to-register">注册账号</button>
+          </div>
+        </form>
+      </section>
+      <section id="register-panel" class="auth-panel" aria-labelledby="register-heading" hidden>
+        <header class="auth-panel-heading">
+          <h2 id="register-heading" tabindex="-1">注册账号</h2>
+          <div class="auth-description" id="register-description">
+            <p>请填写真实姓名或花名，审批通过后即可登录。</p>
+            <p class="auth-contact-note">若提交后长时间无法登录，请通过阿里钉联系</p>
+            <p class="auth-contacts"><span>彦龙（431661）</span><span>禾尚（286633）</span></p>
+          </div>
+        </header>
+        <form id="register" class="auth-form" aria-describedby="register-description">
+          <label class="auth-field">
+            <span>登录账号</span>
+            <input name="username" autocomplete="username" required placeholder="请输入登录账号" autocapitalize="none" spellcheck="false">
+          </label>
+          <label class="auth-field">
+            <span>真实姓名 / 花名</span>
+            <input name="display_name" autocomplete="nickname" required maxlength="64" placeholder="请输入真实姓名或花名">
+          </label>
+          <label class="auth-field">
+            <span>密码（至少 8 位）</span>
+            <input name="password" type="password" autocomplete="new-password" required minlength="8" maxlength="1024" placeholder="请设置密码" aria-describedby="password-note">
+          </label>
+          <label class="auth-field">
+            <span>再输一次密码</span>
+            <input name="confirm_password" type="password" autocomplete="new-password" required minlength="8" maxlength="1024" placeholder="请再次输入密码" aria-describedby="password-note register-error">
+          </label>
+          <p class="auth-description auth-password-note" id="password-note">密码无需组合大小写、数字或符号，请勿使用 12345678 等常见弱密码。</p>
+          <p id="register-error" class="auth-error" role="alert" tabindex="-1"></p>
+          <div class="auth-actions">
+            <button class="auth-button auth-primary" type="submit" disabled>提交注册申请</button>
+            <button class="auth-button auth-secondary" type="button" id="to-login">返回登录</button>
+          </div>
+        </form>
+      </section>
+      <noscript><p class="auth-notice">请启用浏览器 JavaScript 后登录或提交注册申请。</p></noscript>
+    </div>
+  </main>
+  <script src="/auth.js"></script>
+  <script>
+    const loginPanel = document.getElementById('login-panel');
+    const registerPanel = document.getElementById('register-panel');
+    const loginForm = document.getElementById('login');
+    const registerForm = document.getElementById('register');
+    const loginError = document.getElementById('error');
+    const registerError = document.getElementById('register-error');
+    const done = document.getElementById('register-done');
+    const loginButton = loginForm.querySelector('[type="submit"]');
+    const registerButton = registerForm.querySelector('[type="submit"]');
+    let ready = false, submitting = false;
+
+    function showPanel(register) {
+      if (submitting) return;
+      loginPanel.hidden = register;
+      registerPanel.hidden = !register;
+      document.title = `${register ? '注册账号' : '登录'} · 抽卡系统`;
+      loginError.textContent = '';
+      registerError.textContent = '';
+      loginForm.elements.password.value = '';
+      registerForm.elements.password.value = '';
+      registerForm.elements.confirm_password.value = '';
+      registerForm.elements.confirm_password.removeAttribute('aria-invalid');
+      document.getElementById(register ? 'register-heading' : 'login-heading').focus({preventScroll: true});
+    }
+
+    function setSubmitting(form, busy) {
+      submitting = busy;
+      form.setAttribute('aria-busy', String(busy));
+      for (const control of document.querySelectorAll('.auth-form input, .auth-form button')) {
+        control.disabled = busy;
+      }
+      loginButton.disabled = busy || !ready;
+      registerButton.disabled = busy || !ready;
+      loginButton.textContent = busy && form === loginForm ? '正在登录…' : '登录';
+      registerButton.textContent = busy && form === registerForm ? '正在提交…' : '提交注册申请';
+    }
+
+    document.getElementById('to-register').onclick = () => showPanel(true);
+    document.getElementById('to-login').onclick = () => showPanel(false);
+    registerForm.elements.confirm_password.addEventListener('input', () => {
+      registerForm.elements.confirm_password.removeAttribute('aria-invalid');
+      registerError.textContent = '';
+    });
+
+    H3Auth.me().then(() => location.replace('/')).catch(error => {
+      ready = true;
+      loginButton.disabled = false;
+      registerButton.disabled = false;
+      loginButton.textContent = '登录';
+      if (error.status !== 401) {
+        const message = '暂时无法检查登录状态，请尝试登录或稍后重试。';
+        loginError.textContent = message;
+        registerError.textContent = message;
+      }
+    });
+
+    loginForm.onsubmit = async event => {
+      event.preventDefault();
+      if (!ready || submitting) return;
+      const username = loginForm.elements.username.value;
+      const password = loginForm.elements.password.value;
+      loginError.textContent = '';
+      setSubmitting(loginForm, true);
+      try {
+        await H3Auth.login(username, password);
+        loginForm.reset();
+        location.replace('/');
+      } catch (error) {
+        loginError.textContent = error.status ? error.message : '网络连接异常，请检查网络后重试。';
+        setSubmitting(loginForm, false);
+        loginError.focus({preventScroll: true});
+      }
+    };
+
+    registerForm.onsubmit = async event => {
+      event.preventDefault();
+      if (!ready || submitting) return;
+      registerError.textContent = '';
+      const data = Object.fromEntries(new FormData(registerForm));
+      if (data.password !== data.confirm_password) {
+        registerError.textContent = '两次输入的密码不一致，请重新确认。';
+        registerForm.elements.confirm_password.setAttribute('aria-invalid', 'true');
+        registerForm.elements.confirm_password.focus();
+        return;
+      }
+      setSubmitting(registerForm, true);
+      try {
+        const result = await H3Auth.register(data.username, data.display_name, data.password);
+        registerForm.reset();
+        setSubmitting(registerForm, false);
+        showPanel(false);
+        loginForm.elements.username.value = result.username;
+        done.textContent = `注册申请已提交（${result.display_name}），等待审批通过后即可登录。`;
+        done.hidden = false;
+        done.focus({preventScroll: true});
+      } catch (error) {
+        registerError.textContent = error.status ? error.message : '网络连接异常，请检查网络后重试。';
+        setSubmitting(registerForm, false);
+        registerError.focus({preventScroll: true});
+      }
+    };
+  </script>
+</body>
+</html>
