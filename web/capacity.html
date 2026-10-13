@@ -115,9 +115,7 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 .mean-time { display:block; font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; }
 .model-label { display:block; font-size:13px; font-weight:600; }
 .model-item + .model-item,.model-variant + .model-variant { margin-top:8px; padding-top:6px; border-top:1px solid var(--line); }
-.model-role { display:block; color:var(--muted); font-size:12px; }
 .model-origin { margin-bottom:8px; color:var(--warn); }
-.model-context { color:var(--muted); font-size:12px; }
 .model-reference { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
 .model-variant { overflow-wrap:anywhere; }
 .simple-table summary,.machine-more summary { color:var(--blue); }
@@ -370,43 +368,44 @@ function modelPrecision(model) {
   if(!parts.length)parts.push('精度未记录 / 待确认');
   return parts;
 }
-function modelColumns(summary,origin='') {
+function compactModelPrecision(model) {
+  const normalize=value=>{
+    if(typeof value!=='string')return null;
+    const tokens=value.split(/\s*\/\s*/).map(part=>part.trim().match(/^(bfloat16|float(?:8|16|32|64)|bf16|fp(?:4|8|16|32|64)|int(?:4|8|16)|nf4|q[2-8]_(?:k(?:_[sml])?|[01]))(?:_e4m3fn|_e5m2)?(?:_fast)?$/i)?.[1]);
+    return tokens.every(Boolean)?[...new Set(tokens.map(token=>token.toUpperCase().replace('BFLOAT16','BF16').replace('FLOAT','FP')))].sort().join(' / '):null;
+  };
+  const file=model.precision_source==='filename'?normalize(model.precision):null;
+  const loader=normalize(model.loader_dtype) || (model.precision_source==='loader'?normalize(model.precision):null);
+  // 不同来源的精度不能合成一个结论；简写只用于单一已知精度。
+  if(file && loader && file!==loader)return modelPrecision(model);
+  return [file || loader || '无'];
+}
+function modelColumns(summary) {
   const names=el('div',null,'model-variant'), precision=el('div',null,'model-variant'), models=mainModels(summary);
-  for(const node of [names,precision]) {
-    if(origin)node.append(el('p',origin,'model-context'));
-    if(summary?.complete===false)node.append(el('p','部分模型，详见详情','model-context'));
-  }
-  models.forEach((model,index)=>{
-    const name=el('div',null,'model-item'), dtype=el('div',null,'model-item'), role=modelRole(model,index,models.length);
-    for(const node of [name,dtype])if(role)node.append(el('span',role,'model-role'));
+  models.forEach(model=>{
+    const name=el('div',null,'model-item'), dtype=el('div',null,'model-item');
     name.append(el('p',model.name || '未获取到模型信息','model-name'));
-    for(const part of modelPrecision(model))dtype.append(el('p',part,'model-label'));
+    for(const part of compactModelPrecision(model))dtype.append(el('p',part,'model-label'));
     names.append(name);precision.append(dtype);
   });
-  if(!models.length) {names.append(el('p','未获取到模型信息','muted'));precision.append(el('p','模型待确认，精度未确认','muted'));}
-  const sources=new Set(models.filter(m=>m.precision).map(m=>m.precision_source));
-  const originNote=sources.has('filename')?'模型文件标记':models.some(m=>m.loader_dtype || m.precision_source==='loader')?'加载配置':'精度未记录';
-  precision.append(el('p',`${originNote}，非运行时检测`,'hint'));
+  if(!models.length) {names.append(el('p','未获取到模型信息','muted'));precision.append(el('p','无','muted'));}
   return [names,precision];
 }
 function renderModelCells(g,nameCell,precisionCell,timeCell) {
   const evidence=modelEvidence(g), {variants,reference}=evidence;
   nameCell.replaceChildren();precisionCell.replaceChildren();
-  if(evidence.hasEvidence)nameCell.append(el('p',`模型记录覆盖 ${num(evidence.recorded)} / ${num(evidence.total)} 次`,'hint model-coverage'));
   if(variants.length) {
-    variants.forEach((variant,index)=>{
-      const origin=variants.length>1?`任务组合 ${index+1}`:'';
-      const [names,precision]=modelColumns(variant.summary,origin);nameCell.append(names);precisionCell.append(precision);
+    variants.forEach(variant=>{
+      const [names,precision]=modelColumns(variant.summary);nameCell.append(names);precisionCell.append(precision);
     });
     if(variants.length>1 || evidence.hasEvidence && evidence.recorded<evidence.total || variants.some(v=>v.summary.complete===false))timeCell.append(el('p','全组历史任务平均，非某个模型或组合专属速度。','warn hint'));
   } else if(reference) {
-    const [names,precision]=modelColumns(reference,'模板参考（非历史）');
+    const [names,precision]=modelColumns(reference);
     nameCell.append(names);precisionCell.append(precision);
     timeCell.append(el('p','此处耗时来自历史任务，不代表当前模型速度。','warn hint'));
-    precisionCell.append(el('p','历史未记录可用主模型证据；当前模板仅作参考，不补写历史精度。','hint'));
   } else {
     nameCell.append(el('span','未获取到模型信息','muted'));
-    precisionCell.append(el('p','历史未记录可用主模型证据；当前工具模板未提供、找不到或无法识别。','hint'),el('p','模型待确认，精度未确认；不按业务名称推断。','hint'));
+    precisionCell.append(el('p','无','muted'));
   }
 }
 function appendModelDetails(node,summary,origin) {
