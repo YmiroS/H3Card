@@ -287,6 +287,7 @@ test('AlphaGen toolbox mode, editable parameters and isolated submissions in com
       assert.notDeepEqual(await page.evaluate(() => [PROJ.cards[0].x, PROJ.cards[0].y]), before);
       await page.keyboard.press('Control+z');
       assert.deepEqual(await page.evaluate(() => [PROJ.cards[0].x, PROJ.cards[0].y]), before);
+      page.once('dialog', dialog => void dialog.accept());
       await card.locator('.ch .x').click();
       assert.equal(await page.locator('#world .card').count(), 0);
       await page.keyboard.press('Control+z');
