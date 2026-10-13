@@ -14,6 +14,7 @@ const staticFiles = new Map([
   ['/auth-page.css', ['auth-page.css', 'text/css; charset=utf-8']],
   ['/auth-art.webp', ['auth-art.webp', 'image/webp']],
   ['/auth-logo.png', ['auth-logo.png', 'image/png']],
+  ['/favicon.png?v=ck05', ['favicon.png', 'image/png']],
 ]);
 const apiMethods = new Map([
   ['/api/auth/me', 'GET'], ['/api/auth/login', 'POST'], ['/api/auth/register', 'POST'],
