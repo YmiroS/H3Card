@@ -67,7 +67,13 @@ body.auth-screen {
   letter-spacing: -.025em;
 }
 .auth-intro h1 span { display: block; }
-.auth-forms { align-self: center; min-width: 0; }
+.auth-forms {
+  align-self: center;
+  justify-self: center;
+  width: 100%;
+  max-width: 400px;
+  min-width: 0;
+}
 .auth-panel { width: 100%; }
 .auth-panel-heading { margin-bottom: 32px; }
 .auth-panel-heading h2 {
