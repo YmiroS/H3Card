@@ -495,6 +495,7 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
         const projectPath = '/api/projects/undo_restore';
         const deleted = page.waitForResponse(response => new URL(response.url()).pathname === projectPath
           && response.request().method() === 'PUT' && response.status() === 200);
+        page.once('dialog',dialog => void dialog.accept());
         await page.locator(`[data-id="${p.cards[0].id}"] .x`).click();
         await deleted;
         assert.equal(state.projects[0].cards.length,1,'删除必须先真实落盘，才能覆盖本次竞态');
@@ -667,7 +668,10 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
           if (action === '切项目') await page.locator('#plist .pitem').filter({hasText:'回归画布other'}).click();
           else if (action === '退出画布') await page.evaluate(() => clearProject());
           else if (action === '完整重绘') await page.evaluate(() => render());
-          else if (action === '删除节点') await page.locator('[data-id="cleanup_0"] .x').click();
+          else if (action === '删除节点') {
+            page.once('dialog',dialog => void dialog.accept());
+            await page.locator('[data-id="cleanup_0"] .x').click();
+          }
           else await page.evaluate(() => {
             const c = PROJ.cards[0]; c.outputs = [{...c.outputs[0],url:'/api/artifact/repaint.png'}]; paint(c);
           });

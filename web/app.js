@@ -2079,7 +2079,7 @@ function buildCard(c) {
   d.dataset.id = c.id;
   d.style.left = c.x + "px"; d.style.top = c.y + "px";
   d.innerHTML = `
-    <div class="ch"><span>${def ? def.icon : "▪"}</span><span class="t"></span><button class="x" title="删除">✕</button></div>
+    <div class="ch"><span>${def ? def.icon : "▪"}</span><span class="t"></span><button class="x" type="button" title="删除" aria-label="删除节点">✕</button></div>
     <div class="body">${phHTML(c)}</div>
     <div class="bar"><i></i></div>
     <div class="cf"><span class="kt"></span><span class="st"></span><span class="meta" style="margin-left:auto"></span></div>
@@ -2090,7 +2090,9 @@ function buildCard(c) {
   c._el = d;
   applySize(c);
   paintTitle(c);
-  d.querySelector(".ch .x").onclick = (ev) => { ev.stopPropagation(); delCard(c.id); };
+  const removeButton = d.querySelector(".ch .x");
+  removeButton.onmousedown = (ev) => ev.stopPropagation();
+  removeButton.onclick = (ev) => { ev.stopPropagation(); askDelCard(c); };
   d.querySelector(".rz.tl").onmousedown = (ev) => startResize(ev, c, d, -1);
   d.querySelector(".rz.br").onmousedown = (ev) => startResize(ev, c, d, 1);
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
@@ -4107,16 +4109,16 @@ function delCards(ids) {
   return gone.size;
 }
 
-/** Delete 键删节点。菜单里那条不问就删（点菜单是有意的），键盘容易手滑，
-    所以**跑出过东西的节点**要问一句 —— 没有撤销，删掉那几轮的产物记录就找不回来了。 */
+/** 单节点删除统一确认：右上角按钮和 Delete/Backspace 都走这里。 */
 function askDelCard(c) {
-  const n = (c.history || []).length;
-  if ((c.outputs || []).length || n) {
-    if (!confirm(`删除「${titleOf(c)}」？它有 ${n} 轮生成记录，删了找不回来。\n`
-      + "（产物文件本身还在 ComfyUI 的输出目录里）")) return;
-  }
-  delCard(c.id);
-  toast(`已删除「${titleOf(c)}」`);
+  if (!PROJ || !requireOperate() || !c || cardOf(c.id) !== c) return;
+  const project = PROJ, id = c.id, title = titleOf(c);
+  const n = (c.history || []).length, hasOutput = (c.outputs || []).length || n;
+  if (!confirm(`删除「${title}」？\n`
+      + (hasOutput ? `它有 ${n} 轮生成记录或产物，节点内记录删除后无法恢复。\n` : "")
+      + "相关连线会一并移除，此操作不能撤销；不会删除素材文件。")) return;
+  if (PROJ !== project || !canOperate() || cardOf(id) !== c) return;
+  if (delCard(id)) toast(`已删除「${title}」`);
 }
 
 /** Ctrl+C 存下的那个节点。只活在这一次打开里（不落盘）—— 它是"手上拿着的东西"，
