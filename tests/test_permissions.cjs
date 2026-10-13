@@ -12,6 +12,83 @@ const helpers = source.slice(source.indexOf('const canOperate'), source.indexOf(
 const presenceHelpers = source.slice(source.indexOf('const PRESENCE_COLORS'), source.indexOf('function updatePresenceCursor'));
 const browserOptions = process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {};
 
+test('所有页面统一CK标签图标，品牌图片保持透明及原始比例', async () => {
+  const pages = ['index', 'login', 'director', 'permissions', 'teams', 'controller', 'costs', 'capacity'];
+  const files = new Map([
+    ...pages.map(name => [`/${name}.html`, [`${name}.html`, 'text/html; charset=utf-8']]),
+    ...['style', 'auth-page', 'director'].map(name => [`/${name}.css`, [`${name}.css`, 'text/css']]),
+    ...['icon.png', 'favicon.png', 'auth-logo.png', 'auth-art.webp'].map(name => [`/${name}`, [name, name.endsWith('.webp') ? 'image/webp' : 'image/png']]),
+  ]);
+  const server = createServer((req, res) => {
+    const item = files.get(new URL(req.url, 'http://localhost').pathname);
+    if (!item) { res.writeHead(404); res.end(); return; }
+    // 此项只检查真实HTML/CSS品牌展示，禁止业务脚本发起账号或画布请求。
+    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:");
+    res.setHeader('Content-Type', item[1]);
+    res.end(readFileSync(path.join(web, item[0])));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  let browser;
+  try {
+    browser = await chromium.launch(browserOptions);
+    const page = await browser.newPage({viewport:{width:1440, height:900}});
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    for (const name of pages) {
+      await page.goto(`${origin}/${name}.html`);
+      const favicon = page.locator('link[rel="icon"]');
+      assert.equal(await favicon.count(), 1, `${name} 必须声明唯一标签图标`);
+      assert.equal(await favicon.getAttribute('href'), '/favicon.png?v=ck05');
+      const icons = page.locator('img[src$="icon.png"], img[src$="auth-logo.png"]');
+      const expected = ['index', 'login', 'permissions', 'teams'].includes(name) ? 1 : name === 'director' ? 2 : 0;
+      assert.equal(await icons.count(), expected, `${name} 品牌入口不可遗漏`);
+      for (const icon of await icons.all()) {
+        await icon.evaluate(image => image.decode());
+        const box = await icon.evaluate(image => ({
+          width:image.width, height:image.height, naturalWidth:image.naturalWidth, naturalHeight:image.naturalHeight,
+          visible:image.getBoundingClientRect().width > 0,
+        }));
+        assert.equal(box.visible, true);
+        assert.ok(Math.abs(box.width / box.height - box.naturalWidth / box.naturalHeight) < 0.02, `${name} Logo不能被拉伸`);
+      }
+      if (name === 'index') assert.equal(await page.locator('link[rel="apple-touch-icon"]').getAttribute('href'), '/icon.png?v=ck05');
+      if (name === 'director') assert.equal(await page.locator('.welcome-mark').innerText(), '');
+      if (expected) await page.screenshot({path:`/tmp/h3card-brand-${name}.png`});
+    }
+    const images = await page.evaluate(async () => {
+      const read = async (url) => {
+        const image = new Image(); image.src = url; await image.decode();
+        const canvas = document.createElement('canvas'); canvas.width = canvas.height = 128;
+        const context = canvas.getContext('2d');
+        const scale = Math.min(128 / image.naturalWidth, 128 / image.naturalHeight);
+        const width = image.naturalWidth * scale, height = image.naturalHeight * scale;
+        context.drawImage(image, (128 - width) / 2, (128 - height) / 2, width, height);
+        return {width:image.naturalWidth, height:image.naturalHeight, data:[...context.getImageData(0, 0, 128, 128).data]};
+      };
+      return Promise.all(['/auth-logo.png', '/icon.png', '/favicon.png?v=ck05'].map(read));
+    });
+    const [reference, ...variants] = images;
+    assert.deepEqual(variants.map(image => [image.width, image.height]), [[256, 256], [64, 64]]);
+    for (const image of variants) {
+      assert.equal(image.data[3], 0, '正方形图标四周保持透明');
+      let intersection = 0, union = 0, colorDifference = 0;
+      for (let i = 0; i < image.data.length; i += 4) {
+        const expected = reference.data[i + 3] >= 128, actual = image.data[i + 3] >= 128;
+        if (expected || actual) union++;
+        if (expected && actual) {
+          intersection++;
+          for (let channel = 0; channel < 3; channel++) colorDifference += Math.abs(reference.data[i + channel] - image.data[i + channel]);
+        }
+      }
+      assert.ok(intersection / union > 0.95, `${image.width}px图标轮廓应与CK一致，重合度为${intersection / union}`);
+      assert.ok(colorDifference / (intersection * 3) < 3, '全站图标应保留CK原色');
+    }
+  } finally {
+    if (browser) await browser.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('readonly blocks save and operate while allowing view of granted projects', async () => {
   const html = `<!doctype html><meta charset="utf-8"><div id="fixture"></div><script>
     let PROJ = null, projects = [], TASKS = [];

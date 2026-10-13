@@ -70,6 +70,8 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             '/auth-page.css': 'text/css',
             '/auth-art.webp': 'image/webp',
             '/auth-logo.png': 'image/png',
+            '/icon.png': 'image/png',
+            '/favicon.png?v=ck05': 'image/png',
         }
         for route, content_type in assets.items():
             with self.subTest(route=route):
