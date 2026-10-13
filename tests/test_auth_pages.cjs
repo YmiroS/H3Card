@@ -487,6 +487,7 @@ async function inspectPanel(page, form) {
   const first = geometry[0];
   for (const size of geometry) {
     assert.ok(size.height >= 44, `${form} 控件应保留足够点击高度`);
+    assert.ok(size.width <= (viewportWidth <= 760 ? 440 : 400), `${form} 输入框和按钮不得随宽屏无限拉长`);
     assert.ok(Math.abs(size.height - first.height) < 0.1, `${form} 输入框和按钮 computed 高度必须一致`);
     assert.ok(Math.abs(size.width - first.width) < 0.1, `${form} 输入框和按钮 computed 宽度必须一致`);
     assert.ok(size.boxWidth > 0 && size.boxHeight > 0 && size.left >= 0 && size.right <= viewportWidth + 1, `${form} 控件不得超出横向视口`);
@@ -495,6 +496,33 @@ async function inspectPanel(page, form) {
     viewport:innerWidth, document:document.documentElement.scrollWidth, body:document.body.scrollWidth,
   }));
   assert.ok(overflow.document <= overflow.viewport && overflow.body <= overflow.viewport, `${form} 横向溢出：${JSON.stringify(overflow)}`);
+  const scene = await page.evaluate(() => {
+    const image = document.querySelector('.auth-backdrop img');
+    const layout = document.querySelector('.auth-layout');
+    const layoutStyle = getComputedStyle(layout);
+    return {
+      viewport:{width:document.documentElement.clientWidth, height:innerHeight},
+      body:document.body.getBoundingClientRect().toJSON(),
+      layout:layout.getBoundingClientRect().toJSON(),
+      forms:document.querySelector('.auth-forms').getBoundingClientRect().toJSON(),
+      columnWidth:parseFloat(layoutStyle.gridTemplateColumns.split(' ').at(-1)),
+      paddingRight:parseFloat(layoutStyle.paddingRight),
+      image:image.getBoundingClientRect().toJSON(),
+      fit:getComputedStyle(image).objectFit,
+      mask:getComputedStyle(image).maskImage,
+    };
+  });
+  assert.ok(Math.abs(scene.body.width - scene.viewport.width) < 1, '页面保持全宽，不能缩进固定尺寸画面');
+  assert.ok(Math.abs(scene.layout.width - scene.viewport.width) < 1, '布局应随视口宽度自适应');
+  assert.equal(scene.fit, 'cover', '背景等比覆盖，不拉伸变形');
+  if (scene.viewport.width > 760) {
+    assert.ok(scene.layout.height >= scene.viewport.height, '桌面布局应铺满视口高度');
+    assert.ok(Math.abs(scene.image.width - scene.viewport.width) < 1 && Math.abs(scene.image.height - scene.viewport.height) < 1, '桌面背景必须铺满全屏');
+    assert.ok(Math.abs(scene.image.left) < 1 && Math.abs(scene.image.top) < 1, '桌面背景不能留居中缩小后的边框');
+    assert.equal(scene.mask, 'none', '全屏背景不应保留固定画面的边缘遮罩');
+    const columnCenter = scene.layout.right - scene.paddingRight - scene.columnWidth / 2;
+    assert.ok(Math.abs(scene.forms.left + scene.forms.width / 2 - columnCenter) < 1, '限宽表单应在自适应右栏内居中');
+  }
   return {width:first.width, height:first.height};
 }
 
@@ -548,8 +576,15 @@ async function inspectLayout(fixture, screenshotSuffix) {
 
 for (const {width, height, suffix} of [
   {width:1672, height:941, suffix:'desktop'},
+  {width:1920, height:1080},
+  {width:2560, height:1440, suffix:'2k'},
+  {width:3440, height:1440, suffix:'ultrawide'},
+  {width:3840, height:2160},
+  {width:1512, height:800},
   {width:1440, height:900},
   {width:1366, height:768},
+  {width:1024, height:768},
+  {width:768, height:1024},
   {width:390, height:844, suffix:'390'},
   {width:320, height:740, suffix:'320'},
 ]) {
@@ -557,6 +592,15 @@ for (const {width, height, suffix} of [
     await withFixture({viewport:{width, height}}, fixture => inspectLayout(fixture, suffix));
   });
 }
+
+test('同一窗口跨桌面、超宽屏和手机调整尺寸时，两表单保持全宽背景与独立限宽', async () => {
+  await withFixture({}, async fixture => {
+    for (const viewport of [{width:2560, height:1440}, {width:3440, height:1440}, {width:390, height:844}, {width:1920, height:1080}]) {
+      await fixture.page.setViewportSize(viewport);
+      await inspectLayout(fixture);
+    }
+  });
+});
 
 test('短高窗口及 200% 等效 CSS 视口支持两表单滚动且无横向溢出', async () => {
   // 缩小 CSS 视口模拟桌面 200% 缩放的回流；deviceScaleFactor 不是页面缩放。
