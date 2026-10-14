@@ -18,13 +18,20 @@ FINISHED_DISPATCH = ("done", "error", "canceled")
 HIGH_VRAM_CAPABILITIES = frozenset({"minimax_h3_ref_2pass"})
 HIGH_VRAM_GPU_POLICY = "primary_gpu_vram_gte_32gb"
 MIN_HIGH_QUALITY_VRAM_BYTES = 32_000_000_000
+MAX_4090_HIGH_QUALITY_DURATION_SECONDS = 5
+
+
+def primary_gpu(devices):
+    if not isinstance(devices, list) or not devices or not isinstance(devices[0], dict):
+        return None
+    return devices[0]
 
 
 def primary_gpu_vram_bytes(devices):
     # ComfyUI 的 devices[0] 是实际执行的主设备，不能用机器名或其他闲置显卡放行。
-    if not isinstance(devices, list) or not devices or not isinstance(devices[0], dict):
+    primary = primary_gpu(devices)
+    if not primary:
         return 0
-    primary = devices[0]
     if primary.get("type") != "cuda":
         return 0
     for key in ("vram_total", "torch_vram_total"):
@@ -41,10 +48,23 @@ def requires_high_vram(capability, gpu_policy=None):
     return capability in HIGH_VRAM_CAPABILITIES or gpu_policy == HIGH_VRAM_GPU_POLICY
 
 
-def can_run_capability(capability, devices, gpu_policy=None):
+def can_run_capability(capability, devices, gpu_policy=None, duration_seconds=None):
     if not requires_high_vram(capability, gpu_policy):
         return True
-    return primary_gpu_vram_bytes(devices) >= MIN_HIGH_QUALITY_VRAM_BYTES
+    primary = primary_gpu(devices)
+    if not primary or primary.get("type") != "cuda":
+        return False
+    if primary_gpu_vram_bytes(devices) >= MIN_HIGH_QUALITY_VRAM_BYTES:
+        return True
+    try:
+        duration = float(duration_seconds)
+    except (TypeError, ValueError):
+        return False
+    return (
+        capability == "minimax_h3_ref_2pass"
+        and duration <= MAX_4090_HIGH_QUALITY_DURATION_SECONDS
+        and "4090" in str(primary.get("name") or "").lower()
+    )
 
 
 def _hash_token(token):
@@ -414,12 +434,16 @@ class DistributedStore:
                 gpu_policy = payload.get("gpu_policy")
                 if not required.issubset(available_nodes) or not can_run_capability(
                     capability, capabilities.get("devices"), gpu_policy,
+                    payload.get("duration_seconds"),
                 ):
                     continue
                 if requires_high_vram(capability, gpu_policy) and any(
                     primary_gpu_vram_bytes(other.get("devices")) > current_vram
                     and required.issubset(set(other.get("node_classes") or []))
-                    and can_run_capability(capability, other.get("devices"), gpu_policy)
+                    and can_run_capability(
+                        capability, other.get("devices"), gpu_policy,
+                        payload.get("duration_seconds"),
+                    )
                     for other in idle_capabilities
                 ):
                     continue

@@ -222,6 +222,40 @@ class DistributedStoreTest(unittest.TestCase):
                 self.store.remove_job("hq")
                 self.store.enqueue("hq", {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
 
+    def test_high_quality_h3_up_to_five_seconds_allows_4090(self):
+        gib = 1024 ** 3
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{
+                "type": "cuda", "name": "NVIDIA GeForce RTX 4090",
+                "vram_total": 24 * gib,
+            }],
+        })
+        for duration, accepted in ((5, True), (5.001, False)):
+            with self.subTest(duration=duration):
+                self.store.enqueue("hq-short", {
+                    "capability": "minimax_h3_ref_2pass",
+                    "duration_seconds": duration,
+                }, ["KSampler"])
+                assignment = self.store.acquire(self.worker_id)
+                self.assertEqual(assignment is not None, accepted)
+                if assignment:
+                    self.store.finish(
+                        "hq-short", self.worker_id, assignment["lease_token"], "done"
+                    )
+                self.store.remove_job("hq-short")
+
+    def test_short_high_quality_h3_requires_actual_4090(self):
+        gib = 1024 ** 3
+        self.store.enqueue("hq-short", {
+            "capability": "minimax_h3_ref_2pass", "duration_seconds": 5,
+        }, ["KSampler"])
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "RTX 3090", "vram_total": 24 * gib}],
+        })
+        self.assertIsNone(self.store.acquire(self.worker_id))
+
     def test_long_video_gpu_policy_requires_32gb_primary_cuda_gpu(self):
         gib = 1024 ** 3
         self.store.enqueue("long-video", {
