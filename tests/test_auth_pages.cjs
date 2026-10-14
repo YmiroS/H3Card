@@ -554,7 +554,7 @@ async function inspectLayout(fixture, screenshotSuffix) {
   assert.deepEqual(images.map(image => image.src).sort(), ['/auth-art.webp', '/auth-logo.png']);
   assert.ok(images.every(image => image.loaded), '背景图和 Logo 必须真实加载成功');
   const login = await inspectPanel(page, 'login');
-  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-final-login-${screenshotSuffix}.png`, fullPage:true});
+  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-fox-login-${screenshotSuffix}.png`, fullPage:true});
   await inspectKeyboardFocus(page, 'login');
   await page.keyboard.press('Enter');
   await page.locator('#register-panel').waitFor();
@@ -565,7 +565,7 @@ async function inspectLayout(fixture, screenshotSuffix) {
   // 完整页面截图便于主助手检查窄屏长表单，拍摄前回顶且移走焦点轮廓。
   await page.locator('#register-heading').evaluate(node => node.blur());
   await page.evaluate(() => scrollTo(0, 0));
-  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-final-register-${screenshotSuffix}.png`, fullPage:true});
+  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-fox-register-${screenshotSuffix}.png`, fullPage:true});
   await inspectKeyboardFocus(page, 'register');
   await page.locator('#to-login').scrollIntoViewIfNeeded();
   assert.equal(await page.locator('#to-login').isVisible(), true, '短高页面仍可滚动到返回按钮');
@@ -574,6 +574,71 @@ async function inspectLayout(fixture, screenshotSuffix) {
   assert.deepEqual(await inspectPanel(page, 'login'), login);
   assert.deepEqual(posts(fixture), []);
 }
+
+test('狐狸导演背景保持完整原图比例和轻量体积，暖色两表单保留足够对比度', async () => {
+  assert.ok(readFileSync(path.join(web, 'auth-art.webp')).byteLength < 200 * 1024, '舞台背景应压缩为小于200KB的WebP');
+  await withFixture({viewport:{width:1672, height:941}}, async ({page}) => {
+    await ready(page);
+    const art = await page.locator('.auth-backdrop img').evaluate(async image => {
+      await image.decode();
+      return {width:image.naturalWidth, height:image.naturalHeight};
+    });
+    assert.deepEqual(art, {width:1672, height:941});
+    for (const viewport of [{width:1672, height:941}, {width:390, height:844}]) {
+      await page.setViewportSize(viewport);
+      for (const form of ['login', 'register']) {
+        if (form === 'register') await openRegister(page);
+        const theme = await page.evaluate(form => {
+          const style = selector => getComputedStyle(document.querySelector(selector));
+          const rgb = color => color.match(/[\d.]+/g).map(Number);
+          const luminance = color => rgb(color).slice(0, 3).map(value => {
+            const channel = value / 255;
+            return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+          }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+          const contrast = (text, background) => {
+            const values = [luminance(text), luminance(background)].sort((a, b) => b - a);
+            return (values[0] + .05) / (values[1] + .05);
+          };
+          const primary = style(`#${form} .auth-primary`);
+          const inputNode = document.querySelector(`#${form} input`);
+          const input = getComputedStyle(inputNode);
+          const fill = rgb(input.backgroundColor);
+          // 在最亮的白色背景上计算半透明输入框，保证舞台亮部也不吞掉占位文字。
+          const alpha = fill[3] ?? 1;
+          const brightestInput = `rgb(${fill.slice(0, 3).map(value => value * alpha + 255 * (1 - alpha)).join(',')})`;
+          const notice = style('.auth-notice');
+          const description = style(`#${form}-panel .auth-description`);
+          return {
+            accent:primary.backgroundColor,
+            inputFill:input.backgroundColor,
+            primaryContrast:contrast(primary.color, primary.backgroundColor),
+            placeholderContrast:contrast(getComputedStyle(inputNode, '::placeholder').color, brightestInput),
+            inputContrast:contrast(input.color, brightestInput),
+            noticeContrast:contrast(notice.color, notice.backgroundColor),
+            descriptionContrast:contrast(description.color, style('body').backgroundColor),
+            formBackground:style('.auth-forms').backgroundColor,
+            contacts:[...document.querySelectorAll('.auth-contacts span')].map(node => {
+              const value = getComputedStyle(node);
+              return {size:value.fontSize, color:value.color, weight:value.fontWeight};
+            }),
+            description:{size:style('#register-description').fontSize, color:style('#register-description').color, weight:'400'},
+          };
+        }, form);
+        assert.equal(theme.accent, 'rgb(223, 194, 142)', '主按钮沿用批准的香槟金，不回退冷蓝色');
+        const [red, green, blue] = theme.inputFill.match(/[\d.]+/g).map(Number);
+        assert.ok(red > green && green > blue, '输入框保持暖灰棕色');
+        assert.equal(theme.formBackground, 'rgba(0, 0, 0, 0)', '桌面及手机表单不增加割裂场景的外层卡片');
+        for (const key of ['primaryContrast', 'placeholderContrast', 'inputContrast', 'noticeContrast', 'descriptionContrast']) {
+          assert.ok(theme[key] >= 4.5, `${form} ${key}=${theme[key]} 应达到AA正文对比度`);
+        }
+        assert.deepEqual(theme.contacts, [theme.description, theme.description], '联系人与审批说明字号、颜色和字重一致');
+        await page.locator(`#${form} input`).first().focus();
+        assert.equal(await page.locator(`#${form} input`).first().evaluate(node => getComputedStyle(node).outlineColor), 'rgb(238, 216, 170)');
+        if (form === 'register') await page.locator('#to-login').click();
+      }
+    }
+  });
+});
 
 for (const {width, height, suffix} of [
   {width:1672, height:941, suffix:'desktop'},
