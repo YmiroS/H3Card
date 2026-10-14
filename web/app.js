@@ -545,7 +545,7 @@ function imageClarityPicker(c, cap, onchange) {
 const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length"]);
 const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
   !RES_PARAM_KEYS.has(s.key) && !MEDIA.includes(s.type) && s.type !== "textarea"
-  && s.type !== "seed" && !s.advanced && !s.mirror && !s.rangeOf);
+  && (s.type === "seed" || !s.advanced) && !s.mirror && !s.rangeOf);
 
 /** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度、画面比例和当前模式的常规参数。 */
 function openResPop(c, anchor) {
@@ -5227,8 +5227,7 @@ function openPanel(id) {
   // mirror = 多个节点共用同一个参数框（如两个采样器共用种子），只画一次
   // ranged = 已经画成上面那条选区了，别在这儿再出一对文本框
   const rows = specs.filter(x => !MEDIA.includes(x.type) && x.type !== "textarea"
-    && x.type !== "seed"            // 种子不进面板：永远默认 -1（每次随机），想复现去历史栏复制 seed
-    && !x.advanced && !x.mirror && !ranged.has(x.key));
+    && (x.type === "seed" || !x.advanced) && !x.mirror && !ranged.has(x.key));
   // 旋钮下面那行小字：光靠 label 说不清的（"分辨率"是每格的还是整张的）必须摆在
   // 明面上。以前只有「高级」里的旋钮画它，常规旋钮的 hint 只当 tooltip，不悬停看不见
   const addRow = (box, s) => {
@@ -7348,8 +7347,7 @@ function payloadOf(c) {
   const pkeys = new Set(promptSpecs(cap).map(s => s.key));
   for (const s of cap.inputs) {
     if (MEDIA.includes(s.type) || s.mirror) continue;
-    // 统一生图面板允许固定种子；其他模式继续使用原来的每次随机规则。
-    const v = s.type === "seed" && !cap.imageControls ? undefined : c.params[s.key];
+    const v = c.params[s.key];
     if (v != null) params[s.key] = v;
     else if (s.type === "seed") params[s.key] = -1;      // 每次随机
     else if (s.default !== undefined) params[s.key] = s.default;
