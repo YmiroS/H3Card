@@ -509,18 +509,44 @@ async function inspectPanel(page, form) {
       columnWidth:parseFloat(layoutStyle.gridTemplateColumns.split(' ').at(-1)),
       paddingRight:parseFloat(layoutStyle.paddingRight),
       image:image.getBoundingClientRect().toJSON(),
+      backdrop:document.querySelector('.auth-backdrop').getBoundingClientRect().toJSON(),
+      natural:{width:image.naturalWidth, height:image.naturalHeight},
+      heading:document.querySelector('.auth-intro h1').getBoundingClientRect().toJSON(),
       fit:getComputedStyle(image).objectFit,
-      mask:getComputedStyle(image).maskImage,
     };
   });
   assert.ok(Math.abs(scene.body.width - scene.viewport.width) < 1, '页面保持全宽，不能缩进固定尺寸画面');
   assert.ok(Math.abs(scene.layout.width - scene.viewport.width) < 1, '布局应随视口宽度自适应');
-  assert.equal(scene.fit, 'cover', '背景等比覆盖，不拉伸变形');
+  assert.equal(scene.fit, 'contain', '角色原图完整等比显示，不再通过cover裁掉尾巴');
+  const scale = scene.image.width / scene.natural.width;
+  assert.ok(Math.abs(scene.image.height - scene.natural.height * scale) < 1, '原图不得拉伸变形');
+  // 已批准原图中包含整条尾巴及白色尾尖的保守包围框，随实际图像等比映射。
+  const tail = {left:scene.image.left + 130 * scale, right:scene.image.left + 475 * scale,
+    top:scene.image.top + 640 * scale, bottom:scene.image.top + 910 * scale};
+  assert.ok(tail.left >= Math.max(0, scene.backdrop.left) && tail.right <= Math.min(scene.viewport.width, scene.backdrop.right), '整条尾巴不得横向裁切');
+  assert.ok(tail.top >= scene.backdrop.top && tail.bottom <= scene.backdrop.bottom, '白色尾尖必须留在背景可见范围内');
+  for (const [name, box] of [['主标题', scene.heading], ['表单', scene.forms]]) {
+    const intersects = tail.left < box.right && tail.right > box.left && tail.top < box.bottom && tail.bottom > box.top;
+    assert.equal(intersects, false, `整条尾巴不得被${name}遮挡`);
+  }
+  const head = {left:scene.image.left + 350 * scale, right:scene.image.left + 690 * scale,
+    top:scene.image.top + 18 * scale, bottom:scene.image.top + 370 * scale};
+  // 标题容器可能比文字宽，只检查真实文字的边界，避免将留白当成遮挡。
+  const title = await page.locator('.auth-intro h1').evaluate(node => {
+    return [...node.children].flatMap(line => {
+      const range = document.createRange();
+      range.selectNodeContents(line);
+      return [...range.getClientRects()].filter(rect => rect.width > 0).map(rect => rect.toJSON());
+    });
+  });
+  for (const box of title) {
+    assert.equal(head.left < box.right && head.right > box.left && head.top < box.bottom && head.bottom > box.top, false, '主标题不得盖住狐狸头部');
+  }
   if (scene.viewport.width > 760) {
     assert.ok(scene.layout.height >= scene.viewport.height, '桌面布局应铺满视口高度');
-    assert.ok(Math.abs(scene.image.width - scene.viewport.width) < 1 && Math.abs(scene.image.height - scene.viewport.height) < 1, '桌面背景必须铺满全屏');
-    assert.ok(Math.abs(scene.image.left) < 1 && Math.abs(scene.image.top) < 1, '桌面背景不能留居中缩小后的边框');
-    assert.equal(scene.mask, 'none', '全屏背景不应保留固定画面的边缘遮罩');
+    assert.ok(Math.abs(scene.backdrop.width - scene.viewport.width) < 1 && Math.abs(scene.backdrop.height - scene.viewport.height) < 1, '舞台背景层必须铺满全屏，不能缩小整页');
+    assert.ok(Math.abs(scene.backdrop.left) < 1 && Math.abs(scene.backdrop.top) < 1, '全屏背景不能留居中缩小后的边框');
+    assert.ok(scene.image.bottom <= scene.viewport.height + 1 && scene.image.right <= scene.viewport.width + 1, '桌面原图全部落在视口内');
     const columnCenter = scene.layout.right - scene.paddingRight - scene.columnWidth / 2;
     assert.ok(Math.abs(scene.forms.left + scene.forms.width / 2 - columnCenter) < 1, '限宽表单应在自适应右栏内居中');
   }
@@ -554,7 +580,7 @@ async function inspectLayout(fixture, screenshotSuffix) {
   assert.deepEqual(images.map(image => image.src).sort(), ['/auth-art.webp', '/auth-logo.png']);
   assert.ok(images.every(image => image.loaded), '背景图和 Logo 必须真实加载成功');
   const login = await inspectPanel(page, 'login');
-  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-final-login-${screenshotSuffix}.png`, fullPage:true});
+  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-tail-login-${screenshotSuffix}.png`, fullPage:true});
   await inspectKeyboardFocus(page, 'login');
   await page.keyboard.press('Enter');
   await page.locator('#register-panel').waitFor();
@@ -565,7 +591,7 @@ async function inspectLayout(fixture, screenshotSuffix) {
   // 完整页面截图便于主助手检查窄屏长表单，拍摄前回顶且移走焦点轮廓。
   await page.locator('#register-heading').evaluate(node => node.blur());
   await page.evaluate(() => scrollTo(0, 0));
-  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-final-register-${screenshotSuffix}.png`, fullPage:true});
+  if (screenshotSuffix) await page.screenshot({path:`/tmp/h3card-auth-tail-register-${screenshotSuffix}.png`, fullPage:true});
   await inspectKeyboardFocus(page, 'register');
   await page.locator('#to-login').scrollIntoViewIfNeeded();
   assert.equal(await page.locator('#to-login').isVisible(), true, '短高页面仍可滚动到返回按钮');
@@ -575,17 +601,82 @@ async function inspectLayout(fixture, screenshotSuffix) {
   assert.deepEqual(posts(fixture), []);
 }
 
+test('狐狸导演背景保持完整原图比例和轻量体积，暖色两表单保留足够对比度', async () => {
+  assert.ok(readFileSync(path.join(web, 'auth-art.webp')).byteLength < 200 * 1024, '舞台背景应压缩为小于200KB的WebP');
+  await withFixture({viewport:{width:1672, height:941}}, async ({page}) => {
+    await ready(page);
+    const art = await page.locator('.auth-backdrop img').evaluate(async image => {
+      await image.decode();
+      return {width:image.naturalWidth, height:image.naturalHeight};
+    });
+    assert.deepEqual(art, {width:1672, height:941});
+    for (const viewport of [{width:1672, height:941}, {width:390, height:844}]) {
+      await page.setViewportSize(viewport);
+      for (const form of ['login', 'register']) {
+        if (form === 'register') await openRegister(page);
+        const theme = await page.evaluate(form => {
+          const style = selector => getComputedStyle(document.querySelector(selector));
+          const rgb = color => color.match(/[\d.]+/g).map(Number);
+          const luminance = color => rgb(color).slice(0, 3).map(value => {
+            const channel = value / 255;
+            return channel <= .04045 ? channel / 12.92 : ((channel + .055) / 1.055) ** 2.4;
+          }).reduce((sum, value, index) => sum + value * [.2126, .7152, .0722][index], 0);
+          const contrast = (text, background) => {
+            const values = [luminance(text), luminance(background)].sort((a, b) => b - a);
+            return (values[0] + .05) / (values[1] + .05);
+          };
+          const primary = style(`#${form} .auth-primary`);
+          const inputNode = document.querySelector(`#${form} input`);
+          const input = getComputedStyle(inputNode);
+          const fill = rgb(input.backgroundColor);
+          // 在最亮的白色背景上计算半透明输入框，保证舞台亮部也不吞掉占位文字。
+          const alpha = fill[3] ?? 1;
+          const brightestInput = `rgb(${fill.slice(0, 3).map(value => value * alpha + 255 * (1 - alpha)).join(',')})`;
+          const notice = style('.auth-notice');
+          const description = style(`#${form}-panel .auth-description`);
+          return {
+            accent:primary.backgroundColor,
+            inputFill:input.backgroundColor,
+            primaryContrast:contrast(primary.color, primary.backgroundColor),
+            placeholderContrast:contrast(getComputedStyle(inputNode, '::placeholder').color, brightestInput),
+            inputContrast:contrast(input.color, brightestInput),
+            noticeContrast:contrast(notice.color, notice.backgroundColor),
+            descriptionContrast:contrast(description.color, style('body').backgroundColor),
+            formBackground:style('.auth-forms').backgroundColor,
+            contacts:[...document.querySelectorAll('.auth-contacts span')].map(node => {
+              const value = getComputedStyle(node);
+              return {size:value.fontSize, color:value.color, weight:value.fontWeight};
+            }),
+            description:{size:style('#register-description').fontSize, color:style('#register-description').color, weight:'400'},
+          };
+        }, form);
+        assert.equal(theme.accent, 'rgb(223, 194, 142)', '主按钮沿用批准的香槟金，不回退冷蓝色');
+        const [red, green, blue] = theme.inputFill.match(/[\d.]+/g).map(Number);
+        assert.ok(red > green && green > blue, '输入框保持暖灰棕色');
+        assert.equal(theme.formBackground, 'rgba(0, 0, 0, 0)', '桌面及手机表单不增加割裂场景的外层卡片');
+        for (const key of ['primaryContrast', 'placeholderContrast', 'inputContrast', 'noticeContrast', 'descriptionContrast']) {
+          assert.ok(theme[key] >= 4.5, `${form} ${key}=${theme[key]} 应达到AA正文对比度`);
+        }
+        assert.deepEqual(theme.contacts, [theme.description, theme.description], '联系人与审批说明字号、颜色和字重一致');
+        await page.locator(`#${form} input`).first().focus();
+        assert.equal(await page.locator(`#${form} input`).first().evaluate(node => getComputedStyle(node).outlineColor), 'rgb(238, 216, 170)');
+        if (form === 'register') await page.locator('#to-login').click();
+      }
+    }
+  });
+});
+
 for (const {width, height, suffix} of [
   {width:1672, height:941, suffix:'desktop'},
   {width:1920, height:1080},
   {width:2560, height:1440, suffix:'2k'},
   {width:3440, height:1440, suffix:'ultrawide'},
   {width:3840, height:2160},
-  {width:1512, height:800},
+  {width:1512, height:800, suffix:'1512'},
   {width:1440, height:900},
   {width:1366, height:768},
   {width:1024, height:768},
-  {width:768, height:1024},
+  {width:768, height:1024, suffix:'tablet'},
   {width:390, height:844, suffix:'390'},
   {width:320, height:740, suffix:'320'},
 ]) {
