@@ -331,7 +331,10 @@ test('image model menus, parameters and media limits in the complete UI', async 
       const row = label => page.locator('#respop .row').filter({has:page.getByText(label, {exact:true})});
       const steps = row(stepSpec.label);
       const refine = row(refineSpec.label);
-      assert.equal(await page.locator('#respop .row').count(), 2, 'cfg and seed do not become extra controls');
+      assert.equal(await page.locator('#respop .row').count(), 3, 'sampling steps and seed are visible; cfg stays hidden');
+      const seed = row('种子').locator('input[type="number"]');
+      assert.equal(await seed.inputValue(), '-1');
+      await seed.fill('2468');
       assert.equal(await steps.locator('input[type="number"]').inputValue(), '6');
       assert.equal(await refine.locator('input[type="number"]').inputValue(), '2');
       await steps.locator('input[type="number"]').fill('8');
@@ -351,6 +354,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       let payload = await submit();
       assert.deepEqual([payload.params.width, payload.params.height, payload.params.steps,
         payload.params.refine_steps, payload.params.cfg], [1280, 720, 8, 3, 1.5]);
+      assert.equal(payload.params.seed, 2468);
       await chooseModel('Z-Image');
       payload = await submit();
       assert.deepEqual([payload.params.width, payload.params.height], [1280, 720]);
@@ -388,7 +392,10 @@ test('image model menus, parameters and media limits in the complete UI', async 
       const steps = page.locator('#respop .row').filter({hasText:'采样步数'});
       await steps.locator('input[type="number"]').fill('12');
       assert.equal(await steps.locator('input[type="range"]').inputValue(), '12');
-      assert.equal(await page.locator('#respop .row').count(), 1, 'advanced and seed controls stay hidden');
+      assert.equal(await page.locator('#respop .row').count(), 2, 'sampling steps and seed are visible; advanced controls stay hidden');
+      const seed = page.locator('#respop .row').filter({has:page.getByText('种子', {exact:true})}).locator('input[type="number"]');
+      assert.equal(await seed.inputValue(), '-1');
+      await seed.fill('8642');
       await page.locator('#respop .x').click();
       await paramsButton.click();
       assert.equal(await length.inputValue(), '1536');
@@ -406,7 +413,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       assert.equal(payload.params.scale_to_length, 1536);
       assert.equal(payload.params.steps, 12);
       assert.equal(payload.params.prompt, '将三张参考图合成一幅画');
-      assert.equal(payload.params.seed, -1);
+      assert.equal(payload.params.seed, 8642);
       assert.deepEqual(Object.keys(payload.assets), ['images[0]']);
     });
 
