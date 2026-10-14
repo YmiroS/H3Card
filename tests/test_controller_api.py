@@ -1145,7 +1145,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
     })
-    async def test_high_quality_h3_dispatches_to_gpu_with_at_least_32gb(self, _patch_graph):
+    async def test_high_quality_h3_up_to_five_seconds_allows_4090(self, _patch_graph):
         capability = {"name": "H3全能参考(高质量)", "outputType": "video", "_graph_ok": True}
         with mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
             response = await self.client.post("/api/generate", json={
@@ -1155,7 +1155,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(response.status, 200)
         job = await response.json()
         gib = 1024 ** 3
-        for gpu, vram, status in (("RTX 4090", 24 * gib, 204), ("RTX A6000", 48 * gib, 200)):
+        for gpu, vram, status in (("RTX 4090", 24 * gib, 200), ("RTX A6000", 48 * gib, 204)):
             credentials = self.store.register_worker(gpu, {
                 "node_classes": ["KSampler"],
                 "devices": [{"type": "cuda", "name": gpu, "vram_total": vram}],
@@ -1170,6 +1170,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                 assignment = await response.json()
                 self.assertEqual(assignment["job_id"], job["id"])
                 self.assertEqual(assignment["payload"]["capability"], "minimax_h3_ref_2pass")
+                self.assertEqual(assignment["payload"]["duration_seconds"], 5)
             else:
                 self.assertEqual(controller_app.JOBS[job["id"]]["status"], "queued")
 
@@ -1187,7 +1188,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
              mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": capability}):
             gib = 1024 ** 3
             for gpu, vram, status in (
-                ("RTX 4090", 24 * gib, 400), (None, 0, 400), ("RTX A6000", 48 * gib, 200),
+                ("RTX 4090", 24 * gib, 200), (None, 0, 400), ("RTX A6000", 48 * gib, 200),
             ):
                 with self.subTest(gpu=gpu):
                     submit.reset_mock()

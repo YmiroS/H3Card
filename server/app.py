@@ -45,7 +45,7 @@ from costs import CostLedger
 from capacity import make_spec, export_csv, model_summary_from_graph
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
-    can_run_capability,
+    MAX_4090_HIGH_QUALITY_DURATION_SECONDS, can_run_capability,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1065,6 +1065,7 @@ async def api_generate(request):
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
+    duration_seconds = rw.duration(cap, params) if cid == "minimax_h3_ref_2pass" else None
     uploaded = await generation_assets(request, body.get("assets") or {}, body["project"])
     source_video_duration, video_metadata = None, {}
     if not body.get("dry_run"):
@@ -1097,8 +1098,13 @@ async def api_generate(request):
                 stats = await response.json()
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，此任务要求主 GPU 显存至少 32GB")
-        if not can_run_capability(cid, stats.get("devices"), gpu_policy):
-            raise web.HTTPBadRequest(reason="此任务只能在主 GPU 显存至少 32GB 的机器上运行")
+        if not can_run_capability(
+            cid, stats.get("devices"), gpu_policy, duration_seconds,
+        ):
+            raise web.HTTPBadRequest(
+                reason="此任务只能在主 GPU 显存至少 32GB 的机器上运行；"
+                       f"H3高质量不超过{MAX_4090_HIGH_QUALITY_DURATION_SECONDS:g}秒时也可使用RTX 4090"
+            )
     await require_project(request, body["project"], operate=True)
     pid = str(uuid.uuid4())
     await call_store(request.app, "register_job", pid, body["project"], require_user(request)["id"])
@@ -1154,6 +1160,8 @@ async def api_generate(request):
         }
         if gpu_policy:
             dispatch_payload["gpu_policy"] = gpu_policy
+        if duration_seconds is not None:
+            dispatch_payload["duration_seconds"] = duration_seconds
         distributed_store(request.app).enqueue(pid, dispatch_payload, required_nodes)
         if ledger:
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
