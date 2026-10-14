@@ -19,7 +19,7 @@ const NEGATIVE_CAPS = new Set(['qwen_image_2512_t2i','qwen_image_21_t2i','qwen_i
 const LEVELS = ['480P', '720P', '1080P', '1440P', '2K'];
 const RATIOS = ['1:1', '1:2', '2:1', '9:16', '16:9', '3:4', '4:3', '3:2', '2:3', '5:4', '4:5', '21:9', '9:21'];
 
-test('all image models share real runtime controls without changing video parameters', async t => {
+test('generation cards expose real runtime controls and honor workflow seeds', async t => {
   const project = {id:'controls-test', name:'基础参数测试', permission:'operate', locked:true,
     edges:[], groups:[], view:{x:100,y:70,k:1},
     cards:[{id:'card',type:'card_image',cap:'zimage_t2i',x:100,y:20,params:{},assets:{},outputs:[]}]};
@@ -32,6 +32,15 @@ test('all image models share real runtime controls without changing video parame
     if (pathname === '/api/jobs') return json(res,{jobs:[]});
     if (pathname === '/api/projects') return json(res,{projects:[{...project,cards:1}]});
     if (pathname === '/api/projects/controls-test') return json(res,project);
+    if (pathname === '/api/projects/controls-test/cards' && req.method === 'POST') {
+      const chunks=[];
+      req.on('data',chunk=>chunks.push(chunk));
+      req.on('end',()=>{
+        const {card}=JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        json(res,{ok:true,card,project:{...project,rev:1,cards:[...project.cards,card]}});
+      });
+      return;
+    }
     const files = {'/':'index.html','/app.js':'app.js','/auth.js':'auth.js','/style.css':'style.css','/icon.png':'icon.png','/favicon.png':'favicon.png'};
     if (files[pathname]) {
       const name=files[pathname];
@@ -126,6 +135,45 @@ test('all image models share real runtime controls without changing video parame
         }
         assert.match(await paramsButton.innerText(),/9:21.*2K/,cap);
       }
+    });
+
+    await t.test('every seeded workflow exposes one editable control and submits its visible value',async()=>{
+      const seeded=Object.values(runtime.capabilities).filter(cap=>cap.inputs.some(s=>s.type==='seed' && !s.mirror));
+      assert.ok(seeded.length>20);
+      for(const cap of seeded) {
+        await reset(cap.id);
+        await page.evaluate(()=>{PROJ.cards[0].seed=987654;});
+        const compact=await page.evaluate(()=>{
+          const def=defOf(PROJ.cards[0]);
+          return ['card_image','card_video','card_tools'].includes(def.id) && def.modes.length>1;
+        });
+        if(compact) await paramsButton.click();
+        const container=page.locator(compact?'#respop':'#panel .pwrap');
+        const seeds=cap.inputs.filter(s=>s.type==='seed' && !s.mirror);
+        assert.equal(await container.locator('.dice').count(),seeds.length,cap.id);
+        for(const spec of seeds) {
+          const seedRow=container.locator('.row').filter({has:page.getByText(spec.label,{exact:true})});
+          const input=seedRow.locator('input[type=number]');
+          assert.equal(await input.inputValue(),'-1',cap.id);
+          assert.equal((await page.evaluate(()=>payloadOf(PROJ.cards[0]))).params[spec.key],-1,cap.id);
+          const fixed=Math.min(spec.max || Number.MAX_SAFE_INTEGER,3723077505083689);
+          await input.fill(String(fixed));
+          assert.equal((await page.evaluate(()=>payloadOf(PROJ.cards[0]))).params[spec.key],fixed,cap.id);
+          assert.equal((await page.evaluate(()=>plain(PROJ.cards[0]))).params[spec.key],fixed,cap.id);
+          await page.evaluate(()=>openPanel(PROJ.cards[0].id));
+          if(compact) await paramsButton.click();
+          assert.equal(await input.inputValue(),String(fixed),cap.id);
+          await input.fill('0');
+          assert.equal((await page.evaluate(()=>payloadOf(PROJ.cards[0]))).params[spec.key],0,cap.id);
+          await seedRow.locator('.dice').click();
+          assert.equal(await input.inputValue(),'-1',cap.id);
+          assert.equal((await page.evaluate(()=>payloadOf(PROJ.cards[0]))).params[spec.key],-1,cap.id);
+          await input.fill('');
+          assert.equal((await page.evaluate(()=>payloadOf(PROJ.cards[0]))).params[spec.key],-1,cap.id);
+        }
+      }
+      await reset('depth_image','card_tools');await paramsButton.click();
+      assert.equal(await page.locator('#respop .dice').count(),0,'unseeded workflows do not get a seed control');
     });
 
     await t.test('model changes retain clarity, restore model-specific edits and default i2i to original ratio',async()=>{
@@ -295,13 +343,14 @@ test('all image models share real runtime controls without changing video parame
       const modeRow=page.locator('#respop .row').filter({hasText:'生成模式'});
       const mode=modeRow.locator('select');
       assert.deepEqual(await mode.locator('option').allTextContents(),['快速模式（8步·提速）','质量模式（20步·高一致性）']);
-      assert.equal(await mode.inputValue(),'fast');
+      assert.equal(await mode.inputValue(),runtime.capabilities.minimax_h3_ref9.inputs.find(s=>s.key==='sampling_mode').default);
       await mode.selectOption('quality');
       const durationRow=page.locator('#respop .row').filter({hasText:'时长(秒)'});
       await durationRow.locator('input[type=number]').fill('10');
       assert.equal(await durationRow.locator('.paramwarn').isVisible(),true);
-      const payload=await page.evaluate(()=>{PROJ.cards[0].params.seed=123;return payloadOf(PROJ.cards[0]);});
-      assert.equal(payload.params.seed,-1);
+      await page.locator('#respop .row').filter({has:page.getByText('种子',{exact:true})}).locator('input[type=number]').fill('123');
+      const payload=await page.evaluate(()=>payloadOf(PROJ.cards[0]));
+      assert.equal(payload.params.seed,123);
       assert.equal(payload.params.sampling_mode,'quality');
       assert.equal(payload.params.steps,20);
       assert.equal(payload.params.strength_model,0);
