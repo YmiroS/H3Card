@@ -13,7 +13,7 @@
   let project = null, doc = null, caps = {}, cardTypes = [], stage = 'image', selected = null;
   let jobs = new Map(), dirty = false, editVersion = 0, saving = null, saveTimer = null;
   let conflict = false, busy = false, polling = false, previewIndex = 0, toastTimer;
-  let historySignature = '', pollSignature = '', dragging = null;
+  let historySignature = '', historyType = 'image', historyContext = '', pollSignature = '', dragging = null;
   let editorOpening = false, editorClosing = false, serverReady = false;
   const editorOpen = () => $('node-dialog').open || editorOpening;
   function mergeDocument(next, keepEdits = false) {
@@ -60,6 +60,23 @@
     const url = new URL(value, location.href);
     return url.origin === location.origin && /^\/api\/(upload\/|file\?|artifact\/)/.test(value) ? url.href : '';
   }
+  function previewMedia(output, title) {
+    const media = el(output.kind === 'video' ? 'video' : 'img');
+    media.setAttribute('aria-label', title);
+    if (output.kind === 'video') {
+      media.controls = true; media.playsInline = true; media.preload = 'metadata';
+      const url = new URL(mediaURL(output.url));
+      if (/^\/api\/(upload|artifact)\//.test(url.pathname)) {
+        media.poster = `/api/thumbnail?url=${encodeURIComponent(url.pathname + url.search)}`;
+      }
+      media.addEventListener('loadedmetadata', () => {
+        if (!media.poster && media.currentTime === 0) media.currentTime = Math.min(0.001, media.duration || 0);
+      }, {once:true});
+      media.addEventListener('error', () => { media.title = '视频加载失败，请检查原文件是否仍可访问'; });
+    } else { media.alt = title; media.loading = 'lazy'; }
+    media.src = mediaURL(output.url);
+    return media;
+  }
   function touch() {
     if (!writable()) return;
     dirty = true; editVersion++;
@@ -80,7 +97,7 @@
     $('readonly').hidden = !project || project.permission === 'operate' && !project.locked;
     $('conflict').hidden = !conflict;
     $('script').disabled = $('style').disabled = !writable() || busy;
-    if (!writable() || busy) $('inspector').querySelectorAll('button,input,textarea,select').forEach(node => { node.disabled = true; });
+    if (!writable() || busy) $('inspector').querySelectorAll('button:not([data-version-type]),input,textarea,select').forEach(node => { node.disabled = true; });
     if (project) $('summary').textContent = `${doc.shots.length} 个镜头 · ${doc.shots.filter(s => chosen(s,'video')).length} 段视频`;
   }
   async function save() {
@@ -142,7 +159,7 @@
       window.DirectorEdit.setContext(pid);
       const targetShot = new URL(location.href).searchParams.get('shot');
       selected = doc.shots.find(s => s.id === targetShot)?.id || doc.shots[0]?.id || null; dirty = false; conflict = false;
-      jobs = new Map(); historySignature = ''; pollSignature = '';
+      jobs = new Map(); historySignature = ''; historyContext = ''; pollSignature = '';
       $('projects').value = pid; $('project-name').textContent = next.name;
       $('save-status').textContent = next.permission === 'operate' && !next.locked ? '已保存' : '只读项目';
       $('save-status').classList.remove('error');
@@ -182,7 +199,9 @@
   function taskFor(entry) {
     if (!entry) return null;
     const job = jobs.get(entry.job);
-    return (!job || job.unavailable) && entry.outputs?.length ? {id:entry.job,status:'done',name:'已保存的生成产物',outputs:entry.outputs} : job;
+    if (!entry.outputs?.length) return job;
+    if (!job || job.unavailable) return {id:entry.job,status:'done',name:'已保存的生成产物',outputs:entry.outputs};
+    return job.outputs?.length ? job : {...job,outputs:entry.outputs};
   }
   function versions(shot, type) {
     return shot.history.filter(h => h.stage === type).flatMap(h => {
@@ -221,29 +240,53 @@
     doc.shots.splice(to,0,doc.shots.splice(from,1)[0]); touch(); renderShots(); renderInspector(); renderReview();
   }
   function renderShots() {
-    const grid = $('shots'); grid.replaceChildren();
+    const grid = $('shots');
+    if (!['image','video'].includes(stage)) { grid.replaceChildren(); return; }
     $('list-title').textContent = stage === 'video' ? '镜头视频' : '分镜清单';
-    if (!doc.shots.length) { grid.append(el('div','empty-shots','还没有镜头。点击「添加镜头」，开始编排你的故事。')); return; }
+    if (!doc.shots.length) { grid.replaceChildren(el('div','empty-shots','还没有镜头。点击「添加镜头」，开始编排你的故事。')); return; }
+    const existing = new Map([...grid.children].map(node => [node.dataset.shot,node]));
+    for (const [id,node] of existing) if (!doc.shots.some(shot => shot.id === id)) node.remove();
     doc.shots.forEach((shot,index) => {
-      const card = el('article','shot-card'+(shot.id === selected ? ' selected' : ''));
+      const card = existing.get(shot.id) || el('article');
+      card.className = 'shot-card'+(shot.id === selected ? ' selected' : '');
       card.tabIndex = 0; card.setAttribute('aria-label',`${index+1}. ${shot.title}`); card.dataset.shot = shot.id;
-      const selectShot = () => { selected = shot.id; historySignature = ''; renderShots(); renderInspector(); };
-      card.onclick = selectShot; card.onkeydown = e => { if (['Enter',' '].includes(e.key)) { e.preventDefault(); selectShot(); } };
+      const selectShot = () => {
+        if (selected === shot.id) return;
+        selected = shot.id; historySignature = '';
+        grid.querySelectorAll('.shot-card').forEach(node => node.classList.toggle('selected',node.dataset.shot === selected));
+        renderInspector();
+      };
+      card.onclick = selectShot;
+      card.onkeydown = e => { if (e.target === card && ['Enter',' '].includes(e.key)) { e.preventDefault(); selectShot(); } };
       card.draggable = !!writable() && !busy;
       card.ondragstart = e => { dragging = shot.id; e.dataTransfer.setData('text/plain',shot.id); e.dataTransfer.effectAllowed = 'move'; };
       card.ondragend = () => { dragging = null; document.querySelectorAll('.drag-over').forEach(n => n.classList.remove('drag-over')); };
       card.ondragover = e => { if (dragging && writable() && !busy) { e.preventDefault(); card.classList.add('drag-over'); } };
       card.ondragleave = () => card.classList.remove('drag-over');
       card.ondrop = e => { e.preventDefault(); const from = doc.shots.findIndex(s => s.id === dragging); dragging = null; if (from >= 0) moveShot(from,index); };
-      const visual = el('div','shot-visual'), image = chosen(shot,'image');
-      if (image) { const img = el('img'); img.src = mediaURL(image.output.url); img.alt = shot.title; img.loading = 'lazy'; visual.append(img); }
-      else visual.append(el('span','placeholder',String(index+1).padStart(2,'0')));
+      const visual = card.querySelector('.shot-visual') || el('div','shot-visual');
+      const version = chosen(shot,'video') || chosen(shot,'image');
+      let media = visual.querySelector('img,video');
+      if (version) {
+        if (!media || media.src !== mediaURL(version.output.url)) {
+          media = previewMedia(version.output,shot.title); visual.replaceChildren(media);
+        }
+        media.setAttribute('aria-label',shot.title);
+        if (media.tagName === 'IMG') media.alt = shot.title;
+        media.ondblclick = event => { event.stopPropagation(); openPreview(index); };
+      } else visual.replaceChildren(el('span','placeholder',String(index+1).padStart(2,'0')));
+      visual.querySelectorAll('.tag,.video-tag').forEach(node => node.remove());
       visual.append(el('span','tag',`镜头 ${String(index+1).padStart(2,'0')}`));
-      if (chosen(shot,'video')) visual.append(el('span','video-tag','视频已就绪'));
+      if (version?.output.kind === 'video') visual.append(el('span','video-tag','视频已就绪'));
       const copy = el('div','shot-copy'); copy.append(el('h3','',shot.title),el('p','',shot.description || '添加画面描述，定义这个镜头。'));
       const meta = el('div','shot-meta'); meta.append(el('span','',shot.shotSize),el('span','',shot.movement)); copy.append(meta);
       const job = latestJob(shot,stage === 'video' ? 'video' : 'image');
-      card.append(visual,copy,el('div','job-status '+(job?.status || ''),statusText(job))); grid.append(card);
+      const status = el('div','job-status '+(job?.status || ''),statusText(job));
+      if (!visual.parentNode) card.append(visual);
+      const oldCopy = card.querySelector('.shot-copy'), oldStatus = card.querySelector('.job-status');
+      if (oldCopy) oldCopy.replaceWith(copy); else card.append(copy);
+      if (oldStatus) oldStatus.replaceWith(status); else card.append(status);
+      if (grid.children[index] !== card) grid.insertBefore(card,grid.children[index] || null);
     });
   }
   function field(label, value, change, options = {}) {
@@ -273,6 +316,7 @@
   }
   function renderInspector() {
     const panel = $('inspector'), shot = currentShot(); panel.replaceChildren(); historySignature = '';
+    if (!['image','video'].includes(stage)) return;
     if (!shot) { panel.append(el('div','inspector-body muted','选中一个镜头，编辑画面与生成参数。')); return; }
     const index = doc.shots.indexOf(shot), type = stage === 'video' ? 'video' : 'image';
     const head = el('div','inspector-head'); head.append(el('h2','',`镜头 ${String(index+1).padStart(2,'0')} · 详情`));
@@ -319,8 +363,20 @@
       const add = button('加入现有画布节点',() => showImport(shot,type),'button');
       add.disabled = !writable() || busy; body.append(add);
     }
-    body.append(el('hr'),el('h2','',type === 'image' ? '分镜版本' : '视频版本'));
-    const history = el('div'); history.id = 'versions'; body.append(history); panel.append(body); renderStoryboardReferences(); renderVersions();
+    body.append(el('hr'),el('h2','','生成历史'));
+    const context = `${stage}:${shot.id}`;
+    if (historyContext !== context) {
+      historyType = type === 'image' && !shot.history.some(h => h.stage === 'image') && shot.history.some(h => h.stage === 'video') ? 'video' : type;
+      historyContext = context;
+    }
+    const tabs = el('div','version-tabs');
+    for (const kind of ['image','video']) {
+      const tab = button(kind === 'image' ? '分镜版本' : '视频版本',() => {
+        historyType = kind; historySignature = ''; renderVersions();
+      },'button');
+      tab.dataset.versionType = kind; tabs.append(tab);
+    }
+    const history = el('div'); history.id = 'versions'; body.append(tabs,history); panel.append(body); renderStoryboardReferences(); renderVersions();
   }
   function renderStoryboardReferences() {
     const container = $('storyboard-references'), shot = currentShot();
@@ -346,8 +402,12 @@
   }
   function renderVersions() {
     const container = $('versions'), shot = currentShot(); if (!container || !shot) return;
-    const type = stage === 'video' ? 'video' : 'image';
-    const signature = JSON.stringify([shot.selected[type],shot.history.filter(h => h.stage === type).map(h => [h,taskFor(h)])]);
+    const type = historyType;
+    document.querySelectorAll('[data-version-type]').forEach(tab => {
+      tab.classList.toggle('primary',tab.dataset.versionType === type);
+      tab.setAttribute('aria-pressed',String(tab.dataset.versionType === type));
+    });
+    const signature = JSON.stringify([type,shot.selected[type],shot.history.filter(h => h.stage === type).map(h => [h,taskFor(h)])]);
     if (signature === historySignature) return; historySignature = signature; container.replaceChildren();
     const entries = shot.history.filter(h => h.stage === type).slice().reverse();
     if (!entries.length) { container.append(el('p','muted','尚未生成。生成后可以预览并选择采用版本。')); return; }
@@ -359,11 +419,13 @@
       if (job?.error) block.append(el('p','version-error',String(job.error)));
       const adopted = chosen(shot,type);
       for (const v of outputs) {
-        const media = el(type === 'video' ? 'video' : 'img'); media.src = mediaURL(v.output.url);
-        if (type === 'video') { media.controls = true; media.playsInline = true; media.preload = 'none'; } else { media.alt = shot.title; media.loading = 'lazy'; }
-        block.append(media);
+        block.append(previewMedia(v.output,shot.title));
         const active = adopted?.job === v.job && adopted?.index === v.index;
-        const adopt = button(active ? '当前采用' : '采用这个版本',() => { if (!writable()) return; shot.selected[type] = {job:v.job,index:v.index}; touch(); historySignature = ''; renderVersions(); renderShots(); updateActions(); });
+        const adopt = button(active ? '当前采用' : '采用这个版本',() => {
+          if (!writable() || busy) return;
+          shot.selected[type] = {job:v.job,index:v.index}; touch(); historySignature = '';
+          renderVersions(); renderShots(); renderReview(); renderStoryboardReferences(); updateActions();
+        });
         adopt.disabled = !writable() || busy || active; block.append(adopt); if (active) block.classList.add('selected-version');
       }
       if (live(job)) { const cancel = button('取消任务',async () => { try { await auth.json(`/api/job/${entry.job}/cancel`,'POST',{}); await poll(); } catch (error) { toast(error.message); } }); cancel.disabled = !writable() || busy; block.append(cancel); }
@@ -534,20 +596,31 @@
     } finally { polling = false; }
   }
   function renderReview() {
-    const list = $('review-list'); list.replaceChildren();
-    if (!doc.shots.length) { list.append(el('div','empty-shots','先添加镜头，再制作分镜与视频。')); return; }
+    const list = $('review-list');
+    if (stage !== 'review') { list.replaceChildren(); return; }
+    if (!doc.shots.length) { list.replaceChildren(el('div','empty-shots','先添加镜头，再制作分镜与视频。')); return; }
+    const existing = new Map([...list.children].map(node => [node.dataset.shot,node]));
+    for (const [id,node] of existing) if (!doc.shots.some(shot => shot.id === id)) node.remove();
     doc.shots.forEach((shot,index) => {
-      const row = el('div','review-row'), image = chosen(shot,'image'), video = chosen(shot,'video');
-      if (image) { const img = el('img'); img.src = mediaURL(image.output.url); img.alt = shot.title; img.loading = 'lazy'; row.append(img); }
-      else row.append(el('div','review-placeholder',String(index+1).padStart(2,'0')));
-      const copy = el('div'); copy.append(el('h2','',`${String(index+1).padStart(2,'0')} · ${shot.title}`),el('p','',shot.description || '尚未填写画面描述'),el('span','muted',video ? '视频已就绪' : '缺少视频 · 不会自动跳过此镜头'));
-      row.append(copy,button('预览镜头',() => openPreview(index),'button')); list.append(row);
+      const image = chosen(shot,'image'), video = chosen(shot,'video'), version = video || image;
+      const signature = JSON.stringify([index,shot.title,shot.description,version?.output.url]);
+      let row = existing.get(shot.id);
+      if (!row || row.dataset.signature !== signature) {
+        const previous = row; row = el('div','review-row');
+        row.dataset.shot = shot.id; row.dataset.signature = signature;
+        if (version) row.append(previewMedia(version.output,shot.title));
+        else row.append(el('div','review-placeholder',String(index+1).padStart(2,'0')));
+        const copy = el('div'); copy.append(el('h2','',`${String(index+1).padStart(2,'0')} · ${shot.title}`),el('p','',shot.description || '尚未填写画面描述'),el('span','muted',video ? '视频已就绪' : '缺少视频 · 不会自动跳过此镜头'));
+        row.append(copy,button('预览镜头',() => openPreview(index),'button'));
+        previous?.replaceWith(row);
+      }
+      if (list.children[index] !== row) list.insertBefore(row,list.children[index] || null);
     });
   }
   function showPreview() {
     const shot = doc?.shots[previewIndex]; if (!shot) return;
     $('preview-title').textContent = `${previewIndex+1} / ${doc.shots.length} · ${shot.title}`;
-    const container = $('preview-media'); container.replaceChildren();
+    const container = $('preview-media'); container.querySelector('video')?.pause(); container.replaceChildren();
     const video = chosen(shot,'video'), image = chosen(shot,'image');
     if (video) {
       const player = el('video'); player.src = mediaURL(video.output.url); player.controls = true; player.playsInline = true;
@@ -561,6 +634,7 @@
   }
   function openPreview(index = 0) {
     if (!doc?.shots.length) return;
+    document.querySelectorAll('video').forEach(video => video.pause());
     previewIndex = index; $('preview-dialog').showModal(); showPreview();
   }
   function showCreate() {
