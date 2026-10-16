@@ -340,21 +340,21 @@
    }
   },
   {
-   "key": "lora_acceleration",
-   "label": "LoRA 加速",
-   "mirror": true,
+   "key": "stable_mode",
+   "label": "稳定模式",
    "type": "select",
    "appearance": "switch",
-   "default": "on",
+   "default": "off",
    "options": [
     {"value": "on", "label": "开启"},
     {"value": "off", "label": "关闭"}
    ],
    "presets": {
-    "on": {"strength_model": 1},
-    "off": {"strength_model": 0}
+    "on": {"strength_model": 0, "processing_control_value": 0},
+    "off": {"strength_model": 1, "processing_control_value": 0.12}
    },
-   "hint": "默认开启加速 LoRA；关闭后不使用加速 LoRA。只控制 LoRA，不改变采样步数、TE 缓存或二采设置。",
+   "hint": "开启：关闭 LoRA 与 TE 缓存，稳定优先；关闭：开启两项加速（TE 0.12），速度优先。稳定模式不保证消除所有画面异常。",
+   "showHint": true,
    "target": {"kind": "preset"}
   },
   {
@@ -377,14 +377,14 @@
   {
    "key": "processing_control_value",
    "label": "TE 缓存加速",
+   "mirror": true,
    "type": "slider",
    "min": 0,
    "max": 0.5,
    "step": 0.005,
-   "default": 0,
-   "hint": "推荐 0（关闭，画质优先）。大于 0 启用 TE 缓存加速，可缩短生成时间，但可能影响画面细节、动作与时序稳定性，并出现彩条、鸟形等异常。原值 0.12 已在本例复现彩条；出现异常请先设为 0。",
-   "showHint": true,
-   "advanced": false,
+   "default": 0.12,
+   "hint": "由稳定模式统一控制：开启稳定模式为 0，关闭为 0.12。",
+   "advanced": true,
    "target": {
     "node": "232",
     "input": "processing_control_value",

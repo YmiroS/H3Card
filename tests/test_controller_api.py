@@ -249,38 +249,39 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
         with self.assertRaises(web.HTTPBadRequest):
             controller_app.patch_graph(cap, {"sampling_mode": "unknown"}, {})
 
-    def test_h3_two_pass_lora_switch_only_controls_lora_strength(self):
+    def test_h3_two_pass_stable_mode_only_controls_lora_and_te(self):
         cap = controller_app.CAPS["minimax_h3_ref_2pass"]
-        spec = next(item for item in cap["inputs"] if item["key"] == "lora_acceleration")
+        spec = next(item for item in cap["inputs"] if item["key"] == "stable_mode")
         self.assertEqual(spec, scan_workflows.CAP_INPUT_PRESETS[cap["id"]][0])
-        self.assertEqual(spec["default"], "on")
-        self.assertTrue(spec["mirror"])
-        te = next(item for item in cap["inputs"] if item["key"] == "processing_control_value")
-        self.assertEqual(te["default"], 0)
-        self.assertFalse(te["advanced"])
-        self.assertTrue(te["showHint"])
-        self.assertEqual(te["hint"], scan_workflows.CAP_KNOBS[cap["id"]][te["key"]][4])
-        strength = next(item for item in cap["inputs"] if item["key"] == "strength_model")
-        self.assertTrue(strength["mirror"])
-        self.assertFalse(any(item["key"] == "lora_acceleration"
+        self.assertEqual(spec["default"], "off")
+        self.assertEqual(spec["appearance"], "switch")
+        self.assertFalse(spec.get("mirror"))
+        self.assertTrue(spec["showHint"])
+        for key in ("strength_model", "processing_control_value"):
+            self.assertTrue(next(item for item in cap["inputs"] if item["key"] == key)["mirror"])
+        self.assertFalse(any(item["key"] == "lora_acceleration" for item in cap["inputs"]))
+        self.assertFalse(any(item["key"] == "stable_mode"
                              for item in controller_app.CAPS["minimax_h3_ref9"]["inputs"]))
 
-        baseline = controller_app.patch_graph(cap, {"seed": 42}, {})
+        params = {"seed": 42, "steps": 27, "duration": 7, "scale_by": 1.5}
+        baseline = controller_app.patch_graph(cap, dict(params), {})
         self.assertEqual(baseline["230"]["inputs"]["strength_model"], 1)
-        enabled = controller_app.patch_graph(cap, {
-            "seed": 42, "lora_acceleration": "on", "strength_model": 0,
-        }, {})
-        self.assertEqual(enabled, baseline)
-        disabled = controller_app.patch_graph(cap, {
-            "seed": 42, "lora_acceleration": "off", "strength_model": 1,
-        }, {})
-        self.assertEqual(disabled["230"]["inputs"]["strength_model"], 0)
-        disabled["230"]["inputs"]["strength_model"] = 1
-        self.assertEqual(disabled, baseline)
+        self.assertEqual(baseline["232"]["inputs"]["processing_control_value"], 0.12)
+        for selected, strength, te in (("off", 1, 0.12), ("on", 0, 0)):
+            with self.subTest(stable_mode=selected):
+                graph = controller_app.patch_graph(cap, {
+                    **params, "stable_mode": selected, "lora_acceleration": "off",
+                    "strength_model": 0.5, "processing_control_value": 0.085,
+                }, {})
+                self.assertEqual(graph["230"]["inputs"]["strength_model"], strength)
+                self.assertEqual(graph["232"]["inputs"]["processing_control_value"], te)
+                graph["230"]["inputs"]["strength_model"] = 1
+                graph["232"]["inputs"]["processing_control_value"] = 0.12
+                self.assertEqual(graph, baseline, "steps, seed, duration and all other graph fields stay unchanged")
         with self.assertRaises(web.HTTPBadRequest):
-            controller_app.patch_graph(cap, {"lora_acceleration": "invalid"}, {})
+            controller_app.patch_graph(cap, {"stable_mode": "invalid"}, {})
 
-    def test_h3_two_pass_rescan_preserves_hidden_lora_and_visible_te(self):
+    def test_h3_two_pass_rescan_preserves_stable_mode_and_hidden_raw_controls(self):
         graph = {
             "230": {"class_type": "LoraLoaderModelOnly", "inputs": {"strength_model": 1},
                     "_meta": {"title": "Load LoRA"}},
@@ -292,11 +293,13 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
             "TESpeedMiniMaxH3": {"input": {"required": {"processing_control_value": ["FLOAT", {"default": 0.12}]}}},
         }
         inputs, *_ = scan_workflows.derive_inputs(graph, info, "minimax_h3_ref_2pass")
-        switch = next(item for item in inputs if item["key"] == "lora_acceleration")
+        switch = next(item for item in inputs if item["key"] == "stable_mode")
         strength = next(item for item in inputs if item["key"] == "strength_model")
-        self.assertEqual(switch["default"], "on")
-        self.assertTrue(switch["mirror"])
+        self.assertEqual(switch, scan_workflows.CAP_INPUT_PRESETS["minimax_h3_ref_2pass"][0])
+        self.assertEqual(switch["default"], "off")
+        self.assertFalse(switch.get("mirror"))
         self.assertTrue(strength["mirror"])
+        self.assertFalse(any(item["key"] == "lora_acceleration" for item in inputs))
         te = next(item for item in inputs if item["key"] == "processing_control_value")
         declared = next(item for item in controller_app.CAPS["minimax_h3_ref_2pass"]["inputs"]
                         if item["key"] == te["key"])
@@ -306,27 +309,14 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
         self.assertTrue(ordinary_te["advanced"])
         self.assertNotIn("showHint", ordinary_te)
 
-    def test_h3_two_pass_te_controls_only_cache_threshold(self):
-        cap = controller_app.CAPS["minimax_h3_ref_2pass"]
-        params = {item["key"]: item["default"] for item in cap["inputs"]
-                  if "default" in item and item["type"] != "seed" and not item.get("mirror")}
-        params["seed"] = 42
-        baseline = controller_app.patch_graph(cap, params, {})
-        self.assertEqual(baseline["230"]["inputs"]["strength_model"], 1)
-        self.assertEqual(baseline["232"]["inputs"]["processing_control_value"], 0)
-        for value in (0, 0.085, 0.12):
-            changed = controller_app.patch_graph(cap, {**params, "processing_control_value": value}, {})
-            self.assertEqual(changed["232"]["inputs"]["processing_control_value"], value)
-            changed["232"]["inputs"]["processing_control_value"] = 0
-            self.assertEqual(changed, baseline)
-
-    def test_h3_two_pass_te_defaults_off_without_explicit_parameter(self):
+    def test_h3_two_pass_stable_mode_defaults_off_despite_legacy_values(self):
         cap = controller_app.CAPS["minimax_h3_ref_2pass"]
         for supplied in ({}, {"processing_control_value": None},
-                         {"processing_control_value": ""}, {"processing_control_value": 0}):
+                         {"processing_control_value": ""}, {"processing_control_value": 0},
+                         {"lora_acceleration": "off", "strength_model": 0, "processing_control_value": 0.085}):
             with self.subTest(params=supplied):
                 graph = controller_app.patch_graph(cap, {"seed": 42, **supplied}, {})
-                self.assertEqual(graph["232"]["inputs"]["processing_control_value"], 0)
+                self.assertEqual(graph["232"]["inputs"]["processing_control_value"], 0.12)
                 self.assertEqual(graph["230"]["inputs"]["strength_model"], 1)
 
     def test_h3_two_pass_uses_tested_audio_denoise(self):
@@ -1633,43 +1623,50 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(len(text_modes), 1)
         self.assertEqual(text_modes[0]["modelSwitch"]["krea2"], "krea2_t2i")
 
-    async def test_high_quality_te_defaults_off_in_dry_run(self):
+    async def test_high_quality_stable_mode_maps_both_nodes_in_dry_run(self):
         controller_app.load_caps()
         cap = controller_app.CAPS["minimax_h3_ref_2pass"]
         template = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
-        for supplied in ({}, {"processing_control_value": None},
-                         {"processing_control_value": ""}, {"processing_control_value": 0.12}):
-            with self.subTest(params=supplied):
+        cases = [({}, 1, 0.12), ({"stable_mode": "off"}, 1, 0.12),
+                 ({"stable_mode": "on"}, 0, 0)]
+        for selected, strength, te in cases:
+            with self.subTest(params=selected):
                 response = await self.client.post("/api/generate", headers=self.headers, json={
                     "project": "p", "capability": cap["id"], "dry_run": True,
-                    "params": {"seed": 42, **supplied},
+                    "params": {"seed": 42, "lora_acceleration": "off",
+                               "strength_model": 0.5, "processing_control_value": 0.085, **selected},
                 })
                 self.assertEqual(response.status, 200, await response.text())
                 payload = await response.json()
-                actual = payload["changed"].get("#232.processing_control_value",
-                    [None, template["232"]["inputs"]["processing_control_value"]])[1]
-                self.assertEqual(actual, 0.12 if supplied.get("processing_control_value") == 0.12 else 0)
+                for node, field, expected in (("230", "strength_model", strength),
+                                               ("232", "processing_control_value", te)):
+                    actual = payload["changed"].get(f"#{node}.{field}",
+                        [None, template[node]["inputs"][field]])[1]
+                    self.assertEqual(actual, expected)
+        response = await self.client.post("/api/generate", headers=self.headers, json={
+            "project": "p", "capability": cap["id"], "dry_run": True,
+            "params": {"stable_mode": "invalid"},
+        })
+        self.assertEqual(response.status, 400)
         self.assertEqual(controller_app.JOBS, {})
 
-    async def test_reload_exposes_high_quality_te_and_hides_lora(self):
+    async def test_reload_exposes_high_quality_stable_mode_and_hides_raw_controls(self):
         response = await self.client.post("/api/reload", headers=self.headers)
         self.assertEqual(response.status, 200)
         payload = await (await self.client.get("/api/cards")).json()
         high_quality = payload["capabilities"]["minimax_h3_ref_2pass"]
-        switch = next(item for item in high_quality["inputs"]
-                      if item["key"] == "lora_acceleration")
-        self.assertEqual(switch["default"], "on")
-        self.assertTrue(switch["mirror"])
+        switch = next(item for item in high_quality["inputs"] if item["key"] == "stable_mode")
+        self.assertEqual(switch["default"], "off")
+        self.assertEqual(switch["appearance"], "switch")
+        self.assertFalse(switch.get("mirror"))
+        self.assertTrue(switch["showHint"])
         self.assertEqual(switch["presets"], {
-            "on": {"strength_model": 1}, "off": {"strength_model": 0},
+            "on": {"strength_model": 0, "processing_control_value": 0},
+            "off": {"strength_model": 1, "processing_control_value": 0.12},
         })
-        te = next(item for item in high_quality["inputs"] if item["key"] == "processing_control_value")
-        self.assertEqual(te["default"], 0)
-        self.assertFalse(te["advanced"])
-        self.assertTrue(te["showHint"])
-        self.assertIn("推荐 0", te["hint"])
-        self.assertIn("彩条", te["hint"])
-        self.assertIn("鸟形", te["hint"])
+        for key in ("strength_model", "processing_control_value"):
+            self.assertTrue(next(item for item in high_quality["inputs"] if item["key"] == key)["mirror"])
+        self.assertFalse(any(item["key"] == "lora_acceleration" for item in high_quality["inputs"]))
 
     async def test_controller_dashboard_and_health_metadata(self):
         response = await self.client.get("/controller")
