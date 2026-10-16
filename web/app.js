@@ -1130,10 +1130,6 @@ function hoverTip(node, contentGetter) {
 }
 
 /* ================= 启动 ================= */
-const onlineCount = document.querySelector('#online-count b');
-window.addEventListener('h3auth:presence', event => {
-  if (onlineCount) onlineCount.textContent = String(event.detail.online_users);
-});
 const bootReady = (async function boot() {
   try {
     await H3Auth.requireUser();
@@ -1736,7 +1732,7 @@ function renderPresenceMembers() {
   if (!users.size) return;
   const count = document.createElement("span");
   count.className = "presence-count";
-  count.textContent = `${users.size} 人在线`;
+  count.textContent = `${users.size} 人使用中`;
   el.presenceUsers.appendChild(count);
   for (const member of users.values()) {
     const avatar = document.createElement("span");
@@ -3081,7 +3077,12 @@ function bindGlobal() {
       if (editing || field || transfer) { event.preventDefault(); event.stopImmediatePropagation(); }
     }, true);
   }
-  $("#toggle").onclick = () => document.body.classList.toggle("collapsed");
+  if (matchMedia('(max-width: 760px)').matches) document.body.classList.add('collapsed');
+  $("#toggle").setAttribute('aria-expanded', String(!document.body.classList.contains('collapsed')));
+  $("#toggle").onclick = () => {
+    const collapsed = document.body.classList.toggle('collapsed');
+    $("#toggle").setAttribute('aria-expanded', String(!collapsed));
+  };
   $("#newproj").onclick = newProject;
   $("#createHere").onclick = newProject;
   el.spaceSelect.onchange = () => {
@@ -5218,8 +5219,8 @@ function placePanel() {
   // 检查节点是否在可视区域内，如果完全不在就隐藏面板
   const nodeRight = screenX + screenW;
   const nodeBottom = screenY + screenH;
-  const isVisible = nodeRight > r.left && screenX < r.right &&
-                    nodeBottom > r.top && screenY < r.bottom;
+  const isVisible = nodeRight > 0 && screenX < r.width &&
+                    nodeBottom > 0 && screenY < r.height;
 
   if (!isVisible) {
     el.panel.style.visibility = "hidden";

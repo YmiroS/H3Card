@@ -7,9 +7,15 @@
 <link rel="icon" type="image/png" href="/favicon.png?v=ck05">
 <link rel="stylesheet" href="/director.css">
 </head>
-<body>
+<body class="director-studio" data-workspace="director">
+<aside id="workspace-nav" aria-label="主导航">
+  <a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a>
+  <div class="workspace-footer">
+    <div id="online-count" class="workspace-presence" title="近 90 秒活跃用户" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人使用中</span></div>
+    <div id="account" class="account-bar"></div>
+  </div>
+</aside>
 <aside class="sidebar">
-  <a class="brand" href="/"><img src="/icon.png" alt=""><span>Chouka<small>DIRECTOR STUDIO</small></span></a>
   <div class="workspace-label">创作空间</div>
   <select id="projects" aria-label="选择导演项目"><option value="">选择项目</option></select>
   <button id="new-project" class="new-project">＋ 新建导演项目</button>
@@ -25,7 +31,7 @@
 <div class="workspace">
   <header>
     <div class="breadcrumb">导演工作台 <span>/</span> <b id="project-name">未打开项目</b></div>
-    <div class="header-actions"><span id="save-status" role="status">先创建一个故事</span><button id="save" class="button">保存</button><button id="export" class="button">导出方案</button><div id="account" class="account-bar"></div></div>
+    <div class="header-actions"><span id="save-status" role="status">先创建一个故事</span><button id="save" class="button">保存</button><button id="export" class="button">导出方案</button></div>
   </header>
   <main>
     <section class="stage-heading"><div><div class="eyebrow">YOUR STORY, SHOT BY SHOT</div><h1 id="stage-title">镜头与分镜</h1><p id="stage-subtitle">用镜头组织故事，用参考图建立画面，再交给模型生成。</p></div><div class="heading-actions"><span id="summary" class="summary">0 个镜头</span><button id="preview" class="button">顺序预览</button><button id="import-canvas" class="button">从画布加入</button><button id="add-shot" class="button primary">＋ 添加镜头</button></div></section>
