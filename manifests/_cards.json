@@ -81,6 +81,11 @@
     "slots": "img5+aud0+vid0"
    },
    {
+    "id": "minimax_h3_fusion_v2",
+    "name": "H3无损融合单采V2",
+    "slots": "img6+aud3+vid1"
+   },
+   {
     "id": "minimax_h3_ref9",
     "name": "H3全能参考",
     "slots": "img9+aud0+vid1"
