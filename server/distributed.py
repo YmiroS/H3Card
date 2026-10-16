@@ -266,7 +266,7 @@ class DistributedStore:
                 seen_names.add(name_key)
                 capabilities = json.loads(row["capabilities_json"] or "{}")
                 if (not isinstance(capabilities, dict)
-                        or not capabilities.get("supports_file_sync")):
+                        or not capabilities.get("supports_code_restart")):
                     skipped_count += 1
                     continue
                 worker_ids.append(row["id"])
@@ -432,6 +432,8 @@ class DistributedStore:
                 item["state"] = "offline"
             elif item.get("sync_status") in {"pending", "running"}:
                 item["state"] = "syncing"
+            elif item.get("sync_status") == "error":
+                item["state"] = "error"
             elif not item["enabled"]:
                 item["state"] = "disabled"
             elif not item["comfy_online"]:
@@ -463,7 +465,7 @@ class DistributedStore:
             ).fetchone()
             if not worker or not worker["enabled"] or not worker["comfy_online"]:
                 return None
-            if worker["sync_status"] in ("pending", "running"):
+            if worker["sync_status"] in ("pending", "running", "error"):
                 return None
             if now - worker["last_seen"] > self.offline_seconds:
                 return None
@@ -475,7 +477,9 @@ class DistributedStore:
             idle_workers = self.db.execute(
                 """SELECT id, capabilities_json FROM workers
                    WHERE id != ? AND enabled = 1 AND comfy_online = 1
-                     AND busy = 0 AND current_job_id IS NULL AND last_seen >= ?""",
+                     AND busy = 0 AND current_job_id IS NULL
+                     AND sync_status NOT IN ('pending', 'running', 'error')
+                     AND last_seen >= ?""",
                 (worker_id, now - self.offline_seconds),
             ).fetchall()
             idle_capabilities = [

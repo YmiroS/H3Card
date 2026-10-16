@@ -1697,6 +1697,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         credentials = self.store.register_worker(
             "gpu-sync", {
                 "node_classes": ["KSampler"], "supports_file_sync": True,
+                "supports_code_restart": True,
             }
         )
         self.store.heartbeat(

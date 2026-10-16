@@ -91,7 +91,7 @@ tr:last-child td { border-bottom:0; }
   <a href="/admin/permissions">权限管理</a>
   <a href="/">打开 Chouka Web</a>
   <span id="account" class="account-bar"></span>
-  <button id="sync-all">一键同步全部节点</button>
+  <button id="sync-all">一键更新全部节点</button>
   <button id="refresh">立即刷新</button>
 </header>
 <main>
@@ -127,8 +127,8 @@ tr:last-child td { border-bottom:0; }
 </main>
 <script src="/auth.js"></script>
 <script>
-const STATUS = {idle:"空闲",busy:"忙碌",syncing:"正在同步",offline:"离线",disabled:"已禁用",error:"异常",queued:"排队中",assigned:"已分配",running:"运行中",done:"已完成",canceled:"已取消",cancel_requested:"正在取消"};
-const SYNC_STATUS = {idle:"尚未同步",pending:"等待空闲",running:"正在同步",done:"同步完成",error:"同步失败"};
+const STATUS = {idle:"空闲",busy:"忙碌",syncing:"正在更新",offline:"离线",disabled:"已禁用",error:"异常",queued:"排队中",assigned:"已分配",running:"运行中",done:"已完成",canceled:"已取消",cancel_requested:"正在取消"};
+const SYNC_STATUS = {idle:"尚未更新",pending:"等待空闲",running:"更新并重启中",done:"更新重启完成",error:"更新重启失败"};
 const $ = id => document.getElementById(id);
 const text = (id,value) => { $(id).textContent = value; };
 
@@ -393,14 +393,14 @@ async function refresh() {
   }
 }
 async function syncAllWorkers() {
-  if (!confirm("确认让全部节点增量同步 ComfyUI 核心、models 和 user？\n\n忙碌节点会等当前任务结束，离线节点会在下次上线后执行。同步完成后，请更新 requirements 并重启各节点的 ComfyUI。")) return;
+  if (!confirm("确认更新全部节点？\n\n节点空闲后会依次同步 ComfyUI、models 和 user，拉取 chouka 最新代码，再按本机 GPU 启动配置重启 ComfyUI 与 Worker。全部服务恢复就绪后才会显示完成。")) return;
   const button=$("sync-all");
   button.disabled=true;
   try {
     const result=await H3Auth.json("/api/admin/workers/sync-all","POST",{});
     await refresh();
     const skipped=result.skipped_count||0;
-    alert(`已向 ${result.worker_count||0} 个节点下发同步请求。${skipped?`\n${skipped} 个旧版节点已跳过，请先手动更新一次 chouka。`:""}`);
+    alert(`已向 ${result.worker_count||0} 个节点下发更新请求。${skipped?`\n${skipped} 个旧版节点已跳过，请先手动更新一次 chouka Worker。`:""}`);
   } catch (error) {
     $("error").textContent=`下发同步请求失败：${error.message}`;
     $("error").style.display="block";
