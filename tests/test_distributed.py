@@ -17,7 +17,7 @@ sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "worker"))
 
 from distributed import DistributedStore, HIGH_VRAM_GPU_POLICY
-from agent import JobFailed, WorkerAgent
+from agent import AgentError, JobFailed, WorkerAgent
 
 
 class ModelDispatchTest(unittest.TestCase):
@@ -932,10 +932,14 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             script = Path(directory) / "sync.bat"
             script.write_text("@echo off\necho SYNC_OK [%1]\nexit /b 0\n", encoding="ascii")
             output = await self.agent.run_local_command(
-                "cmd.exe", "/d", "/c", f".\\{script.name}", "--upgrade",
-                cwd=script.parent, timeout=10,
+                "cmd.exe", "/d", "/c", self.agent.batch_command_name(script),
+                "--upgrade", cwd=script.parent, timeout=10,
             )
         self.assertIn("SYNC_OK", output)
+
+    def test_batch_filename_rejects_cmd_metacharacters(self):
+        with self.assertRaisesRegex(AgentError, "cmd 不安全字符"):
+            self.agent.batch_command_name(Path("sync & run.bat"))
 
     async def test_git_pull_requires_clean_expected_branch_and_fast_forward(self):
         with tempfile.TemporaryDirectory() as directory:
