@@ -1,11 +1,17 @@
 <!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>项目组 · 抽卡系统</title><link rel="icon" type="image/png" href="/favicon.png?v=ck05"><link rel="stylesheet" href="/style.css"></head>
-<body class="auth-page permissions-page">
+<body class="auth-page permissions-page" data-workspace="teams">
+<aside id="workspace-nav" aria-label="主导航">
+  <a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a>
+  <div class="workspace-footer">
+    <div id="online-count" class="workspace-presence" title="近 90 秒活跃用户" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人使用中</span></div>
+    <div id="account" class="account-bar"></div>
+  </div>
+</aside>
 <main class="perm-page">
 <header class="perm-header">
-  <div class="brandmark"><img src="/icon.png" alt=""><b>抽卡系统</b></div>
-  <nav aria-label="项目组导航"><a class="tbtn" href="/">画布</a><a id="permissions-link" class="tbtn" href="/admin/permissions" hidden>账号与权限</a></nav>
-  <div id="account" class="account-bar"></div>
+  <span class="workspace-breadcrumb">创作空间 / 项目组</span>
+  <nav aria-label="项目组管理"><a id="permissions-link" class="tbtn" href="/admin/permissions" hidden>账号与权限</a></nav>
 </header>
 <div class="perm-intro"><h1>项目组</h1><p>创建项目组并添加组员。项目组空间中的全部画布由所有组员共同查看和编辑。</p></div>
 <p id="error" role="alert"></p>

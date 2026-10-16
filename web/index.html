@@ -9,14 +9,19 @@
 <link rel="apple-touch-icon" href="/icon.png?v=ck05">
 <link rel="stylesheet" href="style.css">
 </head>
-<body class="canvas-studio">
+<body class="canvas-studio" data-workspace="canvas">
+<aside id="workspace-nav" aria-label="主导航">
+  <a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a>
+  <div class="workspace-footer">
+    <div id="online-count" class="workspace-presence" title="近 90 秒活跃用户" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人使用中</span></div>
+    <div id="account" class="account-bar"></div>
+  </div>
+</aside>
 
 <!-- ---------- 左侧项目栏 ---------- -->
 <aside id="side" aria-label="画布项目">
   <div class="head">
-    <span class="brand-mark" aria-hidden="true"><img src="icon.png" alt="" class="logo" draggable="false"></span>
-    <span class="brand-copy"><b>Chouka</b><small>CREATIVE CANVAS</small></span>
-    <span id="online-count" class="online-count" title="近 90 秒活跃用户" aria-live="polite"><span aria-hidden="true"></span><b>--</b> 人在线</span>
+    <span class="project-panel-title">画布列表</span>
     <a class="dot" id="dot" title="ComfyUI 连接状态" aria-label="ComfyUI 连接状态"></a>
   </div>
   <button id="newproj"><span aria-hidden="true">＋</span><span>新建画布</span></button>
@@ -29,14 +34,12 @@
 <!-- ---------- 主区 ---------- -->
 <main id="main">
   <div id="topbar" aria-label="画布工具栏">
-    <button class="tbtn icon-btn" id="toggle" title="收起/展开项目栏" aria-label="收起或展开项目栏">☰</button>
+    <button class="tbtn icon-btn" id="toggle" title="收起/展开项目栏" aria-label="收起或展开项目栏" aria-controls="side" aria-expanded="true">☰</button>
     <span class="crumb">画布</span><span class="crumb-sep">/</span>
     <span id="ptitle"></span>
     <button class="tbtn" id="fit" style="display:none">适应视图</button>
     <span id="hint"></span>
     <div id="presence-users" aria-label="当前画布在线成员"></div>
-    <div id="account" class="account-bar"></div>
-    <a class="tbtn" id="directorbtn" href="/director" title="按剧本与镜头组织创作">导演工作台</a>
     <button class="tbtn" id="jobsbtn" title="查看所有任务">任务</button>
   </div>
 
