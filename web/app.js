@@ -5,6 +5,7 @@
 const $ = (s, r = document) => r.querySelector(s);
 const CW = 268;            // 节点默认宽度，与 style.css 保持一致
 const CW_MIN = 180, CW_MAX = 900, CH_MIN = 90, CH_MAX = 900;
+const CANVAS_ZOOM_MIN = 0.1, CANVAS_ZOOM_MAX = 5;
 const cardW = (c) => c.w || CW;
 const SVGNS = "http://www.w3.org/2000/svg";
 const EDITOR_TARGET = new URLSearchParams(location.search);
@@ -1891,6 +1892,7 @@ function applyView() {
   paintSel();               // 工具条跟着缩放/平移走，不然就飘走了
   updateMinimap();
   updateZoomPercent();
+  scheduleCardMedia();
 }
 
 function updateZoomPercent() {
@@ -3176,7 +3178,7 @@ function bindGlobal() {
     if (NODE_EDITOR || !PROJ) return;
     ev.preventDefault();
     const w = toWorld(ev.clientX, ev.clientY);
-    const k = Math.min(2, Math.max(0.1, view.k * (ev.deltaY < 0 ? 1.1 : 1 / 1.1)));
+    const k = Math.min(CANVAS_ZOOM_MAX, Math.max(CANVAS_ZOOM_MIN, view.k * (ev.deltaY < 0 ? 1.1 : 1 / 1.1)));
     const r = el.stage.getBoundingClientRect();
     view.x = ev.clientX - r.left - w.x * k;
     view.y = ev.clientY - r.top - w.y * k;
@@ -3437,13 +3439,20 @@ function bindGlobal() {
 
   el.zoomMenu.onclick = (ev) => {
     const persist = () => { if (typeof saveView === "function") saveView(); else save(); };
+    const zoomTo = k => {
+      const r = el.stage.getBoundingClientRect();
+      const center = toWorld(r.left + r.width / 2, r.top + r.height / 2);
+      view.x = r.width / 2 - center.x * k;
+      view.y = r.height / 2 - center.y * k;
+      view.k = k;
+      applyView(); placePanel(); persist();
+    };
     const items = [
-      { icon: "+", text: "放大 (125%)", run: () => { view.k = 1.25; applyView(); placePanel(); persist(); } },
-      { icon: "1:1", text: "重置 (100%)", run: () => { view.k = 1; applyView(); placePanel(); persist(); } },
-      { icon: "−", text: "缩小 (75%)", run: () => { view.k = 0.75; applyView(); placePanel(); persist(); } },
-      { icon: "−", text: "缩小 (50%)", run: () => { view.k = 0.5; applyView(); placePanel(); persist(); } },
-      { icon: "−", text: "缩小 (25%)", run: () => { view.k = 0.25; applyView(); placePanel(); persist(); } },
-      { icon: "−", text: "缩小 (10%)", run: () => { view.k = 0.1; applyView(); placePanel(); persist(); } },
+      ...[500, 300, 200, 125, 100, 75, 50, 25, 10].map(percent => ({
+        icon: percent > 100 ? "+" : percent === 100 ? "1:1" : "−",
+        text: `${percent > 100 ? "放大" : percent === 100 ? "重置" : "缩小"} (${percent}%)`,
+        run: () => zoomTo(percent / 100),
+      })),
       { icon: "□", text: "适应画布", run: () => { view = { x: 60, y: 70, k: 1 }; applyView(); placePanel(); persist(); } },
     ];
     showMenu(ev.clientX, ev.clientY - 200, "缩放", items);
@@ -4616,11 +4625,12 @@ function prepareVideo(video, url, isCurrent = () => true, signal) {
   video.dataset.previewOriginal = url;
   const poster = video.getAttribute("poster");
   const title = video.title;
+  let previewNotice;
   const notice = (failed, detail) => {
     video.dataset.previewState = failed ? "error" : "processing";
     video.title = detail;
     const lines = failed ? ["视频转码失败", "修复转码后才能生成"] : ["正在转码为 MP4", "完成后可预览和生成"];
-    video.poster = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(
+    video.poster = previewNotice = "data:image/svg+xml;charset=utf-8," + encodeURIComponent(
       `<svg xmlns="http://www.w3.org/2000/svg" width="640" height="360" viewBox="0 0 640 360">`
       + `<rect width="640" height="360" fill="#111318"/><g fill="#d1d5db" text-anchor="middle" font-family="sans-serif" font-size="25">`
       + `<text x="320" y="168">${lines[0]}</text><text x="320" y="208" font-size="19">${lines[1]}</text></g></svg>`);
@@ -4630,8 +4640,11 @@ function prepareVideo(video, url, isCurrent = () => true, signal) {
     if (video.dataset.previewOriginal !== url || !isCurrent()) return;
     video.dataset.previewState = "ready";
     video.title = title || "MP4 转码已完成，预览和后续生成均使用此版本；原片已备份。";
-    if (poster) video.poster = poster;
-    else video.removeAttribute("poster");
+    // 等待转码期间封面可能已升级，不能用旧缩略图覆盖新封面。
+    if (video.getAttribute("poster") === previewNotice) {
+      if (poster) video.poster = poster;
+      else video.removeAttribute("poster");
+    }
     video.src = source;
   }).catch(error => {
     if (signal?.aborted || video.dataset.previewOriginal !== url || !isCurrent()) return;
@@ -4649,7 +4662,13 @@ function prepareVideos(root) {
 
 // 只给进入视口的卡片请求预览；卡片本身仍完整保留，连线和框选不受影响。
 const CARD_MEDIA = new Map();
-let cardMediaObserver = null, cardMediaMutations = null, cardMediaActive = 0;
+let cardMediaObserver = null, cardMediaMutations = null, cardMediaResize = null, cardMediaActive = 0;
+let cardMediaFrame = null;
+function scheduleCardMedia() {
+  if (!CARD_MEDIA.size || cardMediaFrame !== null) return;
+  cardMediaFrame = requestAnimationFrame(() => { cardMediaFrame = null; pumpCardMedia(); });
+}
+window.addEventListener('resize', scheduleCardMedia);
 function cardThumbnailURL(url) {
   return /^\/api\/(upload|artifact)\//.test(url)
     ? `/api/thumbnail?url=${encodeURIComponent(url)}` : null;
@@ -4660,18 +4679,32 @@ function releaseCardMedia(node, state) {
   cancelCardPlayback(node);
   if (node.tagName === 'VIDEO') { node.pause(); node.removeAttribute('src'); node.load(); }
   cardMediaObserver?.unobserve(node);
+  cardMediaResize?.unobserve(node);
   CARD_MEDIA.delete(node);
 }
 function resetCardMedia() {
   for (const [node, state] of CARD_MEDIA) releaseCardMedia(node, state);
-  cardMediaObserver?.disconnect(); cardMediaMutations?.disconnect();
-  cardMediaObserver = null; cardMediaMutations = null;
+  cardMediaObserver?.disconnect(); cardMediaMutations?.disconnect(); cardMediaResize?.disconnect();
+  cardMediaObserver = null; cardMediaMutations = null; cardMediaResize = null;
+  cancelAnimationFrame(cardMediaFrame); cardMediaFrame = null;
 }
 function pumpCardMedia() {
+  const root = el.stage.getBoundingClientRect(), dpr = window.devicePixelRatio || 1;
   for (const [node, state] of CARD_MEDIA) {
-    if (cardMediaActive >= 4) break;
-    if (!state.visible || state.loading || state.done || !node.isConnected
-      || state.project !== PROJ || !H3Auth.active) continue;
+    if (!state.visible || !node.isConnected || state.project !== PROJ || !H3Auth.active) continue;
+    const rect = node.getBoundingClientRect();
+    // 缩放时观察器可能尚未送达离屏通知，不能据旧可见状态请求大文件。
+    if (rect.right <= root.left - 120 || rect.left >= root.right + 120
+      || rect.bottom <= root.top - 120 || rect.top >= root.bottom + 120) {
+      state.controller?.abort();
+      continue;
+    }
+    // 按实际屏幕像素（含高分屏）升级；已加载原文件不再降级或重复下载。
+    if (state.fullURL && !state.original && Math.max(rect.width, rect.height) * dpr > 512) {
+      state.url = state.fullURL; state.original = true; state.done = false;
+      state.controller?.abort();
+    }
+    if (state.loading || state.done || cardMediaActive >= 4) continue;
     const controller = new AbortController();
     state.controller = controller; state.loading = true; cardMediaActive++;
     (async () => {
@@ -4687,9 +4720,11 @@ function pumpCardMedia() {
         const blob = await response.blob();
         if (controller.signal.aborted || CARD_MEDIA.get(node) !== state || !node.isConnected
           || state.project !== PROJ || !H3Auth.active) return;
+        const previous = state.blob;
         state.blob = URL.createObjectURL(blob);
         if (node.tagName === 'VIDEO') node.poster = state.blob;
         else node.src = state.blob;
+        if (previous) URL.revokeObjectURL(previous);
         state.done = true;
       } catch (error) {
         if (!controller.signal.aborted && CARD_MEDIA.get(node) === state) {
@@ -4732,10 +4767,14 @@ function observeCardMedia(node, url) {
       }
     });
     cardMediaMutations.observe(el.world, {childList:true, subtree:true});
+    cardMediaResize = new ResizeObserver(scheduleCardMedia);
   }
-  CARD_MEDIA.set(node, {url:thumbnail || url, project:PROJ, visible:false, loading:false,
+  CARD_MEDIA.set(node, {url:thumbnail || url,
+    fullURL:thumbnail ? (node.tagName === 'VIDEO' ? `${thumbnail}&size=original` : url) : null,
+    original:false, project:PROJ, visible:false, loading:false,
     done:node.tagName === 'VIDEO' && !thumbnail});
   cardMediaObserver.observe(node);
+  cardMediaResize.observe(node);
 }
 function prepareCardMedia(body, outputs, compare) {
   for (const node of body.querySelectorAll('img, video')) {

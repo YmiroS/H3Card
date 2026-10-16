@@ -182,6 +182,24 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             headers=bob_headers)).status, 404)
         self.assertTrue(teammate_session['csrf_token'])
 
+    async def test_canvas_view_supports_500_percent_and_rejects_out_of_range(self):
+        created = await (await self.client.post(
+            '/api/projects', json={'name': '高清缩放画布'}, headers=self.headers)).json()
+        url = f"/api/projects/{created['id']}"
+        for zoom in (0.1, 2, 3, 5):
+            response = await self.client.put(
+                url + '/view', json={'x': -100, 'y': 80, 'k': zoom}, headers=self.headers)
+            self.assertEqual(response.status, 200, await response.text())
+            project = await (await self.client.get(url)).json()
+            self.assertEqual(project['view'], {'x': -100, 'y': 80, 'k': zoom})
+            self.assertEqual(project['rev'], created['rev'])
+        for zoom in (0, 0.09, 5.01, 10):
+            response = await self.client.put(
+                url + '/view', json={'x': 0, 'y': 0, 'k': zoom}, headers=self.headers)
+            self.assertEqual(response.status, 400, await response.text())
+        project = await (await self.client.get(url)).json()
+        self.assertEqual(project['view']['k'], 5)
+
     async def test_collaborators_keep_independent_views_and_append_cards(self):
         bob = self.auth.create_user('bob', PASSWORD)
         created = await (await self.client.post(
