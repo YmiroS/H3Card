@@ -70,26 +70,29 @@ test('recent jobs show their recorded mode separately from card names', async ()
   }
 });
 
-test('H3 two-pass hides default-on LoRA and exposes TE with a safe recommendation', () => {
+test('H3 two-pass exposes a default-off stable switch and hides independent LoRA and TE', () => {
   const cap = JSON.parse(readFileSync(path.join(__dirname, '..', 'manifests', 'minimax_h3_ref_2pass.json'), 'utf8'));
-  const spec = cap.inputs.find(input => input.key === 'lora_acceleration');
-  assert.ok(spec, 'two-pass manifest must declare lora_acceleration');
+  const spec = cap.inputs.find(input => input.key === 'stable_mode');
+  assert.ok(spec, 'two-pass manifest must declare stable_mode');
   assert.equal(spec.type, 'select');
-  assert.equal(spec.mirror, true);
-  assert.equal(spec.default, 'on');
+  assert.equal(spec.appearance, 'switch');
+  assert.ok(!spec.mirror);
+  assert.equal(spec.default, 'off');
   assert.deepEqual(spec.options, [{value:'on', label:'开启'}, {value:'off', label:'关闭'}]);
-  assert.deepEqual(spec.presets, {on:{strength_model:1}, off:{strength_model:0}}, 'must not change TE-Speed or steps');
+  assert.deepEqual(spec.presets, {
+    on:{strength_model:0, processing_control_value:0},
+    off:{strength_model:1, processing_control_value:0.12},
+  }, 'must only change LoRA and TE, never steps');
   assert.equal(spec.target.kind, 'preset');
-  assert.equal(cap.inputs.find(input => input.key === 'strength_model').mirror, true);
-  const te = cap.inputs.find(input => input.key === 'processing_control_value');
-  assert.equal(te.default, 0);
-  assert.equal(te.advanced, false);
-  assert.equal(te.showHint, true);
-  assert.equal(te.label, 'TE 缓存加速');
-  for (const word of ['推荐 0', '生成时间', '画面细节', '动作', '时序稳定性', '彩条', '鸟形', '0.12']) assert.ok(te.hint.includes(word));
+  assert.equal(spec.showHint, true);
+  for (const key of ['strength_model', 'processing_control_value']) {
+    assert.equal(cap.inputs.find(input => input.key === key).mirror, true);
+  }
+  assert.ok(!cap.inputs.some(input => input.key === 'lora_acceleration'));
+  for (const word of ['LoRA', 'TE', '0.12', '稳定优先', '速度优先', '不保证']) assert.ok(spec.hint.includes(word));
 });
 
-test('H3 two-pass TE is visible, persistent and keyboard accessible while LoRA stays hidden', {timeout:60000}, async () => {
+test('H3 stable switch persists across reloads and supports keyboard with real payload mapping', {timeout:60000}, async () => {
   const root = path.join(__dirname, '..');
   const load = name => JSON.parse(readFileSync(path.join(root, 'manifests', name), 'utf8'));
   const cards = load('_cards.json');
@@ -102,7 +105,7 @@ test('H3 two-pass TE is visible, persistent and keyboard accessible while LoRA s
     rev:0, edges:[], groups:[], view:{x:80, y:70, k:1},
     cards:[
       {id:'two-pass', type:'card_video', cap:cap.id, x:60, y:20,
-        params:{strength_model:0, steps:27, processing_control_value:0.085, duration:7, seed:12345}, assets:{}, outputs:[]},
+        params:{lora_acceleration:'off', strength_model:0, steps:27, processing_control_value:0.085, duration:7, seed:12345}, assets:{}, outputs:[]},
       {id:'normal-ref9', type:'card_video', cap:'minimax_h3_ref9', x:460, y:20,
         params:{}, assets:{}, outputs:[]},
     ],
@@ -130,6 +133,9 @@ test('H3 two-pass TE is visible, persistent and keyboard accessible while LoRA s
           : name.endsWith('.css') ? 'text/css' : name.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
         return res.end(readFileSync(path.join(root, 'web', name)));
       }
+    }
+    if (req.method === 'POST' && url === '/api/auth/presence') {
+      req.resume(); return json(res, {online_count:1});
     }
     if (req.method === 'PUT' && url === '/api/projects/' + project.id) {
       const chunks = [];
@@ -173,82 +179,87 @@ test('H3 two-pass TE is visible, persistent and keyboard accessible while LoRA s
     const stored = () => page.evaluate(() => PROJ.cards.find(card => card.id === 'two-pass').params);
     const saveResponse = value => page.waitForResponse(response => {
       if (response.url() !== origin + '/api/projects/' + project.id || response.request().method() !== 'PUT') return false;
-      return response.request().postDataJSON().cards.find(card => card.id === 'two-pass').params.processing_control_value === value;
+      return response.request().postDataJSON().cards.find(card => card.id === 'two-pass').params.stable_mode === value;
     });
     await page.goto(origin + '/?project=' + project.id);
     await page.locator('#world .card[data-id="two-pass"] .ch .t').click();
     assert.equal(await page.locator('#panel').isVisible(), true, 'real card click opens parameter panel');
     await paramsButton.click();
     assert.equal(await popup.isVisible(), true, 'real bottom parameter button opens the existing popup');
-    const spec = cap.inputs.find(input => input.key === 'processing_control_value');
+    const spec = cap.inputs.find(input => input.key === 'stable_mode');
     const row = popup.locator('.row').filter({has:page.getByText(spec.label, {exact:true})});
-    const slider = row.getByRole('slider', {name:spec.label, exact:true});
-    const number = row.getByRole('spinbutton', {name:spec.label + '数值', exact:true});
-    assert.equal(await slider.isVisible(), true, 'TE is exposed in the existing parameter popup');
-    assert.equal(await number.isVisible(), true);
-    assert.equal(await number.inputValue(), '0.085', 'existing non-default TE value is shown');
-    assert.equal(await row.locator('.knobnote').isVisible(), true, 'recommendation is visible without hovering');
+    const toggle = row.getByRole('switch', {name:spec.label, exact:true});
+    assert.equal(await toggle.isVisible(), true, 'stable mode uses the existing switch control');
+    assert.equal(await toggle.evaluate(element => element.tagName), 'BUTTON');
+    assert.equal(await toggle.getAttribute('aria-checked'), 'false', 'stable mode defaults off');
+    assert.equal(await toggle.textContent(), '关闭');
+    assert.equal(await row.locator('.knobnote').isVisible(), true, 'trade-off is visible without hovering');
     assert.equal(await row.locator('.knobnote').textContent(), spec.hint);
-    for (const input of [slider, number]) {
-      assert.equal(await input.getAttribute('aria-describedby'), await row.locator('.knobnote').getAttribute('id'));
-    }
-    assert.equal(await popup.getByRole('switch').count(), 0, 'LoRA switch is hidden');
-    for (const key of ['strength_model', 'lora_acceleration']) {
-      const mirror = cap.inputs.find(input => input.key === key);
+    assert.equal(await toggle.getAttribute('aria-describedby'), await row.locator('.knobnote').getAttribute('id'));
+    assert.equal(await popup.getByRole('switch').count(), 1);
+    for (const label of ['加速模型强度', 'TE 缓存加速', 'LoRA 加速']) {
       assert.equal(await page.locator('#panel .row, #respop .row')
-        .filter({has:page.getByText(mirror.label, {exact:true})}).count(), 0, 'LoRA controls are absent');
+        .filter({has:page.getByText(label, {exact:true})}).count(), 0, 'independent controls are absent');
     }
     const baseline = await payload();
     const originalParams = await stored();
-    assert.equal(originalParams.strength_model, 0, 'fixture retains a legacy zero-strength card value');
-    assert.equal(baseline.params.lora_acceleration, 'on');
-    assert.equal(baseline.params.strength_model, 1, 'default on overrides the stale mirror value');
+    assert.equal(originalParams.strength_model, 0, 'fixture retains stale raw values');
+    assert.equal(baseline.params.stable_mode, 'off');
+    assert.equal(baseline.params.lora_acceleration, undefined, 'removed legacy preset cannot compete');
+    assert.equal(baseline.params.strength_model, 1);
+    assert.equal(baseline.params.processing_control_value, 0.12);
     assert.equal(baseline.params.steps, 27);
-    assert.equal(baseline.params.processing_control_value, 0.085, 'non-default TE-Speed is preserved');
     assert.equal(baseline.params.duration, 7);
     assert.equal(baseline.params.seed, 12345);
     async function check(value) {
-      assert.equal(Number(await slider.inputValue()), value);
-      assert.equal(Number(await number.inputValue()), value);
-      assert.deepEqual(await stored(), {...originalParams, processing_control_value:value}, 'only TE changes on the card');
+      const enabled = value === 'on';
+      assert.equal(await toggle.getAttribute('aria-checked'), String(enabled));
+      assert.equal(await toggle.textContent(), enabled ? '开启' : '关闭');
+      assert.deepEqual(await stored(), {...originalParams, stable_mode:value}, 'only the mode is saved on the card');
       assert.deepEqual(await payload(), {...baseline,
-        params:{...baseline.params, processing_control_value:value}},
-      'LoRA, steps, seed, duration and every unrelated parameter stay unchanged');
+        params:{...baseline.params, stable_mode:value,
+          strength_model:enabled ? 0 : 1, processing_control_value:enabled ? 0 : 0.12}},
+      'both effective values change; steps, seed, duration and every unrelated parameter stay unchanged');
     }
-    let saving = saveResponse(0);
-    await number.fill('0');
-    await check(0);
-    assert.equal((await saving).status(), 200, 'recommended zero persists through the isolated save API');
-    assert.equal(saved.at(-1).cards.find(card => card.id === 'two-pass').params.processing_control_value, 0);
+    let saving = saveResponse('on');
+    await toggle.click();
+    await check('on');
+    assert.equal((await saving).status(), 200, 'mode persists through the isolated save API');
+    assert.equal(saved.at(-1).cards.find(card => card.id === 'two-pass').params.stable_mode, 'on');
     await popup.locator('.x').click();
     assert.equal(await popup.isVisible(), false);
     await paramsButton.click();
-    await check(0);
-    await page.screenshot({path:path.resolve(root, '..', 'temp', 'chouka-h3-te-parameters.png'), fullPage:true});
-    saving = saveResponse(0.005);
-    await slider.focus();
-    await page.keyboard.press('ArrowRight');
-    await check(0.005);
-    assert.equal((await saving).status(), 200, 'keyboard slider change saves too');
-    saving = saveResponse(0.12);
-    await number.fill('0.12');
-    await check(0.12);
-    await saving;
-    await popup.locator('.x').click();
-    await paramsButton.click();
-    await check(0.12);
+    await check('on');
+    await page.screenshot({path:path.resolve(root, '..', 'temp', 'chouka-h3-stable-mode.png'), fullPage:true});
     await page.reload();
     await page.locator('#world .card[data-id="two-pass"] .ch .t').click();
     await paramsButton.click();
-    await check(0.12);
-    assert.equal(await popup.getByRole('switch').count(), 0, 'LoRA stays hidden after a full reload');
+    await check('on');
+    saving = saveResponse('off');
+    await toggle.focus();
+    await page.keyboard.press('Space');
+    await check('off');
+    assert.equal((await saving).status(), 200, 'Space toggles and saves the switch');
+    saving = saveResponse('on');
+    await page.keyboard.press('Enter');
+    await check('on');
+    await saving;
+    saving = saveResponse('off');
+    await page.keyboard.press('Space');
+    await check('off');
+    await saving;
+    await page.reload();
+    await page.locator('#world .card[data-id="two-pass"] .ch .t').click();
+    await paramsButton.click();
+    await check('off');
     await page.evaluate(() => {
       const card = PROJ.cards.find(item => item.id === 'two-pass');
-      delete card.params.processing_control_value;
+      delete card.params.stable_mode;
       openResPop(card, document.querySelector('#panel .foot button[title^="点开弹窗"]'));
     });
-    assert.equal(Number(await number.inputValue()), 0, 'a card without TE settings starts at the recommended zero');
-    assert.equal((await payload()).params.processing_control_value, 0);
+    assert.equal(await toggle.getAttribute('aria-checked'), 'false', 'missing mode uses default off');
+    assert.equal((await payload()).params.strength_model, 1);
+    assert.equal((await payload()).params.processing_control_value, 0.12);
     await popup.locator('.x').click();
     await page.locator('#world .card[data-id="normal-ref9"] .ch .t').click();
     await paramsButton.click();

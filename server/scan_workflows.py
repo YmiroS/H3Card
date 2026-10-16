@@ -450,9 +450,7 @@ CAP_KNOBS = {
     "minimax_h3_ref_2pass": {
         "processing_control_value": (
             "TE 缓存加速", 0, 0.5, 0.005,
-            "推荐 0（关闭，画质优先）。大于 0 启用 TE 缓存加速，可缩短生成时间，"
-            "但可能影响画面细节、动作与时序稳定性，并出现彩条、鸟形等异常。"
-            "原值 0.12 已在本例复现彩条；出现异常请先设为 0。"
+            "由稳定模式统一控制：开启稳定模式为 0，关闭为 0.12。"
         ),
         "audio_denoise": (
             "音频降噪强度", 0, 1, 0.05,
@@ -545,21 +543,21 @@ CAP_INPUT_PRESETS = {
         "target": {"kind": "preset"},
     }],
     "minimax_h3_ref_2pass": [{
-        "key": "lora_acceleration",
-        "label": "LoRA 加速",
-        "mirror": True,
+        "key": "stable_mode",
+        "label": "稳定模式",
         "type": "select",
         "appearance": "switch",
-        "default": "on",
+        "default": "off",
         "options": [
             {"value": "on", "label": "开启"},
             {"value": "off", "label": "关闭"},
         ],
         "presets": {
-            "on": {"strength_model": 1},
-            "off": {"strength_model": 0},
+            "on": {"strength_model": 0, "processing_control_value": 0},
+            "off": {"strength_model": 1, "processing_control_value": 0.12},
         },
-        "hint": "默认开启加速 LoRA；关闭后不使用加速 LoRA。只控制 LoRA，不改变采样步数、TE 缓存或二采设置。",
+        "hint": "开启：关闭 LoRA 与 TE 缓存，稳定优先；关闭：开启两项加速（TE 0.12），速度优先。稳定模式不保证消除所有画面异常。",
+        "showHint": True,
         "target": {"kind": "preset"},
     }],
 }
@@ -1630,7 +1628,7 @@ def derive_inputs(api, oi, wid=None):
             if item["key"] == "strength_model":
                 item["mirror"] = True
             elif item["key"] == "processing_control_value":
-                item.update(default=0, advanced=False, showHint=True)
+                item.update(default=0.12, advanced=True, mirror=True)
 
     # 切格子的工作流：这是用户唯一会踩的坑，写成卡片说明摆在最上面
     note = None
