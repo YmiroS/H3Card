@@ -751,13 +751,56 @@ test('产能看板语法与离线路由专项', async t => {
     });
     await t.test('简明规格保留期望尺寸、请求时长及MP，输入独立成行，技术参数完整移入详情',async()=>{
       const input=fixture();input.groups=[{...input.groups[3],dimensions:{duration:5,fps:24,megapixels:1.5,image_count:2,steps:20,frames:121,scale_to_length:1280,batch_size:3},spec:{expected:{width:1280,height:720}}}];const {page,state}=await setup({data:input});
-      const row=page.locator('.business-row'),parameters='请求时长 5 秒 / 期望 1,280 × 720 / 分辨率 1.5 MP';
+      const row=page.locator('.business-row'),parameters='请求时长 5 秒 / 期望 720p（1,280 × 720）';
       await assertMaterialSpec(row,['图片 2 张','视频数量未记录','音频数量未记录'],parameters);
       assert.doesNotMatch(await row.textContent(),/FPS|步数|帧数|长边|批量|depth-5s/);
       await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
-      for(const text of [parameters,'帧率 24 FPS','步数 20 步','帧数 121 帧','长边 1,280 px','批量 3','生成参数不是成品实测规格'])assert.ok((await detail.innerText()).includes(text),text);
+      for(const text of [parameters,'像素设置 1.5 MP','帧率 24 FPS','步数 20 步','帧数 121 帧','长边 1,280 px','批量 3','生成参数不是成品实测规格'])assert.ok((await detail.innerText()).includes(text),text);
       const raw=detail.locator('details');assert.equal(await raw.evaluate(n=>n.open),false);await raw.locator('summary').click();
       const evidence=JSON.parse(await raw.locator('pre').textContent());assert.deepEqual(evidence.dimensions,input.groups[0].dimensions);assert.deepEqual(evidence.spec,input.groups[0].spec);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('分辨率使用精确尺寸档位，MP只译为像素量，竖屏与期望来源不混淆',async()=>{
+      const cases=[
+        ['hd',{dimensions:{width:1280,height:720,megapixels:1}},'720p（1,280 × 720）'],
+        ['full-hd',{dimensions:{width:1920,height:1080}},'1080p（1,920 × 1,080）'],
+        ['qhd',{dimensions:{width:2560,height:1440}},'1440p（2,560 × 1,440）'],
+        ['uhd',{dimensions:{width:3840,height:2160}},'4K（3,840 × 2,160）'],
+        ['portrait-hd',{dimensions:{width:720,height:1280}},'720p 竖屏（720 × 1,280）'],
+        ['portrait-full',{dimensions:{width:1080,height:1920}},'1080p 竖屏（1,080 × 1,920）'],
+        ['square',{dimensions:{width:1024,height:1024,megapixels:1}},'尺寸 1,024 × 1,024'],
+        ['square-720',{dimensions:{width:720,height:720}},'尺寸 720 × 720'],
+        ['near-hd',{dimensions:{width:1280,height:704}},'尺寸 1,280 × 704'],
+        ['wide',{dimensions:{width:2560,height:1080}},'尺寸 2,560 × 1,080'],
+        ['one-mp',{dimensions:{megapixels:1}},'约 100 万像素（尺寸未记录）'],
+        ['fraction-mp',{dimensions:{megapixels:.39}},'约 39 万像素（尺寸未记录）'],
+        ['expected',{dimensions:{megapixels:1},spec:{expected:{width:1280,height:720}}},'期望 720p（1,280 × 720）'],
+        ['expected-square',{dimensions:{},spec:{expected:{width:1024,height:1024}}},'期望 1,024 × 1,024'],
+        ['output-pair',{dimensions:{width:1280,height:720,output_width:1920,output_height:1080}},'1080p（1,920 × 1,080）'],
+        ['partial-output',{dimensions:{width:1280,height:720,output_width:1920}},'720p（1,280 × 720）'],
+        ['partial-size',{dimensions:{width:1280,megapixels:1}},'约 100 万像素（尺寸未记录）'],
+        ['resolution-setting',{dimensions:{resolution:'1280x720 (16:9)',megapixels:1}},'720p（1,280 × 720）'],
+        ['portrait-setting',{dimensions:{resolution:'720x1280 (9:16)'}},'720p 竖屏（720 × 1,280）'],
+        ['numeric-short-edge',{dimensions:{resolution:720}},'规格未完整记录'],
+        ['input-only',{dimensions:{source_width:1280,source_height:720}},'规格未完整记录'],
+        ['missing',{dimensions:{}},'规格未完整记录'],
+        ['malicious',{dimensions:{width:ATTACK,height:720,megapixels:ATTACK,resolution:ATTACK}},'规格未完整记录'],
+      ];
+      for(const [index,value] of [0,-1,1.5,'1280',null,true,Number.MAX_SAFE_INTEGER+1].entries())cases.push(['invalid-size-'+index,{dimensions:{width:value,height:720}},'规格未完整记录']);
+      for(const [index,value] of [0,-1,'1',null,true,Number.MAX_VALUE].entries())cases.push(['invalid-mp-'+index,{dimensions:{megapixels:value}},'规格未完整记录']);
+      const input=fixture(),base=input.groups[0];input.groups=cases.map(([id,fields],index)=>({...base,...fields,id,mean_seconds:60+index}));
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const [index,[id,fields,label]] of cases.entries()) {
+        await row.locator('select').selectOption(id);
+        assert.equal(await row.locator('.generation-parameters').textContent(),label,id);
+        assert.ok((await row.locator('option:checked').textContent()).startsWith('素材信息未记录｜'+label),id);
+        assert.doesNotMatch(await row.locator('.selected-spec').textContent(),/ MP|NaN|Infinity|<img|undefined/);
+        assert.equal(await row.locator('.mean-time').textContent(),`1 分 ${index} 秒`,id+'：分辨率展示不得合并原始耗时分组');
+        if(['hd','square','one-mp','expected'].includes(id))assert.match(await detail.innerText(),/像素设置 1 MP/);
+        const raw=detail.locator('details');await raw.locator('summary').click();
+        const evidence=JSON.parse(await raw.locator('pre').textContent());assert.deepEqual(evidence.dimensions,fields.dimensions);assert.deepEqual(evidence.spec,fields.spec);
+      }
+      assert.equal(await page.locator('main img, main [onerror]').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
     });
     await t.test('输入素材合同1：混合素材、明确零与逐类型未知，非法计数不强转或冒充零',async()=>{
       const cases=[
@@ -819,9 +862,9 @@ test('产能看板语法与离线路由专项', async t => {
       const cases=[
         ['source-only',{dimensions},'规格未完整记录'],
         ['technical-only',{dimensions:{...dimensions,...technical}},'规格未完整记录'],
-        ['requested',{dimensions:{...dimensions,duration:5,width:1280,height:720}},'请求时长 5 秒 / 尺寸 1,280 × 720'],
-        ['output-request',{dimensions:{...dimensions,duration:5,output_duration:6,width:1280,height:720,output_width:1920,output_height:1080}},'请求时长 6 秒 / 尺寸 1,920 × 1,080'],
-        ['expected',{dimensions,spec:{expected:{duration:7,width:640,height:480,fps:30}}},'请求时长 7 秒 / 期望 640 × 480'],
+        ['requested',{dimensions:{...dimensions,duration:5,width:1280,height:720}},'请求时长 5 秒 / 720p（1,280 × 720）'],
+        ['output-request',{dimensions:{...dimensions,duration:5,output_duration:6,width:1280,height:720,output_width:1920,output_height:1080}},'请求时长 6 秒 / 1080p（1,920 × 1,080）'],
+        ['expected',{dimensions,spec:{expected:{duration:7,width:640,height:480,fps:30}}},'请求时长 7 秒 / 期望 480p（640 × 480）'],
         ['parameters',{dimensions,spec:{parameters:{duration:8,...technical}}},'请求时长 8 秒'],
         ['dimension-precedence',{dimensions:{...dimensions,duration:9},spec:{dimensions:{duration:8},parameters:{duration:7}}},'请求时长 9 秒'],
       ];
@@ -852,16 +895,16 @@ test('产能看板语法与离线路由专项', async t => {
       ];
       const {page,state}=await setup({data:input}),row=page.locator('td[data-summary-worker-id=w1] .business-row'),other=page.locator('td[data-summary-worker-id=w3] .business-row');
       const options=await row.locator('option').allTextContents();assert.equal(new Set(options).size,3);
-      assert.deepEqual(options.slice(0,2),[1,3].map(n=>`图片 2 张 + 视频 ${n} 段 + 音频 1 段｜请求时长 5 秒 / 尺寸 1,280 × 720`));
+      assert.deepEqual(options.slice(0,2),[1,3].map(n=>`图片 2 张 + 视频 ${n} 段 + 音频 1 段｜请求时长 5 秒 / 720p（1,280 × 720）`));
       await purchase(page);await page.locator('.demand-group').selectOption('minimax_h3_ref9');await calculate(page);
       const before={post:structuredClone(state.posts.at(-1)),result:await page.locator('#estimate-result').textContent()};
       await page.locator('#tab-machines').click();await row.locator('button').click();await other.locator('button').click();
       const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls')),otherDetail=page.locator('#'+await other.locator('button').getAttribute('aria-controls'));
       const otherBefore={row:await other.textContent(),detail:await otherDetail.textContent()};
       for(const [id,materials,parameters,time,count] of [
-        ['three-videos',['图片 2 张','视频 3 段','音频 1 段'],'请求时长 5 秒 / 尺寸 1,280 × 720','32 秒',8],
+        ['three-videos',['图片 2 张','视频 3 段','音频 1 段'],'请求时长 5 秒 / 720p（1,280 × 720）','32 秒',8],
         ['unknown-material',['素材信息未记录'],'请求时长 5 秒','1 分 31 秒',5],
-        ['one-video',['图片 2 张','视频 1 段','音频 1 段'],'请求时长 5 秒 / 尺寸 1,280 × 720','1 分 18 秒',10],
+        ['one-video',['图片 2 张','视频 1 段','音频 1 段'],'请求时长 5 秒 / 720p（1,280 × 720）','1 分 18 秒',10],
       ]) {
         await row.locator('select').selectOption(id);await assertMaterialSpec(row,materials,parameters);
         assert.equal(await row.getAttribute('data-selected-group-id'),id);assert.equal(await row.locator('.mean-time').textContent(),time);assert.match(await row.locator('.matrix-samples').textContent(),new RegExp(`仅 ${count} 次`));
@@ -888,7 +931,7 @@ test('产能看板语法与离线路由专项', async t => {
       await row.locator('select').selectOption('mixed-material');assert.doesNotMatch(await detail.textContent(),/onerror|hostile-material/);await row.locator('button').click();
       for(const width of [1440,390,320]) {
         await page.setViewportSize({width,height:width===1440?1000:844});await positionMatrix(page);
-        await assertMaterialSpec(row,['图片 12 张','视频 3 段','音频 2 段'],'请求时长 5 秒 / 尺寸 1,280 × 720');await assertComparisonTable(page);
+        await assertMaterialSpec(row,['图片 12 张','视频 3 段','音频 2 段'],'请求时长 5 秒 / 720p（1,280 × 720）');await assertComparisonTable(page);
         const layout=await row.locator('.selected-spec').evaluate(node=>{
           const rect=n=>{const r=n.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};};
           const materials=node.querySelector('.input-materials');
