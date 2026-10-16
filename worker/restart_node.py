@@ -112,7 +112,7 @@ def start_launcher(launcher):
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     )
     process = subprocess.Popen(
-        ["cmd.exe", "/d", "/c", "call", str(launcher), "--comfy-only"],
+        ["cmd.exe", "/d", "/c", "call", f".\\{launcher.name}", "--comfy-only"],
         cwd=str(launcher.parent),
         creationflags=flags,
     )
