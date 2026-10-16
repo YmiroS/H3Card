@@ -42,7 +42,7 @@ import rewrite as rw
 import llm
 import translate as tr
 from costs import CostLedger
-from capacity import make_spec, export_csv, model_summary_from_graph
+from capacity import make_spec, export_csv, model_summary_from_graph, _hash as capacity_output_key
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     MAX_4090_HIGH_QUALITY_DURATION_SECONDS, can_run_capability,
@@ -1713,7 +1713,9 @@ def probe_capacity_output(path):
     if duration and kind in {"video", "audio"}:
         h, m, sec = duration.groups()
         result["duration"] = int(h) * 3600 + int(m) * 60 + float(sec)
-    video = next((line for line in text.splitlines() if "Video:" in line), "")
+    # 解码输出已应用媒体旋转，不能把输入流的编码宽高当成显示方向。
+    videos = [line for line in text.splitlines() if "Video:" in line]
+    video = videos[-1] if videos else ""
     size = re.search(r"\b([1-9]\d{0,4})x([1-9]\d{0,4})\b", video)
     if size:
         result.update(width=int(size.group(1)), height=int(size.group(2)))
@@ -1724,6 +1726,8 @@ def probe_capacity_output(path):
         bool(size) if kind == "image" else result.get("duration", 0) > 0
         and (bool(size) if kind == "video" else True)
     )
+    if result["valid"] and size and "Output #0," in text and len(videos) > 1:
+        result["dimension_source"] = "decoded_frame"
     return result
 
 
@@ -3034,6 +3038,134 @@ async def api_capacity_review(request):
     return web.json_response(result)
 
 
+async def api_capacity_probe_outputs(request):
+    body = await capacity_body(request)
+    offset = body.get("offset", 0)
+    if set(body) - {"offset"} or type(offset) is not int or not 0 <= offset < 512:
+        raise web.HTTPBadRequest(text="仅接受 0..511 的整数 offset，不接受文件路径或网址")
+    pid = request.match_info["pid"]
+    access = request.app["resource_access"]
+    try:
+        access.normalize("artifact", f"{pid}/probe")
+    except ValueError:
+        raise web.HTTPBadRequest(text="任务编号无效")
+    user_id = require_admin(request)["id"]
+    store = distributed_store(request.app)
+    state = request.app["capacity_probe_state"]
+    if state["task"] is not None:
+        raise web.HTTPTooManyRequests(text="已有成品尺寸补采正在进行，请完成后重试")
+    if request.app.get("lifecycle", {}).get("shutting_down"):
+        raise web.HTTPServiceUnavailable(text="服务正在停止")
+
+    def manifest():
+        with store.lock:
+            task = store.db.execute("SELECT status,capability,outputs_json FROM capacity_tasks WHERE job_id=?", (pid,)).fetchone()
+            event = store.db.execute("SELECT status,capability,event_kind FROM cost_events WHERE job_id=?", (pid,)).fetchone()
+            if event and event["event_kind"] != "generation":
+                raise web.HTTPConflict(text="API 调用不属于机器生成产物")
+            if (task or event) is None or (task or event)["status"] != "done":
+                raise web.HTTPConflict(text="仅可补采已完成的生成任务")
+            outputs = json.loads(task["outputs_json"] or "null") if task else None
+            if outputs:
+                return ("captured", task["capability"], tuple(dict.fromkeys(o["key"] for o in outputs))), None
+            job = copy.deepcopy(JOBS.get(pid) or {})
+            if job.get("status") != "done" or job.get("capability") != (task or event)["capability"]:
+                raise web.HTTPConflict(text="未保留可信最终产物清单，无法补采；不会扫描目录猜测")
+            refs = []
+            for output in job.get("outputs") or []:
+                try:
+                    ref = access.reference(output.get("url")) if isinstance(output, dict) else None
+                except ValueError:
+                    ref = None
+                if not ref or ref[0] != "artifact" or not ref[1].startswith(pid + "/"):
+                    raise web.HTTPConflict(text="最终产物不是本任务的受控本地文件，无法补采")
+                refs.append(ref[1])
+            refs = list(dict.fromkeys(refs))
+            if not refs or len(refs) > 512:
+                raise web.HTTPConflict(text="没有可补采的完整最终清单，或清单超过 512 项")
+            return ("retained_job", job["capability"], tuple(capacity_output_key(ref) for ref in refs)), refs
+
+    def check_admin():
+        current = access.store.get_user(user_id)
+        if not current or not current.get("enabled") or current.get("role") != "admin":
+            raise web.HTTPForbidden(text="管理员权限已变化，补采结果未保存")
+
+    def probe_batch():
+        check_admin()
+        identity, refs = manifest()
+        keys = identity[2]
+        if offset >= len(keys):
+            raise web.HTTPBadRequest(text="补采位置超出最终产物清单，请从头重试")
+        if refs is None:
+            # 登记索引只用于把最终 hash 还原成定位符；不能把同目录其他上传视作最终产物。
+            prefix = pid + "/"
+            with access.store.lock:
+                registered = access.store.db.execute(
+                    "SELECT locator FROM resources WHERE kind='artifact' AND substr(locator,1,?)=?",
+                    (len(prefix), prefix)).fetchall()
+            locators = {capacity_output_key(row["locator"]): row["locator"] for row in registered}
+        else:
+            locators = dict(zip(keys, refs))
+        with store.lock:
+            prior = {o["key"]: o for o in store.capacity.output_recovery(pid) or []}
+        values = {key: dict(prior.get(key) or {"valid": False}) for key in keys}
+        checked = []
+        batch = keys[offset:offset + 4]
+        for key in batch:
+            locator = locators.get(key)
+            values[key] = {"valid": False}
+            if not locator or not access.authorize(user_id, "artifact", locator):
+                continue
+            try:
+                path = access.local_path("artifact", locator)
+                before = path.stat()
+                if not path.is_file() or before.st_size > 512 * 1024 ** 2:
+                    continue
+                signature = (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                metadata = probe_capacity_output(path)
+                after = path.stat()
+                if signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+                    continue
+                if not access.authorize(user_id, "artifact", locator) or access.local_path("artifact", locator) != path:
+                    continue
+            except (OSError, ValueError, PermissionError):
+                continue
+            values[key] = metadata
+            checked.append((key, locator, path, signature))
+        # 探测期间任务清单、文件或权限有变化，不能把新文件算成旧任务证据。
+        if manifest()[0] != identity:
+            raise web.HTTPConflict(text="最终产物记录已变化，请刷新后重试")
+        for key, locator, path, signature in checked:
+            try:
+                current = path.stat()
+                unchanged = signature == (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+                if not unchanged or not access.authorize(user_id, "artifact", locator) or access.local_path("artifact", locator) != path:
+                    values[key] = {"valid": False}
+            except (OSError, ValueError, PermissionError):
+                values[key] = {"valid": False}
+        recovered = [dict(values[key], key=locators[key]) for key in keys if key in locators]
+        check_admin()
+        with store.lock, store.db:
+            if manifest()[0] != identity:
+                raise web.HTTPConflict(text="最终产物记录已变化，请刷新后重试")
+            store.capacity.record_output_recovery(pid, recovered)
+        recorded = sum(values[key].get("valid") is True and values[key].get("kind") in {"image", "video"}
+                       and bool(values[key].get("width")) and bool(values[key].get("height")) for key in batch)
+        return {"processed": len(batch), "recorded": recorded, "total": len(keys),
+                "next_offset": offset + len(batch) if offset + len(batch) < len(keys) else None}
+
+    task = asyncio.create_task(asyncio.to_thread(probe_batch))
+    state["task"] = task
+
+    def finished(done):
+        state["task"] = None
+        if not done.cancelled():
+            done.exception()
+    task.add_done_callback(finished)
+    # 请求断开不释放并发槽；关服也会等待受超时约束的探测结束后再关闭数据库。
+    return web.json_response(await asyncio.shield(task))
+
+
 async def api_capacity_worker(request):
     body = await capacity_body(request)
     store = distributed_store(request.app)
@@ -3119,6 +3251,9 @@ async def close_presence_connections(app):
 
 async def on_stop(app):
     await close_presence_connections(app)
+    probe_task = app.get("capacity_probe_state", {}).get("task")
+    if probe_task:
+        await asyncio.gather(asyncio.shield(probe_task), return_exceptions=True)
     await asyncio.gather(*app["cleanup_tasks"].values(), return_exceptions=True)
     await app["video_previews"].close()
     await app["media_thumbnails"].close()
@@ -3194,6 +3329,7 @@ def make_app(auth_path=None):
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
     app["local_output_tasks"] = {}
+    app["capacity_probe_state"] = {"task": None}
     app["lifecycle"] = {"shutting_down": False}
     app["local_test"] = local_test
     app["bind_host"] = "127.0.0.1" if local_test else "0.0.0.0"
@@ -3265,6 +3401,7 @@ def make_app(auth_path=None):
         app.router.add_get("/api/capacity/export", api_capacity_export)
         app.router.add_post("/api/capacity/estimate", api_capacity_estimate)
         app.router.add_post("/api/capacity/jobs/{pid}/review", api_capacity_review)
+        app.router.add_post("/api/capacity/jobs/{pid}/probe-outputs", api_capacity_probe_outputs)
         app.router.add_post("/api/capacity/workers/{worker_id}", api_capacity_worker)
         app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
         app.router.add_post("/api/admin/workers/sync-all", api_workers_sync_all)

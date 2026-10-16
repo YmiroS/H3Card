@@ -116,6 +116,9 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 .selected-spec dd { margin-top:2px; }
 .input-materials { display:flex; flex-wrap:wrap; gap:2px 12px; }
 .input-materials span { overflow-wrap:anywhere; }
+.actual-resolution > span { display:block; overflow-wrap:anywhere; }
+.output-probe { margin:12px 0; }
+.output-probe p { margin-top:6px; }
 .business-title { font-size:13px; font-weight:600; }
 .mean-time { display:block; font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; }
 .model-label { display:block; font-size:13px; font-weight:600; }
@@ -352,6 +355,31 @@ function generationParameters(g,detailed=false) {
   }
   return parts.join(' / ') || '规格未完整记录';
 }
+function outputVariants(resolution) {
+  return (Array.isArray(resolution?.variants)?resolution.variants:[]).filter(v=>v && ['image','video'].includes(v.kind) && Number.isSafeInteger(v.width) && v.width>0 && Number.isSafeInteger(v.height) && v.height>0);
+}
+function outputVariantLabel(v) {
+  // 实际成品只读取服务端产物证据，绝不混入请求、MP 或期望尺寸。
+  return `${v.kind==='image'?'图片':'视频'} · ${resolutionLabel({width:v.width,height:v.height},{})}`;
+}
+function renderActualResolution(node,resolution) {
+  const variants=outputVariants(resolution);node.replaceChildren();
+  if(!variants.length)node.append(el('span','尺寸未记录'));
+  else {
+    if(new Set(variants.map(v=>`${v.width}x${v.height}`)).size>1)node.append(el('span','多种成品规格（非单一尺寸）','hint'));
+    for(const variant of variants)node.append(el('span',outputVariantLabel(variant),'resolution-variant'));
+  }
+  if(numeric(resolution?.total_samples) && resolution.total_samples>0 && resolution.complete_samples!==resolution.total_samples)node.append(el('span',`已知 ${num(resolution.recorded_samples)} / ${num(resolution.total_samples)} 次任务的部分或全部成品`,'resolution-coverage hint'));
+}
+function appendOutputResolutionDetails(node,resolution) {
+  const section=el('div',null,'output-resolution-details'), sizes=el('div',null,'actual-resolution');
+  section.append(el('h3','实际成品'));renderActualResolution(sizes,resolution);section.append(sizes);
+  section.append(el('p',`尺寸覆盖：${num(resolution?.recorded_samples)} / ${num(resolution?.total_samples)} 次已完成任务至少有一个成品尺寸；${num(resolution?.complete_samples)} / ${num(resolution?.total_samples)} 次已完成任务的全部最终产物都有尺寸。`));
+  section.append(el('p',`已知尺寸产物 ${num(resolution?.recorded_outputs)} / ${num(resolution?.total_outputs)} 个${resolution?.total_outputs==null?'（最终清单不完整，产物总数未知）':''}。`));
+  for(const variant of outputVariants(resolution))section.append(el('p',`${outputVariantLabel(variant)}：${num(variant.outputs)} 个产物 / ${num(variant.samples)} 次任务`));
+  section.append(el('p','同一任务可能包含多种尺寸，各尺寸的任务数不能相加。尺寸来自最终产物记录或受控补采，与技术合格产量、人工验收和采购资格分离；有尺寸不代表技术合格。平均耗时仍为原组成功任务平均，不按尺寸重算。','hint'));
+  node.append(section);
+}
 function simpleSpec(g) {
   return `${inputMaterials(g).join(' + ')}｜${generationParameters(g)}`;
 }
@@ -463,6 +491,7 @@ function summaryEvidence(g) {
   node.append(el('p','素材数量按任务输入槽位计，同一文件被多次引用也会分别计数；生成参数不是成品实测规格。','hint'));
   node.append(el('p',`来源：${source(g.source)}；有效耗时样本 ${num(g.measured)} / 总样本 ${num(g.samples)}；成功 ${num(g.done)} / 失败 ${num(g.error)} / 取消 ${num(g.canceled)}`),el('p',`P90：${friendlyTime(g.p90_seconds)}；最近成功样本：${when(g.last_sample_at)}`),el('p','平均值仅使用该组成功任务执行耗时；不包含排队，不等于纯 GPU 计算时间，也不是合格日产能。','hint'));
   node.append(el('p',`执行时配置：${hardwareSummary(g.config)}（${configSource(g.config_source)}）`),el('p',`缓存条件：${text(g.cache_condition)}`));
+  appendOutputResolutionDetails(node,g.output_resolution);
   const evidence=modelEvidence(g);
   if(evidence.hasEvidence)node.append(el('p',`模型记录覆盖 ${num(evidence.recorded)} / ${num(evidence.total)} 次；覆盖数不是完整主模型链的确认。`));
   if(evidence.variants.length>1)node.append(el('p','不同任务记录对应不同模型组合；每个组合内的主模型才属于同一个图。全组平均耗时不代表任一组合的专属速度。','warn'));
@@ -473,7 +502,7 @@ function summaryEvidence(g) {
     node.append(el('p','仅为工具模板默认值，不代表用户画布节点当前选中的模型。历史耗时不代表当前模型速度；参考信息不补齐历史覆盖，也不覆盖历史精度。','warn hint'));
   } else if(!evidence.variants.length)node.append(el('p','未获取到模型信息：当前工具模板未提供、找不到或无法识别。','hint'));
   node.append(list(groupWarnings(g)),el('p',`采样日期：${text(g.days)}；配置编号：${text(g.config_id)}；采样编号：${text(g.id)}`,'hint'));
-  const raw=el('details');raw.append(el('summary','原始规格与证据'),el('pre',text({dimensions:g.dimensions,spec:g.spec,model_summary:g.model_summary,model_evidence:g.model_evidence,current_model_reference:g.current_model_reference,cache_condition:g.cache_condition})));node.append(raw);
+  const raw=el('details');raw.append(el('summary','原始规格与证据'),el('pre',text({dimensions:g.dimensions,spec:g.spec,output_resolution:g.output_resolution,recovered_outputs:g.recovered_outputs,model_summary:g.model_summary,model_evidence:g.model_evidence,current_model_reference:g.current_model_reference,cache_condition:g.cache_condition})));node.append(raw);
   return node;
 }
 function renderMachineSummary() {
@@ -523,8 +552,8 @@ function renderMachineSummary() {
       const select=el('select',null,'summary-spec');select.setAttribute('aria-label',`${w.name || '机器'} ${title}任务规格`);
       const names=entries.map(simpleSpec);
       entries.forEach((g,i)=>option(select,g.id,`${names[i]}${names.filter(name=>name===names[i]).length>1?` · ${source(g.source)} · ${numeric(g.last_sample_at)?when(g.last_sample_at):'日期未记录'} · 采样 ${i+1}`:''}`));
-      const selectedSpec=el('dl',null,'selected-spec'), materials=el('dd',null,'input-materials'), parameters=el('dd',null,'generation-parameters');
-      selectedSpec.append(el('dt','输入素材'),materials,el('dt','生成参数'),parameters);
+      const selectedSpec=el('dl',null,'selected-spec'), materials=el('dd',null,'input-materials'), parameters=el('dd',null,'generation-parameters'), actual=el('dd',null,'actual-resolution');
+      selectedSpec.append(el('dt','输入素材'),materials,el('dt','生成参数'),parameters,el('dt','实际成品'),actual);
       select.value=preferredGroup(entries).id;spec.append(select,selectedSpec);
       const evidence=el('div',null,'summary-evidence');evidence.hidden=true;evidence.id=`summary-evidence-${++detailNumber}`;
       const sample=el('div',null,'matrix-samples'), count=el('p'), button=el('button','查看详情','summary-detail-toggle');sample.dataset.label='样本与详情';
@@ -534,6 +563,7 @@ function renderMachineSummary() {
         const g=entries.find(item=>item.id===select.value);content.dataset.selectedGroupId=g.id;
         materials.replaceChildren(...inputMaterials(g).map(value=>el('span',value)));
         parameters.textContent=generationParameters(g);
+        renderActualResolution(actual,g.output_resolution);
         time.replaceChildren(el('span',hasMean(g)?friendlyTime(g.mean_seconds):'暂无成功耗时',hasMean(g)?'mean-time':'muted'));
         renderModelCells(g,namesCell,precisionCell,time);
         if(hasMean(g) && (g.mean_seconds<1 || g.mean_seconds>3600))time.append(el('p','耗时异常，请核对详情','warn hint'));
@@ -626,12 +656,37 @@ function reviewForm(d) {
   };
   return form;
 }
+function outputProbe(d) {
+  const node=el('div',null,'output-probe'), button=el('button','补采成品尺寸'), status=el('p',null,'hint');
+  button.type='button';status.setAttribute('role','status');
+  node.append(el('p','仅按可信最终产物清单补采，每次最多 4 个；不会从输入素材或请求参数猜测尺寸。','hint'),button,status);
+  let nextOffset=0;
+  button.onclick=async()=>{
+    if(button.disabled || !node.isConnected || nextOffset===null)return;
+    button.disabled=true;status.textContent='正在补采本批成品尺寸…';
+    try {
+      const result=await H3Auth.json(`/api/capacity/jobs/${encodeURIComponent(d.job_id)}/probe-outputs`,'POST',{offset:nextOffset});
+      if(!node.isConnected)return;
+      const count=value=>Number.isSafeInteger(value) && value>=0;
+      if(!result || !count(result.processed) || result.processed>4 || !count(result.recorded) || result.recorded>result.processed || !count(result.total) || !(result.next_offset===null || count(result.next_offset) && result.next_offset>nextOffset && result.next_offset<result.total))throw Error('补采响应格式无效，请刷新看板核对结果');
+      nextOffset=result.next_offset;
+      status.textContent=`本批处理 ${num(result.processed)} 个，成功记录尺寸 ${num(result.recorded)} 个；可信最终产物共 ${num(result.total)} 个。${nextOffset===null?'补采已完成，刷新看板查看结果。':'尚有后续产物，请点击继续补采；刷新看板查看结果。'}`;
+      button.textContent=nextOffset===null?'补采已完成':'继续补采成品尺寸';
+    } catch(error) {
+      if(node.isConnected)status.textContent=`补采失败：${error.message}${error.status===409?'。没有可信最终产物记录，不能猜测成品尺寸。':''}`;
+    } finally {button.disabled=nextOffset===null;}
+  };
+  return node;
+}
 function renderDetails() {
   $('details').replaceChildren();const details=data.details || [];
   for(const d of details) {
     const node=el('details',null,'evidence'), summary=el('summary');node.dataset.jobId=d.job_id;
     summary.append(el('strong',text(d.job_id)),el('span',source(d.source),'badge'),el('span',` ${STATUS[d.status] || text(d.status)} / ${text(d.capability)} / ${workerName(d.worker_id,d.worker_name)} / ${when(d.created_at)}`));
     node.append(summary,el('p',`任务 runtime：${sec(d.runtime_seconds)}`),list(d.warnings),el('h3','执行尝试（包含重试）'),el('pre',text(d.attempts)),el('h3','实际输出证据'),el('pre',text(d.outputs)),el('p',`人工合格数量：${num(d.review?.accepted)}；样本标签：${d.review?.source==='standard'?'标准样本（人工声明）':d.review?.source==='business'?'业务样本':'未标记'}；标准场景编号：${text(d.review?.benchmark_id)}；备注：${text(d.review?.note)}`));
+    appendOutputResolutionDetails(node,d.output_resolution);
+    const raw=el('details',null,'output-resolution-raw');raw.append(el('summary','成品尺寸原始证据'),el('pre',text({output_resolution:d.output_resolution,recovered_outputs:d.recovered_outputs})));node.append(raw);
+    if(d.status==='done')node.append(outputProbe(d));
     if(['captured','standard'].includes(d.source)) node.append(reviewForm(d));
     $('details').append(node);
   }
