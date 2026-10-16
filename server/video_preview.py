@@ -113,7 +113,7 @@ class MediaThumbnails:
         self.tasks = {}
         self.closed = False
 
-    def source_key(self, source):
+    def source_key(self, source, *, original=False):
         source = Path(source).resolve()
         if source.suffix.lower() not in self.extensions:
             raise web.HTTPBadRequest(text="缩略图仅支持图片或视频")
@@ -123,20 +123,22 @@ class MediaThumbnails:
                 raise web.HTTPNotFound(text="素材文件不存在")
         except (FileNotFoundError, NotADirectoryError):
             raise web.HTTPNotFound(text="素材文件不存在")
-        identity = json.dumps([str(source), stat.st_mtime_ns, stat.st_size, self.VERSION],
+        # 默认版本保持旧缓存键；原尺寸单独命名，避免与 512 缩略图串用。
+        version = self.VERSION + "-original" if original else self.VERSION
+        identity = json.dumps([str(source), stat.st_mtime_ns, stat.st_size, version],
                               ensure_ascii=False, separators=(",", ":"))
         return source, hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
-    async def get(self, source):
+    async def get(self, source, *, original=False):
         if self.closed:
             raise web.HTTPServiceUnavailable(text="缩略图服务已关闭")
-        source, key = self.source_key(source)
+        source, key = self.source_key(source, original=original)
         target = self.directory / (key + ".png")
         if target.is_file():
             return target
         task = self.tasks.get(key)
         if task is None:
-            task = asyncio.create_task(self._convert(source, key, target))
+            task = asyncio.create_task(self._convert(source, key, target, original=original))
             self.tasks[key] = task
             # 唯一请求断开后任务仍会完成；取出异常，避免无人等待时的事件循环警告。
             task.add_done_callback(self._consume_exception)
@@ -147,27 +149,30 @@ class MediaThumbnails:
         if not task.cancelled():
             task.exception()
 
-    async def _convert(self, source, key, target):
+    async def _convert(self, source, key, target, *, original=False):
         try:
             async with self.slots:
-                return await self._generate(source, key, target)
+                return await self._generate(source, key, target, original=original)
         finally:
             self.tasks.pop(key, None)
 
-    async def _generate(self, source, key, target):
+    async def _generate(self, source, key, target, *, original=False):
         temporary = target.with_name(key + "." + uuid.uuid4().hex + ".part.png")
         process = None
         try:
             executable = await asyncio.to_thread(self.ffmpeg_bin)
             if executable is None:
                 raise web.HTTPServiceUnavailable(text="服务器未找到 FFmpeg")
-            if self.source_key(source)[1] != key:
+            if self.source_key(source, original=original)[1] != key:
                 raise web.HTTPConflict(text="素材已变化，请重试")
             # 普通 JPEG 自动探测可能落到 image2；按文件头强制单图解码，不放开序列读取。
             with source.open("rb") as file:
                 input_format = ["-f", "jpeg_pipe"] if file.read(3) == b"\xff\xd8\xff" else []
             self.directory.mkdir(parents=True, exist_ok=True)
-            # 默认 autorotate 在缩放前应用方向元数据；RGBA 保留透明度，尺寸不会放大小图。
+            # 默认 autorotate 应用方向元数据；原尺寸不缩放，RGBA 保留透明度。
+            filters = "setsar=1" if original else (
+                "scale=w='min(512,iw)':h='min(512,ih)':force_original_aspect_ratio=decrease,setsar=1"
+            )
             spawn = asyncio.create_task(asyncio.create_subprocess_exec(
                 str(executable), "-nostdin", "-hide_banner", "-loglevel", "error", "-y",
                 "-protocol_whitelist", "file,pipe",
@@ -175,7 +180,7 @@ class MediaThumbnails:
                 "-format_whitelist", "png_pipe,jpeg_pipe,webp_pipe,bmp_pipe,gif,mov,matroska,webm,avi",
                 *input_format, "-threads", "1", "-i", str(source),
                 "-map", "0:v:0", "-an", "-sn", "-dn", "-frames:v", "1",
-                "-vf", "scale=w='min(512,iw)':h='min(512,ih)':force_original_aspect_ratio=decrease,setsar=1",
+                "-vf", filters,
                 "-filter_threads", "1", "-c:v", "png", "-pix_fmt", "rgba", "-threads", "1",
                 "-f", "image2", "-update", "1", str(temporary),
                 stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
@@ -193,9 +198,10 @@ class MediaThumbnails:
                 header = file.read(24)
             if (len(header) != 24 or header[:8] != b"\x89PNG\r\n\x1a\n"
                     or header[12:16] != b"IHDR"
-                    or not all(0 < size <= self.MAX_SIZE for size in struct.unpack(">II", header[16:24]))):
-                raise RuntimeError("缩略图输出不是有效的限定尺寸 PNG")
-            if self.source_key(source)[1] != key:
+                    or not all(size > 0 and (original or size <= self.MAX_SIZE)
+                               for size in struct.unpack(">II", header[16:24]))):
+                raise RuntimeError("缩略图输出不是有效的指定尺寸 PNG")
+            if self.source_key(source, original=original)[1] != key:
                 raise web.HTTPConflict(text="素材已变化，请重试")
             temporary.replace(target)
             return target

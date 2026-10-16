@@ -146,7 +146,7 @@ function installProbe(options) {
   }).observe(document, {childList:true,subtree:true});
 }
 
-async function fixtureServer(videoBytes, audioBytes) {
+async function fixtureServer(videoBytes, audioBytes, highRes) {
   const staticFiles = Object.fromEntries(['index.html','style.css','app.js','auth.js'].map(name => [name,readFileSync(path.join(web,name))]));
   const state = {projects:[],requests:[],writes:[],held:[],events:new EventEmitter(),thumbnailDelay:65,holdThumbnails:false,holdPreviews:false,previewModes:{},heldPaths:new Set(),failThumbnail:null};
   const json = (res, data, status = 200) => { res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(data)); };
@@ -178,6 +178,10 @@ async function fixtureServer(videoBytes, audioBytes) {
           project.cards.push(card); project.rev++;
           return json(res,{ok:true,card,project:clone(project)});
         }
+        if (url.pathname.endsWith('/view')) {
+          const target = state.projects.find(p => url.pathname === `/api/projects/${p.id}/view`);
+          if (target) target.view = JSON.parse(body);
+        }
         json(res,{ok:true,rev:2});
       });
       return;
@@ -201,7 +205,8 @@ async function fixtureServer(videoBytes, audioBytes) {
     if (url.pathname === '/api/thumbnail') {
       const item = delayed(() => {
         if (record.original === state.failThumbnail) return json(res,{error:'测试缩略图失败'},state.failThumbnailStatus);
-        res.writeHead(200,{'Content-Type':'image/png','Cache-Control':'no-store'}); res.end(PNG);
+        res.writeHead(200,{'Content-Type':'image/png','Cache-Control':'no-store'});
+        res.end(state.highRes && url.searchParams.get('size') === 'original' ? highRes.image : PNG);
       });
       if (!state.holdThumbnails) setTimeout(item.send,state.thumbnailDelay);
       return;
@@ -213,8 +218,9 @@ async function fixtureServer(videoBytes, audioBytes) {
       return;
     }
     if (/^\/api\/(upload|artifact)\//.test(url.pathname) || /\/api\/preview\/.+\/file$/.test(url.pathname) || url.pathname === '/comfy/view') {
-      const bytes = /\.png$/.test(url.pathname) ? PNG : /\.wav$/.test(url.pathname) ? audioBytes : videoBytes;
-      const type = bytes === PNG ? 'image/png' : bytes === audioBytes ? 'audio/wav' : 'video/mp4';
+      const bytes = /\.png$/.test(url.pathname) ? (state.highRes ? highRes.image : PNG)
+        : /\.wav$/.test(url.pathname) ? audioBytes : (state.highRes ? highRes.video : videoBytes);
+      const type = /\.png$/.test(url.pathname) ? 'image/png' : bytes === audioBytes ? 'audio/wav' : 'video/mp4';
       // 真实视频播放支持 Range，避免把浏览器合法续读当成重复业务请求。
       const range = /^bytes=(\d+)-(\d*)$/.exec(req.headers.range || '');
       if (range) {
@@ -283,13 +289,16 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
     const mp4 = path.join(directory,'fixture.mp4'), wav = path.join(directory,'fixture.wav');
     execFileSync(process.env.CHOUKA_TEST_FFMPEG || 'ffmpeg',['-nostdin','-v','error','-y','-f','lavfi','-i','testsrc2=size=96x64:rate=12:duration=3','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',mp4]);
     execFileSync(process.env.CHOUKA_TEST_FFMPEG || 'ffmpeg',['-nostdin','-v','error','-y','-f','lavfi','-i','sine=frequency=440:duration=1',wav]);
-    fixture = await fixtureServer(readFileSync(mp4),readFileSync(wav));
+    const hdImage = path.join(directory,'hd.png'), hdVideo = path.join(directory,'hd.mp4');
+    execFileSync(process.env.CHOUKA_TEST_FFMPEG || 'ffmpeg',['-nostdin','-v','error','-y','-f','lavfi','-i','testsrc2=size=1920x1080:rate=12:duration=1','-c:v','libx264','-pix_fmt','yuv420p','-movflags','+faststart',hdVideo]);
+    execFileSync(process.env.CHOUKA_TEST_FFMPEG || 'ffmpeg',['-nostdin','-v','error','-y','-i',hdVideo,'-frames:v','1',hdImage]);
+    fixture = await fixtureServer(readFileSync(mp4),readFileSync(wav),{image:readFileSync(hdImage),video:readFileSync(hdVideo)});
     browser = await chromium.launch({channel:process.env.CHOUKA_TEST_BROWSER || 'chrome'});
     async function withPage(projects, run, configure = () => {}) {
       const state = fixture.state;
-      Object.assign(state,{projects:clone(projects),requests:[],writes:[],held:[],thumbnailDelay:65,holdThumbnails:false,holdPreviews:false,previewModes:{},heldPaths:new Set(),failThumbnail:null,failThumbnailStatus:500,holdNextBlob:false});
+      Object.assign(state,{projects:clone(projects),requests:[],writes:[],held:[],thumbnailDelay:65,holdThumbnails:false,holdPreviews:false,previewModes:{},heldPaths:new Set(),failThumbnail:null,failThumbnailStatus:500,holdNextBlob:false,highRes:false,deviceScaleFactor:1});
       configure(state);
-      const context = await browser.newContext({viewport:{width:1440,height:960}});
+      const context = await browser.newContext({viewport:{width:1440,height:960},deviceScaleFactor:state.deviceScaleFactor});
       await context.addInitScript(installProbe,{holdNextBlob:state.holdNextBlob});
       const page = await context.newPage(), errors = [], external = [];
       page.setDefaultTimeout(10000);
@@ -402,6 +411,180 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
       });
     });
 
+    await t.test('菜单与滚轮支持500%，锚点不漂移，视图保存并恢复，原图不重复降级', async () => {
+      const p = smallProject('zoom_hd',['image']);
+      await withPage([p],async (page,state) => {
+        await settle(page);
+        assert.equal(await page.locator('#world img').evaluate(i => i.naturalWidth),1);
+        const center = await page.evaluate(() => {
+          const r = el.stage.getBoundingClientRect(), c = PROJ.cards[0];
+          const x = c.x + cardW(c) / 2, y = c.y + 100;
+          view.x = r.width / 2 - x; view.y = r.height / 2 - y; applyView();
+          return {x,y};
+        });
+        await page.locator('#zoom-menu').click();
+        await page.locator('#menu button').filter({hasText:'放大 (500%)'}).click();
+        await page.waitForFunction(() => el.world.querySelector('img').naturalWidth === 1920);
+        await settle(page);
+        assert.equal(await page.locator('#zoom-percent').textContent(),'500%');
+        const stage = await page.locator('#stage').boundingBox();
+        const anchor = {x:stage.x+stage.width/2,y:stage.y+stage.height/2};
+        const current = await page.evaluate(a => toWorld(a.x,a.y),anchor);
+        assert.ok(Math.abs(current.x-center.x)<0.001 && Math.abs(current.y-center.y)<0.001);
+        await page.mouse.move(anchor.x,anchor.y);
+        await page.mouse.wheel(0,-100);
+        await page.waitForTimeout(50);
+        assert.equal(await page.evaluate(() => view.k),5,'继续放大不能超过500%');
+        await page.mouse.wheel(0,100);
+        await page.waitForFunction(() => view.k < 5);
+        const after = await page.evaluate(a => toWorld(a.x,a.y),anchor);
+        assert.ok(Math.abs(after.x-current.x)<0.001 && Math.abs(after.y-current.y)<0.001);
+        await page.mouse.wheel(0,-100);
+        await page.waitForFunction(() => view.k === 5);
+        await waitServer(state,() => state.projects[0].view.k === 5,'500%视图必须真正保存');
+        await page.screenshot({path:'/private/tmp/h3card-canvas-500-image.png'});
+        await page.reload(); await page.evaluate(() => bootReady); await settle(page);
+        assert.equal(await page.locator('#zoom-percent').textContent(),'500%');
+        await page.waitForFunction(() => el.world.querySelector('img').naturalWidth === 1920);
+        const requestsBefore = mediaRequests(state).length;
+        await page.locator('#zoom-menu').click();
+        await page.locator('#menu button').filter({hasText:'缩小 (10%)'}).click();
+        await settle(page);
+        await page.mouse.move(anchor.x,anchor.y); await page.mouse.wheel(0,100);
+        await page.waitForTimeout(50);
+        assert.equal(await page.evaluate(() => view.k),0.1);
+        await page.locator('#zoom-menu').click();
+        await page.locator('#menu button').filter({hasText:'放大 (500%)'}).click();
+        await settle(page);
+        assert.equal(await page.locator('#world img').evaluate(i => i.naturalWidth),1920);
+        assert.equal(mediaRequests(state).length,requestsBefore,'缩小再放大复用已加载原图');
+        assert.deepEqual(await outputs(page),p.cards.map(c => c.outputs));
+        assert.ok(state.writes.every(r => r.path.endsWith('/view')));
+      },state => { state.highRes = true; });
+    });
+
+    await t.test('500%视频封面使用原尺寸，仍只在单击时下载播放1920px视频', async () => {
+      const p = smallProject('zoom_video',['video']);
+      p.view = {x:40,y:-400,k:5}; p.cards[0].x = 0;
+      await withPage([p],async (page,state) => {
+        await settle(page);
+        const video = page.locator('#world video');
+        assert.ok(thumbs(state).some(r => r.url.endsWith('&size=original')));
+        assert.equal(await video.evaluate(async v => {
+          const image = new Image(); image.src = v.poster; await image.decode(); return image.naturalWidth;
+        }),1920);
+        assert.equal(await video.getAttribute('preload'),'none');
+        assert.equal(await video.getAttribute('src'),null);
+        assert.equal(mediaRequests(state).length,0);
+        await page.screenshot({path:'/private/tmp/h3card-canvas-500-video.png'});
+        await video.click();
+        await page.waitForFunction(() => {
+          const v = el.world.querySelector('video'); return !v.paused && v.currentTime > 0 && v.videoWidth === 1920;
+        });
+        assert.equal(await video.evaluate(v => v.videoHeight),1080);
+        assert.deepEqual(await outputs(page),p.cards.map(c => c.outputs));
+        await quietWrites(page,state);
+      },state => { state.highRes = true; });
+    });
+
+    await t.test('高清封面请求失败保留旧封面且不无限重试', async () => {
+      const p = smallProject('hd_failure',['video']);
+      await withPage([p],async (page,state) => {
+        await settle(page);
+        const video = page.locator('#world video'), poster = await video.getAttribute('poster');
+        state.failThumbnail = p.cards[0].outputs[0].url;
+        await page.evaluate(() => { view = {x:-200,y:-450,k:5}; applyView(); });
+        await page.waitForFunction(() => el.world.querySelector('video').title.includes('500'));
+        await settle(page);
+        assert.equal(await video.getAttribute('poster'),poster);
+        assert.ok(!(await page.evaluate(() => __canvasProbe.revoked)).includes(poster));
+        await page.evaluate(() => { applyView(); applyView(); }); await settle(page);
+        assert.equal(thumbs(state).length,2,'高清失败后视图刷新不能无限重试');
+        assert.equal(mediaRequests(state).length,0);
+      },state => { state.highRes = true; });
+    });
+
+    await t.test('等待视频转码时升级封面，转码返回不能恢复已回收的旧缩略图', async () => {
+      const p = smallProject('poster_race',['video']);
+      await withPage([p],async (page,state) => {
+        await settle(page);
+        const video = page.locator('#world video'), oldPoster = await video.getAttribute('poster');
+        await video.click();
+        await waitServer(state,() => previewRequests(state).length === 1,'必须进入真实转码请求等待');
+        await page.evaluate(() => { view = {x:-200,y:-450,k:5}; applyView(); });
+        await page.waitForFunction(() => {
+          const v = el.world.querySelector('video'), s = CARD_MEDIA.get(v);
+          return s.original && s.done && v.poster === s.blob;
+        });
+        const newPoster = await video.getAttribute('poster');
+        assert.notEqual(newPoster,oldPoster);
+        await assertReclaimed(page,[oldPoster]);
+        state.holdPreviews = false; fixture.release();
+        await page.waitForFunction(() => el.world.querySelector('video').videoWidth === 1920);
+        assert.equal(await video.getAttribute('poster'),newPoster);
+        assert.equal(await video.evaluate(async v => {
+          const image = new Image(); image.src = v.poster; await image.decode(); return image.naturalWidth;
+        }),1920);
+      },state => { state.highRes = true; state.holdPreviews = true; });
+    });
+
+    await t.test('高分屏100%和节点扩尺寸都按实际像素升级，不必先滚轮缩放', async () => {
+      const p = smallProject('retina',['image']);
+      p.cards[0].w = 320;
+      await withPage([p],async (page,state) => {
+        await settle(page);
+        assert.ok(await page.locator('#world img').evaluate(i => i.getBoundingClientRect().width * devicePixelRatio > 512));
+        await page.waitForFunction(() => el.world.querySelector('img').naturalWidth === 1920);
+        assert.equal(thumbs(state).length,0,'高分屏初始直接请求原图，不重复下载512预览');
+        assert.equal(mediaRequests(state).length,1);
+        await quietWrites(page,state);
+      },state => { state.highRes = true; state.deviceScaleFactor = 2; });
+      await withPage([smallProject('resize_hd',['image'])],async (page,state) => {
+        await settle(page);
+        assert.equal(await page.locator('#world img').evaluate(i => i.naturalWidth),1);
+        const old = await page.locator('#world img').getAttribute('src');
+        await page.evaluate(() => { const c = PROJ.cards[0]; c.w = 700; applySize(c); });
+        await page.waitForFunction(() => el.world.querySelector('img').naturalWidth === 1920);
+        await settle(page); await assertReclaimed(page,[old]);
+        assert.equal(mediaRequests(state).length,1);
+      },state => { state.highRes = true; });
+    });
+
+    await t.test('缩放升级中迟到的旧缩略图不能覆盖原图，未进入视口的节点不下载原图', async () => {
+      const p = smallProject('late_zoom',['image','image']);
+      p.cards[1].x = 40000;
+      await withPage([p],async (page,state) => {
+        await page.waitForFunction(() => __canvasProbe.late !== null);
+        await page.evaluate(() => { view = {x:-200,y:-450,k:5}; applyView(); });
+        await page.waitForFunction(() => __canvasProbe.fetches[0].aborted);
+        await page.evaluate(() => __canvasProbe.releaseBlob());
+        await page.waitForFunction(() => el.world.querySelector('img').naturalWidth === 1920);
+        await settle(page);
+        assert.equal(mediaRequests(state).length,1);
+        assert.equal(await page.locator('[data-id="late_zoom_1"] img').getAttribute('src'),null);
+        assert.equal(await page.evaluate(() => __canvasProbe.created.length),1,'迟到缩略图不能发布Blob');
+        assert.deepEqual(await outputs(page),p.cards.map(c => c.outputs));
+      },state => { state.highRes = true; state.holdNextBlob = true; });
+    });
+
+    await t.test('宫格与原图对比在500%分别保留各自的源图像素', async () => {
+      for (const mode of ['grid','compare']) {
+        const p = smallProject(`zoom_${mode}`,['image']);
+        p.cards[0].x = 0; p.view = {x:40,y:-400,k:5};
+        const other = {...p.cards[0].outputs[0],url:`/api/artifact/${mode}_other.png`};
+        if (mode === 'grid') p.cards[0].outputs.push(other);
+        else { p.cards[0].cap = 'fixture_compare'; p.cards[0].assets.image = other; }
+        await withPage([p],async (page,state) => {
+          await settle(page);
+          assert.equal(await page.locator('#world img').count(),2);
+          await page.waitForFunction(() => [...el.world.querySelectorAll('img')].every(i => i.naturalWidth === 1920));
+          assert.equal(mediaRequests(state).length,2);
+          assert.deepEqual(await outputs(page),p.cards.map(c => c.outputs));
+          await quietWrites(page,state);
+        },state => { state.highRes = true; });
+      }
+    });
+
     await t.test('本地视频封面就绪仍 preload=none 无 src，真实单击后兼容 MP4 可播放', async () => {
       const p = smallProject('play',['video']);
       await withPage([p],async (page,state) => {
@@ -503,7 +686,7 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
 
         const restored = page.waitForResponse(response => new URL(response.url()).pathname === projectPath
           && response.request().method() === 'PUT' && response.status() === 200);
-        await page.keyboard.press('Control+z');
+        await page.keyboard.press(process.platform === 'darwin' ? 'Meta+z' : 'Control+z');
         await restored;
         await page.waitForFunction(() => PROJ.rev === 4 && cardOf('undo_restore_0')?.params.prompt === '撤销必须保留');
         await settle(page);
