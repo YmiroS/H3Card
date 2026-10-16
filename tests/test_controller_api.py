@@ -317,6 +317,15 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
             changed["232"]["inputs"]["processing_control_value"] = 0
             self.assertEqual(changed, baseline)
 
+    def test_h3_two_pass_te_defaults_off_without_explicit_parameter(self):
+        cap = controller_app.CAPS["minimax_h3_ref_2pass"]
+        for supplied in ({}, {"processing_control_value": None},
+                         {"processing_control_value": ""}, {"processing_control_value": 0}):
+            with self.subTest(params=supplied):
+                graph = controller_app.patch_graph(cap, {"seed": 42, **supplied}, {})
+                self.assertEqual(graph["232"]["inputs"]["processing_control_value"], 0)
+                self.assertEqual(graph["230"]["inputs"]["strength_model"], 1)
+
     def test_h3_two_pass_uses_tested_audio_denoise(self):
         cap = controller_app.CAPS["minimax_h3_ref_2pass"]
         spec = next(item for item in cap["inputs"] if item["key"] == "audio_denoise")
@@ -982,6 +991,24 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         text_modes = [item for item in card["modes"] if item["name"] == "文生图"]
         self.assertEqual(len(text_modes), 1)
         self.assertEqual(text_modes[0]["modelSwitch"]["krea2"], "krea2_t2i")
+
+    async def test_high_quality_te_defaults_off_in_dry_run(self):
+        controller_app.load_caps()
+        cap = controller_app.CAPS["minimax_h3_ref_2pass"]
+        template = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
+        for supplied in ({}, {"processing_control_value": None},
+                         {"processing_control_value": ""}, {"processing_control_value": 0.12}):
+            with self.subTest(params=supplied):
+                response = await self.client.post("/api/generate", headers=self.headers, json={
+                    "project": "p", "capability": cap["id"], "dry_run": True,
+                    "params": {"seed": 42, **supplied},
+                })
+                self.assertEqual(response.status, 200, await response.text())
+                payload = await response.json()
+                actual = payload["changed"].get("#232.processing_control_value",
+                    [None, template["232"]["inputs"]["processing_control_value"]])[1]
+                self.assertEqual(actual, 0.12 if supplied.get("processing_control_value") == 0.12 else 0)
+        self.assertEqual(controller_app.JOBS, {})
 
     async def test_reload_exposes_high_quality_te_and_hides_lora(self):
         response = await self.client.post("/api/reload", headers=self.headers)
