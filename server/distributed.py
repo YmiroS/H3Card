@@ -19,6 +19,64 @@ HIGH_VRAM_CAPABILITIES = frozenset({"minimax_h3_ref_2pass"})
 HIGH_VRAM_GPU_POLICY = "primary_gpu_vram_gte_32gb"
 MIN_HIGH_QUALITY_VRAM_BYTES = 32_000_000_000
 MAX_4090_HIGH_QUALITY_DURATION_SECONDS = 5
+MODEL_INPUT_NAMES = frozenset({
+    "ckpt_name", "unet_name", "vae_name", "clip_name", "clip_name1", "clip_name2",
+    "clip_name3", "lora_name", "control_net_name", "model_name", "model", "mmproj",
+    "upscale_model", "diffusion_model", "text_encoder_name",
+})
+MODEL_FILE_SUFFIXES = (".safetensors", ".gguf", ".ckpt", ".pth", ".pt", ".bin", ".onnx")
+
+
+def literal_model_name(graph, value):
+    seen = set()
+    while isinstance(value, list):
+        if len(value) != 2 or value[1] != 0 or str(value[0]) in seen:
+            return None
+        node_id = str(value[0])
+        seen.add(node_id)
+        source = graph.get(node_id, {})
+        kind = source.get("class_type")
+        if kind in {"PrimitiveString", "PrimitiveStringMultiline"}:
+            value = source.get("inputs", {}).get("value")
+        elif kind == "ConvertStringToComboNode":
+            value = source.get("inputs", {}).get("string")
+        else:
+            return None
+    return value if isinstance(value, str) else None
+
+
+def has_required_models(graph, capabilities):
+    choices_by_class = capabilities.get("input_choices") or {}
+    types_by_class = capabilities.get("input_types") or {}
+    if not isinstance(choices_by_class, dict) or not isinstance(types_by_class, dict):
+        return False
+    for node in graph.values():
+        node_class = node.get("class_type")
+        choices = choices_by_class.get(node_class, {})
+        types = types_by_class.get(node_class, {})
+        if not isinstance(choices, dict) or not isinstance(types, dict):
+            return False
+        for name, value in (node.get("inputs") or {}).items():
+            options = choices.get(name)
+            input_type = types.get(name)
+            resolved = literal_model_name(graph, value)
+            is_model = name in MODEL_INPUT_NAMES or (
+                (name in choices or input_type == "COMBO") and (
+                    (resolved is not None and resolved.lower().endswith(MODEL_FILE_SUFFIXES))
+                    or (isinstance(options, list) and any(
+                        isinstance(option, str) and option.lower().endswith(MODEL_FILE_SUFFIXES)
+                        for option in options))
+                )
+            )
+            if not is_model:
+                continue
+            # 只有明确的非字符串/COMBO 类型才可把连线视为张量，而不是缺少模型清单。
+            if (isinstance(value, list) and name not in choices and isinstance(input_type, str)
+                    and input_type not in {"COMBO", "STRING", "*", "ANY"}):
+                continue
+            if not isinstance(options, list) or resolved is None or resolved not in options:
+                return False
+    return True
 
 
 def primary_gpu(devices):
@@ -432,14 +490,17 @@ class DistributedStore:
                 payload = json.loads(row["payload_json"])
                 capability = payload.get("capability")
                 gpu_policy = payload.get("gpu_policy")
-                if not required.issubset(available_nodes) or not can_run_capability(
-                    capability, capabilities.get("devices"), gpu_policy,
-                    payload.get("duration_seconds"),
-                ):
+                if (not required.issubset(available_nodes)
+                        or not has_required_models(payload.get("graph") or {}, capabilities)
+                        or not can_run_capability(
+                            capability, capabilities.get("devices"), gpu_policy,
+                            payload.get("duration_seconds"),
+                        )):
                     continue
                 if requires_high_vram(capability, gpu_policy) and any(
                     primary_gpu_vram_bytes(other.get("devices")) > current_vram
                     and required.issubset(set(other.get("node_classes") or []))
+                    and has_required_models(payload.get("graph") or {}, other)
                     and can_run_capability(
                         capability, other.get("devices"), gpu_policy,
                         payload.get("duration_seconds"),

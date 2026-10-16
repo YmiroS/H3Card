@@ -246,9 +246,35 @@ class WorkerAgent:
         self.comfy_online = True
         hardware = self.capacity_hardware(self.telemetry.get("memory"), stats.get("devices"))
         self.telemetry.update(hardware)
+        input_choices = {}
+        input_types = {}
+        for node_class, node in nodes.items():
+            choices = {}
+            types = {}
+            for section in ("required", "optional"):
+                for name, spec in (node.get("input", {}).get(section) or {}).items():
+                    if name in {"image", "video", "audio"} or not isinstance(spec, (list, tuple)) or not spec:
+                        continue
+                    if (len(spec) > 1 and isinstance(spec[1], dict)
+                            and any(spec[1].get(flag) for flag in ("image_upload", "video_upload", "audio_upload"))):
+                        continue
+                    if isinstance(spec[0], list):
+                        types[name] = "COMBO"
+                        choices[name] = spec[0]
+                    elif isinstance(spec[0], str):
+                        types[name] = spec[0]
+                        if (spec[0] == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict)
+                                and isinstance(spec[1].get("options"), list)):
+                            choices[name] = spec[1]["options"]
+            if choices:
+                input_choices[node_class] = choices
+            if types:
+                input_types[node_class] = types
         self.capabilities = {
             "hardware": hardware,
             "node_classes": sorted(nodes.keys()),
+            "input_choices": input_choices,
+            "input_types": input_types,
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
