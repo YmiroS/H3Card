@@ -208,31 +208,47 @@ test('H3 two-pass TE is visible, persistent and keyboard accessible while LoRA s
     assert.equal(baseline.params.duration, 7);
     assert.equal(baseline.params.seed, 12345);
     async function check(value) {
-      assert.equal(await toggle.getAttribute('aria-checked'), String(value === 'on'));
-      assert.equal((await toggle.innerText()).trim(), value === 'on' ? '开启' : '关闭');
-      assert.deepEqual(await stored(), {...originalParams, lora_acceleration:value}, 'only the switch parameter changes on the card');
+      assert.equal(Number(await slider.inputValue()), value);
+      assert.equal(Number(await number.inputValue()), value);
+      assert.deepEqual(await stored(), {...originalParams, processing_control_value:value}, 'only TE changes on the card');
       assert.deepEqual(await payload(), {...baseline,
-        params:{...baseline.params, lora_acceleration:value, strength_model:value === 'on' ? 1 : 0}},
-      'all other payload parameters, including TE-Speed and steps, are unchanged');
+        params:{...baseline.params, processing_control_value:value}},
+      'LoRA, steps, seed, duration and every unrelated parameter stay unchanged');
     }
-    let saving = saveResponse('off');
-    await toggle.click();
-    await check('off');
-    assert.equal((await saving).status(), 200, 'click persists through the isolated save API');
-    assert.equal(saved.at(-1).cards.find(card => card.id === 'two-pass').params.lora_acceleration, 'off');
+    let saving = saveResponse(0);
+    await number.fill('0');
+    await check(0);
+    assert.equal((await saving).status(), 200, 'recommended zero persists through the isolated save API');
+    assert.equal(saved.at(-1).cards.find(card => card.id === 'two-pass').params.processing_control_value, 0);
     await popup.locator('.x').click();
     assert.equal(await popup.isVisible(), false);
     await paramsButton.click();
-    await check('off');
-    await page.screenshot({path:path.resolve(root, '..', 'temp', 'chouka-h3-acceleration-off.png'), fullPage:true});
-    saving = saveResponse('on');
-    await toggle.focus();
-    await page.keyboard.press('Space');
-    await check('on');
-    assert.equal((await saving).status(), 200, 'keyboard change saves too');
+    await check(0);
+    await page.screenshot({path:path.resolve(root, '..', 'temp', 'chouka-h3-te-parameters.png'), fullPage:true});
+    saving = saveResponse(0.005);
+    await slider.focus();
+    await page.keyboard.press('ArrowRight');
+    await check(0.005);
+    assert.equal((await saving).status(), 200, 'keyboard slider change saves too');
+    saving = saveResponse(0.12);
+    await number.fill('0.12');
+    await check(0.12);
+    await saving;
     await popup.locator('.x').click();
     await paramsButton.click();
-    await check('on');
+    await check(0.12);
+    await page.reload();
+    await page.locator('#world .card[data-id="two-pass"] .ch .t').click();
+    await paramsButton.click();
+    await check(0.12);
+    assert.equal(await popup.getByRole('switch').count(), 0, 'LoRA stays hidden after a full reload');
+    await page.evaluate(() => {
+      const card = PROJ.cards.find(item => item.id === 'two-pass');
+      delete card.params.processing_control_value;
+      openResPop(card, document.querySelector('#panel .foot button[title^="点开弹窗"]'));
+    });
+    assert.equal(Number(await number.inputValue()), 0, 'a card without TE settings starts at the recommended zero');
+    assert.equal((await payload()).params.processing_control_value, 0);
     await popup.locator('.x').click();
     await page.locator('#world .card[data-id="normal-ref9"] .ch .t').click();
     await paramsButton.click();
