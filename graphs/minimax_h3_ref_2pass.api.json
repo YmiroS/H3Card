@@ -450,7 +450,7 @@
     "131",
     1
    ],
-   "ref_image_size": "match"
+   "ref_image_size": "max"
   },
   "_meta": {
    "title": "MiniMax H3 Reference to Video"

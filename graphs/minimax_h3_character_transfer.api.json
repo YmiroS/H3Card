@@ -73,7 +73,7 @@
    "sigmas": ["9", 0],
    "seed": 358,
    "continue_audio_latent": true,
-   "ref_image_size": "match"
+   "ref_image_size": "max"
   },
   "_meta": {"title": "H3 人物迁移分段采样"}
  },
