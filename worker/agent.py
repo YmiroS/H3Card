@@ -584,7 +584,7 @@ class WorkerAgent:
             if not script.is_file():
                 raise AgentError(f"找不到同步脚本：{script}")
             await self.run_local_command(
-                "cmd.exe", "/d", "/c", str(script),
+                "cmd.exe", "/d", "/c", f".\\{script.name}",
                 "--upgrade", "--non-interactive",
                 cwd=script.parent,
                 timeout=max(float(self.config.get("file_sync_timeout_seconds", 3600)), 60.0),

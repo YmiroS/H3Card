@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -921,8 +922,20 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.agent.pending_sync)
         self.assertEqual([item[0] for item in calls], ["files", "pull", "restart"])
         self.assertEqual(calls[0][1][:3], ("cmd.exe", "/d", "/c"))
+        self.assertEqual(calls[0][1][3], f".\\{script.name}")
         self.assertEqual(calls[0][1][-2:], ("--upgrade", "--non-interactive"))
         self.assertEqual(calls[-1][1], ("sync-1", "abc123def456"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows cmd.exe behavior")
+    async def test_local_batch_runs_from_directory_with_shell_metacharacters(self):
+        with tempfile.TemporaryDirectory(prefix="sync & path ") as directory:
+            script = Path(directory) / "sync.bat"
+            script.write_text("@echo off\necho SYNC_OK [%1]\nexit /b 0\n", encoding="ascii")
+            output = await self.agent.run_local_command(
+                "cmd.exe", "/d", "/c", f".\\{script.name}", "--upgrade",
+                cwd=script.parent, timeout=10,
+            )
+        self.assertIn("SYNC_OK", output)
 
     async def test_git_pull_requires_clean_expected_branch_and_fast_forward(self):
         with tempfile.TemporaryDirectory() as directory:
