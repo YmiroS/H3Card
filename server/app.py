@@ -79,7 +79,7 @@ MODEL_FAMILY = {
         "minimax_h3_i2v", "minimax_h3_flf2v", "minimax_h3_talk1",
         "minimax_h3_talk2", "minimax_h3_ref4", "minimax_h3_ref9",
         "minimax_h3_ref_2pass", "minimax_h3_comic20",
-        "minimax_h3_character_transfer",
+        "minimax_h3_character_transfer", "minimax_h3_fusion_v2",
     )},
     "flux2_klein_edit": "flux2_klein",
     "flux2_klein_storyboard9": "flux2_klein",
