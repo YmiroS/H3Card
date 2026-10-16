@@ -1,7 +1,10 @@
 import asyncio
+import hashlib
 import json
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
@@ -453,7 +456,38 @@ class CostLedgerTest(unittest.TestCase):
         self.assertEqual(len(report["jobs"]), 501)
 
 
+def capacity_test_video(path, *, width=1280, height=720, rotate=False):
+    """生成真实临时媒体；依赖缺失直接失败，不以模拟元数据替代回归。"""
+    executable = controller_app.ffmpeg_bin()
+    if executable is None:
+        raise RuntimeError("真实产物回归需要 ffmpeg，不能跳过或放宽断言")
+    source = path.with_name("rotation-source.mp4") if rotate else path
+    controller_app.subprocess.run(
+        [str(executable), "-hide_banner", "-loglevel", "error", "-nostdin",
+         "-f", "lavfi", "-i", f"color=c=blue:s={width}x{height}:r=24",
+         "-t", "2", "-c:v", "mpeg4", str(source)],
+        check=True, capture_output=True, timeout=8,
+    )
+    if rotate:
+        controller_app.subprocess.run(
+            [str(executable), "-hide_banner", "-loglevel", "error", "-nostdin",
+             "-display_rotation", "90", "-i", str(source), "-c", "copy", str(path)],
+            check=True, capture_output=True, timeout=8,
+        )
+    return path.read_bytes()
+
+
 class FfmpegDiscoveryTest(unittest.TestCase):
+    def test_capacity_output_probe_uses_real_rotated_display_dimensions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rotated.mp4"
+            capacity_test_video(path, rotate=True)
+            metadata = controller_app.probe_capacity_output(path)
+            self.assertTrue(metadata["valid"], metadata)
+            self.assertEqual((metadata["width"], metadata["height"]), (720, 1280))
+            self.assertAlmostEqual(metadata["duration"], 2)
+            self.assertAlmostEqual(metadata["fps"], 24)
+
     def test_capacity_output_probe_reads_real_synthetic_media(self):
         executable = controller_app.ffmpeg_bin()
         if executable is None:
@@ -651,6 +685,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
 
         application = self.build_app()
         application["comfy_lock"] = asyncio.Lock()
+        application["capacity_probe_state"] = {"task": None}
         application["cleanup_pending"] = set()
         application["cleanup_tasks"] = {}
         application["session"] = mock.MagicMock()
@@ -689,6 +724,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_get("/api/capacity/export", controller_app.api_capacity_export)
         application.router.add_post("/api/capacity/estimate", controller_app.api_capacity_estimate)
         application.router.add_post("/api/capacity/jobs/{pid}/review", controller_app.api_capacity_review)
+        application.router.add_post("/api/capacity/jobs/{pid}/probe-outputs", controller_app.api_capacity_probe_outputs)
         application.router.add_post("/api/capacity/workers/{worker_id}", controller_app.api_capacity_worker)
         await self.start_client(application)
 
@@ -943,6 +979,569 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(reviewed["groups"][0]["source"], "standard")
         self.assertEqual(reviewed["groups"][0]["benchmark_id"], "synthetic-bench")
         self.assertFalse(reviewed["groups"][0]["eligible"])
+
+    def seed_capacity_probe(self, pid="probe-final", *, count=1, captured=True, status="done"):
+        """构造旧任务及登记清单，尺寸刻意缺失，所有文件只位于临时目录。"""
+        if not hasattr(self, "probe_worker"):
+            self.probe_worker = self.store.register_worker("补采回归机器", {})
+        worker_id = self.probe_worker["worker_id"]
+        capability = "minimax_h3_ref_2pass"
+        now = time.time() - 200
+        self.register_job(pid)
+        folder = self.root / "data" / "artifacts" / pid
+        folder.mkdir(parents=True)
+        locators = [f"{pid}/final-{i}.mp4" for i in range(count)]
+        for locator in locators:
+            (self.root / "data" / "artifacts" / locator).write_bytes(b"synthetic-video")
+            self.access.register("p", "artifact", locator)
+        job = {"id": pid, "capability": capability, "status": "queued", "created": now,
+               "worker_id": worker_id, "outputs": [{"url": "/api/artifact/" + key} for key in locators]}
+        self.ledger.record_job(job, {"output_kind": "video"}, {}, {"duration": 2})
+        self.ledger.start_job(pid, worker_id, now + 1)
+        if status in {"done", "error", "canceled"}:
+            self.ledger.finish_job(pid, status, now + 61, worker_id)
+        job["status"] = status
+        controller_app.JOBS[pid] = job
+        if captured:
+            graph = json.loads((ROOT / "graphs/minimax_h3_ref_2pass.api.json").read_text())
+            spec = controller_app.make_spec(capability, {"output_kind": "video"}, graph, {"duration": 2})
+            self.assertEqual(spec["expected"], {"kind": "video", "duration": 2})
+            with self.store.lock, self.store.db:
+                worker = dict(self.store.db.execute("SELECT * FROM workers WHERE id=?", (worker_id,)).fetchone())
+                self.store.capacity.enqueue(pid, {"capability": capability, "capacity_spec": spec}, now)
+                self.store.capacity.assigned(pid, worker, "test-lease", now + 0.5)
+                self.store.capacity.running(pid, worker_id, "test-lease", now + 1)
+                if status in {"done", "error", "canceled"}:
+                    self.store.capacity.terminal(
+                        pid, worker_id, "test-lease", status, now + 61, released=True,
+                        outputs=[{"key": key, "kind": "video", "valid": False} for key in locators])
+        return locators
+
+    def capacity_original_rows(self):
+        with self.store.lock:
+            return {table: [tuple(row) for row in self.store.db.execute(f"SELECT * FROM {table} ORDER BY rowid")]
+                    for table in ("capacity_tasks", "capacity_attempts", "capacity_artifacts",
+                                  "dispatch_jobs", "cost_events")}
+
+    async def post_capacity_probe(self, pid="probe-final", offset=0):
+        return await self.client.post(f"/api/capacity/jobs/{pid}/probe-outputs", json={"offset": offset})
+
+    @staticmethod
+    def probe_metadata():
+        return {"kind": "video", "valid": True, "width": 1280, "height": 720,
+                "duration": 2, "fps": 24, "bytes": 15}
+
+    async def test_capacity_h3_real_upload_completion_displays_actual_sizes_without_qualifying(self):
+        credentials = self.store.register_worker("真实媒体回归机器", {
+            "devices": [{"name": "测试 48GB GPU", "type": "cuda", "vram_total": 48 * 1024 ** 3}]})
+        worker_id = credentials["worker_id"]
+        headers = {"X-Worker-ID": worker_id, "Authorization": f"Bearer {credentials['worker_token']}"}
+        self.store.heartbeat(worker_id, comfy_online=True)
+        pid, capability = "h3-real-complete", "minimax_h3_ref_2pass"
+        self.register_job(pid)
+        graph = json.loads((ROOT / "graphs/minimax_h3_ref_2pass.api.json").read_text())
+        spec = controller_app.make_spec(capability, {"output_kind": "video"}, graph, {"duration": 2})
+        self.assertEqual(spec["expected"], {"kind": "video", "duration": 2})
+        controller_app.JOBS[pid] = {"id": pid, "capability": capability, "status": "queued",
+                                    "created": time.time(), "outputs": []}
+        self.ledger.record_job(controller_app.JOBS[pid])
+        self.store.enqueue(pid, {"capability": capability, "graph": graph, "capacity_spec": spec})
+        response = await self.client.post("/agent/v1/jobs/acquire", headers=headers, json={})
+        self.assertEqual(response.status, 200, await response.text())
+        assignment = await response.json()
+        headers["X-Lease-Token"] = assignment["lease_token"]
+        self.assertEqual((await self.client.post(f"/agent/v1/jobs/{pid}/start", headers=headers, json={})).status, 200)
+        finals = []
+        for filename, rotate in (("landscape.mp4", False), ("portrait.mp4", True), ("intermediate.mp4", False)):
+            media = capacity_test_video(self.root / filename, rotate=rotate)
+            data = aiohttp.FormData()
+            data.add_field("file", media, filename=filename, content_type="video/mp4")
+            response = await self.client.post(f"/agent/v1/jobs/{pid}/artifact", headers=headers, data=data)
+            self.assertEqual(response.status, 201, await response.text())
+            output = await response.json()
+            if filename != "intermediate.mp4":
+                # 客户端尺寸不能覆盖服务端真实探测，重复最终引用也不能多计产量。
+                finals.append(dict(output, width=1, height=1, duration=999))
+        response = await self.client.post(f"/agent/v1/jobs/{pid}/complete", headers=headers,
+                                          json={"outputs": finals + finals[:1], "capacity_released": True})
+        self.assertEqual(response.status, 200, await response.text())
+        original = self.capacity_original_rows()
+        with mock.patch.object(controller_app, "probe_capacity_output", side_effect=AssertionError("GET 不得探测")):
+            report = await (await self.client.get("/api/capacity?limit=1")).json()
+        resolution = report["groups"][0]["output_resolution"]
+        self.assertEqual(resolution, {
+            "total_samples": 1, "recorded_samples": 1, "complete_samples": 1,
+            "total_outputs": 2, "recorded_outputs": 2,
+            "variants": [{"kind": "video", "width": 720, "height": 1280, "outputs": 1, "samples": 1},
+                         {"kind": "video", "width": 1280, "height": 720, "outputs": 1, "samples": 1}]})
+        self.assertEqual(report["details"][0]["output_resolution"], resolution)
+        self.assertIsNone(report["details"][0]["output_count"])
+        self.assertIsNone(report["groups"][0]["output_count"])
+        self.assertFalse(report["groups"][0]["eligible"])
+        self.assertIsNone(report["overview"]["output_videos"])
+        self.assertEqual(self.capacity_original_rows(), original)
+        self.assertTrue(all(output.get("dimension_source") == "decoded_frame"
+                            for output in report["details"][0]["outputs"]))
+
+        # 模拟旧探测器已将旋转视频的编码尺寸作为有效终态证据保存；不是缺尺寸的场景。
+        portrait_locator = self.access.reference(finals[1]["url"])[1]
+        portrait_key = controller_app.capacity_output_key(portrait_locator)
+        with self.store.lock, self.store.db:
+            row = self.store.db.execute("SELECT outputs_json FROM capacity_tasks WHERE job_id=?", (pid,)).fetchone()
+            legacy_outputs = json.loads(row["outputs_json"])
+            portrait = next(output for output in legacy_outputs if output["key"] == portrait_key)
+            self.assertTrue(portrait["valid"])
+            self.assertEqual((portrait["width"], portrait["height"]), (720, 1280))
+            portrait.update(width=1280, height=720)
+            portrait.pop("dimension_source")
+            self.store.db.execute("UPDATE capacity_tasks SET outputs_json=? WHERE job_id=?",
+                                  (json.dumps(legacy_outputs), pid))
+        controller_app.JOBS.clear()
+        before = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(before["groups"][0]["output_resolution"]["variants"], [
+            {"kind": "video", "width": 1280, "height": 720, "outputs": 2, "samples": 1}])
+        original = self.capacity_original_rows()
+        report_end = time.time()
+        costs = self.ledger.report(0, report_end)
+        with mock.patch.object(controller_app, "probe_capacity_output", wraps=controller_app.probe_capacity_output) as probe:
+            response = await self.post_capacity_probe(pid, offset=1)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(await response.json(), {"processed": 1, "recorded": 1, "total": 2, "next_offset": None})
+        probe.assert_called_once_with(self.access.local_path("artifact", portrait_locator))
+        with mock.patch.object(controller_app, "probe_capacity_output", side_effect=AssertionError("GET 不得探测")):
+            after = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(after["groups"][0]["output_resolution"], resolution)
+        self.assertEqual(after["details"][0]["output_resolution"], resolution)
+        recovered = next(output for output in after["details"][0]["recovered_outputs"]
+                         if output["key"] == portrait_key)
+        self.assertTrue(recovered["valid"])
+        self.assertEqual(recovered["dimension_source"], "decoded_frame")
+        self.assertEqual((recovered["width"], recovered["height"]), (720, 1280))
+        # 只纠正展示层：同 key 原始有效编码尺寸、原技术指标、采购资格及费用全部不变。
+        self.assertEqual(after["details"][0]["outputs"], legacy_outputs)
+        raw_portrait = next(output for output in after["details"][0]["outputs"]
+                            if output["key"] == portrait_key)
+        self.assertTrue(raw_portrait["valid"])
+        self.assertEqual((raw_portrait["width"], raw_portrait["height"]), (1280, 720))
+        self.assertNotIn("dimension_source", raw_portrait)
+        self.assertEqual(after["overview"], before["overview"])
+        self.assertEqual({key: value for key, value in after["groups"][0].items() if key != "output_resolution"},
+                         {key: value for key, value in before["groups"][0].items() if key != "output_resolution"})
+        display_fields = {"output_resolution", "recovered_outputs"}
+        self.assertEqual({key: value for key, value in after["details"][0].items() if key not in display_fields},
+                         {key: value for key, value in before["details"][0].items() if key not in display_fields})
+        self.assertEqual(self.capacity_original_rows(), original)
+        self.assertEqual(self.ledger.report(0, report_end), costs)
+
+    async def test_capacity_probe_original_hash_survives_jobs_cleanup_and_ignores_nonfinal_files(self):
+        keys = self.seed_capacity_probe()
+        path = self.access.local_path("artifact", keys[0])
+        path.unlink()
+        capacity_test_video(path)
+        # 同目录中同时存在已登记中间产物、未登记产物和输入资源，都不能被猜成最终产物。
+        extra = path.with_name("intermediate.mp4")
+        extra.write_bytes(path.read_bytes())
+        self.access.register("p", "artifact", f"probe-final/{extra.name}")
+        path.with_name("unregistered.mp4").write_bytes(path.read_bytes())
+        upload = self.root / "data" / "uploads" / "input.mp4"
+        upload.parent.mkdir(parents=True, exist_ok=True)
+        upload.write_bytes(path.read_bytes())
+        self.register_asset(upload.name)
+        controller_app.JOBS.clear()
+        report_end = time.time()
+        original, costs = self.capacity_original_rows(), self.ledger.report(0, report_end)
+        before = await (await self.client.get("/api/capacity")).json()
+        with mock.patch.object(controller_app, "probe_capacity_output", wraps=controller_app.probe_capacity_output) as probe:
+            response = await self.post_capacity_probe()
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(await response.json(), {"processed": 1, "recorded": 1, "total": 1, "next_offset": None})
+        self.assertEqual([call.args[0] for call in probe.call_args_list], [path])
+        recovered = self.store.capacity.output_recovery("probe-final")
+        expected_hash = hashlib.sha256(json.dumps(keys[0], ensure_ascii=False, sort_keys=True,
+                                                   separators=(",", ":")).encode()).hexdigest()
+        self.assertEqual(recovered[0]["key"], expected_hash)
+        self.assertNotEqual(expected_hash, hashlib.sha256(keys[0].encode()).hexdigest())
+        after = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(after["groups"][0]["output_resolution"]["variants"], [
+            {"kind": "video", "width": 1280, "height": 720, "outputs": 1, "samples": 1}])
+        self.assertEqual(after["overview"], before["overview"])
+        for field in ("id", "eligible", "output_count", "mean_seconds", "source", "spec"):
+            self.assertEqual(after["groups"][0][field], before["groups"][0][field])
+        self.assertEqual(self.capacity_original_rows(), original)
+        self.assertEqual(self.ledger.report(0, report_end), costs)
+        self.assertNotIn(str(path), json.dumps(after))
+
+    async def test_capacity_probe_final_hash_wins_over_retained_jobs_outputs(self):
+        keys = self.seed_capacity_probe()
+        extra = "probe-final/intermediate.mp4"
+        self.access.local_path("artifact", keys[0]).with_name("intermediate.mp4").write_bytes(b"other-video")
+        self.access.register("p", "artifact", extra)
+        controller_app.JOBS["probe-final"]["outputs"] = [{"url": "/api/artifact/" + extra}]
+        with mock.patch.object(controller_app, "probe_capacity_output", return_value=self.probe_metadata()) as probe:
+            response = await self.post_capacity_probe()
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(probe.call_args.args[0], self.access.local_path("artifact", keys[0]))
+        self.assertEqual([o["key"] for o in self.store.capacity.output_recovery("probe-final")],
+                         [controller_app.capacity_output_key(keys[0])])
+
+    async def test_capacity_probe_historical_retained_manifest_recovers_without_changing_estimate(self):
+        self.seed_capacity_probe(captured=False)
+        before = await (await self.client.get("/api/capacity")).json()
+        group = before["groups"][0]
+        payload = {"worker_id": group["worker_id"], "mode": "historical", "quality": "technical",
+                   "hours": 8, "availability": 1, "utilization": 0.75,
+                   "demands": [{"group_id": group["id"], "quantity": 100}]}
+        estimate = self.store.capacity.estimate(payload)
+        original = self.capacity_original_rows()
+        with mock.patch.object(controller_app, "probe_capacity_output", return_value=self.probe_metadata()):
+            response = await self.post_capacity_probe()
+        self.assertEqual(response.status, 200, await response.text())
+        report = await (await self.client.get("/api/capacity")).json()
+        self.assertEqual(report["groups"][0]["output_resolution"]["recorded_outputs"], 1)
+        self.assertEqual(report["groups"][0]["source"], "historical")
+        self.assertFalse(report["groups"][0]["eligible"])
+        self.assertEqual(self.capacity_original_rows(), original)
+        self.assertEqual(self.store.capacity.estimate(payload), estimate)
+
+    async def test_capacity_probe_missing_or_mismatched_retained_manifest_never_guesses(self):
+        for index, change in enumerate(("missing", "empty", "capability", "running", "input", "other-job")):
+            pid = f"no-manifest-{index}"
+            self.seed_capacity_probe(pid, captured=False)
+            job = controller_app.JOBS[pid]
+            if change == "missing":
+                del controller_app.JOBS[pid]
+            elif change == "empty":
+                job["outputs"] = []
+            elif change == "capability":
+                job["capability"] = "other"
+            elif change == "running":
+                job["status"] = "running"
+            else:
+                job["outputs"] = [{"url": "/api/upload/input.mp4" if change == "input"
+                                   else "/api/artifact/other-job/final.mp4"}]
+            with self.subTest(change=change), mock.patch.object(controller_app, "probe_capacity_output") as probe:
+                response = await self.post_capacity_probe(pid)
+                self.assertEqual(response.status, 409, await response.text())
+                probe.assert_not_called()
+                self.assertIsNone(self.store.capacity.output_recovery(pid))
+
+    async def test_capacity_probe_historical_malformed_or_external_references_return_conflict(self):
+        self.seed_capacity_probe(captured=False)
+        for url in ("https://example.invalid/output.mp4", "/api/artifact/probe-final/../other.mp4",
+                    "/api/artifact/probe-final/final-0.mp4?path=/private/tmp/other", "file:///private/tmp/other"):
+            controller_app.JOBS["probe-final"]["outputs"] = [{"url": url}]
+            with self.subTest(url=url), mock.patch.object(controller_app, "probe_capacity_output") as probe:
+                response = await self.post_capacity_probe()
+                self.assertEqual(response.status, 409, await response.text())
+                probe.assert_not_called()
+                self.assertIsNone(self.store.capacity.output_recovery("probe-final"))
+
+    async def test_capacity_probe_admin_revoked_during_probe_cannot_persist_recovery(self):
+        self.auth.create_user("remaining-admin", auth_support.PASSWORD, role="admin")
+        for index, change in enumerate(({"role": "user"}, {"enabled": False})):
+            pid = f"admin-revoked-{index}"
+            self.seed_capacity_probe(pid)
+            original = self.capacity_original_rows()
+
+            def revoke_admin(path):
+                self.auth.set_user(self.admin["id"], **change)
+                return self.probe_metadata()
+
+            with self.subTest(change=change), mock.patch.object(controller_app, "probe_capacity_output", side_effect=revoke_admin):
+                try:
+                    response = await self.post_capacity_probe(pid)
+                    self.assertEqual(response.status, 403, await response.text())
+                    self.assertIsNone(self.store.capacity.output_recovery(pid))
+                    self.assertEqual(self.capacity_original_rows(), original)
+                finally:
+                    self.auth.set_user(self.admin["id"], role="admin", enabled=True)
+                    self.headers = await self.login()
+                    self.client.session.headers.update(self.headers)
+
+    async def test_capacity_probe_final_manifest_changed_during_probe_is_not_committed(self):
+        for index, captured in enumerate((True, False)):
+            pid = f"manifest-changed-{index}"
+            self.seed_capacity_probe(pid, captured=captured)
+
+            def change_manifest(path):
+                if captured:
+                    with self.store.lock, self.store.db:
+                        self.store.db.execute("UPDATE capacity_tasks SET outputs_json='[]' WHERE job_id=?", (pid,))
+                else:
+                    controller_app.JOBS[pid]["outputs"] = []
+                return self.probe_metadata()
+
+            with self.subTest(captured=captured), mock.patch.object(controller_app, "probe_capacity_output", side_effect=change_manifest):
+                response = await self.post_capacity_probe(pid)
+                self.assertEqual(response.status, 409, await response.text())
+                self.assertIsNone(self.store.capacity.output_recovery(pid))
+
+    async def test_capacity_probe_captured_missing_list_requires_matching_done_jobs(self):
+        self.seed_capacity_probe()
+        with self.store.lock, self.store.db:
+            self.store.db.execute("UPDATE capacity_tasks SET outputs_json=NULL WHERE job_id='probe-final'")
+        controller_app.JOBS["probe-final"]["capability"] = "other"
+        with mock.patch.object(controller_app, "probe_capacity_output", return_value=self.probe_metadata()) as probe:
+            response = await self.post_capacity_probe()
+            self.assertEqual(response.status, 409, await response.text())
+            probe.assert_not_called()
+            controller_app.JOBS["probe-final"]["capability"] = "minimax_h3_ref_2pass"
+            response = await self.post_capacity_probe()
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual(probe.call_count, 1)
+
+    async def test_capacity_probe_paginates_four_serial_outputs_preserves_results_and_is_idempotent(self):
+        keys = self.seed_capacity_probe(count=6)
+        original = self.capacity_original_rows()
+        loop_thread = threading.get_ident()
+        active, maximum = 0, 0
+
+        def probe_file(path):
+            nonlocal active, maximum
+            self.assertNotEqual(threading.get_ident(), loop_thread, "探测必须在线程执行")
+            active += 1
+            maximum = max(maximum, active)
+            try:
+                return self.probe_metadata()
+            finally:
+                active -= 1
+
+        with mock.patch.object(controller_app, "probe_capacity_output", side_effect=probe_file) as probe:
+            response = await self.post_capacity_probe()
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual(await response.json(), {"processed": 4, "recorded": 4, "total": 6, "next_offset": 4})
+            self.assertEqual(probe.call_count, 4)
+            recovered = self.store.capacity.output_recovery("probe-final")
+            self.assertEqual(len(recovered), 6)
+            self.assertEqual([o["valid"] for o in recovered], [True] * 4 + [False] * 2)
+            response = await self.post_capacity_probe(offset=4)
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual(await response.json(), {"processed": 2, "recorded": 2, "total": 6, "next_offset": None})
+            self.assertEqual(probe.call_count, 6)
+            complete = self.store.capacity.output_recovery("probe-final")
+            self.assertEqual(complete[:4], recovered[:4])
+            self.assertTrue(all(o["valid"] for o in complete))
+            for offset in (0, 4):
+                response = await self.post_capacity_probe(offset=offset)
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertEqual(self.store.capacity.output_recovery("probe-final"), complete)
+            self.assertEqual(maximum, 1)
+            self.assertEqual([c.args[0].name for c in probe.call_args_list[:6]], [Path(k).name for k in keys])
+        self.assertEqual(self.capacity_original_rows(), original)
+        with mock.patch.object(controller_app, "probe_capacity_output", side_effect=AssertionError("GET 不得探测")):
+            report = await (await self.client.get("/api/capacity?limit=1&offset=100")).json()
+        self.assertEqual(report["details"], [])
+        self.assertEqual(report["groups"][0]["output_resolution"]["recorded_outputs"], 6)
+
+    async def test_capacity_probe_requires_admin_and_csrf(self):
+        self.seed_capacity_probe()
+        url = "/api/capacity/jobs/probe-final/probe-outputs"
+        with mock.patch.object(controller_app, "probe_capacity_output") as probe:
+            token = self.client.session.headers.pop("X-CSRF-Token")
+            response = await self.client.post(url, json={"offset": 0})
+            self.assertEqual(response.status, 403)
+            self.client.session.headers["X-CSRF-Token"] = token
+            self.auth.create_user("probe-reader", auth_support.PASSWORD)
+            headers = await self.login("probe-reader")
+            self.client.session.headers.update(headers)
+            self.assertEqual((await self.client.post(url, json={"offset": 0})).status, 403)
+            self.client.session.cookie_jar.clear()
+            self.assertEqual((await self.client.post(url, json={"offset": 0})).status, 401)
+            probe.assert_not_called()
+        self.assertIsNone(self.store.capacity.output_recovery("probe-final"))
+
+    async def test_capacity_probe_rejects_untrusted_parameters_and_out_of_range_offsets(self):
+        self.seed_capacity_probe()
+        url = "/api/capacity/jobs/probe-final/probe-outputs"
+        bodies = [{"offset": value} for value in (-1, 512, True, False, 0.5, "0", None, [], {})]
+        bodies += [{"offset": 0, key: "/private/tmp/arbitrary"} for key in
+                   ("path", "url", "outputs", "filename", "locator", "limit", "anything")]
+        bodies += [[], "bad", {"offset": 1}, {"offset": 511}]
+        with mock.patch.object(controller_app, "probe_capacity_output") as probe:
+            for body in bodies:
+                with self.subTest(body=body):
+                    response = await self.client.post(url, json=body)
+                    self.assertEqual(response.status, 400, await response.text())
+            response = await self.client.post(url, data="{", headers={"Content-Type": "application/json"})
+            self.assertEqual(response.status, 400)
+            response = await self.client.post(url, data="x" * 65537, headers={"Content-Type": "application/json"})
+            self.assertEqual(response.status, 413)
+            response = await self.client.post("/api/capacity/jobs/bad%2Fpid/probe-outputs", json={})
+            self.assertEqual(response.status, 400, await response.text())
+            probe.assert_not_called()
+        self.assertIsNone(self.store.capacity.output_recovery("probe-final"))
+
+    async def test_capacity_probe_rejects_non_done_tasks_and_api_events(self):
+        with mock.patch.object(controller_app, "probe_capacity_output") as probe:
+            self.assertEqual((await self.post_capacity_probe("missing-job")).status, 409)
+            for status in ("running", "error", "canceled"):
+                for captured in (True, False):
+                    pid = f"reject-{status}-{captured}"
+                    self.seed_capacity_probe(pid, captured=captured, status=status)
+                    with self.subTest(status=status, captured=captured):
+                        response = await self.post_capacity_probe(pid)
+                        self.assertEqual(response.status, 409, await response.text())
+            self.ledger.record_api("rewrite", "test-model", 1, 1, 100)
+            pid = self.ledger.db.execute("SELECT job_id FROM cost_events WHERE event_kind='api'").fetchone()[0]
+            response = await self.post_capacity_probe(pid)
+            self.assertEqual(response.status, 409, await response.text())
+            probe.assert_not_called()
+        self.assertEqual(self.store.db.execute("SELECT count(*) FROM capacity_output_recovery").fetchone()[0], 0)
+
+    async def test_capacity_probe_missing_pending_revoked_and_escaping_files_remain_invalid(self):
+        for index, failure in enumerate(("missing", "pending", "revoked", "symlink")):
+            pid = f"unavailable-{index}"
+            keys = self.seed_capacity_probe(pid)
+            path = self.access.local_path("artifact", keys[0])
+            if failure == "missing":
+                path.unlink()
+            elif failure == "pending":
+                with self.auth.lock, self.auth.db:
+                    self.auth.db.execute("UPDATE resources SET state='pending' WHERE locator=?", (keys[0],))
+            elif failure == "revoked":
+                with self.auth.lock, self.auth.db:
+                    self.auth.db.execute("DELETE FROM project_resources WHERE resource_id IN "
+                                         "(SELECT resource_id FROM resources WHERE locator=?)", (keys[0],))
+            else:
+                outside = self.root / "outside.mp4"
+                outside.write_bytes(b"outside-resource")
+                path.unlink()
+                path.symlink_to(outside)
+            with self.subTest(failure=failure), mock.patch.object(controller_app, "probe_capacity_output") as probe:
+                response = await self.post_capacity_probe(pid)
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertEqual((await response.json())["recorded"], 0)
+                probe.assert_not_called()
+                recovered = self.store.capacity.output_recovery(pid)
+                self.assertEqual(len(recovered), 1)
+                self.assertFalse(recovered[0]["valid"])
+                self.assertIsNone(recovered[0]["width"])
+        report = await (await self.client.get("/api/capacity")).json()
+        self.assertTrue(all(g["output_resolution"]["recorded_outputs"] == 0 for g in report["groups"]))
+
+    async def test_capacity_probe_changed_file_or_revoked_permission_during_probe_is_invalid(self):
+        for index, change in enumerate(("content", "permission", "removed")):
+            pid = f"changed-{index}"
+            keys = self.seed_capacity_probe(pid)
+
+            def changed(path):
+                if change == "content":
+                    path.write_bytes(b"different-content-and-size")
+                elif change == "removed":
+                    path.unlink()
+                else:
+                    with self.auth.lock, self.auth.db:
+                        self.auth.db.execute("DELETE FROM project_resources WHERE resource_id IN "
+                                             "(SELECT resource_id FROM resources WHERE locator=?)", (keys[0],))
+                return self.probe_metadata()
+
+            with self.subTest(change=change), mock.patch.object(controller_app, "probe_capacity_output", side_effect=changed):
+                response = await self.post_capacity_probe(pid)
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertEqual((await response.json())["recorded"], 0)
+                recovered = self.store.capacity.output_recovery(pid)
+                self.assertEqual(len(recovered), 1)
+                self.assertFalse(recovered[0]["valid"])
+                self.assertIsNone(recovered[0]["width"])
+
+    async def test_capacity_probe_rechecks_previous_files_before_committing_batch(self):
+        keys = self.seed_capacity_probe(count=2)
+        first_path = self.access.local_path("artifact", keys[0])
+
+        def changed_by_second(path):
+            if path.name == "final-1.mp4":
+                first_path.write_bytes(b"changed-after-first-probe")
+            return self.probe_metadata()
+
+        with mock.patch.object(controller_app, "probe_capacity_output", side_effect=changed_by_second):
+            response = await self.post_capacity_probe()
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())["recorded"], 1)
+        self.assertEqual([o["valid"] for o in self.store.capacity.output_recovery("probe-final")], [False, True])
+
+    async def test_capacity_probe_real_timeout_is_invalid_and_batch_has_four_eight_second_limits(self):
+        self.seed_capacity_probe(count=5)
+        timeout = controller_app.subprocess.TimeoutExpired("ffmpeg", 8)
+        with mock.patch.object(controller_app, "ffmpeg_bin", return_value=Path("/synthetic/ffmpeg")), \
+             mock.patch.object(controller_app.subprocess, "run", side_effect=timeout) as run:
+            response = await self.post_capacity_probe()
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(await response.json(), {"processed": 4, "recorded": 0, "total": 5, "next_offset": 4})
+        self.assertEqual(run.call_count, 4)
+        self.assertEqual(sum(call.kwargs["timeout"] for call in run.call_args_list), 32)
+        for call in run.call_args_list:
+            command = call.args[0]
+            self.assertEqual(command[command.index("-protocol_whitelist") + 1], "file,pipe")
+            self.assertNotIn("-hwaccel", command)
+        self.assertTrue(all(not o["valid"] for o in self.store.capacity.output_recovery("probe-final")))
+
+    async def test_capacity_probe_global_concurrency_rejects_second_job_without_blocking_get(self):
+        self.seed_capacity_probe()
+        self.seed_capacity_probe("another-job")
+        started, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+
+        def blocked(path):
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(5):
+                raise AssertionError("测试未释放探测线程")
+            return self.probe_metadata()
+
+        with mock.patch.object(controller_app, "probe_capacity_output", side_effect=blocked):
+            first = asyncio.create_task(self.post_capacity_probe())
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                second = await asyncio.wait_for(self.post_capacity_probe("another-job"), 2)
+                self.assertEqual(second.status, 429, await second.text())
+                response = await asyncio.wait_for(self.client.get("/api/capacity"), 2)
+                self.assertEqual(response.status, 200)
+                self.assertFalse(first.done())
+            finally:
+                release.set()
+                response = await asyncio.wait_for(first, 2)
+            self.assertEqual(response.status, 200, await response.text())
+        self.assertIsNone(self.client.server.app["capacity_probe_state"]["task"])
+        with mock.patch.object(controller_app, "probe_capacity_output", return_value=self.probe_metadata()):
+            self.assertEqual((await self.post_capacity_probe("another-job")).status, 200)
+
+    async def test_capacity_probe_cancelled_request_keeps_slot_until_background_work_finishes(self):
+        self.seed_capacity_probe()
+        started, release = asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        handler_tasks = []
+        original_body = controller_app.capacity_body
+
+        async def track_request(request):
+            handler_tasks.append(asyncio.current_task())
+            return await original_body(request)
+
+        def blocked(path):
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(5):
+                raise AssertionError("测试未释放取消后的探测线程")
+            return self.probe_metadata()
+
+        with mock.patch.object(controller_app, "capacity_body", side_effect=track_request), \
+             mock.patch.object(controller_app, "probe_capacity_output", side_effect=blocked):
+            request_task = asyncio.create_task(self.post_capacity_probe())
+            background = None
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                background = self.client.server.app["capacity_probe_state"]["task"]
+                handler_tasks[0].cancel()
+                await asyncio.gather(handler_tasks[0], return_exceptions=True)
+                self.assertFalse(background.done())
+                self.assertIs(self.client.server.app["capacity_probe_state"]["task"], background)
+                response = await asyncio.wait_for(self.post_capacity_probe(), 2)
+                self.assertEqual(response.status, 429, await response.text())
+                self.assertEqual((await asyncio.wait_for(self.client.get("/api/capacity"), 2)).status, 200)
+            finally:
+                release.set()
+                if background is not None:
+                    await asyncio.wait_for(asyncio.shield(background), 2)
+                await asyncio.gather(request_task, return_exceptions=True)
+        self.assertIsNone(self.client.server.app["capacity_probe_state"]["task"])
+        self.assertTrue(self.store.capacity.output_recovery("probe-final")[0]["valid"])
 
     async def test_reload_exposes_one_text_to_image_mode(self):
         response = await self.client.post("/api/reload", headers=self.headers)
