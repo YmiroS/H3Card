@@ -103,7 +103,7 @@ function evidenceFixture() {
   ];
   return input;
 }
-function realStoreReport(withModelEvidence=false) {
+function realStoreReport(withModelEvidence=false,withOutputResolution=false) {
   // 真正调用 CapacityStore，只创建内存 SQLite；不启动服务、不读取项目数据库。
   const script = `
 import json, sqlite3, sys, threading, time
@@ -139,6 +139,36 @@ for index, benchmark in enumerate([None,'contract-bench-a','contract-bench-b']):
         store.review(job,{'accepted':1,'source':'standard','benchmark_id':benchmark,'note':'人工标签'})
 connection.execute('INSERT INTO cost_events VALUES (?,?,?,?,?,?,?,?)',('contract-history','generation','zimage_t2i',worker['id'],'done',now-100,20,json.dumps({'width':512,'height':512})))
 baseline = None
+if sys.argv[2] == 'outputs':
+    from pathlib import Path
+    graph = json.loads((Path(sys.argv[1]) / 'graphs/minimax_h3_ref_2pass.api.json').read_text())
+    capability = 'minimax_h3_ref_2pass'
+    def output(key, kind='video', width=1280, height=720, valid=True):
+        return {'key':key,'kind':kind,'bytes':1024,'width':width,'height':height,'duration':2,'valid':valid}
+    cases = [
+        ('actual-h3', 2, [output('720p')], 78),
+        ('multi-a', 3, [output('landscape'), output('landscape-2'), output('portrait', width=720, height=1280), output('image', kind='image', width=1024, height=768)], 60),
+        ('multi-b', 3, [output('landscape-b')], 100),
+        ('partial-a', 4, [output('known'), output('unknown', width=None, height=None, valid=False)], 70),
+        ('partial-b', 4, None, 90),
+        ('all-partial', 5, [output('known'), output('unknown', width=None, height=None, valid=False)], 65),
+        ('unknown-h3', 6, None, 55),
+        ('recovered-h3', 7, [output('recover', width=None, height=None, valid=False)], 45),
+        ('actual-h3-1312', 8, [output('actual-1312', width=1312, height=736)], 67),
+        ('actual-h3-2080', 9, [output('actual-2080', width=2080, height=1152)], 69),
+    ]
+    for index, (job, duration, outputs, seconds) in enumerate(cases):
+        dims = {'duration':duration,'megapixels':0.91,'image_count':12,'video_count':3,'audio_count':2}
+        spec = make_spec(capability, {'output_kind':'video'}, graph, dims)
+        assert spec['expected'] == {'kind':'video','duration':duration}
+        payload = {'capability':capability,'graph':graph,'capacity_spec':spec}
+        assigned = now - 1000 + index * 10
+        store.enqueue(job,payload,assigned)
+        store.assigned(job,worker,'lease-'+job,assigned)
+        store.running(job,worker['id'],'lease-'+job,assigned+1)
+        store.terminal(job,worker['id'],'lease-'+job,'done',assigned+seconds+1,released=True,outputs=outputs,measurements={'prepare_seconds':0,'execute_seconds':seconds,'upload_seconds':0,'total_seconds':seconds,'graph_changed':False,'cached_nodes':[]})
+    baseline = store.report()
+    store.record_output_recovery('recovered-h3', [output('recover', width=1920, height=1080)])
 if sys.argv[2] == 'evidence':
     import copy
     from server import app
@@ -174,7 +204,7 @@ except ValueError as error:
 print(json.dumps({'report':report,'write':profile,'baseline':baseline,'estimates':estimates,'mixed_error':mixed_error},ensure_ascii=False))
 connection.close()
 `;
-  return JSON.parse(execFileSync(process.env.CHOUKA_TEST_PYTHON || 'python3',['-c',script,path.join(__dirname,'..'),withModelEvidence?'evidence':'basic',String(NOW.getTime()/1000)],{encoding:'utf8'}));
+  return JSON.parse(execFileSync(process.env.CHOUKA_TEST_PYTHON || 'python3',['-c',script,path.join(__dirname,'..'),withOutputResolution?'outputs':withModelEvidence?'evidence':'basic',String(NOW.getTime()/1000)],{encoding:'utf8'}));
 }
 const estimateResponse = {mode:'historical',quality:'technical',worker_id:'w1',total_seconds:12000,daily_capacity_seconds:8*3600*1*.75,machines:1,price_total:null,lines:[{group_id:'h1',quantity:100,seconds_per_unit:60,daily_units:360},{group_id:'h2',quantity:100,seconds_per_unit:60,daily_units:360}],warnings:['测算响应警告一','测算响应警告二'],assumptions:['未包含模型切换','单机并发槽位为一']};
 const tick = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -270,6 +300,18 @@ async function assertQuietModelCells(page) {
     assert.equal(r>140 && g>90 && b<Math.min(r,g)*.85,false,'模型列不得计算成黄色：'+item.color+' '+item.text);
   }
 }
+async function assertMaterialSpec(row,materials,parameters) {
+  const spec=row.locator('.selected-spec');
+  assert.equal(await spec.count(),1);
+  assert.deepEqual(await spec.evaluate(node=>({tag:node.tagName,children:[...node.children].map(n=>n.tagName),labels:[...node.querySelectorAll('dt')].map(n=>n.textContent)})),
+    {tag:'DL',children:['DT','DD','DT','DD','DT','DD'],labels:['输入素材','生成参数','实际成品']},'必须使用真实定义列表，不能用段落或样式模拟语义');
+  const inputs=spec.locator(':scope > dd.input-materials'),output=spec.locator(':scope > dd.generation-parameters');
+  assert.deepEqual(await inputs.locator(':scope > span').allTextContents(),materials);
+  assert.equal(await inputs.textContent(),materials.join(''));
+  assert.ok(await inputs.evaluate(n=>[...n.childNodes].every(s=>s.nodeName==='SPAN' && s.childNodes.length===1 && s.firstChild.nodeType===Node.TEXT_NODE)),'输入素材只能包含纯文本 span');
+  assert.equal(await output.textContent(),parameters);assert.equal(await output.locator('*').count(),0);
+  assert.equal(await row.locator('select option:checked').textContent(),materials.join(' + ')+'｜'+parameters);
+}
 async function assertModelLabels(row,names,labels) {
   const nameCell=row.locator('[data-label="模型名称"]'),precisionCell=row.locator('[data-label="模型精度"]');
   assert.deepEqual(await nameCell.locator('.model-name').allTextContents(),names);
@@ -330,6 +372,13 @@ test('产能看板语法与离线路由专项', async t => {
         const worker=state.data.workers.find(w=>w.id===decodeURIComponent(url.pathname.split('/').at(-1)));
         Object.assign(worker.hardware,body);worker.hardware_source='manual+reported';
         return json({id:'manual-config-version',worker_id:worker.id,source:'manual',hardware:worker.hardware});
+      }
+      if(url.pathname.endsWith('/probe-outputs')) {
+        assert.equal(request.method(),'POST');
+        state.posts.push({path:url.pathname,body:request.postDataJSON(),csrf:request.headers()['x-csrf-token']});
+        if(state.holdProbe)return state.holdProbe(route);
+        if(state.probeError)return json({error:state.probeError.message},state.probeError.status);
+        return json(state.probeResult || {processed:4,recorded:3,total:6,next_offset:4});
       }
       if(url.pathname.endsWith('/review')) {
         const body=request.postDataJSON();state.posts.push({path:url.pathname,body,csrf:request.headers()['x-csrf-token']});
@@ -476,7 +525,7 @@ test('产能看板语法与离线路由专项', async t => {
       const input=summaryFixture();for(const state of ['disabled','syncing','error','unavailable','running'])input.workers.push({...input.workers[0],id:state,state});
       const {page,state}=await setup({data:input});assert.equal(await page.locator('#online-count').innerText(),'当前在线 4 台');assert.equal(await page.locator('#summary-machines thead th.machine-heading').count(),4);
       const gets=state.gets.length;await page.locator('#include-offline').check();assert.equal(await page.locator('#summary-machines thead th.machine-heading').count(),9);assert.equal(state.gets.length,gets);
-      assert.equal(await page.locator('[data-summary-worker-id=w1] h3').innerText(),await page.locator('[data-summary-worker-id=w2] h3').innerText());
+      assert.equal(await page.locator('th.machine-heading[data-summary-worker-id=w1] > h3').innerText(),await page.locator('th.machine-heading[data-summary-worker-id=w2] > h3').innerText());
       assert.match(await page.locator('th.machine-heading[data-summary-worker-id=w2]').innerText(),/离线/);await page.locator('[data-summary-worker-id=w2] .machine-more summary').click();assert.match(await page.locator('th.machine-heading[data-summary-worker-id=w2]').innerText(),/历史速度不代表现在能执行/);
       await page.locator('#include-offline').uncheck();assert.equal(await page.locator('[data-summary-worker-id=w2]').count(),0);
     });
@@ -484,7 +533,7 @@ test('产能看板语法与离线路由专项', async t => {
       const input=summaryFixture();input.groups[1].warnings=['警告一','警告二'];const {page}=await setup({data:input});
       const row=page.locator('td.machine-result[data-summary-worker-id=w1] .business-row[data-capability=depth_video]'),select=row.locator('select');
       assert.equal(await select.inputValue(),'c1');assert.equal(await select.locator('option').count(),3);
-      const names=await select.locator('option').allTextContents();assert.equal(new Set(names).size,3);assert.ok(names.every(n=>!n.includes('depth-5s')));assert.match(names[0],/规格未完整记录/);
+      const names=await select.locator('option').allTextContents();assert.equal(new Set(names).size,3);assert.ok(names.every(n=>!n.includes('depth-5s')));assert.equal(names[0],'素材信息未记录｜请求时长 5 秒');
       assert.match(await row.innerText(),/1 分 18 秒/);await assertModelLabels(row,['sample-main-int8.safetensors'],[['INT8']]);assert.match(await row.innerText(),/仅 10 次 \/ 仅供参考/);
       await row.locator('button').click();let detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
       for(const value of ['P90：1 分 38 秒','采集业务样本','sample-main-int8.safetensors','文件标记 INT8','非运行时检测','警告一','警告二','总样本 12','失败 1','取消 1','缓存条件','配置编号：config-1'])assert.ok((await detail.innerText()).includes(value),value);
@@ -688,7 +737,7 @@ test('产能看板语法与离线路由专项', async t => {
         assert.match(await detail.innerText(),/模型记录覆盖 30 \/ 3,201 次/);assert.match(await detail.innerText(),/不完整 \/ 未确认完整主模型链/);
         for(const name of [...pairNames,'other-task-fp16.safetensors','other-task-q4_k_m.gguf'])assert.ok((await detail.innerText()).includes(name));
         await row.locator('select').selectOption('unknown-reference');await assertModelLabels(row,['current-main-fp8.safetensors'],[['FP8']]);
-        assert.doesNotMatch(await detail.innerText(),/history-high|history-low|other-task|历史任务记录组合|不完整/);
+        assert.doesNotMatch(await detail.innerText(),/history-high|history-low|other-task|历史任务记录组合|不完整 \/ 未确认完整主模型链/);
         assert.match(await row.locator('[data-label="平均生成时间"]').innerText(),/此处耗时来自历史任务，不代表当前模型速度/);
         await row.locator('select').selectOption('no-reference');await assertModelLabels(row,[],[]);
         assert.doesNotMatch(await detail.innerText(),/current-main|当前工具默认配置|历史任务记录组合/);
@@ -737,10 +786,353 @@ test('产能看板语法与离线路由专项', async t => {
       await machine.locator('.machine-more summary').click();assert.match(await machine.innerText(),/升级该 Worker 后补采/);
       const modern=page.locator('thead .machine-heading[data-summary-worker-id=w3]');await modern.locator('.machine-more summary').click();assert.match(await modern.innerText(),/人工声明未填写/);assert.doesNotMatch(await modern.innerText(),/升级该 Worker|整机配置未知/);
     });
-    await t.test('简明规格显示期望尺寸、时长帧率MP输入及步数，不用哈希代替',async()=>{
-      const input=fixture();input.groups=[{...input.groups[3],dimensions:{duration:5,fps:24,megapixels:1.5,image_count:2,steps:20},spec:{expected:{width:1280,height:720}}}];const {page}=await setup({data:input});
-      const value=await page.locator('.summary-spec option').innerText();for(const text of ['期望 1,280 × 720','时长 5 秒','24 FPS','1.5 MP','输入 2 张图','步数 20 步'])assert.ok(value.includes(text),text);
-      assert.equal(await page.locator('.selected-spec').innerText(),value);
+    await t.test('简明规格保留期望尺寸、请求时长及MP，输入独立成行，技术参数完整移入详情',async()=>{
+      const input=fixture();input.groups=[{...input.groups[3],dimensions:{duration:5,fps:24,megapixels:1.5,image_count:2,steps:20,frames:121,scale_to_length:1280,batch_size:3},spec:{expected:{width:1280,height:720}}}];const {page,state}=await setup({data:input});
+      const row=page.locator('.business-row'),parameters='请求时长 5 秒 / 期望 720p（1,280 × 720）';
+      await assertMaterialSpec(row,['图片 2 张','视频数量未记录','音频数量未记录'],parameters);
+      assert.doesNotMatch(await row.textContent(),/FPS|步数|帧数|长边|批量|depth-5s/);
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const text of [parameters,'像素设置 1.5 MP','帧率 24 FPS','步数 20 步','帧数 121 帧','长边 1,280 px','批量 3','生成参数不是成品实测规格'])assert.ok((await detail.innerText()).includes(text),text);
+      const raw=detail.locator('details');assert.equal(await raw.evaluate(n=>n.open),false);await raw.locator('summary').click();
+      const evidence=JSON.parse(await raw.locator('pre').textContent());assert.deepEqual(evidence.dimensions,input.groups[0].dimensions);assert.deepEqual(evidence.spec,input.groups[0].spec);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('分辨率使用精确尺寸档位，MP只译为像素量，竖屏与期望来源不混淆',async()=>{
+      const cases=[
+        ['hd',{dimensions:{width:1280,height:720,megapixels:1}},'720p（1,280 × 720）'],
+        ['full-hd',{dimensions:{width:1920,height:1080}},'1080p（1,920 × 1,080）'],
+        ['qhd',{dimensions:{width:2560,height:1440}},'1440p（2,560 × 1,440）'],
+        ['uhd',{dimensions:{width:3840,height:2160}},'4K（3,840 × 2,160）'],
+        ['portrait-hd',{dimensions:{width:720,height:1280}},'720p 竖屏（720 × 1,280）'],
+        ['portrait-full',{dimensions:{width:1080,height:1920}},'1080p 竖屏（1,080 × 1,920）'],
+        ['square',{dimensions:{width:1024,height:1024,megapixels:1}},'尺寸 1,024 × 1,024'],
+        ['square-720',{dimensions:{width:720,height:720}},'尺寸 720 × 720'],
+        ['near-hd',{dimensions:{width:1280,height:704}},'尺寸 1,280 × 704'],
+        ['wide',{dimensions:{width:2560,height:1080}},'尺寸 2,560 × 1,080'],
+        ['one-mp',{dimensions:{megapixels:1}},'约 100 万像素（尺寸未记录）'],
+        ['fraction-mp',{dimensions:{megapixels:.39}},'约 39 万像素（尺寸未记录）'],
+        ['expected',{dimensions:{megapixels:1},spec:{expected:{width:1280,height:720}}},'期望 720p（1,280 × 720）'],
+        ['expected-square',{dimensions:{},spec:{expected:{width:1024,height:1024}}},'期望 1,024 × 1,024'],
+        ['output-pair',{dimensions:{width:1280,height:720,output_width:1920,output_height:1080}},'1080p（1,920 × 1,080）'],
+        ['partial-output',{dimensions:{width:1280,height:720,output_width:1920}},'720p（1,280 × 720）'],
+        ['partial-size',{dimensions:{width:1280,megapixels:1}},'约 100 万像素（尺寸未记录）'],
+        ['resolution-setting',{dimensions:{resolution:'1280x720 (16:9)',megapixels:1}},'720p（1,280 × 720）'],
+        ['portrait-setting',{dimensions:{resolution:'720x1280 (9:16)'}},'720p 竖屏（720 × 1,280）'],
+        ['numeric-short-edge',{dimensions:{resolution:720}},'规格未完整记录'],
+        ['input-only',{dimensions:{source_width:1280,source_height:720}},'规格未完整记录'],
+        ['missing',{dimensions:{}},'规格未完整记录'],
+        ['malicious',{dimensions:{width:ATTACK,height:720,megapixels:ATTACK,resolution:ATTACK}},'规格未完整记录'],
+      ];
+      for(const [index,value] of [0,-1,1.5,'1280',null,true,Number.MAX_SAFE_INTEGER+1].entries())cases.push(['invalid-size-'+index,{dimensions:{width:value,height:720}},'规格未完整记录']);
+      for(const [index,value] of [0,-1,'1',null,true,Number.MAX_VALUE].entries())cases.push(['invalid-mp-'+index,{dimensions:{megapixels:value}},'规格未完整记录']);
+      const input=fixture(),base=input.groups[0];input.groups=cases.map(([id,fields],index)=>({...base,...fields,id,mean_seconds:60+index}));
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const [index,[id,fields,label]] of cases.entries()) {
+        await row.locator('select').selectOption(id);
+        assert.equal(await row.locator('.generation-parameters').textContent(),label,id);
+        assert.ok((await row.locator('option:checked').textContent()).startsWith('素材信息未记录｜'+label),id);
+        assert.doesNotMatch(await row.locator('.selected-spec').textContent(),/ MP|NaN|Infinity|<img|undefined/);
+        assert.equal(await row.locator('.mean-time').textContent(),`1 分 ${index} 秒`,id+'：分辨率展示不得合并原始耗时分组');
+        if(['hd','square','one-mp','expected'].includes(id))assert.match(await detail.innerText(),/像素设置 1 MP/);
+        const raw=detail.locator('details');await raw.locator('summary').click();
+        const evidence=JSON.parse(await raw.locator('pre').textContent());assert.deepEqual(evidence.dimensions,fields.dimensions);assert.deepEqual(evidence.spec,fields.spec);
+      }
+      assert.equal(await page.locator('main img, main [onerror]').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同1：混合素材、明确零与逐类型未知，非法计数不强转或冒充零',async()=>{
+      const cases=[
+        ['image',{image_count:2,video_count:0,audio_count:0},['图片 2 张']],
+        ['videos',{image_count:0,video_count:3,audio_count:0},['视频 3 段']],
+        ['audio',{image_count:0,video_count:0,audio_count:2},['音频 2 段']],
+        ['mixed',{image_count:2,video_count:3,audio_count:1},['图片 2 张','视频 3 段','音频 1 段']],
+        ['zero',{image_count:0,video_count:0,audio_count:0},['未使用图片、视频或音频']],
+        ['missing',{},['素材信息未记录']],
+        ['null',{image_count:null,video_count:null,audio_count:null},['素材信息未记录']],
+        ['partial',{image_count:2},['图片 2 张','视频数量未记录','音频数量未记录']],
+        ['partial-zero',{image_count:0},['视频数量未记录','音频数量未记录']],
+        ['partial-null',{image_count:null,video_count:2,audio_count:0},['图片数量未记录','视频 2 段']],
+        ['safe-limit',{image_count:Number.MAX_SAFE_INTEGER,video_count:0,audio_count:0},['图片 9,007,199,254,740,991 张']],
+      ];
+      const invalid=['2','0','',true,false,[],[2],{},-1,1.5,Number.MAX_SAFE_INTEGER+1,ATTACK,{value:ATTACK}];
+      for(const [index,value] of invalid.entries()) {
+        cases.push(['invalid-all-'+index,{image_count:value,video_count:value,audio_count:value},['素材信息未记录']]);
+        for(const [key,label] of [['image_count','图片'],['video_count','视频'],['audio_count','音频']])
+          cases.push([`invalid-${key}-${index}`,{image_count:0,video_count:0,audio_count:0,[key]:value},[label+'数量未记录']]);
+      }
+      const input=fixture(),base=input.groups[0];input.groups=cases.map(([id,dimensions])=>({...base,id,dimensions}));
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      // 未知组合的下拉需要来源/采样后缀区分；逐组验证前缀，不丢失原始分组。
+      assert.deepEqual(await row.locator('select option').evaluateAll(nodes=>nodes.map(n=>n.value)),cases.map(c=>c[0]));
+      for(const [id,,materials] of cases) {
+        await row.locator('select').selectOption(id);
+        assert.deepEqual(await row.locator('dd.input-materials > span').allTextContents(),materials,id);
+        assert.equal(await row.locator('dd.generation-parameters').textContent(),'规格未完整记录',id);
+        const label=await row.locator('option:checked').textContent(),prefix=materials.join(' + ')+'｜规格未完整记录';
+        assert.ok(label===prefix || label.startsWith(prefix+' · '),id+'：下拉以素材组合开头');
+        assert.doesNotMatch(await row.locator('.selected-spec').textContent(),/NaN|undefined|<img|\[object Object\]/);
+      }
+      assert.equal(await page.locator('main img').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
+      t.diagnostic(`素材计数边界共验证 ${cases.length} 组独立数据`);
+    });
+    await t.test('输入素材合同2：仅dimensions供给计数，spec回退与g逐字段覆盖，不从参数或成品推断',async()=>{
+      const counts={image_count:2,video_count:3,audio_count:1},input=fixture(),base=input.groups[0];
+      const cases=[
+        ['spec-fallback',{spec:{dimensions:counts},dimensions:{}},['图片 2 张','视频 3 段','音频 1 段']],
+        ['no-g-dimensions',{spec:{dimensions:counts},dimensions:undefined},['图片 2 张','视频 3 段','音频 1 段']],
+        ['null-g-dimensions',{spec:{dimensions:counts},dimensions:null},['图片 2 张','视频 3 段','音频 1 段']],
+        ['partial-override',{spec:{dimensions:counts},dimensions:{video_count:4}},['图片 2 张','视频 4 段','音频 1 段']],
+        ['zero-override',{spec:{dimensions:counts},dimensions:{image_count:0,video_count:0,audio_count:0}},['未使用图片、视频或音频']],
+        ['null-override',{spec:{dimensions:counts},dimensions:{image_count:null,video_count:0,audio_count:0}},['图片数量未记录']],
+        ['invalid-override',{spec:{dimensions:counts},dimensions:{image_count:'7',video_count:0,audio_count:0}},['图片数量未记录']],
+        ['no-inference',{spec:{parameters:counts,expected:counts},dimensions:{},image_count:8,video_count:9,audio_count:10,output_count:7,unit:'image'},['素材信息未记录']],
+      ];
+      input.groups=cases.map(([id,fields])=>({...base,id,...fields}));const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      for(const [id,,expected] of cases) {
+        await row.locator('select').selectOption(id);assert.deepEqual(await row.locator('.input-materials > span').allTextContents(),expected,id);
+        assert.equal(await row.locator('.generation-parameters').textContent(),'规格未完整记录');
+      }
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同3：首视频时长仅详情说明非合计，请求参数优先级与原始技术证据保持',async()=>{
+      const input=fixture(),base=input.groups[0],dimensions={image_count:1,video_count:3,audio_count:1,source_duration:37};
+      const technical={steps:20,fps:24,frames:121,scale_to_length:1280,batch_size:3};
+      const cases=[
+        ['source-only',{dimensions},'规格未完整记录'],
+        ['technical-only',{dimensions:{...dimensions,...technical}},'规格未完整记录'],
+        ['requested',{dimensions:{...dimensions,duration:5,width:1280,height:720}},'请求时长 5 秒 / 720p（1,280 × 720）'],
+        ['output-request',{dimensions:{...dimensions,duration:5,output_duration:6,width:1280,height:720,output_width:1920,output_height:1080}},'请求时长 6 秒 / 1080p（1,920 × 1,080）'],
+        ['expected',{dimensions,spec:{expected:{duration:7,width:640,height:480,fps:30}}},'请求时长 7 秒 / 期望 480p（640 × 480）'],
+        ['parameters',{dimensions,spec:{parameters:{duration:8,...technical}}},'请求时长 8 秒'],
+        ['dimension-precedence',{dimensions:{...dimensions,duration:9},spec:{dimensions:{duration:8},parameters:{duration:7}}},'请求时长 9 秒'],
+      ];
+      input.groups=cases.map(([id,fields])=>({...base,id,...fields}));const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const [id,fields,parameters] of cases) {
+        await row.locator('select').selectOption(id);
+        assert.equal(await row.locator('.generation-parameters').textContent(),parameters);
+        assert.doesNotMatch(await row.locator('.selected-spec').textContent(),/37|111|FPS|步数|帧数|长边|批量|输入视频时长/);
+        assert.ok((await row.locator('option:checked').textContent()).startsWith('图片 1 张 + 视频 3 段 + 音频 1 段｜'+parameters));
+        assert.match(await detail.innerText(),/首个输入视频时长：37 秒（非多段视频合计）/);
+        assert.doesNotMatch(await detail.innerText(),/请求时长 (37|111) 秒|总时长|总输入时长/);
+        if(['technical-only','parameters'].includes(id))for(const text of ['帧率 24 FPS','步数 20 步','帧数 121 帧','长边 1,280 px','批量 3'])assert.ok((await detail.innerText()).includes(text),id+'：'+text);
+        if(id==='expected')assert.match(await detail.innerText(),/帧率 30 FPS/);
+        const raw=detail.locator('details');assert.equal(await raw.evaluate(n=>n.open),false);await raw.locator('summary').click();
+        const evidence=JSON.parse(await raw.locator('pre').textContent());assert.deepEqual(evidence.dimensions,fields.dimensions);assert.deepEqual(evidence.spec,fields.spec);
+      }
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同4：同参数不同视频数可区分，切组清理且原组均值、另一机器及采购互不影响',async()=>{
+      const input=summaryFixture(),base=input.groups[1],dimensions={duration:5,width:1280,height:720,image_count:2,video_count:1,audio_count:1};
+      input.groups=[
+        {...base,id:'one-video',capability:'minimax_h3_ref9',dimensions,mean_seconds:78,measured:10},
+        {...base,id:'three-videos',capability:'minimax_h3_ref9',dimensions:{...dimensions,video_count:3,source_duration:37,steps:20},mean_seconds:32,measured:8},
+        {...base,id:'unknown-material',capability:'minimax_h3_ref9',dimensions:{duration:5},mean_seconds:91,measured:5},
+        {...base,id:'other-one',worker_id:'w3',capability:'minimax_h3_ref9',dimensions,mean_seconds:61},
+        {...base,id:'other-three',worker_id:'w3',capability:'minimax_h3_ref9',dimensions:{...dimensions,video_count:3},mean_seconds:19},
+      ];
+      const {page,state}=await setup({data:input}),row=page.locator('td[data-summary-worker-id=w1] .business-row'),other=page.locator('td[data-summary-worker-id=w3] .business-row');
+      const options=await row.locator('option').allTextContents();assert.equal(new Set(options).size,3);
+      assert.deepEqual(options.slice(0,2),[1,3].map(n=>`图片 2 张 + 视频 ${n} 段 + 音频 1 段｜请求时长 5 秒 / 720p（1,280 × 720）`));
+      await purchase(page);await page.locator('.demand-group').selectOption('minimax_h3_ref9');await calculate(page);
+      const before={post:structuredClone(state.posts.at(-1)),result:await page.locator('#estimate-result').textContent()};
+      await page.locator('#tab-machines').click();await row.locator('button').click();await other.locator('button').click();
+      const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls')),otherDetail=page.locator('#'+await other.locator('button').getAttribute('aria-controls'));
+      const otherBefore={row:await other.textContent(),detail:await otherDetail.textContent()};
+      for(const [id,materials,parameters,time,count] of [
+        ['three-videos',['图片 2 张','视频 3 段','音频 1 段'],'请求时长 5 秒 / 720p（1,280 × 720）','32 秒',8],
+        ['unknown-material',['素材信息未记录'],'请求时长 5 秒','1 分 31 秒',5],
+        ['one-video',['图片 2 张','视频 1 段','音频 1 段'],'请求时长 5 秒 / 720p（1,280 × 720）','1 分 18 秒',10],
+      ]) {
+        await row.locator('select').selectOption(id);await assertMaterialSpec(row,materials,parameters);
+        assert.equal(await row.getAttribute('data-selected-group-id'),id);assert.equal(await row.locator('.mean-time').textContent(),time);assert.match(await row.locator('.matrix-samples').textContent(),new RegExp(`仅 ${count} 次`));
+        assert.equal(await detail.isVisible(),true);assert.ok((await detail.innerText()).includes('采样编号：'+id));
+        if(id!=='three-videos')assert.doesNotMatch(await detail.innerText(),/首个输入视频时长|步数 20|视频 3 段|three-videos/);
+        assert.deepEqual({row:await other.textContent(),detail:await otherDetail.textContent()},otherBefore);
+      }
+      const firstBefore={row:await row.textContent(),detail:await detail.textContent()};await other.locator('select').selectOption('other-three');
+      assert.equal(await other.locator('.mean-time').textContent(),'19 秒');assert.match(await otherDetail.innerText(),/采样编号：other-three/);
+      assert.deepEqual({row:await row.textContent(),detail:await detail.textContent()},firstBefore);
+      await assertComparisonTable(page);await page.locator('#tab-purchase').click();assert.equal(await page.locator('#estimate-result').textContent(),before.result);
+      assert.deepEqual(state.posts,[before.post]);assert.deepEqual(before.post.body.demands,[{group_id:'one-video',quantity:100}]);
+      await calculate(page);assert.deepEqual(state.posts.at(-1),before.post);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同5：恶意规格只作原始文本，三尺寸真实定义列表换行且不溢出，批量截图',async()=>{
+      const input=summaryFixture(),base=input.groups[1];input.groups=[{...base,id:'mixed-material',dimensions:{image_count:12,video_count:3,audio_count:2,duration:5,width:1280,height:720,steps:20,source_duration:37}},
+        {...base,id:'hostile-material',dimensions:{image_count:ATTACK,video_count:2,audio_count:{value:ATTACK},duration:ATTACK,steps:ATTACK,source_duration:ATTACK},spec:{parameters:{frames:ATTACK},expected:{width:ATTACK,height:ATTACK}}}];
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      await row.locator('select').selectOption('hostile-material');await assertMaterialSpec(row,['图片数量未记录','视频 2 段','音频数量未记录'],'规格未完整记录');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));await detail.locator('details summary').click();
+      const raw=detail.locator('pre');assert.equal(await raw.locator('*').count(),0);const evidence=JSON.parse(await raw.textContent());
+      assert.deepEqual(evidence.dimensions,input.groups[1].dimensions);assert.deepEqual(evidence.spec,input.groups[1].spec);
+      assert.equal(await page.locator('main img, main script, main iframe, main [onerror]').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);
+      await row.locator('select').selectOption('mixed-material');assert.doesNotMatch(await detail.textContent(),/onerror|hostile-material/);await row.locator('button').click();
+      for(const width of [1440,390,320]) {
+        await page.setViewportSize({width,height:width===1440?1000:844});await positionMatrix(page);
+        await assertMaterialSpec(row,['图片 12 张','视频 3 段','音频 2 段'],'请求时长 5 秒 / 720p（1,280 × 720）');await assertComparisonTable(page);
+        const layout=await row.locator('.selected-spec').evaluate(node=>{
+          const rect=n=>{const r=n.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};};
+          const materials=node.querySelector('.input-materials');
+          return {spec:rect(node),box:rect(materials),wrap:getComputedStyle(materials).flexWrap,client:materials.clientWidth,scroll:materials.scrollWidth,
+            spans:[...materials.children].map(n=>{const range=document.createRange();range.selectNodeContents(n);return {box:rect(n),text:[...range.getClientRects()].map(r=>({left:r.left,right:r.right}))};})};
+        });
+        assert.equal(layout.wrap,'wrap');assert.ok(layout.scroll<=layout.client,`${width}px素材容器无横向溢出`);
+        // 宽屏能完整容纳时允许单行；窄屏必须实际换行，不能靠截断或横滚隐藏素材。
+        if(width===320)assert.ok(new Set(layout.spans.map(s=>Math.round(s.box.top))).size>1,'320px混合输入实际分行，而非仅声明换行样式');
+        for(const span of layout.spans)for(const box of [span.box,...span.text])assert.ok(box.left>=layout.box.left-1 && box.right<=layout.box.right+1 && box.left>=layout.spec.left-1 && box.right<=layout.spec.right+1,`${width}px素材文字完整位于规格容器`);
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+        await row.locator('button').click();assert.equal(await detail.isVisible(),true);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await row.locator('button').click();
+        if(process.env.CHOUKA_TEST_MATERIAL_SCREENSHOT) {
+          await page.evaluate(()=>document.activeElement?.blur());await positionMatrix(page);
+          // 手机将矩阵移入视口，完整截到换行后的音频，而不是只截首屏上沿；不改变真实视口尺寸。
+          await page.locator('#summary-machines .scroll').evaluate((node,width)=>window.scrollTo({top:width===1440?0:node.getBoundingClientRect().top+window.scrollY-16,left:0,behavior:'instant'}),width);
+          assert.ok(await row.locator('.input-materials > span').evaluateAll(nodes=>nodes.every(n=>{const r=n.getBoundingClientRect();return r.top>=0 && r.bottom<=innerHeight;})),`${width}px截图完整包含各类输入素材`);
+          const file=path.parse(process.env.CHOUKA_TEST_MATERIAL_SCREENSHOT),output=path.join(file.dir,file.name+`-${width}.png`);
+          await page.screenshot({path:output,fullPage:false});t.diagnostic('合成混合输入截图：'+output);
+        }
+      }
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('实际成品合同1：真实H3报告与技术产量分离，多尺寸和覆盖不改原组均值',async()=>{
+      const {report,baseline}=realStoreReport(false,true),capability='minimax_h3_ref_2pass';
+      const groups=report.groups.filter(g=>g.capability===capability),byDuration=duration=>groups.find(g=>g.dimensions.duration===duration);
+      assert.equal(groups.length,8);
+      for(const g of groups) {
+        assert.equal(g.output_count,null);assert.equal(g.eligible,false);
+        assert.deepEqual(g.spec.expected,{duration:g.dimensions.duration,kind:'video'});
+        const previous=baseline.groups.find(old=>old.id===g.id);
+        assert.deepEqual({...g,output_resolution:null},{...previous,output_resolution:null},'补采尺寸不改变分组、均值或技术资格');
+      }
+      const actual=byDuration(2),multi=byDuration(3),partial=byDuration(4),allPartial=byDuration(5),unknown=byDuration(6),recovered=byDuration(7);
+      assert.deepEqual(actual.output_resolution,{total_samples:1,recorded_samples:1,complete_samples:1,total_outputs:1,recorded_outputs:1,variants:[{kind:'video',width:1280,height:720,outputs:1,samples:1}]});
+      assert.deepEqual(multi.output_resolution,{total_samples:2,recorded_samples:2,complete_samples:2,total_outputs:5,recorded_outputs:5,variants:[{kind:'image',width:1024,height:768,outputs:1,samples:1},{kind:'video',width:720,height:1280,outputs:1,samples:1},{kind:'video',width:1280,height:720,outputs:3,samples:2}]});
+      assert.deepEqual([partial.output_resolution.total_samples,partial.output_resolution.recorded_samples,partial.output_resolution.complete_samples,partial.output_resolution.total_outputs],[2,1,0,null]);
+      assert.deepEqual([allPartial.output_resolution.recorded_samples,allPartial.output_resolution.complete_samples,allPartial.output_resolution.total_outputs],[1,0,2]);
+      const {page,state}=await setup({data:report});
+      const row=page.locator(`.business-row[data-capability=${capability}]`),select=row.locator('select');
+      await select.selectOption(actual.id);await assertMaterialSpec(row,['图片 12 张','视频 3 段','音频 2 段'],'请求时长 2 秒 / 约 91 万像素（尺寸未记录）');
+      assert.deepEqual(await row.locator('.actual-resolution > span').allTextContents(),['视频 · 720p（1,280 × 720）']);
+      assert.equal(await row.locator('.mean-time').textContent(),'1 分 18 秒');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/1 \/ 1 次已完成任务至少有一个成品尺寸；1 \/ 1 次已完成任务的全部最终产物都有尺寸/);
+      assert.match(await detail.innerText(),/与技术合格产量、人工验收和采购资格分离/);
+      await select.selectOption(multi.id);
+      assert.deepEqual(await row.locator('.actual-resolution .resolution-variant').allTextContents(),['图片 · 尺寸 1,024 × 768','视频 · 720p 竖屏（720 × 1,280）','视频 · 720p（1,280 × 720）']);
+      assert.match(await row.locator('.actual-resolution').textContent(),/非单一尺寸/);
+      assert.equal(await row.locator('.resolution-coverage').count(),0);assert.equal(await row.locator('.mean-time').textContent(),'1 分 20 秒');
+      assert.match(await detail.innerText(),/720p（1,280 × 720）：3 个产物 \/ 2 次任务/);
+      assert.match(await detail.innerText(),/已知尺寸产物 5 \/ 5 个/);
+      for(const [g,coverage,total] of [[partial,'已知 1 / 2 次任务的部分或全部成品','已知尺寸产物 1 / 未知 个（最终清单不完整，产物总数未知）'],[allPartial,'已知 1 / 1 次任务的部分或全部成品','已知尺寸产物 1 / 2 个'],[unknown,'已知 0 / 1 次任务的部分或全部成品','已知尺寸产物 0 / 未知 个（最终清单不完整，产物总数未知）']]) {
+        await select.selectOption(g.id);assert.equal(await row.locator('.resolution-coverage').textContent(),coverage);assert.ok((await detail.innerText()).includes(total));
+        assert.match(await detail.innerText(),new RegExp(`0 / ${g.output_resolution.total_samples} 次已完成任务的全部最终产物都有尺寸`));
+        assert.equal(await row.locator('.actual-resolution .resolution-variant').count(),g===unknown?0:1);
+      }
+      assert.match(await row.locator('.actual-resolution').textContent(),/^尺寸未记录/);
+      assert.doesNotMatch(await row.locator('.actual-resolution').textContent(),/720p|91|MP/);
+      // 线上真实形态为非标准尺寸，不能按相近短边或 MP 强标成 720p。
+      for(const [duration,label] of [[8,'视频 · 尺寸 1,312 × 736'],[9,'视频 · 尺寸 2,080 × 1,152']]) {
+        await select.selectOption(byDuration(duration).id);assert.equal(await row.locator('.actual-resolution').textContent(),label);
+        assert.doesNotMatch(await row.locator('.actual-resolution').textContent(),/720p|1080p/);
+      }
+      await select.selectOption(recovered.id);assert.deepEqual(await row.locator('.resolution-variant').allTextContents(),['视频 · 1080p（1,920 × 1,080）']);
+      await detail.locator('details > summary').click();assert.deepEqual(JSON.parse(await detail.locator('pre').textContent()).output_resolution,recovered.output_resolution);
+      await page.locator('#task-evidence > summary').click();const task=page.locator('#details > details[data-job-id="recovered-h3"]');await task.locator(':scope > summary').click();
+      assert.match(await task.locator('.output-resolution-details').innerText(),/1080p/);
+      await task.locator('.output-resolution-raw > summary').click();const raw=JSON.parse(await task.locator('.output-resolution-raw pre').textContent());
+      const stored=report.details.find(d=>d.job_id==='recovered-h3');assert.deepEqual(raw,{output_resolution:stored.output_resolution,recovered_outputs:stored.recovered_outputs});assert.equal(raw.recovered_outputs[0].width,1920);
+      assert.deepEqual(state.posts,[]);assert.equal(state.gets.length,1);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('实际成品合同2：不猜尺寸、严格验证和XSS安全，跨机器切换不串数据',async()=>{
+      const input=summaryFixture(),base=input.groups[1];
+      const resolution={total_samples:2,recorded_samples:2,complete_samples:2,total_outputs:2,recorded_outputs:2,variants:[{kind:'video',width:1280,height:720,outputs:2,samples:2}]};
+      input.groups=[{...base,id:'actual',output_resolution:resolution},{...base,id:'unknown',output_resolution:undefined},
+        {...base,id:'hostile',output_resolution:{...resolution,variants:[{kind:ATTACK,width:1280,height:720,outputs:ATTACK,samples:ATTACK},{kind:'video',width:ATTACK,height:720},{kind:'image',width:512,height:512,outputs:ATTACK,samples:ATTACK}]}},
+        {...base,id:'other-machine',worker_id:'w3',output_resolution:{...resolution,variants:[{kind:'image',width:1536,height:864,outputs:2,samples:2}]}}];
+      const {page,state}=await setup({data:input}),first=page.locator('[data-summary-worker-id=w1] > .business-row'),other=page.locator('[data-summary-worker-id=w3] > .business-row');
+      await first.locator('select').selectOption('actual');await first.locator('button').click();await other.locator('button').click();
+      const detail=page.locator('#'+await first.locator('button').getAttribute('aria-controls')),otherDetail=page.locator('#'+await other.locator('button').getAttribute('aria-controls'));
+      const untouched={row:await other.textContent(),detail:await otherDetail.textContent()};
+      await first.locator('select').selectOption('unknown');assert.equal(await first.locator('.actual-resolution').textContent(),'尺寸未记录');assert.doesNotMatch(await detail.locator('.output-resolution-details').textContent(),/720p/);
+      await first.locator('select').selectOption('hostile');assert.deepEqual(await first.locator('.resolution-variant').allTextContents(),['图片 · 尺寸 512 × 512']);
+      assert.match(await detail.locator('.output-resolution-details').textContent(),/未知 个产物 \/ 未知 次任务/);
+      await detail.locator('details > summary').click();assert.deepEqual(JSON.parse(await detail.locator('pre').textContent()).output_resolution,input.groups[2].output_resolution);
+      await first.locator('select').selectOption('actual');assert.equal(await first.locator('.actual-resolution').textContent(),'视频 · 720p（1,280 × 720）');assert.doesNotMatch(await detail.textContent(),/onerror|512 × 512/);
+      assert.deepEqual({row:await other.textContent(),detail:await otherDetail.textContent()},untouched);
+      state.data.groups[0].output_resolution={...resolution,variants:[{kind:'image',width:1280,height:720,outputs:1,samples:1},{kind:'video',width:1280,height:720,outputs:1,samples:1}]};
+      await refresh(page);await first.locator('select').selectOption('actual');
+      assert.deepEqual(await first.locator('.actual-resolution > span').allTextContents(),['图片 · 720p（1,280 × 720）','视频 · 720p（1,280 × 720）']);
+      const invalid=[null,{}, {width:1280}, {width:1280,height:0}, {width:1280,height:-1}, {width:1280,height:720.5}, {width:'1280',height:720}, {width:true,height:720}, {width:1280,height:Number.MAX_SAFE_INTEGER+1}];
+      for(const value of invalid) {
+        state.data.groups[0].output_resolution={...resolution,variants:[value==null?null:{kind:'video',...value}]};await refresh(page);await first.locator('select').selectOption('actual');
+        assert.match(await first.locator('.actual-resolution').textContent(),/^尺寸未记录/);assert.equal(await first.locator('.resolution-variant').count(),0);
+      }
+      assert.equal(await page.locator('main img, main script, main iframe, main [onerror]').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('实际成品合同3：真实Store的720p在1440、390、320宽度可读且无整页溢出',async()=>{
+      const {report}=realStoreReport(false,true),g=report.groups.find(g=>g.capability==='minimax_h3_ref_2pass' && g.dimensions.duration===2);
+      const {page,state}=await setup({data:report}),row=page.locator('.business-row[data-capability=minimax_h3_ref_2pass]');await row.locator('select').selectOption(g.id);
+      for(const width of [1440,390,320]) {
+        await page.setViewportSize({width,height:width===1440?1000:844});await positionMatrix(page);
+        await row.locator('.actual-resolution').scrollIntoViewIfNeeded();
+        await page.locator('#summary-machines .scroll').evaluate(node=>window.scrollTo({top:Math.max(0,node.getBoundingClientRect().top+window.scrollY-16),left:0,behavior:'instant'}));
+        await assertComparisonTable(page);await assertMaterialSpec(row,['图片 12 张','视频 3 段','音频 2 段'],'请求时长 2 秒 / 约 91 万像素（尺寸未记录）');
+        assert.equal(await row.locator('.actual-resolution').textContent(),'视频 · 720p（1,280 × 720）');
+        const bounds=await row.locator('.selected-spec').evaluate(node=>{
+          const r=node.getBoundingClientRect(),size=node.querySelector('.actual-resolution');
+          return {left:r.left,right:r.right,scroll:size.scrollWidth,client:size.clientWidth,lines:[...size.querySelectorAll('span')].flatMap(n=>{const range=document.createRange();range.selectNodeContents(n);return [...range.getClientRects()].map(r=>({left:r.left,right:r.right,top:r.top,bottom:r.bottom}));})};
+        });
+        assert.ok(bounds.scroll<=bounds.client);assert.ok(bounds.lines.length>0);
+        for(const line of bounds.lines)assert.ok(line.left>=bounds.left-1 && line.right<=bounds.right+1 && line.left>=0 && line.right<=width && line.top>=0 && line.bottom<=(width===1440?1000:844),`${width}px真实成品尺寸文字完整可见`);
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+        if(process.env.CHOUKA_TEST_MATERIAL_SCREENSHOT) {
+          const file=path.parse(process.env.CHOUKA_TEST_MATERIAL_SCREENSHOT),output=path.join(file.dir,file.name+`-real-${width}.png`);
+          await page.evaluate(()=>document.activeElement?.blur());await page.screenshot({path:output,fullPage:false});t.diagnostic('真实 CapacityStore 合成任务截图：'+output);
+        }
+      }
+      assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('成品补采合同1：仅done任务折叠详情可操作，分页手动继续、防重复且不自动刷新',async()=>{
+      const input=fixture(),job='任务 /?#'+ATTACK;input.details[0].job_id=job;
+      input.details.push({...input.details[0],job_id:'running-task',status:'running'},{...input.details[0],job_id:'error-task',status:'error'},{...input.details[0],job_id:'canceled-task',status:'canceled'});
+      const {page,state}=await setup({data:input});assert.deepEqual(state.posts,[]);
+      assert.equal(await page.locator('#summary-machines .output-probe').count(),0);assert.equal(await page.locator('.output-probe').count(),2);
+      for(const button of await page.locator('.output-probe button').all())assert.equal(await button.isVisible(),false);
+      await refresh(page);await page.locator('#task-evidence > summary').click();
+      const task=page.locator('#details > details').first();await task.locator(':scope > summary').click();
+      const probe=task.locator('.output-probe'),button=probe.locator('button'),status=probe.locator('[role=status]');
+      assert.equal(await button.innerText(),'补采成品尺寸');assert.deepEqual(state.posts,[]);
+      const gets=state.gets.length,summary=await page.locator('#summary-machines').textContent();
+      let held;state.holdProbe=route=>{held=route;};
+      await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe button').disabled);
+      await button.evaluate(node=>{node.click();node.dispatchEvent(new MouseEvent('click'));});await tick(page);
+      assert.equal(state.posts.length,1);assert.deepEqual(state.posts[0],{path:'/api/capacity/jobs/'+encodeURIComponent(job)+'/probe-outputs',body:{offset:0},csrf:'synthetic-csrf'});
+      assert.match(await status.textContent(),/正在补采/);
+      assert.ok(held);state.holdProbe=null;await held.fulfill({contentType:'application/json',body:JSON.stringify({processed:4,recorded:3,total:6,next_offset:4})});
+      await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='继续补采成品尺寸');
+      assert.equal(await button.isEnabled(),true);assert.match(await status.textContent(),/本批处理 4 个，成功记录尺寸 3 个；可信最终产物共 6 个/);
+      await tick(page);assert.equal(state.posts.length,1);assert.equal(state.gets.length,gets);
+      await task.locator(':scope > summary').click();await task.locator(':scope > summary').click();assert.equal(await button.innerText(),'继续补采成品尺寸');assert.equal(state.posts.length,1);
+      state.probeResult={processed:2,recorded:1,total:6,next_offset:null};await button.click();
+      await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='补采已完成');
+      assert.deepEqual(state.posts.map(p=>p.body),[{offset:0},{offset:4}]);assert.equal(await button.isDisabled(),true);
+      assert.match(await status.textContent(),/本批处理 2 个，成功记录尺寸 1 个；可信最终产物共 6 个。补采已完成，刷新看板查看结果/);
+      assert.equal(await task.evaluate(n=>n.open),true);assert.equal(state.gets.length,gets);assert.equal(await page.locator('#summary-machines').textContent(),summary);
+      await button.evaluate(n=>n.click());await tick(page);assert.equal(state.posts.length,2);
+      await refresh(page);assert.equal(state.gets.length,gets+1);assert.equal(state.posts.length,2);assert.equal(await page.locator('.output-probe button').first().textContent(),'补采成品尺寸');
+      assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('成品补采合同2：409及失败安全显示，不自动重试，继续批次失败保留offset',async()=>{
+      const {page,state}=await setup({evidence:true});const task=page.locator('#details > details').first();await task.locator(':scope > summary').click();
+      const probe=task.locator('.output-probe'),button=probe.locator('button'),status=probe.locator('[role=status]');
+      state.probeError={status:409,message:'没有可信 final 记录 '+ATTACK};await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe [role=status]').textContent.startsWith('补采失败'));
+      assert.match(await status.textContent(),/没有可信最终产物记录，不能猜测成品尺寸/);assert.ok((await status.textContent()).includes(ATTACK));assert.equal(await status.locator('*').count(),0);assert.equal(await button.isEnabled(),true);
+      await tick(page);assert.equal(state.posts.length,1);assert.equal(state.gets.length,1);
+      state.probeError=null;await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='继续补采成品尺寸');
+      state.probeError={status:500,message:ATTACK};await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe [role=status]').textContent.startsWith('补采失败'));
+      assert.equal(await status.textContent(),'补采失败：'+ATTACK);assert.equal(await button.innerText(),'继续补采成品尺寸');assert.equal(await button.isEnabled(),true);
+      await tick(page);assert.equal(state.posts.length,3);assert.equal(state.gets.length,1);
+      state.probeError=null;state.probeResult={processed:2,recorded:0,total:6,next_offset:null};await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='补采已完成');
+      assert.deepEqual(state.posts.map(p=>p.body),[{offset:0},{offset:0},{offset:4},{offset:4}]);assert.match(await status.textContent(),/成功记录尺寸 0 个/);
+      assert.equal(await page.locator('main img, main script, main iframe, main [onerror]').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
     });
     await t.test('简明首页及详情的名称模型来源配置与警告安全渲染',async()=>{
       const input=summaryFixture();input.workers[0].name=ATTACK;input.workers[0].hardware.gpus[0].name=ATTACK;const g=input.groups[1];g.capability_name=ATTACK;g.model_summary.models[0].name=ATTACK;g.model_summary.precision_label=ATTACK;g.config={cpu:ATTACK};g.warnings=[ATTACK];g.cache_condition={kind:ATTACK};
@@ -962,19 +1354,19 @@ test('产能看板语法与离线路由专项', async t => {
     });
     await t.test('历史不可验收；采集记录人工标签、未验收 null、零合格、失败与 CSRF；成功仍刷新全历史',async()=>{
       const {page,state}=await setupAdvanced();assert.equal(await page.locator('[data-job-id="history-job"] form').count(),0);
-      const record=page.locator('[data-job-id="captured-job"]');await record.locator('summary').click();await record.locator('select').selectOption('standard');await record.locator('button').click();assert.match(await record.locator('[role=status]').innerText(),/标准场景编号/);assert.equal(state.posts.length,0);
+      const record=page.locator('[data-job-id="captured-job"]');await record.locator(':scope > summary').click();await record.locator('select').selectOption('standard');await record.locator('.review-form button').click();assert.match(await record.locator('.review-form [role=status]').innerText(),/标准场景编号/);assert.equal(state.posts.length,0);
       await page.clock.setFixedTime(new Date(NOW.getTime()+60000));
-      await record.locator('input:not([type=number])').fill('bench-001');await record.locator('textarea').fill('人工复核，不是自动验证');await record.locator('button').click();await loaded(page);await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('bench-001'));
+      await record.locator('input:not([type=number])').fill('bench-001');await record.locator('textarea').fill('人工复核，不是自动验证');await record.locator('.review-form button').click();await loaded(page);await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('bench-001'));
       assert.deepEqual(state.posts.at(-1).body,{accepted:null,source:'standard',benchmark_id:'bench-001',note:'人工复核，不是自动验证'});assert.equal(state.posts.at(-1).csrf,'synthetic-csrf');
-      await record.locator('summary').click();await record.locator('input[type=number]').fill('0');await record.locator('button').click();await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('人工合格数量：0'));
+      await record.locator(':scope > summary').click();await record.locator('input[type=number]').fill('0');await record.locator('.review-form button').click();await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('人工合格数量：0'));
       assert.equal(state.posts.at(-1).body.accepted,0);assert.equal(state.gets.length,3);for(const query of state.gets)assertHistoryQuery(query);
-      await record.locator('summary').click();state.reviewError=true;await record.locator('button').click();await page.waitForFunction(()=>document.querySelector('.review-form [role=status]').textContent.includes('保存失败'));assert.match(await record.locator('[role=status]').innerText(),/合成验收保存失败/);
+      await record.locator(':scope > summary').click();state.reviewError=true;await record.locator('.review-form button').click();await page.waitForFunction(()=>document.querySelector('.review-form [role=status]').textContent.includes('保存失败'));assert.match(await record.locator('.review-form [role=status]').innerText(),/合成验收保存失败/);
     });
     await t.test('所有来源文本、规格、证据、警告与错误安全渲染，不截掉警告',async()=>{
       const input=fixture();input.workers[0].name=ATTACK;input.workers[0].hardware.cpu=ATTACK;input.groups[0].capability_name=ATTACK;input.groups[0].dimensions={injected:ATTACK};input.groups[0].warnings=Array.from({length:7},(_,i)=>`${ATTACK} 警告${i}`);input.details[1].outputs=[{name:ATTACK}];input.details[1].review.note=ATTACK;
       const {page,state}=await setupAdvanced({data:input});assert.equal(await page.locator('main img').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);
       assert.ok((await page.locator('#workers').innerText()).includes(ATTACK));const row=await page.locator('#machine-groups [data-group-id=h1]').innerText();for(const warning of input.groups[0].warnings)assert.ok(row.includes(warning));
-      await page.locator('[data-job-id=captured-job] summary').click();assert.ok((await page.locator('[data-job-id=captured-job]').innerText()).includes(ATTACK));assert.deepEqual(state.errors,[]);
+      await page.locator('[data-job-id=captured-job] > summary').click();assert.ok((await page.locator('[data-job-id=captured-job]').innerText()).includes(ATTACK));assert.deepEqual(state.errors,[]);
     });
     await t.test('空态、读取失败及全历史刷新恢复不把未知当 0，移除分组导出不影响测算导出',async()=>{
       const input={period:{},overview:{tasks:0,done:0,error:0,canceled:0},workers:[],groups:[],details:[],details_total:0};const {page,state}=await setupAdvanced({data:input});
@@ -1007,7 +1399,7 @@ test('产能看板语法与离线路由专项', async t => {
       for(const action of ['page','refresh']) {
         const {page,state,context}=await setupPurchase();let release,received;const saved=new Promise(resolve=>received=resolve);
         await context.route('**/api/capacity/jobs/*/review',route=>{release=()=>route.fulfill({contentType:'application/json',body:'{"ok":true}'});received();});
-        await page.locator('[data-job-id=captured-job] summary').click();await page.locator('[data-job-id=captured-job] button').click();await saved;
+        await page.locator('[data-job-id=captured-job] > summary').click();await page.locator('[data-job-id=captured-job] .review-form button').click();await saved;
         const later=new Date(NOW.getTime()+60000);await page.clock.setFixedTime(later);
         if(action==='page') {await page.locator('#next').click();await page.waitForSelector('[data-job-id=page-2-job]');assertHistoryQuery(state.gets.at(-1),NOW,100);}
         else {await refresh(page);assertHistoryQuery(state.gets.at(-1),later);}
