@@ -850,6 +850,18 @@ class AuthStore:
             row = self.db.execute('SELECT * FROM job_acl WHERE job_id=?', (job_id,)).fetchone()
             return dict(row) if row else None
 
+    def job_submitters(self, job_ids):
+        if not job_ids:
+            return {}
+        with self.lock:
+            rows = self.db.execute(
+                'SELECT j.job_id,u.id AS submitter_id,u.username AS submitter_username,'
+                'u.display_name AS submitter_display_name FROM job_acl j '
+                'JOIN users u ON u.id=j.user_id WHERE j.job_id IN ('
+                + ','.join('?' for _ in job_ids) + ')', tuple(job_ids))
+            return {row['job_id']: {key: row[key] for key in (
+                'submitter_id', 'submitter_username', 'submitter_display_name')} for row in rows}
+
     def list_project_jobs(self, project_id):
         self._identifier(project_id, '画布 ID')
         with self.lock:

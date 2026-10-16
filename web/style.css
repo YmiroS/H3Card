@@ -1163,6 +1163,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 .jrow.done { border-left-color: var(--ok); }
 .jrow.bad { border-left-color: var(--err); }
 .jrow.gone { border-left-color: #3a4763; opacity: .72; }
+.jrow .jowner { margin-bottom: 4px; color: var(--txt); font-size: 12px; overflow-wrap: anywhere; }
 .jrow .r1 { display: flex; align-items: center; gap: 8px; }
 .jrow .r1 .nm { flex: 1; display: flex; align-items: baseline; min-width: 0; }
 /* 「项目名 - 卡片名」：浮窗只有 356px，挤不下时先截项目名（flex-shrink 给得大得多），

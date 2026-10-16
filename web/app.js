@@ -7721,7 +7721,8 @@ function placeJobs() {
 /** 列表骨架的签名：有哪些任务、各自什么状态。只有它变了才重建 DOM ——
     每 700ms 整块重画会让按钮在 mousedown 和 mouseup 之间被换掉，那一下点击就丢了。
     进度、步骤、耗时这些一直在变的东西交给 fillJobRow 原地刷。 */
-const jobsSig = () => TASKS.map(j => `${j.id}:${j.status}:${j.error ? 1 : 0}`).join(",");
+const jobsSig = () => JSON.stringify(TASKS.map(j => [j.id, j.status, !!j.error,
+  jobProjName(j), j.cardName, j.name, j.submitter_display_name, j.submitter_username]));
 
 function renderJobs() {
   const sig = jobsSig();
@@ -7778,6 +7779,12 @@ function jobRow(j) {
   d.className = "jrow " + jobCls(j);
   d._id = j.id;
 
+  const submitter = H3Auth.user?.role === 'admin'
+    ? j.submitter_display_name?.trim() || j.submitter_username || '未记录提交人' : '';
+  if (submitter) {
+    const person = document.createElement('div'); person.className = 'jowner';
+    person.textContent = submitter; d.append(person);
+  }
   const r1 = document.createElement("div"); r1.className = "r1";
   const nm = document.createElement("span"); nm.className = "nm";
   // 节点名才是用户认得出的那个（"角色图放大"），能力名（"SeedVR2 图片高清放大"）退到第二行。
@@ -7792,7 +7799,7 @@ function jobRow(j) {
   const cn = document.createElement("span"); cn.className = "cn";
   cn.textContent = card;
   nm.appendChild(cn);
-  nm.title = (pj ? `${pj} - ` : "") + (card !== j.name ? `${card}（${j.name}）` : j.name);
+  nm.title = (submitter ? `${submitter} - ` : '') + (pj ? `${pj} - ` : "") + (card !== j.name ? `${card}（${j.name}）` : j.name);
   d._st = document.createElement("span"); d._st.className = "st";
   r1.append(nm, d._st);
 
