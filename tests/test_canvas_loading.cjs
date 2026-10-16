@@ -156,6 +156,12 @@ async function fixtureServer(videoBytes, audioBytes, highRes) {
     state.requests.push(record);
     res.on('close', () => { record.closed = true; state.events.emit('change'); });
     res.on('finish', () => { record.complete = true; });
+    // 活跃心跳保留在 requests 中，但不属于画布内容写入。
+    if (req.method === 'POST' && url.pathname === '/api/auth/presence') {
+      req.resume();
+      assert.equal(req.headers['x-csrf-token'], 'fixture-csrf');
+      return json(res,{online_users:1});
+    }
     if (!['GET','HEAD','OPTIONS'].includes(req.method)) {
       state.writes.push(record);
       let body = ''; req.on('data', bytes => { body += bytes; });
@@ -892,6 +898,7 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
           window.__captureLogout({active:H3Auth.active,project:PROJ,cards:el.world.children.length,media:CARD_MEDIA.size,
             aborted:__canvasProbe.fetches.filter(r => r.aborted).length,created:__canvasProbe.created,revoked:__canvasProbe.revoked});
         }));
+        await page.locator('.account-trigger').click();
         await page.getByRole('button',{name:'退出登录',exact:true}).click();
         await page.waitForURL('**/login');
         assert.ok(snapshot,'必须观察到真实 auth.js 的会话失效事件');
@@ -1123,6 +1130,7 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
             intent:__pendingVideo._playRequest,controller:__pendingVideo._previewController,active:H3Auth.active,
             cards:el.world.children.length,aborted:__pendingEntry.controller.signal.aborted});
         }));
+        await page.locator('.account-trigger').click();
         await page.getByRole('button',{name:'退出登录',exact:true}).click();
         await page.waitForURL('**/login');
         await waitServer(state,() => request.closed && !request.complete,'退出登录未取消在途状态 HTTP 请求');

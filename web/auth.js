@@ -34,6 +34,70 @@
   .chip.off { color: var(--err, var(--bad, #ff3b5c)); border-color: #ff3b5c3a; }
   .account-bar { display: inline-flex; align-items: center; gap: 10px; font-size: 12px; }
   .account-bar .who { color: var(--txt, var(--text, #d8e6f2)); }
+  body[data-workspace] { --workspace-width: 184px; padding-left: var(--workspace-width); }
+  #workspace-nav {
+    position: fixed; inset: 0 auto 0 0; z-index: 60; width: var(--workspace-width); height: 100dvh;
+    display: flex; flex-direction: column; box-sizing: border-box; padding: 0 12px;
+    background: #0c0e12; border-right: 1px solid #262a32; color: #e5e7eb;
+    font: 13px/1.5 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+  }
+  .workspace-brand { display: flex; align-items: center; gap: 10px; min-height: 76px; padding: 12px 7px;
+    color: #f3f4f6; text-decoration: none; font-size: 18px; font-weight: 650; letter-spacing: -.4px; }
+  .workspace-brand img { width: 32px; height: 32px; object-fit: contain; flex: none; }
+  .workspace-brand small { display: block; margin-top: 1px; color: #949ba8; font-size: 10px; letter-spacing: 2px; font-weight: 400; }
+  .workspace-links { flex: 1; min-height: 0; overflow-y: auto; padding-top: 18px; }
+  .workspace-nav-label { margin: 0 12px 12px; color: #949ba8; font-size: 10px; letter-spacing: 1.5px; }
+  .workspace-nav-label.management { margin-top: 32px; }
+  #workspace-nav .workspace-link { display: flex; align-items: center; gap: 12px; min-height: 46px;
+    margin: 4px 0; padding: 10px 12px; border: 1px solid transparent; border-radius: 9px;
+    color: #aeb4c0; text-decoration: none; white-space: nowrap; transition: background-color .15s, color .15s; }
+  #workspace-nav .workspace-link svg { flex: none; width: 19px; height: 19px; }
+  #workspace-nav .workspace-link:hover { background: #181c23; color: #fff; }
+  #workspace-nav .workspace-link[aria-current="page"] { background: #192a37; border-color: #284454; color: #bce9ff; }
+  #workspace-nav :is(a, button):focus-visible { outline: 2px solid #7dd3fc; outline-offset: 2px; }
+  .workspace-footer { flex: none; padding: 16px 0 max(14px, env(safe-area-inset-bottom)); }
+  .workspace-presence { display: flex; gap: 8px; align-items: center; padding: 0 12px 15px; color: #a5acb8; font-size: 11px; }
+  .workspace-presence i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: #34d399; box-shadow: 0 0 0 3px #34d39915; }
+  .workspace-presence b { color: #e5e7eb; font-weight: 550; }
+  #workspace-nav .account-bar { display: block; width: 100%; margin: 0; padding-top: 12px; border-top: 1px solid #262a32; }
+  #workspace-nav .chip { white-space: normal; font-size: 11px; line-height: 1.5; }
+  .account-trigger { width: 100%; min-height: 48px; display: flex; align-items: center; gap: 10px;
+    padding: 7px 9px; border: 1px solid transparent; border-radius: 9px; color: #e5e7eb; background: transparent; font: inherit; cursor: pointer; }
+  .account-trigger:hover, .account-trigger[aria-expanded="true"] { background: #1b2028; border-color: #303641; }
+  .account-avatar { display: grid; place-items: center; width: 32px; height: 32px; flex: none;
+    border-radius: 10px; color: #c7e9ff; background: #243c50; border: 1px solid #36536a; font-size: 14px; font-weight: 650; }
+  .account-name { min-width: 0; text-align: left; overflow-wrap: anywhere; font-size: 13px; font-weight: 550; }
+  .account-menu { position: fixed; inset: auto; margin: 0; box-sizing: border-box; width: min(260px, calc(100vw - 16px));
+    max-height: calc(100dvh - 90px); overflow-y: auto; padding: 8px; border: 1px solid #343b47; border-radius: 12px;
+    background: #15191f; color: #e5e7eb; box-shadow: 0 20px 70px #0008; font: 13px/1.5 "Microsoft YaHei", system-ui, sans-serif; }
+  .account-menu-heading { padding: 10px 12px 13px; margin-bottom: 4px; border-bottom: 1px solid #2b313b; overflow-wrap: anywhere; }
+  .account-menu-heading b { display: block; font-weight: 600; }
+  .account-menu-heading small { display: block; margin-top: 3px; color: #a5acb8; font-size: 11px; }
+  .account-menu .account-action { display: flex; align-items: center; gap: 10px; width: 100%; min-height: 44px;
+    padding: 10px 12px; border: 0; border-radius: 7px; color: #dce1e9; background: transparent; text-align: left; font: inherit; cursor: pointer; }
+  .account-menu .account-action:hover { background: #262c36; }
+  .account-menu .account-action:focus-visible { outline: 2px solid #7dd3fc; outline-offset: -2px; }
+  .account-menu .account-action.danger { color: #fda4af; }
+  .account-menu .account-action.danger:hover { background: #3c242e; }
+  .account-info { margin: 0; display: grid; grid-template-columns: auto minmax(0, 1fr); gap: 14px 20px; font-size: 13px; }
+  .account-info dt { color: var(--dim, #a5acb8); }
+  .account-info dd { margin: 0; overflow-wrap: anywhere; user-select: text; }
+  .workspace-breadcrumb { color: var(--dim, #a5acb8); font-size: 12px; }
+  body.node-editor[data-workspace] { padding-left: 0; }
+  body.node-editor #workspace-nav { display: none; }
+  @media (max-width: 1100px) {
+    body[data-workspace] { --workspace-width: 72px; }
+    #workspace-nav { padding: 0 8px; }
+    .workspace-brand { justify-content: center; padding-inline: 0; }
+    .workspace-brand > span, .workspace-link > span, .workspace-nav-label, #workspace-nav .account-name { display: none; }
+    #workspace-nav .workspace-link { justify-content: center; padding-inline: 8px; }
+    .workspace-presence { justify-content: center; padding-inline: 0; gap: 0; }
+    .workspace-presence i { display: none; }
+    .workspace-presence > span { font-size: 10px; text-align: center; }
+    .workspace-presence b { font-size: inherit; }
+    #workspace-nav .account-trigger { justify-content: center; padding-inline: 0; }
+  }
+  @media (prefers-reduced-motion: reduce) { #workspace-nav .workspace-link { transition: none; } }
   .auth-dialog {
     /* 主样式表有 * { margin: 0 } 全局重置，会吃掉原生 dialog 的 margin:auto 居中，
        这里必须显式声明，否则弹窗会跑到角落 */
@@ -105,6 +169,8 @@
   async function refreshPresence() {
     if (stopped || document.hidden) return;
     if (!presencePending) presencePending = json('/api/auth/presence', 'POST').then(data => {
+      const count = document.querySelector('#online-count b');
+      if (count) count.textContent = String(data.online_users);
       window.dispatchEvent(new CustomEvent('h3auth:presence', {detail:data}));
       return data;
     }).finally(() => { presencePending = null; });
@@ -148,7 +214,37 @@
     try { await json('/api/auth/logout', 'POST'); }
     finally { invalidate(); }
   }
+  function mountWorkspace() {
+    const rail = document.getElementById('workspace-nav');
+    if (!rail || rail.querySelector('.workspace-links')) return;
+    const icons = {
+      canvas: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
+      director: '<rect x="3" y="8" width="18" height="13" rx="2"/><path d="m3 8 16-5 2 5M7 7l3-4m4 2 3-3M10 12l5 3-5 3z"/>',
+      teams: '<circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m1-16a3 3 0 0 1 0 6m3 10v-3a6 6 0 0 0-2-4"/>',
+      controller: '<path d="M3 17V7m6 14V3m6 14V7m6 14V3"/><path d="M1 10h4m2 5h4m2-5h4m2 5h4"/>',
+      permissions: '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/>',
+    };
+    const nav = document.createElement('nav'); nav.className = 'workspace-links'; nav.setAttribute('aria-label', '工作区导航');
+    nav.innerHTML = '<div class="workspace-nav-label">工作区</div>';
+    const add = (key, label, href) => {
+      const link = document.createElement('a'); link.className = 'workspace-link'; link.href = href;
+      link.setAttribute('aria-label', label); link.title = label;
+      if (document.body.dataset.workspace === key) link.setAttribute('aria-current', 'page');
+      if (key === 'director' && document.body.dataset.workspace === 'canvas') link.id = 'directorbtn';
+      link.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + icons[key] + '</svg><span></span>';
+      link.querySelector('span').textContent = label; nav.append(link);
+    };
+    add('canvas', '画布', '/'); add('director', '导演工作台', '/director');
+    if (user.role === 'admin' || user.team_leader) add('teams', '项目组', '/teams');
+    if (user.role === 'admin') {
+      const label = document.createElement('div'); label.className = 'workspace-nav-label management'; label.textContent = '管理'; nav.append(label);
+      add('controller', '运行面板', '/controller'); add('permissions', '账号与权限', '/admin/permissions');
+    }
+    rail.querySelector('.workspace-footer').before(nav);
+  }
   function mountAccount(container) {
+    mountWorkspace();
+    const workspace = container.closest('#workspace-nav');
     container.replaceChildren();
     if (localTest) {
       const badge = document.createElement('span'); badge.className = 'chip';
@@ -156,7 +252,11 @@
       container.append(badge);
       return;
     }
-    const who = document.createElement('span'); who.className = 'who'; who.textContent = user.username;
+    let trigger = null, menu = null;
+    const closeMenu = () => { if (menu?.matches(':popover-open')) menu.hidePopover(); };
+    const displayName = user.display_name?.trim() || user.username;
+    const who = document.createElement('span'); who.className = workspace ? 'account-name' : 'who';
+    who.textContent = workspace ? displayName : user.username;
     const role = document.createElement('span'); role.className = 'chip' + (user.role === 'admin' ? ' admin' : '');
     const dot = document.createElement('i'); dot.className = 'd';
     const roleText = user.role === 'admin' ? '管理员' : user.team_leader ? '组长' : '普通用户';
@@ -164,7 +264,11 @@
     const teams = document.createElement('a'); teams.className = 'btn sm'; teams.href = '/teams'; teams.textContent = '项目组';
     const password = document.createElement('button'); password.className = 'btn sm'; password.textContent = '修改密码';
     password.onclick = () => {
+      closeMenu();
       const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog';
+      dialog.setAttribute('aria-label', '修改密码');
+      dialog.addEventListener('keydown', event => event.stopPropagation());
+      dialog.addEventListener('close', () => { dialog.remove(); trigger?.focus(); }, {once:true});
       dialog.innerHTML = '<form><h2>修改密码</h2>'
         + '<label class="fld"><span>当前密码</span><input name="current_password" type="password" autocomplete="current-password" required></label>'
         + '<label class="fld"><span>新密码（至少 8 位）</span><input name="new_password" type="password" autocomplete="new-password" required minlength="8"></label>'
@@ -172,7 +276,7 @@
         + '<p class="auth-note">密码无需组合大小写、数字或符号，请勿使用 12345678 等常见弱密码。保存后需要重新登录。</p>'
         + '<p role="alert"></p>'
         + '<footer><button type="button" class="btn">取消</button><button type="submit" class="btn primary">保存</button></footer></form>';
-      dialog.querySelector('[type=button]').onclick = () => dialog.remove();
+      dialog.querySelector('[type=button]').onclick = () => dialog.close();
       dialog.querySelector('form').onsubmit = async event => {
         event.preventDefault(); const form = event.currentTarget;
         const alert = form.querySelector('[role=alert]');
@@ -197,10 +301,55 @@
       document.body.append(dialog); dialog.showModal();
     };
     const exit = document.createElement('button'); exit.className = 'btn sm'; exit.textContent = '退出登录';
-    exit.onclick = () => logout().catch(() => {});
-    container.append(who, role);
-    if (user.role === 'admin' || user.team_leader) container.append(teams);
-    container.append(password, exit);
+    exit.onclick = () => { closeMenu(); logout().catch(() => {}); };
+    if (!workspace) {
+      container.append(who, role);
+      if (user.role === 'admin' || user.team_leader) container.append(teams);
+      container.append(password, exit);
+      return;
+    }
+    trigger = document.createElement('button'); trigger.className = 'account-trigger'; trigger.type = 'button';
+    trigger.setAttribute('aria-label', '用户菜单：' + displayName); trigger.setAttribute('aria-expanded', 'false');
+    trigger.setAttribute('aria-controls', 'account-menu');
+    const avatar = document.createElement('span'); avatar.className = 'account-avatar'; avatar.setAttribute('aria-hidden', 'true');
+    avatar.textContent = Array.from(displayName)[0]?.toUpperCase() || '?';
+    trigger.append(avatar, who);
+    menu = document.createElement('div'); menu.className = 'account-menu'; menu.id = 'account-menu'; menu.popover = 'auto';
+    menu.setAttribute('aria-label', '账号菜单');
+    trigger.popoverTargetElement = menu;
+    const heading = document.createElement('div'); heading.className = 'account-menu-heading';
+    const name = document.createElement('b'); name.textContent = displayName;
+    const detail = document.createElement('small'); detail.textContent = user.username + ' · ' + roleText;
+    heading.append(name, detail);
+    const info = document.createElement('button'); info.type = 'button'; info.textContent = '用户信息';
+    info.onclick = () => {
+      closeMenu();
+      const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog'; dialog.setAttribute('aria-label', '用户信息');
+      dialog.innerHTML = '<form method="dialog"><h2>用户信息</h2><dl class="account-info"></dl><footer><button class="btn primary">关闭</button></footer></form>';
+      const list = dialog.querySelector('dl');
+      for (const [label, value] of [['姓名 / 花名', user.display_name?.trim() || '未填写'], ['用户名', user.username], ['角色', roleText], ['用户 ID', user.id]]) {
+        const term = document.createElement('dt'); term.textContent = label;
+        const definition = document.createElement('dd'); definition.textContent = value;
+        list.append(term, definition);
+      }
+      dialog.addEventListener('keydown', event => event.stopPropagation());
+      dialog.addEventListener('close', () => { dialog.remove(); trigger.focus(); }, {once:true});
+      document.body.append(dialog); dialog.showModal();
+    };
+    info.className = password.className = 'account-action'; exit.className = 'account-action danger';
+    menu.append(heading, info, password, exit);
+    menu.addEventListener('keydown', event => event.stopPropagation());
+    menu.addEventListener('beforetoggle', event => {
+      const open = event.newState === 'open'; trigger.setAttribute('aria-expanded', String(open));
+      if (open) {
+        const rect = trigger.getBoundingClientRect();
+        menu.style.left = Math.max(8, Math.min(rect.left, innerWidth - Math.min(260, innerWidth - 16) - 8)) + 'px';
+        menu.style.bottom = Math.max(8, innerHeight - rect.top + 8) + 'px';
+        menu.style.maxHeight = Math.max(44, rect.top - 16) + 'px';
+        window.addEventListener('resize', closeMenu);
+      } else window.removeEventListener('resize', closeMenu);
+    });
+    container.append(trigger, menu);
   }
   window.H3Auth = {request,json,me,requireUser,every,login,register,logout,mountAccount, get user(){return user;}, get active(){return !!user && !stopped;}};
 })();

@@ -18,6 +18,7 @@ const staticFiles = new Map([
 ]);
 const apiMethods = new Map([
   ['/api/auth/me', 'GET'], ['/api/auth/login', 'POST'], ['/api/auth/register', 'POST'],
+  ['/api/auth/presence', 'POST'],
 ]);
 const session = {user:{id:'fixture-user', username:'fixture-account', role:'user'}, csrf_token:'fixture-csrf'};
 const registration = {username:'fixture-account', display_name:'测试花名', password:'月光落在山间2026'};
@@ -49,6 +50,7 @@ async function withFixture(options, run) {
   const pendingResponses = new Set();
   const handlers = {
     '/api/auth/me': () => unauthorized,
+    '/api/auth/presence': () => ({status:200, body:{online_users:1}}),
     '/api/auth/login': () => ({status:200, body:session}),
     '/api/auth/register': request => ({status:201, body:{
       username:request.body.username, display_name:request.body.display_name, status:'pending',
@@ -230,7 +232,8 @@ test('已登录 me 成功后重定向根地址且不发送登录或注册请求'
   await withFixture({handlers:{'/api/auth/me': () => ({body:session})}}, async fixture => {
     await expectHome(fixture);
     assert.equal(fixture.requests.filter(request => request.url === '/api/auth/me').length, 1);
-    assert.deepEqual(posts(fixture), []);
+    assert.deepEqual(posts(fixture).filter(request => request.url !== '/api/auth/presence'), []);
+    for (const request of posts(fixture)) assert.equal(request.headers['x-csrf-token'], session.csrf_token);
   });
 });
 

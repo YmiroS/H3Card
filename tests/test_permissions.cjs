@@ -506,6 +506,129 @@ test('team leader page selects multiple members and submits one atomic batch saf
   }
 });
 
+test('workspace navigation keeps account actions at the bottom across pages and screen sizes', async () => {
+  let user = {id:'admin-1', username:'admin-account', display_name:'张三', role:'admin'};
+  let localTest = false;
+  const mutations = [];
+  const files = {'/':'index.html', '/director':'director.html', '/teams':'teams.html',
+    '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/director.js':'director.js',
+    '/director.css':'director.css', '/director_edit.js':'director_edit.js', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+  const reply = (res, body, status = 200) => { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(body)); };
+  const server = createServer((req, res) => {
+    const pathname = new URL(req.url, 'http://localhost').pathname;
+    if (pathname === '/api/auth/me') return reply(res, {user, csrf_token:'nav-csrf', local_test:localTest});
+    if (pathname === '/api/auth/presence') { req.resume(); return reply(res, {online_users:7}); }
+    if (pathname === '/api/auth/password' || pathname === '/api/auth/logout') {
+      const chunks = []; req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        mutations.push({path:pathname, body:JSON.parse(Buffer.concat(chunks).toString() || '{}'), csrf:req.headers['x-csrf-token']});
+        reply(res, pathname.endsWith('password') ? {error:'当前密码不正确'} : {ok:true}, pathname.endsWith('password') ? 400 : 200);
+      }); return;
+    }
+    const payloads = {'/api/cards':{cards:[], capabilities:{}, comfy_online:false, director_schema:1},
+      '/api/projects':{projects:[], teams:[]}, '/api/jobs':{jobs:[]}, '/api/health':{comfy_online:false},
+      '/api/teams':{teams:[]}, '/api/team-candidates':{users:[]}};
+    if (Object.hasOwn(payloads, pathname)) return reply(res, payloads[pathname]);
+    if (pathname === '/login') { res.setHeader('Content-Type','text/html'); return res.end('<h1>登录</h1>'); }
+    const file = files[pathname];
+    if (!file) { res.writeHead(404); return res.end(); }
+    res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
+    res.end(readFileSync(path.join(web, file)));
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  let browser;
+  try {
+    browser = await chromium.launch(browserOptions);
+    const page = await browser.newPage({viewport:{width:1440, height:900}});
+    page.setDefaultTimeout(10000);
+    const errors = []; page.on('pageerror', error => errors.push(error.message));
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    await page.goto(origin);
+    const trigger = page.locator('.account-trigger');
+    await trigger.waitFor();
+    assert.equal(await trigger.innerText(), '张\n张三');
+    assert.equal(await page.locator('#topbar #account, #topbar #directorbtn').count(), 0);
+    assert.deepEqual(await page.locator('.workspace-link').allTextContents(), ['画布', '导演工作台', '项目组', '运行面板', '账号与权限']);
+    assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'), '/');
+    await page.waitForFunction(() => document.querySelector('#online-count b').textContent === '7');
+    assert.equal(await page.locator('#online-count').innerText(), '7 人使用中');
+    assert.ok((await trigger.boundingBox()).y > 790, 'account is anchored at the bottom');
+    await trigger.focus(); await page.keyboard.press('Enter');
+    const menu = page.locator('#account-menu');
+    await menu.waitFor({state:'visible'});
+    assert.deepEqual(await menu.locator('button').allTextContents(), ['用户信息', '修改密码', '退出登录']);
+    await page.keyboard.press('Escape');
+    assert.equal(await trigger.getAttribute('aria-expanded'), 'false');
+    assert.equal(await trigger.evaluate(el => el === document.activeElement), true);
+    await trigger.click(); await page.locator('#empty .big').click();
+    assert.equal(await menu.isVisible(), false, 'click outside closes the account popover');
+    await trigger.click(); await menu.getByRole('button', {name:'用户信息', exact:true}).click();
+    const info = page.getByRole('dialog', {name:'用户信息', exact:true});
+    assert.deepEqual(await info.locator('dd').allTextContents(), ['张三', 'admin-account', '管理员', 'admin-1']);
+    await page.keyboard.press('Escape');
+    await info.waitFor({state:'detached'});
+    assert.equal(await page.locator('.auth-dialog').count(), 0);
+    assert.equal(await trigger.evaluate(el => el === document.activeElement), true);
+    await trigger.click(); await menu.getByRole('button', {name:'修改密码', exact:true}).click();
+    const password = page.getByRole('dialog', {name:'修改密码', exact:true});
+    await password.locator('[name="current_password"]').fill('old-password');
+    await password.locator('[name="new_password"]').fill('new-password');
+    await password.locator('[name="confirm_password"]').fill('not-the-same');
+    await password.getByRole('button', {name:'保存', exact:true}).click();
+    assert.equal(await password.getByRole('alert').textContent(), '两次输入的新密码不一致');
+    assert.equal(mutations.length, 0);
+    await password.locator('[name="confirm_password"]').fill('new-password');
+    await password.getByRole('button', {name:'保存', exact:true}).click();
+    await page.waitForFunction(() => document.querySelector('.auth-dialog [role="alert"]').textContent === '当前密码不正确');
+    assert.deepEqual(mutations, [{path:'/api/auth/password', body:{current_password:'old-password', new_password:'new-password'}, csrf:'nav-csrf'}]);
+    assert.equal(await password.locator('[name="new_password"]').inputValue(), 'new-password');
+    await password.getByRole('button', {name:'取消', exact:true}).click();
+    await trigger.click();
+    await page.screenshot({path:path.resolve(web, '..', '..', 'temp', 'chouka-workspace-nav-desktop.png')});
+    await page.keyboard.press('Escape');
+    await page.locator('#toggle').click();
+    assert.equal(await trigger.isVisible(), true, 'collapsing projects never hides account or navigation');
+    await page.setViewportSize({width:375, height:812}); await page.reload();
+    await trigger.waitFor();
+    assert.equal(await page.locator('#toggle').getAttribute('aria-expanded'), 'false');
+    assert.ok((await page.locator('#main').boundingBox()).width >= 300);
+    await trigger.click();
+    const box = await menu.boundingBox();
+    assert.ok(box.x >= 8 && box.x + box.width <= 375 && box.y >= 0 && box.y + box.height <= 812);
+    await page.screenshot({path:path.resolve(web, '..', '..', 'temp', 'chouka-workspace-nav-mobile.png')});
+    await page.keyboard.press('Escape');
+    await page.locator('#toggle').click();
+    assert.equal(await page.locator('#side').isVisible(), true);
+    await page.locator('#toggle').click();
+    await page.getByRole('link', {name:'导演工作台', exact:true}).click();
+    await page.waitForURL('**/director'); await trigger.waitFor();
+    assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'), '/director');
+    assert.equal(await page.locator('.sidebar [data-stage]').count(), 5, 'director workflow remains separate from site navigation');
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    await page.setViewportSize({width:1440, height:900});
+    await page.screenshot({path:path.resolve(web, '..', '..', 'temp', 'chouka-workspace-nav-director.png')});
+    await page.getByRole('link', {name:'项目组', exact:true}).click();
+    await page.waitForURL('**/teams'); await trigger.waitFor();
+    assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'), '/teams');
+    await page.setViewportSize({width:375, height:812});
+    assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    user = {...user, role:'user', display_name:'<img src=x onerror=alert(1)>'};
+    await page.goto(origin); await trigger.waitFor();
+    assert.equal(await page.locator('.workspace-link[href="/teams"], .workspace-link[href="/controller"]').count(), 0);
+    assert.equal(await trigger.locator('img').count(), 0, 'names are never parsed as HTML');
+    localTest = true; await page.reload();
+    await page.getByText('本地测试 · 免登录', {exact:true}).waitFor();
+    assert.equal(await trigger.count(), 0, 'local testing stays login-free');
+    localTest = false; await page.reload(); await trigger.click();
+    await menu.getByRole('button', {name:'退出登录', exact:true}).click();
+    await page.waitForURL('**/login');
+    assert.deepEqual(mutations.at(-1), {path:'/api/auth/logout', body:{}, csrf:'nav-csrf'});
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close(); server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('real auth client expires protected sessions and allows a subsequent anonymous login', async () => {
   let expired = false;
   const session = {user:{id:'u1', username:'admin', role:'admin'}, csrf_token:'test-csrf'};
