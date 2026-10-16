@@ -107,6 +107,8 @@ def stop_comfy(comfy_url):
 
 
 def start_launcher(launcher):
+    if re.search(r'[\s&|<>^()%!\"]', launcher.name):
+        raise RuntimeError(f"启动脚本文件名包含 cmd 不安全字符：{launcher.name}")
     flags = (
         getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
