@@ -324,15 +324,29 @@ function inputMaterials(g) {
   if(counts.every(([,value])=>value===0))return ['未使用图片、视频或音频'];
   return counts.flatMap(([label,value,unit])=>!known(value)?[`${label}数量未记录`]:value>0?[`${label} ${num(value)} ${unit}`]:[]);
 }
+function resolutionLabel(d,expected) {
+  const valid=value=>Number.isSafeInteger(value) && value>0;
+  const setting=typeof d.resolution==='string'?d.resolution.match(/^(\d+)\s*[x×]\s*(\d+)(?:\s*\(\d+:\d+\))?$/i):null;
+  const candidates=[[d.output_width,d.output_height],[d.width,d.height],setting?[Number(setting[1]),Number(setting[2])]:[],[expected.width,expected.height,'期望 ']];
+  const size=candidates.find(([width,height])=>valid(width) && valid(height));
+  if(size) {
+    const [width,height,prefix='']=size;
+    // 只标注精确匹配的常见尺寸，不按像素总量、短边或相近尺寸猜档位。
+    const levels={'640x360':'360p','640x480':'480p','854x480':'480p','1280x720':'720p','1920x1080':'1080p','2560x1440':'1440p','3840x2160':'4K'};
+    const level=levels[`${Math.max(width,height)}x${Math.min(width,height)}`];
+    return level?`${prefix}${level}${width<height?' 竖屏':''}（${num(width)} × ${num(height)}）`:`${prefix || '尺寸 '}${num(width)} × ${num(height)}`;
+  }
+  if(numeric(d.megapixels) && d.megapixels>0 && numeric(d.megapixels*100))return `约 ${num(d.megapixels*100)} 万像素（尺寸未记录）`;
+  return null;
+}
 function generationParameters(g,detailed=false) {
   const d={...g.spec?.parameters,...g.spec?.dimensions,...g.dimensions}, expected=g.spec?.expected || {}, parts=[];
   const duration=d.output_duration ?? d.duration ?? expected.duration;
   if(numeric(duration))parts.push(`请求时长 ${num(duration)} 秒`);
-  const width=d.output_width || d.width, height=d.output_height || d.height;
-  if(numeric(width) && numeric(height))parts.push(`尺寸 ${num(width)} × ${num(height)}`);
-  else if(numeric(expected.width) && numeric(expected.height))parts.push(`期望 ${num(expected.width)} × ${num(expected.height)}`);
-  if(numeric(d.megapixels))parts.push(`分辨率 ${num(d.megapixels)} MP`);
+  const resolution=resolutionLabel(d,expected);
+  if(resolution)parts.push(resolution);
   if(detailed) {
+    if(numeric(d.megapixels) && d.megapixels>0)parts.push(`像素设置 ${num(d.megapixels)} MP`);
     const values=[['帧率',d.output_fps ?? d.target_fps ?? d.fps ?? d.force_rate ?? expected.fps,' FPS'],['步数',d.steps,' 步'],['帧数',d.frames,' 帧'],['长边',d.scale_to_length,' px'],['批量',d.batch_size,'']];
     for(const [label,value,suffix] of values)if(numeric(value))parts.push(`${label} ${num(value)}${suffix}`);
   }
