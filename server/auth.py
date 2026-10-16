@@ -177,7 +177,8 @@ async def _local_test_request(request, handler):
     if request.headers.get('Origin') or request.headers.get('Sec-Fetch-Site') == 'cross-site':
         _check_source(request)
     path = request.path
-    if path.startswith('/agent/v1/') or (path.startswith('/api/auth/') and path != '/api/auth/me'):
+    local_auth_routes = {'/api/auth/me', '/api/auth/presence'}
+    if path.startswith('/agent/v1/') or (path.startswith('/api/auth/') and path not in local_auth_routes):
         raise web.HTTPForbidden(text='本地测试模式不提供账号管理或 Worker 接口')
     if path in ('/login', '/login.html'):
         raise web.HTTPFound('/')
@@ -318,6 +319,18 @@ async def me(request):
     return web.json_response(request['auth_session'])
 
 
+async def online_presence(request):
+    user = require_user(request)
+    now = time.monotonic()
+    window = request.app['online_presence_window']
+    active = request.app['online_presence']
+    active[user['id']] = now
+    expired = [user_id for user_id, last_seen in active.items() if last_seen <= now - window]
+    for user_id in expired:
+        active.pop(user_id, None)
+    return web.json_response({'online_users': len(active), 'window_seconds': window})
+
+
 async def logout(request):
     user = require_user(request)
     await call_store(request.app, 'logout', request.cookies.get(COOKIE, ''))
@@ -453,6 +466,7 @@ def register_auth_routes(app, web_root):
     for asset in AUTH_ASSETS:
         app.router.add_get(asset, public_asset)
     app.router.add_get('/api/auth/me', me)
+    app.router.add_post('/api/auth/presence', online_presence)
     app.router.add_post('/api/auth/login', login)
     app.router.add_post('/api/auth/register', register)
     app.router.add_post('/api/auth/logout', logout)

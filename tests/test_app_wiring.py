@@ -57,6 +57,15 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.get('/permissions.html')).status, 404)
         self.assertEqual((await self.client.get('/app.js')).status, 200)
 
+    async def test_online_presence_requires_login_and_counts_active_user(self):
+        response = await self.client.post('/api/auth/presence', headers=self.headers)
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())['online_users'], 1)
+
+        self.client.session.cookie_jar.clear()
+        response = await self.client.post('/api/auth/presence', headers=self.headers)
+        self.assertEqual(response.status, 401)
+
     async def test_auth_page_assets_are_explicitly_public(self):
         self.client.session.cookie_jar.clear()
         for route in ('/login', '/login.html'):

@@ -60,6 +60,7 @@
 
 (() => {
   let user = null, csrf = '', stopped = false, pendingMe = null, localTest = false;
+  let presenceStarted = false, presencePending = null;
   const controllers = new Set(), timers = new Set();
   function invalidate(redirect = true) {
     stopped = true; user = null; csrf = '';
@@ -101,9 +102,28 @@
     }
   }
   const json = (path, method, body) => request(path, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body || {})});
+  async function refreshPresence() {
+    if (stopped || document.hidden) return;
+    if (!presencePending) presencePending = json('/api/auth/presence', 'POST').then(data => {
+      window.dispatchEvent(new CustomEvent('h3auth:presence', {detail:data}));
+      return data;
+    }).finally(() => { presencePending = null; });
+    return presencePending;
+  }
+  function startPresence() {
+    if (presenceStarted) return;
+    presenceStarted = true;
+    refreshPresence().catch(() => {});
+    every(refreshPresence, 30000);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) refreshPresence().catch(() => {});
+    });
+  }
   async function me() {
     if (!pendingMe) pendingMe = request('/api/auth/me', {cache:'no-store'}).then(data => {
-      user = data.user; csrf = data.csrf_token; localTest = data.local_test === true; return user;
+      user = data.user; csrf = data.csrf_token; localTest = data.local_test === true;
+      startPresence();
+      return user;
     }).finally(() => { pendingMe = null; });
     return pendingMe;
   }

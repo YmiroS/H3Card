@@ -3204,6 +3204,8 @@ def make_app(auth_path=None):
     app["project_locks"] = defaultdict(asyncio.Lock)
     app["presence_rooms"] = defaultdict(dict)
     app["presence_versions"] = defaultdict(int)
+    app["online_presence"] = {}
+    app["online_presence_window"] = 90
     app["presence_access_changed"] = partial(handle_presence_access_changed, app)
     register_auth_routes(app, ROOT / "web")
     register_edit_routes(app, sys.modules[__name__])

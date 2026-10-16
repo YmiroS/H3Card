@@ -1130,6 +1130,10 @@ function hoverTip(node, contentGetter) {
 }
 
 /* ================= 启动 ================= */
+const onlineCount = document.querySelector('#online-count b');
+window.addEventListener('h3auth:presence', event => {
+  if (onlineCount) onlineCount.textContent = String(event.detail.online_users);
+});
 const bootReady = (async function boot() {
   try {
     await H3Auth.requireUser();
