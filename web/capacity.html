@@ -111,6 +111,11 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 .matrix-samples button { padding:4px 8px; }
 .matrix-empty { color:var(--muted); }
 .simple-table select { max-width:100%; padding:5px 7px; }
+.selected-spec { margin:8px 0 0; }
+.selected-spec dt { font-size:11px; margin-top:6px; }
+.selected-spec dd { margin-top:2px; }
+.input-materials { display:flex; flex-wrap:wrap; gap:2px 12px; }
+.input-materials span { overflow-wrap:anywhere; }
 .business-title { font-size:13px; font-weight:600; }
 .mean-time { display:block; font-size:18px; font-weight:600; font-variant-numeric:tabular-nums; }
 .model-label { display:block; font-size:13px; font-weight:600; }
@@ -311,15 +316,30 @@ function friendlyTime(value) {
   const seconds=Math.round(value), minutes=Math.floor(seconds/60), rest=seconds%60;
   return minutes?`${num(minutes)} 分 ${rest} 秒`:`${rest} 秒`;
 }
-function simpleSpec(g) {
+function inputMaterials(g) {
+  const d={...g.spec?.dimensions,...g.dimensions};
+  const counts=[['图片',d.image_count,'张'],['视频',d.video_count,'段'],['音频',d.audio_count,'段']];
+  const known=value=>Number.isSafeInteger(value) && value>=0;
+  if(counts.every(([,value])=>!known(value)))return ['素材信息未记录'];
+  if(counts.every(([,value])=>value===0))return ['未使用图片、视频或音频'];
+  return counts.flatMap(([label,value,unit])=>!known(value)?[`${label}数量未记录`]:value>0?[`${label} ${num(value)} ${unit}`]:[]);
+}
+function generationParameters(g,detailed=false) {
   const d={...g.spec?.parameters,...g.spec?.dimensions,...g.dimensions}, expected=g.spec?.expected || {}, parts=[];
+  const duration=d.output_duration ?? d.duration ?? expected.duration;
+  if(numeric(duration))parts.push(`请求时长 ${num(duration)} 秒`);
   const width=d.output_width || d.width, height=d.output_height || d.height;
-  if(numeric(width) && numeric(height))parts.push(`${num(width)} × ${num(height)}`);
+  if(numeric(width) && numeric(height))parts.push(`尺寸 ${num(width)} × ${num(height)}`);
   else if(numeric(expected.width) && numeric(expected.height))parts.push(`期望 ${num(expected.width)} × ${num(expected.height)}`);
-  const values=[['时长',d.output_duration ?? d.duration ?? expected.duration,' 秒'],['帧率',d.output_fps ?? d.target_fps ?? d.fps ?? d.force_rate ?? expected.fps,' FPS'],['分辨率',d.megapixels,' MP'],['输入',d.image_count,' 张图'],['步数',d.steps,' 步'],['帧数',d.frames,' 帧'],['长边',d.scale_to_length,' px'],['批量',d.batch_size,'']];
-  for(const [label,value,suffix] of values)if(numeric(value))parts.push(`${label} ${num(value)}${suffix}`);
-  if(!parts.length || !(numeric(width) && numeric(height)) && !(numeric(expected.width) && numeric(expected.height)))parts.push('规格未完整记录');
-  return parts.join(' / ');
+  if(numeric(d.megapixels))parts.push(`分辨率 ${num(d.megapixels)} MP`);
+  if(detailed) {
+    const values=[['帧率',d.output_fps ?? d.target_fps ?? d.fps ?? d.force_rate ?? expected.fps,' FPS'],['步数',d.steps,' 步'],['帧数',d.frames,' 帧'],['长边',d.scale_to_length,' px'],['批量',d.batch_size,'']];
+    for(const [label,value,suffix] of values)if(numeric(value))parts.push(`${label} ${num(value)}${suffix}`);
+  }
+  return parts.join(' / ') || '规格未完整记录';
+}
+function simpleSpec(g) {
+  return `${inputMaterials(g).join(' + ')}｜${generationParameters(g)}`;
 }
 function preferredGroup(groups) {
   // 只选择原分组，不重算或合并不同配置、规格、来源和缓存的均值。
@@ -423,6 +443,10 @@ function appendModelDetails(node,summary,origin) {
 }
 function summaryEvidence(g) {
   const node=el('div',null,'pad');
+  node.append(el('p',`输入素材：${inputMaterials(g).join(' / ')}`),el('p',`生成参数：${generationParameters(g,true)}`));
+  const d={...g.spec?.dimensions,...g.dimensions};
+  if(numeric(d.source_duration))node.append(el('p',`首个输入视频时长：${num(d.source_duration)} 秒（非多段视频合计）`,'hint'));
+  node.append(el('p','素材数量按任务输入槽位计，同一文件被多次引用也会分别计数；生成参数不是成品实测规格。','hint'));
   node.append(el('p',`来源：${source(g.source)}；有效耗时样本 ${num(g.measured)} / 总样本 ${num(g.samples)}；成功 ${num(g.done)} / 失败 ${num(g.error)} / 取消 ${num(g.canceled)}`),el('p',`P90：${friendlyTime(g.p90_seconds)}；最近成功样本：${when(g.last_sample_at)}`),el('p','平均值仅使用该组成功任务执行耗时；不包含排队，不等于纯 GPU 计算时间，也不是合格日产能。','hint'));
   node.append(el('p',`执行时配置：${hardwareSummary(g.config)}（${configSource(g.config_source)}）`),el('p',`缓存条件：${text(g.cache_condition)}`));
   const evidence=modelEvidence(g);
@@ -485,14 +509,17 @@ function renderMachineSummary() {
       const select=el('select',null,'summary-spec');select.setAttribute('aria-label',`${w.name || '机器'} ${title}任务规格`);
       const names=entries.map(simpleSpec);
       entries.forEach((g,i)=>option(select,g.id,`${names[i]}${names.filter(name=>name===names[i]).length>1?` · ${source(g.source)} · ${numeric(g.last_sample_at)?when(g.last_sample_at):'日期未记录'} · 采样 ${i+1}`:''}`));
-      const selectedSpec=el('p',null,'hint selected-spec');select.value=preferredGroup(entries).id;spec.append(select,selectedSpec);
+      const selectedSpec=el('dl',null,'selected-spec'), materials=el('dd',null,'input-materials'), parameters=el('dd',null,'generation-parameters');
+      selectedSpec.append(el('dt','输入素材'),materials,el('dt','生成参数'),parameters);
+      select.value=preferredGroup(entries).id;spec.append(select,selectedSpec);
       const evidence=el('div',null,'summary-evidence');evidence.hidden=true;evidence.id=`summary-evidence-${++detailNumber}`;
       const sample=el('div',null,'matrix-samples'), count=el('p'), button=el('button','查看详情','summary-detail-toggle');sample.dataset.label='样本与详情';
       button.type='button';button.setAttribute('aria-expanded','false');button.setAttribute('aria-controls',evidence.id);sample.append(count,button);
       button.onclick=()=>{evidence.hidden=!evidence.hidden;button.setAttribute('aria-expanded',String(!evidence.hidden));button.textContent=evidence.hidden?'查看详情':'收起详情';};
       const update=()=>{
         const g=entries.find(item=>item.id===select.value);content.dataset.selectedGroupId=g.id;
-        selectedSpec.textContent=simpleSpec(g);
+        materials.replaceChildren(...inputMaterials(g).map(value=>el('span',value)));
+        parameters.textContent=generationParameters(g);
         time.replaceChildren(el('span',hasMean(g)?friendlyTime(g.mean_seconds):'暂无成功耗时',hasMean(g)?'mean-time':'muted'));
         renderModelCells(g,namesCell,precisionCell,time);
         if(hasMean(g) && (g.mean_seconds<1 || g.mean_seconds>3600))time.append(el('p','耗时异常，请核对详情','warn hint'));
