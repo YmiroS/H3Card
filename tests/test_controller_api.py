@@ -1675,7 +1675,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn("<title>运行面板</title>", dashboard)
         self.assertIn('id="worker-cards" class="worker-grid"', dashboard)
         self.assertIn("GPU 利用率", dashboard)
-        self.assertIn("一键同步全部节点", dashboard)
+        self.assertIn("一键更新全部节点", dashboard)
         self.assertIn("/controller/costs", dashboard)
 
         response = await self.client.get("/controller/costs")
