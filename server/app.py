@@ -1475,6 +1475,12 @@ def job_node_names(app, jobs):
     return {job["id"]: "本机" for job in jobs}
 
 
+async def job_submitter_info(request, jobs):
+    if require_user(request)['role'] != 'admin':
+        return {}
+    return await call_store(request.app, 'job_submitters', [job['id'] for job in jobs])
+
+
 async def api_job(request):
     pid = request.match_info["pid"]
     permission = await authorized_job(request, pid)
@@ -1482,8 +1488,9 @@ async def api_job(request):
     if not job:
         raise web.HTTPNotFound(reason="没有这个任务")
     node_name = job_node_names(request.app, [job]).get(pid)
+    submitters = await job_submitter_info(request, [job])
     return web.json_response(
-        job | job_display_info(job, node_name) | {"permission": permission}
+        job | job_display_info(job, node_name) | submitters.get(pid, {}) | {"permission": permission}
     )
 
 
@@ -1495,9 +1502,12 @@ async def api_jobs(request):
             visible.append((job, permission))
         if len(visible) == 60:
             break
-    node_names = job_node_names(request.app, [job for job, _permission in visible])
+    jobs = [job for job, _permission in visible]
+    node_names = job_node_names(request.app, jobs)
+    submitters = await job_submitter_info(request, jobs)
     return web.json_response({"jobs": [
-        job | job_display_info(job, node_names.get(job["id"])) | {"permission": permission}
+        job | job_display_info(job, node_names.get(job["id"]))
+        | submitters.get(job['id'], {}) | {"permission": permission}
         for job, permission in visible
     ]})
 

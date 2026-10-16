@@ -8,13 +8,15 @@ const { chromium } = require('playwright');
 
 test('recent jobs show their recorded mode separately from card names', async () => {
   const html = readFileSync(path.join(__dirname, '..', 'web', 'controller.html'));
-  const base = {project:'project-1', cardName:'生视频', created:1789535317, progress:1};
+  const base = {project:'project-1', cardName:'生视频', created:1789535317, progress:1,
+    submitter_id:'member', submitter_username:'zhangsan', submitter_display_name:'张三'};
   const jobs = [
     {...base, id:'high-quality', status:'done', capability:'minimax_h3_ref_2pass', name:'H3全能参考(高质量)'},
     {...base, id:'image-video', status:'running', capability:'minimax_h3_i2v', name:'H3图生视频', progress:0.5},
-    {...base, id:'legacy-id', status:'queued', capability:'legacy_video_mode', progress:0},
-    {...base, id:'legacy-unknown', status:'done'},
-    {...base, id:'escaped-name', status:'error', name:'<img src=x onerror="window.injected=true">'},
+    {...base, id:'legacy-id', status:'queued', capability:'legacy_video_mode', progress:0, submitter_display_name:' '},
+    {...base, id:'legacy-unknown', status:'done', submitter_display_name:null, submitter_username:null},
+    {...base, id:'escaped-name', status:'error', name:'<img src=x onerror="window.injected=true">',
+      submitter_display_name:'<img src=x onerror="window.injected=true">'},
   ];
   const payloads = {
     '/api/auth/me': {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'test-csrf'},
@@ -22,12 +24,21 @@ test('recent jobs show their recorded mode separately from card names', async ()
     '/api/status': {running_count:1, queued_count:1},
     '/api/workers': {workers:[]},
     '/api/jobs': {jobs},
-    '/api/projects': {projects:[{id:'project-1', name:'模式展示测试'}]},
+    '/api/cards': {cards:[], capabilities:{}, comfy_online:false},
+    '/api/projects': {projects:[{id:'project-1', name:'模式展示测试', owner_id:'admin', permission:'operate', cards:0}]},
+    '/api/projects/project-1': {id:'project-1', name:'模式展示测试', permission:'operate', cards:[], edges:[], groups:[], view:{}, rev:0},
   };
   const server = createServer((req, res) => {
-    if (req.url === '/auth.js') {
-      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-      return res.end(readFileSync(path.join(__dirname, '..', 'web', 'auth.js')));
+    if (req.url === '/api/auth/presence') {
+      req.resume(); res.setHeader('Content-Type', 'application/json'); return res.end('{"online_users":1}');
+    }
+    const files = {'/':'index.html', '/auth.js':'auth.js', '/app.js':'app.js', '/style.css':'style.css',
+      '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+    const file = files[new URL(req.url, 'http://localhost').pathname];
+    if (file) {
+      res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript; charset=utf-8'
+        : file.endsWith('.css') ? 'text/css' : file.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
+      return res.end(readFileSync(path.join(__dirname, '..', 'web', file)));
     }
     if (Object.hasOwn(payloads, req.url)) {
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
@@ -47,11 +58,13 @@ test('recent jobs show their recorded mode separately from card names', async ()
     await page.goto('http://127.0.0.1:' + server.address().port + '/controller');
     await page.waitForFunction(() => document.querySelectorAll('#job-rows tr').length === 5);
     assert.deepEqual(await page.locator('thead th').allTextContents(),
-      ['状态', '项目 / 卡片', '模式', '过程进度', '执行端', '创建时间', '耗时 / 错误']);
+      ['状态', '姓名 / 项目 / 卡片', '模式', '过程进度', '执行端', '创建时间', '耗时 / 错误']);
     assert.deepEqual(await page.locator('#job-rows .job-mode').allTextContents(),
       ['H3全能参考(高质量)', 'H3图生视频', 'legacy_video_mode', '未记录', jobs[4].name]);
     assert.equal(await page.locator('#job-rows .job-mode').first().getAttribute('title'), 'minimax_h3_ref_2pass');
-    assert.equal(await page.locator('#job-rows .job-origin').first().innerText(), '模式展示测试\n卡片 · 生视频');
+    assert.equal(await page.locator('#job-rows .job-origin').first().innerText(), '张三\n模式展示测试\n卡片 · 生视频');
+    assert.deepEqual(await page.locator('.job-submitter').allTextContents(), ['张三', '张三', 'zhangsan', '未记录提交人', jobs[4].submitter_display_name]);
+    assert.equal(await page.locator('#job-rows .job-origin').first().getAttribute('title'), '张三 - 模式展示测试 - 生视频');
     assert.equal(await page.locator('#job-rows tr').first().locator('td').count(), 7);
     assert.equal(await page.locator('#job-rows img').count(), 0);
     assert.equal(await page.evaluate(() => window.injected), undefined);
@@ -62,6 +75,19 @@ test('recent jobs show their recorded mode separately from card names', async ()
     if (process.env.CHOUKA_TEST_SCREENSHOT) {
       await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT, fullPage:true});
     }
+    await page.goto('http://127.0.0.1:' + server.address().port + '/');
+    await page.locator('#jobsbtn').click();
+    await page.waitForFunction(() => document.querySelectorAll('.jrow').length === 5);
+    assert.deepEqual(await page.locator('.jowner').allTextContents(), ['张三', '张三', 'zhangsan', '未记录提交人', jobs[4].submitter_display_name]);
+    assert.match(await page.locator('.jrow .nm').first().getAttribute('title'), /^张三 - 模式展示测试 - 已改名的卡片/);
+    assert.equal(await page.locator('.jrow img').count(), 0);
+    assert.equal(await page.evaluate(() => window.injected), undefined);
+    jobs[0].submitter_display_name = '李四';
+    await page.evaluate(() => pollJobs());
+    assert.equal(await page.locator('.jowner').first().textContent(), '李四', 'polling refreshes names without a status change');
+    assert.equal(await page.locator('.jrow').first().locator('.st').textContent(), '已完成');
+    await page.evaluate(() => { H3Auth.user.role = 'user'; el.jobs._sig = null; renderJobs(); });
+    assert.equal(await page.locator('.jowner').count(), 0, 'ordinary accounts keep their existing task presentation');
     assert.deepEqual(errors, []);
   } finally {
     if (browser) await browser.close();

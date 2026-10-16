@@ -99,6 +99,46 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
         self.assertEqual((await self.client.get('/api/projects')).status, 401)
 
+    async def test_admin_job_names_use_submitter_not_project_owner(self):
+        submitter = self.auth.create_user('submitter', PASSWORD)
+        with self.auth.db:
+            self.auth.db.execute('UPDATE users SET display_name=? WHERE id=?', ('张三', submitter['id']))
+        self.own_project('task-project', name='管理员的项目')
+        self.register_job('job-by-member', 'task-project', owner=submitter)
+        job = {'id': 'job-by-member', 'project': 'task-project', 'projectName': '管理员的项目',
+               'card': 'card-1', 'cardName': '主角视频', 'name': 'H3图生视频',
+               'status': 'queued', 'created': time.time(), 'progress': 0}
+        with mock.patch.dict(controller_app.JOBS, {job['id']: job}, clear=True), \
+                mock.patch.object(controller_app, 'CONTROLLER_MODE', False):
+            listed = await (await self.client.get('/api/jobs')).json()
+            result = listed['jobs'][0]
+            self.assertEqual(result['submitter_id'], submitter['id'])
+            self.assertNotEqual(result['submitter_id'], self.admin['id'])
+            self.assertEqual(result['submitter_username'], 'submitter')
+            self.assertEqual(result['submitter_display_name'], '张三')
+            self.assertEqual((result['projectName'], result['cardName']), ('管理员的项目', '主角视频'))
+            detail = await (await self.client.get('/api/job/job-by-member')).json()
+            self.assertEqual(detail['submitter_display_name'], '张三')
+            self.assertNotIn('submitter_display_name', controller_app.JOBS[job['id']])
+            self.assertEqual(self.auth.job_submitters(['missing-job']), {})
+            self.assertEqual(self.auth.job_submitters([]), {})
+            with self.auth.db:
+                self.auth.db.execute('UPDATE users SET display_name=? WHERE id=?', ('李四', submitter['id']))
+            updated = await (await self.client.get('/api/jobs')).json()
+            self.assertEqual(updated['jobs'][0]['submitter_display_name'], '李四')
+
+            await self.login('submitter')
+            self.assertEqual((await (await self.client.get('/api/jobs')).json())['jobs'], [])
+            self.assertEqual((await self.client.get('/api/job/job-by-member')).status, 404)
+            self.auth.set_grant(submitter['id'], self.admin['id'], 'read')
+            shared = (await (await self.client.get('/api/jobs')).json())['jobs'][0]
+            self.assertEqual(shared['permission'], 'read')
+            self.assertFalse(any(key.startswith('submitter_') for key in shared))
+            detail = await (await self.client.get('/api/job/job-by-member')).json()
+            self.assertFalse(any(key.startswith('submitter_') for key in detail))
+            self.auth.delete_grant(submitter['id'], self.admin['id'])
+            self.assertEqual((await (await self.client.get('/api/jobs')).json())['jobs'], [])
+
     async def test_project_crud_permission_flow(self):
         bob = self.auth.create_user('bob', PASSWORD)
         created = await (await self.client.post(
