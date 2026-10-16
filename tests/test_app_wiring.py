@@ -2,6 +2,8 @@
 import asyncio
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -429,6 +431,124 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.post('/api/projects', json={'name': '越权', 'team_id': team['id']},
                                                  headers=outsider_headers)).status, 403)
         self.assertFalse(outsider['team_leader'])
+
+
+class CapacityProbeWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
+    async def asyncSetUp(self):
+        self.auth_setup()
+        self.addCleanup(self.auth_teardown)
+        self.own_project("capacity-project")
+        database = self.root / "data" / "control.db"
+        distributed_type, costs_type = controller_app.DistributedStore, controller_app.CostLedger
+        resource_type = controller_app.ResourceAccess
+        # 保留真实 make_app、中间件、启动/停止钩子；仅将持久化位置隔离到临时目录。
+        patches = (
+            mock.patch.object(controller_app, "CONTROLLER_MODE", True),
+            mock.patch.object(controller_app, "EXECUTION_MODE", "controller"),
+            mock.patch.dict(controller_app.JOBS, {}, clear=True),
+            mock.patch.object(controller_app, "load_jobs", return_value=None),
+            mock.patch.object(controller_app, "DistributedStore", side_effect=lambda _: distributed_type(database)),
+            mock.patch.object(controller_app, "CostLedger", side_effect=lambda *_: costs_type(database, ROOT / "pricing.json")),
+            mock.patch.object(controller_app, "ResourceAccess", side_effect=lambda store, *_: resource_type(store, self.root)),
+            mock.patch.dict("os.environ", {"CHOUKA_LOCAL_TEST": "0"}),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        application = controller_app.make_app(auth_path=self.root / "data" / "auth.db")
+        self.client = TestClient(TestServer(application))
+        self.addAsyncCleanup(self.client.close)
+        await self.client.start_server()
+        self.origin = str(self.client.make_url("/")).rstrip("/")
+        self.headers = await self.login()
+        self.application = application
+        self.store = application["distributed"]
+        self.pid = "wiring-capacity-final"
+        self.locator = f"{self.pid}/output.mp4"
+        folder = self.root / "data" / "artifacts" / self.pid
+        folder.mkdir(parents=True)
+        (folder / "output.mp4").write_bytes(b"synthetic-video")
+        self.application["resource_access"].register("capacity-project", "artifact", self.locator)
+        worker = self.store.register_worker("真实装配回归机器", {})
+        now = time.time() - 200
+        job = {"id": self.pid, "capability": "minimax_h3_ref_2pass", "status": "queued",
+               "created": now, "worker_id": worker["worker_id"],
+               "outputs": [{"url": "/api/artifact/" + self.locator}]}
+        self.application["costs"].record_job(job)
+        self.application["costs"].start_job(self.pid, worker["worker_id"], now + 1)
+        self.application["costs"].finish_job(self.pid, "done", now + 61, worker["worker_id"])
+        controller_app.JOBS[self.pid] = dict(job, status="done")
+        self.url = f"/api/capacity/jobs/{self.pid}/probe-outputs"
+
+    async def test_make_app_probe_route_state_admin_and_csrf_are_really_wired(self):
+        self.assertEqual(self.application["capacity_probe_state"], {"task": None})
+        metadata = {"kind": "video", "width": 1312, "height": 736, "duration": 2, "valid": True}
+        with mock.patch.object(controller_app, "probe_capacity_output", return_value=metadata) as probe:
+            response = await self.client.post(self.url, json={"offset": 0}, headers=self.headers)
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual((await response.json())["recorded"], 1)
+            probe.assert_called_once()
+            self.assertIsNone(self.application["capacity_probe_state"]["task"])
+            response = await self.client.get("/api/capacity?limit=1&offset=100")
+            self.assertEqual(response.status, 200, await response.text())
+            report = await response.json()
+            self.assertEqual(report["details"], [])
+            self.assertEqual(report["groups"][0]["output_resolution"]["variants"], [
+                {"kind": "video", "width": 1312, "height": 736, "outputs": 1, "samples": 1}])
+            self.assertFalse(report["groups"][0]["eligible"])
+            self.assertEqual((await self.client.post(self.url, json={"offset": 0},
+                                                     headers={"Origin": self.origin})).status, 403)
+            self.auth.create_user("capacity-wiring-reader", PASSWORD)
+            reader_headers = await self.login("capacity-wiring-reader")
+            self.assertEqual((await self.client.post(self.url, json={"offset": 0}, headers=reader_headers)).status, 403)
+            self.client.session.cookie_jar.clear()
+            self.assertEqual((await self.client.post(self.url, json={"offset": 0}, headers=self.headers)).status, 401)
+            probe.assert_called_once()
+
+    async def test_make_app_shutdown_waits_for_probe_before_closing_databases(self):
+        started, stopping, release = asyncio.Event(), asyncio.Event(), threading.Event()
+        loop = asyncio.get_running_loop()
+        original_close_presence = controller_app.close_presence_connections
+
+        def blocked_probe():
+            loop.call_soon_threadsafe(started.set)
+            if not release.wait(5):
+                raise AssertionError("停服回归未释放后台线程")
+            # 后台真正结束前，两个资源库都必须仍可访问。
+            self.store.db.execute("SELECT 1").fetchone()
+            self.application["auth_store"].get_user(self.admin["id"])
+
+        async def signal_stopping(app):
+            await original_close_presence(app)
+            stopping.set()
+
+        task = asyncio.create_task(asyncio.to_thread(blocked_probe))
+        self.application["capacity_probe_state"]["task"] = task
+        closing = None
+        with mock.patch.object(controller_app, "close_presence_connections", side_effect=signal_stopping), \
+             mock.patch.object(self.store, "close", wraps=self.store.close) as close_store:
+            try:
+                await asyncio.wait_for(started.wait(), 2)
+                closing = asyncio.create_task(self.client.server.close())
+                await asyncio.wait_for(stopping.wait(), 2)
+                self.assertTrue(self.application["lifecycle"]["shutting_down"])
+                self.assertFalse(closing.done())
+                close_store.assert_not_called()
+                self.assertEqual(self.store.db.execute("SELECT 1").fetchone()[0], 1)
+            finally:
+                release.set()
+                await asyncio.wait_for(asyncio.shield(task), 2)
+                if closing is not None:
+                    await asyncio.wait_for(closing, 2)
+            close_store.assert_called_once()
+
+    async def test_make_app_shutdown_rejects_new_capacity_probe(self):
+        self.application["lifecycle"]["shutting_down"] = True
+        with mock.patch.object(controller_app, "probe_capacity_output") as probe:
+            response = await self.client.post(self.url, json={"offset": 0}, headers=self.headers)
+            self.assertEqual(response.status, 503, await response.text())
+            probe.assert_not_called()
+        self.assertIsNone(self.store.capacity.output_recovery(self.pid))
 
 
 if __name__ == '__main__':
