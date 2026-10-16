@@ -1,5 +1,7 @@
 """缩略图专项：真实 FFmpeg 媒体、共享任务生命周期及真实 HTTP 权限边界。"""
 import asyncio
+import hashlib
+import json
 import os
 import struct
 import sys
@@ -91,6 +93,51 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(self.source.stat().st_mtime_ns, before.st_mtime_ns)
                 self.assertFalse(list(self.service.directory.glob("*.part.png")))
 
+    async def test_real_original_images_dimensions_alpha_and_independent_cache(self):
+        for extension, size in ((".png", (1600, 1200)), (".jpg", (1600, 3200))):
+            with self.subTest(extension=extension):
+                source = self.root / ("large" + extension)
+                contents = png(*size) if extension == ".png" else await jpeg(*size)
+                source.write_bytes(contents)
+                stat = source.stat()
+                legacy_identity = json.dumps(
+                    [str(source.resolve()), stat.st_mtime_ns, stat.st_size, "png-rgba-512-v1"],
+                    ensure_ascii=False, separators=(",", ":"))
+                legacy_key = hashlib.sha256(legacy_identity.encode("utf-8")).hexdigest()
+                self.assertEqual(self.service.source_key(source)[1], legacy_key)
+                self.assertEqual(self.service.source_key(source, original=False)[1], legacy_key)
+                with mock.patch("video_preview.asyncio.create_subprocess_exec",
+                                wraps=asyncio.create_subprocess_exec) as spawn:
+                    original = await self.service.get(source, original=True)
+                args = spawn.call_args.args
+                self.assertEqual(args[args.index("-vf") + 1], "setsar=1")
+                self.assertEqual(dimensions(original.read_bytes()), size)
+                self.assertEqual(original.read_bytes()[25], 6)
+                self.assertEqual(original.stem, self.service.source_key(source, original=True)[1])
+                small = await self.service.get(source)
+                self.assertEqual(small.stem, legacy_key)
+                self.assertNotEqual(original, small)
+                self.assertEqual(max(dimensions(small.read_bytes())), 512)
+                if extension == ".png":
+                    pixels = await ffmpeg("-threads", "1", "-i", original, "-frames:v", "1",
+                                          "-threads", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1")
+                    self.assertEqual(pixels, bytes((220, 30, 10, 80)) * (size[0] * size[1]))
+                with mock.patch("video_preview.asyncio.create_subprocess_exec",
+                                side_effect=AssertionError("两种尺寸的缓存均不应重新编码")):
+                    other = MediaThumbnails(self.service.directory, controller_app.ffmpeg_bin, {extension})
+                    try:
+                        for service in (self.service, other):
+                            self.assertEqual(await service.get(source), small)
+                            self.assertEqual(await service.get(source, original=True), original)
+                    finally:
+                        await other.close()
+                self.assertEqual(source.read_bytes(), contents)
+                self.assertEqual(source.stat().st_mtime_ns, stat.st_mtime_ns)
+                os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+                self.assertNotEqual(self.service.source_key(source)[1], small.stem)
+                self.assertNotEqual(self.service.source_key(source, original=True)[1], original.stem)
+        self.assertFalse(list(self.service.directory.glob("*.part.png")))
+
     async def test_real_video_first_frame_only_and_rotation(self):
         video = self.root / "video.mp4"
         await ffmpeg("-f", "lavfi", "-i", "color=red:s=1024x768:r=2:d=1",
@@ -100,17 +147,22 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
                      "-threads", "1", video)
         rotated = self.root / "rotated.mp4"
         await ffmpeg("-display_rotation", "90", "-i", video, "-c", "copy", rotated)
-        for source, expected in ((video, (512, 384)), (rotated, (384, 512))):
-            with self.subTest(source=source.name):
-                original = source.read_bytes()
-                result = await self.service.get(source)
-                self.assertEqual(dimensions(result.read_bytes()), expected)
-                pixels = await ffmpeg("-threads", "1", "-i", result, "-frames:v", "1",
-                                      "-threads", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1")
-                self.assertGreater(pixels[0], 240)
-                self.assertLess(pixels[2], 10)
-                self.assertEqual(pixels[3], 255)
-                self.assertEqual(source.read_bytes(), original)
+        for source, full_size in ((video, (1024, 768)), (rotated, (768, 1024))):
+            for original_size in (False, True):
+                with self.subTest(source=source.name, original=original_size):
+                    await self.check_video_frame(source, full_size, original=original_size)
+
+    async def check_video_frame(self, source, full_size, *, original):
+        expected = full_size if original else tuple(size // 2 for size in full_size)
+        contents = source.read_bytes()
+        result = await self.service.get(source, original=original)
+        self.assertEqual(dimensions(result.read_bytes()), expected)
+        pixels = await ffmpeg("-threads", "1", "-i", result, "-frames:v", "1",
+                              "-threads", "1", "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1")
+        self.assertGreater(pixels[0], 240)
+        self.assertLess(pixels[2], 10)
+        self.assertEqual(pixels[3], 255)
+        self.assertEqual(source.read_bytes(), contents)
 
     async def test_real_jfif_jpeg_single_image_and_original_unchanged(self):
         for size, expected in (((1600, 3200), (256, 512)), ((3200, 1600), (512, 256))):
@@ -170,9 +222,10 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_real_jpeg_exif_orientation(self):
         jpeg = self.root / "oriented.jpg"
+        self.source.write_bytes(png(1024, 768))
         await ffmpeg("-i", self.source, "-frames:v", "1", "-threads", "1", jpeg)
         original = jpeg.read_bytes()
-        # EXIF 方向 6：原始 64×32 横图应呈现为 32×64 竖图。
+        # EXIF 方向 6：原始 1024×768 横图应呈现为 768×1024 竖图。
         tiff = (b"II" + struct.pack("<HIH", 42, 8, 1)
                 + struct.pack("<HHI", 0x112, 3, 1) + struct.pack("<H", 6) + b"\x00\x00"
                 + struct.pack("<I", 0))
@@ -180,9 +233,11 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
         jpeg.write_bytes(original[:2] + b"\xff\xe1" + struct.pack(">H", len(exif) + 2)
                          + exif + original[2:])
         original = jpeg.read_bytes()
-        result = await self.service.get(jpeg)
-        self.assertEqual(dimensions(result.read_bytes()), (32, 64))
-        self.assertEqual(jpeg.read_bytes(), original)
+        for original_size, expected in ((False, (384, 512)), (True, (768, 1024))):
+            with self.subTest(original=original_size):
+                result = await self.service.get(jpeg, original=original_size)
+                self.assertEqual(dimensions(result.read_bytes()), expected)
+                self.assertEqual(jpeg.read_bytes(), original)
 
     async def test_real_other_image_formats_and_disguised_playlist_rejected(self):
         for extension in (".webp", ".bmp", ".gif"):
@@ -250,13 +305,19 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
         return spawn
 
     async def test_deduplicates_and_request_cancellation_keeps_shared_task(self):
+        await self.check_shared_task_cancellation(original=False)
+
+    async def test_original_deduplicates_and_request_cancellation_keeps_shared_task(self):
+        await self.check_shared_task_cancellation(original=True)
+
+    async def check_shared_task_cancellation(self, *, original):
         started, release = asyncio.Event(), asyncio.Event()
         calls = []
         with mock.patch("video_preview.asyncio.create_subprocess_exec",
                         side_effect=self.fake_spawn(calls, started, release)):
-            first = asyncio.create_task(self.service.get(self.source))
+            first = asyncio.create_task(self.service.get(self.source, original=original))
             await asyncio.wait_for(started.wait(), 5)
-            second = asyncio.create_task(self.service.get(self.source))
+            second = asyncio.create_task(self.service.get(self.source, original=original))
             first.cancel()
             with self.assertRaises(asyncio.CancelledError):
                 await first
@@ -272,6 +333,23 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(args[args.index("-pix_fmt") + 1], "rgba")
         self.assertEqual(args.count("-threads"), 2)
 
+    async def test_default_and_original_do_not_share_inflight_tasks(self):
+        started, release = asyncio.Event(), asyncio.Event()
+        calls = []
+        with mock.patch("video_preview.asyncio.create_subprocess_exec",
+                        side_effect=self.fake_spawn(calls, started, release)):
+            default = asyncio.create_task(self.service.get(self.source))
+            await asyncio.wait_for(started.wait(), 5)
+            started.clear()
+            original = asyncio.create_task(self.service.get(self.source, original=True))
+            await asyncio.wait_for(started.wait(), 5)
+            self.assertEqual(len(self.service.tasks), 2)
+            self.assertEqual(len(calls), 2)
+            release.set()
+            small, full = await asyncio.gather(default, original)
+        self.assertNotEqual(small, full)
+        self.assertFalse(self.service.tasks)
+
     async def test_limits_active_processes_to_two(self):
         started, release = asyncio.Event(), asyncio.Event()
         calls = []
@@ -282,7 +360,8 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
             sources.append(source)
         with mock.patch("video_preview.asyncio.create_subprocess_exec",
                         side_effect=self.fake_spawn(calls, started, release)):
-            tasks = [asyncio.create_task(self.service.get(source)) for source in sources]
+            tasks = [asyncio.create_task(self.service.get(source, original=bool(index % 2)))
+                     for index, source in enumerate(sources)]
             await asyncio.wait_for(started.wait(), 5)
             # 排在事件之后的回调屏障，让已就绪的请求进入任务池，不使用计时睡眠。
             barrier = asyncio.Event()
@@ -321,7 +400,8 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
             sources.append(source)
         with mock.patch("video_preview.asyncio.create_subprocess_exec",
                         side_effect=self.fake_spawn(calls, started, release)):
-            tasks = [asyncio.create_task(self.service.get(source)) for source in sources]
+            tasks = [asyncio.create_task(self.service.get(source, original=bool(index % 2)))
+                     for index, source in enumerate(sources)]
             await asyncio.wait_for(started.wait(), 5)
             await asyncio.wait_for(self.service.close(), 5)
             results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -333,6 +413,12 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
         await self.service.close()
 
     async def test_close_during_process_creation_still_reaps_process(self):
+        await self.check_close_during_spawn(original=False)
+
+    async def test_original_close_during_process_creation_still_reaps_process(self):
+        await self.check_close_during_spawn(original=True)
+
+    async def check_close_during_spawn(self, *, original):
         spawning, release_spawn, release_process = asyncio.Event(), asyncio.Event(), asyncio.Event()
         killed = []
         process = mock.Mock(returncode=None)
@@ -356,7 +442,7 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
             return process
 
         with mock.patch("video_preview.asyncio.create_subprocess_exec", side_effect=spawn):
-            request = asyncio.create_task(self.service.get(self.source))
+            request = asyncio.create_task(self.service.get(self.source, original=original))
             await asyncio.wait_for(spawning.wait(), 5)
             closing = asyncio.create_task(self.service.close())
             barrier = asyncio.Event()
@@ -371,29 +457,53 @@ class ThumbnailServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(list(self.service.directory.iterdir()))
 
     async def test_rejects_success_exit_with_invalid_or_oversized_output(self):
-        for output in (b"partial", png(513, 1)):
-            with self.subTest(size=len(output)):
-                async def spawn(*args, **kwargs):
-                    Path(args[-1]).write_bytes(output)
-                    return mock.Mock(returncode=0, communicate=mock.AsyncMock(return_value=(b"", b"")))
+        for original in (False, True):
+            outputs = (b"partial", png(0, 1), png(1, 0), b"invalid!" + png()[8:])
+            if not original:
+                outputs += (png(513, 1),)
+            for output in outputs:
+                with self.subTest(original=original, size=len(output)):
+                    async def spawn(*args, **kwargs):
+                        Path(args[-1]).write_bytes(output)
+                        return mock.Mock(returncode=0, communicate=mock.AsyncMock(return_value=(b"", b"")))
 
-                with mock.patch("video_preview.asyncio.create_subprocess_exec", side_effect=spawn):
-                    with self.assertLogs("video_preview", level="ERROR"), self.assertRaises(web.HTTPUnprocessableEntity):
-                        await self.service.get(self.source)
-                self.assertFalse(list(self.service.directory.iterdir()))
-                self.assertFalse(self.service.tasks)
+                    with mock.patch("video_preview.asyncio.create_subprocess_exec", side_effect=spawn):
+                        with self.assertLogs("video_preview", level="ERROR"), self.assertRaises(web.HTTPUnprocessableEntity):
+                            await self.service.get(self.source, original=original)
+                    self.assertFalse(list(self.service.directory.iterdir()))
+                    self.assertFalse(self.service.tasks)
 
     async def test_source_changed_during_encoding_is_not_published(self):
-        started, release = asyncio.Event(), asyncio.Event()
-        with mock.patch("video_preview.asyncio.create_subprocess_exec",
-                        side_effect=self.fake_spawn([], started, release)):
-            task = asyncio.create_task(self.service.get(self.source))
-            await asyncio.wait_for(started.wait(), 5)
-            self.source.write_bytes(png(16, 16))
-            release.set()
-            with self.assertRaises(web.HTTPConflict):
-                await task
-        self.assertFalse(list(self.service.directory.iterdir()))
+        for original in (False, True):
+            with self.subTest(original=original):
+                self.source.write_bytes(png())
+                started, release = asyncio.Event(), asyncio.Event()
+                with mock.patch("video_preview.asyncio.create_subprocess_exec",
+                                side_effect=self.fake_spawn([], started, release)):
+                    task = asyncio.create_task(self.service.get(self.source, original=original))
+                    await asyncio.wait_for(started.wait(), 5)
+                    self.source.write_bytes(png(16, 16))
+                    release.set()
+                    with self.assertRaises(web.HTTPConflict):
+                        await task
+                self.assertFalse(list(self.service.directory.iterdir()))
+
+    async def test_source_changed_before_encoding_is_rejected(self):
+        for original in (False, True):
+            with self.subTest(original=original):
+                self.source.write_bytes(png())
+
+                def executable():
+                    self.source.write_bytes(png(16, 16))
+                    return controller_app.ffmpeg_bin()
+
+                self.service.ffmpeg_bin = executable
+                with mock.patch("video_preview.asyncio.create_subprocess_exec") as spawn:
+                    with self.assertRaises(web.HTTPConflict):
+                        await self.service.get(self.source, original=original)
+                    spawn.assert_not_called()
+                self.assertFalse(self.service.tasks)
+                self.assertFalse(self.service.directory.exists())
 
     async def test_missing_ffmpeg_and_invalid_sources(self):
         self.service.ffmpeg_bin = lambda: None
@@ -434,53 +544,65 @@ class ThumbnailHTTPTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         await self.client.close()
         self.auth_teardown()
 
-    async def get(self, url=None, **kwargs):
-        return await self.client.get("/api/thumbnail", params={"url": url or self.url}, **kwargs)
+    async def get(self, url=None, *, original=False, **kwargs):
+        params = {"url": url or self.url}
+        if original:
+            params["size"] = "original"
+        return await self.client.get("/api/thumbnail", params=params, **kwargs)
 
     def share(self, enabled=True):
         self.auth.set_project_shares("p", [self.bob["id"]] if enabled else [], [], self.admin["id"])
 
     async def test_anonymous_unauthorized_authorized_and_revoked_cached_requests(self):
+        await self.check_cached_authorization(original=False)
+
+    async def test_original_anonymous_unauthorized_authorized_and_revoked_cached_requests(self):
+        await self.check_cached_authorization(original=True)
+
+    async def check_cached_authorization(self, *, original):
         self.client.session.cookie_jar.clear()
-        response = await self.get()
+        response = await self.get(original=original)
         self.assertEqual(response.status, 401)
         await self.login("bob")
-        response = await self.get()
+        response = await self.get(original=original)
         self.assertEqual(response.status, 404)
         self.assertFalse(self.service.directory.exists())
         self.share()
-        response = await self.get()
+        response = await self.get(original=original)
         self.assertEqual(response.status, 200, await response.text() if response.status != 200 else "")
         self.assertEqual(response.headers["Content-Type"], "image/png")
         self.assertEqual(response.headers["Cache-Control"], "private, no-cache")
-        self.assertEqual(dimensions(await response.read()), (512, 384))
+        self.assertEqual(response.headers["X-Content-Type-Options"], "nosniff")
+        self.assertEqual(dimensions(await response.read()), (1024, 768) if original else (512, 384))
         etag = response.headers["ETag"]
         modified = response.headers["Last-Modified"]
         for headers in ({"If-None-Match": etag}, {"If-Modified-Since": modified}):
-            response = await self.get(headers=headers)
+            response = await self.get(original=original, headers=headers)
             self.assertEqual(response.status, 304)
             self.assertEqual(response.headers["Cache-Control"], "private, no-cache")
             self.assertEqual(await response.read(), b"")
         self.share(False)
         for headers in ({}, {"If-None-Match": etag}, {"If-Modified-Since": modified},
                         {"If-None-Match": "*"}):
-            response = await self.get(headers=headers)
+            response = await self.get(original=original, headers=headers)
             self.assertEqual(response.status, 404)
             self.assertIn("no-store", response.headers["Cache-Control"])
         self.assertTrue(list(self.service.directory.glob("*.png")))
         self.client.session.cookie_jar.clear()
-        self.assertEqual((await self.get(headers={"If-None-Match": etag})).status, 401)
+        self.assertEqual((await self.get(original=original, headers={"If-None-Match": etag})).status, 401)
 
     async def test_artifact_and_resource_index_and_original_unchanged(self):
         artifact = self.root / "data" / "artifacts" / "job" / "output.png"
         artifact.parent.mkdir(parents=True)
-        artifact.write_bytes(png(64, 32))
+        artifact.write_bytes(png(1200, 600))
         self.access.register("p", "artifact", "job/output.png")
         before = [tuple(row) for row in self.auth.db.execute("SELECT * FROM resources ORDER BY resource_id")]
         original = artifact.read_bytes()
-        response = await self.get("/api/artifact/job/output.png")
-        self.assertEqual(response.status, 200)
-        self.assertEqual(dimensions(await response.read()), (64, 32))
+        for original_size, expected in ((False, (512, 256)), (True, (1200, 600))):
+            with self.subTest(original=original_size):
+                response = await self.get("/api/artifact/job/output.png", original=original_size)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(dimensions(await response.read()), expected)
         self.assertEqual(artifact.read_bytes(), original)
         after = [tuple(row) for row in self.auth.db.execute("SELECT * FROM resources ORDER BY resource_id")]
         self.assertEqual(before, after)
@@ -518,19 +640,33 @@ class ThumbnailHTTPTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
 
     async def test_real_video_upload_url_returns_first_frame_png(self):
         video = self.uploads / "video.mp4"
-        await ffmpeg("-f", "lavfi", "-i", "color=red:s=64x32:r=5:d=0.4",
+        await ffmpeg("-f", "lavfi", "-i", "color=red:s=1280x720:r=5:d=0.4",
                      "-c:v", "libx264", "-threads", "1", video)
         self.register_asset(video.name)
         original = video.read_bytes()
-        response = await self.get("/api/upload/video.mp4")
-        self.assertEqual(response.status, 200)
-        self.assertEqual(response.headers["Content-Type"], "image/png")
-        self.assertEqual(dimensions(await response.read()), (64, 32))
+        etag = None
+        for original_size, expected in ((False, (512, 288)), (True, (1280, 720))):
+            with self.subTest(original=original_size):
+                response = await self.get("/api/upload/video.mp4", original=original_size,
+                                          headers={"If-None-Match": etag} if etag else {})
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.headers["Content-Type"], "image/png")
+                self.assertEqual(dimensions(await response.read()), expected)
+                self.assertNotEqual(response.headers["ETag"], etag)
+                etag = response.headers["ETag"]
+        self.assertEqual(len(list(self.service.directory.glob("*.png"))), 2)
         self.assertEqual(video.read_bytes(), original)
 
     async def test_strict_query_invalid_url_and_no_network_access(self):
-        queries = ("", "?url=", "?other=x", "?url=x&url=y", "?url=x&size=32",
-                   "?url=" + quote(self.url, safe="") + "&url=" + quote(self.url, safe=""))
+        valid_url = quote(self.url, safe="")
+        queries = ("", "?url=", "?other=x", "?url=x&url=y", "?size=original",
+                   f"?url={valid_url}&url={valid_url}",
+                   f"?url={valid_url}&url={valid_url}&size=original",
+                   *(f"?url={valid_url}&size={value}" for value in
+                     ("", "32", "512", "0", "-1", "Original", "original%20", "true")),
+                   *(f"?url={valid_url}&{extra}" for extra in
+                     ("size=original&size=original", "size=original&size=512",
+                      "size=512&size=original", "other=x", "size=original&other=x")))
         with mock.patch.object(self.service, "get", new_callable=mock.AsyncMock) as generate:
             for query in queries:
                 with self.subTest(query=query):
@@ -546,9 +682,10 @@ class ThumbnailHTTPTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                 "/api/upload/a.png#fragment", "/api/artifact/job/../../outside.png",
             )
             for url in invalid:
-                with self.subTest(url=url):
-                    response = await self.get(url)
-                    self.assertEqual(response.status, 400)
+                for original in (False, True):
+                    with self.subTest(url=url, original=original):
+                        response = await self.get(url, original=original)
+                        self.assertEqual(response.status, 400)
             generate.assert_not_awaited()
 
     async def test_unregistered_pending_unsupported_directory_missing_and_symlink_escape(self):
@@ -577,21 +714,24 @@ class ThumbnailHTTPTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         await self.login("bob")
         original_get = self.service.get
 
-        async def revoke(source):
-            target = await original_get(source)
+        async def revoke(source, *, original=False):
+            target = await original_get(source, original=original)
             self.share(False)
             return target
 
-        with mock.patch.object(self.service, "get", side_effect=revoke):
-            response = await self.get()
-        self.assertEqual(response.status, 404)
-        self.share()
-        response = await self.get()
-        etag = response.headers["ETag"]
-        await response.read()
-        with mock.patch.object(self.service, "get", side_effect=revoke):
-            response = await self.get(headers={"If-None-Match": etag})
-        self.assertEqual(response.status, 404)
+        for original in (False, True):
+            with self.subTest(original=original):
+                self.share()
+                with mock.patch.object(self.service, "get", side_effect=revoke):
+                    response = await self.get(original=original)
+                self.assertEqual(response.status, 404)
+                self.share()
+                response = await self.get(original=original)
+                etag = response.headers["ETag"]
+                await response.read()
+                with mock.patch.object(self.service, "get", side_effect=revoke):
+                    response = await self.get(original=original, headers={"If-None-Match": etag})
+                self.assertEqual(response.status, 404)
 
     async def test_deleted_source_does_not_return_cached_304_and_mtime_invalidates(self):
         first = await self.get()
@@ -606,28 +746,48 @@ class ThumbnailHTTPTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.source.unlink()
         self.assertEqual((await self.get(headers={"If-None-Match": etag})).status, 404)
 
-    async def test_source_deleted_or_path_escaped_after_wait_is_rejected(self):
+    async def test_source_changed_after_wait_is_rejected(self):
         original_get = self.service.get
 
-        async def delete_after_wait(source):
-            target = await original_get(source)
+        async def change_after_wait(source, *, original=False):
+            target = await original_get(source, original=original)
+            stat = source.stat()
+            os.utime(source, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000))
+            return target
+
+        for original in (False, True):
+            with self.subTest(original=original):
+                with mock.patch.object(self.service, "get", side_effect=change_after_wait):
+                    self.assertEqual((await self.get(original=original)).status, 409)
+
+    async def test_source_deleted_or_path_escaped_after_wait_is_rejected(self):
+        await self.check_source_after_wait(original=False)
+
+    async def test_original_source_deleted_or_path_escaped_after_wait_is_rejected(self):
+        await self.check_source_after_wait(original=True)
+
+    async def check_source_after_wait(self, *, original):
+        original_get = self.service.get
+
+        async def delete_after_wait(source, *, original=False):
+            target = await original_get(source, original=original)
             self.source.unlink()
             return target
 
         with mock.patch.object(self.service, "get", side_effect=delete_after_wait):
-            self.assertEqual((await self.get()).status, 404)
+            self.assertEqual((await self.get(original=original)).status, 404)
         self.source.write_bytes(png())
         outside = self.root / "outside.png"
         outside.write_bytes(png())
 
-        async def escape_after_wait(source):
-            target = await original_get(source)
+        async def escape_after_wait(source, *, original=False):
+            target = await original_get(source, original=original)
             self.source.unlink()
             self.source.symlink_to(outside)
             return target
 
         with mock.patch.object(self.service, "get", side_effect=escape_after_wait):
-            self.assertEqual((await self.get()).status, 400)
+            self.assertEqual((await self.get(original=original)).status, 400)
 
     async def test_failure_http_and_no_cache_files_exposed(self):
         self.source.write_bytes(b"invalid media")
