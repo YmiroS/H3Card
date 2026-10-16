@@ -754,6 +754,7 @@ function browserFixture(platform) {
     const canOperate = () => allowed, requireOperate = () => allowed;
     const save = () => saved++, saveView = () => viewSaved++;
     const placePanel = () => {}, updateMinimap = () => {}, tipHide = () => {}, toast = () => {};
+    const scheduleCardMedia = () => {};
     const closeJobs = () => {}, closePanel = () => panelClosed++, openPanel = () => {}, openHistory = () => {}, veilPanel = () => {};
     const cardOf = id => PROJ.cards.find(c => c.id === id);
     const defOf = () => ({icon:'A'}), phHTML = () => '', paintTitle = () => {}, paint = () => {};

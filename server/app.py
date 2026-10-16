@@ -2385,7 +2385,7 @@ async def api_project_view(request):
            or not math.isfinite(value) for value in values):
         raise web.HTTPBadRequest(text="画布视图不正确")
     x, y, k = map(float, values)
-    if abs(x) > 10_000_000 or abs(y) > 10_000_000 or not 0.1 <= k <= 2:
+    if abs(x) > 10_000_000 or abs(y) > 10_000_000 or not 0.1 <= k <= 5:
         raise web.HTTPBadRequest(text="画布视图超出范围")
     await require_project(request, pid)
     saved = await call_store(request.app, "set_project_view", user["id"], pid, x, y, k)
@@ -2823,8 +2823,10 @@ async def api_upload_file(request):
 
 async def api_thumbnail(request):
     query = request.rel_url.query
-    if set(query) != {"url"} or len(query.getall("url")) != 1:
-        raise web.HTTPBadRequest(text="缩略图必须且只能提供一个 url 参数")
+    if (set(query) - {"url", "size"} or len(query.getall("url", [])) != 1
+            or ("size" in query and query.getall("size") != ["original"])):
+        raise web.HTTPBadRequest(text="缩略图必须提供单个 url，可选单个 size=original 参数")
+    original = query.get("size") == "original"
     url = query["url"]
     ref = await resource_call(request.app, "reference", url)
     if (not ref or ref[0] not in ("upload", "artifact")
@@ -2835,11 +2837,11 @@ async def api_thumbnail(request):
     if path.suffix.lower() not in IMG_EXT | VID_EXT:
         raise web.HTTPBadRequest(text="缩略图仅支持图片或视频")
     thumbnails = request.app["media_thumbnails"]
-    target = await thumbnails.get(path)
+    target = await thumbnails.get(path, original=original)
     # 等待期间可能撤权、删除素材或替换路径；条件请求同样要经过这次核验。
     await require_resource(request, *ref)
     current = await resource_call(request.app, "local_path", *ref)
-    if thumbnails.source_key(current)[1] != target.stem:
+    if thumbnails.source_key(current, original=original)[1] != target.stem:
         raise web.HTTPConflict(text="素材已变化，请重试")
     return web.FileResponse(target, headers={
         "Content-Type": "image/png", "Cache-Control": "private, no-cache",
