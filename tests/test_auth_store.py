@@ -191,6 +191,48 @@ class StoreTests(unittest.TestCase):
         with self.assertRaises(AuthError):
             self.store.set_project_shares('team-owned', [outsider], [], self.admin)
 
+    def test_batch_team_members_are_atomic_and_preserve_permissions(self):
+        leader = self.store.create_user('leader', PASSWORD, team_leader=True)['id']
+        other = self.store.create_user('other-leader', PASSWORD, team_leader=True)['id']
+        disabled = self.store.create_user('disabled', PASSWORD)['id']
+        self.store.set_user(disabled, enabled=False)
+        pending = self.store.create_user('pending', PASSWORD)['id']
+        with self.store.db:
+            self.store.db.execute("UPDATE users SET approval_status='pending' WHERE id=?", (pending,))
+        team = self.store.create_team('批量组员', leader)
+        for invalid in (disabled, pending, 'missing'):
+            with self.subTest(user=invalid), self.assertRaises(AuthError):
+                self.store.add_team_members(team['id'], [self.viewer, invalid], leader)
+            self.assertEqual([member['id'] for member in self.store.list_teams(leader)[0]['members']], [leader])
+        for actor in (other, self.viewer):
+            with self.subTest(actor=actor), self.assertRaises(AuthError):
+                self.store.add_team_members(team['id'], [self.viewer, self.owner], actor)
+        result = self.store.add_team_members(team['id'], [self.viewer, self.owner], leader)
+        self.assertEqual([member['user_id'] for member in result], [self.viewer, self.owner])
+        self.store.add_team_members(team['id'], [self.viewer, self.owner], self.admin)
+        self.assertEqual(len(self.store.list_teams(leader)[0]['members']), 3)
+
+    def test_batch_team_members_reject_invalid_selections(self):
+        team = self.store.create_team('输入校验', self.admin)
+        for selection in (None, '', self.viewer, [], [None], [{}], [''],
+                          [self.viewer, self.viewer], [self.viewer] * 1001):
+            with self.subTest(selection=selection), self.assertRaises(AuthError):
+                self.store.add_team_members(team['id'], selection, self.admin)
+        self.assertEqual(len(self.store.list_teams(self.admin)[0]['members']), 1)
+
+    def test_project_list_includes_owner_display_name_without_changing_visibility(self):
+        with self.store.db:
+            self.store.db.execute('UPDATE users SET display_name=? WHERE id=?', ('张三', self.owner))
+        self.store.create_project('shared-name', self.owner)
+        self.assertEqual(self.store.list_projects(self.viewer), [])
+        self.store.set_project_shares('shared-name', [self.viewer], [], self.owner)
+        project = self.store.list_projects(self.viewer)[0]
+        self.assertEqual(project['owner_id'], self.owner)
+        self.assertEqual(project['owner_username'], 'owner')
+        self.assertEqual(project['owner_display_name'], '张三')
+        self.store.set_project_shares('shared-name', [], [], self.owner)
+        self.assertEqual(self.store.list_projects(self.viewer), [])
+
     def test_team_management_permissions(self):
         leader = self.store.create_user('leader', PASSWORD, team_leader=True)['id']
         other_leader = self.store.create_user('leader2', PASSWORD, team_leader=True)['id']
@@ -573,6 +615,71 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.post('/api/teams', json={'name': '越权'}, headers=headers)).status, 403)
         self.assertEqual((await self.client.get('/api/teams')).status, 200)
         self.assertEqual(normal['team_leader'], False)
+
+    async def test_batch_team_member_api_is_atomic_and_requires_manager_and_csrf(self):
+        member = self.store.create_user('member', PASSWORD)
+        disabled = self.store.create_user('disabled', PASSWORD)
+        other = self.store.create_user('other-leader', PASSWORD, team_leader=True)
+        self.store.set_user(disabled['id'], enabled=False)
+        self.store.set_user(self.uid, team_leader=True)
+        self.store.set_ready()
+        session = await self.login('user')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        team = self.store.create_team('批量添加', self.uid)
+        url = f"/api/teams/{team['id']}/members/batch"
+        body = {'user_ids': [member['id'], other['id']]}
+        response = await self.client.post(url, json=body, headers={'Origin': self.origin})
+        self.assertEqual(response.status, 403)
+        for invalid in ({}, {'user_ids': []}, {'user_ids': member['id']},
+                        {'user_ids': [member['id'], member['id']]}, {'user_ids': [None]},
+                        {'user_ids': [member['id']], 'role': 'admin'}):
+            response = await self.client.post(url, json=invalid, headers=headers)
+            self.assertEqual(response.status, 400, await response.text())
+        response = await self.client.post(url, json={'user_ids': [member['id'], disabled['id']]}, headers=headers)
+        self.assertEqual(response.status, 409)
+        self.assertEqual(len(self.store.list_teams(self.uid)[0]['members']), 1)
+        response = await self.client.post(url, json=body, headers=headers)
+        self.assertEqual(response.status, 201, await response.text())
+        self.assertEqual([item['user_id'] for item in (await response.json())['members']], body['user_ids'])
+        self.assertEqual(len(self.store.list_teams(self.uid)[0]['members']), 3)
+        for username in ('other-leader', 'member'):
+            session = await self.login(username)
+            headers['X-CSRF-Token'] = session['csrf_token']
+            response = await self.client.post(url, json={'user_ids': [self.uid]}, headers=headers)
+            self.assertEqual(response.status, 403)
+        session = await self.login()
+        headers['X-CSRF-Token'] = session['csrf_token']
+        self.assertEqual((await self.client.post(url, json=body, headers=headers)).status, 201)
+        self.assertEqual(len(self.store.list_teams(self.uid)[0]['members']), 3)
+
+    async def test_batch_team_member_api_bounds_fixed_and_chunked_json(self):
+        member = self.store.create_user('member', PASSWORD)
+        self.store.set_user(self.uid, team_leader=True)
+        self.store.set_ready()
+        session = await self.login('user')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token'],
+                   'Content-Type': 'application/json'}
+        team = self.store.create_team('请求大小边界', self.uid)
+        url = f"/api/teams/{team['id']}/members/batch"
+        body = ('{"user_ids":["' + member['id'] + '"]}').encode('utf-8')
+        oversized = body.ljust(70050, b' ')
+
+        async def chunks(payload):
+            for start in range(0, len(payload), 4096):
+                yield payload[start:start + 4096]
+
+        for payload in (oversized, chunks(oversized)):
+            response = await self.client.post(url, data=payload, headers=headers)
+            self.assertEqual(response.status, 413, await response.text())
+            self.assertEqual(len(self.store.list_teams(self.uid)[0]['members']), 1)
+        for payload in (b'{', b'\xff', b'[]', b'{"user_ids":[],"role":"admin"}'):
+            response = await self.client.post(url, data=chunks(payload), headers=headers)
+            self.assertEqual(response.status, 400, await response.text())
+            self.assertEqual(len(self.store.list_teams(self.uid)[0]['members']), 1)
+        response = await self.client.post(url, data=chunks(body.ljust(65536, b' ')), headers=headers)
+        self.assertEqual(response.status, 201, await response.text())
+        self.assertEqual((await response.json())['members'][0]['user_id'], member['id'])
+        self.assertEqual(len(self.store.list_teams(self.uid)[0]['members']), 2)
 
     async def test_rate_limit_and_project_acl(self):
         session = await self.login('user')

@@ -1,5 +1,6 @@
 """浏览器认证入口；worker 通道继续使用独立认证。"""
 import asyncio
+import json
 import os
 import secrets
 import sqlite3
@@ -396,6 +397,24 @@ async def team_members(request):
     return web.json_response({'member': result}, status=201)
 
 
+async def team_members_batch(request):
+    if request.content_length is not None and request.content_length > 65536:
+        raise web.HTTPRequestEntityTooLarge(max_size=65536, actual_size=request.content_length)
+    raw = bytearray()
+    async for chunk in request.content.iter_chunked(8192):
+        if len(raw) + len(chunk) > 65536:
+            raise web.HTTPRequestEntityTooLarge(max_size=65536, actual_size=len(raw) + len(chunk))
+        raw.extend(chunk)
+    try:
+        body = json.loads(raw.decode('utf-8'))
+    except (ValueError, UnicodeError):
+        raise web.HTTPBadRequest(text='请求必须为 JSON 对象')
+    if not isinstance(body, dict) or set(body) != {'user_ids'}:
+        raise web.HTTPBadRequest(text='请求字段不正确')
+    result = await team_call(request, 'add_team_members', request.match_info['tid'], body['user_ids'])
+    return web.json_response({'members': result}, status=201)
+
+
 async def delete_team_member(request):
     await team_call(request, 'remove_team_member', request.match_info['tid'], request.match_info['uid'])
     await notify_access_changed(request, user_ids=[request.match_info['uid']])
@@ -475,6 +494,7 @@ def register_auth_routes(app, web_root):
     app.router.add_post('/api/teams', teams)
     app.router.add_get('/api/team-candidates', team_candidates)
     app.router.add_post('/api/teams/{tid}/members', team_members)
+    app.router.add_post('/api/teams/{tid}/members/batch', team_members_batch)
     app.router.add_delete('/api/teams/{tid}/members/{uid}', delete_team_member)
     app.router.add_get('/api/admin/registrations', registrations)
     app.router.add_post('/api/admin/projects/assign', assign_projects)

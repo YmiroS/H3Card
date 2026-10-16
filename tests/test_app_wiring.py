@@ -143,6 +143,8 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(got.status, 404)
 
     async def test_personal_project_share_flow_for_user_and_team(self):
+        with self.auth.db:
+            self.auth.db.execute('UPDATE users SET display_name=? WHERE id=?', ('张三', self.admin['id']))
         bob = self.auth.create_user('bob', PASSWORD)
         teammate = self.auth.create_user('teammate', PASSWORD)
         created = await (await self.client.post(
@@ -166,6 +168,9 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         listed = await (await self.client.get('/api/projects')).json()
         self.assertTrue(listed['projects'][0]['shared_personally'])
         self.assertEqual(listed['projects'][0]['permission'], 'operate')
+        self.assertEqual(listed['projects'][0]['owner_id'], self.admin['id'])
+        self.assertEqual(listed['projects'][0]['owner_display_name'], '张三')
+        self.assertNotEqual(listed['projects'][0]['owner_display_name'], listed['projects'][0]['owner_username'])
         saved = await self.client.put(
             f"/api/projects/{created['id']}",
             json={'rev': created['rev'], 'name': '共同编辑', 'cards': [], 'edges': []},

@@ -1208,6 +1208,7 @@ function syncSpaceOptions() {
     : '项目组画布由全体组员共享';
 }
 const visibleProjects = () => projects.filter(project => projectSpaces(project).includes(selectedSpace));
+const collapsedProjectOwners = new Set();
 
 async function loadProjects() {
   if (!H3Auth.active) return;
@@ -1227,42 +1228,66 @@ async function loadProjects() {
   syncPermissionUI();
   syncSpaceOptions();
   el.plist.innerHTML = "";
-  for (const p of visibleProjects()) {
-    const d = document.createElement("div");
-    d.className = "pitem" + (PROJ && PROJ.id === p.id ? " on" : "");
-    // locked 的项目（示例）不给重命名/删除按钮，服务端也会拒
-    d.innerHTML = '<span class="nm"></span><span class="ct"></span>'
-      + (p.locked || !canOperate(p) ? '' : '<button class="ren" title="重命名">✎</button><button class="del" title="删除">✕</button>');
-    d.querySelector('.ct').textContent = String(p.cards ?? 0);
-    if (p.share_count > 0) {
-      const shared = document.createElement('span'); shared.className = 'pshare';
-      shared.textContent = '↗'; shared.title = `已分享给 ${p.share_count} 个个人或项目组`;
-      d.querySelector('.ct').after(shared);
+  const ownerGroups = new Map();
+  for (const project of visibleProjects()) {
+    const key = selectedSpace === 'shared' ? String(project.owner_id) : null;
+    if (!ownerGroups.has(key)) ownerGroups.set(key, []);
+    ownerGroups.get(key).push(project);
+  }
+  for (const [ownerId, items] of ownerGroups) {
+    let container = el.plist;
+    if (ownerId !== null) {
+      const group = document.createElement('details'); group.className = 'powner';
+      group.dataset.ownerId = ownerId; group.open = !collapsedProjectOwners.has(ownerId);
+      const heading = document.createElement('summary');
+      const name = document.createElement('span'); name.className = 'powner-name';
+      name.textContent = items[0].owner_display_name?.trim() || '未填写姓名';
+      const count = document.createElement('span'); count.className = 'powner-count';
+      count.textContent = String(items.length); count.setAttribute('aria-label', `${items.length} 张画布`);
+      heading.append(name, count); group.append(heading);
+      container = document.createElement('div'); container.className = 'powner-items'; group.append(container);
+      group.ontoggle = () => {
+        if (group.open) collapsedProjectOwners.delete(ownerId); else collapsedProjectOwners.add(ownerId);
+      };
+      el.plist.append(group);
     }
-    d.title = `${p.team_name || p.owner_username || ''} · ${p.permission === 'operate' ? '可操作' : '只读'}`;
-    const nm = d.querySelector(".nm");
-    nm.textContent = p.name;
-    d.onclick = () => openProject(p.id);
-    const canShare = selectedSpace === 'personal' && !p.team_id
-      && String(p.owner_id) === String(H3Auth.user?.id) && !p.locked;
-    if (canShare) d.oncontextmenu = (ev) => {
-      ev.preventDefault(); ev.stopPropagation();
-      showMenu(ev.clientX, ev.clientY, p.name || '未命名画布', [
-        {icon:'↗', text:'分享给个人或项目组', run:() => openShareDialog(p)},
-      ]);
-    };
-    const ren = d.querySelector(".ren");
-    if (ren) ren.onclick = (ev) => { ev.stopPropagation(); renameProject(p); };
-    if (!p.locked && canOperate(p)) nm.ondblclick = (ev) => { ev.stopPropagation(); renameProject(p); };
-    const del = d.querySelector(".del");
-    if (del) del.onclick = async (ev) => {
-      ev.stopPropagation();
-      if (!confirm(`删除项目「${p.name}」？（文件会保留为 .deleted）`)) return;
-      await api(`/api/projects/${p.id}`, { method: "DELETE" });
-      if (PROJ && PROJ.id === p.id) { PROJ = null; closePanel(); showEmpty(); }
-      loadProjects();
-    };
-    el.plist.appendChild(d);
+    for (const p of items) {
+      const d = document.createElement("div");
+      d.className = "pitem" + (PROJ && PROJ.id === p.id ? " on" : "");
+      // locked 的项目（示例）不给重命名/删除按钮，服务端也会拒
+      d.innerHTML = '<span class="nm"></span><span class="ct"></span>'
+        + (p.locked || !canOperate(p) ? '' : '<button class="ren" title="重命名">✎</button><button class="del" title="删除">✕</button>');
+      d.querySelector('.ct').textContent = String(p.cards ?? 0);
+      if (p.share_count > 0) {
+        const shared = document.createElement('span'); shared.className = 'pshare';
+        shared.textContent = '↗'; shared.title = `已分享给 ${p.share_count} 个个人或项目组`;
+        d.querySelector('.ct').after(shared);
+      }
+      d.title = `${p.team_name || p.owner_display_name?.trim() || '未填写姓名'} · ${p.permission === 'operate' ? '可操作' : '只读'}`;
+      const nm = d.querySelector(".nm");
+      nm.textContent = p.name;
+      d.onclick = () => openProject(p.id);
+      const canShare = selectedSpace === 'personal' && !p.team_id
+        && String(p.owner_id) === String(H3Auth.user?.id) && !p.locked;
+      if (canShare) d.oncontextmenu = (ev) => {
+        ev.preventDefault(); ev.stopPropagation();
+        showMenu(ev.clientX, ev.clientY, p.name || '未命名画布', [
+          {icon:'↗', text:'分享给个人或项目组', run:() => openShareDialog(p)},
+        ]);
+      };
+      const ren = d.querySelector(".ren");
+      if (ren) ren.onclick = (ev) => { ev.stopPropagation(); renameProject(p); };
+      if (!p.locked && canOperate(p)) nm.ondblclick = (ev) => { ev.stopPropagation(); renameProject(p); };
+      const del = d.querySelector(".del");
+      if (del) del.onclick = async (ev) => {
+        ev.stopPropagation();
+        if (!confirm(`删除项目「${p.name}」？（文件会保留为 .deleted）`)) return;
+        await api(`/api/projects/${p.id}`, { method: "DELETE" });
+        if (PROJ && PROJ.id === p.id) { PROJ = null; closePanel(); showEmpty(); }
+        loadProjects();
+      };
+      container.appendChild(d);
+    }
   }
 }
 

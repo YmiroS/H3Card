@@ -45,15 +45,50 @@ function render() {
     title.append(h3, meta); header.append(title); card.append(header);
     if (team.can_manage) {
       const form = document.createElement('form'); form.className = 'form-row team-add-member';
-      const field = document.createElement('label'); field.className = 'fld';
-      const caption = document.createElement('span'); caption.textContent = '添加组员';
-      const select = document.createElement('select'); select.required = true;
-      const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '请选择账号'; select.append(placeholder);
+      const field = document.createElement('fieldset'); field.className = 'team-member-picker';
+      const caption = document.createElement('legend'); caption.textContent = '添加组员（可多选）'; field.append(caption);
+      const toolbar = document.createElement('div'); toolbar.className = 'team-member-toolbar';
+      const allLabel = document.createElement('label');
+      const all = document.createElement('input'); all.type = 'checkbox';
+      allLabel.append(all, document.createTextNode('全选'));
+      const count = document.createElement('span'); count.setAttribute('role', 'status');
+      toolbar.append(allLabel, count); field.append(toolbar);
+      const choices = document.createElement('div'); choices.className = 'team-member-choices';
       const memberIds = new Set(team.members.map(member => String(member.id)));
-      for (const user of candidates.filter(user => !memberIds.has(String(user.id)))) { const option = document.createElement('option'); option.value = user.id; option.textContent = user.username + (user.display_name ? '（' + user.display_name + '）' : ''); select.append(option); }
-      const submit = document.createElement('button'); submit.className = 'btn primary'; submit.textContent = '添加'; submit.disabled = select.options.length === 1;
-      field.append(caption, select); form.append(field, submit);
-      form.onsubmit = event => perform(async () => { event.preventDefault(); await H3Auth.json('/api/teams/' + encodeURIComponent(team.id) + '/members','POST',{user_id:select.value}); });
+      const inputs = [];
+      for (const user of candidates.filter(user => !memberIds.has(String(user.id)))) {
+        const label = document.createElement('label'); label.className = 'team-member-option';
+        const input = document.createElement('input'); input.type = 'checkbox'; input.value = user.id;
+        const name = document.createElement('span'); name.textContent = user.username + (user.display_name ? '（' + user.display_name + '）' : '');
+        label.append(input, name); choices.append(label); inputs.push(input);
+      }
+      if (!inputs.length) { const empty = document.createElement('p'); empty.className = 'auth-note'; empty.textContent = '暂无可添加的组员'; choices.append(empty); }
+      field.append(choices);
+      const submit = document.createElement('button'); submit.className = 'btn primary';
+      const error = document.createElement('p'); error.className = 'team-member-error'; error.setAttribute('role', 'alert');
+      let busy = false;
+      const sync = () => {
+        const selected = inputs.filter(input => input.checked).length;
+        count.textContent = `已选 ${selected} 人`;
+        all.checked = inputs.length > 0 && selected === inputs.length;
+        all.indeterminate = selected > 0 && selected < inputs.length; all.disabled = !inputs.length;
+        submit.disabled = busy || !selected;
+        submit.textContent = busy ? '添加中…' : selected ? `添加 ${selected} 名组员` : '添加所选组员';
+      };
+      for (const input of inputs) input.onchange = sync;
+      all.onchange = () => { for (const input of inputs) input.checked = all.checked; sync(); };
+      form.append(field, submit, error); sync();
+      form.onsubmit = async event => {
+        event.preventDefault();
+        const userIds = inputs.filter(input => input.checked).map(input => input.value);
+        if (busy || !userIds.length) return;
+        busy = true; field.disabled = true; form.setAttribute('aria-busy', 'true'); error.textContent = ''; sync();
+        try {
+          await H3Auth.json('/api/teams/' + encodeURIComponent(team.id) + '/members/batch', 'POST', {user_ids:userIds});
+          await refresh();
+        } catch (failure) { error.textContent = failure.message; }
+        finally { busy = false; field.disabled = false; form.removeAttribute('aria-busy'); sync(); }
+      };
       card.append(form);
     }
     const scroll = document.createElement('div'); scroll.className = 'table-scroll';
