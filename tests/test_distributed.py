@@ -19,6 +19,162 @@ from distributed import DistributedStore, HIGH_VRAM_GPU_POLICY
 from agent import JobFailed, WorkerAgent
 
 
+class ModelDispatchTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = DistributedStore(Path(self.temp.name) / "control.db")
+        self.addCleanup(self.store.close)
+        self.graph = json.loads((ROOT / "graphs/minimax_h3_fusion_v2.api.json").read_text(encoding="utf-8"))
+        self.choices = {
+            "UNETLoader": {"unet_name": [self.graph["127"]["inputs"]["unet_name"]]},
+            "LoraLoaderModelOnly": {"lora_name": [self.graph["145"]["inputs"]["lora_name"]]},
+            "CLIPLoader": {"clip_name": [self.graph["232"]["inputs"]["clip_name"]]},
+            "VAELoader": {"vae_name": [self.graph[n]["inputs"]["vae_name"] for n in ("234", "235")]},
+        }
+        self.caps = {
+            "node_classes": sorted({n["class_type"] for n in self.graph.values()}),
+            "input_choices": self.choices,
+            "input_types": {n["class_type"]: {"model": "MODEL"} for n in self.graph.values()
+                            if isinstance(n.get("inputs", {}).get("model"), list)},
+            "devices": [{"type": "cuda", "name": "RTX 5090", "vram_total": 32 * 1024 ** 3}],
+        }
+        self.worker_id = self.store.register_worker("GPU-5090-01", self.caps)["worker_id"]
+        self.store.heartbeat(self.worker_id, comfy_online=True)
+
+    def enqueue(self, job_id="fusion", **payload):
+        self.store.enqueue(job_id, {
+            "graph": self.graph, "capability": "minimax_h3_fusion_v2", **payload,
+        }, self.caps["node_classes"])
+
+    def test_actual_h3_graph_requires_every_exact_model(self):
+        self.enqueue()
+        for node_class, fields in self.choices.items():
+            for name, values in fields.items():
+                for missing in values:
+                    with self.subTest(node_class=node_class, missing=missing):
+                        caps = json.loads(json.dumps(self.caps))
+                        caps["input_choices"][node_class][name].remove(missing)
+                        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+                        self.assertIsNone(self.store.acquire(self.worker_id))
+                        self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_old_or_incomplete_model_inventory_is_not_assumed_compatible(self):
+        self.enqueue()
+        for inventory in (None, {}, {"UNETLoader": self.choices["UNETLoader"]}):
+            with self.subTest(inventory=inventory):
+                caps = {**self.caps}
+                if inventory is None:
+                    caps.pop("input_choices")
+                else:
+                    caps["input_choices"] = inventory
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+                self.assertIsNone(self.store.acquire(self.worker_id))
+
+    def test_model_paths_and_versions_are_not_substituted(self):
+        self.graph["127"]["inputs"]["unet_name"] = "other/" + self.choices["UNETLoader"]["unet_name"][0]
+        self.enqueue()
+        self.assertIsNone(self.store.acquire(self.worker_id))
+
+    def test_missing_model_worker_does_not_block_compatible_lower_vram_worker(self):
+        caps = json.loads(json.dumps(self.caps))
+        caps["devices"][0]["vram_total"] = 48 * 1024 ** 3
+        caps["input_choices"]["UNETLoader"]["unet_name"] = []
+        larger_id = self.store.register_worker("GPU-A6000", caps)["worker_id"]
+        self.store.heartbeat(larger_id, comfy_online=True)
+        self.enqueue(capability="minimax_h3_ref_2pass")
+        self.assertIsNone(self.store.acquire(larger_id))
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_affinity_does_not_bypass_missing_models_or_block_other_jobs(self):
+        caps = json.loads(json.dumps(self.caps))
+        caps["input_choices"]["LoraLoaderModelOnly"]["lora_name"] = []
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET last_capability_id = ?, last_model_family = ? WHERE id = ?",
+                                  ("minimax_h3_fusion_v2", "minimax_h3", self.worker_id))
+        self.enqueue(model_family="minimax_h3")
+        self.store.enqueue("ordinary", {"graph": {"1": {"class_type": "SaveImage", "inputs": {}}}})
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "ordinary")
+        self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+
+    def test_model_choice_can_be_resolved_through_string_to_combo_converter(self):
+        name = self.graph["127"]["inputs"]["unet_name"]
+        self.graph["model-name"] = {"class_type": "PrimitiveStringMultiline", "inputs": {"value": name}}
+        self.graph["model-choice"] = {"class_type": "ConvertStringToComboNode", "inputs": {"string": ["model-name", 0]}}
+        self.graph["127"]["inputs"]["unet_name"] = ["model-choice", 0]
+        self.caps["node_classes"].append("ConvertStringToComboNode")
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.enqueue()
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_unknown_linked_model_selector_is_not_assumed_compatible(self):
+        self.graph["127"]["inputs"]["unet_name"] = ["unknown", 0]
+        self.enqueue()
+        self.assertIsNone(self.store.acquire(self.worker_id))
+
+    def test_malformed_choices_never_match_by_substring_or_crash_dispatch(self):
+        self.enqueue()
+        for malformed in ("not-an-object", {"UNETLoader": []}, {
+                **self.choices, "UNETLoader": {"unet_name": self.choices["UNETLoader"]["unet_name"][0]}}):
+            with self.subTest(malformed=malformed):
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+                    **self.caps, "input_choices": malformed,
+                })
+                self.assertIsNone(self.store.acquire(self.worker_id))
+
+    def test_prompt_text_ending_in_model_suffix_is_not_a_model_requirement(self):
+        self.graph["238"]["inputs"]["value"] = "a robot holding model.safetensors"
+        self.enqueue()
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_custom_linked_model_selector_with_empty_options_cannot_claim_file(self):
+        self.graph["filename"] = {"class_type": "PrimitiveStringMultiline", "inputs": {"value": "exact.gguf"}}
+        self.graph["custom"] = {"class_type": "CustomLoader", "inputs": {"checkpoint": ["filename", 0]}}
+        self.caps["node_classes"].append("CustomLoader")
+        self.caps["input_choices"]["CustomLoader"] = {"checkpoint": []}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.enqueue()
+        self.assertIsNone(self.store.acquire(self.worker_id))
+
+    def test_connected_model_needs_confirmed_tensor_type_or_exact_filename_inventory(self):
+        self.graph["custom"] = {"class_type": "CustomLoader", "inputs": {"model": ["127", 0]}}
+        self.caps["node_classes"].append("CustomLoader")
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.enqueue()
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.caps["input_types"]["CustomLoader"] = {"model": "MODEL"}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_model_converter_without_inventory_and_cycles_are_rejected(self):
+        self.graph["custom"] = {"class_type": "CustomLoader", "inputs": {"model": ["converter", 0]}}
+        self.graph["converter"] = {"class_type": "ConvertStringToComboNode", "inputs": {"string": "exact.gguf"}}
+        self.caps["node_classes"] += ["CustomLoader", "ConvertStringToComboNode"]
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.enqueue()
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.caps["input_choices"]["CustomLoader"] = {"model": ["exact.gguf"]}
+        self.graph["converter"]["inputs"]["string"] = ["converter", 0]
+        self.store.remove_job("fusion")
+        self.enqueue()
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.assertIsNone(self.store.acquire(self.worker_id))
+
+    def test_custom_model_selector_with_empty_options_cannot_claim_file(self):
+        self.graph["custom"] = {"class_type": "CustomLoader", "inputs": {"checkpoint": "exact.gguf"}}
+        self.caps["node_classes"].append("CustomLoader")
+        self.caps["input_choices"]["CustomLoader"] = {"checkpoint": []}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.enqueue()
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.caps["input_choices"]["CustomLoader"]["checkpoint"] = ["exact.gguf"]
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+
 class DistributedStoreTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

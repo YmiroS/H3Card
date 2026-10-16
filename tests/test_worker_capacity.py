@@ -342,6 +342,46 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-", json.dumps(caps))
         self.assertEqual(self.worker._json_request.await_count, 2)
 
+    async def test_model_choices_include_required_optional_empty_and_rescan_removals(self):
+        nodes = {
+            "UNETLoader": {"input": {"required": {
+                "unet_name": [["original.safetensors"], {}],
+                "weight_dtype": [["default", "fp8_e4m3fn"], {}],
+            }}},
+            "CustomLoader": {"input": {"optional": {"mmproj": [["vision.gguf"], {}]}}},
+            "EmptyLoader": {"input": {"required": {"model_name": [[], {}]}}},
+            "ModernLoader": {"input": {"required": {
+                "model": ["COMBO", {"options": ["model.gguf"]}],
+                "lora_name": ["COMBO", {"options": []}],
+            }}},
+            "PrimitiveString": {"input": {"required": {"value": ["STRING", {}]}}},
+            "LoadImage": {"input": {"required": {"image": [["private-input.png"], {}]}}},
+            "CustomUploads": {"input": {"required": {
+                "subject_1": [["private-reference.png"], {"image_upload": True}],
+                "file": ["COMBO", {"options": ["private-video.mp4"], "video_upload": True}],
+                "soundtrack": [["private-audio.wav"], {"audio_upload": True}],
+            }}},
+        }
+        self.worker._json_request = mock.AsyncMock(side_effect=[{"devices": []}, nodes])
+        with mock.patch.object(self.worker, "scan_telemetry", new=mock.AsyncMock()):
+            caps = await self.worker.scan_capabilities()
+        self.assertEqual(caps["input_choices"], {
+            "UNETLoader": {"unet_name": ["original.safetensors"], "weight_dtype": ["default", "fp8_e4m3fn"]},
+            "CustomLoader": {"mmproj": ["vision.gguf"]},
+            "EmptyLoader": {"model_name": []},
+            "ModernLoader": {"model": ["model.gguf"], "lora_name": []},
+        })
+        self.assertEqual(caps["input_types"]["ModernLoader"], {"model": "COMBO", "lora_name": "COMBO"})
+        self.assertEqual(caps["input_types"]["PrimitiveString"], {"value": "STRING"})
+        self.assertNotIn("LoadImage", caps["input_choices"])
+        self.assertNotIn("CustomUploads", caps["input_choices"])
+        self.assertNotIn("private-", json.dumps(caps))
+        nodes["UNETLoader"]["input"]["required"]["unet_name"] = [[], {}]
+        self.worker._json_request = mock.AsyncMock(side_effect=[{"devices": []}, nodes])
+        with mock.patch.object(self.worker, "scan_telemetry", new=mock.AsyncMock()):
+            refreshed = await self.worker.scan_capabilities()
+        self.assertEqual(refreshed["input_choices"]["UNETLoader"]["unet_name"], [])
+
     async def test_registered_worker_does_not_reregister_after_identity_migration(self):
         await self.worker.ensure_registered()
         self.worker._json_request.assert_not_awaited()
