@@ -170,11 +170,18 @@ test('canvas separates personal, shared and team spaces when creating projects',
   const projects = [
     {id:'p1', name:'个人画布', owner_id:'u1', owner_username:'alice', team_id:null, team_name:null, permission:'operate', cards:0, updated:3, locked:false, share_count:0, shared_team_ids:[], shared_personally:false},
     {id:'p2', name:'项目组画布', owner_id:'u2', owner_username:'bob', team_id:'t1', team_name:'项目一组', permission:'operate', cards:0, updated:2, locked:false},
-    {id:'p3', name:'别人共享', owner_id:'u2', owner_username:'bob', team_id:null, team_name:null, permission:'read', cards:0, updated:1, locked:false},
+    {id:'p3', name:'别人共享', owner_id:'u2', owner_username:'bob', owner_display_name:'鲍勃', team_id:null, team_name:null, permission:'read', cards:0, updated:1, locked:false},
+    {id:'p5', name:'同名用户的画布', owner_id:'u3', owner_username:'another-bob', owner_display_name:'鲍勃', team_id:null, permission:'read', cards:0, updated:0.9},
+    {id:'p6', name:'旧用户的画布', owner_id:'u4', owner_username:'legacy-account', owner_display_name:' ', team_id:null, permission:'read', cards:0, updated:0.8},
+    {id:'p7', name:'鲍勃的第二张', owner_id:'u2', owner_username:'bob', owner_display_name:'鲍勃', team_id:null, permission:'operate', cards:0, updated:0.7},
+    {id:'p8', name:'安全显示画布', owner_id:'u5', owner_username:'html-account', owner_display_name:'<img src=x onerror=alert(1)>', team_id:null, permission:'read', cards:0, updated:0.6},
   ];
   const teams = [{id:'t1', name:'项目一组', leader_id:'u2', leader_username:'bob', can_manage:false, members:[]}];
   const mutations = [], shareMutations = [];
   const server = createServer((req, res) => {
+    if (req.url === '/api/auth/presence' && req.method === 'POST') {
+      req.resume(); res.setHeader('Content-Type','application/json'); return res.end(JSON.stringify({online_users:1}));
+    }
     if (req.url === '/api/projects/p1/shares' && req.method === 'GET') {
       res.setHeader('Content-Type','application/json'); return res.end(JSON.stringify({
         user_ids:[], team_ids:[], users:[{id:'u2',username:'bob',display_name:'鲍勃'}], teams:[{id:'t1',name:'项目一组'}],
@@ -199,6 +206,7 @@ test('canvas separates personal, shared and team spaces when creating projects',
       '/api/auth/me': {user:{id:'u1', username:'alice', role:'user', team_leader:false}, csrf_token:'canvas-csrf'},
       '/api/cards': {cards:[], capabilities:{}, comfy_online:false},
       '/api/projects': {projects, teams},
+      '/api/projects/p3': {...projects.find(project => project.id === 'p3'), cards:[], edges:[], groups:[], view:{}, rev:0},
       '/api/projects/p4': {id:'p4', name:'团队新画布', owner_id:'u1', owner_username:'alice', team_id:'t1', team_name:'项目一组', permission:'operate', cards:[], edges:[], groups:[], view:{}, rev:0, locked:false},
       '/api/health': {comfy_online:false, mode:'local'},
       '/api/jobs': {jobs:[]},
@@ -240,8 +248,33 @@ test('canvas separates personal, shared and team spaces when creating projects',
     await page.waitForFunction(()=>document.querySelector('#plist .pshare'));
     assert.deepEqual(shareMutations,[{body:{user_ids:['u2'],team_ids:['t1']},csrf:'canvas-csrf'}]);
     assert.match(await page.locator('#plist .pshare').getAttribute('title'),/已分享给 2 个/);
+    assert.equal(await page.locator('#plist .powner').count(), 0, 'personal space stays flat');
+    await page.locator('#space-select').selectOption('shared');
+    await page.waitForFunction(() => document.querySelectorAll('#plist .powner').length === 4);
+    assert.deepEqual(await page.locator('.powner-name').allTextContents(), ['鲍勃', '鲍勃', '未填写姓名', '<img src=x onerror=alert(1)>']);
+    assert.deepEqual(await page.locator('.powner-count').allTextContents(), ['2', '1', '1', '1']);
+    assert.equal(await page.locator('#plist img').count(), 0, 'display names are text, never HTML');
+    assert.doesNotMatch(await page.locator('#plist').innerText(), /legacy-account|another-bob|html-account/);
+    const bob = page.locator('.powner[data-owner-id="u2"]');
+    assert.deepEqual(await bob.locator('.nm').allTextContents(), ['别人共享', '鲍勃的第二张']);
+    assert.equal(await bob.locator('.pitem').first().locator('button').count(), 0, 'readonly operations stay hidden');
+    assert.match(await bob.locator('.pitem').first().getAttribute('title'), /^鲍勃 · 只读$/);
+    await bob.locator('summary').focus();
+    await page.keyboard.press('Space');
+    await page.waitForFunction(() => collapsedProjectOwners.has('u2'));
+    assert.equal(await bob.locator('.pitem').first().isVisible(), false);
+    await page.evaluate(() => loadProjects());
+    assert.equal(await bob.getAttribute('open'), null, 'list refresh preserves collapsed owner groups');
+    await bob.locator('summary').focus();
+    await page.keyboard.press('Enter');
+    await bob.locator('.pitem').first().waitFor({state:'visible'});
+    await page.locator('#side').screenshot({path:path.resolve(__dirname, '..', '..', 'temp', 'chouka-shared-owner-groups.png')});
+    await bob.locator('.pitem').first().click();
+    await page.waitForFunction(() => PROJ?.id === 'p3');
+    assert.equal(await page.evaluate(() => PROJ.permission), 'read');
     await page.locator('#space-select').selectOption('team:t1');
     await page.waitForFunction(() => document.querySelector('#plist')?.textContent.includes('项目组画布'));
+    assert.equal(await page.locator('#plist .powner').count(), 0, 'team space stays flat');
     const response = page.waitForResponse(r => r.url().endsWith('/api/projects') && r.request().method() === 'POST');
     await page.locator('#newproj').click(); await response;
     await page.waitForFunction(() => document.querySelector('#ptitle')?.textContent.includes('团队新画布'));
@@ -319,21 +352,39 @@ test('production permissions page renders account names as text and sends author
   }
 });
 
-test('team leader page creates groups and adds members safely', async () => {
+test('team leader page selects multiple members and submits one atomic batch safely', async () => {
   const mutations = [];
+  const leader = {id:'lead', username:'leader', display_name:'组长', enabled:true};
+  const users = [leader,
+    {id:'member', username:'<img src=x onerror=alert(1)>', display_name:'组员', enabled:true},
+    {id:'member2', username:'zhangsan', display_name:'张三', enabled:true},
+    {id:'member3', username:'lisi', display_name:'李四', enabled:true},
+  ];
+  const team = {id:'t1', name:'项目一组', leader_id:'lead', leader_username:'leader', can_manage:true, members:[leader]};
   const payloads = {
-    '/api/auth/me': {user:{id:'lead', username:'leader', role:'user', team_leader:true}, csrf_token:'team-csrf'},
-    '/api/teams': {teams:[{id:'t1', name:'项目一组', leader_id:'lead', leader_username:'leader', can_manage:true,
-      members:[{id:'lead', username:'leader', display_name:'组长', enabled:true}]}]},
-    '/api/team-candidates': {users:[{id:'member', username:'<img src=x onerror=alert(1)>', display_name:'组员', enabled:true}]},
+    '/api/auth/me': {user:{...leader, role:'user', team_leader:true}, csrf_token:'team-csrf'},
+    '/api/teams': {teams:[team]},
+    '/api/team-candidates': {users},
   };
+  let finishBatch, batchReceived;
+  const received = new Promise(resolve => { batchReceived = resolve; });
   const server = createServer((req, res) => {
-    if (req.method === 'POST' && (req.url === '/api/teams' || req.url === '/api/teams/t1/members')) {
+    if (req.method === 'POST' && req.url === '/api/auth/presence') {
+      req.resume(); res.setHeader('Content-Type', 'application/json'); return res.end('{"online_users":1}');
+    }
+    if (req.method === 'POST' && req.url === '/api/teams/t1/members/batch') {
       const chunks = [];
       req.on('data', chunk => chunks.push(chunk));
       req.on('end', () => {
-        mutations.push({url:req.url, body:JSON.parse(Buffer.concat(chunks).toString()), csrf:req.headers['x-csrf-token']});
-        res.setHeader('Content-Type', 'application/json'); res.end('{}');
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        mutations.push({url:req.url, body, csrf:req.headers['x-csrf-token']});
+        res.setHeader('Content-Type', 'application/json');
+        if (mutations.length === 1) { res.writeHead(409); return res.end(JSON.stringify({error:'账号状态已变化，请重试'})); }
+        finishBatch = () => {
+          for (const id of body.user_ids) team.members.push(users.find(user => user.id === id));
+          res.end(JSON.stringify({members:body.user_ids.map(user_id => ({team_id:team.id, user_id}))}));
+        };
+        batchReceived();
       });
       return;
     }
@@ -355,11 +406,56 @@ test('team leader page creates groups and adds members safely', async () => {
     await page.goto('http://127.0.0.1:' + server.address().port);
     await page.waitForFunction(() => document.querySelectorAll('.team-card').length === 1);
     assert.equal(await page.locator('.team-card img').count(), 0);
-    assert.equal(await page.locator('.team-add-member option').nth(1).textContent(), '<img src=x onerror=alert(1)>（组员）');
-    await page.locator('.team-add-member select').selectOption('member');
-    const response = page.waitForResponse(r => r.request().method() === 'POST');
-    await page.locator('.team-add-member button').click(); await response;
-    assert.deepEqual(mutations, [{url:'/api/teams/t1/members', body:{user_id:'member'}, csrf:'team-csrf'}]);
+    const form = page.locator('.team-add-member');
+    const options = form.locator('.team-member-option');
+    const submit = form.getByRole('button', {name:/添加/});
+    const all = form.getByRole('checkbox', {name:'全选', exact:true});
+    assert.equal(await options.count(), 3, 'existing members are excluded');
+    assert.equal(await options.first().textContent(), '<img src=x onerror=alert(1)>（组员）');
+    assert.equal(await submit.isDisabled(), true);
+    await all.check();
+    assert.equal(await form.getByRole('status').textContent(), '已选 3 人');
+    await all.uncheck();
+    assert.equal(await submit.isDisabled(), true);
+    await options.first().getByRole('checkbox').check();
+    await options.nth(1).getByRole('checkbox').focus();
+    await page.keyboard.press('Space');
+    assert.equal(await all.evaluate(element => element.indeterminate), true);
+    assert.equal(await form.getByRole('status').textContent(), '已选 2 人');
+    const size = await options.first().boundingBox();
+    assert.ok(size.height >= 44, 'checkbox rows have a 44px hit area');
+    await page.screenshot({path:path.resolve(__dirname, '..', '..', 'temp', 'chouka-team-multiselect.png'), fullPage:true});
+    let response = page.waitForResponse(r => r.url().endsWith('/members/batch'));
+    await submit.click();
+    assert.equal((await response).status(), 409);
+    await form.getByRole('alert').waitFor({state:'visible'});
+    assert.equal(await form.getByRole('alert').textContent(), '账号状态已变化，请重试');
+    assert.equal(await form.locator('.team-member-option input:checked').count(), 2, 'failure preserves selections');
+    assert.equal(await submit.isEnabled(), true);
+    response = page.waitForResponse(r => r.url().endsWith('/members/batch'));
+    response.catch(() => {});
+    await submit.click(); await received;
+    assert.equal(await form.getAttribute('aria-busy'), 'true');
+    assert.equal(await submit.isDisabled(), true, 'batch cannot be submitted twice while pending');
+    assert.equal(await form.locator('fieldset').evaluate(element => element.disabled), true);
+    assert.equal(await options.first().getByRole('checkbox').isDisabled(), true);
+    finishBatch(); await response;
+    await page.waitForFunction(() => document.querySelectorAll('.team-card tbody tr').length === 3);
+    const expected = {url:'/api/teams/t1/members/batch', body:{user_ids:['member', 'member2']}, csrf:'team-csrf'};
+    assert.deepEqual(mutations, [expected, expected], 'each click sends one batch, not one request per member');
+    assert.equal(await options.count(), 1, 'new members leave the candidate list');
+    await page.reload();
+    await page.waitForFunction(() => document.querySelectorAll('.team-card tbody tr').length === 3);
+    assert.equal(await options.count(), 1, 'members persist after a full reload');
+    payloads['/api/team-candidates'].users = team.members;
+    await page.reload();
+    await form.getByText('暂无可添加的组员').waitFor();
+    assert.equal(await submit.isDisabled(), true);
+    assert.equal(await all.isDisabled(), true);
+    team.can_manage = false;
+    await page.reload();
+    await page.waitForFunction(() => document.querySelectorAll('.team-card').length === 1);
+    assert.equal(await page.locator('.team-add-member').count(), 0, 'non-managers have no member picker');
     assert.deepEqual(errors, []);
   } finally {
     if (browser) await browser.close();

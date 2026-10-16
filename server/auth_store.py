@@ -525,14 +525,25 @@ class AuthStore:
                 "SELECT * FROM users WHERE enabled=1 AND approval_status='approved' ORDER BY username_key,id")]
 
     def add_team_member(self, team_id, user_id, actor_id, session_token=None):
+        return self.add_team_members(team_id, [user_id], actor_id, session_token)[0]
+
+    def add_team_members(self, team_id, user_ids, actor_id, session_token=None):
+        if not isinstance(user_ids, list) or not 1 <= len(user_ids) <= 1000:
+            raise AuthError('请选择 1 至 1000 名组员')
+        for user_id in user_ids:
+            self._identifier(user_id, '用户 ID')
+        if len(set(user_ids)) != len(user_ids):
+            raise AuthError('组员不能重复选择')
         with self._tx():
             self._check_team_manager(actor_id, team_id, session_token)
-            user = self._user(user_id)
-            if not user['enabled'] or user['approval_status'] != 'approved':
-                raise AuthError('只能添加已启用且审批通过的账号', 409)
-            self.db.execute('INSERT OR IGNORE INTO team_members(team_id,user_id,joined_at) VALUES(?,?,?)',
-                            (team_id, user_id, time.time()))
-            return {'team_id': team_id, 'user_id': user_id}
+            for user_id in user_ids:
+                user = self._user(user_id)
+                if not user['enabled'] or user['approval_status'] != 'approved':
+                    raise AuthError('只能添加已启用且审批通过的账号', 409)
+            now = time.time()
+            self.db.executemany('INSERT OR IGNORE INTO team_members(team_id,user_id,joined_at) VALUES(?,?,?)',
+                                [(team_id, user_id, now) for user_id in user_ids])
+            return [{'team_id': team_id, 'user_id': user_id} for user_id in user_ids]
 
     def remove_team_member(self, team_id, user_id, actor_id, session_token=None):
         with self._tx():
@@ -763,7 +774,7 @@ class AuthStore:
             if not user or not user['enabled'] or user['approval_status'] != 'approved':
                 return result
             for row in self.db.execute(
-                    'SELECT p.*,u.username AS owner_username,t.name AS team_name FROM project_acl p '
+                    'SELECT p.*,u.username AS owner_username,u.display_name AS owner_display_name,t.name AS team_name FROM project_acl p '
                     'JOIN users u ON u.id=p.owner_id LEFT JOIN teams t ON t.id=p.team_id '
                     'ORDER BY p.created_at,p.project_id'):
                 permission = self.project_permission(user_id, row['project_id'])
@@ -781,7 +792,7 @@ class AuthStore:
             if permission is None:
                 return None
             row = self.db.execute(
-                'SELECT p.*,u.username AS owner_username,t.name AS team_name FROM project_acl p '
+                'SELECT p.*,u.username AS owner_username,u.display_name AS owner_display_name,t.name AS team_name FROM project_acl p '
                 'JOIN users u ON u.id=p.owner_id LEFT JOIN teams t ON t.id=p.team_id '
                 'WHERE p.project_id=?', (project_id,)).fetchone()
             if row is None:

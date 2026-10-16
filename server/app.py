@@ -2110,6 +2110,7 @@ async def api_projects(request):
                     "locked": bool(d.get("locked")), "has_director": "director" in d,
                     "owner_id": acl["owner_id"],
                     "owner_username": acl.get("owner_username", ""),
+                    "owner_display_name": acl.get("owner_display_name", ""),
                     "team_id": acl.get("team_id"), "team_name": acl.get("team_name"),
                     "share_count": acl.get("share_count", 0),
                     "shared_team_ids": acl.get("shared_team_ids", []),
