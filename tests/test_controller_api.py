@@ -1070,6 +1070,37 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         return {"kind": "video", "valid": True, "width": 1280, "height": 720,
                 "duration": 2, "fps": 24, "bytes": 15}
 
+    async def test_h3_fusion_acquire_requires_model_inventory_from_heartbeat(self):
+        graph = json.loads((ROOT / "graphs/minimax_h3_fusion_v2.api.json").read_text(encoding="utf-8"))
+        choices = {}
+        for node in graph.values():
+            for name, value in node.get("inputs", {}).items():
+                if name in {"unet_name", "clip_name", "vae_name", "lora_name"}:
+                    choices.setdefault(node["class_type"], {}).setdefault(name, []).append(value)
+        caps = {
+            "node_classes": sorted({node["class_type"] for node in graph.values()}),
+            "input_types": {node["class_type"]: {"model": "MODEL"} for node in graph.values()
+                            if isinstance(node.get("inputs", {}).get("model"), list)},
+        }
+        credentials = self.store.register_worker("model-inventory-worker", caps)
+        headers = {"X-Worker-ID": credentials["worker_id"],
+                   "Authorization": f"Bearer {credentials['worker_token']}"}
+        self.register_job("fusion-model-check")
+        self.store.enqueue("fusion-model-check", {"capability": "minimax_h3_fusion_v2", "graph": graph}, caps["node_classes"])
+        for inventory in (None, {}, choices):
+            with self.subTest(inventory_reported=inventory is not None):
+                body = {"comfy_online": True, "capabilities": dict(caps)}
+                if inventory is not None:
+                    body["capabilities"]["input_choices"] = inventory
+                heartbeat = await self.client.post("/agent/v1/heartbeat", headers=headers, json=body)
+                self.assertEqual(heartbeat.status, 200, await heartbeat.text())
+                response = await self.client.post("/agent/v1/jobs/acquire", headers=headers, json={})
+                self.assertEqual(response.status, 200 if inventory else 204, await response.text())
+                if inventory:
+                    self.assertEqual((await response.json())["job_id"], "fusion-model-check")
+                else:
+                    self.assertEqual(self.store.dispatch_status("fusion-model-check"), "queued")
+
     async def test_capacity_h3_real_upload_completion_displays_actual_sizes_without_qualifying(self):
         credentials = self.store.register_worker("真实媒体回归机器", {
             "devices": [{"name": "测试 48GB GPU", "type": "cuda", "vram_total": 48 * 1024 ** 3}]})
@@ -1079,6 +1110,17 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         pid, capability = "h3-real-complete", "minimax_h3_ref_2pass"
         self.register_job(pid)
         graph = json.loads((ROOT / "graphs/minimax_h3_ref_2pass.api.json").read_text())
+        choices = {}
+        for node in graph.values():
+            for name, value in node.get("inputs", {}).items():
+                if name in {"unet_name", "clip_name", "vae_name", "lora_name"}:
+                    choices.setdefault(node["class_type"], {}).setdefault(name, []).append(value)
+        self.store.heartbeat(worker_id, comfy_online=True, capabilities={
+            "devices": [{"name": "测试 48GB GPU", "type": "cuda", "vram_total": 48 * 1024 ** 3}],
+            "input_choices": choices,
+            "input_types": {node["class_type"]: {"model": "MODEL"} for node in graph.values()
+                            if isinstance(node.get("inputs", {}).get("model"), list)},
+        })
         spec = controller_app.make_spec(capability, {"output_kind": "video"}, graph, {"duration": 2})
         self.assertEqual(spec["expected"], {"kind": "video", "duration": 2})
         controller_app.JOBS[pid] = {"id": pid, "capability": capability, "status": "queued",
