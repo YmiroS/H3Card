@@ -1570,6 +1570,25 @@ button:focus-visible, a:focus-visible {
   outline: 2px solid rgba(255,255,255,.75);
   outline-offset: 2px;
 }
+.param-switch {
+  display: inline-flex; align-items: center; gap: 8px; flex: none;
+  min-width: 44px; min-height: 44px; padding: 0; border-radius: 8px;
+}
+.param-switch-track {
+  position: relative; display: block; flex: none; width: 48px; height: 28px;
+  border-radius: 999px; background: var(--dim); transition: background-color .18s ease;
+}
+.param-switch-thumb {
+  position: absolute; top: 2px; left: 2px; width: 24px; height: 24px;
+  border-radius: 50%; background: #fff; box-shadow: 0 1px 3px #0004;
+  transform: translateX(0); transition: transform .18s ease;
+}
+.param-switch[aria-checked="true"] .param-switch-track { background: var(--ok); }
+.param-switch[aria-checked="true"] .param-switch-thumb { transform: translateX(20px); }
+.param-switch-state { min-width: 2em; color: var(--dim); }
+@media (prefers-reduced-motion: reduce) {
+  .param-switch-track, .param-switch-thumb { transition: none; }
+}
 
 @media (max-width: 760px) {
   #side { width: 220px; flex-basis: 220px; }

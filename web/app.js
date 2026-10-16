@@ -7292,13 +7292,21 @@ function rowEl(c, s) {
     row.appendChild(ta);
   } else if (s.type === "select" && s.appearance === "switch") {
     const toggle = document.createElement("button");
-    toggle.type = "button"; toggle.className = "btn";
+    toggle.type = "button"; toggle.className = "param-switch";
     toggle.id = `param-${c.id}-${s.key}`; lb.htmlFor = toggle.id;
     toggle.setAttribute("role", "switch");
+    toggle.setAttribute("aria-label", s.label);
+    const track = document.createElement("span"); track.className = "param-switch-track";
+    track.setAttribute("aria-hidden", "true");
+    const thumb = document.createElement("span"); thumb.className = "param-switch-thumb";
+    track.appendChild(thumb);
+    const state = document.createElement("span"); state.className = "param-switch-state";
+    state.setAttribute("aria-hidden", "true");
+    toggle.append(track, state);
     const sync = () => {
       const enabled = (c.params[s.key] ?? s.default) === "on";
       toggle.setAttribute("aria-checked", String(enabled));
-      toggle.textContent = enabled ? "开启" : "关闭";
+      state.textContent = enabled ? "开启" : "关闭";
     };
     toggle.onclick = () => {
       c.params[s.key] = toggle.getAttribute("aria-checked") === "true" ? "off" : "on";
