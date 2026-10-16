@@ -11,6 +11,110 @@ const web = path.join(__dirname, '..', 'web');
 const source = readFileSync(path.join(web, 'app.js'), 'utf8');
 const functions = source.slice(source.indexOf('async function copyHistoryText('), source.indexOf('/* ================= 参数面板'));
 
+function cardCopyContext() {
+  const image = {kind:'image',ref:'chouka/source.png',url:'/api/upload/source.png'};
+  const material = {id:'material',type:'card_asset',cap:'asset',name:'素材1',x:20,y:80,outputs:[image]};
+  const style = {id:'style',type:'card_style',cap:'style',name:'风格1',x:20,y:300,params:{style:'手绘风格'}};
+  const card = {id:'generator',type:'card_image',cap:'image',name:'生成1',x:400,y:100,
+    params:{prompt:'@素材1'},assets:{'images[0]':image,'images[1]':image},outputs:[]};
+  const context = vm.createContext({
+    PROJ:{id:'source',cards:[material,style,card],edges:[
+      {from:'material',to:'generator',slot:'images[0]',slots:['images[0]','images[1]'],version:{job:'fixed',index:1}},
+      {from:'style',to:'generator',slot:'@style'},
+      {from:'generator',to:'unrelated',slot:'image'},
+    ]},
+    CARDS:[{id:'card_image'},{id:'card_asset'},{id:'card_style'}], CW:290,
+    saveChain:Promise.resolve(), allowed:true, notices:[], created:[],
+    requireOperate:() => context.allowed, canOperate:() => context.allowed,
+    cardOf:id => context.PROJ.cards.find(card => card.id === id),
+    isTextEdge:edge => edge.slot.startsWith('@'),
+    isTextCard:card => card.type === 'card_style',
+    edgeSlots:edge => edge.slots || [edge.slot], titleOf:card => card.name,
+    addCard(type,x,y,cap,select) {
+      const card = {id:'new-' + context.created.length,type,x,y,cap};
+      context.created.push({card,select}); context.PROJ.cards.push(card); return card;
+    },
+    paintTitle() {}, applySize() {}, paint() {}, paintKind() {}, paintPort() {},
+    drawWires() {}, paintStyles() {}, pick:id => { context.selected = id; }, save() {},
+    trackNodeWork:promise => promise, toast:text => context.notices.push(text),
+    jpost:async (_url,body) => ({card:JSON.parse(JSON.stringify(body.card))}),
+  });
+  vm.runInContext(source.slice(source.indexOf('function cloneCard('), source.indexOf('function mergeCollaborativeCard(')) +
+    source.slice(source.indexOf('let CLIP = null;'), source.indexOf('const CLIPBOARD_MEDIA_EXT')),context);
+  return context;
+}
+
+test('same-canvas clone and paste retain incoming slots and original source nodes', async () => {
+  const context = cardCopyContext(), original = context.PROJ.cards.find(card => card.id === 'generator');
+  const edges = JSON.parse(JSON.stringify(context.PROJ.edges.filter(edge => edge.to === original.id)));
+  const clone = await context.cloneCard(original);
+  assert.equal(context.PROJ.cards.length,4);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.PROJ.edges.filter(edge => edge.to === clone.id))),
+    edges.map(edge => ({...edge,to:clone.id})));
+  context.copyCard(original);
+  const pasted = await context.pasteCard();
+  assert.equal(context.PROJ.cards.length,5);
+  assert.deepEqual(JSON.parse(JSON.stringify(context.PROJ.edges.filter(edge => edge.to === pasted.id))),
+    edges.map(edge => ({...edge,to:pasted.id})));
+  assert.ok(context.created.every(item => item.select === false));
+  assert.equal(pasted.references,undefined);
+  assert.notEqual(pasted.assets,original.assets);
+});
+
+test('cross-canvas paste copies each incoming source once and remaps only incoming wires', async () => {
+  const context = cardCopyContext();
+  context.copyCard(context.PROJ.cards.find(card => card.id === 'generator'));
+  context.PROJ = {id:'target',cards:[],edges:[]};
+  const pasted = await context.pasteCard();
+  assert.equal(context.PROJ.cards.length,3);
+  const material = context.PROJ.cards.find(card => card.type === 'card_asset');
+  const style = context.PROJ.cards.find(card => card.type === 'card_style');
+  assert.equal(context.PROJ.edges.length,2);
+  assert.deepEqual([...context.PROJ.edges.map(edge => edge.from)].sort(),[material.id,style.id].sort());
+  assert.ok(context.PROJ.edges.every(edge => edge.to === pasted.id));
+  assert.deepEqual(JSON.parse(JSON.stringify(pasted.assets['images[0]'])),JSON.parse(JSON.stringify(material.outputs[0])));
+  assert.equal(pasted.sourceProject,undefined);
+  assert.equal(pasted.references,undefined);
+});
+
+test('copy reconstructs missing wires from exact material references without filename guessing', async () => {
+  const context = cardCopyContext(), card = context.PROJ.cards.find(item => item.id === 'generator');
+  context.PROJ.edges = [];
+  card.assets.other = {kind:'image',url:'/api/upload/unrelated.png',filename:'source.png'};
+  const pasted = await context.cloneCard(card);
+  assert.equal(context.PROJ.edges.length,2);
+  assert.ok(context.PROJ.edges.every(edge => edge.from === 'material' && edge.to === pasted.id));
+});
+
+test('cross-canvas generation references become materials with the consumed version, not upstream tasks', async () => {
+  const context = cardCopyContext(), sourceCard = context.PROJ.cards.find(card => card.id === 'material');
+  sourceCard.type = 'card_image'; sourceCard.cap = 'image'; sourceCard.job = 'running-job';
+  sourceCard.params = {prompt:'upstream prompt'};
+  sourceCard.assets = {image:{ref:'chouka/not-needed.png'}};
+  sourceCard.outputs = [{kind:'image',ref:'chouka/newer.png',url:'/api/upload/newer.png'}];
+  context.copyCard(context.PROJ.cards.find(card => card.id === 'generator'));
+  context.PROJ = {id:'target',cards:[],edges:[]};
+  await context.pasteCard();
+  const material = context.PROJ.cards.find(card => card.type === 'card_asset');
+  assert.equal(material.outputs.length,1);
+  assert.equal(material.outputs[0].ref,'chouka/source.png');
+  assert.equal(material.job,undefined);
+  assert.deepEqual(JSON.parse(JSON.stringify(material.assets)),{});
+});
+
+test('paste discards delayed cross-canvas response after the canvas changes', async () => {
+  const context = cardCopyContext();
+  context.copyCard(context.PROJ.cards.find(card => card.id === 'generator'));
+  context.PROJ = {id:'target',cards:[],edges:[]};
+  let reply;
+  context.jpost = (_url,body) => new Promise(resolve => { reply = () => resolve({card:body.card}); });
+  const pending = context.pasteCard();
+  context.PROJ = {id:'other',cards:[],edges:[]};
+  reply(); await pending;
+  assert.equal(context.PROJ.cards.length,0);
+  assert.match(context.notices.at(-1),/画布已切换/);
+});
+
 test('history uses persisted job snapshots after reload and keeps each submission distinct', async () => {
   const card = {id:'card-1', job:'job-1', status:'running', cap:'changed-mode',
     params:{prompt:'运行中改过的输入', negative_prompt:'改过的负面提示词'}};
@@ -19,6 +123,7 @@ test('history uses persisted job snapshots after reload and keeps each submissio
     outputs:[{url:'/same-output.png', kind:'image'}], prompts:[prompt]};
   const context = vm.createContext({
     PROJ:JSON.parse(JSON.stringify({cards:[card], edges:[]})), TASKS:[],
+    document:{addEventListener() {}},
     el:{jobs:{style:{display:'none'}}, panel:{}, hist:{}},
     api:async () => ({jobs:[job]}),
     paintJobsBtn() {}, paint() {}, drawWires() {}, toast() {}, save() {},

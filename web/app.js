@@ -3945,14 +3945,7 @@ function applyCardNames(entries) {
 
 function cloneCard(c) {
   if (!requireOperate()) return;
-  const n = addCard(c.type, c.x + 24, c.y + 28);
-  const outputs = JSON.parse(JSON.stringify(c.outputs || []));
-  Object.assign(n, {
-    cap: c.cap, name: c.name, params: JSON.parse(JSON.stringify(c.params || {})),
-    assets: JSON.parse(JSON.stringify(c.assets || {})), outputs,
-    status: outputs.length ? "done" : null,
-  });
-  paintTitle(n); paint(n); openPanel(n.id); save();      // paint：风格节点的正文在画面区
+  return pasteCopiedCard(cardCopySnapshot(c), {x:c.x + 24 + CW / 2, y:c.y + 28 + 40});
 }
 
 function mergeCollaborativeCard(card, rev) {
@@ -4141,46 +4134,111 @@ let CLIP = null;
 let mouseW = null;
 let pasteN = 0;
 
+function cardCopyData(c) {
+  return JSON.parse(JSON.stringify({
+    id:c.id, type:c.type, cap:c.cap, name:c.name || null, w:c.w, h:c.h, x:c.x, y:c.y,
+    params:c.params || {}, assets:c.assets || {}, outputs:c.outputs || [],
+    opt:c.opt, optUse:c.optUse, optStyles:c.optStyles,
+  }));
+}
+
+function cardCopySnapshot(c) {
+  const edges = PROJ.edges.filter(edge => edge.to === c.id && edge.from !== c.id && cardOf(edge.from))
+    .map(edge => isTextEdge(edge) ? {...edge} : {...edge, slots:edgeSlots(edge)});
+  // 旧副本可能只有素材格，没有连线；能确定来源的引用也要带上。
+  for (const [slot, asset] of Object.entries(c.assets || {})) {
+    if (!asset || edges.some(edge => !isTextEdge(edge) && edge.slots.includes(slot))) continue;
+    const refs = typeof asset === 'string' ? [asset] : [asset.ref,asset.url].filter(Boolean);
+    const from = PROJ.cards.find(source => source.id !== c.id && (source.outputs || []).some(output =>
+      refs.some(ref => ref === output.ref || ref === output.url)));
+    if (from) edges.push({from:from.id,to:c.id,slot,slots:[slot]});
+  }
+  const cards = [...new Set(edges.map(edge => edge.from))].map(id => {
+    const source = cardOf(id), copied = cardCopyData(source);
+    if (!isTextCard(source)) {
+      // 跨画布只带已引用的素材，不把上游生成任务及其整条依赖链一起复制。
+      const outputs = edges.filter(edge => edge.from === id && !isTextEdge(edge))
+        .flatMap(edge => edge.slots.map(slot => {
+          const asset = c.assets?.[slot];
+          return asset && typeof asset === 'object' ? asset
+            : copied.outputs.find(output => asset && (output.ref === asset || output.url === asset));
+        }).filter(Boolean));
+      const unique = [...new Map(outputs.map(output => [output.ref || output.url || JSON.stringify(output),output])).values()];
+      Object.assign(copied, {type:'card_asset',cap:'asset',name:titleOf(source),params:{},assets:{},
+        outputs:unique.length ? unique : copied.outputs});
+    }
+    return copied;
+  });
+  return JSON.parse(JSON.stringify({...cardCopyData(c), sourceProject:PROJ.id, references:{cards,edges}}));
+}
+
 function copyCard(c) {
-  CLIP = {
-    sourceProject: PROJ?.id,
-    type: c.type, cap: c.cap, name: c.name || null, w: c.w, h: c.h, x: c.x, y: c.y,
-    params: JSON.parse(JSON.stringify(c.params || {})),
-    assets: JSON.parse(JSON.stringify(c.assets || {})),
-    outputs: JSON.parse(JSON.stringify(c.outputs || [])),
-  };
+  CLIP = cardCopySnapshot(c);
   pasteN = 0;
   toast(`已复制「${titleOf(c)}」${CLIP.outputs.length ? "（包含当前产物）" : ""} · Ctrl+V 粘贴`);
 }
 
 function insertPastedCard(card, at) {
-  if (!CARDS.some(d => d.id === card.type)) throw new Error("这种节点在当前版本里不存在了，粘不了");
-  const n = addCard(card.type, at.x - CW / 2, at.y - 40, card.cap);
+  const crossProject = card.sourceProject && card.sourceProject !== PROJ.id;
+  const references = card.references || {cards:[],edges:[]};
+  const sources = crossProject ? references.cards : [];
+  if ([card,...sources].some(item => !CARDS.some(def => def.id === item.type))) {
+    throw new Error("这种节点在当前版本里不存在了，粘不了");
+  }
+  const insert = (data, x, y) => {
+    // 整批建卡期间只合并归属元数据，不能用单张建卡响应覆盖其他新节点。
+    const node = addCard(data.type, x, y, data.cap, false);
+    if (!node) return null;
+    Object.assign(node, {...cardCopyData(data),id:node.id,x:node.x,y:node.y,
+      status:data.outputs?.length ? 'done' : null});
+    paintTitle(node); applySize(node); paint(node); paintKind(node); paintPort(node);
+    return node;
+  };
+  const n = insert(card, at.x - CW / 2, at.y - 40);
   if (!n) return null;
-  const outputs = JSON.parse(JSON.stringify(card.outputs || []));
-  const {sourceProject, id, x, y, ...copied} = card;
-  Object.assign(n, {...copied, id:n.id, x:n.x, y:n.y, outputs, status:outputs.length ? 'done' : null});
-  paintTitle(n); applySize(n); paint(n); paintKind(n); paintPort(n);
-  openPanel(n.id); save();
+  const ids = new Map([[card.id,n.id]]);
+  for (const source of sources) {
+    const copied = insert(source, n.x + source.x - card.x, n.y + source.y - card.y);
+    if (copied) ids.set(source.id,copied.id);
+  }
+  for (const edge of references.edges) {
+    const from = crossProject ? ids.get(edge.from) : edge.from;
+    if (from && cardOf(from)) PROJ.edges.push({...JSON.parse(JSON.stringify(edge)),from,to:n.id});
+  }
+  drawWires(); paintStyles(); pick(n.id); save();
   toast(`已粘贴「${titleOf(n)}」`);
   return n;
 }
 
-async function pasteCard() {
+function pasteCopiedCard(snapshot, at) {
+  const project = PROJ;
+  return trackNodeWork((async () => {
+    try {
+      let card = snapshot;
+      if (snapshot.sourceProject && snapshot.sourceProject !== project.id) {
+        const result = await jpost(`/api/projects/${encodeURIComponent(project.id)}/copy`, {
+          source_project:snapshot.sourceProject, card:snapshot,
+        });
+        if (!result.card) throw new Error('复制接口未返回节点');
+        card = result.card;
+      }
+      // 先排空旧保存，再把整批新 ID 放进画布，避免旧 PUT 抢在建卡请求前提交。
+      for (;;) {
+        const chain = saveChain;
+        await chain;
+        if (!canOperate() || PROJ !== project) throw new Error('画布已切换或权限已变化，未粘贴');
+        if (chain === saveChain) break;
+      }
+      return insertPastedCard(card, at);
+    } catch (error) { toast(`粘贴失败：${error.message}`); }
+  })());
+}
+
+function pasteCard() {
   if (!requireOperate()) return;
   if (!CLIP) return toast("还没复制东西：先点一个节点，Ctrl+C");
-  const at = mouseW || { x: CLIP.x + 24 * ++pasteN, y: CLIP.y + 28 * pasteN };
-  if (!CLIP.sourceProject || CLIP.sourceProject === PROJ.id) return insertPastedCard(CLIP, at);
-  const targetId = PROJ.id;
-  try {
-    const result = await jpost(`/api/projects/${encodeURIComponent(targetId)}/copy`, {
-      source_project: CLIP.sourceProject, card: CLIP,
-    });
-    // 等待复制时切换画布或权限被撤销，绝不能把迟到素材写入新上下文。
-    if (!canOperate() || PROJ.id !== targetId) throw new Error('画布已切换或权限已变化，未粘贴');
-    if (!result.card) throw new Error('复制接口未返回节点');
-    insertPastedCard(result.card, at);
-  } catch (error) { toast(`粘贴失败：${error.message}`); }
+  const at = mouseW || { x:CLIP.x + 24 * ++pasteN, y:CLIP.y + 28 * pasteN };
+  return pasteCopiedCard(CLIP, at);
 }
 
 const CLIPBOARD_MEDIA_EXT = {png:'image',jpg:'image',jpeg:'image',webp:'image',gif:'image',bmp:'image',mp4:'video',webm:'video',mkv:'video',mov:'video',avi:'video'};
