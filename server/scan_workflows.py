@@ -448,6 +448,12 @@ CAP_KNOBS = {
                      "推荐 {d}：相邻窗口的重叠帧数，用于保持长视频深度连续"),
     },
     "minimax_h3_ref_2pass": {
+        "processing_control_value": (
+            "TE 缓存加速", 0, 0.5, 0.005,
+            "推荐 0（关闭，画质优先）。大于 0 启用 TE 缓存加速，可缩短生成时间，"
+            "但可能影响画面细节、动作与时序稳定性，并出现彩条、鸟形等异常。"
+            "原值 0.12 已在本例复现彩条；出现异常请先设为 0。"
+        ),
         "audio_denoise": (
             "音频降噪强度", 0, 1, 0.05,
             "推荐 {d}：二采时轻度重绘音频。0.7 容易让声音失真或崩坏；"
@@ -541,6 +547,7 @@ CAP_INPUT_PRESETS = {
     "minimax_h3_ref_2pass": [{
         "key": "lora_acceleration",
         "label": "LoRA 加速",
+        "mirror": True,
         "type": "select",
         "appearance": "switch",
         "default": "on",
@@ -1622,6 +1629,8 @@ def derive_inputs(api, oi, wid=None):
         for item in out:
             if item["key"] == "strength_model":
                 item["mirror"] = True
+            elif item["key"] == "processing_control_value":
+                item.update(default=0, advanced=False, showHint=True)
 
     # 切格子的工作流：这是用户唯一会踩的坑，写成卡片说明摆在最上面
     note = None
