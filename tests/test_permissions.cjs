@@ -566,7 +566,7 @@ test('workspace navigation keeps account actions at the bottom across pages and 
     const info = page.getByRole('dialog', {name:'用户信息', exact:true});
     assert.deepEqual(await info.locator('dd').allTextContents(), ['张三', 'admin-account', '管理员', 'admin-1']);
     await page.keyboard.press('Escape');
-    await info.waitFor({state:'detached'});
+    await page.locator('.auth-dialog').waitFor({state:'detached'});
     assert.equal(await page.locator('.auth-dialog').count(), 0);
     assert.equal(await trigger.evaluate(el => el === document.activeElement), true);
     await trigger.click(); await menu.getByRole('button', {name:'修改密码', exact:true}).click();
