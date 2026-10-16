@@ -135,7 +135,7 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
       }
     }
     if (req.method === 'POST' && url === '/api/auth/presence') {
-      req.resume(); return json(res, {online_count:1});
+      req.resume(); return json(res, {online_users:1});
     }
     if (req.method === 'PUT' && url === '/api/projects/' + project.id) {
       const chunks = [];
@@ -193,6 +193,24 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
     assert.equal(await toggle.evaluate(element => element.tagName), 'BUTTON');
     assert.equal(await toggle.getAttribute('aria-checked'), 'false', 'stable mode defaults off');
     assert.equal(await toggle.textContent(), '关闭');
+    async function checkAppearance(enabled) {
+      await page.waitForFunction(({id, enabled}) => {
+        const button = document.getElementById(id);
+        const track = button.querySelector('.param-switch-track').getBoundingClientRect();
+        const thumb = button.querySelector('.param-switch-thumb').getBoundingClientRect();
+        return Math.abs(thumb.left - track.left - (enabled ? 22 : 2)) < 0.1;
+      }, {id:await toggle.getAttribute('id'), enabled});
+      const bounds = await toggle.boundingBox();
+      assert.ok(bounds.width >= 44 && bounds.height >= 44, 'switch has a 44px minimum hit area');
+      const shape = await toggle.locator('.param-switch-track').evaluate(element => {
+        const style = getComputedStyle(element);
+        return {radius:parseFloat(style.borderRadius), height:element.getBoundingClientRect().height};
+      });
+      assert.ok(shape.radius >= shape.height / 2, 'track is a rounded iPhone-style pill');
+    }
+    await checkAppearance(false);
+    const offColor = await toggle.locator('.param-switch-track').evaluate(element => getComputedStyle(element).backgroundColor);
+    await popup.screenshot({path:path.resolve(root, '..', 'temp', 'chouka-h3-stable-mode-off.png')});
     assert.equal(await row.locator('.knobnote').isVisible(), true, 'trade-off is visible without hovering');
     assert.equal(await row.locator('.knobnote').textContent(), spec.hint);
     assert.equal(await toggle.getAttribute('aria-describedby'), await row.locator('.knobnote').getAttribute('id'));
@@ -215,6 +233,9 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
       const enabled = value === 'on';
       assert.equal(await toggle.getAttribute('aria-checked'), String(enabled));
       assert.equal(await toggle.textContent(), enabled ? '开启' : '关闭');
+      await checkAppearance(enabled);
+      const color = await toggle.locator('.param-switch-track').evaluate(element => getComputedStyle(element).backgroundColor);
+      assert.equal(color === offColor, !enabled, 'enabled track changes color as the thumb moves right');
       assert.deepEqual(await stored(), {...originalParams, stable_mode:value}, 'only the mode is saved on the card');
       assert.deepEqual(await payload(), {...baseline,
         params:{...baseline.params, stable_mode:value,
@@ -237,6 +258,10 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
     await check('on');
     saving = saveResponse('off');
     await toggle.focus();
+    await page.keyboard.press('Tab');
+    await page.keyboard.press('Shift+Tab');
+    assert.equal(await toggle.evaluate(element => element === document.activeElement
+      && getComputedStyle(element).outlineStyle !== 'none'), true, 'keyboard focus is visible');
     await page.keyboard.press('Space');
     await check('off');
     assert.equal((await saving).status(), 200, 'Space toggles and saves the switch');
@@ -252,6 +277,18 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
     await page.locator('#world .card[data-id="two-pass"] .ch .t').click();
     await paramsButton.click();
     await check('off');
+    await page.emulateMedia({reducedMotion:'reduce'});
+    for (const selector of ['.param-switch-track', '.param-switch-thumb']) {
+      assert.equal(await toggle.locator(selector).evaluate(element => getComputedStyle(element).transitionDuration), '0s');
+    }
+    saving = saveResponse('on');
+    await toggle.click();
+    await check('on');
+    await saving;
+    saving = saveResponse('off');
+    await toggle.click();
+    await check('off');
+    await saving;
     await page.evaluate(() => {
       const card = PROJ.cards.find(item => item.id === 'two-pass');
       delete card.params.stable_mode;
