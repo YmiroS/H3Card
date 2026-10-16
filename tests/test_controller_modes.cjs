@@ -70,20 +70,26 @@ test('recent jobs show their recorded mode separately from card names', async ()
   }
 });
 
-test('H3 two-pass acceleration declares an independent on/off preset and hides its strength mirror', () => {
+test('H3 two-pass hides default-on LoRA and exposes TE with a safe recommendation', () => {
   const cap = JSON.parse(readFileSync(path.join(__dirname, '..', 'manifests', 'minimax_h3_ref_2pass.json'), 'utf8'));
   const spec = cap.inputs.find(input => input.key === 'lora_acceleration');
   assert.ok(spec, 'two-pass manifest must declare lora_acceleration');
   assert.equal(spec.type, 'select');
-  assert.equal(spec.appearance, 'switch');
+  assert.equal(spec.mirror, true);
   assert.equal(spec.default, 'on');
   assert.deepEqual(spec.options, [{value:'on', label:'开启'}, {value:'off', label:'关闭'}]);
   assert.deepEqual(spec.presets, {on:{strength_model:1}, off:{strength_model:0}}, 'must not change TE-Speed or steps');
   assert.equal(spec.target.kind, 'preset');
   assert.equal(cap.inputs.find(input => input.key === 'strength_model').mirror, true);
+  const te = cap.inputs.find(input => input.key === 'processing_control_value');
+  assert.equal(te.default, 0);
+  assert.equal(te.advanced, false);
+  assert.equal(te.showHint, true);
+  assert.equal(te.label, 'TE 缓存加速');
+  for (const word of ['推荐 0', '生成时间', '画面细节', '动作', '时序稳定性', '彩条', '鸟形', '0.12']) assert.ok(te.hint.includes(word));
 });
 
-test('H3 two-pass acceleration is reachable, persistent and keyboard accessible in the complete UI', {timeout:60000}, async () => {
+test('H3 two-pass TE is visible, persistent and keyboard accessible while LoRA stays hidden', {timeout:60000}, async () => {
   const root = path.join(__dirname, '..');
   const load = name => JSON.parse(readFileSync(path.join(root, 'manifests', name), 'utf8'));
   const cards = load('_cards.json');
@@ -167,27 +173,31 @@ test('H3 two-pass acceleration is reachable, persistent and keyboard accessible 
     const stored = () => page.evaluate(() => PROJ.cards.find(card => card.id === 'two-pass').params);
     const saveResponse = value => page.waitForResponse(response => {
       if (response.url() !== origin + '/api/projects/' + project.id || response.request().method() !== 'PUT') return false;
-      return response.request().postDataJSON().cards.find(card => card.id === 'two-pass').params.lora_acceleration === value;
+      return response.request().postDataJSON().cards.find(card => card.id === 'two-pass').params.processing_control_value === value;
     });
     await page.goto(origin + '/?project=' + project.id);
     await page.locator('#world .card[data-id="two-pass"] .ch .t').click();
     assert.equal(await page.locator('#panel').isVisible(), true, 'real card click opens parameter panel');
     await paramsButton.click();
     assert.equal(await popup.isVisible(), true, 'real bottom parameter button opens the existing popup');
-    const spec = cap.inputs.find(input => input.key === 'lora_acceleration');
-    assert.ok(spec, 'two-pass manifest must declare the acceleration switch');
+    const spec = cap.inputs.find(input => input.key === 'processing_control_value');
     const row = popup.locator('.row').filter({has:page.getByText(spec.label, {exact:true})});
-    const toggle = row.getByRole('switch');
-    assert.equal(await toggle.count(), 1, 'existing parameter popup must expose the acceleration switch');
-    assert.equal(await toggle.evaluate(button => button.tagName), 'BUTTON', 'use a native keyboard-accessible button');
-    assert.equal(await toggle.isVisible(), true);
-    assert.equal(await toggle.isEnabled(), true);
-    assert.equal(await toggle.getAttribute('aria-checked'), 'true');
-    assert.equal((await toggle.innerText()).trim(), '开启');
-    assert.equal(await row.locator('select').count(), 0, 'switch must not remain a dropdown');
-    const mirror = cap.inputs.find(input => input.key === 'strength_model');
-    assert.equal(await page.locator('#panel .row, #respop .row')
-      .filter({has:page.getByText(mirror.label, {exact:true})}).count(), 0, 'old acceleration-strength slider is absent');
+    const slider = row.getByRole('slider', {name:spec.label, exact:true});
+    const number = row.getByRole('spinbutton', {name:spec.label + '数值', exact:true});
+    assert.equal(await slider.isVisible(), true, 'TE is exposed in the existing parameter popup');
+    assert.equal(await number.isVisible(), true);
+    assert.equal(await number.inputValue(), '0.085', 'existing non-default TE value is shown');
+    assert.equal(await row.locator('.knobnote').isVisible(), true, 'recommendation is visible without hovering');
+    assert.equal(await row.locator('.knobnote').textContent(), spec.hint);
+    for (const input of [slider, number]) {
+      assert.equal(await input.getAttribute('aria-describedby'), await row.locator('.knobnote').getAttribute('id'));
+    }
+    assert.equal(await popup.getByRole('switch').count(), 0, 'LoRA switch is hidden');
+    for (const key of ['strength_model', 'lora_acceleration']) {
+      const mirror = cap.inputs.find(input => input.key === key);
+      assert.equal(await page.locator('#panel .row, #respop .row')
+        .filter({has:page.getByText(mirror.label, {exact:true})}).count(), 0, 'LoRA controls are absent');
+    }
     const baseline = await payload();
     const originalParams = await stored();
     assert.equal(originalParams.strength_model, 0, 'fixture retains a legacy zero-strength card value');

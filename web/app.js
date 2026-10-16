@@ -5271,7 +5271,7 @@ function openPanel(id) {
   // 明面上。以前只有「高级」里的旋钮画它，常规旋钮的 hint 只当 tooltip，不悬停看不见
   const addRow = (box, s) => {
     box.appendChild(rowEl(c, s));
-    if (s.hint) {
+    if (s.hint && !s.showHint) {
       const nt = document.createElement("div");
       nt.className = "knobnote"; nt.textContent = s.hint;
       box.appendChild(nt);
@@ -7280,6 +7280,18 @@ function rowEl(c, s) {
       input.addEventListener("change", refresh);
     }
     refresh(); row.appendChild(warning);
+  }
+  if (s.showHint && s.hint) {
+    const note = document.createElement("div"); note.className = "knobnote";
+    note.id = `param-${c.id}-${s.key}-hint`; note.textContent = s.hint;
+    const inputs = [...row.querySelectorAll("input, select, textarea, button")];
+    for (const [index, input] of inputs.entries()) {
+      input.id = `param-${c.id}-${s.key}-${index}`;
+      input.setAttribute("aria-describedby", note.id);
+      input.setAttribute("aria-label", s.label + (index ? "数值" : ""));
+    }
+    if (inputs.length) lb.htmlFor = inputs[0].id;
+    row.appendChild(note);
   }
   if (s.key === "megapixels" || s.key === "scale_to_length") augRes(c, s, row);
   if (s.key === "frame_load_cap") augFrames(c, s, row);
