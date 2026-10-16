@@ -401,6 +401,12 @@ class WorkerAgent:
             return root / "启动Windows节点_A6000.bat"
         return root / "启动Windows节点.bat"
 
+    @staticmethod
+    def batch_command_name(path):
+        if re.search(r'[\s&|<>^()%!\"]', path.name):
+            raise AgentError(f"批处理文件名包含 cmd 不安全字符：{path.name}")
+        return f".\\{path.name}"
+
     async def run_local_command(self, *command, cwd=None, timeout=300):
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         if os.name == "nt":
@@ -584,7 +590,7 @@ class WorkerAgent:
             if not script.is_file():
                 raise AgentError(f"找不到同步脚本：{script}")
             await self.run_local_command(
-                "cmd.exe", "/d", "/c", f".\\{script.name}",
+                "cmd.exe", "/d", "/c", self.batch_command_name(script),
                 "--upgrade", "--non-interactive",
                 cwd=script.parent,
                 timeout=max(float(self.config.get("file_sync_timeout_seconds", 3600)), 60.0),
