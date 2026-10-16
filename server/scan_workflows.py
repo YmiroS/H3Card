@@ -538,6 +538,23 @@ CAP_INPUT_PRESETS = {
         "hint": "快速模式适合预览；质量模式关闭 Turbo 和 TE-Speed，建筑与物体更稳定，但生成更慢。",
         "target": {"kind": "preset"},
     }],
+    "minimax_h3_ref_2pass": [{
+        "key": "lora_acceleration",
+        "label": "LoRA 加速",
+        "type": "select",
+        "appearance": "switch",
+        "default": "on",
+        "options": [
+            {"value": "on", "label": "开启"},
+            {"value": "off", "label": "关闭"},
+        ],
+        "presets": {
+            "on": {"strength_model": 1},
+            "off": {"strength_model": 0},
+        },
+        "hint": "默认开启加速 LoRA；关闭后不使用加速 LoRA。只控制 LoRA，不改变采样步数、TE 缓存或二采设置。",
+        "target": {"kind": "preset"},
+    }],
 }
 CAP_DURATION_WARNINGS = {
     "minimax_h3_ref9": {
@@ -1601,6 +1618,10 @@ def derive_inputs(api, oi, wid=None):
         insert_at = next((i for i, item in enumerate(out) if item.get("key") == "duration"), len(out))
         for preset in reversed(presets):
             out.insert(insert_at, copy.deepcopy(preset))
+    if wid == "minimax_h3_ref_2pass":
+        for item in out:
+            if item["key"] == "strength_model":
+                item["mirror"] = True
 
     # 切格子的工作流：这是用户唯一会踩的坑，写成卡片说明摆在最上面
     note = None

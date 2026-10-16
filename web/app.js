@@ -889,7 +889,7 @@ function paramsBrief(c, cap) {
   const resolution = cap.inputs.find(x => x.key === "resolution");
   const w = cap.inputs.find(x => x.key === "width");
   const stl = cap.inputs.find(x => x.key === "scale_to_length");
-  const mode = cap.inputs.find(x => x.presets);
+  const mode = cap.inputs.find(x => x.presets && x.appearance !== "switch");
   const dur = cap.inputs.find(x => x.key === "duration");
   const preview = cap.inputs.find(x => x.key === "preview_seconds");
   if (!ar && !mp && !resolution && !w && !stl && !mode && !dur && !preview) return null;
@@ -7189,6 +7189,21 @@ function rowEl(c, s) {
     ta.value = cur != null ? cur : "";
     ta.oninput = () => { c.params[s.key] = ta.value; save(); };
     row.appendChild(ta);
+  } else if (s.type === "select" && s.appearance === "switch") {
+    const toggle = document.createElement("button");
+    toggle.type = "button"; toggle.className = "btn";
+    toggle.id = `param-${c.id}-${s.key}`; lb.htmlFor = toggle.id;
+    toggle.setAttribute("role", "switch");
+    const sync = () => {
+      const enabled = (c.params[s.key] ?? s.default) === "on";
+      toggle.setAttribute("aria-checked", String(enabled));
+      toggle.textContent = enabled ? "开启" : "关闭";
+    };
+    toggle.onclick = () => {
+      c.params[s.key] = toggle.getAttribute("aria-checked") === "true" ? "off" : "on";
+      sync(); save();
+    };
+    sync(); row.appendChild(toggle);
   } else if (s.type === "select" && s.options) {
     const sel = document.createElement("select"); sel.style.flex = "1";
     for (const o of s.options) {
