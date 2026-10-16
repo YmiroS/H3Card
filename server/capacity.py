@@ -636,6 +636,8 @@ def _outputs(value):
         seen.add(key)
         item = {"key": key, "kind": output.get("kind") if output.get("kind") in {"image", "video"} else None,
                 "valid": output.get("valid") is True}
+        if output.get("dimension_source") == "decoded_frame":
+            item["dimension_source"] = "decoded_frame"
         for field in ("bytes", "width", "height", "duration", "fps"):
             raw = output.get(field)
             number = _num(raw)
@@ -643,6 +645,63 @@ def _outputs(value):
                 raise ValueError("产物数值必须是有界非负有限数")
             item[field] = number
         result.append(item)
+    return result
+
+
+def _output_size(output):
+    """只读取真实产物尺寸；兼容 _outputs 落盘的整数值浮点数，不转换字符串或布尔值。"""
+    if output.get("valid") is not True or output.get("kind") not in {"image", "video"}:
+        return None
+    dimensions = [output.get(field) for field in ("width", "height")]
+    if not all(type(value) in (int, float) and 0 < value <= 2 ** 53 - 1
+               and int(value) == value for value in dimensions):
+        return None
+    return output["kind"], int(dimensions[0]), int(dimensions[1])
+
+
+def _output_resolution(rows):
+    """展示专用：按成功任务的最终清单统计，不依赖规格或技术有效产量。"""
+    result = {"total_samples": 0, "recorded_samples": 0, "complete_samples": 0,
+              "total_outputs": None, "recorded_outputs": 0, "variants": []}
+    variants, total_outputs, all_listed = {}, 0, True
+    for row in rows:
+        if row["status"] != "done":
+            continue
+        result["total_samples"] += 1
+        recovered = {output["key"]: output for output in (row["recovered_outputs"] or [])}
+        # 原清单存在时严格保留最终 key 集合；恢复清单中的额外项不能扩充它。
+        final = row["outputs"] or row["recovered_outputs"] or []
+        if not final:
+            all_listed = False
+            continue
+        outputs = {}
+        for output in final:
+            outputs.setdefault(output["key"], output)
+        total_outputs += len(outputs)
+        recorded, sample_variants = 0, set()
+        for key, output in outputs.items():
+            size = _output_size(output)
+            recovery = recovered.get(key, {})
+            recovered_size = _output_size(recovery)
+            # 旧探测器可能保存旋转前的编码宽高；仅显示口径允许解码帧证据纠正它。
+            if recovered_size and (size is None or output.get("dimension_source") != "decoded_frame"
+                                   and recovery.get("dimension_source") == "decoded_frame"):
+                size = recovered_size
+            if size is None:
+                continue
+            recorded += 1
+            variant = variants.setdefault(size, {"kind": size[0], "width": size[1],
+                                                "height": size[2], "outputs": 0, "samples": 0})
+            variant["outputs"] += 1
+            sample_variants.add(size)
+        for size in sample_variants:
+            variants[size]["samples"] += 1
+        result["recorded_samples"] += int(recorded > 0)
+        result["complete_samples"] += int(recorded == len(outputs))
+        result["recorded_outputs"] += recorded
+    if result["total_samples"] and all_listed:
+        result["total_outputs"] = total_outputs
+    result["variants"] = [variants[size] for size in sorted(variants)]
     return result
 
 
@@ -731,6 +790,8 @@ class CapacityStore:
             """CREATE TABLE IF NOT EXISTS capacity_artifacts (
                 job_id TEXT NOT NULL, key_hash TEXT NOT NULL, metadata_json TEXT NOT NULL,
                 PRIMARY KEY(job_id,key_hash))""",
+            """CREATE TABLE IF NOT EXISTS capacity_output_recovery (
+                job_id TEXT PRIMARY KEY, outputs_json TEXT NOT NULL, probed_at REAL NOT NULL)""",
             """CREATE TABLE IF NOT EXISTS capacity_reviews (
                 job_id TEXT PRIMARY KEY, review_json TEXT NOT NULL)""",
             """CREATE TABLE IF NOT EXISTS capacity_worker_metadata (
@@ -893,6 +954,23 @@ class CapacityStore:
                 ON CONFLICT(job_id,key_hash) DO UPDATE SET metadata_json=excluded.metadata_json""",
                             (job_id, output["key"], _json(output)))
 
+    def record_output_recovery(self, job_id, outputs):
+        """保存可信完整最终清单；调用方管理事务并在探测前后核验任务身份、done 和权限。"""
+        safe = _outputs(outputs)
+        if safe is None:
+            raise ValueError("恢复产物必须为完整列表")
+        with self.lock:
+            self.db.execute("""INSERT INTO capacity_output_recovery(job_id,outputs_json,probed_at)
+                VALUES (?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+                outputs_json=excluded.outputs_json,probed_at=excluded.probed_at""",
+                            (job_id, _json(safe), time.time()))
+
+    def output_recovery(self, job_id):
+        """调用方持锁读取；返回已净化的 hash-key 清单，不再次哈希或创建任务。"""
+        row = self.db.execute("SELECT outputs_json FROM capacity_output_recovery WHERE job_id=?",
+                              (job_id,)).fetchone()
+        return _load(row["outputs_json"]) if row else None
+
     def artifact_outputs(self, job_id, keys):
         if not isinstance(keys, list):
             raise ValueError("产物引用必须为列表")
@@ -1053,6 +1131,8 @@ class CapacityStore:
                 attempts.setdefault(attempt["job_id"], []).append(attempt)
             metadata = self._rows("capacity_worker_metadata")
             historical_reviews = {r["job_id"]: _load(r["review_json"], {}) for r in self._rows("capacity_reviews")}
+            recovered_outputs = {r["job_id"]: _load(r["outputs_json"]) for r in
+                                 self._rows("capacity_output_recovery")}
             # 与账本/快照在同一把锁内读取；精简测试库可能没有调度表，不创建或伪造历史。
             archived = {}
             if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_jobs'").fetchone():
@@ -1212,7 +1292,8 @@ class CapacityStore:
                       "runtime_seconds": runtime, "attempts": public_attempts, "outputs": raw_outputs,
                       "review": review, "warnings": sorted(set(warnings)), "group_id": group_id,
                       "output_count": count, "occupied_seconds": occupied, "spec": spec, "config_id": config_id,
-                      "cache_condition": cache_condition}
+                      "cache_condition": cache_condition, "recovered_outputs": recovered_outputs.get(job_id)}
+            detail["output_resolution"] = _output_resolution([detail])
             details.append(detail)
             snapshot_key = task["spec_json"] if task else None
             if snapshot_key not in snapshot_summaries:
@@ -1311,6 +1392,7 @@ class CapacityStore:
                 "qualified_seconds_per_unit": qualified, "eligible": eligible, "warnings": warnings,
                 "days": days, "config_id": config_id, "spec": spec,
                 "model_summary": bucket["model_summary"],
+                "output_resolution": _output_resolution(rows),
                 "model_evidence": {"total_samples": len(rows),
                     "recorded_samples": sum(v["samples"] for v in bucket["model_variants"].values()),
                     "variants": [bucket["model_variants"][key] for key in sorted(bucket["model_variants"])]},
