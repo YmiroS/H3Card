@@ -632,6 +632,22 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
     if blank:
         raise web.HTTPBadRequest(
             reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
+    if cap["id"] == "minimax_h3_fusion_v2":
+        # H3 会跳过空槽并连续编号；界面里的槽号在提交时一次性换算，避免连锁替换。
+        references = {}
+        for prefix, label in (("ref_images.ref_image_", "Picture"),
+                              ("ref_audios.ref_audio_", "Audio"),
+                              ("ref_videos.ref_video_", "Video")):
+            slots = sorted(int(key[len(prefix):]) for key in g["136"]["inputs"]
+                           if key.startswith(prefix))
+            references.update({f"<{label} {slot + 1}>": f"<{label} {index + 1}>"
+                               for index, slot in enumerate(slots)})
+        prompt = g["238"]["inputs"]["value"]
+        pattern = r"<(?:Picture|Audio|Video) \d+>"
+        absent = set(re.findall(pattern, prompt)) - references.keys()
+        if absent:
+            raise web.HTTPBadRequest(reason="引用素材未提供：" + "、".join(sorted(absent)))
+        g["238"]["inputs"]["value"] = re.sub(pattern, lambda match: references[match[0]], prompt)
     patch_h3_character_transfer(g, cap, params, uploaded, video_metadata)
     try:
         patch_image_controls(g, cap["id"], params)

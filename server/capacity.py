@@ -255,7 +255,7 @@ def model_summary(spec):
     model_links = {kind: ("model",) for kind in (
         "LoraLoader", "LoraLoaderModelOnly", "ModelSamplingAuraFlow", "ModelSamplingSD3",
         "ModelSamplingFlux", "ModelSamplingDiscrete", "ModelSamplingContinuousEDM",
-        "ModelAttentionBackend", "QwenImage21Cache", "CFGNorm",
+        "ModelAttentionBackend", "BlockSparseAttention", "QwenImage21Cache", "CFGNorm",
         "PathchSageAttentionKJ", "TESpeedMiniMaxH3", "MiniMaxLowVRAMAttention",
         "MiniMaxChunkFeedForward", "BasicGuider", "CFGGuider", "DualCFGGuider")}
     model_links.update({"ModelMergeSimple": ("model1", "model2"),

@@ -93,6 +93,48 @@ class H3FusionWorkflowTest(unittest.TestCase):
         for i in range(1, 5):
             self.assertNotIn(f'ref_images.ref_image_{i}', sparse['136']['inputs'])
 
+    def test_sparse_slot_references_are_remapped_once_without_changing_user_prompt(self):
+        params = {'prompt': '<Picture 6> 看 <Picture 2>，<Audio 3> 配 <Video 1>；<Picture 6>。'}
+        assets = {'images[1]': 'chouka/first.png', 'images[5]': 'chouka/second.png',
+                  'audio[2]': 'chouka/third.wav', 'video[0]': 'chouka/video.mp4'}
+        graph = app.patch_graph(capability(), params, assets)
+        self.assertEqual(graph['238']['inputs']['value'],
+                         '<Picture 2> 看 <Picture 1>，<Audio 1> 配 <Video 1>；<Picture 2>。')
+        self.assertEqual(params['prompt'],
+                         '<Picture 6> 看 <Picture 2>，<Audio 3> 配 <Video 1>；<Picture 6>。')
+        self.assertEqual(graph['136']['inputs']['ref_images.ref_image_1'], ['188', 0])
+        self.assertEqual(graph['136']['inputs']['ref_images.ref_image_5'], ['192', 0])
+        full = {f'images[{i}]': f'chouka/image{i}.png' for i in range(6)}
+        prompt = '<Picture 6> 和 <Picture 1>'
+        self.assertEqual(app.patch_graph(capability(), {'prompt': prompt}, full)
+                         ['238']['inputs']['value'], prompt)
+
+    def test_unfilled_references_are_rejected_instead_of_aliasing_another_asset(self):
+        for token in ('<Picture 2>', '<Audio 1>', '<Video 1>'):
+            with self.subTest(token=token), self.assertRaises(app.web.HTTPBadRequest) as error:
+                app.patch_graph(capability(), {'prompt': token}, {'images[5]': 'chouka/sixth.png'})
+            self.assertIn(token, error.exception.reason)
+
+    def test_sparse_attention_preserves_model_and_precision_evidence(self):
+        graph = app.patch_graph(capability(), {}, {})
+        summary = app.model_summary_from_graph(graph)
+        self.assertTrue(summary['complete'])
+        self.assertEqual(summary['precision_label'], 'INT8')
+        self.assertEqual(summary['models'][0]['name'],
+                         'Cobijada_H3_Hybrid_Uncensored_pruned_hybrid_int8_convrot_pruned.safetensors')
+        auxiliary = {item['name']: item['role'] for item in summary['auxiliary_models']}
+        self.assertEqual(auxiliary['minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors'],
+                         '辅助LoRA')
+        report = {'groups': [{'capability': CAP_ID, 'model_evidence': {
+            'recorded_samples': 0, 'total_samples': 1, 'variants': [],
+        }}]}
+        with mock.patch.dict(app.CAPS, {CAP_ID: capability()}):
+            fallback = app.capacity_model_references(report)['groups'][0]['current_model_reference']
+        self.assertTrue(fallback['complete'])
+        self.assertEqual(fallback['models'], summary['models'])
+        self.assertEqual(fallback['auxiliary_models'], summary['auxiliary_models'])
+        self.assertEqual(fallback['precision_label'], 'INT8')
+
     def test_controls_reach_live_nodes_without_fake_steps_or_framerate(self):
         cap = capability()
         keys = {item['key'] for item in cap['inputs']}
@@ -166,6 +208,15 @@ class H3FusionRuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFix
                 self.assertEqual(changed['#199.image'][1], 'chouka/cat.png')
                 self.assertEqual(changed['#136.ref_images.ref_image_5'][1], '<断开>')
                 self.assertEqual(changed['#227.value'][1], 5)
+                response = await client.post('/api/generate', json={
+                    'capability': CAP_ID, 'project': 'p', 'dry_run': True,
+                    'assets': {'images[5]': 'chouka/cat.png'},
+                    'params': {'prompt': '<Picture 6> 转头', 'seed': 123},
+                })
+                self.assertEqual(response.status, 200, await response.text())
+                changed = (await response.json())['changed']
+                self.assertEqual(changed['#238.value'][1], '<Picture 1> 转头')
+                self.assertEqual(changed['#192.image'][1], 'chouka/cat.png')
 
 
 if __name__ == '__main__':
