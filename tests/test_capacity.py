@@ -436,6 +436,7 @@ class CapacityTests(unittest.TestCase):
                 self.capacity.assigned("rollback", self.worker, "secret-lease", 2)
                 self.capacity.running("rollback", "w1", "secret-lease", 3)
                 self.capacity.record_artifact("rollback", "p/name", self.outputs()[0])
+                self.capacity.record_output_recovery("rollback", self.outputs())
                 self.capacity.terminal("rollback", "w1", "secret-lease", "done", 12,
                                        released=True, outputs=self.outputs(), measurements=self.measurements())
                 self.capacity.review("rollback", {"accepted": 1})
@@ -443,7 +444,7 @@ class CapacityTests(unittest.TestCase):
                 self.capacity.update_worker("w1", {"cpu": "CPU B"})
                 raise RuntimeError("模拟调度事务失败")
         for table in ("cost_events", "capacity_tasks", "capacity_attempts", "capacity_configs",
-                      "capacity_artifacts", "capacity_observations", "capacity_worker_metadata"):
+                      "capacity_artifacts", "capacity_output_recovery", "capacity_observations", "capacity_worker_metadata"):
             self.assertEqual(self.db.execute("SELECT COUNT(*) FROM " + table).fetchone()[0], 0)
 
     def test_spec_ignores_private_values_but_keeps_topology_models_and_steps(self):
@@ -1546,6 +1547,247 @@ class CapacityTests(unittest.TestCase):
             self.capacity.report()
             self.assertEqual(summarize.call_count, 2)
 
+    @staticmethod
+    def resolution(total=1, recorded=0, complete=0, outputs=None, sized=0, variants=None):
+        return {"total_samples": total, "recorded_samples": recorded, "complete_samples": complete,
+                "total_outputs": outputs, "recorded_outputs": sized, "variants": variants or []}
+
+    @staticmethod
+    def size_variant(kind="image", width=512, height=512, outputs=1, samples=1):
+        return {"kind": kind, "width": width, "height": height, "outputs": outputs, "samples": samples}
+
+    def test_h3_actual_output_size_does_not_require_expected_size_or_technical_count(self):
+        payload = self.make_payload("minimax_h3_ref_2pass", params={"output_kind": "video"},
+                                    dims={"duration": 2}, graph=ModelSummaryTests.real_graph("minimax_h3_ref_2pass"))
+        self.assertEqual(payload["capacity_spec"]["expected"], {"kind": "video", "duration": 2})
+        self.capture(payload=payload, outputs=self.outputs(kind="video", width=1280, height=720, duration=2))
+        report = self.capacity.report()
+        expected = self.resolution(recorded=1, complete=1, outputs=1, sized=1,
+                                   variants=[self.size_variant("video", 1280, 720)])
+        self.assertEqual(report["groups"][0]["output_resolution"], expected)
+        self.assertEqual(report["details"][0]["output_resolution"], expected)
+        self.assertIsNone(report["details"][0]["recovered_outputs"])
+        self.assertIsNone(report["details"][0]["output_count"])
+        self.assertIsNone(report["groups"][0]["output_count"])
+        self.assertFalse(report["groups"][0]["eligible"])
+        self.assertIsNone(report["overview"]["output_videos"])
+
+    def test_output_resolution_multiple_sizes_dedup_per_task_and_stable_sort(self):
+        outputs = self.outputs(2) + self.outputs(key="other-video", kind="video", width=1280, height=720)
+        outputs += self.outputs(key="other-image", width=256, height=768)
+        self.capture("a", outputs=outputs + outputs)
+        self.capture("b", now=2000, outputs=self.outputs())
+        report = self.capacity.report()
+        expected = self.resolution(total=2, recorded=2, complete=2, outputs=5, sized=5, variants=[
+            self.size_variant(width=256, height=768), self.size_variant(outputs=3, samples=2),
+            self.size_variant("video", 1280, 720)])
+        self.assertEqual(len(report["groups"]), 1)
+        self.assertEqual(report["groups"][0]["output_resolution"], expected)
+        a = next(d for d in report["details"] if d["job_id"] == "a")
+        self.assertEqual(a["output_resolution"]["recorded_outputs"], 4)
+        self.assertEqual(a["output_resolution"]["variants"][1], self.size_variant(outputs=2))
+        # 模拟旧库重复键，报表自身仍需去重，不能只依赖写入净化。
+        self.db.execute("UPDATE capacity_tasks SET outputs_json=? WHERE job_id='a'",
+                        (json.dumps(a["outputs"] * 2),))
+        self.assertEqual(self.group()["output_resolution"], expected)
+        for offset in (0, 1, 100):
+            self.assertEqual(self.capacity.report(limit=1, offset=offset)["groups"][0]["output_resolution"], expected)
+
+    def test_output_resolution_missing_invalid_audio_and_partial_lists(self):
+        cases = {"missing": None, "empty": [], "invalid": self.outputs(valid=False),
+                 "audio": self.outputs(kind="audio"), "no-size": self.outputs(width=None),
+                 "partial": self.outputs() + self.outputs(key="missing-size", height=None)}
+        for job, outputs in cases.items():
+            self.capture(job, outputs=outputs)
+        report = self.capacity.report()
+        self.assertEqual(report["groups"][0]["output_resolution"], self.resolution(
+            total=6, recorded=1, sized=1, variants=[self.size_variant()]))
+        for detail in report["details"]:
+            with self.subTest(job=detail["job_id"]):
+                expected = (self.resolution(recorded=1, outputs=2, sized=1, variants=[self.size_variant()])
+                            if detail["job_id"] == "partial" else
+                            self.resolution(outputs=None if detail["job_id"] in {"missing", "empty"} else 1))
+                self.assertEqual(detail["output_resolution"], expected)
+        # 总产物数仅依赖非空最终清单；无效/音频仍属于最终产物，但不算尺寸覆盖。
+        self.db.execute("DELETE FROM capacity_tasks WHERE job_id IN ('missing','empty')")
+        self.assertEqual(self.group()["output_resolution"]["total_outputs"], 5)
+
+    def test_output_resolution_strict_positive_safe_integer_dimensions(self):
+        self.capture()
+        original = self.capacity.report()["details"][0]["outputs"]
+        for field in ("width", "height"):
+            for value in (None, 0, -1, True, False, "512", 512.5, 2 ** 53, 10 ** 100):
+                with self.subTest(field=field, value=value):
+                    outputs = [dict(original[0], **{field: value})]
+                    self.db.execute("UPDATE capacity_tasks SET outputs_json=?", (json.dumps(outputs),))
+                    self.assertEqual(self.group()["output_resolution"], self.resolution(outputs=1))
+            for value in (1, 512.0, 2 ** 53 - 1):
+                with self.subTest(field=field, value=value):
+                    outputs = [dict(original[0], **{field: value})]
+                    self.db.execute("UPDATE capacity_tasks SET outputs_json=?", (json.dumps(outputs),))
+                    resolution = self.group()["output_resolution"]
+                    self.assertEqual(resolution["complete_samples"], 1)
+                    self.assertIs(type(resolution["variants"][0][field]), int)
+        # 经正常净化路径保留的小数也不能算尺寸。
+        self.capture("fraction", outputs=self.outputs(width=512.25))
+        detail = next(d for d in self.capacity.report()["details"] if d["job_id"] == "fraction")
+        self.assertEqual(detail["output_resolution"], self.resolution(outputs=1))
+
+    def test_output_resolution_excludes_all_non_done_states_even_with_recovery(self):
+        for status in ("error", "canceled", "queued", "assigned", "running"):
+            self.historical(status, status=status)
+            with self.store.lock, self.db:
+                self.capacity.record_output_recovery(status, self.outputs())
+        report = self.capacity.report()
+        self.assertEqual(report["groups"][0]["output_resolution"], self.resolution(total=0))
+        self.assertTrue(all(d["output_resolution"] == self.resolution(total=0) for d in report["details"]))
+        self.historical("done")
+        self.assertEqual(self.group()["output_resolution"], self.resolution())
+
+    def test_output_recovery_prioritizes_original_valid_metadata_and_only_final_keys(self):
+        original = self.outputs(key="original") + self.outputs(key="missing", width=None)
+        original += self.outputs(key="invalid", valid=False)
+        self.capture(outputs=original)
+        before = self.capacity.report()
+        with self.store.lock, self.db:
+            self.capacity.record_artifact("j1", "artifact-only", self.outputs()[0])
+        artifacts = [tuple(r) for r in self.db.execute("SELECT * FROM capacity_artifacts")]
+        frozen = tuple(self.db.execute("SELECT * FROM capacity_tasks").fetchone())
+        recovery = self.outputs(key="original", width=1920, height=1080)
+        recovery += self.outputs(key="missing", width=1280, height=720, kind="video")
+        recovery += self.outputs(key="invalid", width=256, height=256)
+        recovery += self.outputs(key="not-final", width=4096, height=2160)
+        with self.store.lock, self.db:
+            self.capacity.record_output_recovery("j1", recovery)
+        report = self.capacity.report()
+        self.assertEqual(report["groups"][0]["output_resolution"], self.resolution(
+            recorded=1, complete=1, outputs=3, sized=3, variants=[
+                self.size_variant(width=256, height=256), self.size_variant(), self.size_variant("video", 1280, 720)]))
+        self.assertEqual(len(report["details"][0]["recovered_outputs"]), 4)
+        self.assertNotIn("recovered_outputs", report["groups"][0])
+        self.assertNotIn("not-final", json.dumps(report))
+        self.assertEqual(tuple(self.db.execute("SELECT * FROM capacity_tasks").fetchone()), frozen)
+        self.assertEqual([tuple(r) for r in self.db.execute("SELECT * FROM capacity_artifacts")], artifacts)
+        for current, previous in ((report["groups"][0], before["groups"][0]),
+                                  (report["details"][0], before["details"][0])):
+            self.assertEqual({k: v for k, v in current.items() if k not in {"output_resolution", "recovered_outputs"}},
+                             {k: v for k, v in previous.items() if k not in {"output_resolution", "recovered_outputs"}})
+
+    def test_decoded_recovery_corrects_legacy_orientation_only_in_display(self):
+        self.capture(outputs=self.outputs(key="rotated", kind="video", width=1280, height=720))
+        before = self.capacity.report()
+        frozen = tuple(self.db.execute("SELECT * FROM capacity_tasks").fetchone())
+        with self.store.lock, self.db:
+            self.capacity.record_output_recovery("j1", self.outputs(
+                key="rotated", kind="video", width=720, height=1280, dimension_source="decoded_frame"))
+        after = self.capacity.report()
+        self.assertEqual(after["groups"][0]["output_resolution"]["variants"], [self.size_variant("video", 720, 1280)])
+        self.assertEqual(after["details"][0]["recovered_outputs"][0]["dimension_source"], "decoded_frame")
+        self.assertEqual(tuple(self.db.execute("SELECT * FROM capacity_tasks").fetchone()), frozen)
+        self.assertEqual({k: v for k, v in after["groups"][0].items() if k != "output_resolution"},
+                         {k: v for k, v in before["groups"][0].items() if k != "output_resolution"})
+        self.assertEqual(after["details"][0]["outputs"], before["details"][0]["outputs"])
+        # 新版原记录已是解码方向时仍优先；未知来源和无效补采均不能覆盖它。
+        original = [dict(o, dimension_source="decoded_frame") for o in before["details"][0]["outputs"]]
+        self.db.execute("UPDATE capacity_tasks SET outputs_json=?", (json.dumps(original),))
+        self.assertEqual(self.group()["output_resolution"]["variants"], [self.size_variant("video", 1280, 720)])
+        self.db.execute("UPDATE capacity_tasks SET outputs_json=?", (json.dumps(before["details"][0]["outputs"]),))
+        for changes in ({"dimension_source": "untrusted"}, {"dimension_source": "decoded_frame", "valid": False}):
+            with self.subTest(changes=changes), self.store.lock, self.db:
+                self.capacity.record_output_recovery("j1", self.outputs(
+                    key="rotated", kind="video", width=720, height=1280, **changes))
+                self.assertEqual(self.group()["output_resolution"]["variants"], [self.size_variant("video", 1280, 720)])
+
+    def test_output_recovery_never_borrows_another_key_or_uses_invalid_metadata(self):
+        self.capture(outputs=self.outputs(key="final", width=None))
+        for recovery in (self.outputs(key="different"), self.outputs(key="final", valid=False),
+                         self.outputs(key="final", kind="audio"), self.outputs(key="final", height=None),
+                         self.outputs(key="final", width=512.5), self.outputs(key="final", height=2 ** 53)):
+            with self.subTest(recovery=recovery):
+                with self.store.lock, self.db:
+                    self.capacity.record_output_recovery("j1", recovery)
+                self.assertEqual(self.group()["output_resolution"], self.resolution(outputs=1))
+
+    def test_output_recovery_full_list_fallback_keeps_historical_source_estimates_and_costs(self):
+        for job in ("historical", "unknown"):
+            self.historical(job)
+        self.capture("null", outputs=None)
+        self.capture("empty", outputs=[])
+        before = self.capacity.report()
+        estimates = {g["id"]: self.capacity.estimate(self.estimate_payload([g], mode="historical", price=5000))
+                     for g in before["groups"]}
+        costs = [tuple(r) for r in self.db.execute("SELECT * FROM cost_events")]
+        tasks = [tuple(r) for r in self.db.execute("SELECT * FROM capacity_tasks")]
+        for job in ("historical", "null", "empty"):
+            with self.store.lock, self.db:
+                self.capacity.record_output_recovery(job, self.outputs(2) * 2)
+        report = self.capacity.report(limit=1, offset=1)
+        self.assertEqual(report["overview"], before["overview"])
+        for group in report["groups"]:
+            previous = next(g for g in before["groups"] if g["id"] == group["id"])
+            self.assertEqual({k: v for k, v in group.items() if k != "output_resolution"},
+                             {k: v for k, v in previous.items() if k != "output_resolution"})
+            self.assertEqual(self.capacity.estimate(self.estimate_payload([group], mode="historical", price=5000)),
+                             estimates[group["id"]])
+            historical = group["source"] == "historical"
+            self.assertEqual(group["output_resolution"], self.resolution(total=2,
+                recorded=1 if historical else 2, complete=1 if historical else 2,
+                outputs=None if historical else 4, sized=2 if historical else 4,
+                variants=[self.size_variant(outputs=2 if historical else 4, samples=1 if historical else 2)]))
+            self.assertFalse(group["eligible"])
+            self.assertIsNone(group["output_count"])
+        self.assertEqual([tuple(r) for r in self.db.execute("SELECT * FROM cost_events")], costs)
+        self.assertEqual([tuple(r) for r in self.db.execute("SELECT * FROM capacity_tasks")], tasks)
+        historical = next(d for d in self.capacity.report()["details"] if d["job_id"] == "historical")
+        self.assertEqual(historical["source"], "historical")
+        self.assertEqual(historical["output_resolution"]["total_outputs"], 2)
+
+    def test_output_recovery_keeps_verified_estimate_and_original_coverage(self):
+        self.capture()
+        before = self.capacity.report()
+        estimate = self.capacity.estimate(self.estimate_payload(price=5000))
+        with self.store.lock, self.db:
+            self.capacity.record_output_recovery("j1", self.outputs(width=1920, height=1080))
+        after = self.capacity.report()
+        self.assertEqual(after["groups"], before["groups"])
+        self.assertEqual(after["overview"], before["overview"])
+        self.assertTrue(after["groups"][0]["eligible"])
+        self.assertEqual(self.capacity.estimate(self.estimate_payload(price=5000)), estimate)
+
+    def test_output_recovery_sanitization_upsert_job_scope_and_outer_rollback(self):
+        with self.store.lock:
+            self.assertIsNone(self.capacity.output_recovery("missing"))
+        original = self.outputs(prompt="PRIVATE-PROMPT", path="/private/path", url="https://secret.invalid/file") * 2
+        unchanged = copy.deepcopy(original)
+        with self.store.lock, self.db, patch("server.capacity.time.time", return_value=1234):
+            self.capacity.record_output_recovery("saved", original)
+            saved = self.capacity.output_recovery("saved")
+        self.assertEqual(original, unchanged)
+        self.assertEqual(len(saved), 1)
+        self.assertRegex(saved[0]["key"], r"^[0-9a-f]{64}$")
+        self.assertEqual(self.db.execute("SELECT probed_at FROM capacity_output_recovery").fetchone()[0], 1234)
+        for secret in ("private-image", "PRIVATE-PROMPT", "/private/path", "secret.invalid"):
+            self.assertNotIn(secret, json.dumps(saved))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM capacity_tasks").fetchone()[0], 0)
+        self.assertEqual(self.capacity.report()["overview"]["tasks"], 0)
+        with self.assertRaises(RuntimeError):
+            with self.store.lock, self.db:
+                self.capacity.record_output_recovery("saved", [])
+                self.capacity.record_output_recovery("rolled-back", self.outputs())
+                CapacityStore(self.store)
+                raise RuntimeError("模拟外层事务回滚")
+        with self.store.lock:
+            self.assertEqual(self.capacity.output_recovery("saved"), saved)
+            self.assertIsNone(self.capacity.output_recovery("rolled-back"))
+        for invalid in (None, {}, [{}], self.outputs(width=True), self.outputs(height=False), self.outputs(513)):
+            with self.subTest(invalid=type(invalid)), self.assertRaises(ValueError):
+                self.capacity.record_output_recovery("saved", invalid)
+        with self.store.lock, self.db, patch("server.capacity.time.time", return_value=5678):
+            self.capacity.record_output_recovery("saved", [])
+            self.assertEqual(self.capacity.output_recovery("saved"), [])
+        self.assertEqual(self.db.execute("SELECT COUNT(*),probed_at FROM capacity_output_recovery").fetchone()[:],
+                         (1, 5678))
+
     def test_restart_keeps_attempts_and_schema_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "control.db"
@@ -1556,6 +1798,18 @@ class CapacityTests(unittest.TestCase):
             with db:
                 capacity.enqueue("persisted", self.payload, 1000)
                 capacity.assigned("persisted", self.worker, "lease", 1001)
+                capacity.record_output_recovery("persisted", self.outputs())
+                capacity.record_output_recovery("historical", self.outputs(kind="video", width=1280, height=720))
+            with store.lock:
+                recovery = capacity.output_recovery("persisted")
+                historical = capacity.output_recovery("historical")
+            columns = {row["name"]: row for row in db.execute("PRAGMA table_info(capacity_output_recovery)")}
+            self.assertEqual(set(columns), {"job_id", "outputs_json", "probed_at"})
+            self.assertEqual(columns["job_id"]["pk"], 1)
+            self.assertEqual(columns["job_id"]["type"], "TEXT")
+            for name, kind in (("outputs_json", "TEXT"), ("probed_at", "REAL")):
+                self.assertEqual(columns[name]["type"], kind)
+                self.assertEqual(columns[name]["notnull"], 1)
             db.close()
             db = sqlite3.connect(path)
             db.row_factory = sqlite3.Row
@@ -1564,6 +1818,12 @@ class CapacityTests(unittest.TestCase):
             detail = capacity.report()["details"][0]
             self.assertEqual(detail["status"], "assigned")
             self.assertEqual(len(detail["attempts"]), 1)
+            self.assertEqual(detail["recovered_outputs"], recovery)
+            self.assertEqual(detail["output_resolution"], self.resolution(total=0))
+            with store.lock:
+                self.assertEqual(capacity.output_recovery("persisted"), recovery)
+                self.assertEqual(capacity.output_recovery("historical"), historical)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM capacity_tasks").fetchone()[0], 1)
             self.assertFalse(capacity.report()["groups"][0]["eligible"])
             db.close()
 
