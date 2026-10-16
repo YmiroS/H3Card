@@ -930,3 +930,286 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
     if (fixture) await fixture.stop();
   }
 });
+
+// Deliberately separate from the long media-paste matrix so this regression can
+// run alone while clipboard reference copying is being implemented.
+test('card clipboard incoming references: same-canvas duplication and cross-canvas resource bundle', {timeout:180000}, async t => {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(), 'chouka-card-references-'));
+  t.diagnostic('Isolated reference-copy fixture: ' + folder);
+  const media = makeMedia(), pageErrors = [], responses = [];
+  let fixture, browser, page, source, destination, seeded;
+  async function api(url, method = 'GET', data) {
+    return page.evaluate(async ({url, method, data}) => method === 'GET'
+      ? H3Auth.request(url) : H3Auth.json(url, method, data), {url, method, data});
+  }
+  async function settle() {
+    await expect.poll(() => page.evaluate(() => pendingNodeWork.size + pendingCardCreates + pendingContentSaves +
+      Number(contentSaving) + Number(saveTimer !== null)), {timeout:15000}).toBe(0);
+    await page.evaluate(async () => { await saveChain; });
+  }
+  async function state() {
+    return page.evaluate(() => ({id:PROJ.id, cards:PROJ.cards.map(plain), edges:structuredClone(PROJ.edges)}));
+  }
+  async function open(id) {
+    await settle();
+    await page.evaluate(async id => { await loadProjects(); await openProject(id); }, id);
+    await settle();
+  }
+  async function upload(projectId, kind, name) {
+    const result = await page.evaluate(async ({projectId, kind, name, bytes}) => {
+      const form = new FormData();
+      form.append('file', new File([Uint8Array.from(atob(bytes), c => c.charCodeAt(0))], name,
+        {type:{png:'image/png',jpg:'image/jpeg',video:'video/mp4'}[kind]}));
+      return H3Auth.request('/api/upload?project=' + projectId, {method:'POST',body:form});
+    }, {projectId, kind, name, bytes:media[kind].toString('base64')});
+    assert.equal(result.files.length, 1);
+    return {...result.files[0], filename:name, kind:kind === 'video' ? 'video' : 'image'};
+  }
+  function edgeList(edges) {
+    // Edge ordering and object property order are not part of the public contract.
+    return [...edges].sort((a, b) => JSON.stringify([a.from, a.to, a.slot])
+      .localeCompare(JSON.stringify([b.from, b.to, b.slot])));
+  }
+  async function assertWires(project) {
+    const wires = await page.locator('#wires path.hit').evaluateAll(nodes => nodes.map(node =>
+      ({title:node.querySelector('title')?.textContent, d:node.getAttribute('d')})));
+    assert.equal(await page.locator('#world .card').count(), project.cards.length);
+    assert.equal(wires.length, project.edges.length, 'Every saved edge must have a real DOM wire');
+    for (const [i, edge] of project.edges.entries()) {
+      assert.ok(wires[i].d?.startsWith('M'), 'Wire must have rendered SVG geometry');
+      assert.ok(wires[i].title?.includes(project.cards.find(c => c.id === edge.from).name));
+      assert.ok(wires[i].title?.includes(project.cards.find(c => c.id === edge.to).name));
+    }
+    assert.equal(await page.locator('#wires path.txt').count(), project.edges.filter(e => e.slot.startsWith('@')).length);
+  }
+  async function incomingSnapshot() {
+    return page.evaluate(() => PROJ.edges.filter(edge => edge.to === 'ref-target').map(edge => {
+      // Freeze legacy ownership while the original source outputs are available.
+      // Explicit slots (including their order) and all other metadata stay exact.
+      const snapshot = structuredClone(edge);
+      if (!isTextEdge(edge) && !Array.isArray(edge.slots)) snapshot.slots = edgeSlots(edge);
+      return snapshot;
+    }));
+  }
+  async function assertSameCanvas(before, incoming) {
+    await settle();
+    const actual = await state(), saved = await api(`/api/projects/${source.id}`);
+    const added = actual.cards.filter(c => !before.cards.some(old => old.id === c.id));
+    assert.equal(added.length, 1, 'Same-canvas duplication must not duplicate any reference source');
+    const target = before.cards.find(c => c.id === 'ref-target'), copy = added[0];
+    assert.equal(copy.type, target.type); assert.equal(copy.cap, target.cap);
+    assert.deepEqual(copy.params, target.params);
+    assert.deepEqual(copy.assets, target.assets, 'Keep the original material IDs/URLs on this canvas');
+    assert.deepEqual(copy.outputs, target.outputs);
+    const expected = incoming.map(e => ({...e, to:copy.id}));
+    assert.deepEqual(edgeList(actual.edges.filter(e => e.to === copy.id)), edgeList(expected),
+      'Copy original source IDs and frozen slot ownership, preserving explicit slots, version and metadata');
+    assert.deepEqual(edgeList(actual.edges), edgeList([...before.edges, ...expected]),
+      'Do not clone outgoing edges or change any original/unrelated edge');
+    for (const card of before.cards) assert.deepEqual(actual.cards.find(c => c.id === card.id), card);
+    assert.deepEqual(saved.edges, actual.edges, 'References must persist through the real save API');
+    assert.deepEqual(saved.cards.find(c => c.id === copy.id).assets, copy.assets);
+    await assertWires(actual);
+  }
+  try {
+    fixture = await bootFixture(folder);
+    browser = await chromium.launch({channel:process.env.CHOUKA_TEST_BROWSER || 'msedge'});
+    const context = await browser.newContext({viewport:{width:1440,height:1000}, permissions:['clipboard-read','clipboard-write']});
+    const login = await context.request.post(fixture.origin + '/api/auth/login', {
+      headers:{Origin:fixture.origin}, data:{username:'clipboard-test',password:'Clipboard-test-password-123'},
+    });
+    assert.equal(login.status(), 200, await login.text());
+    page = await context.newPage();
+    page.on('pageerror', error => pageErrors.push(error.stack));
+    page.on('response', response => {
+      if (response.request().method() !== 'GET') responses.push({path:new URL(response.url()).pathname, status:response.status()});
+    });
+    await page.goto(fixture.origin);
+    await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    source = await api('/api/projects', 'POST', {name:'Incoming reference source'});
+    destination = await api('/api/projects', 'POST', {name:'Independent paste destination'});
+    const image = await upload(source.id, 'png', 'shared-reference.png');
+    const generated = await upload(source.id, 'jpg', 'generated-snapshot.jpg');
+    const video = await upload(source.id, 'video', 'target-output.mp4');
+    const unrelated = await upload(source.id, 'jpg', 'unrelated-not-copied.jpg');
+    const cards = [
+      {id:'ref-material', type:'card_asset', cap:'asset', name:'共享图片素材', x:40, y:40, params:{}, assets:{}, outputs:[image]},
+      // A generation dependency already has output. Copying it must never submit
+      // generation; representing this snapshot as a material card is also valid.
+      {id:'ref-generated', type:'card_image', cap:'zimage_t2i', name:'已生成参考图', x:40, y:340,
+        params:{prompt:'Only use my existing output'}, assets:{}, outputs:[generated], status:'done'},
+      {id:'ref-text', type:'card_text', cap:'text', name:'文本风格来源', x:40, y:640,
+        params:{text:'冷色调，胶片颗粒，保留原始文字。'}, assets:{}, outputs:[]},
+      {id:'ref-target', type:'card_video', cap:'minimax_h3_ref4', name:'多槽引用目标', x:460, y:160,
+        params:{prompt:'第1张和第2张使用同一素材，第3张用已生成图片。'},
+        assets:{'images[0]':image, 'images[1]':image, 'images[2]':generated, 'images[3]':image}, outputs:[video], status:'done'},
+      {id:'ref-downstream', type:'card_video', cap:'minimax_h3_ref9', name:'只出不入的下游', x:880, y:160,
+        params:{}, assets:{'videos[0]':video}, outputs:[]},
+      {id:'ref-unrelated', type:'card_asset', cap:'asset', name:'完全无关素材', x:880, y:600,
+        params:{}, assets:{}, outputs:[unrelated]},
+    ];
+    for (const card of cards) await api(`/api/projects/${source.id}/cards`, 'POST', {card});
+    const current = await api(`/api/projects/${source.id}`);
+    const edges = [
+      {from:'ref-material', to:'ref-target', slot:'images[0]', slots:['images[0]', 'images[1]']},
+      {from:'ref-generated', to:'ref-target', slot:'images[2]', slots:['images[2]'], version:{job:'snapshot-existing-output', index:0}},
+      // Legacy slot ownership is resolved in the source context and frozen on copy.
+      {from:'ref-material', to:'ref-target', slot:'images[3]'},
+      {from:'ref-text', to:'ref-target', slot:'@style'},
+      {from:'ref-target', to:'ref-downstream', slot:'videos[0]', slots:['videos[0]']},
+    ];
+    await api(`/api/projects/${source.id}`, 'PUT', {rev:current.rev, cards:current.cards, edges, groups:[]});
+    await open(source.id);
+    seeded = await state();
+    assert.deepEqual(seeded.edges, edges);
+    await assertWires(seeded);
+
+    await t.test('cloneCard keeps incoming references to the original source IDs', {timeout:30000}, async () => {
+      await open(source.id);
+      const before = await state(), incoming = await incomingSnapshot();
+      await page.evaluate(() => cloneCard(cardOf('ref-target')));
+      await assertSameCanvas(before, incoming);
+    });
+    await t.test('copyCard/pasteCard keeps exact same-canvas incoming edges', {timeout:30000}, async () => {
+      await open(source.id);
+      const before = await state(), incoming = await incomingSnapshot();
+      await page.evaluate(async () => { copyCard(cardOf('ref-target')); await pasteCard(); });
+      await assertSameCanvas(before, incoming);
+    });
+    await t.test('trusted canvas Ctrl+C/Ctrl+V keeps incoming reference wires', {timeout:30000}, async () => {
+      await open(source.id);
+      const before = await state(), incoming = await incomingSnapshot();
+      await page.bringToFront();
+      await page.evaluate(async () => {
+        await navigator.clipboard.writeText('plain text, not media');
+        pick('ref-target'); closePanel(); document.activeElement?.blur();
+      });
+      await page.keyboard.press('Control+c');
+      await page.keyboard.press('Control+v');
+      await expect.poll(() => page.evaluate(() => PROJ.cards.length)).toBe(before.cards.length + 1);
+      await assertSameCanvas(before, incoming);
+    });
+    await t.test('cross-canvas paste remaps only incoming sources and independent shared files, surviving reload', {timeout:60000}, async () => {
+      await open(source.id);
+      const original = await api(`/api/projects/${source.id}`);
+      const incoming = await incomingSnapshot();
+      const uploadDir = path.join(folder, 'data', 'uploads');
+      const filesBefore = new Set(fs.readdirSync(uploadDir));
+      const responseStart = responses.length;
+      await page.evaluate(() => copyCard(cardOf('ref-target')));
+      // Keep the real in-memory clipboard while switching canvases. No knowledge
+      // of its internal fields or of the copy endpoint's bundle format is needed.
+      await open(destination.id);
+      await page.evaluate(async () => { await pasteCard(); });
+      await settle();
+      const actual = await state();
+      assert.equal(actual.cards.length, 4,
+        'Paste exactly the target, shared material, existing generation output and text source; no downstream/unrelated nodes');
+      const target = actual.cards.find(c => c.type === 'card_video' && c.cap === 'minimax_h3_ref4');
+      assert.ok(target, 'The pasted generator retains its original workflow version');
+      assert.deepEqual(target.params, seeded.cards.find(c => c.id === 'ref-target').params);
+      const mapping = new Map([['ref-target', target.id]]);
+      for (const edge of incoming) {
+        const copiedEdge = actual.edges.find(e => e.to === target.id && e.slot === edge.slot);
+        assert.ok(copiedEdge, 'Automatically reconnect incoming slot ' + edge.slot);
+        assert.ok(actual.cards.some(c => c.id === copiedEdge.from), 'Wire source must be a real pasted card');
+        if (mapping.has(edge.from)) assert.equal(copiedEdge.from, mapping.get(edge.from),
+          'Multiple slots referencing one material must share one copied source card');
+        else mapping.set(edge.from, copiedEdge.from);
+      }
+      assert.equal(mapping.size, 4);
+      assert.equal(new Set(mapping.values()).size, 4, 'Every copied source/target needs its own new ID');
+      assert.ok(actual.cards.every(c => !original.cards.some(old => old.id === c.id)), 'Never reuse source-canvas node IDs');
+      assert.deepEqual(edgeList(actual.edges), edgeList(incoming.map(e =>
+        ({...e, from:mapping.get(e.from), to:target.id}))),
+      'Remap both endpoints, preserving exact slot/slots/version and excluding every outgoing edge');
+      const copiedMaterial = actual.cards.find(c => c.id === mapping.get('ref-material'));
+      const copiedGeneration = actual.cards.find(c => c.id === mapping.get('ref-generated'));
+      const copiedText = actual.cards.find(c => c.id === mapping.get('ref-text'));
+      assert.equal(copiedMaterial.type, 'card_asset');
+      assert.ok(['card_asset', 'card_image'].includes(copiedGeneration.type),
+        'An existing generation output may be snapshotted as material rather than rerun');
+      if (copiedGeneration.type === 'card_image') assert.equal(copiedGeneration.cap, 'zimage_t2i');
+      assert.equal(copiedText.type, 'card_text');
+      assert.deepEqual(copiedText.params, seeded.cards.find(c => c.id === 'ref-text').params,
+        'Text/style input remains an editable text source, not a media placeholder');
+      assert.equal(copiedMaterial.outputs.length, 1); assert.equal(copiedGeneration.outputs.length, 1);
+      assert.equal(target.outputs.length, 1);
+      for (const slot of ['images[0]', 'images[1]', 'images[3]']) {
+        assert.equal(target.assets[slot].url, copiedMaterial.outputs[0].url);
+        assert.equal(target.assets[slot].ref, copiedMaterial.outputs[0].ref,
+          'Target assets and new source outputs must use the same copied resource ID');
+      }
+      assert.equal(target.assets['images[2]'].url, copiedGeneration.outputs[0].url);
+      assert.equal(target.assets['images[2]'].ref, copiedGeneration.outputs[0].ref);
+      assert.deepEqual(Object.keys(target.assets).sort(), Object.keys(seeded.cards.find(c => c.id === 'ref-target').assets).sort());
+      const resources = [
+        {old:image, copy:copiedMaterial.outputs[0], bytes:media.png},
+        {old:generated, copy:copiedGeneration.outputs[0], bytes:media.jpg},
+        {old:video, copy:target.outputs[0], bytes:media.video},
+      ];
+      for (const {old, copy, bytes} of resources) {
+        assert.notEqual(copy.url, old.url, 'Destination owns an independent URL, not a source-project alias');
+        assert.notEqual(copy.ref, old.ref, 'Destination owns an independent resource ref');
+        assert.equal(copy.kind, old.kind);
+        assert.match(copy.url, /^\/api\/upload\/[^/?]+$/);
+        const oldFile = path.join(uploadDir, path.posix.basename(old.url));
+        const newFile = path.join(uploadDir, path.posix.basename(copy.url));
+        assert.notEqual(fs.realpathSync(newFile), fs.realpathSync(oldFile), 'The copy must be a distinct on-disk resource');
+        assert.deepEqual(fs.readFileSync(newFile), bytes);
+        assert.deepEqual(fs.readFileSync(oldFile), bytes, 'Copy must not modify the source file');
+        const response = await page.request.get(fixture.origin + copy.url);
+        assert.equal(response.status(), 200, 'Independent resource is accessible through authenticated production routes');
+        assert.deepEqual(await response.body(), bytes);
+      }
+      // Rendering video cards can create compatibility previews asynchronously.
+      // Exclude only sidecars belonging to these known source/copied videos, not
+      // arbitrary extra uploads (which would hide unrelated/duplicate copies).
+      const previewFiles = new Set([video.url, target.outputs[0].url].flatMap(url => {
+        const name = path.posix.basename(url);
+        return [name + '.browser.mp4', name + '.browser.part.mp4'];
+      }));
+      const newFiles = fs.readdirSync(uploadDir).filter(name => !filesBefore.has(name) && !previewFiles.has(name)).sort();
+      assert.deepEqual(newFiles, resources.map(r => path.posix.basename(r.copy.url)).sort(),
+        'Copy each distinct needed resource once, despite repeated slots; do not copy unrelated resources');
+      for (const out of [image, generated, video, unrelated]) assert.ok(!JSON.stringify(actual).includes(out.url),
+        'No source upload URL may leak into the independent destination');
+      const copies = responses.slice(responseStart).filter(r => r.path === `/api/projects/${destination.id}/copy`);
+      assert.deepEqual(copies, [{path:`/api/projects/${destination.id}/copy`, status:200}],
+        'Use one real resource-copy request so shared resources are rewritten consistently across the bundle');
+      await assertWires(actual);
+      const saved = await api(`/api/projects/${destination.id}`);
+      assert.deepEqual(saved.edges, actual.edges);
+      for (const card of actual.cards) {
+        const persisted = saved.cards.find(c => c.id === card.id);
+        assert.ok(persisted);
+        for (const key of ['type', 'cap', 'params', 'assets', 'outputs']) assert.deepEqual(persisted[key], card[key]);
+      }
+      assert.deepEqual(await api(`/api/projects/${source.id}`), original, 'Cross-canvas paste must not change the source project');
+      await page.reload();
+      await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+      await open(destination.id);
+      const reloaded = await state();
+      assert.deepEqual(reloaded.edges, actual.edges, 'Remapped wires survive a full browser reload, not just local render');
+      assert.deepEqual(reloaded.cards.map(c => c.id).sort(), actual.cards.map(c => c.id).sort());
+      for (const card of actual.cards) {
+        const restored = reloaded.cards.find(c => c.id === card.id);
+        for (const key of ['type', 'cap', 'params', 'assets', 'outputs']) assert.deepEqual(restored[key], card[key]);
+      }
+      await assertWires(reloaded);
+      for (const {copy, bytes} of resources) {
+        const response = await page.request.get(fixture.origin + copy.url);
+        assert.equal(response.status(), 200); assert.deepEqual(await response.body(), bytes);
+      }
+    });
+    const audit = await api('/__fixture/audit');
+    assert.deepEqual(audit.jobs, []); assert.deepEqual(audit.outbound, []);
+    assert.ok(!audit.writes.some(w => /^\/api\/(generate|text|rewrite)(\?|$)/.test(w.path)),
+      'Copying a source generation output or text must never trigger generation');
+    assert.deepEqual(responses.filter(r => r.status >= 400), [], 'No rejected creates, copies or save conflicts');
+    assert.deepEqual(pageErrors, [], 'No uncaught production browser errors');
+  } finally {
+    if (browser) await browser.close();
+    if (fixture) await fixture.stop();
+  }
+});
