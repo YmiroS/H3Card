@@ -1,0 +1,609 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <title>Chouka 抽卡系统技术架构与扩展</title>
+  <style>
+    :root {
+      --bg: #020617;
+      --slide: #081426;
+      --panel: #0e2037;
+      --panel-strong: #122a46;
+      --line: #34506d;
+      --text: #f1f5f9;
+      --muted: #bac7d7;
+      --blue: #38bdf8;
+      --green: #34d399;
+      --amber: #fbbf24;
+      --red: #fb7185;
+      --violet: #c4b5fd;
+      --mono: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      --sans: "Microsoft YaHei UI", "PingFang SC", "Noto Sans CJK SC", sans-serif;
+      --ease: cubic-bezier(.2,.75,.25,1);
+    }
+
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; }
+    body {
+      overflow: hidden;
+      color: var(--text);
+      font-family: var(--sans);
+      background:
+        linear-gradient(rgba(56,189,248,.035) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(56,189,248,.035) 1px, transparent 1px),
+        var(--bg);
+      background-size: 36px 36px;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    button, a { font: inherit; }
+    button { cursor: pointer; }
+    button:focus-visible, a:focus-visible { outline: 3px solid var(--blue); outline-offset: 3px; }
+    .skip { position: fixed; z-index: 999; left: 16px; top: -80px; padding: 12px 16px; color: #00131f; background: var(--blue); border-radius: 8px; }
+    .skip:focus { top: 16px; }
+
+    .stage { position: fixed; inset: 0; display: grid; place-items: center; padding: 16px; }
+    .deck {
+      position: relative;
+      width: min(calc(100vh * 16 / 9 - 32px), calc(100vw - 32px));
+      aspect-ratio: 16 / 9;
+      overflow: hidden;
+      border: 1px solid #36516d;
+      border-radius: 16px;
+      background: var(--slide);
+      box-shadow: 0 32px 96px rgba(0,0,0,.5);
+    }
+    .deck::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 80;
+      pointer-events: none;
+      background: linear-gradient(115deg, transparent 0 58%, rgba(56,189,248,.018) 58% 59%, transparent 59%);
+    }
+
+    .progress { position: absolute; z-index: 120; top: 0; left: 0; right: 0; height: 4px; background: #10233a; }
+    .progress span { display: block; width: 0; height: 100%; background: linear-gradient(90deg, var(--blue), var(--green)); transition: width .25s var(--ease); }
+    .slides { position: absolute; inset: 0; }
+
+    .slide {
+      position: absolute;
+      inset: 0;
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+      gap: clamp(15px,1.7vw,26px);
+      padding: clamp(30px,3.3vw,52px) clamp(42px,4.4vw,70px) clamp(66px,4.7vw,76px);
+      overflow: hidden;
+      background: var(--slide);
+      opacity: 0;
+      visibility: hidden;
+      transform: translateX(18px);
+      transition: opacity .24s var(--ease), transform .24s var(--ease), visibility .24s;
+    }
+    .slide.active { z-index: 2; opacity: 1; visibility: visible; transform: none; }
+    .slide-head, .slide-foot { display: flex; align-items: center; justify-content: space-between; min-width: 0; }
+    .slide-head { padding-bottom: 13px; border-bottom: 1px solid var(--line); }
+    .slide-foot { color: #8294aa; font: 600 clamp(11px,.78vw,13px)/1 var(--mono); }
+    .brand { display: flex; align-items: center; gap: 11px; font: 800 clamp(13px,1vw,16px)/1 var(--mono); letter-spacing: .07em; }
+    .brand::before { content: ""; width: 11px; height: 11px; background: var(--blue); box-shadow: 9px 0 0 var(--green); }
+    .page-id { color: var(--blue); font: 700 clamp(11px,.82vw,14px)/1 var(--mono); letter-spacing: .1em; }
+
+    .slide-body { min-height: 0; display: flex; flex-direction: column; justify-content: center; gap: clamp(15px,1.6vw,25px); }
+    h1, h2, h3, p { margin: 0; }
+    h1 { max-width: 15ch; font-size: clamp(50px,6.1vw,94px); line-height: 1.03; letter-spacing: -.045em; }
+    h2 { font-size: clamp(36px,3.55vw,56px); line-height: 1.1; letter-spacing: -.035em; }
+    h3 { font-size: clamp(18px,1.35vw,22px); line-height: 1.35; }
+    p, li { font-size: clamp(15px,1.08vw,18px); line-height: 1.55; }
+    ul { margin: 0; padding-left: 1.25em; }
+    li + li { margin-top: 7px; }
+    code, .mono { font-family: var(--mono); }
+    .eyebrow { color: var(--blue); font: 700 clamp(13px,.92vw,16px)/1 var(--mono); letter-spacing: .11em; }
+    .lead { max-width: 48em; color: var(--muted); font-size: clamp(19px,1.5vw,25px); line-height: 1.55; }
+    .muted { color: var(--muted); }
+    .blue { color: var(--blue); }
+    .green { color: var(--green); }
+    .amber { color: var(--amber); }
+
+    .grid-2 { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: clamp(14px,1.5vw,22px); }
+    .grid-3 { display: grid; grid-template-columns: repeat(3,minmax(0,1fr)); gap: clamp(12px,1.25vw,19px); }
+    .grid-4 { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: clamp(11px,1.1vw,17px); }
+    .split { display: grid; grid-template-columns: minmax(0,.8fr) minmax(0,1.2fr); gap: clamp(24px,3.4vw,54px); align-items: center; }
+    .split > * { min-width: 0; }
+
+    .panel { padding: clamp(16px,1.5vw,24px); border: 1px solid var(--line); border-radius: 10px; background: rgba(14,32,55,.9); }
+    .panel-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; padding-bottom: 11px; border-bottom: 1px solid rgba(148,163,184,.22); }
+    .panel-head strong { font: 800 clamp(15px,1.08vw,18px)/1.3 var(--mono); }
+    .tag { display: inline-flex; padding: 5px 9px; border: 1px solid #42617f; border-radius: 999px; color: var(--muted); font: 700 clamp(11px,.78vw,13px)/1 var(--mono); }
+    .tag.blue { color: var(--blue); border-color: rgba(56,189,248,.55); background: rgba(56,189,248,.08); }
+    .tag.green { color: var(--green); border-color: rgba(52,211,153,.5); background: rgba(52,211,153,.08); }
+    .tag.amber { color: var(--amber); border-color: rgba(251,191,36,.5); background: rgba(251,191,36,.08); }
+
+    .box { min-width: 0; padding: 15px 16px; border: 1px solid #3c5875; border-radius: 9px; background: #10223a; }
+    .box.primary { border-color: var(--blue); box-shadow: inset 4px 0 0 var(--blue); }
+    .box.success { border-color: var(--green); box-shadow: inset 4px 0 0 var(--green); }
+    .box.warn { border-color: var(--amber); box-shadow: inset 4px 0 0 var(--amber); }
+    .box strong { display: block; font-size: clamp(17px,1.2vw,21px); line-height: 1.3; }
+    .box span { display: block; margin-top: 6px; color: var(--muted); font: 500 clamp(13px,.9vw,15px)/1.45 var(--mono); overflow-wrap: anywhere; }
+
+    .arrow { display: grid; place-items: center; min-width: 54px; color: var(--blue); font: 700 clamp(12px,.85vw,14px)/1.25 var(--mono); text-align: center; }
+    .arrow::after { content: "→"; display: block; margin-top: 6px; font-size: clamp(28px,2.4vw,40px); line-height: 1; }
+    .arrow.green { color: var(--green); }
+
+    .topology { display: grid; grid-template-columns: 1fr auto 1.15fr auto 1fr; gap: 10px; align-items: center; }
+    .stores { grid-column: 2 / 5; display: flex; justify-content: center; gap: 10px; margin-top: 10px; }
+    .store-chip { padding: 8px 12px; color: #c4d2e2; border: 1px dashed #496987; border-radius: 7px; font: 600 clamp(12px,.82vw,14px)/1 var(--mono); }
+
+    .layer-stack { display: grid; gap: 11px; }
+    .layer { display: grid; grid-template-columns: 150px 1fr; gap: 12px; }
+    .layer-name { display: grid; place-items: center; padding: 10px; color: var(--blue); border: 1px solid rgba(56,189,248,.45); border-radius: 9px; background: rgba(56,189,248,.08); font: 800 clamp(13px,.9vw,15px)/1.35 var(--mono); text-align: center; }
+    .layer-items { display: grid; grid-template-columns: repeat(4,minmax(0,1fr)); gap: 9px; }
+    .layer-item { padding: 12px 13px; border: 1px solid #35516e; border-radius: 8px; background: #0f2036; }
+    .layer-item strong { display: block; font: 750 clamp(14px,.95vw,16px)/1.35 var(--mono); overflow-wrap: anywhere; }
+    .layer-item span { display: block; margin-top: 5px; color: var(--muted); font-size: clamp(12px,.82vw,14px); line-height: 1.35; }
+
+    .flow { display: grid; grid-template-columns: repeat(7,minmax(0,1fr)); gap: 9px; }
+    .step { position: relative; min-height: 105px; padding: 13px; border: 1px solid #385471; border-radius: 8px; background: #0f2036; }
+    .step:not(:last-child)::after { content: "→"; position: absolute; z-index: 2; right: -14px; top: 39px; color: var(--blue); font: 800 20px/1 var(--mono); }
+    .step b { display: block; margin-bottom: 9px; color: var(--blue); font: 800 clamp(13px,.88vw,15px)/1 var(--mono); }
+    .step strong { display: block; font-size: clamp(15px,1vw,17px); line-height: 1.3; }
+    .step span { display: block; margin-top: 7px; color: var(--muted); font-size: clamp(12px,.8vw,14px); line-height: 1.35; }
+
+    .channels { display: grid; grid-template-columns: repeat(2,1fr); gap: 14px; }
+    .channel { padding: 16px 18px; border: 1px solid #3b5875; border-radius: 9px; background: #0f2036; }
+    .channel code { display: block; margin-bottom: 8px; color: var(--green); font-size: clamp(14px,.95vw,16px); }
+    .channel p { color: var(--muted); }
+
+    .contract { display: grid; grid-template-columns: 1fr auto 1fr auto 1fr; gap: 12px; align-items: stretch; }
+    .contract .box { min-height: 130px; display: flex; flex-direction: column; justify-content: space-between; }
+
+    pre { margin: 0; }
+    .code { padding: 16px 18px; overflow: hidden; color: #d6e2f0; border: 1px solid #36516d; border-radius: 9px; background: #030b18; font: 500 clamp(13px,.9vw,15px)/1.55 var(--mono); white-space: pre-wrap; }
+    .ck { color: #7dd3fc; }
+    .cv { color: #86efac; }
+
+    .sequence { display: grid; gap: 7px; }
+    .actors, .event { display: grid; align-items: center; gap: 10px; }
+    .actors.three, .event.three { grid-template-columns: repeat(3,1fr); }
+    .actors.four, .event.four { grid-template-columns: repeat(4,1fr); }
+    .actor { padding: 11px 12px; color: var(--text); border: 1px solid #466582; border-radius: 8px; background: #11253e; text-align: center; font: 800 clamp(14px,1vw,17px)/1.3 var(--mono); }
+    .event { min-height: 39px; }
+    .event .label { position: relative; grid-column: var(--from) / var(--to); padding: 7px 12px; color: #d9e5f2; border-top: 2px solid var(--blue); text-align: center; font: 650 clamp(13px,.9vw,15px)/1.35 var(--mono); }
+    .event.reply .label { border-top-style: dashed; border-top-color: var(--green); }
+    .event .label::after { content: "▶"; position: absolute; top: -11px; right: -2px; color: var(--blue); font-size: 14px; }
+    .event.reply .label::after { color: var(--green); }
+    .event.reverse .label::after { left: -2px; right: auto; transform: rotate(180deg); }
+    .event-note { padding: 10px 14px; color: var(--amber); border: 1px solid rgba(251,191,36,.55); border-radius: 8px; background: rgba(251,191,36,.08); text-align: center; font-size: clamp(14px,.95vw,16px); }
+
+    .decision { display: grid; grid-template-columns: repeat(6,minmax(0,1fr)); gap: 10px; }
+    .decision .box { position: relative; min-height: 118px; }
+    .decision .box:not(:last-child)::after { content: "→"; position: absolute; right: -16px; top: 42px; z-index: 2; color: var(--green); font: 800 22px/1 var(--mono); }
+
+    .storage { display: grid; grid-template-columns: 1fr .75fr 1fr; gap: 18px; align-items: center; }
+    .storage-col { display: grid; gap: 10px; }
+    .db { padding: 12px 14px; border: 1px solid #3a5673; border-radius: 8px; background: #0f2036; }
+    .db strong { display: block; color: var(--violet); font: 750 clamp(14px,.95vw,16px)/1.35 var(--mono); }
+    .db span { display: block; margin-top: 5px; color: var(--muted); font-size: clamp(13px,.88vw,15px); line-height: 1.35; }
+    .server-core { padding: 28px 18px; border: 1px solid var(--blue); border-radius: 10px; background: rgba(56,189,248,.09); text-align: center; }
+    .server-core strong { display: block; font: 800 clamp(19px,1.35vw,23px)/1.3 var(--mono); }
+    .server-core span { display: block; margin-top: 8px; color: var(--muted); font-size: 14px; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: clamp(13px,.9vw,15px); }
+    th, td { padding: 10px 12px; border: 1px solid #36516d; text-align: left; vertical-align: top; line-height: 1.4; }
+    th { color: var(--blue); background: rgba(56,189,248,.08); font-family: var(--mono); }
+    td { color: #d0dbea; background: rgba(14,32,55,.72); }
+    td:first-child { color: var(--text); font-weight: 700; }
+
+    .callout { padding: 13px 16px; border-left: 4px solid var(--blue); background: rgba(56,189,248,.09); color: #d6e2ef; font-size: clamp(15px,1vw,17px); line-height: 1.5; }
+    .callout.warn { border-color: var(--amber); background: rgba(251,191,36,.08); }
+
+    .roadmap { display: grid; grid-template-columns: repeat(3,1fr); gap: 14px; }
+    .phase { padding: 16px 18px; border: 1px solid #3b5875; border-top: 4px solid var(--blue); border-radius: 9px; background: #0f2036; }
+    .phase:nth-child(2) { border-top-color: var(--green); }
+    .phase:nth-child(3) { border-top-color: var(--amber); }
+    .phase b { color: var(--blue); font: 800 14px/1 var(--mono); }
+    .phase:nth-child(2) b { color: var(--green); }
+    .phase:nth-child(3) b { color: var(--amber); }
+    .phase strong { display: block; margin-top: 9px; font-size: 20px; }
+    .phase p { margin-top: 6px; color: var(--muted); }
+
+    .controls { position: absolute; z-index: 140; right: clamp(16px,2vw,28px); bottom: clamp(13px,1.5vw,22px); display: flex; align-items: center; gap: 8px; }
+    .control { width: 42px; height: 42px; display: grid; place-items: center; color: var(--text); border: 1px solid #46617d; border-radius: 8px; background: rgba(4,13,27,.95); }
+    .control:hover { border-color: var(--blue); background: #112943; }
+    .control svg { width: 19px; height: 19px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+    .counter { min-width: 76px; color: #a4b4c7; text-align: center; font: 700 13px/1 var(--mono); }
+
+    .popover { position: absolute; z-index: 130; bottom: 72px; width: min(430px,calc(100% - 44px)); padding: 18px; color: var(--text); border: 1px solid #45617f; border-radius: 10px; background: rgba(3,11,23,.98); opacity: 0; visibility: hidden; transform: translateY(7px); transition: .18s var(--ease); }
+    .popover.open { opacity: 1; visibility: visible; transform: none; }
+    .popover h3 { margin-bottom: 10px; color: var(--blue); font-family: var(--mono); }
+    .popover p, .popover span { color: #c5d1df; font-size: 14px; }
+    #notesPanel { left: 22px; }
+    #helpPanel { right: 22px; }
+    .keys { display: grid; grid-template-columns: auto 1fr; gap: 8px 12px; align-items: center; }
+    kbd { min-width: 38px; padding: 5px 8px; text-align: center; color: var(--text); border: 1px solid #49637f; border-radius: 5px; background: #102139; font: 700 12px/1 var(--mono); }
+
+    .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; border: 0; }
+    .slide.active .reveal { animation: show .32s var(--ease) both; }
+    .slide.active .d1 { animation-delay: .06s; }
+    .slide.active .d2 { animation-delay: .12s; }
+    @keyframes show { from { opacity: 0; transform: translateY(9px); } to { opacity: 1; transform: none; } }
+
+    @media (max-width: 920px), (max-height: 650px) {
+      .stage { padding: 0; }
+      .deck { width: 100vw; height: 100vh; aspect-ratio: auto; border: 0; border-radius: 0; }
+      .slide { padding: 24px 24px 78px; overflow: auto; }
+      .slide-body { justify-content: flex-start; }
+      .grid-4 { grid-template-columns: repeat(2,1fr); }
+      .layer { grid-template-columns: 1fr; }
+      .layer-items { grid-template-columns: repeat(2,1fr); }
+      .flow, .decision { grid-template-columns: repeat(2,1fr); }
+      .step::after, .decision .box::after { display: none; }
+      .topology, .contract { grid-template-columns: 1fr; }
+      .topology .arrow, .contract .arrow { transform: rotate(90deg); }
+      .stores { grid-column: 1; flex-wrap: wrap; }
+      .sequence { min-width: 820px; }
+      .sequence-wrap { overflow-x: auto; }
+    }
+    @media (max-width: 640px) {
+      .slide { display: block; overflow-x: hidden; }
+      .slide-head { margin-bottom: 26px; }
+      .page-id { display: none; }
+      .slide-body { width: 100%; }
+      .slide-foot { margin-top: 28px; padding-bottom: 18px; }
+      .grid-2, .grid-3, .grid-4, .split, .channels, .storage, .roadmap { grid-template-columns: 1fr; }
+      .controls { left: 50%; right: auto; transform: translateX(-50%); }
+      .control.secondary { display: none; }
+      .counter { min-width: 58px; }
+      table { min-width: 760px; }
+    }
+    @media (prefers-reduced-motion: reduce) { *,*::before,*::after { animation-duration: .001ms !important; transition-duration: .001ms !important; } }
+    @media print {
+      @page { size: 16in 9in; margin: 0; }
+      body { overflow: visible; }
+      .stage { position: static; display: block; padding: 0; }
+      .deck { width: 16in; height: 9in; border: 0; border-radius: 0; overflow: visible; }
+      .slides { position: static; }
+      .slide { position: relative; width: 16in; height: 9in; opacity: 1; visibility: visible; transform: none; page-break-after: always; }
+      .controls,.progress,.popover { display: none !important; }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip" href="#slides">跳到演示内容</a>
+  <main class="stage" aria-label="Chouka 技术架构演示">
+    <section class="deck" aria-roledescription="幻灯片演示">
+      <div class="progress" aria-hidden="true"><span id="progressBar"></span></div>
+      <div class="slides" id="slides">
+        <article class="slide active" aria-hidden="false" data-note="先讲边界：Chouka 不是推理引擎，它负责 ComfyUI 外围的业务编排、权限和任务治理。">
+          <header class="slide-head"><span class="brand">CHOUKA / SYSTEM BOUNDARY</span><span class="page-id">01 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">CHOUKA 管什么，COMFYUI 管什么</span>
+            <h2 class="reveal d1">业务编排与节点执行<span class="blue">明确分层</span></h2>
+            <div class="topology reveal d2">
+              <div class="box"><strong>Chouka Web</strong><span>业务参数 · 素材 · 项目操作</span></div>
+              <div class="arrow">HTTP API</div>
+              <div class="box primary"><strong>Chouka Server</strong><span>项目、权限、Graph、任务、资源、调度</span></div>
+              <div class="arrow green">API Graph</div>
+              <div class="box success"><strong>ComfyUI</strong><span>模型、节点、GPU 执行、history、output</span></div>
+            </div>
+            <div class="grid-2 reveal d2">
+              <section class="panel"><div class="panel-head"><strong>Chouka 负责</strong><span class="tag blue">业务治理</span></div><ul><li>浏览器画布、业务参数和项目协作</li><li>用户、项目 ACL 与素材访问权限</li><li>Manifest 参数注入和任务调度</li><li>产物归档、费用、产能和管理页面</li></ul></section>
+              <section class="panel"><div class="panel-head"><strong>ComfyUI 负责</strong><span class="tag green">推理执行</span></div><ul><li>校验 API Graph</li><li>加载模型与自定义节点</li><li>执行节点图并发送进度事件</li><li>写入 history 与 output</li></ul></section>
+            </div>
+            <div class="callout reveal d2">核心结论：Chouka 是 ComfyUI 之外的业务编排和治理层，不是新的推理引擎。</div>
+          </div>
+          <footer class="slide-foot"><span>System Context</span><span>任务状态与授权产物通过 Chouka 返回浏览器</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="Local 用于开发和单机；Controller 用于多台 Windows GPU。两种模式共用前端和大部分服务端逻辑。">
+          <header class="slide-head"><span class="brand">CHOUKA / DEPLOYMENT</span><span class="page-id">02 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">两种部署形态</span>
+            <h2 class="reveal d1">同一套业务层，连接<span class="blue">两种执行后端</span></h2>
+            <div class="grid-2 reveal d2">
+              <section class="panel">
+                <div class="panel-head"><strong>Local 模式</strong><span class="tag blue">开发 / 单机</span></div>
+                <div class="topology">
+                  <div class="box"><strong>Browser</strong><span>HTTP :8199</span></div><div class="arrow">API</div><div class="box primary"><strong>Chouka aiohttp</strong><span>server/app.py</span></div><div class="arrow green">/prompt<br>/ws</div><div class="box success"><strong>Local ComfyUI</strong><span>:8188</span></div>
+                  <div class="stores"><span class="store-chip">projects</span><span class="store-chip">jobs</span><span class="store-chip">auth.db</span></div>
+                </div>
+                <ul style="margin-top:16px"><li>入口：<code>启动抽卡系统.bat</code></li><li>Chouka 直接调用本机 ComfyUI</li><li>服务端常驻监听 ComfyUI WebSocket</li></ul>
+              </section>
+              <section class="panel">
+                <div class="panel-head"><strong>分布式模式</strong><span class="tag green">多机 / 集中治理</span></div>
+                <div class="topology">
+                  <div class="box"><strong>Browser</strong><span>HTTP :8199</span></div><div class="arrow">API</div><div class="box primary"><strong>Controller</strong><span>control.db</span></div><div class="arrow green">pull<br>lease</div><div class="box success"><strong>Windows Worker</strong><span>agent.py → ComfyUI</span></div>
+                  <div class="stores"><span class="store-chip">dispatch_jobs</span><span class="store-chip">artifacts</span><span class="store-chip">worker state</span></div>
+                </div>
+                <ul style="margin-top:16px"><li>Worker 主动注册、心跳并领取任务</li><li>每个 Worker 调用自己机器的 ComfyUI</li><li>浏览器不直接访问 Worker 或 ComfyUI</li></ul>
+              </section>
+            </div>
+          </div>
+          <footer class="slide-foot"><span>Local / Controller</span><span>Controller 不主动远程执行 Windows 命令</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="从代码目录看四层：浏览器、Chouka 服务、能力定义、执行端。重点记三个入口 app.py、app.js、agent.py。">
+          <header class="slide-head"><span class="brand">CHOUKA / COMPONENTS</span><span class="page-id">03 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">组件架构</span>
+            <h2 class="reveal d1">代码模块如何组成<span class="blue">运行系统</span></h2>
+            <div class="layer-stack reveal d2">
+              <div class="layer"><div class="layer-name">ChouKa Web</div><div class="layer-items"><div class="layer-item"><strong>web/app.js</strong><span>画布、参数、任务轮询</span></div><div class="layer-item"><strong>web/auth.js</strong><span>Session / CSRF</span></div><div class="layer-item"><strong>director.js</strong><span>导演台与真实节点</span></div><div class="layer-item"><strong>director_edit.js</strong><span>剪辑文档与导出</span></div></div></div>
+              <div class="layer"><div class="layer-name">Chouka Server</div><div class="layer-items"><div class="layer-item"><strong>server/app.py</strong><span>HTTP API / Presence / 编排</span></div><div class="layer-item"><strong>auth*.py</strong><span>用户、Session、ACL</span></div><div class="layer-item"><strong>resource_access.py</strong><span>资源索引与访问</span></div><div class="layer-item"><strong>distributed.py</strong><span>Worker、Dispatch、Lease</span></div></div></div>
+              <div class="layer"><div class="layer-name">能力定义</div><div class="layer-items"><div class="layer-item"><strong>graphs/*.api.json</strong><span>ComfyUI 执行图</span></div><div class="layer-item"><strong>manifests/*.json</strong><span>业务参数到节点映射</span></div><div class="layer-item"><strong>_cards.json</strong><span>卡片、模式、模型</span></div><div class="layer-item"><strong>scan_workflows.py</strong><span>扫描并生成定义</span></div></div></div>
+              <div class="layer"><div class="layer-name">执行端</div><div class="layer-items"><div class="layer-item"><strong>worker/agent.py</strong><span>注册、心跳、执行、上传</span></div><div class="layer-item"><strong>ComfyUI /prompt</strong><span>验证工作流并入队</span></div><div class="layer-item"><strong>ComfyUI /ws</strong><span>节点、进度与错误事件</span></div><div class="layer-item"><strong>/history + /view</strong><span>输出记录与文件</span></div></div></div>
+            </div>
+            <div class="callout reveal d2">关键入口：<code>server/app.py:make_app()</code> · <code>web/app.js:boot()</code> · <code>POST /api/generate</code> · <code>/agent/v1/*</code></div>
+          </div>
+          <footer class="slide-foot"><span>Browser → Server → Capability Definition → Execution</span><span>能力不是在前端写死</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="前端状态主要在 app.js 模块变量。saveChain 和 rev 负责保存一致性；任务轮询与 Presence WebSocket 是两条不同链路。">
+          <header class="slide-head"><span class="brand">CHOUKA / FRONTEND</span><span class="page-id">04 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">前端运行结构</span>
+            <h2 class="reveal d1">状态、保存与<span class="blue">实时更新</span></h2>
+            <div class="flow reveal d2">
+              <div class="step"><b>BOOT</b><strong>/auth/me</strong><span>用户与 CSRF</span></div>
+              <div class="step"><b>CAPS</b><strong>/api/cards</strong><span>卡片与能力定义</span></div>
+              <div class="step"><b>PROJECTS</b><strong>/api/projects</strong><span>个人、共享、团队</span></div>
+              <div class="step"><b>OPEN</b><strong>加载项目</strong><span>cards / edges / groups</span></div>
+              <div class="step"><b>STATE</b><strong>PROJ</strong><span>当前画布与 rev</span></div>
+              <div class="step"><b>SAVE</b><strong>saveChain</strong><span>700ms 防抖 + 串行</span></div>
+              <div class="step"><b>CHECK</b><strong>rev 乐观锁</strong><span>避免覆盖新版本</span></div>
+            </div>
+            <div class="grid-3 reveal d2">
+              <div class="box primary"><strong>PROJ</strong><span>当前画布、节点、连线、分组和 rev</span></div>
+              <div class="box"><strong>CARDS / CAPS</strong><span>服务端下发的卡片和能力定义</span></div>
+              <div class="box success"><strong>TASKS</strong><span>当前用户可见的近期任务</span></div>
+            </div>
+            <div class="channels reveal d2">
+              <div class="channel"><code>HTTP POLL · GET /api/jobs</code><h3>生成状态</h3><p>约每 700ms 获取排队、进度、错误和结果；完成后写回卡片历史与下游素材。</p></div>
+              <div class="channel"><code>WEBSOCKET · /presence</code><h3>多人协作</h3><p>同步成员、光标和画布变更。Presence WebSocket 不承载生成任务进度。</p></div>
+            </div>
+          </div>
+          <footer class="slide-foot"><span>Optimistic UI + Serialized Save + Revision Check</span><span>任务状态通过 HTTP 轮询</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="沿着 POST /api/generate 讲解服务端管线。最后强调卡片、JOBS、dispatch_jobs 是三层状态。">
+          <header class="slide-head"><span class="brand">CHOUKA / SERVER PIPELINE</span><span class="page-id">05 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">POST /api/generate</span>
+            <h2 class="reveal d1">业务请求如何变成<span class="blue">可执行 Graph</span></h2>
+            <div class="flow reveal d2">
+              <div class="step"><b>01</b><strong>身份校验</strong><span>Session / Origin / CSRF</span></div>
+              <div class="step"><b>02</b><strong>项目权限</strong><span>必须具备 operate</span></div>
+              <div class="step"><b>03</b><strong>Project Lock</strong><span>同项目关键写串行</span></div>
+              <div class="step"><b>04</b><strong>素材校验</strong><span>归属、状态、任务输入</span></div>
+              <div class="step"><b>05</b><strong>patch_graph</strong><span>参数、seed、素材槽</span></div>
+              <div class="step"><b>06</b><strong>任务身份</strong><span>job ACL / job_inputs</span></div>
+              <div class="step"><b>07</b><strong>提交或派发</strong><span>Local / Controller</span></div>
+            </div>
+            <div class="grid-2 reveal d2">
+              <section class="panel"><div class="panel-head"><strong>patch_graph() 处理内容</strong><span class="tag blue">server/app.py</span></div><div class="grid-2"><div class="box"><strong>参数注入</strong><span>target.node / input</span></div><div class="box"><strong>Seed</strong><span>固定或随机</span></div><div class="box"><strong>素材替换</strong><span>图片、视频、音频</span></div><div class="box"><strong>支线清理</strong><span>必填校验与空槽断开</span></div></div></section>
+              <section class="panel"><div class="panel-head"><strong>三层任务状态</strong><span class="tag amber">排障边界</span></div><div class="grid-3"><div class="box"><strong>Card</strong><span>浏览器节点</span></div><div class="box primary"><strong>JOBS</strong><span>页面展示</span></div><div class="box success"><strong>dispatch_jobs</strong><span>派发与租约</span></div></div><div class="callout warn" style="margin-top:12px">页面 queued 不代表调度队列仍 queued，排查必须同时看 JOBS 和 dispatch_jobs。</div></section>
+            </div>
+          </div>
+          <footer class="slide-foot"><span>Auth → Assets → Graph → Job Identity → Execution</span><span>Local: /prompt · Controller: dispatch_jobs</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="Graph 决定执行什么，Manifest 决定业务参数如何映射，Cards 决定前端如何组织能力。三个文件应一起发布。">
+          <header class="slide-head"><span class="brand">CHOUKA / CAPABILITY CONTRACT</span><span class="page-id">06 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">GRAPH、MANIFEST 与 CARDS</span>
+            <h2 class="reveal d1">工作流如何变成<span class="blue">业务能力</span></h2>
+            <div class="contract reveal d2">
+              <div class="box"><strong>ComfyUI Workflow</strong><span>界面中研发和验证节点图</span></div><div class="arrow">scan</div><div class="box primary"><strong>API Graph</strong><span>graphs/*.api.json<br>提交到 /prompt</span></div><div class="arrow green">+</div><div class="box success"><strong>Manifest + Cards</strong><span>参数映射、输出节点、前端组织</span></div>
+            </div>
+            <div class="grid-2 reveal d2">
+              <pre class="code"><span class="ck">"id"</span>: <span class="cv">"example_capability"</span>,
+<span class="ck">"graph"</span>: <span class="cv">"graphs/example.api.json"</span>,
+<span class="ck">"output"</span>: { <span class="ck">"node"</span>: <span class="cv">"99"</span> },
+<span class="ck">"inputs"</span>: [{
+  <span class="ck">"key"</span>: <span class="cv">"prompt"</span>,
+  <span class="ck">"type"</span>: <span class="cv">"textarea"</span>,
+  <span class="ck">"target"</span>: { <span class="ck">"node"</span>: <span class="cv">"12"</span>, <span class="ck">"input"</span>: <span class="cv">"text"</span> }
+}]</pre>
+              <section class="panel"><div class="panel-head"><strong>协议含义与约束</strong><span class="tag green">一个发布单元</span></div><ul><li><code>key/type</code> 用于生成前端控件</li><li><code>target.node/input</code> 用于服务端写入 Graph</li><li><code>output.node</code> 用于结果归集</li><li><code>class_type</code> 必须存在于执行 Worker</li><li>节点编号改变后必须重新核对 target</li></ul></section>
+            </div>
+            <div class="callout reveal d2">Graph、Manifest 与 <code>_cards.json</code> 应作为同一个版本单元发布和回归。</div>
+          </div>
+          <footer class="slide-foot"><span>Execution + Mapping + Experience</span><span>本次运行使用独立 Graph 快照</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="Local 模式由 Chouka 直接提交 /prompt，并监听 /ws。ComfyUI 执行完成后还要读取 history 和登记资源。">
+          <header class="slide-head"><span class="brand">CHOUKA / LOCAL EXECUTION</span><span class="page-id">07 / 12</span></header>
+          <div class="slide-body">
+            <div class="split"><div><span class="eyebrow reveal">LOCAL 模式调用时序</span><h2 class="reveal d1">从 Prompt 到<br><span class="blue">授权产物</span></h2></div><div class="grid-3 reveal d2"><div class="box"><strong>/prompt</strong><span>提交 API Graph</span></div><div class="box primary"><strong>/ws</strong><span>节点、进度、错误</span></div><div class="box success"><strong>/history + /view</strong><span>输出记录与文件</span></div></div></div>
+            <div class="panel sequence-wrap reveal d2">
+              <div class="sequence">
+                <div class="actors three"><div class="actor">Browser</div><div class="actor">Chouka Server</div><div class="actor">ComfyUI :8188</div></div>
+                <div class="event three"><div class="label" style="--from:1;--to:3">POST /api/generate</div></div>
+                <div class="event-note">服务端：鉴权 → 素材校验 → patch_graph → 登记 job ACL 与 job_inputs</div>
+                <div class="event three"><div class="label" style="--from:2;--to:4">POST /prompt · prompt_id = job id</div></div>
+                <div class="event three reply reverse"><div class="label" style="--from:2;--to:4">accepted / queued</div></div>
+                <div class="event three reply reverse"><div class="label" style="--from:1;--to:3">queued + job id</div></div>
+                <div class="event three reply reverse"><div class="label" style="--from:2;--to:4">WebSocket：executing / progress_state / error</div></div>
+                <div class="event three"><div class="label" style="--from:1;--to:3">GET /api/jobs · 约每 700ms</div></div>
+                <div class="event three"><div class="label" style="--from:2;--to:4">GET /history/{job_id}</div></div>
+                <div class="event three reply reverse"><div class="label" style="--from:1;--to:3">done + authorized outputs</div></div>
+              </div>
+            </div>
+            <div class="callout warn reveal d2"><span class="amber mono">99%</span> 通常表示节点执行已完成，但 history、文件或可信资源登记仍在归集。</div>
+          </div>
+          <footer class="slide-foot"><span>Execution completion ≠ Artifact completion</span><span>真正完成：history → resource index → done</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="远程模式比 Local 多了派发、租约、输入下载和产物上传。真正成功终态是 Worker complete。">
+          <header class="slide-head"><span class="brand">CHOUKA / CONTROLLER & WORKER</span><span class="page-id">08 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">分布式执行时序</span>
+            <h2 class="reveal d1">租约贯穿领取、执行与<span class="green">产物上传</span></h2>
+            <div class="panel sequence-wrap reveal d2">
+              <div class="sequence">
+                <div class="actors four"><div class="actor">Browser</div><div class="actor">Controller</div><div class="actor">Windows Worker</div><div class="actor">Worker ComfyUI</div></div>
+                <div class="event four"><div class="label" style="--from:1;--to:3">POST /api/generate → 写 JOBS + dispatch_jobs</div></div>
+                <div class="event four reply reverse"><div class="label" style="--from:1;--to:3">queued + job id</div></div>
+                <div class="event four reverse"><div class="label" style="--from:2;--to:4">register / heartbeat / acquire</div></div>
+                <div class="event four reply"><div class="label" style="--from:2;--to:4">assignment + lease_token + graph</div></div>
+                <div class="event four reverse"><div class="label" style="--from:2;--to:4">下载授权输入 + POST start</div></div>
+                <div class="event four"><div class="label" style="--from:3;--to:5">POST /prompt → WS events → history / view</div></div>
+                <div class="event four reverse"><div class="label" style="--from:2;--to:4">event + heartbeat 续租</div></div>
+                <div class="event four reverse"><div class="label" style="--from:2;--to:4">artifact × N → complete</div></div>
+                <div class="event four reply reverse"><div class="label" style="--from:1;--to:3">done + artifact URLs</div></div>
+              </div>
+            </div>
+            <div class="grid-2 reveal d2">
+              <div class="callout"><strong>租约的作用：</strong>避免重复执行；断线任务可重新派发；拒绝旧 Worker 的迟到事件；输入、事件和产物均绑定当前任务。</div>
+              <div class="callout warn"><strong>成功终态：</strong>远程模式以 Worker <code>/complete</code> 为准，不以 ComfyUI 的 <code>execution_success</code> 为准。</div>
+            </div>
+          </div>
+          <footer class="slide-foot"><span>Pull Model + Lease Isolation</span><span>Artifact upload is part of task completion</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="调度分两步：先硬条件过滤，再按模型缓存亲和性排序。required_nodes 来自任务 Graph 的 class_type。">
+          <header class="slide-head"><span class="brand">CHOUKA / SCHEDULER</span><span class="page-id">09 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">Worker 调度条件</span>
+            <h2 class="reveal d1">先过滤资格，再按<span class="green">缓存亲和性</span>排序</h2>
+            <div class="decision reveal d2">
+              <div class="box"><strong>1. 在线可用</strong><span>enabled + heartbeat 未过期</span></div>
+              <div class="box"><strong>2. 当前空闲</strong><span>idle 且不在同步模型</span></div>
+              <div class="box"><strong>3. 节点齐全</strong><span>包含全部 required_nodes</span></div>
+              <div class="box"><strong>4. GPU 合格</strong><span>型号、显存、特殊策略</span></div>
+              <div class="box success"><strong>5. 亲和排序</strong><span>同能力 / 同模型族优先</span></div>
+              <div class="box primary"><strong>6. 分配租约</strong><span>生成 lease_token</span></div>
+            </div>
+            <div class="grid-2 reveal d2">
+              <section class="panel"><div class="panel-head"><strong>Worker 心跳来源</strong><span class="tag green">运行事实</span></div><div class="grid-3"><div class="box"><strong>/system_stats</strong><span>GPU、显存、系统</span></div><div class="box"><strong>/object_info</strong><span>节点 class_type 集合</span></div><div class="box"><strong>/queue</strong><span>本机队列占用</span></div></div><p class="muted" style="margin-top:13px">同时上报当前任务、租约、同步状态和模型缓存信息。</p></section>
+              <section class="panel"><div class="panel-head"><strong>调度边界</strong><span class="tag amber">需要版本治理</span></div><p class="muted">节点类匹配只能证明节点“存在”，不能证明插件版本、模型文件、ComfyUI 核心补丁完全一致。</p><div class="callout warn" style="margin-top:14px">因此仍需维护 Worker 执行环境版本和发布清单。</div></section>
+            </div>
+          </div>
+          <footer class="slide-foot"><span>Eligibility First · Affinity Second</span><span>Graph class_type → required_nodes → Worker capability set</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="把文件和数据库分开讲，解决常见误判：jobs.json 不是完整账本，Local 产物也不在 artifacts。">
+          <header class="slide-head"><span class="brand">CHOUKA / STATE & STORAGE</span><span class="page-id">10 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">状态与存储地图</span>
+            <h2 class="reveal d1">项目、索引、调度与产物<span class="blue">分别存放</span></h2>
+            <div class="storage reveal d2">
+              <div class="storage-col"><div class="db"><strong>data/projects/*.json</strong><span>画布、连线、卡片历史、rev</span></div><div class="db"><strong>data/jobs.json</strong><span>最近约 60 条展示任务，不是完整账本</span></div><div class="db"><strong>data/uploads/</strong><span>用户输入文件</span></div></div>
+              <div class="server-core"><strong>Chouka Server</strong><span>State Owner<br>Access Boundary</span></div>
+              <div class="storage-col"><div class="db"><strong>data/auth.db</strong><span>用户、Session、ACL、资源索引</span></div><div class="db"><strong>data/control.db</strong><span>Worker、dispatch、lease、费用、产能</span></div><div class="db"><strong>artifacts / ComfyUI output</strong><span>远程产物 / Local 模式产物</span></div></div>
+            </div>
+            <div class="table-wrap reveal d2"><table><thead><tr><th>常见误判</th><th>实际情况</th><th>排查位置</th></tr></thead><tbody><tr><td>页面一直 queued</td><td>可能是 JOBS 未同步，或 dispatch 没有合格 Worker</td><td>JOBS + dispatch_jobs + heartbeat</td></tr><tr><td>文件存在但返回 403</td><td>还需要 auth.db 中处于 ready 的可信资源索引</td><td>resource_access + project ACL</td></tr><tr><td>ComfyUI 完成但仍为 99%</td><td>history、artifact 或资源发布尚未完成</td><td>/history + artifact + complete</td></tr></tbody></table></div>
+            <div class="callout reveal d2">备份必须同时覆盖资源文件、项目 JSON、<code>auth.db</code> 和 <code>control.db</code>。</div>
+          </div>
+          <footer class="slide-foot"><span>Files and Indexes Must Be Backed Up Together</span><span>Local outputs remain in ComfyUI output</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="新增能力时先判断变化属于定义层、服务端修补、传输协议还是调度策略，避免把普通能力做成 Worker 特例。">
+          <header class="slide-head"><span class="brand">CHOUKA / CAPABILITY ONBOARDING</span><span class="page-id">11 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">新增能力的技术影响面</span>
+            <h2 class="reveal d1">变化落在哪一层，就修改<span class="blue">对应边界</span></h2>
+            <div class="flow reveal d2">
+              <div class="step"><b>01</b><strong>验证工作流</strong><span>ComfyUI UI</span></div><div class="step"><b>02</b><strong>导出 Graph</strong><span>API format</span></div><div class="step"><b>03</b><strong>维护 Manifest</strong><span>输入输出协议</span></div><div class="step"><b>04</b><strong>更新 Cards</strong><span>模式与模型</span></div><div class="step"><b>05</b><strong>协议测试</strong><span>target / slots / output</span></div><div class="step"><b>06</b><strong>双模式回归</strong><span>Local + Worker</span></div><div class="step"><b>07</b><strong>发布</strong><span>计价与产能</span></div>
+            </div>
+            <div class="table-wrap reveal d2"><table><thead><tr><th>变化类型</th><th>主要修改位置</th><th>通常不需要修改</th></tr></thead><tbody><tr><td>新模型 / 新参数</td><td>Graph、Manifest、Cards</td><td>Worker</td></tr><tr><td>新自定义节点</td><td>custom_nodes 与所有目标 Worker 环境</td><td>前端任务协议</td></tr><tr><td>特殊参数注入</td><td>patch_graph() 的最小能力规则</td><td>调度协议</td></tr><tr><td>新输入或产物类型</td><td>上传、资源索引、Worker 传输</td><td>仅修改 Manifest 不够</td></tr><tr><td>新 GPU 策略</td><td>distributed.py 与 Worker 遥测</td><td>画布保存</td></tr><tr><td>新计价规则</td><td>pricing.json 与 costs.py</td><td>ComfyUI Graph</td></tr></tbody></table></div>
+            <div class="callout warn reveal d2">发布检查：Graph / Manifest / Cards 同版本；目标 Worker 节点齐全；权限、取消、素材组合、Local 与 Controller 场景通过。</div>
+          </div>
+          <footer class="slide-foot"><span>Change Layer Determines Change Scope</span><span>普通模型和参数通常不修改 Worker</span></footer>
+        </article>
+
+        <article class="slide" aria-hidden="true" data-note="把后续业务规划翻译成技术分层：体验层、能力平台、编排治理、执行层，并按标准化、生产化、平台化推进。">
+          <header class="slide-head"><span class="brand">CHOUKA / TARGET ARCHITECTURE</span><span class="page-id">12 / 12</span></header>
+          <div class="slide-body">
+            <span class="eyebrow reveal">后续业务能力扩展架构 · 规划方向</span>
+            <h2 class="reveal d1">业务扩展最终落在<span class="green">四层技术能力</span></h2>
+            <div class="layer-stack reveal d2">
+              <div class="layer"><div class="layer-name">业务体验层</div><div class="layer-items"><div class="layer-item"><strong>模板 / 批量任务</strong><span>可复用生产入口</span></div><div class="layer-item"><strong>导演生产链</strong><span>剧本→分镜→生成→剪辑</span></div><div class="layer-item"><strong>素材 / 风格库</strong><span>团队资产复用</span></div><div class="layer-item"><strong>内部 API / SDK</strong><span>被其他系统调用</span></div></div></div>
+              <div class="layer"><div class="layer-name">能力平台层</div><div class="layer-items"><div class="layer-item"><strong>能力注册与版本</strong><span>ID、输入输出、依赖</span></div><div class="layer-item"><strong>协议测试</strong><span>Graph / Manifest 自动校验</span></div><div class="layer-item"><strong>环境版本</strong><span>Nodes、Models、ComfyUI</span></div><div class="layer-item"><strong>灰度与回退</strong><span>按团队授权</span></div></div></div>
+              <div class="layer"><div class="layer-name">任务与资源层</div><div class="layer-items"><div class="layer-item"><strong>智能路由</strong><span>GPU、显存、模型缓存</span></div><div class="layer-item"><strong>优先级与配额</strong><span>团队并发和容量</span></div><div class="layer-item"><strong>可观测性</strong><span>成功率、等待、耗时</span></div><div class="layer-item"><strong>计量与成本</strong><span>内部成本与建议价</span></div></div></div>
+              <div class="layer"><div class="layer-name">执行层</div><div class="layer-items"><div class="layer-item"><strong>Windows Worker Pool</strong><span>GPU 执行节点</span></div><div class="layer-item"><strong>ComfyUI</strong><span>节点图执行</span></div><div class="layer-item"><strong>Custom Nodes</strong><span>版本化插件</span></div><div class="layer-item"><strong>Model Cache</strong><span>预热与亲和调度</span></div></div></div>
+            </div>
+            <div class="roadmap reveal d2"><div class="phase"><b>PHASE 01</b><strong>标准化</strong><p>能力协议、版本、自动测试、环境清单</p></div><div class="phase"><b>PHASE 02</b><strong>生产化</strong><p>模板、批量、素材库、导演链路、质量反馈</p></div><div class="phase"><b>PHASE 03</b><strong>平台化</strong><p>智能调度、API/SDK、配额、计量、运营看板</p></div></div>
+          </div>
+          <footer class="slide-foot"><span>Frontend → Orchestration → Worker → ComfyUI</span><span>保持职责边界，持续扩展</span></footer>
+        </article>
+      </div>
+
+      <nav class="controls" aria-label="幻灯片控制">
+        <button class="control" id="prevBtn" type="button" aria-label="上一页"><svg viewBox="0 0 24 24"><path d="M15 18l-6-6 6-6"/></svg></button>
+        <span class="counter"><span id="current">1</span> / <span id="total">12</span></span>
+        <button class="control" id="nextBtn" type="button" aria-label="下一页"><svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6"/></svg></button>
+        <button class="control secondary" id="notesBtn" type="button" aria-label="讲解提示"><svg viewBox="0 0 24 24"><path d="M5 4h14v16H5zM8 8h8M8 12h8M8 16h5"/></svg></button>
+        <button class="control secondary" id="fullBtn" type="button" aria-label="全屏"><svg viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M8 21H3v-5M16 21h5v-5"/></svg></button>
+        <button class="control secondary" id="helpBtn" type="button" aria-label="快捷键帮助"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M9.8 9a2.4 2.4 0 114 1.8c-.9.6-1.8 1.1-1.8 2.7M12 17h.01"/></svg></button>
+      </nav>
+      <aside class="popover" id="notesPanel" aria-hidden="true"><h3>讲解提示</h3><p id="notesText"></p></aside>
+      <aside class="popover" id="helpPanel" aria-hidden="true"><h3>快捷键</h3><div class="keys"><kbd>← / →</kbd><span>上一页 / 下一页</span><kbd>Space</kbd><span>下一页</span><kbd>Home / End</kbd><span>首页 / 末页</span><kbd>N</kbd><span>讲解提示</span><kbd>F</kbd><span>全屏</span><kbd>?</kbd><span>帮助</span></div></aside>
+      <div class="sr-only" id="announcement" aria-live="polite"></div>
+    </section>
+  </main>
+
+  <script>
+    (() => {
+      const slides = [...document.querySelectorAll('.slide')];
+      const currentEl = document.getElementById('current');
+      const totalEl = document.getElementById('total');
+      const progress = document.getElementById('progressBar');
+      const notes = document.getElementById('notesPanel');
+      const help = document.getElementById('helpPanel');
+      const notesText = document.getElementById('notesText');
+      const announcement = document.getElementById('announcement');
+      let current = Math.max(0, Math.min(slides.length - 1, Number(location.hash.replace('#slide-','')) - 1 || 0));
+      let touchX = 0;
+      totalEl.textContent = slides.length;
+
+      function show(index, updateHash = true) {
+        current = Math.max(0, Math.min(slides.length - 1, index));
+        slides.forEach((slide, i) => {
+          const active = i === current;
+          slide.classList.toggle('active', active);
+          slide.setAttribute('aria-hidden', String(!active));
+          if ('inert' in slide) slide.inert = !active;
+        });
+        currentEl.textContent = current + 1;
+        progress.style.width = `${(current + 1) / slides.length * 100}%`;
+        const title = slides[current].querySelector('h1,h2')?.textContent?.trim() || `第 ${current + 1} 页`;
+        notesText.textContent = slides[current].dataset.note || '无额外提示。';
+        announcement.textContent = `第 ${current + 1} 页，共 ${slides.length} 页：${title}`;
+        document.title = `${current + 1}/${slides.length} · ${title}`;
+        if (updateHash) history.replaceState(null, '', `#slide-${current + 1}`);
+      }
+      const next = () => current < slides.length - 1 && show(current + 1);
+      const prev = () => current > 0 && show(current - 1);
+      function toggle(panel) {
+        const open = !panel.classList.contains('open');
+        [notes,help].forEach(p => { p.classList.remove('open'); p.setAttribute('aria-hidden','true'); });
+        if (open) { panel.classList.add('open'); panel.setAttribute('aria-hidden','false'); }
+      }
+      async function fullscreen() { try { if (!document.fullscreenElement) await document.documentElement.requestFullscreen(); else await document.exitFullscreen(); } catch (_) {} }
+      document.getElementById('prevBtn').addEventListener('click', prev);
+      document.getElementById('nextBtn').addEventListener('click', next);
+      document.getElementById('notesBtn').addEventListener('click', () => toggle(notes));
+      document.getElementById('helpBtn').addEventListener('click', () => toggle(help));
+      document.getElementById('fullBtn').addEventListener('click', fullscreen);
+      document.addEventListener('keydown', e => {
+        if (e.altKey || e.ctrlKey || e.metaKey) return;
+        if (['ArrowRight','PageDown',' '].includes(e.key)) { e.preventDefault(); next(); }
+        else if (['ArrowLeft','PageUp'].includes(e.key)) { e.preventDefault(); prev(); }
+        else if (e.key === 'Home') { e.preventDefault(); show(0); }
+        else if (e.key === 'End') { e.preventDefault(); show(slides.length - 1); }
+        else if (e.key.toLowerCase() === 'n') toggle(notes);
+        else if (e.key.toLowerCase() === 'f') fullscreen();
+        else if (e.key === '?') toggle(help);
+        else if (e.key === 'Escape') [notes,help].forEach(p => p.classList.remove('open'));
+      });
+      document.querySelector('.deck').addEventListener('touchstart', e => touchX = e.changedTouches[0].clientX, {passive:true});
+      document.querySelector('.deck').addEventListener('touchend', e => { const dx = e.changedTouches[0].clientX - touchX; if (Math.abs(dx) > 55) dx < 0 ? next() : prev(); }, {passive:true});
+      window.addEventListener('hashchange', () => { const i = Number(location.hash.replace('#slide-','')) - 1; if (Number.isFinite(i)) show(i,false); });
+      show(current,false);
+    })();
+  </script>
+</body>
+</html>
