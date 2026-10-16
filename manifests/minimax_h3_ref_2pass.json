@@ -340,8 +340,26 @@
    }
   },
   {
+   "key": "lora_acceleration",
+   "label": "LoRA 加速",
+   "type": "select",
+   "appearance": "switch",
+   "default": "on",
+   "options": [
+    {"value": "on", "label": "开启"},
+    {"value": "off", "label": "关闭"}
+   ],
+   "presets": {
+    "on": {"strength_model": 1},
+    "off": {"strength_model": 0}
+   },
+   "hint": "默认开启加速 LoRA；关闭后不使用加速 LoRA。只控制 LoRA，不改变采样步数、TE 缓存或二采设置。",
+   "target": {"kind": "preset"}
+  },
+  {
    "key": "strength_model",
    "label": "加速模型强度",
+   "mirror": true,
    "type": "slider",
    "min": 0,
    "max": 2,

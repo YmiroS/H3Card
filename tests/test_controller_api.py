@@ -246,6 +246,47 @@ class WorkflowParameterRegressionTest(unittest.TestCase):
         with self.assertRaises(web.HTTPBadRequest):
             controller_app.patch_graph(cap, {"sampling_mode": "unknown"}, {})
 
+    def test_h3_two_pass_lora_switch_only_controls_lora_strength(self):
+        cap = controller_app.CAPS["minimax_h3_ref_2pass"]
+        spec = next(item for item in cap["inputs"] if item["key"] == "lora_acceleration")
+        self.assertEqual(spec, scan_workflows.CAP_INPUT_PRESETS[cap["id"]][0])
+        self.assertEqual(spec["default"], "on")
+        self.assertEqual(spec["appearance"], "switch")
+        strength = next(item for item in cap["inputs"] if item["key"] == "strength_model")
+        self.assertTrue(strength["mirror"])
+        self.assertFalse(any(item["key"] == "lora_acceleration"
+                             for item in controller_app.CAPS["minimax_h3_ref9"]["inputs"]))
+
+        baseline = controller_app.patch_graph(cap, {"seed": 42}, {})
+        self.assertEqual(baseline["230"]["inputs"]["strength_model"], 1)
+        enabled = controller_app.patch_graph(cap, {
+            "seed": 42, "lora_acceleration": "on", "strength_model": 0,
+        }, {})
+        self.assertEqual(enabled, baseline)
+        disabled = controller_app.patch_graph(cap, {
+            "seed": 42, "lora_acceleration": "off", "strength_model": 1,
+        }, {})
+        self.assertEqual(disabled["230"]["inputs"]["strength_model"], 0)
+        disabled["230"]["inputs"]["strength_model"] = 1
+        self.assertEqual(disabled, baseline)
+        with self.assertRaises(web.HTTPBadRequest):
+            controller_app.patch_graph(cap, {"lora_acceleration": "invalid"}, {})
+
+    def test_h3_two_pass_rescan_preserves_lora_switch(self):
+        graph = {"230": {
+            "class_type": "LoraLoaderModelOnly",
+            "inputs": {"strength_model": 1},
+            "_meta": {"title": "Load LoRA"},
+        }}
+        info = {"LoraLoaderModelOnly": {"input": {
+            "required": {"strength_model": ["FLOAT", {"default": 1}]},
+        }}}
+        inputs, *_ = scan_workflows.derive_inputs(graph, info, "minimax_h3_ref_2pass")
+        switch = next(item for item in inputs if item["key"] == "lora_acceleration")
+        strength = next(item for item in inputs if item["key"] == "strength_model")
+        self.assertEqual(switch["default"], "on")
+        self.assertTrue(strength["mirror"])
+
     def test_h3_two_pass_uses_tested_audio_denoise(self):
         cap = controller_app.CAPS["minimax_h3_ref_2pass"]
         spec = next(item for item in cap["inputs"] if item["key"] == "audio_denoise")
@@ -911,6 +952,20 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         text_modes = [item for item in card["modes"] if item["name"] == "文生图"]
         self.assertEqual(len(text_modes), 1)
         self.assertEqual(text_modes[0]["modelSwitch"]["krea2"], "krea2_t2i")
+
+    async def test_reload_exposes_high_quality_lora_switch(self):
+        response = await self.client.post("/api/reload", headers=self.headers)
+        self.assertEqual(response.status, 200)
+        payload = await (await self.client.get("/api/cards")).json()
+        high_quality = payload["capabilities"]["minimax_h3_ref_2pass"]
+        switch = next(item for item in high_quality["inputs"]
+                      if item["key"] == "lora_acceleration")
+        self.assertEqual(switch["default"], "on")
+        self.assertEqual(switch["appearance"], "switch")
+        self.assertFalse(switch.get("advanced", False))
+        self.assertEqual(switch["presets"], {
+            "on": {"strength_model": 1}, "off": {"strength_model": 0},
+        })
 
     async def test_controller_dashboard_and_health_metadata(self):
         response = await self.client.get("/controller")
