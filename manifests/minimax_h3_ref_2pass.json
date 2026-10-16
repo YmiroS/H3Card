@@ -342,6 +342,7 @@
   {
    "key": "lora_acceleration",
    "label": "LoRA 加速",
+   "mirror": true,
    "type": "select",
    "appearance": "switch",
    "default": "on",
@@ -375,14 +376,15 @@
   },
   {
    "key": "processing_control_value",
-   "label": "提速档位",
+   "label": "TE 缓存加速",
    "type": "slider",
    "min": 0,
    "max": 0.5,
    "step": 0.005,
-   "default": 0.12,
-   "hint": "推荐 0.12：再快画面就开始糊、动作发飘，这一档是不掉画质的上限。0 = 不提速",
-   "advanced": true,
+   "default": 0,
+   "hint": "推荐 0（关闭，画质优先）。大于 0 启用 TE 缓存加速，可缩短生成时间，但可能影响画面细节、动作与时序稳定性，并出现彩条、鸟形等异常。原值 0.12 已在本例复现彩条；出现异常请先设为 0。",
+   "showHint": true,
+   "advanced": false,
    "target": {
     "node": "232",
     "input": "processing_control_value",
