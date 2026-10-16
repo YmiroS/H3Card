@@ -89,7 +89,8 @@
 const $ = id => document.getElementById(id);
 let users = [], projects = [], assigning = false;
 const selectedProjects = new Set();
-const projectOwner = project => project.owner_username || users.find(u => String(u.id) === String(project.owner_id))?.username || '未知用户';
+const userLabel = user => user.username + (user.display_name?.trim() ? '（' + user.display_name.trim() + '）' : '');
+const projectOwner = project => userLabel(users.find(u => String(u.id) === String(project.owner_id)) || {username: project.owner_username || '未知用户', display_name: project.owner_display_name});
 const ownerLabel = project => projectOwner(project) + '（ID: ' + project.owner_id + '）';
 function filteredProjects() {
   const search = $('project-search').value.trim().toLowerCase(), owner = $('project-owner').value;
@@ -130,7 +131,7 @@ function refreshProjectOptions() {
   for (const [id, name] of owners) { const option = document.createElement('option'); option.value = id; option.textContent = name; owner.append(option); }
   if (owners.has(previousOwner)) owner.value = previousOwner;
   const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '请选择目标用户'; target.append(placeholder);
-  for (const user of users.filter(u => u.enabled)) { const option = document.createElement('option'); option.value = user.id; option.textContent = user.username; option.title = user.username + '（ID: ' + user.id + '）'; target.append(option); }
+  for (const user of users.filter(u => u.enabled)) { const option = document.createElement('option'); option.value = user.id; option.textContent = userLabel(user); option.title = userLabel(user) + '（ID: ' + user.id + '）'; target.append(option); }
   if ([...target.options].some(o => o.value === previousTarget)) target.value = previousTarget;
   selectedProjects.clear(); renderProjects();
 }
@@ -189,13 +190,13 @@ async function refresh() {
     });
     $('users').append(row);
   }
-  for (const name of ['viewer_id','owner_id']) { const select = $('grant').elements[name], previous = select.value; select.replaceChildren(); for (const user of users) { const option = document.createElement('option'); option.value = user.id; option.textContent = user.username; select.append(option); } if ([...select.options].some(o => o.value === previous)) select.value = previous; }
-  const username = id => users.find(u => String(u.id) === String(id))?.username || String(id);
+  for (const name of ['viewer_id','owner_id']) { const select = $('grant').elements[name], previous = select.value; select.replaceChildren(); for (const user of users) { const option = document.createElement('option'); option.value = user.id; option.textContent = userLabel(user); select.append(option); } if ([...select.options].some(o => o.value === previous)) select.value = previous; }
+  const accountLabel = id => { const user = users.find(u => String(u.id) === String(id)); return user ? userLabel(user) : String(id); };
   $('grants').replaceChildren();
   for (const grant of g.grants) {
-    const row = document.createElement('tr'); cell(row,'').append(identity(username(grant.viewer_id), grant.viewer_id));
+    const row = document.createElement('tr'); cell(row,'').append(identity(accountLabel(grant.viewer_id), grant.viewer_id));
     const arrow = cell(row,''); arrow.className = 'grant-arrow'; arrow.textContent = '→';
-    cell(row,'').append(identity(username(grant.owner_id), grant.owner_id));
+    cell(row,'').append(identity(accountLabel(grant.owner_id), grant.owner_id));
     cell(row,'').append(chip(grant.permission === 'operate' ? '可操作（含删除）' : '只读', grant.permission === 'operate' ? 'op' : ''));
     const acts = cell(row,''); acts.className = 'acts';
     button(acts,'撤销', async () => { if (confirm('撤销后 A 立即失去对 B 全部画布的访问。确认撤销？')) await H3Auth.request(`/api/admin/grants/${encodeURIComponent(grant.viewer_id)}/${encodeURIComponent(grant.owner_id)}`,{method:'DELETE'}); }, 'danger');
@@ -246,7 +247,7 @@ $('assign').onsubmit = async event => {
   const chosen = filteredProjects().filter(p => selectedProjects.has(p.id));
   if (!target || !chosen.length) return;
   if (chosen.length > 1000) { $('error').textContent = '每次最多分配 1000 个画布，请缩小筛选范围后再选择。'; return; }
-  const targetLabel = target.username + '（ID: ' + target.id + '）';
+  const targetLabel = userLabel(target) + '（ID: ' + target.id + '）';
   const list = chosen.map(p => '画布：' + (p.name || '未命名画布') + '\nID: ' + p.id + '\n旧归属：' + ownerLabel(p) + '\n目标：' + targetLabel).join('\n\n');
   if (!confirm('确认分配以下 ' + chosen.length + ' 个画布？\n\n' + list + '\n\n画布内容和历史费用不变。目标用户的授权访问者也会获得相应权限（可操作包含删除）；原所有者及其授权访问者可能失去访问权限。管理员仍可访问全部画布。')) return;
   assigning = true; $('error').textContent = ''; $('assign-status').textContent = ''; renderProjects();

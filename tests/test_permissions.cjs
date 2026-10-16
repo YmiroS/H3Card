@@ -287,18 +287,35 @@ test('canvas separates personal, shared and team spaces when creating projects',
 
 test('production permissions page renders account names as text and sends authorized mutations', async () => {
   const users = [
-    {id:'u1', username:'<script>alert(1)</script>', role:'admin', enabled:true, team_leader:false},
-    {id:'u2', username:'alice', role:'user', enabled:false, team_leader:false},
+    {id:'u1', username:'<script>alert(1)</script>', display_name:'<img src=x onerror=alert(1)>', role:'admin', enabled:true, team_leader:false},
+    {id:'u2', username:'alice', display_name:'张三', role:'user', enabled:false, team_leader:false},
+    {id:'u3', username:'bob', display_name:' ', role:'user', enabled:true, team_leader:false},
   ];
-  const mutations = [];
+  const mutations = [], assignments = [], grants = [];
   const payloads = {
     '/api/auth/me': {user:{id:'u1', username:'admin', role:'admin'}, csrf_token:'test-csrf'},
     '/api/admin/users': {users},
     '/api/admin/grants': {grants:[{viewer_id:'u2', owner_id:'u1', permission:'read'}]},
-    '/api/projects': {projects:[]},
+    '/api/projects': {projects:[{id:'p1', name:'待分配画布', owner_id:'u2', owner_username:'alice'},
+      {id:'p2', name:'旧账号画布', owner_id:'old', owner_username:'legacy', owner_display_name:'历史姓名'}]},
     '/api/admin/registrations': {requests:[]},
   };
   const server = createServer((req, res) => {
+    if ((req.method === 'POST' && req.url === '/api/admin/projects/assign')
+        || (req.method === 'PUT' && req.url === '/api/admin/grants')) {
+      const chunks = [];
+      req.on('data', chunk => chunks.push(chunk));
+      req.on('end', () => {
+        const body = JSON.parse(Buffer.concat(chunks).toString());
+        const record = {body, csrf:req.headers['x-csrf-token']};
+        if (req.method === 'POST') {
+          assignments.push(record);
+          payloads['/api/projects'].projects[0].owner_id = body.owner_id;
+        } else grants.push(record);
+        res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify({count:1}));
+      });
+      return;
+    }
     if (req.method === 'PATCH' && req.url === '/api/admin/users/u2') {
       const chunks = [];
       req.on('data', chunk => chunks.push(chunk));
@@ -328,10 +345,36 @@ test('production permissions page renders account names as text and sends author
     page.on('pageerror', error => errors.push(error.message));
     page.on('dialog', async dialog => { dialogs.push(dialog.message()); await dialog.accept(); });
     await page.goto('http://127.0.0.1:' + server.address().port);
-    await page.waitForFunction(() => document.querySelectorAll('#users tr').length === 2);
+    await page.waitForFunction(() => document.querySelectorAll('#users tr').length === 3);
     assert.match(await page.locator('#users').innerText(), /<script>alert\(1\)<\/script>/);
     assert.equal(await page.locator('#users script').count(), 0);
     assert.equal(await page.locator('#grants tr').count(), 1);
+    const adminLabel = '<script>alert(1)</script>（<img src=x onerror=alert(1)>）';
+    for (const name of ['viewer_id', 'owner_id']) {
+      assert.deepEqual(await page.locator(`#grant select[name="${name}"] option`).allTextContents(), [adminLabel, 'alice（张三）', 'bob']);
+    }
+    assert.deepEqual(await page.locator('#project-owner option').allTextContents(), ['全部所有者', 'alice（张三）', 'legacy（历史姓名）']);
+    assert.deepEqual(await page.locator('#assign select option').allTextContents(), ['请选择目标用户', adminLabel, 'bob']);
+    assert.match(await page.locator('#grants').innerText(), /alice（张三）/);
+    assert.match(await page.locator('#projects').innerText(), /alice（张三）/);
+    assert.equal(await page.locator('#grants img, #grants script, #projects img, #projects script').count(), 0);
+    await page.locator('#grant select[name="viewer_id"]').selectOption('u2');
+    await page.locator('#grant select[name="owner_id"]').selectOption('u3');
+    const grantResponse = page.waitForResponse(r => r.request().method() === 'PUT');
+    await page.getByRole('button', {name:'保存授权', exact:true}).click(); await grantResponse;
+    assert.deepEqual(grants, [{body:{viewer_id:'u2', owner_id:'u3', permission:'read'}, csrf:'test-csrf'}]);
+    await page.locator('#project-owner').selectOption('u2');
+    await page.waitForFunction(() => document.querySelectorAll('#projects tr').length === 1);
+    await page.locator('#projects input[type="checkbox"]').check();
+    await page.locator('#assign select').selectOption('u1');
+    const assignResponse = page.waitForResponse(r => r.url().endsWith('/projects/assign'));
+    await page.locator('#assign-submit').click(); await assignResponse;
+    await page.waitForFunction(() => document.querySelector('#assign-status').textContent.startsWith('分配成功'));
+    assert.deepEqual(assignments, [{body:{owner_id:'u1', projects:[{project_id:'p1', owner_id:'u2'}]}, csrf:'test-csrf'}]);
+    assert.match(dialogs[0], /旧归属：alice（张三）/);
+    assert.ok(dialogs[0].includes('目标：' + adminLabel + '（ID: u1）'));
+    assert.ok((await page.locator('#assign-status').textContent()).includes(adminLabel));
+    assert.equal(await page.locator('#assign-status img, #assign-status script').count(), 0);
     const response = page.waitForResponse(r => r.request().method() === 'PATCH');
     await page.locator('#users tr').filter({hasText:'alice'}).getByRole('button', {name:'启用', exact:true}).click();
     await response;
@@ -343,8 +386,8 @@ test('production permissions page renders account names as text and sends author
       {body:{team_leader:true}, csrf:'test-csrf'},
     ]);
     assert.deepEqual(errors, []);
-    assert.equal(dialogs.length, 1);
-    assert.match(dialogs[0], /授予.*项目组/);
+    assert.equal(dialogs.length, 2);
+    assert.match(dialogs[1], /授予.*项目组/);
   } finally {
     if (browser) await browser.close();
     server.closeAllConnections();
