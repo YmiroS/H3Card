@@ -270,6 +270,18 @@ async function assertQuietModelCells(page) {
     assert.equal(r>140 && g>90 && b<Math.min(r,g)*.85,false,'模型列不得计算成黄色：'+item.color+' '+item.text);
   }
 }
+async function assertMaterialSpec(row,materials,parameters) {
+  const spec=row.locator('.selected-spec');
+  assert.equal(await spec.count(),1);
+  assert.deepEqual(await spec.evaluate(node=>({tag:node.tagName,children:[...node.children].map(n=>n.tagName),labels:[...node.querySelectorAll('dt')].map(n=>n.textContent)})),
+    {tag:'DL',children:['DT','DD','DT','DD'],labels:['输入素材','生成参数']},'必须使用真实定义列表，不能用段落或样式模拟语义');
+  const inputs=spec.locator(':scope > dd.input-materials'),output=spec.locator(':scope > dd.generation-parameters');
+  assert.deepEqual(await inputs.locator(':scope > span').allTextContents(),materials);
+  assert.equal(await inputs.textContent(),materials.join(''));
+  assert.ok(await inputs.evaluate(n=>[...n.childNodes].every(s=>s.nodeName==='SPAN' && s.childNodes.length===1 && s.firstChild.nodeType===Node.TEXT_NODE)),'输入素材只能包含纯文本 span');
+  assert.equal(await output.textContent(),parameters);assert.equal(await output.locator('*').count(),0);
+  assert.equal(await row.locator('select option:checked').textContent(),materials.join(' + ')+'｜'+parameters);
+}
 async function assertModelLabels(row,names,labels) {
   const nameCell=row.locator('[data-label="模型名称"]'),precisionCell=row.locator('[data-label="模型精度"]');
   assert.deepEqual(await nameCell.locator('.model-name').allTextContents(),names);
@@ -484,7 +496,7 @@ test('产能看板语法与离线路由专项', async t => {
       const input=summaryFixture();input.groups[1].warnings=['警告一','警告二'];const {page}=await setup({data:input});
       const row=page.locator('td.machine-result[data-summary-worker-id=w1] .business-row[data-capability=depth_video]'),select=row.locator('select');
       assert.equal(await select.inputValue(),'c1');assert.equal(await select.locator('option').count(),3);
-      const names=await select.locator('option').allTextContents();assert.equal(new Set(names).size,3);assert.ok(names.every(n=>!n.includes('depth-5s')));assert.match(names[0],/规格未完整记录/);
+      const names=await select.locator('option').allTextContents();assert.equal(new Set(names).size,3);assert.ok(names.every(n=>!n.includes('depth-5s')));assert.equal(names[0],'素材信息未记录｜请求时长 5 秒');
       assert.match(await row.innerText(),/1 分 18 秒/);await assertModelLabels(row,['sample-main-int8.safetensors'],[['INT8']]);assert.match(await row.innerText(),/仅 10 次 \/ 仅供参考/);
       await row.locator('button').click();let detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
       for(const value of ['P90：1 分 38 秒','采集业务样本','sample-main-int8.safetensors','文件标记 INT8','非运行时检测','警告一','警告二','总样本 12','失败 1','取消 1','缓存条件','配置编号：config-1'])assert.ok((await detail.innerText()).includes(value),value);
@@ -737,10 +749,168 @@ test('产能看板语法与离线路由专项', async t => {
       await machine.locator('.machine-more summary').click();assert.match(await machine.innerText(),/升级该 Worker 后补采/);
       const modern=page.locator('thead .machine-heading[data-summary-worker-id=w3]');await modern.locator('.machine-more summary').click();assert.match(await modern.innerText(),/人工声明未填写/);assert.doesNotMatch(await modern.innerText(),/升级该 Worker|整机配置未知/);
     });
-    await t.test('简明规格显示期望尺寸、时长帧率MP输入及步数，不用哈希代替',async()=>{
-      const input=fixture();input.groups=[{...input.groups[3],dimensions:{duration:5,fps:24,megapixels:1.5,image_count:2,steps:20},spec:{expected:{width:1280,height:720}}}];const {page}=await setup({data:input});
-      const value=await page.locator('.summary-spec option').innerText();for(const text of ['期望 1,280 × 720','时长 5 秒','24 FPS','1.5 MP','输入 2 张图','步数 20 步'])assert.ok(value.includes(text),text);
-      assert.equal(await page.locator('.selected-spec').innerText(),value);
+    await t.test('简明规格保留期望尺寸、请求时长及MP，输入独立成行，技术参数完整移入详情',async()=>{
+      const input=fixture();input.groups=[{...input.groups[3],dimensions:{duration:5,fps:24,megapixels:1.5,image_count:2,steps:20,frames:121,scale_to_length:1280,batch_size:3},spec:{expected:{width:1280,height:720}}}];const {page,state}=await setup({data:input});
+      const row=page.locator('.business-row'),parameters='请求时长 5 秒 / 期望 1,280 × 720 / 分辨率 1.5 MP';
+      await assertMaterialSpec(row,['图片 2 张','视频数量未记录','音频数量未记录'],parameters);
+      assert.doesNotMatch(await row.textContent(),/FPS|步数|帧数|长边|批量|depth-5s/);
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const text of [parameters,'帧率 24 FPS','步数 20 步','帧数 121 帧','长边 1,280 px','批量 3','生成参数不是成品实测规格'])assert.ok((await detail.innerText()).includes(text),text);
+      const raw=detail.locator('details');assert.equal(await raw.evaluate(n=>n.open),false);await raw.locator('summary').click();
+      const evidence=JSON.parse(await raw.locator('pre').textContent());assert.deepEqual(evidence.dimensions,input.groups[0].dimensions);assert.deepEqual(evidence.spec,input.groups[0].spec);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同1：混合素材、明确零与逐类型未知，非法计数不强转或冒充零',async()=>{
+      const cases=[
+        ['image',{image_count:2,video_count:0,audio_count:0},['图片 2 张']],
+        ['videos',{image_count:0,video_count:3,audio_count:0},['视频 3 段']],
+        ['audio',{image_count:0,video_count:0,audio_count:2},['音频 2 段']],
+        ['mixed',{image_count:2,video_count:3,audio_count:1},['图片 2 张','视频 3 段','音频 1 段']],
+        ['zero',{image_count:0,video_count:0,audio_count:0},['未使用图片、视频或音频']],
+        ['missing',{},['素材信息未记录']],
+        ['null',{image_count:null,video_count:null,audio_count:null},['素材信息未记录']],
+        ['partial',{image_count:2},['图片 2 张','视频数量未记录','音频数量未记录']],
+        ['partial-zero',{image_count:0},['视频数量未记录','音频数量未记录']],
+        ['partial-null',{image_count:null,video_count:2,audio_count:0},['图片数量未记录','视频 2 段']],
+        ['safe-limit',{image_count:Number.MAX_SAFE_INTEGER,video_count:0,audio_count:0},['图片 9,007,199,254,740,991 张']],
+      ];
+      const invalid=['2','0','',true,false,[],[2],{},-1,1.5,Number.MAX_SAFE_INTEGER+1,ATTACK,{value:ATTACK}];
+      for(const [index,value] of invalid.entries()) {
+        cases.push(['invalid-all-'+index,{image_count:value,video_count:value,audio_count:value},['素材信息未记录']]);
+        for(const [key,label] of [['image_count','图片'],['video_count','视频'],['audio_count','音频']])
+          cases.push([`invalid-${key}-${index}`,{image_count:0,video_count:0,audio_count:0,[key]:value},[label+'数量未记录']]);
+      }
+      const input=fixture(),base=input.groups[0];input.groups=cases.map(([id,dimensions])=>({...base,id,dimensions}));
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      // 未知组合的下拉需要来源/采样后缀区分；逐组验证前缀，不丢失原始分组。
+      assert.deepEqual(await row.locator('select option').evaluateAll(nodes=>nodes.map(n=>n.value)),cases.map(c=>c[0]));
+      for(const [id,,materials] of cases) {
+        await row.locator('select').selectOption(id);
+        assert.deepEqual(await row.locator('dd.input-materials > span').allTextContents(),materials,id);
+        assert.equal(await row.locator('dd.generation-parameters').textContent(),'规格未完整记录',id);
+        const label=await row.locator('option:checked').textContent(),prefix=materials.join(' + ')+'｜规格未完整记录';
+        assert.ok(label===prefix || label.startsWith(prefix+' · '),id+'：下拉以素材组合开头');
+        assert.doesNotMatch(await row.locator('.selected-spec').textContent(),/NaN|undefined|<img|\[object Object\]/);
+      }
+      assert.equal(await page.locator('main img').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
+      t.diagnostic(`素材计数边界共验证 ${cases.length} 组独立数据`);
+    });
+    await t.test('输入素材合同2：仅dimensions供给计数，spec回退与g逐字段覆盖，不从参数或成品推断',async()=>{
+      const counts={image_count:2,video_count:3,audio_count:1},input=fixture(),base=input.groups[0];
+      const cases=[
+        ['spec-fallback',{spec:{dimensions:counts},dimensions:{}},['图片 2 张','视频 3 段','音频 1 段']],
+        ['no-g-dimensions',{spec:{dimensions:counts},dimensions:undefined},['图片 2 张','视频 3 段','音频 1 段']],
+        ['null-g-dimensions',{spec:{dimensions:counts},dimensions:null},['图片 2 张','视频 3 段','音频 1 段']],
+        ['partial-override',{spec:{dimensions:counts},dimensions:{video_count:4}},['图片 2 张','视频 4 段','音频 1 段']],
+        ['zero-override',{spec:{dimensions:counts},dimensions:{image_count:0,video_count:0,audio_count:0}},['未使用图片、视频或音频']],
+        ['null-override',{spec:{dimensions:counts},dimensions:{image_count:null,video_count:0,audio_count:0}},['图片数量未记录']],
+        ['invalid-override',{spec:{dimensions:counts},dimensions:{image_count:'7',video_count:0,audio_count:0}},['图片数量未记录']],
+        ['no-inference',{spec:{parameters:counts,expected:counts},dimensions:{},image_count:8,video_count:9,audio_count:10,output_count:7,unit:'image'},['素材信息未记录']],
+      ];
+      input.groups=cases.map(([id,fields])=>({...base,id,...fields}));const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      for(const [id,,expected] of cases) {
+        await row.locator('select').selectOption(id);assert.deepEqual(await row.locator('.input-materials > span').allTextContents(),expected,id);
+        assert.equal(await row.locator('.generation-parameters').textContent(),'规格未完整记录');
+      }
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同3：首视频时长仅详情说明非合计，请求参数优先级与原始技术证据保持',async()=>{
+      const input=fixture(),base=input.groups[0],dimensions={image_count:1,video_count:3,audio_count:1,source_duration:37};
+      const technical={steps:20,fps:24,frames:121,scale_to_length:1280,batch_size:3};
+      const cases=[
+        ['source-only',{dimensions},'规格未完整记录'],
+        ['technical-only',{dimensions:{...dimensions,...technical}},'规格未完整记录'],
+        ['requested',{dimensions:{...dimensions,duration:5,width:1280,height:720}},'请求时长 5 秒 / 尺寸 1,280 × 720'],
+        ['output-request',{dimensions:{...dimensions,duration:5,output_duration:6,width:1280,height:720,output_width:1920,output_height:1080}},'请求时长 6 秒 / 尺寸 1,920 × 1,080'],
+        ['expected',{dimensions,spec:{expected:{duration:7,width:640,height:480,fps:30}}},'请求时长 7 秒 / 期望 640 × 480'],
+        ['parameters',{dimensions,spec:{parameters:{duration:8,...technical}}},'请求时长 8 秒'],
+        ['dimension-precedence',{dimensions:{...dimensions,duration:9},spec:{dimensions:{duration:8},parameters:{duration:7}}},'请求时长 9 秒'],
+      ];
+      input.groups=cases.map(([id,fields])=>({...base,id,...fields}));const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
+      for(const [id,fields,parameters] of cases) {
+        await row.locator('select').selectOption(id);
+        assert.equal(await row.locator('.generation-parameters').textContent(),parameters);
+        assert.doesNotMatch(await row.locator('.selected-spec').textContent(),/37|111|FPS|步数|帧数|长边|批量|输入视频时长/);
+        assert.ok((await row.locator('option:checked').textContent()).startsWith('图片 1 张 + 视频 3 段 + 音频 1 段｜'+parameters));
+        assert.match(await detail.innerText(),/首个输入视频时长：37 秒（非多段视频合计）/);
+        assert.doesNotMatch(await detail.innerText(),/请求时长 (37|111) 秒|总时长|总输入时长/);
+        if(['technical-only','parameters'].includes(id))for(const text of ['帧率 24 FPS','步数 20 步','帧数 121 帧','长边 1,280 px','批量 3'])assert.ok((await detail.innerText()).includes(text),id+'：'+text);
+        if(id==='expected')assert.match(await detail.innerText(),/帧率 30 FPS/);
+        const raw=detail.locator('details');assert.equal(await raw.evaluate(n=>n.open),false);await raw.locator('summary').click();
+        const evidence=JSON.parse(await raw.locator('pre').textContent());assert.deepEqual(evidence.dimensions,fields.dimensions);assert.deepEqual(evidence.spec,fields.spec);
+      }
+      assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同4：同参数不同视频数可区分，切组清理且原组均值、另一机器及采购互不影响',async()=>{
+      const input=summaryFixture(),base=input.groups[1],dimensions={duration:5,width:1280,height:720,image_count:2,video_count:1,audio_count:1};
+      input.groups=[
+        {...base,id:'one-video',capability:'minimax_h3_ref9',dimensions,mean_seconds:78,measured:10},
+        {...base,id:'three-videos',capability:'minimax_h3_ref9',dimensions:{...dimensions,video_count:3,source_duration:37,steps:20},mean_seconds:32,measured:8},
+        {...base,id:'unknown-material',capability:'minimax_h3_ref9',dimensions:{duration:5},mean_seconds:91,measured:5},
+        {...base,id:'other-one',worker_id:'w3',capability:'minimax_h3_ref9',dimensions,mean_seconds:61},
+        {...base,id:'other-three',worker_id:'w3',capability:'minimax_h3_ref9',dimensions:{...dimensions,video_count:3},mean_seconds:19},
+      ];
+      const {page,state}=await setup({data:input}),row=page.locator('td[data-summary-worker-id=w1] .business-row'),other=page.locator('td[data-summary-worker-id=w3] .business-row');
+      const options=await row.locator('option').allTextContents();assert.equal(new Set(options).size,3);
+      assert.deepEqual(options.slice(0,2),[1,3].map(n=>`图片 2 张 + 视频 ${n} 段 + 音频 1 段｜请求时长 5 秒 / 尺寸 1,280 × 720`));
+      await purchase(page);await page.locator('.demand-group').selectOption('minimax_h3_ref9');await calculate(page);
+      const before={post:structuredClone(state.posts.at(-1)),result:await page.locator('#estimate-result').textContent()};
+      await page.locator('#tab-machines').click();await row.locator('button').click();await other.locator('button').click();
+      const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls')),otherDetail=page.locator('#'+await other.locator('button').getAttribute('aria-controls'));
+      const otherBefore={row:await other.textContent(),detail:await otherDetail.textContent()};
+      for(const [id,materials,parameters,time,count] of [
+        ['three-videos',['图片 2 张','视频 3 段','音频 1 段'],'请求时长 5 秒 / 尺寸 1,280 × 720','32 秒',8],
+        ['unknown-material',['素材信息未记录'],'请求时长 5 秒','1 分 31 秒',5],
+        ['one-video',['图片 2 张','视频 1 段','音频 1 段'],'请求时长 5 秒 / 尺寸 1,280 × 720','1 分 18 秒',10],
+      ]) {
+        await row.locator('select').selectOption(id);await assertMaterialSpec(row,materials,parameters);
+        assert.equal(await row.getAttribute('data-selected-group-id'),id);assert.equal(await row.locator('.mean-time').textContent(),time);assert.match(await row.locator('.matrix-samples').textContent(),new RegExp(`仅 ${count} 次`));
+        assert.equal(await detail.isVisible(),true);assert.ok((await detail.innerText()).includes('采样编号：'+id));
+        if(id!=='three-videos')assert.doesNotMatch(await detail.innerText(),/首个输入视频时长|步数 20|视频 3 段|three-videos/);
+        assert.deepEqual({row:await other.textContent(),detail:await otherDetail.textContent()},otherBefore);
+      }
+      const firstBefore={row:await row.textContent(),detail:await detail.textContent()};await other.locator('select').selectOption('other-three');
+      assert.equal(await other.locator('.mean-time').textContent(),'19 秒');assert.match(await otherDetail.innerText(),/采样编号：other-three/);
+      assert.deepEqual({row:await row.textContent(),detail:await detail.textContent()},firstBefore);
+      await assertComparisonTable(page);await page.locator('#tab-purchase').click();assert.equal(await page.locator('#estimate-result').textContent(),before.result);
+      assert.deepEqual(state.posts,[before.post]);assert.deepEqual(before.post.body.demands,[{group_id:'one-video',quantity:100}]);
+      await calculate(page);assert.deepEqual(state.posts.at(-1),before.post);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('输入素材合同5：恶意规格只作原始文本，三尺寸真实定义列表换行且不溢出，批量截图',async()=>{
+      const input=summaryFixture(),base=input.groups[1];input.groups=[{...base,id:'mixed-material',dimensions:{image_count:12,video_count:3,audio_count:2,duration:5,width:1280,height:720,steps:20,source_duration:37}},
+        {...base,id:'hostile-material',dimensions:{image_count:ATTACK,video_count:2,audio_count:{value:ATTACK},duration:ATTACK,steps:ATTACK,source_duration:ATTACK},spec:{parameters:{frames:ATTACK},expected:{width:ATTACK,height:ATTACK}}}];
+      const {page,state}=await setup({data:input}),row=page.locator('.business-row');
+      await row.locator('select').selectOption('hostile-material');await assertMaterialSpec(row,['图片数量未记录','视频 2 段','音频数量未记录'],'规格未完整记录');
+      await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));await detail.locator('details summary').click();
+      const raw=detail.locator('pre');assert.equal(await raw.locator('*').count(),0);const evidence=JSON.parse(await raw.textContent());
+      assert.deepEqual(evidence.dimensions,input.groups[1].dimensions);assert.deepEqual(evidence.spec,input.groups[1].spec);
+      assert.equal(await page.locator('main img, main script, main iframe, main [onerror]').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);
+      await row.locator('select').selectOption('mixed-material');assert.doesNotMatch(await detail.textContent(),/onerror|hostile-material/);await row.locator('button').click();
+      for(const width of [1440,390,320]) {
+        await page.setViewportSize({width,height:width===1440?1000:844});await positionMatrix(page);
+        await assertMaterialSpec(row,['图片 12 张','视频 3 段','音频 2 段'],'请求时长 5 秒 / 尺寸 1,280 × 720');await assertComparisonTable(page);
+        const layout=await row.locator('.selected-spec').evaluate(node=>{
+          const rect=n=>{const r=n.getBoundingClientRect();return {left:r.left,right:r.right,top:r.top,bottom:r.bottom};};
+          const materials=node.querySelector('.input-materials');
+          return {spec:rect(node),box:rect(materials),wrap:getComputedStyle(materials).flexWrap,client:materials.clientWidth,scroll:materials.scrollWidth,
+            spans:[...materials.children].map(n=>{const range=document.createRange();range.selectNodeContents(n);return {box:rect(n),text:[...range.getClientRects()].map(r=>({left:r.left,right:r.right}))};})};
+        });
+        assert.equal(layout.wrap,'wrap');assert.ok(layout.scroll<=layout.client,`${width}px素材容器无横向溢出`);
+        // 宽屏能完整容纳时允许单行；窄屏必须实际换行，不能靠截断或横滚隐藏素材。
+        if(width===320)assert.ok(new Set(layout.spans.map(s=>Math.round(s.box.top))).size>1,'320px混合输入实际分行，而非仅声明换行样式');
+        for(const span of layout.spans)for(const box of [span.box,...span.text])assert.ok(box.left>=layout.box.left-1 && box.right<=layout.box.right+1 && box.left>=layout.spec.left-1 && box.right<=layout.spec.right+1,`${width}px素材文字完整位于规格容器`);
+        assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+        await row.locator('button').click();assert.equal(await detail.isVisible(),true);assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);await row.locator('button').click();
+        if(process.env.CHOUKA_TEST_MATERIAL_SCREENSHOT) {
+          await page.evaluate(()=>document.activeElement?.blur());await positionMatrix(page);
+          // 手机将矩阵移入视口，完整截到换行后的音频，而不是只截首屏上沿；不改变真实视口尺寸。
+          await page.locator('#summary-machines .scroll').evaluate((node,width)=>window.scrollTo({top:width===1440?0:node.getBoundingClientRect().top+window.scrollY-16,left:0,behavior:'instant'}),width);
+          assert.ok(await row.locator('.input-materials > span').evaluateAll(nodes=>nodes.every(n=>{const r=n.getBoundingClientRect();return r.top>=0 && r.bottom<=innerHeight;})),`${width}px截图完整包含各类输入素材`);
+          const file=path.parse(process.env.CHOUKA_TEST_MATERIAL_SCREENSHOT),output=path.join(file.dir,file.name+`-${width}.png`);
+          await page.screenshot({path:output,fullPage:false});t.diagnostic('合成混合输入截图：'+output);
+        }
+      }
+      assert.deepEqual(state.errors,[]);
     });
     await t.test('简明首页及详情的名称模型来源配置与警告安全渲染',async()=>{
       const input=summaryFixture();input.workers[0].name=ATTACK;input.workers[0].hardware.gpus[0].name=ATTACK;const g=input.groups[1];g.capability_name=ATTACK;g.model_summary.models[0].name=ATTACK;g.model_summary.precision_label=ATTACK;g.config={cpu:ATTACK};g.warnings=[ATTACK];g.cache_condition={kind:ATTACK};
