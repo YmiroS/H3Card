@@ -52,7 +52,8 @@
       box-shadow: 16px 0 40px #0005;
     }
   }
-  .workspace-brand { display: flex; align-items: center; gap: 10px; min-height: 76px; padding: 12px 11px;
+  #workspace-nav .workspace-brand { display: flex; align-items: center; gap: 10px; min-height: 76px; padding: 12px 11px;
+    border: 0; border-radius: 0; background: transparent;
     color: #f3f4f6; text-decoration: none; font-size: 18px; font-weight: 650; letter-spacing: -.4px; }
   .workspace-brand img { width: 32px; height: 32px; object-fit: contain; flex: none; }
   .workspace-brand small { display: block; margin-top: 1px; color: #949ba8; font-size: 10px; letter-spacing: 2px; font-weight: 400; }
@@ -65,7 +66,7 @@
   .workspace-brand > span, .workspace-link > span { flex: none; white-space: nowrap; }
   #workspace-nav .workspace-link { display: flex; align-items: center; gap: 12px; min-height: 46px;
     margin: 4px 0; padding: 10px 17px; border: 1px solid transparent; border-radius: 9px;
-    color: #aeb4c0; text-decoration: none; white-space: nowrap; transition: background-color .15s, color .15s; }
+    color: #aeb4c0; background: transparent; text-decoration: none; white-space: nowrap; transition: background-color .15s, color .15s; }
   #workspace-nav .workspace-link svg { flex: none; width: 19px; height: 19px; }
   #workspace-nav .workspace-link:hover { background: #181c23; color: #fff; }
   #workspace-nav .workspace-link[aria-current="page"] { background: #192a37; border-color: #284454; color: #bce9ff; }
@@ -213,7 +214,7 @@
   async function refreshPresence() {
     if (stopped || document.hidden) return;
     if (!presencePending) presencePending = json('/api/auth/presence', 'POST').then(data => {
-      const count = document.querySelector('#online-count b');
+      const count = document.querySelector('#workspace-nav .workspace-presence b');
       if (count) count.textContent = String(data.online_users);
       window.dispatchEvent(new CustomEvent('h3auth:presence', {detail:data}));
       return data;
@@ -340,9 +341,11 @@
       link.querySelector('span').textContent = label; group.append(link);
     };
     add('canvas', '画布', '/'); add('director', '导演工作台', '/director');
-    if (user.role === 'admin' || user.team_leader) add('teams', '项目组', '/teams');
-    if (user.role === 'admin') {
+    if (user.role === 'admin' || user.team_leader) {
       group = addGroup('管理');
+      add('teams', '项目组', '/teams');
+    }
+    if (user.role === 'admin') {
       add('controller', '运行面板', '/controller'); add('permissions', '账号与权限', '/admin/permissions');
       group = addGroup('统计');
       add('costs', '费用评估', '/controller/costs'); add('capacity', '产能统计', '/controller/capacity');
