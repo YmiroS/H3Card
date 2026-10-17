@@ -243,7 +243,15 @@ test('运行六概览保留真实模式、多GPU比例、状态色、最近30条
     const ratios = await page.locator('#worker-rows [role=meter]').evaluateAll(nodes => nodes.map(node => ({
       value:Number(node.getAttribute('aria-valuenow')), ratio:node.querySelector('i').getBoundingClientRect().width / node.getBoundingClientRect().width * 100,
     })));
-    assert.ok(ratios.length >= 5, '利用率、显存、内存指标确实存在，不能让空列表假通过');
+    assert.equal(ratios.length, 3, '保留两张显卡的独立显存条和系统内存条，不再渲染GPU利用率条');
+    assert.equal(await page.locator('.workers-table th').nth(2).textContent(), 'GPU / 显存');
+    const gpuCells = page.locator('#worker-rows td:nth-child(3)');
+    assert.equal(await gpuCells.locator('.utilization').count(), 0);
+    assert.doesNotMatch((await gpuCells.allTextContents()).join(' '), /\d+%/);
+    assert.match(await gpuCells.first().textContent(), /GPU 0 · RTX 4090.*6\.0 GB \/ 24\.0 GB.*GPU 1 · RTX 4090.*0 KB \/ 24\.0 GB/s);
+    assert.deepEqual(await gpuCells.locator('[role=meter]').evaluateAll(nodes => nodes.map(node => ({value:Number(node.getAttribute('aria-valuenow')), color:getComputedStyle(node.querySelector('i')).backgroundColor}))), [{value:25, color:'rgb(56, 189, 248)'}, {value:0, color:'rgb(56, 189, 248)'}]);
+    assert.equal(await page.locator('#worker-rows tr').first().locator('td').nth(4).locator('[role=meter] i').evaluate(node => getComputedStyle(node).backgroundColor), 'rgb(174, 186, 202)', '系统内存条颜色不随显存修改');
+    assert.equal(await page.locator('#job-rows tr').first().locator('[role=meter]').getAttribute('aria-valuenow'), '27', '任务进度条保持不变');
     for (const item of ratios) assert.ok(Math.abs(item.value - item.ratio) < .2, JSON.stringify(item));
     await page.selectOption('#jobs-filter', 'error');
     assert.equal(await page.locator('#job-rows tr').count(), 1);
