@@ -337,7 +337,7 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             "name": "actual CUDA device", "type": "cuda", "index": 2, "vram_total": 1234,
         }])
         self.assertEqual(caps["telemetry"]["execution_device"], hardware["execution_device"])
-        self.assertEqual(caps["agent_version"], 4)
+        self.assertEqual(caps["agent_version"], 5)
         self.assertEqual(caps["supports_capacity_telemetry"], 1)
         self.assertNotIn("private-", json.dumps(caps))
         self.assertEqual(self.worker._json_request.await_count, 2)
@@ -387,6 +387,24 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.worker._json_request.assert_not_awaited()
         self.assertEqual(json.loads(self.worker.state_path.read_text())["host_id"],
                          self.worker.state["host_id"])
+
+    async def test_heartbeat_transmits_temperature_with_original_collection_time(self):
+        self.worker.telemetry = {
+            "collected_at": time.time() - 3,
+            "gpus": [{"index": 0, "temperature_c": 67.5},
+                     {"index": 1, "temperature_c": None}],
+        }
+        self.worker.last_capability_scan = time.time()
+        self.worker.last_telemetry_scan = time.time()
+        self.worker.local_status = mock.AsyncMock()
+        self.worker.confirm_release_recovery = mock.AsyncMock()
+        self.worker.stop_event = mock.Mock()
+        self.worker.stop_event.is_set.side_effect = [False, True]
+        self.worker.stop_event.wait = mock.AsyncMock(return_value=True)
+        await self.worker.heartbeat_loop()
+        body = self.requests[-1][1]
+        self.assertEqual(body["telemetry"], self.worker.telemetry)
+        self.assertNotIn("private-", json.dumps(body))
 
     async def test_heartbeat_release_requires_all_four_observations(self):
         for current, failed, online, busy, expected in (

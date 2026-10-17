@@ -6,12 +6,14 @@ import copy
 import csv
 import ctypes
 import json
+import math
 import mimetypes
 import os
 import platform
 import re
 import ssl
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -63,7 +65,18 @@ class WorkerAgent:
         self.comfy_online = False
         self.local_busy = False
         self.pending_sync = None
-        self.sync_report = None
+        maintenance = self.state.get("maintenance")
+        if isinstance(maintenance, dict) and maintenance.get("request_id"):
+            status = str(maintenance.get("status") or "restarting")
+            self.sync_report = {
+                "request_id": str(maintenance["request_id"]),
+                "status": "error" if status == "error" else (
+                    "done" if status == "ready" else "running"
+                ),
+                "message": str(maintenance.get("message") or "正在重启节点服务"),
+            }
+        else:
+            self.sync_report = None
         self.stop_event = asyncio.Event()
 
     def _load_state(self):
@@ -105,24 +118,26 @@ class WorkerAgent:
 
     @staticmethod
     def _nvidia_gpus():
-        command = [
-            "nvidia-smi",
-            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-        ]
-        try:
-            result = subprocess.run(
-                command, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=5, check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return []
-        if result.returncode != 0:
+        fields = "index,name,utilization.gpu,memory.used,memory.total"
+        # 旧驱动可能不认识温度字段；失败时只回退一次，不丢掉原有资源指标。
+        for query in (fields + ",temperature.gpu", fields):
+            command = ["nvidia-smi", "--query-gpu=" + query,
+                       "--format=csv,noheader,nounits"]
+            try:
+                result = subprocess.run(
+                    command, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=5, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                return []
+            if result.returncode == 0:
+                break
+        else:
             return []
 
         gpus = []
-        for row in csv.reader(result.stdout.splitlines()):
+        for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
             if len(row) < 5:
                 continue
             try:
@@ -139,8 +154,17 @@ class WorkerAgent:
             except ValueError:
                 memory_used = None
                 memory_total = None
+            temperature = None
+            if len(row) >= 6:
+                try:
+                    value = float(row[5].strip())
+                    if math.isfinite(value) and 0 <= value <= 150:
+                        temperature = value
+                except ValueError:
+                    pass
             gpus.append({
                 "index": index,
+                "temperature_c": temperature,
                 "name": row[1].strip(),
                 "utilization_percent": utilization,
                 "memory_used_bytes": memory_used,
@@ -278,9 +302,10 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 4,
+            "agent_version": 5,
             "supports_capacity_telemetry": 1,
             "supports_file_sync": True,
+            "supports_code_restart": True,
         }
         self.last_capability_scan = time.time()
         return self.capabilities
@@ -357,6 +382,208 @@ class WorkerAgent:
             return path if path.is_absolute() else (self.config_path.parent / path).resolve()
         return self.config_path.parent.parent / "同步主节点模型和用户.bat"
 
+    def code_repo_path(self):
+        configured = self.config.get("code_repo")
+        if configured:
+            path = Path(configured)
+            return path if path.is_absolute() else (self.config_path.parent / path).resolve()
+        return self.config_path.parent.parent
+
+    def node_launcher_path(self):
+        configured = self.config.get("node_launcher")
+        if configured:
+            path = Path(configured)
+            return path if path.is_absolute() else (self.config_path.parent / path).resolve()
+        devices = self.capabilities.get("devices") or self._nvidia_gpus()
+        gpu_names = [
+            str(item.get("name") or "").casefold()
+            for item in devices if isinstance(item, dict)
+        ]
+        profiles = set()
+        if any("rtx 4090" in name for name in gpu_names):
+            profiles.add("4090")
+        if any("rtx a6000" in name for name in gpu_names):
+            profiles.add("A6000")
+        if len(profiles) > 1:
+            raise AgentError("检测到多个 GPU 启动配置，请在 node_launcher 中明确指定")
+        root = self.code_repo_path()
+        if profiles == {"4090"}:
+            return root / "启动Windows节点_4090.bat"
+        if profiles == {"A6000"}:
+            return root / "启动Windows节点_A6000.bat"
+        return root / "启动Windows节点.bat"
+
+    @staticmethod
+    def batch_command_name(path):
+        if re.search(r'[\s&|<>^()%!\"]', path.name):
+            raise AgentError(f"批处理文件名包含 cmd 不安全字符：{path.name}")
+        return f".\\{path.name}"
+
+    async def run_local_command(self, *command, cwd=None, timeout=300):
+        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        if os.name == "nt":
+            flags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        with tempfile.TemporaryFile() as output_file:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                cwd=str(cwd) if cwd else None,
+                stdout=output_file,
+                stderr=asyncio.subprocess.STDOUT,
+                creationflags=flags,
+            )
+            try:
+                await asyncio.wait_for(process.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                if os.name == "nt":
+                    killer = await asyncio.create_subprocess_exec(
+                        "taskkill", "/PID", str(process.pid), "/T", "/F",
+                        stdout=asyncio.subprocess.DEVNULL,
+                        stderr=asyncio.subprocess.DEVNULL,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    await asyncio.wait_for(killer.wait(), timeout=30)
+                elif process.returncode is None:
+                    process.kill()
+                try:
+                    await asyncio.wait_for(process.wait(), timeout=30)
+                except asyncio.TimeoutError:
+                    pass
+                raise AgentError(f"命令执行超时：{command[0]}")
+            output_file.seek(0, os.SEEK_END)
+            size = output_file.tell()
+            output_file.seek(max(0, size - 65536))
+            output = output_file.read()
+        text = output.decode("utf-8", errors="replace") if output else ""
+        if process.returncode != 0:
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            detail = " | ".join(lines[-6:])[-1000:]
+            raise AgentError(detail or f"命令退出码 {process.returncode}：{command[0]}")
+        return text.strip()
+
+    async def pull_code(self):
+        repo = self.code_repo_path().resolve()
+        if not (repo / ".git").exists():
+            raise AgentError(f"chouka 不是 Git 仓库：{repo}")
+        timeout = max(float(self.config.get("git_pull_timeout_seconds", 300)), 30.0)
+        branch = str(self.config.get("code_branch") or "main").strip()
+        current = await self.run_local_command(
+            "git", "rev-parse", "--abbrev-ref", "HEAD", cwd=repo, timeout=30,
+        )
+        if current.strip() != branch:
+            raise AgentError(f"chouka 当前分支是 {current.strip()}，预期为 {branch}")
+        dirty = await self.run_local_command(
+            "git", "status", "--porcelain", "--untracked-files=no",
+            cwd=repo, timeout=30,
+        )
+        if dirty:
+            raise AgentError("chouka 存在未提交的已跟踪文件，已停止自动更新")
+        output = await self.run_local_command(
+            "git", "pull", "--ff-only", "origin", branch, cwd=repo, timeout=timeout,
+        )
+        commit = await self.run_local_command(
+            "git", "rev-parse", "HEAD", cwd=repo, timeout=30,
+        )
+        return commit.strip(), output
+
+    async def schedule_node_restart(self, request_id, commit):
+        if os.name != "nt":
+            raise AgentError("节点重启只能在 Windows Worker 上运行")
+        repo = self.code_repo_path().resolve()
+        helper = repo / "worker" / "restart_node.py"
+        launcher = self.node_launcher_path().resolve()
+        if not helper.is_file():
+            raise AgentError(f"找不到节点重启程序：{helper}")
+        if not launcher.is_file():
+            raise AgentError(f"找不到当前 GPU 的启动脚本：{launcher}")
+
+        timeout = max(float(self.config.get("restart_timeout_seconds", 300)), 60.0)
+        maintenance = {
+            "request_id": request_id,
+            "status": "restarting",
+            "message": f"代码已更新至 {commit[:12]}，正在重启 ComfyUI 和 Worker",
+            "target_commit": commit,
+            "deadline": time.time() + timeout,
+        }
+        self.state["maintenance"] = maintenance
+        self._save_state()
+        flags = (
+            getattr(subprocess, "DETACHED_PROCESS", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+            | getattr(subprocess, "CREATE_NO_WINDOW", 0)
+        )
+        try:
+            process = await asyncio.create_subprocess_exec(
+                sys.executable, str(helper),
+                "--config", str(self.config_path),
+                "--worker-pid", str(os.getpid()),
+                "--launcher", str(launcher),
+                cwd=str(repo),
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+                creationflags=flags,
+            )
+            await asyncio.sleep(0.5)
+            if process.returncode is not None:
+                raise AgentError(f"节点重启程序提前退出：{process.returncode}")
+        except Exception:
+            self.state.pop("maintenance", None)
+            self._save_state()
+            raise
+        self.sync_report = {
+            "request_id": request_id,
+            "status": "running",
+            "message": maintenance["message"],
+        }
+        self.stop_event.set()
+
+    def refresh_restart_report(self):
+        maintenance = self.state.get("maintenance")
+        if not isinstance(maintenance, dict) or not maintenance.get("request_id"):
+            return
+        request_id = str(maintenance["request_id"])
+        status = str(maintenance.get("status") or "restarting")
+        if status == "error":
+            self.sync_report = {
+                "request_id": request_id,
+                "status": "error",
+                "message": str(maintenance.get("message") or "节点重启失败")[:1000],
+            }
+            return
+        if status == "ready":
+            self.sync_report = {
+                "request_id": request_id,
+                "status": "done",
+                "message": str(maintenance.get("message") or "代码更新和节点重启完成")[:1000],
+            }
+            return
+        if time.time() >= float(maintenance.get("deadline") or 0):
+            message = "节点已重启，但 ComfyUI 未在限定时间内恢复就绪"
+            maintenance.update(status="error", message=message)
+            self._save_state()
+            self.sync_report = {
+                "request_id": request_id,
+                "status": "error",
+                "message": message,
+            }
+            return
+        if self.comfy_online and "node_classes" in self.capabilities:
+            commit = str(maintenance.get("target_commit") or "")[:12]
+            message = f"代码 {commit} 已拉取，ComfyUI 和 Worker 已重启并就绪"
+            maintenance.update(status="ready", message=message)
+            self._save_state()
+            self.sync_report = {
+                "request_id": request_id,
+                "status": "done",
+                "message": message,
+            }
+            return
+        self.sync_report = {
+            "request_id": request_id,
+            "status": "running",
+            "message": str(maintenance.get("message") or "正在重启 ComfyUI 和 Worker"),
+        }
+
     async def execute_pending_sync(self):
         command = self.pending_sync
         if not command:
@@ -367,39 +594,30 @@ class WorkerAgent:
             "status": "running",
             "message": "正在同步 ComfyUI、模型和用户目录",
         }
-        print(f"[Worker] 开始同步 ComfyUI、模型和用户目录：{request_id}", flush=True)
+        print(f"[Worker] 开始同步文件并更新节点：{request_id}", flush=True)
         try:
             if os.name != "nt":
                 raise AgentError("文件同步脚本只能在 Windows Worker 上运行")
             script = self.sync_script_path()
             if not script.is_file():
                 raise AgentError(f"找不到同步脚本：{script}")
-            process = await asyncio.create_subprocess_exec(
-                "cmd.exe", "/d", "/c", str(script), "--upgrade", "--non-interactive",
-                cwd=str(script.parent),
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            await self.run_local_command(
+                "cmd.exe", "/d", "/c", self.batch_command_name(script),
+                "--upgrade", "--non-interactive",
+                cwd=script.parent,
+                timeout=max(float(self.config.get("file_sync_timeout_seconds", 3600)), 60.0),
             )
-            output, _ = await process.communicate()
-            text = output.decode("utf-8", errors="replace") if output else ""
-            lines = [line.strip() for line in text.splitlines() if line.strip()]
-            message = " | ".join(lines[-6:])[-1000:]
-            if process.returncode != 0:
-                raise AgentError(message or f"同步脚本退出码 {process.returncode}")
-            self.sync_report = {
-                "request_id": request_id,
-                "status": "done",
-                "message": message or "ComfyUI、模型和用户目录同步完成",
-            }
-            print(f"[Worker] 文件同步完成：{request_id}", flush=True)
+            self.sync_report["message"] = "文件同步完成，正在拉取 chouka 代码"
+            commit, _ = await self.pull_code()
+            print(f"[Worker] chouka 已更新至 {commit[:12]}，准备重启节点", flush=True)
+            await self.schedule_node_restart(request_id, commit)
         except Exception as exc:
             self.sync_report = {
                 "request_id": request_id,
                 "status": "error",
                 "message": str(exc)[:1000],
             }
-            print(f"[Worker] 文件同步失败：{exc}", flush=True)
+            print(f"[Worker] 节点同步更新失败：{exc}", flush=True)
         finally:
             self.pending_sync = None
 
@@ -420,6 +638,7 @@ class WorkerAgent:
                     await self.scan_capabilities()
                 elif now - self.last_telemetry_scan >= telemetry_interval:
                     await self.scan_telemetry()
+                self.refresh_restart_report()
                 sync_running = bool(
                     self.sync_report and self.sync_report.get("status") == "running"
                 )
@@ -455,6 +674,11 @@ class WorkerAgent:
                         and self.sync_report.get("status") in {"done", "error"}
                         and acknowledgement.get("request_id") == self.sync_report.get("request_id")
                         and acknowledgement.get("status") == self.sync_report.get("status")):
+                    maintenance = self.state.get("maintenance")
+                    if (isinstance(maintenance, dict)
+                            and maintenance.get("request_id") == self.sync_report.get("request_id")):
+                        self.state.pop("maintenance", None)
+                        self._save_state()
                     self.sync_report = None
                 for command in (reply or {}).get("commands", []):
                     if command.get("type") in ("cancel_job", "abort_job"):
@@ -882,6 +1106,7 @@ class WorkerAgent:
             self.session = session
             await self.ensure_registered()
             await self.scan_capabilities()
+            self.refresh_restart_report()
             self.last_capability_scan = 0.0
             heartbeat = asyncio.create_task(self.heartbeat_loop())
             try:

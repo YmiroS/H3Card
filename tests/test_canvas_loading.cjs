@@ -156,6 +156,12 @@ async function fixtureServer(videoBytes, audioBytes, highRes) {
     state.requests.push(record);
     res.on('close', () => { record.closed = true; state.events.emit('change'); });
     res.on('finish', () => { record.complete = true; });
+    // 活跃心跳保留在 requests 中，但不属于画布内容写入。
+    if (req.method === 'POST' && url.pathname === '/api/auth/presence') {
+      req.resume();
+      assert.equal(req.headers['x-csrf-token'], 'fixture-csrf');
+      return json(res,{online_users:1});
+    }
     if (!['GET','HEAD','OPTIONS'].includes(req.method)) {
       state.writes.push(record);
       let body = ''; req.on('data', bytes => { body += bytes; });
@@ -194,7 +200,7 @@ async function fixtureServer(videoBytes, audioBytes, highRes) {
     };
     if (state.heldPaths.has(url.pathname)) { delayed(() => json(res,{ok:true})); return; }
     if (url.pathname === '/api/auth/me') return json(res,{user:{id:'tester',username:'tester',role:'user'},csrf_token:'fixture-csrf'});
-    if (url.pathname === '/api/cards') return json(res,manifests);
+    if (url.pathname === '/api/cards') return json(res,state.manifests);
     if (url.pathname === '/api/projects') return json(res,{projects:state.projects.map(p => ({...p,cards:p.cards.length,edges:undefined,groups:undefined})),teams:[]});
     if (/^\/api\/projects\/[^/]+$/.test(url.pathname)) {
       const p = state.projects.find(p => p.id === decodeURIComponent(url.pathname.split('/').pop()));
@@ -296,7 +302,7 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
     browser = await chromium.launch({channel:process.env.CHOUKA_TEST_BROWSER || 'chrome'});
     async function withPage(projects, run, configure = () => {}) {
       const state = fixture.state;
-      Object.assign(state,{projects:clone(projects),requests:[],writes:[],held:[],thumbnailDelay:65,holdThumbnails:false,holdPreviews:false,previewModes:{},heldPaths:new Set(),failThumbnail:null,failThumbnailStatus:500,holdNextBlob:false,highRes:false,deviceScaleFactor:1});
+      Object.assign(state,{projects:clone(projects),manifests,requests:[],writes:[],held:[],thumbnailDelay:65,holdThumbnails:false,holdPreviews:false,previewModes:{},heldPaths:new Set(),failThumbnail:null,failThumbnailStatus:500,holdNextBlob:false,highRes:false,deviceScaleFactor:1});
       configure(state);
       const context = await browser.newContext({viewport:{width:1440,height:960},deviceScaleFactor:state.deviceScaleFactor});
       await context.addInitScript(installProbe,{holdNextBlob:state.holdNextBlob});
@@ -334,6 +340,108 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
         assert.deepEqual(await page.evaluate(() => __canvasProbe.batches),[{added:381,total:381}]);
         assert.deepEqual(await outputs(page),p.cards.map(c => c.outputs));
         await quietWrites(page,state);
+      });
+    });
+
+    await t.test('选中节点显示完整上下游流向，旁支弱化；真实参数面板、连线命中及减少动态效果保持可用', async () => {
+      const p = project('flow', Array.from({length:7}, (_,i) => ({...card(i,'image','flow'),x:50+(i%4)*380,y:i<4?80:650,outputs:[]})));
+      p.view = {x:30,y:20,k:0.55};
+      p.edges = [[0,1],[1,2],[2,3],[0,4],[5,6]].map(([a,b])=>({from:`flow_${a}`,to:`flow_${b}`,slot:'image'}));
+      p.edges.push({from:'flow_0',to:'flow_1',slot:'@style'});
+      p.cards[1].params.prompt = '连线流向检查';
+      p.groups = [{id:'flow-group',name:'流向测试组',cards:['flow_1']}];
+      await withPage([p],async (page,state) => {
+        const originalHit = await page.locator('#wires path.hit').first().elementHandle();
+        await page.locator('[data-id="flow_1"] .ch .t').click();
+        assert.equal(await originalHit.evaluate(n=>n===document.querySelector('#wires path.hit')),true,'选择态保留连线DOM，不重算几何');
+        await page.waitForFunction(() => document.querySelector('#wires .flow.in-view'));
+        assert.equal(await page.locator('#wires path.flow-up').count(),2);
+        assert.equal(await page.locator('#wires path.flow-down').count(),2);
+        assert.equal(await page.locator('#wires path.related.txt').count(),1,'文字/风格线的虚线语义保留');
+        assert.equal(await page.locator('#wires path.hit').count(),6);
+        assert.equal(await page.locator('#panel').isVisible(),true);
+        assert.equal(await page.locator('#panel .modes .on').innerText(),'图片','仍打开真实节点参数面板');
+        assert.equal(await page.locator('#panel textarea').inputValue(),'连线流向检查');
+        assert.equal(await page.locator('#panel textarea').isEditable(),true);
+        const flow = page.locator('#wires path.flow-up').first();
+        const initial = await flow.evaluate(n=>getComputedStyle(n).strokeDashoffset);
+        await page.waitForFunction(value => getComputedStyle(document.querySelector('#wires path.flow-up')).strokeDashoffset !== value, initial);
+        assert.deepEqual(await flow.evaluate(n=>n.getAnimations()[0].effect.getKeyframes().map(f=>f.strokeDashoffset)),['0px','-24px'],'负偏移沿 SVG 来源到目标流动');
+        assert.equal(await flow.evaluate(n=>getComputedStyle(n).pointerEvents),'none');
+        assert.match(await flow.getAttribute('marker-end'),/wire-arrow-up/);
+        assert.equal(await page.locator('#wires marker polygon').count(),3);
+        assert.equal(await page.locator('#wires path:not(.hit):not(.flow):not(.related)').first().evaluate(n=>getComputedStyle(n).opacity),'0.22');
+        await page.mouse.move(800,50);
+        await page.screenshot({path:path.resolve(web,'..','..','temp','chouka-node-wire-flow.png')});
+        const rename = page.waitForEvent('dialog').then(async dialog=>{assert.equal(dialog.message(),'组名');await dialog.dismiss();});
+        await page.locator('.gglabel').dblclick(); await rename;
+        assert.equal(await page.locator('#wires path.flow').count(),4,'双击分组仍保留相关链路');
+        // 动态覆盖层不截获点击，实际命中透明粗线仍能选线。
+        const point = await page.locator('#wires path.hit').first().evaluate(n=>{const p=n.getPointAtLength(n.getTotalLength()/2).matrixTransform(n.getScreenCTM());return {x:p.x,y:p.y};});
+        await page.mouse.click(point.x,point.y);
+        assert.equal(await page.locator('#wires path.sel').count(),1);
+        assert.equal(await page.locator('#wires path.flow').count(),0);
+        await page.locator('[data-id="flow_2"] .ch .t').click();
+        assert.equal(await page.locator('#wires path.flow-up').count(),3);
+        assert.equal(await page.locator('#wires path.flow-down').count(),1);
+        await page.emulateMedia({reducedMotion:'reduce'});
+        assert.ok(await page.locator('#wires path.flow').evaluateAll(nodes=>nodes.every(n=>getComputedStyle(n).animationName==='none' && n.hasAttribute('marker-end'))));
+        await page.screenshot({path:path.resolve(web,'..','..','temp','chouka-node-wire-flow-reduced.png')});
+        await page.keyboard.press('Escape');
+        assert.equal(await page.locator('#wires path.flow').count(),0);
+        assert.equal(await page.locator('#wires.has-flow').count(),0);
+        assert.equal(await page.locator('#wires path.hit').count(),6);
+        assert.deepEqual(await page.evaluate(()=>PROJ.edges),p.edges,'选择效果不能改写连线或固定版本');
+        await quietWrites(page,state);
+      },state=>{
+        state.manifests = clone(manifests);
+        state.manifests.capabilities.fixture_image.inputs = [{key:'prompt',type:'textarea',label:'提示词'}];
+      });
+    });
+
+    await t.test('环路、自连、重复边、多选与无效端点的流向遍历不串入兄弟分支', async () => {
+      await withPage([smallProject('relations',['image'],'readonly')],async (page,state) => {
+        const result = await page.evaluate(() => {
+          const graph={cards:['a','b','c','d','sibling','x'].map(id=>({id})),edges:[['a','b'],['b','c'],['c','b'],['c','c'],['c','d'],['a','sibling'],['a','b'],['missing','b']].map(([from,to])=>({from,to}))};
+          const classify = ids => {const r=wireRelations(graph,ids);return graph.edges.map(e=>(r.upstream.has(e)?1:0)+(r.downstream.has(e)?2:0));};
+          const large={cards:Array.from({length:6000},(_,i)=>({id:i})),edges:Array.from({length:5999},(_,i)=>({from:i,to:i+1}))};
+          const long=wireRelations(large,[3000]);
+          return {single:classify(['b']),multiple:classify(['b','x']),empty:classify([]),stale:classify(['gone']),long:[long.upstream.size,long.downstream.size]};
+        });
+        assert.deepEqual(result.single,[1,3,3,3,2,0,1,0]);assert.deepEqual(result.multiple,result.single);
+        assert.deepEqual(result.empty,Array(8).fill(0));assert.deepEqual(result.stale,result.empty);
+        assert.deepEqual(result.long,[3000,2999],'迭代遍历长链不递归爆栈');
+        await page.locator('[data-id="relations_0"] .ch .t').click();
+        assert.match(await page.locator('#panel').innerText(),/只读/);
+        await quietWrites(page,state);
+      });
+    });
+
+    await t.test('381节点长链只动画可视连线，平移缩放保持真实方向、几何及命中，退出清理观察器', async () => {
+      await withPage([largeProject()],async (page,state) => {
+        await settle(page);
+        const node = await page.locator('[data-id="large_1"]').elementHandle();
+        await page.locator('[data-id="large_1"] .ch').click();
+        await page.waitForFunction(() => document.querySelector('#wires path.flow.in-view'));
+        assert.equal(await page.locator('#wires path.flow').count(),272);
+        const counts = await page.locator('#wires path.flow').evaluateAll(nodes=>({running:nodes.filter(n=>getComputedStyle(n).animationPlayState==='running').length,paused:nodes.filter(n=>getComputedStyle(n).animationPlayState==='paused').length}));
+        assert.ok(counts.running>0 && counts.running<272);assert.equal(counts.running+counts.paused,272);
+        assert.equal(await node.evaluate(n=>n===cardOf('large_1')._el),true,'选择不能重新渲染节点或媒体');
+        const before = await page.locator('#wires path.flow').first().getAttribute('d');
+        const box = await page.locator('#stage').boundingBox(),x=box.x+box.width-60,y=box.y+box.height-160;
+        await page.mouse.move(x,y);await page.mouse.down({button:'middle'});await page.mouse.move(x-40,y-20,{steps:3});await page.mouse.up({button:'middle'});
+        await page.mouse.wheel(0,-100);
+        assert.equal(await page.locator('#wires path.flow').first().getAttribute('d'),before);
+        assert.equal(await page.locator('#wires').evaluate(n=>n.style.transform===document.querySelector('#world').style.transform),true);
+        assert.equal(await page.locator('#wires path.hit').count(),272);
+        await page.locator('#wires-toggle').click();assert.equal(await page.locator('#wires').isVisible(),false);
+        await page.locator('#wires-toggle').click();assert.equal(await page.locator('#wires').isVisible(),true);
+        await page.keyboard.press('Escape');
+        assert.equal(await page.locator('#wires path.flow').count(),0);
+        await page.evaluate(()=>clearProject());
+        assert.equal(await page.locator('#wires path').count(),0);
+        assert.equal(await page.locator('#wires.has-flow').count(),0);
+        assert.equal(state.writes.filter(r=>!r.path.endsWith('/view')).length,0);
       });
     });
 
@@ -754,7 +862,8 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
           panel:el.panel.firstElementChild === __before404.panel,
         })),{project:true,nodes:true,panel:true},'不能通过恢复权限后重建节点或重新打开面板掩盖中间冻结');
         assert.equal(await page.locator('#world .card').count(),381);
-        assert.equal(await page.locator('#wires path').count(),544);
+        assert.equal(await page.locator('#wires path:not(.flow)').count(),544);
+        assert.equal(await page.locator('#wires path.flow').count(),272,'权限核实不得清掉当前节点的流向');
         assert.deepEqual(await page.evaluate(() => __canvasProbe.batches),[{added:381,total:381}]);
         assert.equal(thumbs(state).filter(r => r.original === failedURL).length,1,'404 失败 URL 不得自动重复请求');
         assert.equal(state.requests.filter(r => r.path === '/api/projects').length,listCount+1,'失败只能触发一次权限列表核实，不能进入请求循环');
@@ -892,6 +1001,7 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
           window.__captureLogout({active:H3Auth.active,project:PROJ,cards:el.world.children.length,media:CARD_MEDIA.size,
             aborted:__canvasProbe.fetches.filter(r => r.aborted).length,created:__canvasProbe.created,revoked:__canvasProbe.revoked});
         }));
+        await page.locator('.account-trigger').click();
         await page.getByRole('button',{name:'退出登录',exact:true}).click();
         await page.waitForURL('**/login');
         assert.ok(snapshot,'必须观察到真实 auth.js 的会话失效事件');
@@ -1123,6 +1233,7 @@ test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeou
             intent:__pendingVideo._playRequest,controller:__pendingVideo._previewController,active:H3Auth.active,
             cards:el.world.children.length,aborted:__pendingEntry.controller.signal.aborted});
         }));
+        await page.locator('.account-trigger').click();
         await page.getByRole('button',{name:'退出登录',exact:true}).click();
         await page.waitForURL('**/login');
         await waitServer(state,() => request.closed && !request.complete,'退出登录未取消在途状态 HTTP 请求');

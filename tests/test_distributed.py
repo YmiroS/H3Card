@@ -1,5 +1,6 @@
 import asyncio
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -16,7 +17,7 @@ sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "worker"))
 
 from distributed import DistributedStore, HIGH_VRAM_GPU_POLICY
-from agent import JobFailed, WorkerAgent
+from agent import AgentError, JobFailed, WorkerAgent
 
 
 class ModelDispatchTest(unittest.TestCase):
@@ -266,6 +267,7 @@ class DistributedStoreTest(unittest.TestCase):
             "GPU-01", {
                 "node_classes": ["KSampler", "SaveImage"],
                 "supports_file_sync": True,
+                "supports_code_restart": True,
             }
         )
         newest_id = newest["worker_id"]
@@ -312,6 +314,47 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(worker["sync_status"], "done")
         self.assertEqual(worker["state"], "idle")
         self.assertEqual(self.store.acquire(newest_id)["job_id"], "job-1")
+
+    def test_temperature_history_survives_maintenance_and_failed_sync_stays_blocked(self):
+        worker = self.store.register_worker("GPU-maintenance", {
+            "node_classes": ["KSampler"], "supports_code_restart": True,
+            "supports_file_sync": True,
+        })
+        worker_id = worker["worker_id"]
+        now = time.time()
+        with mock.patch("distributed.time.time", return_value=now):
+            self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+            request = self.store.request_sync_all()
+            self.store.enqueue("temperature-maintenance-job", {"graph": {}}, ["KSampler"])
+            points = []
+            for offset, status in enumerate(("running", "error")):
+                at = now + offset * 10
+                points.append({"at": at, "temperature_c": 65 + offset})
+                with mock.patch("distributed.time.time", return_value=at):
+                    reply = self.store.heartbeat(
+                        worker_id, comfy_online=True, busy=False,
+                        telemetry={"collected_at": at, "gpus": [
+                            {"index": 255, "temperature_c": 65 + offset},
+                        ]},
+                        maintenance={"request_id": request["request_id"],
+                                     "status": status, "message": "温度与维护组合回归"},
+                    )
+                    self.assertEqual(reply["maintenance_ack"]["status"], status)
+                    self.assertIsNone(self.store.acquire(worker_id))
+                    rows = {row["id"]: row for row in self.store.list_workers()}
+                    self.assertEqual(rows[worker_id]["state"], "syncing" if status == "running" else "error")
+                    self.assertEqual(self.store.temperature_history(
+                        worker_id, gpu_index=255, now=at)["points"], points)
+            # 失败状态不能被随后一个普通的在线、空闲心跳解除。
+            self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+            self.assertIsNone(self.store.acquire(worker_id))
+            self.store.heartbeat(
+                worker_id, comfy_online=True, busy=False,
+                maintenance={"request_id": request["request_id"], "status": "done"},
+            )
+            self.assertEqual(self.store.acquire(worker_id)["job_id"], "temperature-maintenance-job")
+            self.assertEqual(self.store.temperature_history(
+                worker_id, gpu_index=255, now=now + 10)["points"], points)
 
     def test_heartbeat_merges_telemetry_without_dropping_capabilities(self):
         telemetry = {
@@ -680,6 +723,7 @@ class WorkerTelemetryTest(unittest.TestCase):
             "index": 0,
             "name": "NVIDIA GeForce RTX 4090",
             "utilization_percent": 73.0,
+            "temperature_c": None,
             "memory_used_bytes": 12288 * 1024 ** 2,
             "memory_total_bytes": 24564 * 1024 ** 2,
         }])
@@ -892,29 +936,97 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
     def failed_requests(self):
         return [kwargs["json"] for _, url, kwargs in self.requests if url.endswith("/failed")]
 
-    async def test_sync_command_runs_batch_and_records_success(self):
-        class Process:
-            returncode = 0
+    async def test_sync_command_waits_for_files_then_pulls_and_restarts(self):
+        calls = []
 
-            async def communicate(self):
-                return b"models synchronized\nSynchronization completed successfully.\n", None
+        async def run_command(*arguments, **_kwargs):
+            calls.append(("files", arguments))
+            return "Synchronization completed successfully."
+
+        async def pull_code():
+            calls.append(("pull", None))
+            return "abc123def456", "Already up to date."
+
+        async def restart(request_id, commit):
+            calls.append(("restart", (request_id, commit)))
 
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "sync.bat"
             script.write_text("@exit /b 0", encoding="ascii")
-            create_process = mock.AsyncMock(return_value=Process())
             with mock.patch.object(self.agent, "sync_script_path", return_value=script), \
-                 mock.patch("agent.asyncio.create_subprocess_exec", create_process), \
+                 mock.patch.object(self.agent, "run_local_command", side_effect=run_command), \
+                 mock.patch.object(self.agent, "pull_code", side_effect=pull_code), \
+                 mock.patch.object(self.agent, "schedule_node_restart", side_effect=restart), \
                  mock.patch("agent.os.name", "nt"):
                 self.agent.queue_sync({"type": "sync_files", "request_id": "sync-1"})
                 await self.agent.execute_pending_sync()
 
         self.assertIsNone(self.agent.pending_sync)
-        self.assertEqual(self.agent.sync_report["request_id"], "sync-1")
+        self.assertEqual([item[0] for item in calls], ["files", "pull", "restart"])
+        self.assertEqual(calls[0][1][:3], ("cmd.exe", "/d", "/c"))
+        self.assertEqual(calls[0][1][3], f".\\{script.name}")
+        self.assertEqual(calls[0][1][-2:], ("--upgrade", "--non-interactive"))
+        self.assertEqual(calls[-1][1], ("sync-1", "abc123def456"))
+
+    @unittest.skipUnless(os.name == "nt", "Windows cmd.exe behavior")
+    async def test_local_batch_runs_from_directory_with_shell_metacharacters(self):
+        with tempfile.TemporaryDirectory(prefix="sync & path ") as directory:
+            script = Path(directory) / "sync.bat"
+            script.write_text("@echo off\necho SYNC_OK [%1]\nexit /b 0\n", encoding="ascii")
+            output = await self.agent.run_local_command(
+                "cmd.exe", "/d", "/c", self.agent.batch_command_name(script),
+                "--upgrade", cwd=script.parent, timeout=10,
+            )
+        self.assertIn("SYNC_OK", output)
+
+    def test_batch_filename_rejects_cmd_metacharacters(self):
+        with self.assertRaisesRegex(AgentError, "cmd 不安全字符"):
+            self.agent.batch_command_name(Path("sync & run.bat"))
+
+    async def test_git_pull_requires_clean_expected_branch_and_fast_forward(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            (repo / ".git").mkdir()
+            self.agent.config = {"code_branch": "main"}
+            command = mock.AsyncMock(side_effect=[
+                "main", "", "Already up to date.", "abc123def456",
+            ])
+            with mock.patch.object(self.agent, "code_repo_path", return_value=repo), \
+                 mock.patch.object(self.agent, "run_local_command", command):
+                commit, _ = await self.agent.pull_code()
+
+        self.assertEqual(commit, "abc123def456")
+        pull_args = command.await_args_list[2].args
+        self.assertEqual(pull_args, ("git", "pull", "--ff-only", "origin", "main"))
+
+    def test_restarted_worker_only_reports_done_after_comfy_capabilities_load(self):
+        self.agent.state["maintenance"] = {
+            "request_id": "sync-1", "status": "restarting",
+            "target_commit": "abc123def456", "deadline": time.time() + 60,
+        }
+        self.agent.capabilities = {"node_classes": ["KSampler"]}
+        self.agent.comfy_online = True
+        self.agent._save_state = mock.Mock()
+
+        self.agent.refresh_restart_report()
+
         self.assertEqual(self.agent.sync_report["status"], "done")
-        arguments = create_process.await_args.args
-        self.assertEqual(arguments[:3], ("cmd.exe", "/d", "/c"))
-        self.assertEqual(arguments[-2:], ("--upgrade", "--non-interactive"))
+        self.assertEqual(self.agent.state["maintenance"]["status"], "ready")
+        self.agent._save_state.assert_called_once_with()
+
+    def test_restart_does_not_report_late_comfy_recovery_as_success(self):
+        self.agent.state["maintenance"] = {
+            "request_id": "sync-1", "status": "restarting",
+            "target_commit": "abc123def456", "deadline": time.time() - 1,
+        }
+        self.agent.capabilities = {"node_classes": ["KSampler"]}
+        self.agent.comfy_online = True
+        self.agent._save_state = mock.Mock()
+
+        self.agent.refresh_restart_report()
+
+        self.assertEqual(self.agent.sync_report["status"], "error")
+        self.assertEqual(self.agent.state["maintenance"]["status"], "error")
 
     async def test_cancel_retains_current_until_ack_and_reuses_targeted_cleanup(self):
         task = asyncio.create_task(self.agent.execute(self.assignment))
