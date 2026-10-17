@@ -34,39 +34,56 @@
   .chip.off { color: var(--err, var(--bad, #ff3b5c)); border-color: #ff3b5c3a; }
   .account-bar { display: inline-flex; align-items: center; gap: 10px; font-size: 12px; }
   .account-bar .who { color: var(--txt, var(--text, #d8e6f2)); }
-  body[data-workspace] { --workspace-width: 184px; padding-left: var(--workspace-width); }
+  body[data-workspace] { --workspace-width: 72px; padding-left: var(--workspace-width); }
   #workspace-nav {
-    position: fixed; inset: 0 auto 0 0; z-index: 60; width: var(--workspace-width); height: 100dvh;
-    display: flex; flex-direction: column; box-sizing: border-box; padding: 0 12px;
+    --workspace-rail-width: var(--workspace-width); --workspace-reveal: 0; --workspace-extra-display: none;
+    position: fixed; inset: 0 auto 0 0; z-index: 60; width: var(--workspace-rail-width); height: 100dvh;
+    display: flex; flex-direction: column; box-sizing: border-box; padding: 0 8px; overflow-x: clip;
     background: #0c0e12; border-right: 1px solid #262a32; color: #e5e7eb;
     font: 13px/1.5 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
   }
-  .workspace-brand { display: flex; align-items: center; gap: 10px; min-height: 76px; padding: 12px 7px;
+  #workspace-nav:is(:focus-within, :has(.account-menu:popover-open)) {
+    --workspace-rail-width: 184px; --workspace-reveal: 1; --workspace-extra-display: block;
+    box-shadow: 16px 0 40px #0005;
+  }
+  @media (hover: hover) and (pointer: fine) {
+    #workspace-nav:hover {
+      --workspace-rail-width: 184px; --workspace-reveal: 1; --workspace-extra-display: block;
+      box-shadow: 16px 0 40px #0005;
+    }
+  }
+  .workspace-brand { display: flex; align-items: center; gap: 10px; min-height: 76px; padding: 12px 11px;
     color: #f3f4f6; text-decoration: none; font-size: 18px; font-weight: 650; letter-spacing: -.4px; }
   .workspace-brand img { width: 32px; height: 32px; object-fit: contain; flex: none; }
   .workspace-brand small { display: block; margin-top: 1px; color: #949ba8; font-size: 10px; letter-spacing: 2px; font-weight: 400; }
-  .workspace-links { flex: 1; min-height: 0; overflow-y: auto; padding-top: 18px; }
-  .workspace-nav-label { margin: 0 12px 12px; color: #949ba8; font-size: 10px; letter-spacing: 1.5px; }
-  .workspace-nav-label.management { margin-top: 32px; }
+  .workspace-links { flex: 1; min-height: 0; overflow: hidden auto; padding-top: 18px; }
+  .workspace-nav-label { margin: 0 12px 12px; color: #949ba8; font-size: 10px; letter-spacing: 1.5px; white-space: nowrap; }
+  .workspace-nav-group + .workspace-nav-group { margin-top: 16px; padding-top: 16px; border-top: 1px solid #262a32; }
+  #workspace-nav :is(.workspace-brand > span, .workspace-link > span, .workspace-nav-label, .account-name) {
+    opacity: var(--workspace-reveal); transition: opacity .14s ease-out;
+  }
+  .workspace-brand > span, .workspace-link > span { flex: none; white-space: nowrap; }
   #workspace-nav .workspace-link { display: flex; align-items: center; gap: 12px; min-height: 46px;
-    margin: 4px 0; padding: 10px 12px; border: 1px solid transparent; border-radius: 9px;
+    margin: 4px 0; padding: 10px 17px; border: 1px solid transparent; border-radius: 9px;
     color: #aeb4c0; text-decoration: none; white-space: nowrap; transition: background-color .15s, color .15s; }
   #workspace-nav .workspace-link svg { flex: none; width: 19px; height: 19px; }
   #workspace-nav .workspace-link:hover { background: #181c23; color: #fff; }
   #workspace-nav .workspace-link[aria-current="page"] { background: #192a37; border-color: #284454; color: #bce9ff; }
   #workspace-nav :is(a, button):focus-visible { outline: 2px solid #7dd3fc; outline-offset: 2px; }
   .workspace-footer { flex: none; padding: 16px 0 max(14px, env(safe-area-inset-bottom)); }
-  .workspace-presence { display: flex; gap: 8px; align-items: center; padding: 0 12px 15px; color: #a5acb8; font-size: 11px; }
-  .workspace-presence i { width: 6px; height: 6px; flex: none; border-radius: 50%; background: #34d399; box-shadow: 0 0 0 3px #34d39915; }
+  .workspace-presence { display: flex; justify-content: center; gap: calc(8px * var(--workspace-reveal)); align-items: center;
+    padding: 0 0 15px; color: #a5acb8; font-size: 10px; white-space: nowrap; }
+  .workspace-presence i { display: var(--workspace-extra-display); width: 6px; height: 6px; flex: none;
+    border-radius: 50%; background: #34d399; box-shadow: 0 0 0 3px #34d39915; }
   .workspace-presence b { color: #e5e7eb; font-weight: 550; }
   #workspace-nav .account-bar { display: block; width: 100%; margin: 0; padding-top: 12px; border-top: 1px solid #262a32; }
   #workspace-nav .chip { white-space: normal; font-size: 11px; line-height: 1.5; }
   .account-trigger { width: 100%; min-height: 48px; display: flex; align-items: center; gap: 10px;
-    padding: 7px 9px; border: 1px solid transparent; border-radius: 9px; color: #e5e7eb; background: transparent; font: inherit; cursor: pointer; }
+    padding: 7px 11px; overflow: hidden; border: 1px solid transparent; border-radius: 9px; color: #e5e7eb; background: transparent; font: inherit; cursor: pointer; }
   .account-trigger:hover, .account-trigger[aria-expanded="true"] { background: #1b2028; border-color: #303641; }
   .account-avatar { display: grid; place-items: center; width: 32px; height: 32px; flex: none;
     border-radius: 10px; color: #c7e9ff; background: #243c50; border: 1px solid #36536a; font-size: 14px; font-weight: 650; }
-  .account-name { min-width: 0; text-align: left; overflow-wrap: anywhere; font-size: 13px; font-weight: 550; }
+  .account-name { min-width: 0; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; font-weight: 550; }
   .account-menu { position: fixed; inset: auto; margin: 0; box-sizing: border-box; width: min(260px, calc(100vw - 16px));
     max-height: calc(100dvh - 90px); overflow-y: auto; padding: 8px; border: 1px solid #343b47; border-radius: 12px;
     background: #15191f; color: #e5e7eb; box-shadow: 0 20px 70px #0008; font: 13px/1.5 "Microsoft YaHei", system-ui, sans-serif; }
@@ -85,19 +102,9 @@
   .workspace-breadcrumb { color: var(--dim, #a5acb8); font-size: 12px; }
   body.node-editor[data-workspace] { padding-left: 0; }
   body.node-editor #workspace-nav { display: none; }
-  @media (max-width: 1100px) {
-    body[data-workspace] { --workspace-width: 72px; }
-    #workspace-nav { padding: 0 8px; }
-    .workspace-brand { justify-content: center; padding-inline: 0; }
-    .workspace-brand > span, .workspace-link > span, .workspace-nav-label, #workspace-nav .account-name { display: none; }
-    #workspace-nav .workspace-link { justify-content: center; padding-inline: 8px; }
-    .workspace-presence { justify-content: center; padding-inline: 0; gap: 0; }
-    .workspace-presence i { display: none; }
-    .workspace-presence > span { font-size: 10px; text-align: center; }
-    .workspace-presence b { font-size: inherit; }
-    #workspace-nav .account-trigger { justify-content: center; padding-inline: 0; }
+  @media (prefers-reduced-motion: reduce) {
+    #workspace-nav :is(.workspace-link, .workspace-brand > span, .workspace-link > span, .workspace-nav-label, .account-name) { transition: none; }
   }
-  @media (prefers-reduced-motion: reduce) { #workspace-nav .workspace-link { transition: none; } }
   .auth-dialog {
     /* 主样式表有 * { margin: 0 } 全局重置，会吃掉原生 dialog 的 margin:auto 居中，
        这里必须显式声明，否则弹窗会跑到角落 */
@@ -223,22 +230,33 @@
       teams: '<circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m1-16a3 3 0 0 1 0 6m3 10v-3a6 6 0 0 0-2-4"/>',
       controller: '<path d="M3 17V7m6 14V3m6 14V7m6 14V3"/><path d="M1 10h4m2 5h4m2-5h4m2 5h4"/>',
       permissions: '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/>',
+      costs: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 7h8m-7 4 3 3 3-3m-3 3v4m-3-3h6"/>',
+      capacity: '<path d="M4 3v17h17M8 16v-5m5 5V7m5 9V4"/>',
     };
     const nav = document.createElement('nav'); nav.className = 'workspace-links'; nav.setAttribute('aria-label', '工作区导航');
-    nav.innerHTML = '<div class="workspace-nav-label">工作区</div>';
+    const addGroup = label => {
+      const group = document.createElement('div'); group.className = 'workspace-nav-group';
+      group.setAttribute('role', 'group'); group.setAttribute('aria-label', label);
+      const heading = document.createElement('div'); heading.className = 'workspace-nav-label';
+      heading.textContent = label; heading.setAttribute('aria-hidden', 'true');
+      group.append(heading); nav.append(group); return group;
+    };
+    let group = addGroup('工作区');
     const add = (key, label, href) => {
       const link = document.createElement('a'); link.className = 'workspace-link'; link.href = href;
       link.setAttribute('aria-label', label); link.title = label;
       if (document.body.dataset.workspace === key) link.setAttribute('aria-current', 'page');
       if (key === 'director' && document.body.dataset.workspace === 'canvas') link.id = 'directorbtn';
       link.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">' + icons[key] + '</svg><span></span>';
-      link.querySelector('span').textContent = label; nav.append(link);
+      link.querySelector('span').textContent = label; group.append(link);
     };
     add('canvas', '画布', '/'); add('director', '导演工作台', '/director');
     if (user.role === 'admin' || user.team_leader) add('teams', '项目组', '/teams');
     if (user.role === 'admin') {
-      const label = document.createElement('div'); label.className = 'workspace-nav-label management'; label.textContent = '管理'; nav.append(label);
+      group = addGroup('管理');
       add('controller', '运行面板', '/controller'); add('permissions', '账号与权限', '/admin/permissions');
+      group = addGroup('统计');
+      add('costs', '费用评估', '/controller/costs'); add('capacity', '产能统计', '/controller/capacity');
     }
     rail.querySelector('.workspace-footer').before(nav);
   }
