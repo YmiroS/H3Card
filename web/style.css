@@ -1163,6 +1163,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 .jrow.done { border-left-color: var(--ok); }
 .jrow.bad { border-left-color: var(--err); }
 .jrow.gone { border-left-color: #3a4763; opacity: .72; }
+.jrow .jowner { margin-bottom: 4px; color: var(--txt); font-size: 12px; overflow-wrap: anywhere; }
 .jrow .r1 { display: flex; align-items: center; gap: 8px; }
 .jrow .r1 .nm { flex: 1; display: flex; align-items: baseline; min-width: 0; }
 /* 「项目名 - 卡片名」：浮窗只有 356px，挤不下时先截项目名（flex-shrink 给得大得多），
@@ -1266,6 +1267,8 @@ input:focus, textarea:focus, select:focus {
   border-right-color: var(--line); box-shadow: none;
 }
 #side .head { min-height: 68px; padding: 14px 16px; gap: 11px; border-bottom: 1px solid var(--line); }
+#side .project-panel-title { flex: 1; font-size: 13px; font-weight: 600; color: var(--txt); }
+body[data-workspace="canvas"] #main { min-width: 0; }
 #side .brand-mark {
   width: 36px; height: 36px; flex: none; display: grid; place-items: center;
   border: 1px solid var(--line); border-radius: 10px; background: rgba(255,255,255,.04);
@@ -1385,6 +1388,20 @@ input:focus, textarea:focus, select:focus {
 #wires path.tmp { stroke: rgba(255,255,255,.88); stroke-width: 2.2; stroke-dasharray: none; filter: none; }
 #wires path.txt { stroke: rgba(255,255,255,.24); stroke-dasharray: 3 5; filter: none; }
 #wires path.carry { stroke: rgba(167,139,250,.54); stroke-width: 1.2; filter: none; opacity: 1; }
+#wires .flow-up { --wire-flow: #7dd3fc; }
+#wires .flow-down { --wire-flow: #5eead4; }
+#wires .flow-both { --wire-flow: #c4b5fd; }
+#wires.has-flow path:not(.hit):not(.related):not(.flow) { opacity: .22; }
+#wires path.related { stroke-width: 2; }
+#wires path.flow {
+  stroke: var(--wire-flow); stroke-width: 2.6; stroke-linecap: round; stroke-dasharray: 5 19;
+  pointer-events: none; filter: none; animation: wire-flow 1s linear infinite paused;
+}
+#wires path.flow.in-view { animation-play-state: running; }
+#wires marker { overflow: visible; }
+#wires marker polygon { fill: var(--wire-flow); }
+@keyframes wire-flow { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -24; } }
+@media (prefers-reduced-motion: reduce) { #wires path.flow { animation: none; } }
 
 /* Workflow node cards — mirrors open-canvas CanvasNode. */
 .card {
@@ -1606,6 +1623,7 @@ button:focus-visible, a:focus-visible {
 
 @media (max-width: 760px) {
   #side { width: 220px; flex-basis: 220px; }
+  body[data-workspace="canvas"] #side { position: fixed; top: 60px; bottom: 0; left: var(--workspace-width); z-index: 40; transition: none; }
   body.collapsed #side { width: 0; flex-basis: 0; }
   #hist { position: fixed; inset: 0 0 0 auto; z-index: 80; width: min(320px, 90vw); box-shadow: -20px 0 60px rgba(0,0,0,.45); }
   #topbar .crumb, #topbar .crumb-sep, #hint { display: none; }

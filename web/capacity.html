@@ -5,8 +5,11 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>产能评估</title>
 <link rel="icon" type="image/png" href="/favicon.png?v=ck05">
+<link rel="stylesheet" href="/admin-shell.css">
 <style>
-:root { color-scheme:dark; --bg:#0b0d10; --panel:#111318; --panel2:#16191f; --line:rgba(255,255,255,.10); --muted:#a0a5af; --text:#f3f4f6; --ok:#34d399; --warn:#fbbf24; --bad:#fb7185; --blue:#38bdf8; }
+/* 页面样式只作用于产能主区及产能对话框，不覆盖共享侧栏。 */
+@scope (.capacity-page) {
+:scope { color-scheme:dark; --bg:#0b0d10; --panel:#111318; --panel2:#16191f; --line:#303640; --muted:#a0a6b1; --text:#f3f4f6; --ok:#34d399; --warn:#fbbf24; --bad:#fb7185; --blue:#38bdf8; }
 * { box-sizing:border-box; }
 [hidden] { display:none !important; }
 body { margin:0; background:var(--bg); color:var(--text); font:13px/1.6 system-ui,"Microsoft YaHei",sans-serif; }
@@ -136,17 +139,102 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 #technical-details>.summary { padding:0 14px; }
 #technical-details>.section { margin:14px; }
 @media(max-width:1100px) { .worker-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .summary,.procurement { grid-template-columns:1fr; } }
-@media(max-width:700px) { .matrix-axis-col { width:104px; } .matrix-table { min-width:calc(104px + (100vw - 130px) * var(--machine-count)); } .matrix-models { grid-template-columns:1fr; } main { padding:12px; } header { padding:12px; } header .state { width:100%; order:5; } .worker-grid { grid-template-columns:1fr; padding:10px; } .metrics { grid-template-columns:1fr 1fr; } .tabs button { flex:1; padding:12px 4px; } .form-grid,.review-fields { grid-template-columns:1fr; } .demand { grid-template-columns:minmax(0,1fr) 90px; } .demand>button { grid-column:2; } }
+@media(max-width:700px) { .matrix-axis-col { width:104px; } .matrix-table { min-width:calc(104px + (100vw - var(--workspace-width) - 130px) * var(--machine-count)); } .matrix-models { grid-template-columns:1fr; } main { padding:12px; } header { padding:12px; } header .state { width:100%; order:5; } .worker-grid { grid-template-columns:1fr; padding:10px; } .metrics { grid-template-columns:1fr 1fr; } .tabs button { flex:1; padding:12px 4px; } .form-grid,.review-fields { grid-template-columns:1fr; } .demand { grid-template-columns:minmax(0,1fr) 90px; } .demand>button { grid-column:2; } }
+@media(max-width:480px) { .demand { grid-template-columns:minmax(0,1fr); } .demand>button { grid-column:auto; justify-self:end; } }
 @media(prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; transition:none !important; } }
+:scope:is(main) { max-width:none; margin:0; padding:var(--pad); min-width:0; font-size:14px; line-height:1.6; }
+:scope:is(main).page { gap:var(--gap); align-content:start; }
+header.page-header { border:1px solid var(--line); border-radius:var(--radius); padding:23px 25px; gap:20px; }
+h1 { font-size:30px; font-weight:650; } h2 { font-size:21px; } h3 { font-size:17px; }
+.subtitle { color:#b5bbc5; font-size:14px; margin-top:8px; }
+a,button,input,select,textarea { color:var(--text); }
+button { min-height:40px; background:#1a1f27; border-color:#39414d; }
+input,select,textarea { background:var(--surface); border-color:#39414d; min-height:42px; }
+.primary { background:#edf0f5; color:#15181d; border-color:#e5e9ef; font-weight:600; }
+.primary:hover { background:#fff; color:#15181d; }
+.hint { font-size:12px; } .pad { padding:24px; }
+.section { margin-top:0; border-radius:var(--radius); }
+.section-head { padding:20px 24px; border-bottom-color:var(--soft-line); }
+.tabs { margin-top:0; gap:28px; }
+.tabs button { background:none; padding:4px 2px 14px; border:0; border-radius:0; color:var(--muted); }
+.tabs [aria-selected="true"] { color:var(--text); background:none; border-bottom:0; }
+#capacity-stats { gap:14px; }
+#capacity-stats .metric { display:block; padding:16px; min-height:100px; border:1px solid var(--soft-line); border-radius:10px; background:var(--surface); }
+#capacity-stats strong { font-size:25px; margin-top:8px; }
+#panel-machines,#panel-scenarios,#panel-purchase { min-width:0; display:grid; gap:20px; }
+#machine-summary { margin-top:0; border:1px solid var(--line); border-radius:var(--radius); background:var(--panel); overflow:hidden; }
+.summary-toolbar { padding:20px 24px 0; } .summary-toolbar h2 { font-size:21px; }
+.summary-note { max-width:none; margin:14px 24px 18px; }
+#summary-machines { padding:0 24px; }
+.comparison-scroll { max-height:min(900px,65dvh); border:0; border-radius:0; scrollbar-gutter:stable; }
+.simple-table { min-width:calc(180px + 340px * var(--machine-count)); }
+.matrix-axis-col { width:180px; }
+.simple-table th,.simple-table td { padding:20px 16px; border-color:var(--soft-line); font-size:13px; }
+.simple-table thead th { background:var(--surface); z-index:3; }
+.simple-table .business-axis { background:var(--panel); z-index:2; }
+.simple-table thead .business-axis { background:var(--surface); z-index:4; }
+.machine-heading h3 { font-size:15px; } .business-title { font-size:14px; }
+.matrix-table .business-row { gap:16px; } .matrix-field::before { font-size:12px; }
+.mean-time { font-size:24px; line-height:1.4; margin:4px 0; }
+.matrix-models { grid-template-columns:minmax(0,1.2fr) minmax(0,1fr); gap:12px; }
+.model-label,.model-name { font-size:12px; font-weight:400; } .selected-spec { display:grid; gap:3px; }
+/* 同图多主模型共用行轨道，长文件名换行时精度仍对应本行模型。 */
+.matrix-models { grid-template-rows:repeat(var(--model-rows,2),auto); row-gap:0; }
+.matrix-models > .matrix-field { display:grid; grid-template-rows:subgrid; grid-row:1 / span var(--model-rows,2); }
+.matrix-models > .matrix-field:first-child { grid-column:1; }
+.matrix-models > .matrix-field:last-child { grid-column:2; }
+.matrix-models .model-variant { display:contents; }
+.matrix-models .model-item { padding:4px 0; }
+.matrix-models .model-variant + .model-variant > .model-item:first-child { margin-top:8px; padding-top:8px; border-top:1px solid var(--line); }
+.selected-spec dt { margin-top:8px; } .matrix-samples { justify-content:flex-start; gap:8px; }
+.summary-evidence { max-height:560px; } .summary-evidence .pad { padding:16px 0; }
+.matrix-samples button,.machine-more button { min-height:32px; font-size:12px; padding:6px 9px; }
+.matrix-actions { display:flex; flex-wrap:wrap; gap:12px; padding:24px; }
+#technical-details > summary,#task-evidence > summary { padding:18px 24px; font-size:16px; color:#dce2ec; }
+#technical-details > .summary { padding:0 24px; gap:20px; }
+#technical-details > .section { margin:20px 24px; }
+.metrics .metric { display:block; min-height:0; padding:0; } .metrics { gap:14px; }
+.worker-grid { grid-template-columns:repeat(2,minmax(0,1fr)); padding:24px; gap:20px; }
+.worker { background:var(--panel); border-radius:14px; padding:24px; }
+.worker dl { grid-template-columns:90px minmax(0,1fr); gap:10px 14px; font-size:13px; }
+.badge { background:var(--surface); border-color:#3a424e; }
+.scroll { scrollbar-width:thin; scrollbar-color:#3e4652 transparent; }
+#machine-groups table,#scenario-groups table { min-width:1500px; }
+th,td { border-color:var(--soft-line); } td { font-size:14px; }
+.procurement { grid-template-columns:minmax(0,1.2fr) minmax(0,1fr); gap:20px; }
+#estimate-form > .form-grid { grid-template-columns:repeat(3,minmax(0,1fr)); }
+.demand { padding:16px 0; border-top:1px solid var(--soft-line); }
+.result-number { font-size:42px; font-weight:650; }
+.notice { background:var(--surface); border:1px solid var(--line); border-radius:8px; padding:14px 18px; }
+.evidence { margin:16px 24px; border:1px solid var(--line); border-radius:14px; padding:0; }
+.evidence > summary { padding:18px 24px; font-size:14px; }
+.evidence-content { padding:0 24px 24px; display:grid; gap:16px; }
+.evidence-filters { display:grid; grid-template-columns:2fr 1fr 1fr 1fr; gap:16px; padding:0 24px 20px; }
+.pager { padding:16px 24px; border-top:1px solid var(--soft-line); }
+pre { margin:0; font:12px/1.8 ui-monospace,SFMono-Regular,Consolas,monospace; border:1px solid var(--soft-line); padding:16px; }
+.output-resolution-details { padding:16px; border:1px solid var(--soft-line); border-radius:10px; }
+.output-resolution-details p,.pad > p + p { margin-top:9px; }
+.profile-form { grid-template-columns:1fr 1fr; } .profile-form > p { grid-column:1/-1; }
+.profile-form,.review-form { margin-top:0; }
+.review-fields { grid-template-columns:1fr 1fr; } .review-fields > :last-child { grid-column:1/-1; }
+.capacity-operation { display:grid; gap:18px; }
+.profile-details summary { color:var(--blue); }
+@media(min-width:2000px) { h1 { font-size:34px; } h2,.summary-toolbar h2 { font-size:23px; } }
+@media(max-width:1200px) { .procurement,.summary { grid-template-columns:1fr; } }
+@media(max-width:767px) { main { padding:var(--pad); } header.page-header { padding:20px; } h1 { font-size:25px; } h2,.summary-toolbar h2 { font-size:19px; } .worker-grid,.profile-form,.review-fields,#estimate-form > .form-grid { grid-template-columns:1fr; } .evidence-filters { grid-template-columns:1fr 1fr; } .summary-toolbar { padding:18px 18px 0; } .summary-note { margin:12px 18px; } #summary-machines { padding:0 18px; } .matrix-axis-col { width:110px; } .simple-table { min-width:calc(110px + 300px * var(--machine-count)); } .simple-table th,.simple-table td { padding:16px 12px; } .matrix-models { grid-template-columns:1fr; } .comparison-scroll { max-height:70dvh; } .evidence { margin:12px; } .evidence-content { padding:0 14px 18px; } .pad,.worker-grid,.worker { padding:18px; } }
+@media(max-width:767px) { .matrix-models { grid-template-rows:none; row-gap:12px; } .matrix-models > .matrix-field { display:block; grid-column:1; grid-row:auto; } .matrix-models > .matrix-field:last-child { grid-column:1; } .matrix-models .model-variant { display:block; } .demand { grid-template-columns:1fr; } .demand > button { grid-column:auto; justify-self:start; } .input-materials { max-width:180px; } }
+@media(max-width:480px) { .evidence-filters { grid-template-columns:1fr; } .section-head { padding:18px; } .tabs { gap:18px; } .tabs button { font-size:13px; } }
+}
+/* 对话框本身是作用域根，独立限定根节点高度，避免原生上下 inset 拉伸。 */
+dialog.capacity-page { height:fit-content; max-height:88dvh; }
 </style>
 </head>
-<body>
-<header>
-  <h1>产能评估</h1><span id="refresh-state" class="state" role="status">正在验证身份…</span>
-  <a href="/controller">运行面板</a><a href="/controller/costs">费用统计</a>
-  <span id="account" class="account-bar"></span><button id="refresh" type="button">立即刷新</button>
+<body data-workspace="capacity">
+<main id="main-content" class="page capacity-page" tabindex="-1">
+<header class="page-header card">
+  <div><h1>产能评估</h1><p class="subtitle">真实任务与独立规格分组，查看机器产能、证据和每日需求。</p><div class="page-caption"><span id="refresh-state" class="state" role="status">正在验证身份…</span></div></div>
+  <div class="header-actions"><button id="refresh" type="button">立即刷新</button></div>
 </header>
-<main>
   <div id="error" class="error" role="alert" hidden></div>
   <div id="write-status" class="write-status" role="status" hidden></div>
   <div class="tabs" role="tablist" aria-label="产能评估视图">
@@ -154,11 +242,13 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
     <button id="tab-scenarios" role="tab" aria-selected="false" aria-controls="panel-scenarios" tabindex="-1">场景对比</button>
     <button id="tab-purchase" role="tab" aria-selected="false" aria-controls="panel-purchase" tabindex="-1">采购测算</button>
   </div>
+  <div id="capacity-stats" class="metrics" aria-label="产能数据概览"></div>
   <section id="panel-machines" role="tabpanel" aria-labelledby="tab-machines" tabindex="0">
     <section id="machine-summary" aria-label="在线机器业务简览">
       <div class="summary-toolbar"><h2 id="online-count">当前在线 — 台</h2><label class="offline-toggle"><input id="include-offline" type="checkbox">包含离线</label></div>
       <p class="summary-note hint">在线状态是当前状态；业务为全部历史记录中跑过的业务，不代表当前均可执行。平均生成时间仅计成功任务执行耗时，不含排队，非纯 GPU 耗时，也不是合格日产能。同一业务的任务规格、模型或采样条件不同，不能直接按耗时做性能排名。</p>
       <div id="summary-machines"></div>
+      <div class="matrix-actions"><button type="button" id="open-purchase">进入多模式采购测算</button><button type="button" id="open-evidence">展开全部任务证据</button></div>
     </section>
     <details id="technical-details" class="section advanced"><summary>详细统计与机器配置</summary>
     <div class="summary">
@@ -190,9 +280,10 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
       <section class="section"><div class="section-head"><h2>测算结果与依据</h2><button id="export-estimate" disabled>导出测算 CSV</button></div><div id="estimate-error" class="error" role="alert" hidden></div><div id="estimate-result" class="pad" aria-live="polite"><p class="muted">填写每日需求后计算。没有样本的场景不能按零耗时处理。</p></div></section>
     </div>
   </section>
-  <details id="task-evidence" class="section advanced"><summary>任务证据与人工标记</summary><section aria-labelledby="evidence-heading"><div class="section-head"><h2 id="evidence-heading">任务证据与人工标记</h2><span id="detail-count" class="hint"></span></div><p class="hint pad">明细每页最多 100 条。人工验收 / 标准样本是人工声明，不等于系统自动验证通过；历史记录不可补写为完整采集证据。</p><div id="details"></div><div class="pager"><button id="previous" disabled>上一页</button><span id="page-note" class="hint"></span><button id="next" disabled>下一页</button></div></section></details>
+  <details id="task-evidence" class="section advanced"><summary>任务证据与人工标记</summary><section aria-labelledby="evidence-heading"><div class="section-head"><h2 id="evidence-heading">任务证据与人工标记</h2><span id="detail-count" class="hint"></span></div><p class="hint pad">明细每页最多 100 条。人工验收 / 标准样本是人工声明，不等于系统自动验证通过；历史记录不可补写为完整采集证据。</p><template id="evidence-filter-template"><div class="evidence-filters"><label class="field"><span>独立原分组（按真实 group_id）</span><select id="evidence-group"><option value="">全部原分组</option></select></label><label class="field"><span>任务状态</span><select id="evidence-status"><option value="">全部状态</option><option value="done">已完成</option><option value="error">失败</option><option value="canceled">已取消</option><option value="queued">排队中</option><option value="running">运行中</option></select></label><label class="field"><span>采集来源</span><select id="evidence-source"><option value="">全部来源</option><option value="historical">历史运行参考</option><option value="captured">采集业务样本</option><option value="standard">标准样本（人工标签）</option></select></label><label class="field"><span>每页最多 100 条</span><select id="evidence-size"><option value="100">100 条 / 页</option><option value="50">50 条 / 页</option><option value="25">25 条 / 页</option><option value="10">10 条 / 页</option></select></label></div></template><div id="evidence-filters"></div><p id="evidence-state" class="hint pad" role="status" hidden></p><div id="details"></div><div class="pager"><button id="previous" disabled>上一页</button><span id="page-note" class="hint"></span><button id="next" disabled>下一页</button></div></section></details>
 </main>
 <script src="/auth.js"></script>
+<script src="/admin-shell.js"></script>
 <script>
 'use strict';
 const $ = id => document.getElementById(id);
@@ -210,6 +301,7 @@ const PURCHASE_MODES = [
   {id:'minimax_h3_talk2',type:'生视频模式',label:'H3 说话唱歌',capabilities:['minimax_h3_talk1','minimax_h3_talk2']},
   {id:'minimax_h3_ref4',type:'生视频模式',label:'H3图片参考',capabilities:['minimax_h3_ref4']},
   {id:'minimax_h3_comic20',type:'生视频模式',label:'漫剧4宫格',capabilities:['minimax_h3_comic20']},
+  {id:'minimax_h3_fusion_v2',type:'生视频模式',label:'H3无损融合单采V2',capabilities:['minimax_h3_fusion_v2']},
   {id:'minimax_h3_ref9',type:'生视频模式',label:'H3全能参考',capabilities:['minimax_h3_ref9']},
   {id:'minimax_h3_ref_2pass',type:'生视频模式',label:'H3全能参考(高质量)',capabilities:['minimax_h3_ref_2pass']}
 ];
@@ -256,8 +348,59 @@ function choose(select, items, placeholder, selected=select.value) {
   for(const [value,label] of items) option(select,value,label);
   if([...select.options].some(o=>o.value===selected)) select.value=selected;
 }
+// 每份数据快照只挂载已访问区域；刷新清空旧节点，保留筛选选择供下次展开恢复。
+const mountedRegions=new Set();
+let scenarioSelection='', estimateWorkerSelection='';
+const evidenceSelection={'evidence-group':'','evidence-status':'','evidence-source':'','evidence-size':'100'};
+function mountRegion(key,render) {
+  if(!ready || !data || mountedRegions.has(key))return false;
+  render();mountedRegions.add(key);return true;
+}
+function invalidateRegions() {
+  if(mountedRegions.has('scenarios'))scenarioSelection=$('scenario-filter').value;
+  if(mountedRegions.has('purchase'))estimateWorkerSelection=$('estimate-worker').value;
+  if(mountedRegions.has('evidence'))for(const id of Object.keys(evidenceSelection))evidenceSelection[id]=$(id).value;
+  mountedRegions.clear();
+  for(const id of ['summary-machines','task-metrics','output-metrics','coverage','workers','machine-groups','scenario-filter','scenario-groups','evidence-filters','details','detail-count','page-note','estimate-worker','demands'])$(id).replaceChildren();
+}
+function mountEvidence() {
+  return mountRegion('evidence',()=>{
+    $('evidence-filters').append($('evidence-filter-template').content.cloneNode(true));
+    setupEvidence();
+    for(const id of Object.keys(evidenceSelection)) {
+      if([...$(id).options].some(option=>option.value===evidenceSelection[id]))$(id).value=evidenceSelection[id];
+      $(id).onchange=()=>{if(!ready)return;evidenceOffset=0;filterEvidence();};
+    }
+  });
+}
+async function renderActiveRegions() {
+  if(!ready || !data)return;
+  if(!$('panel-machines').hidden) {
+    mountRegion('machines',renderMachineSummary);
+    if($('technical-details').open)mountRegion('technical',()=>{renderTechnicalOverview();renderWorkers();renderGroups('machine-groups',data.groups || []);});
+  }
+  if(!$('panel-scenarios').hidden)mountRegion('scenarios',renderScenarios);
+  if(!$('panel-purchase').hidden)mountRegion('purchase',setupEstimate);
+  if($('task-evidence').open && mountEvidence()) {
+    if(filteredEvidence())await filterEvidence();else renderDetails();
+  }
+}
+function mountOnOpen(details,render) {
+  let mounted=false;
+  details.addEventListener('toggle',()=>{
+    if(details.open && !mounted){render();mounted=true;}
+  });
+}
+function rawEvidence(title,value,cls) {
+  const details=el('details',null,cls);details.append(el('summary',title));
+  mountOnOpen(details,()=>details.append(el('pre',text(value))));return details;
+}
 function metrics(id, items) { $(id).replaceChildren(...items.map(([label,value])=>{const node=el('div',null,'metric');node.append(el('span',label),el('strong',num(value)));return node;})); }
 function renderOverview() {
+  const o=data.overview || {};
+  metrics('capacity-stats',[['当前在线电脑',(data.workers || []).filter(isOnline).length],['真实任务记录',o.tasks],['独立原规格组',(data.groups || []).length],['产物清单未知任务',o.unknown_outputs]]);
+}
+function renderTechnicalOverview() {
   const o=data.overview || {};
   metrics('task-metrics',[['总任务',o.tasks],['完成',o.done],['失败',o.error],['取消',o.canceled]]);
   metrics('output-metrics',[['图片（张）',o.output_images],['视频（条）',o.output_videos],['视频总时长（秒）',o.output_seconds],['产物未知记录',o.unknown_outputs]]);
@@ -272,44 +415,48 @@ async function mutationSaved(version,label) {
   }
   message('write-status',`${label}已保存。人工声明不回写历史快照，也不代表自动验证通过。`);
 }
+function capacityDialog(title,body,submitLabel,onSubmit) {
+  const dialog=AdminUI.dialog({title,body,submitLabel,onSubmit});
+  dialog.classList.add('capacity-page');
+  return dialog;
+}
 function profileForm(w) {
-  const details=el('details',null,'profile-details'), form=el('form',null,'profile-form'), h=w.hardware || {}, fields=new Map();
-  details.append(el('summary','补录机器配置（人工声明）'));
-  form.append(el('p','仅保存本次修改的非空字段；留空保留原值。内存以 GiB 输入、按字节保存，不是采购标称容量。新声明仅向后生效，不回写历史快照。','hint'));
-  form.append(el('p','主机 ID 仅在人工确认属于同一物理机器时填写相同值，不按机器名称合并；同机多个 Worker 不自动代表多倍产能。','hint'));
+  const details=el('details',null,'profile-details'), button=el('button','查看 / 补录配置');button.type='button';
+  details.append(el('summary','补录机器配置（人工声明）'),el('p','7 个字段仅保存非空新声明，不回写历史快照。','hint'),button);
+  button.onclick=()=>openProfile(w);
+  return details;
+}
+function openProfile(w) {
+  const body=el('div',null,'capacity-operation'), fields=el('div',null,'profile-form'), h=w.hardware || {}, inputs=new Map();
+  const current=el('details');current.append(el('summary','当前 / 最后上报配置'),el('p',hardwareSummary(h)),el('p',`配置来源：${configSource(w.hardware_source)}；配置备注：${text(h.note)}`));
+  body.append(current,el('p','仅保存本次修改的非空字段；留空保留原值。内存以 GiB 输入、按字节保存，不是采购标称容量。新声明仅向后生效，不回写历史快照。','notice'),el('p','主机 ID 仅在人工确认属于同一物理机器时填写相同值，不按机器名称合并；同机多个 Worker 不自动代表多倍产能。','hint'),fields);
   const definitions=[['host_id','主机 ID',160],['cpu','CPU 型号',160],['memory_total_bytes','系统可见内存（GiB）'],['environment_id','执行环境版本',160],['model_version','模型版本',160],['disk','磁盘配置说明',160],['note','配置备注',500]];
   for(const [key,label,maxLength] of definitions) {
     const field=el('label',null,'field'), input=el('input');input.name=key;
-    if(key==='memory_total_bytes') {input.type='number';input.min='0.000001';input.step='any';input.value=numeric(h[key])?h[key]/1024**3:'';}
-    else {input.type='text';input.maxLength=maxLength;input.value=typeof h[key]==='string'?h[key]:key==='cpu' && h.cpu?hardwareDescription(h.cpu,'cpu'):'';}
-    if(['model_version','environment_id'].includes(key))input.placeholder='填写固定版本，勿用 latest / main / unknown';
-    else input.placeholder='留空保留现值';
-    fields.set(key,{input,initial:input.value});field.append(el('span',label),input);form.append(field);
+    if(key==='memory_total_bytes'){input.type='number';input.min='0.000001';input.step='any';}
+    else {input.type='text';input.maxLength=maxLength;}
+    input.placeholder=['model_version','environment_id'].includes(key)?'填写固定版本，勿用 latest / main / unknown':'留空保留现值';
+    inputs.set(key,input);field.append(el('span',label),input);fields.append(field);
   }
-  const button=el('button','保存人工配置');button.type='submit';
-  const status=el('p',null,'hint');status.setAttribute('role','status');form.append(button,status);details.append(form);
-  form.addEventListener('input',()=>invalidateEstimate('机器配置输入已更改；请保存后重新计算，未保存内容不会进入测算。'));
-  form.onsubmit=async event=>{
-    event.preventDefault();if(!form.reportValidity())return;
+  body.addEventListener('input',()=>invalidateEstimate('机器配置输入已更改；请保存后重新计算，未保存内容不会进入测算。'));
+  capacityDialog(`机器配置与人工补录 · ${w.name || w.id}`,body,'保存人工配置',async()=>{
     const payload={};
-    for(const [key,{input,initial}] of fields) {
-      const value=input.value.trim();if(!value || value===initial)continue;
+    for(const [key,input] of inputs) {
+      const value=input.value.trim();if(!value)continue;
+      if(/[\u0000-\u001f\u007f]/.test(value)){input.focus();throw Error('配置字段请使用不含控制字符的单行文本。');}
       if(key==='memory_total_bytes') {
         const converted=Math.round(Number(value)*1024**3);
-        if(!Number.isSafeInteger(converted) || converted<=0){status.textContent='内存必须是能转换为安全正整数字节的 GiB 数值。';input.focus();return;}
-        payload[key]=converted;
-      } else payload[key]=value;
+        if(!Number.isSafeInteger(converted) || converted<=0){input.focus();throw Error('内存必须是能转换为安全正整数字节的 GiB 数值。');}
+        if(converted!==h[key])payload[key]=converted;
+      } else if(value!==(key==='cpu'?hardwareDescription(h.cpu,'cpu'):h[key]))payload[key]=value;
     }
-    if(!Object.keys(payload).length){status.textContent='没有需要保存的修改；留空不会删除已有配置。';return;}
-    for(const control of form.elements)control.disabled=true;
-    const version=loadVersion;status.textContent='正在保存人工声明…';message('write-status','');invalidateEstimate('机器配置正在保存，旧测算已清除。');
+    if(!Object.keys(payload).length)throw Error('没有需要保存的修改；留空不会删除已有配置。');
+    const version=loadVersion;message('write-status','');invalidateEstimate('机器配置正在保存，旧测算已清除。');
     try {
       await H3Auth.json(`/api/capacity/workers/${encodeURIComponent(w.id)}`,'POST',payload);
       await mutationSaved(version,'机器配置');
-    } catch(error) {if(form.isConnected)status.textContent=`保存失败：${error.message}。输入已保留，请检查字段后重试。`;}
-    finally {for(const control of form.elements)control.disabled=false;}
-  };
-  return details;
+    } catch(error) {throw Error(`保存失败：${error.message}。输入已保留，请检查字段后重试。`);}
+  });
 }
 const isOnline = w => ['idle','busy','online','running'].includes(w.state);
 const hasMean = g => numeric(g.mean_seconds) && g.mean_seconds>=0 && numeric(g.measured) && g.measured>0;
@@ -438,15 +585,18 @@ function compactModelPrecision(model) {
   };
   const file=model.precision_source==='filename'?normalize(model.precision):null;
   const loader=normalize(model.loader_dtype) || (model.precision_source==='loader'?normalize(model.precision):null);
-  // 不同来源的精度不能合成一个结论；简写只用于单一已知精度。
-  if(file && loader && file!==loader)return modelPrecision(model);
-  return [file || loader || '无'];
+  // 简览仅展示可识别声明；文件与加载配置即使相同也分别保留，未知原文只在证据详情呈现。
+  const parts=modelPrecision(model).filter(part=>part.startsWith('文件标记 ')?Boolean(file):part.startsWith('加载配置 ')?Boolean(loader) || ['default','auto'].includes(String(model.loader_dtype).toLowerCase()):false);
+  if(!parts.some(part=>part.startsWith('文件标记 ')))parts.unshift('文件标记未记录 / 待确认');
+  if(!parts.some(part=>part.startsWith('加载配置 ')))parts.push('加载配置未记录 / 待确认');
+  return parts;
 }
 function modelColumns(summary) {
   const names=el('div',null,'model-variant'), precision=el('div',null,'model-variant'), models=mainModels(summary);
   models.forEach(model=>{
     const name=el('div',null,'model-item'), dtype=el('div',null,'model-item');
     name.append(el('p',model.name || '未获取到模型信息','model-name'));
+    // 文件声明与加载配置始终分开显示，不合并为运行时精度结论。
     for(const part of compactModelPrecision(model))dtype.append(el('p',part,'model-label'));
     names.append(name);precision.append(dtype);
   });
@@ -455,6 +605,8 @@ function modelColumns(summary) {
 }
 function renderModelCells(g,nameCell,precisionCell,timeCell) {
   const evidence=modelEvidence(g), {variants,reference}=evidence;
+  const rows=variants.length?variants.reduce((count,variant)=>count+Math.max(1,mainModels(variant.summary).length),0):Math.max(1,mainModels(reference).length);
+  nameCell.parentElement.style.setProperty('--model-rows',rows+1);
   nameCell.replaceChildren();precisionCell.replaceChildren();
   if(variants.length) {
     variants.forEach(variant=>{
@@ -489,8 +641,9 @@ function summaryEvidence(g) {
   const d={...g.spec?.dimensions,...g.dimensions};
   if(numeric(d.source_duration))node.append(el('p',`首个输入视频时长：${num(d.source_duration)} 秒（非多段视频合计）`,'hint'));
   node.append(el('p','素材数量按任务输入槽位计，同一文件被多次引用也会分别计数；生成参数不是成品实测规格。','hint'));
-  node.append(el('p',`来源：${source(g.source)}；有效耗时样本 ${num(g.measured)} / 总样本 ${num(g.samples)}；成功 ${num(g.done)} / 失败 ${num(g.error)} / 取消 ${num(g.canceled)}`),el('p',`P90：${friendlyTime(g.p90_seconds)}；最近成功样本：${when(g.last_sample_at)}`),el('p','平均值仅使用该组成功任务执行耗时；不包含排队，不等于纯 GPU 计算时间，也不是合格日产能。','hint'));
+  node.append(el('p',`来源：${source(g.source)}；有效耗时样本 ${num(g.measured)} / 总样本 ${num(g.samples)}；成功 ${num(g.done)} / 失败 ${num(g.error)} / 取消 ${num(g.canceled)}`),el('p',`mean：${sec(g.mean_seconds)}；P50：${sec(g.p50_seconds)}；P90：${sec(g.p90_seconds)}；最近成功样本：${when(g.last_sample_at)}`),el('p','平均值仅使用该组成功任务执行耗时；不包含排队，不等于纯 GPU 计算时间，也不是合格日产能。','hint'));
   node.append(el('p',`执行时配置：${hardwareSummary(g.config)}（${configSource(g.config_source)}）`),el('p',`缓存条件：${text(g.cache_condition)}`));
+  node.append(el('p',`成功 runtime 合计：${sec(g.runtime_seconds)}；占机合计：${sec(g.occupied_seconds)}；实际产出：${num(g.output_count)} ${unit(g)}。`),el('p',`单位技术交付：${sec(g.seconds_per_unit)} / ${unit(g)}；单位人工合格：${sec(g.qualified_seconds_per_unit)} / ${unit(g)}；已人工验收：${num(g.reviewed)}；全组人工合格数量：${num(g.accepted)}。`),el('p',`技术基线资格：${g.eligible===true?'服务端判定具备完整基线证据':g.eligible===false?'证据不足，不作为已验证采购依据':'未记录'}；标准场景编号：${text(g.benchmark_id)}。`,'hint'));
   appendOutputResolutionDetails(node,g.output_resolution);
   const evidence=modelEvidence(g);
   if(evidence.hasEvidence)node.append(el('p',`模型记录覆盖 ${num(evidence.recorded)} / ${num(evidence.total)} 次；覆盖数不是完整主模型链的确认。`));
@@ -502,7 +655,7 @@ function summaryEvidence(g) {
     node.append(el('p','仅为工具模板默认值，不代表用户画布节点当前选中的模型。历史耗时不代表当前模型速度；参考信息不补齐历史覆盖，也不覆盖历史精度。','warn hint'));
   } else if(!evidence.variants.length)node.append(el('p','未获取到模型信息：当前工具模板未提供、找不到或无法识别。','hint'));
   node.append(list(groupWarnings(g)),el('p',`采样日期：${text(g.days)}；配置编号：${text(g.config_id)}；采样编号：${text(g.id)}`,'hint'));
-  const raw=el('details');raw.append(el('summary','原始规格与证据'),el('pre',text({dimensions:g.dimensions,spec:g.spec,output_resolution:g.output_resolution,recovered_outputs:g.recovered_outputs,model_summary:g.model_summary,model_evidence:g.model_evidence,current_model_reference:g.current_model_reference,cache_condition:g.cache_condition})));node.append(raw);
+  node.append(rawEvidence('原始规格与证据',{dimensions:g.dimensions,spec:g.spec,output_resolution:g.output_resolution,recovered_outputs:g.recovered_outputs,model_summary:g.model_summary,model_evidence:g.model_evidence,current_model_reference:g.current_model_reference,cache_condition:g.cache_condition}));
   return node;
 }
 function renderMachineSummary() {
@@ -528,9 +681,10 @@ function renderMachineSummary() {
   visible.forEach((w,index)=>{
     columns.append(el('col'));
     const heading=el('th',null,'machine-heading');heading.scope='col';heading.id=`summary-machine-${index+1}`;heading.dataset.summaryWorkerId=w.id;
-    heading.append(el('h3',w.name || '未命名机器'),el('span',STATUS[w.state] || '状态待确认',isOnline(w)?'online-state':'muted'),el('p',knownHardware(w),'machine-hardware'));
+    heading.append(el('h3',w.name || '未命名机器'),el('span',STATUS[w.state] || '状态待确认',['busy','running'].includes(w.state)?'warn':isOnline(w)?'online-state':'muted'),el('p',knownHardware(w),'machine-hardware'));
     const details=el('details',null,'machine-more');details.append(el('summary','机器详情'),el('p',missingHardware(w)),el('p',`最后上报：${when(w.last_seen)}；Worker ID：${text(w.id)}；采集程序版本：${text(w.agent_version)}`,'hint'));
     if(!isOnline(w))details.append(el('p','此记录当前不可用，配置为最后上报信息，历史速度不代表现在能执行。','hint'));
+    const configButton=el('button','查看配置');configButton.type='button';configButton.onclick=()=>w.state==='historical'?capacityDialog('历史执行端配置',el('p',hardwareSummary(w.hardware)),'关闭',async()=>{}):openProfile(w);details.append(configButton);
     heading.append(details);header.append(heading);
   });
   thead.append(header);tableNode.append(columns,thead,body);wrap.append(tableNode);root.append(wrap);
@@ -550,15 +704,18 @@ function renderMachineSummary() {
       const time=field('平均生成时间'), spec=field('任务规格'), namesCell=field('模型名称'), precisionCell=field('模型精度'), models=el('div',null,'matrix-models');
       models.append(namesCell,precisionCell);
       const select=el('select',null,'summary-spec');select.setAttribute('aria-label',`${w.name || '机器'} ${title}任务规格`);
-      const names=entries.map(simpleSpec);
-      entries.forEach((g,i)=>option(select,g.id,`${names[i]}${names.filter(name=>name===names[i]).length>1?` · ${source(g.source)} · ${numeric(g.last_sample_at)?when(g.last_sample_at):'日期未记录'} · 采样 ${i+1}`:''}`));
+      const names=entries.map(simpleSpec), nameCounts=new Map();
+      for(const name of names)nameCounts.set(name,(nameCounts.get(name) || 0)+1);
+      entries.forEach((g,i)=>option(select,g.id,`${names[i]}${nameCounts.get(names[i])>1?` · ${source(g.source)} · ${numeric(g.last_sample_at)?when(g.last_sample_at):'日期未记录'} · 采样 ${i+1}`:''}`));
       const selectedSpec=el('dl',null,'selected-spec'), materials=el('dd',null,'input-materials'), parameters=el('dd',null,'generation-parameters'), actual=el('dd',null,'actual-resolution');
       selectedSpec.append(el('dt','输入素材'),materials,el('dt','生成参数'),parameters,el('dt','实际成品'),actual);
       select.value=preferredGroup(entries).id;spec.append(select,selectedSpec);
       const evidence=el('div',null,'summary-evidence');evidence.hidden=true;evidence.id=`summary-evidence-${++detailNumber}`;
       const sample=el('div',null,'matrix-samples'), count=el('p'), button=el('button','查看详情','summary-detail-toggle');sample.dataset.label='样本与详情';
       button.type='button';button.setAttribute('aria-expanded','false');button.setAttribute('aria-controls',evidence.id);sample.append(count,button);
-      button.onclick=()=>{evidence.hidden=!evidence.hidden;button.setAttribute('aria-expanded',String(!evidence.hidden));button.textContent=evidence.hidden?'查看详情':'收起详情';};
+      const mountSummaryEvidence=()=>{if(!evidence.childElementCount){taskButton.disabled=!ready;evidence.append(summaryEvidence(entries.find(g=>g.id===select.value)),taskButton);}};
+      button.onclick=()=>{evidence.hidden=!evidence.hidden;if(!evidence.hidden)mountSummaryEvidence();button.setAttribute('aria-expanded',String(!evidence.hidden));button.textContent=evidence.hidden?'查看详情':'收起详情';};
+      const taskButton=el('button','任务证据');taskButton.type='button';taskButton.dataset.evidenceEntry='';taskButton.disabled=!ready;taskButton.onclick=()=>showEvidence(select.value);
       const update=()=>{
         const g=entries.find(item=>item.id===select.value);content.dataset.selectedGroupId=g.id;
         materials.replaceChildren(...inputMaterials(g).map(value=>el('span',value)));
@@ -568,8 +725,10 @@ function renderMachineSummary() {
         renderModelCells(g,namesCell,precisionCell,time);
         if(hasMean(g) && (g.mean_seconds<1 || g.mean_seconds>3600))time.append(el('p','耗时异常，请核对详情','warn hint'));
         count.textContent=numeric(g.measured)?g.measured<30?`仅 ${num(g.measured)} 次 / 仅供参考`:`${num(g.measured)} 次成功实测`:'样本数未记录';
+        count.textContent+=` · ${source(g.source)}`;
         count.className=!numeric(g.measured) || g.measured<30?'warn hint':'hint';
-        evidence.replaceChildren(summaryEvidence(g));
+        select.title=`原组 ${text(g.id)} / 配置 ${text(g.config_id)} / ${source(g.source)} / 规格键 ${text(g.spec_key)}`;
+        evidence.replaceChildren();if(!evidence.hidden)mountSummaryEvidence();
       };
       select.onchange=update;update();content.append(time,sample,spec,models);result.append(content,evidence);
     });
@@ -607,7 +766,8 @@ function renderGroups(id, groups) {
     if(g.source==='standard')identity.append(el('p',`标准场景编号：${text(g.benchmark_id)}`,'hint'));
     const specification=el('div'); specification.append(el('p',`规格键：${text(g.spec_key)}`),el('p',`已知规格：${text(g.dimensions)}`,'hint'));
     const evidence=el('details'), evidenceTitle=el('summary','配置 / 规格 / 日期证据');
-    evidence.append(evidenceTitle,el('p',`执行时配置：${hardwareSummary(g.config)}`),el('p',`配置来源：${configSource(g.config_source)}`),el('p',`采样日期（服务端记录）：${text(g.days)}`),el('p',`缓存条件：${text(g.cache_condition)}`),el('pre',text(g.spec)));
+    evidence.append(evidenceTitle);
+    mountOnOpen(evidence,()=>evidence.append(el('p',`执行时配置：${hardwareSummary(g.config)}`),el('p',`配置来源：${configSource(g.config_source)}`),el('p',`采样日期（服务端记录）：${text(g.days)}`),el('p',`缓存条件：${text(g.cache_condition)}`),el('pre',text(g.spec))));
     specification.append(evidence);
     const samples=el('div'); samples.append(el('p',`样本 ${num(g.samples)} / ${num(dayCount(g))} 天`),el('p',`完成 ${num(g.done)} / 失败 ${num(g.error)} / 取消 ${num(g.canceled)}`),el('p',`有效耗时样本 ${num(g.measured)}；已人工验收 ${num(g.reviewed)}`,'hint'));
     const runtime=el('div'); runtime.append(el('p',`平均 ${sec(g.mean_seconds)}`),el('p',`P50 ${sec(g.p50_seconds)}`),el('p',`P90 ${sec(g.p90_seconds)}`));
@@ -626,79 +786,164 @@ function scenarioKey(g) {
 }
 function renderScenarios() {
   const choices=new Map(); for(const g of data.groups || []) choices.set(scenarioKey(g),`${capabilityLabel(g)} / ${text(g.spec_key)} / ${source(g.source)} / 模型 ${text(g.spec?.model_version || g.config?.model_version)} / 环境 ${text(g.config?.environment_id)} / 缓存 ${{none:'无节点结果缓存',loaders:'加载节点缓存',execution:'执行节点缓存',unknown:'未知',mixed:'混合条件'}[g.cache_condition?.kind] || '未知'}${g.source==='standard'?` / 基准 ${text(g.benchmark_id)}`:''}`);
-  choose($('scenario-filter'),[...choices],choices.size?null:'暂无场景');
+  choose($('scenario-filter'),[...choices],choices.size?null:'暂无场景',scenarioSelection);
   renderGroups('scenario-groups',(data.groups || []).filter(g=>scenarioKey(g)===$('scenario-filter').value));
 }
 function reviewForm(d) {
-  const form=el('form',null,'review-form'), fields=el('div',null,'review-fields');
-  function field(label,node) { const root=el('label',null,'field');root.append(el('span',label),node);fields.append(root);return node; }
-  const accepted=field('人工合格产物数量（留空为未验收）',el('input')); accepted.type='number';accepted.min='0';accepted.step='1';accepted.value=numeric(d.review?.accepted)?d.review.accepted:'';
-  const reviewSource=field('人工样本标签',el('select'));option(reviewSource,'business','业务样本');option(reviewSource,'standard','标准样本（人工声明）');reviewSource.value=d.review?.source==='standard'?'standard':'business';
-  const benchmark=field('标准场景编号（标准样本请填写）',el('input'));benchmark.value=d.review?.benchmark_id || '';benchmark.maxLength=100;
-  const note=el('textarea');note.rows=2;note.maxLength=500;note.value=d.review?.note || '';
+  const button=el('button','人工验收 / 样本标签','review-open');button.type='button';button.onclick=()=>openReview(d);return button;
+}
+function openReview(d) {
+  const body=el('div',null,'review-form'), fields=el('div',null,'review-fields');
+  function field(label,node) {const root=el('label',null,'field');root.append(el('span',label),node);fields.append(root);return node;}
+  const accepted=field('人工合格产物数量（留空为未验收）',el('input'));accepted.name='accepted';accepted.type='number';accepted.min='0';accepted.step='1';accepted.value=numeric(d.review?.accepted)?d.review.accepted:'';
+  const reviewSource=field('人工样本标签',el('select'));reviewSource.name='source';option(reviewSource,'business','业务样本');option(reviewSource,'standard','标准样本（人工声明）');reviewSource.value=d.review?.source==='standard'?'standard':'business';
+  const benchmark=field('标准场景编号（标准样本请填写）',el('input'));benchmark.name='benchmark_id';benchmark.value=d.review?.benchmark_id || '';benchmark.maxLength=100;
+  const note=el('textarea');note.name='note';note.rows=2;note.maxLength=500;note.value=d.review?.note || '';
   const noteLabel=el('label',null,'field');noteLabel.append(el('span','验收备注 / 固定条件说明'),note);
-  const button=el('button','保存人工标记');button.type='submit';const status=el('p',null,'hint');status.setAttribute('role','status');
-  form.append(fields,noteLabel,el('p','此操作只保存人工声明，不会自动确认技术规格、缓存条件或标准测试通过。','hint'),button,status);
-  form.onsubmit=async event=>{
-    event.preventDefault();if(!form.reportValidity())return;
+  body.append(el('p',`任务 ${text(d.job_id)}；原采集来源：${source(d.source)}。`),fields,noteLabel,el('p','此操作只保存人工声明，不会自动确认技术规格、缓存条件或标准测试通过；不会将历史记录补写为完整采集证据。','notice'));
+  body.addEventListener('input',()=>invalidateEstimate('人工验收输入已变更；未保存内容不会进入测算。'));
+  capacityDialog(`人工验收 · ${d.job_id}`,body,'保存人工标记',async()=>{
     const count=accepted.value===''?null:Number(accepted.value);
-    if(count!==null && (!Number.isSafeInteger(count) || count<0)) {status.textContent='请输入非负整数，或留空表示未验收。';return;}
-    if(reviewSource.value==='standard' && !benchmark.value.trim()) {status.textContent='标准样本需要填写标准场景编号；标签不代表自动验证。';benchmark.focus();return;}
-    if(/[\u0000-\u001f]/.test(note.value.trim())) {status.textContent='验收备注请使用单行文本，不含换行或控制字符。';note.focus();return;}
+    if(count!==null && (!Number.isSafeInteger(count) || count<0)){accepted.focus();throw Error('请输入非负整数，或留空表示未验收。');}
+    if(reviewSource.value==='standard' && !benchmark.value.trim()){benchmark.focus();throw Error('标准样本需要填写标准场景编号；标签不代表自动验证。');}
+    if(/[\u0000-\u001f\u007f]/.test(note.value.trim()) || /[\u0000-\u001f\u007f]/.test(benchmark.value.trim())){note.focus();throw Error('验收备注和标准场景编号请使用单行文本，不含换行或控制字符。');}
     const payload={accepted:count,source:reviewSource.value,benchmark_id:benchmark.value.trim(),note:note.value.trim()};
-    button.disabled=true;status.textContent='正在保存…';invalidateEstimate();const version=loadVersion;
+    invalidateEstimate();const version=loadVersion;
     try {
       await H3Auth.json(`/api/capacity/jobs/${encodeURIComponent(d.job_id)}/review`,'POST',payload);
       await mutationSaved(version,'人工标记');
-    }
-    catch(error) {if(form.isConnected)status.textContent=`保存失败：${error.message}`;}
-    finally {button.disabled=false;}
-  };
-  return form;
+    } catch(error) {throw Error(`保存失败：${error.message}`);}
+  });
 }
 function outputProbe(d) {
   const node=el('div',null,'output-probe'), button=el('button','补采成品尺寸'), status=el('p',null,'hint');
   button.type='button';status.setAttribute('role','status');
   node.append(el('p','仅按可信最终产物清单补采，每次最多 4 个；不会从输入素材或请求参数猜测尺寸。','hint'),button,status);
   let nextOffset=0;
-  button.onclick=async()=>{
+  button.onclick=()=>{
     if(button.disabled || !node.isConnected || nextOffset===null)return;
-    button.disabled=true;status.textContent='正在补采本批成品尺寸…';
-    try {
-      const result=await H3Auth.json(`/api/capacity/jobs/${encodeURIComponent(d.job_id)}/probe-outputs`,'POST',{offset:nextOffset});
-      if(!node.isConnected)return;
-      const count=value=>Number.isSafeInteger(value) && value>=0;
-      if(!result || !count(result.processed) || result.processed>4 || !count(result.recorded) || result.recorded>result.processed || !count(result.total) || !(result.next_offset===null || count(result.next_offset) && result.next_offset>nextOffset && result.next_offset<result.total))throw Error('补采响应格式无效，请刷新看板核对结果');
-      nextOffset=result.next_offset;
-      status.textContent=`本批处理 ${num(result.processed)} 个，成功记录尺寸 ${num(result.recorded)} 个；可信最终产物共 ${num(result.total)} 个。${nextOffset===null?'补采已完成，刷新看板查看结果。':'尚有后续产物，请点击继续补采；刷新看板查看结果。'}`;
-      button.textContent=nextOffset===null?'补采已完成':'继续补采成品尺寸';
-    } catch(error) {
-      if(node.isConnected)status.textContent=`补采失败：${error.message}${error.status===409?'。没有可信最终产物记录，不能猜测成品尺寸。':''}`;
-    } finally {button.disabled=nextOffset===null;}
+    const batchOffset=nextOffset, version=loadVersion, body=el('div',null,'capacity-operation');
+    body.append(el('p',`任务 ${text(d.job_id)}；本批偏移 ${batchOffset}，最多处理 4 个可信最终产物。`,'notice'),el('p','补采仅添加成品尺寸证据，不修改技术资格、原生成参数、人工合格量或标准标签。最终清单由服务端核验；不会扫描目录，也不会从请求猜测尺寸。'));
+    const raw=el('details');raw.append(el('summary','本页已记录的最终产物（最终以服务端可信清单为准）'),el('pre',text(d.outputs)));body.append(raw);
+    capacityDialog(`确认受控补采 · ${d.job_id}`,body,'确认本批补采',async()=>{
+      if(!node.isConnected || version!==loadVersion || nextOffset!==batchOffset)throw Error('证据页面或批次已变化，请关闭后重新打开。');
+      button.disabled=true;status.textContent='正在补采本批成品尺寸…';invalidateEstimate('成品尺寸正在补采，旧测算已清除。');
+      try {
+        const result=await H3Auth.json(`/api/capacity/jobs/${encodeURIComponent(d.job_id)}/probe-outputs`,'POST',{offset:batchOffset});
+        revision++;ready=false;updateEvidenceControls();invalidateEstimate('成品尺寸证据已更新，请刷新看板后重新计算。');
+        if(!node.isConnected)return;
+        const count=value=>Number.isSafeInteger(value) && value>=0;
+        if(!result || !count(result.processed) || result.processed>4 || !count(result.recorded) || result.recorded>result.processed || !count(result.total) || !(result.next_offset===null || count(result.next_offset) && result.next_offset>batchOffset && result.next_offset<result.total))throw Error('补采响应格式无效，请刷新看板核对结果');
+        nextOffset=result.next_offset;
+        status.textContent=`本批处理 ${num(result.processed)} 个，成功记录尺寸 ${num(result.recorded)} 个；可信最终产物共 ${num(result.total)} 个。${nextOffset===null?'补采已完成，刷新看板查看结果。':'尚有后续产物，请点击继续补采；刷新看板查看结果。'}`;
+        button.textContent=nextOffset===null?'补采已完成':'继续补采成品尺寸';
+      } catch(error) {
+        const reason=`补采失败：${error.message}${error.status===409?'。没有可信最终产物记录，不能猜测成品尺寸。':''}`;
+        if(node.isConnected)status.textContent=reason;
+        throw Error(reason);
+      } finally {button.disabled=nextOffset===null;}
+    });
   };
   return node;
 }
-function renderDetails() {
-  $('details').replaceChildren();const details=data.details || [];
+let evidenceSnapshot=null, evidenceCache=null, evidencePending=null, evidenceVersion=0, evidenceOffset=0;
+// 版本属于请求，快照只在聚合提交后建立；刷新窗口里的旧 data 不能借用新版本。
+const currentEvidenceSnapshot=snapshot=>Boolean(ready && snapshot && snapshot===evidenceSnapshot && snapshot.version===loadVersion && snapshot.data===data && snapshot.range===applied);
+function updateEvidenceControls() {
+  for(const node of document.querySelectorAll('#evidence-filters select, #scenario-filter, #include-offline, .summary-spec, [data-evidence-entry], #open-evidence'))node.disabled=!ready;
+  if(!ready)for(const id of ['previous','next'])if($(id))$(id).disabled=true;
+}
+const evidencePageSize=()=>Number($('evidence-size')?.value || evidenceSelection['evidence-size']) || 100;
+const filteredEvidence=()=>Boolean(($('evidence-group')?.value ?? evidenceSelection['evidence-group']) || ($('evidence-status')?.value ?? evidenceSelection['evidence-status']) || ($('evidence-source')?.value ?? evidenceSelection['evidence-source']) || evidencePageSize()!==100);
+function setupEvidence() {
+  choose($('evidence-group'),(data.groups || []).map(g=>[g.id,`${capabilityTitle(g)} / ${workerName(g.worker_id,g.worker_name)} / ${source(g.source)} / ${g.config_id || '配置未知'} / ${g.id}`]),'全部原分组');
+}
+async function allEvidence(snapshot=evidenceSnapshot) {
+  if(!currentEvidenceSnapshot(snapshot))return null;
+  if(evidenceCache?.snapshot===snapshot)return evidenceCache.records;
+  if(evidencePending?.snapshot===snapshot)return evidencePending.promise;
+  const total=snapshot.data.details_total, initialOffset=snapshot.offset, initial=snapshot.data.details || [];
+  const pending={snapshot,promise:null};
+  pending.promise=(async()=>{
+    if(!Number.isSafeInteger(total) || total<0)throw Error('明细总数无效，请刷新后重试。');
+    const records=[];
+    for(let start=0;start<total;start+=100) {
+      if(!currentEvidenceSnapshot(snapshot))return null;
+      const response=start===initialOffset?{details:initial,details_total:total}:await H3Auth.request(`/api/capacity?${new URLSearchParams({...snapshot.range,limit:100,offset:start})}`,{cache:'no-store'});
+      if(!currentEvidenceSnapshot(snapshot))return null;
+      if(response.details_total!==total || !Array.isArray(response.details) || response.details.length!==Math.min(100,total-start))throw Error('任务证据在读取期间变化或分页不完整，请刷新后重新筛选。');
+      records.push(...response.details);
+      if(filteredEvidence())message('evidence-state',`正在读取真实分页证据 ${records.length} / ${total} 条；聚合统计保持不变。`);
+    }
+    if(new Set(records.map(d=>d.job_id)).size!==records.length)throw Error('任务证据分页出现重复，请刷新后重试。');
+    if(!currentEvidenceSnapshot(snapshot))return null;
+    evidenceCache={snapshot,records};return records;
+  })();
+  evidencePending=pending;
+  try {return await pending.promise;} finally {if(evidencePending===pending)evidencePending=null;}
+}
+async function filterEvidence() {
+  const snapshot=evidenceSnapshot;
+  if(!currentEvidenceSnapshot(snapshot) || !mountedRegions.has('evidence'))return;
+  const filterVersion=++evidenceVersion;
+  if(!filteredEvidence()) {
+    message('evidence-state','');
+    if(offset!==0){offset=0;await load(false);}else renderDetails();
+    return;
+  }
+  $('previous').disabled=true;$('next').disabled=true;$('details').replaceChildren();
+  message('evidence-state','正在读取同一截止时间下的真实分页证据，完成后筛选；不会按当前页冒充全部任务。');
+  try {
+    const records=await allEvidence(snapshot);
+    if(!records || !currentEvidenceSnapshot(snapshot) || filterVersion!==evidenceVersion)return;
+    const matches=records.filter(d=>(!$('evidence-group').value || d.group_id===$('evidence-group').value) && (!$('evidence-status').value || d.status===$('evidence-status').value) && (!$('evidence-source').value || d.source===$('evidence-source').value));
+    const size=evidencePageSize();evidenceOffset=Math.min(evidenceOffset,Math.max(0,Math.ceil(matches.length/size)-1)*size);
+    renderDetails(matches.slice(evidenceOffset,evidenceOffset+size),matches.length,evidenceOffset,size);
+    message('evidence-state',`筛选 ${matches.length} / 全集 ${records.length} 条；只改变明细，聚合统计不受筛选或分页影响。`);
+  } catch(error) {
+    if(!currentEvidenceSnapshot(snapshot) || filterVersion!==evidenceVersion)return;
+    message('evidence-state',`证据筛选失败：${error.message}。请立即刷新后重试。`);
+    $('detail-count').textContent='筛选未完成';$('page-note').textContent='';
+  }
+}
+function showEvidence(group='') {
+  if(!currentEvidenceSnapshot(evidenceSnapshot))return;
+  $('task-evidence').open=true;mountEvidence();$('evidence-group').value=group;$('evidence-status').value='';$('evidence-source').value='';evidenceOffset=0;
+  filterEvidence();$('task-evidence').scrollIntoView({block:'start'});
+}
+function renderDetails(details=data.details || [],total=data.details_total,start=offset,size=100) {
+  $('details').replaceChildren();
   for(const d of details) {
     const node=el('details',null,'evidence'), summary=el('summary');node.dataset.jobId=d.job_id;
     summary.append(el('strong',text(d.job_id)),el('span',source(d.source),'badge'),el('span',` ${STATUS[d.status] || text(d.status)} / ${text(d.capability)} / ${workerName(d.worker_id,d.worker_name)} / ${when(d.created_at)}`));
-    node.append(summary,el('p',`任务 runtime：${sec(d.runtime_seconds)}`),list(d.warnings),el('h3','执行尝试（包含重试）'),el('pre',text(d.attempts)),el('h3','实际输出证据'),el('pre',text(d.outputs)),el('p',`人工合格数量：${num(d.review?.accepted)}；样本标签：${d.review?.source==='standard'?'标准样本（人工声明）':d.review?.source==='business'?'业务样本':'未标记'}；标准场景编号：${text(d.review?.benchmark_id)}；备注：${text(d.review?.note)}`));
-    appendOutputResolutionDetails(node,d.output_resolution);
-    const raw=el('details',null,'output-resolution-raw');raw.append(el('summary','成品尺寸原始证据'),el('pre',text({output_resolution:d.output_resolution,recovered_outputs:d.recovered_outputs})));node.append(raw);
-    if(d.status==='done')node.append(outputProbe(d));
-    if(['captured','standard'].includes(d.source)) node.append(reviewForm(d));
+    const content=el('div',null,'evidence-content');node.append(summary,content);
+    mountOnOpen(node,()=>{
+    content.append(el('p',`任务 runtime：${sec(d.runtime_seconds)}；占机：${sec(d.occupied_seconds)}；原分组：${text(d.group_id)}`),list(d.warnings));
+    const layers=el('div',null,'f-grid3');
+    for(const [label,value] of [['输入素材',inputMaterials(d).join(' / ')],['生成参数',generationParameters(d,true)],['技术与人工口径','技术资格以原采集证据及服务端校验为准；尺寸补采与人工标签不修改它。']]){const layer=el('div');layer.append(el('h3',label),el('p',value));layers.append(layer);}
+    content.append(layers);
+    content.append(rawEvidence('执行尝试（包含重试）',d.attempts),el('h3','实际输出证据'));
+    if(Array.isArray(d.outputs) && d.outputs.length) {
+      content.append(table(['产物标识','类型','实际尺寸','视频时长','技术记录'],d.outputs.map(output=>{const row=el('tr');cell(row,output.key || output.id || '未记录');cell(row,output.kind);cell(row,outputVariants({variants:[output]}).length?outputVariantLabel(output):'尺寸未记录');cell(row,sec(output.duration));cell(row,output.valid===true?'采集记录标记有效':output.valid===false?'未通过 / 待确认':'未记录');return row;})));
+    } else content.append(el('p','最终产物清单未记录；不能按请求猜测，也不按零产物处理。','notice'));
+    content.append(rawEvidence('实际输出原始证据',d.outputs),el('p',`人工合格数量：${num(d.review?.accepted)}；样本标签：${d.review?.source==='standard'?'标准样本（人工声明）':d.review?.source==='business'?'业务样本':'未标记'}；标准场景编号：${text(d.review?.benchmark_id)}；备注：${text(d.review?.note)}`));
+    appendOutputResolutionDetails(content,d.output_resolution);
+    content.append(rawEvidence('成品尺寸原始证据',{output_resolution:d.output_resolution,recovered_outputs:d.recovered_outputs},'output-resolution-raw'));
+    if(d.status==='done')content.append(outputProbe(d));
+    if(['captured','standard'].includes(d.source))content.append(reviewForm(d));
+    else content.append(el('p','历史任务不能补写为完整采集证据，不提供采集验收表单。','hint'));
+    });
     $('details').append(node);
   }
   if(!details.length) $('details').append(el('p','当前页没有任务证据。可立即刷新，或返回上一页。','empty'));
-  $('detail-count').textContent=`当前 ${details.length} / 总计 ${num(data.details_total)} 条；聚合不受分页截断`;
-  $('page-note').textContent=`第 ${Math.floor(offset/100)+1} 页`;
-  $('previous').disabled=offset===0;
-  $('next').disabled=!numeric(data.details_total) || offset+100>=data.details_total;
+  $('detail-count').textContent=`当前 ${details.length} / 总计 ${num(total)} 条；聚合不受分页截断`;
+  $('page-note').textContent=`第 ${Math.floor(start/size)+1} 页`;
+  $('previous').disabled=!ready || start===0;
+  $('next').disabled=!ready || !numeric(total) || start+size>=total;
 }
 function clearData() {
-  data=null;ready=false;
-  for(const id of ['summary-machines','task-metrics','output-metrics','coverage','workers','machine-groups','scenario-groups','details','detail-count','page-note']) $(id).replaceChildren();
+  invalidateRegions();data=null;ready=false;evidenceVersion++;evidenceSnapshot=null;evidenceCache=null;evidencePending=null;updateEvidenceControls();
+  $('capacity-stats').replaceChildren();
   $('online-count').textContent='当前在线 — 台';
   $('previous').disabled=true;$('next').disabled=true;$('estimate-submit').disabled=true;
 }
@@ -707,7 +952,7 @@ function invalidateEstimate(note='输入或证据已变更，请重新计算。'
   $('estimate-result').replaceChildren(el('p',note,'muted'));updateDemandControls();
 }
 async function load(reset=true) {
-  const version=++loadVersion;ready=false;invalidateEstimate('证据正在刷新，旧测算已清除。');message('error','');
+  const version=++loadVersion;ready=false;evidenceVersion++;evidenceSnapshot=null;evidenceCache=null;evidencePending=null;updateEvidenceControls();invalidateEstimate('证据正在刷新，旧测算已清除。');message('error','');message('evidence-state','');
   // 不限制历史起点；翻页与测算沿用同一截止时间，刷新时再纳入新任务。
   const range=reset?{to:Math.floor(Date.now()/1000)}:applied;
   if(reset)offset=0;
@@ -717,11 +962,13 @@ async function load(reset=true) {
     const result=await H3Auth.request(`/api/capacity?${new URLSearchParams({...range,limit:100,offset})}`,{cache:'no-store'});
     // H3Auth.request 返回已解析数据；请求序号保护刷新与分页，旧响应不能覆盖新状态。
     if(version!==loadVersion)return;
-    data=result;applied={...range};revision++;ready=true;
+    data=result;applied=Object.freeze({...range});revision++;ready=true;
+    evidenceSnapshot=Object.freeze({data,range:applied,version,offset});updateEvidenceControls();
     workers.clear();
     for(const w of data.workers || [])workers.set(w.id,w);
     for(const g of data.groups || [])if(g.worker_id && !workers.has(g.worker_id))workers.set(g.worker_id,{id:g.worker_id,name:g.worker_name});
-    renderMachineSummary();renderOverview();renderWorkers();renderGroups('machine-groups',data.groups || []);renderScenarios();renderDetails();setupEstimate();
+    invalidateRegions();renderOverview();await renderActiveRegions();
+    if(version!==loadVersion)return;
     $('refresh-state').textContent=`最后刷新：${new Date().toLocaleTimeString('zh-CN',{hour12:false})}`;
   } catch(error) {
     if(version!==loadVersion)return;clearData();message('error',`读取产能数据失败：${error.message}。请点击立即刷新重试。`);$('refresh-state').textContent='读取失败';
@@ -738,7 +985,7 @@ function purchaseGroups(workerId) {
 function candidateGroups() {return purchaseGroups($('estimate-worker').value);}
 function hasUsableMode(mode,groups=candidateGroups()) {return groups.some(g=>mode.capabilities.includes(g.capability) && usable(g));}
 function setupEstimate() {
-  const online=(data?.workers || []).filter(isOnline), previous=$('estimate-worker').value;
+  const online=(data?.workers || []).filter(isOnline), previous=estimateWorkerSelection;
   const selected=online.some(w=>w.id===previous)?previous:(online.find(w=>purchaseGroups(w.id).length) || online[0])?.id || '';
   choose($('estimate-worker'),online.map(w=>[w.id,w.name || '未命名电脑']),online.length?null:'暂无在线电脑',selected);
   resetDemands();
@@ -851,19 +1098,23 @@ $('export-estimate').onclick=()=>{
   link.href=url;link.download='capacity-estimate.csv';document.body.append(link);link.click();link.remove();setTimeout(()=>URL.revokeObjectURL(url),1000);
 };
 for(const tab of document.querySelectorAll('[role="tab"]')) {
-  tab.onclick=()=>{for(const other of document.querySelectorAll('[role="tab"]')){const active=other===tab;other.setAttribute('aria-selected',String(active));other.tabIndex=active?0:-1;$(other.getAttribute('aria-controls')).hidden=!active;}};
+  tab.onclick=()=>{for(const other of document.querySelectorAll('[role="tab"]')){const active=other===tab;other.setAttribute('aria-selected',String(active));other.tabIndex=active?0:-1;$(other.getAttribute('aria-controls')).hidden=!active;}renderActiveRegions();};
   tab.onkeydown=event=>{const tabs=[...document.querySelectorAll('[role="tab"]')],index=tabs.indexOf(tab);let next;if(event.key==='ArrowRight')next=(index+1)%tabs.length;if(event.key==='ArrowLeft')next=(index+tabs.length-1)%tabs.length;if(event.key==='Home')next=0;if(event.key==='End')next=tabs.length-1;if(next!==undefined){event.preventDefault();tabs[next].click();tabs[next].focus();}};
 }
 $('refresh').onclick=()=>load();
-$('include-offline').onchange=renderMachineSummary;
-$('previous').onclick=()=>{offset=Math.max(0,offset-100);load(false);};$('next').onclick=()=>{offset+=100;load(false);};
-$('scenario-filter').onchange=()=>renderGroups('scenario-groups',(data?.groups || []).filter(g=>scenarioKey(g)===$('scenario-filter').value));
+$('include-offline').onchange=()=>{if(ready)renderMachineSummary();};
+for(const id of ['technical-details','task-evidence'])$(id).addEventListener('toggle',()=>renderActiveRegions());
+$('open-purchase').onclick=()=>{$('tab-purchase').click();$('panel-purchase').focus();};
+$('open-evidence').onclick=()=>showEvidence();
+$('previous').onclick=()=>{if(!ready || $('previous').disabled || !mountedRegions.has('evidence'))return;if(filteredEvidence()){evidenceOffset=Math.max(0,evidenceOffset-evidencePageSize());filterEvidence();}else{offset=Math.max(0,offset-100);load(false);}};
+$('next').onclick=()=>{if(!ready || $('next').disabled || !mountedRegions.has('evidence'))return;if(filteredEvidence()){evidenceOffset+=evidencePageSize();filterEvidence();}else{offset+=100;load(false);}};
+$('scenario-filter').onchange=()=>{if(ready)renderGroups('scenario-groups',(data?.groups || []).filter(g=>scenarioKey(g)===$('scenario-filter').value));};
 $('estimate-form').addEventListener('input',()=>invalidateEstimate());
 $('estimate-form').addEventListener('change',()=>invalidateEstimate());
 $('estimate-worker').onchange=resetDemands;
 $('add-demand').onclick=()=>{addDemand();invalidateEstimate();};
 window.addEventListener('h3auth:expired',()=>{loadVersion++;clearData();invalidateEstimate('登录已失效，请重新登录。');});
-H3Auth.requireUser(true).then(()=>{H3Auth.mountAccount($('account'));load();}).catch(error=>message('error',error.message));
+H3Auth.requireUser(true).then(user=>{AdminUI.mount({page:'capacity',user});load();}).catch(error=>message('error',error.message));
 </script>
 </body>
 </html>
