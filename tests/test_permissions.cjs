@@ -729,8 +729,8 @@ test('workspace navigation keeps account actions at the bottom across pages and 
   }
 });
 
-test('global maintenance banner appears during updates and hides when a worker is available', async () => {
-  let maintenance = true, stallHealth = false, healthRequests = 0;
+test('global maintenance banner stays for outages and briefly reports partial maintenance', async () => {
+  let maintenanceActive = true, comfyOnline = false, stallHealth = false, healthRequests = 0;
   const session = {user:{id:'u1', username:'viewer', role:'user'}, csrf_token:'test-csrf'};
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -747,7 +747,7 @@ test('global maintenance banner appears during updates and hides when a worker i
       healthRequests++;
       if (stallHealth) return;
       res.setHeader('Content-Type', 'application/json');
-      return res.end(JSON.stringify({ok:true, comfy_online:!maintenance, maintenance_active:maintenance}));
+      return res.end(JSON.stringify({ok:true, comfy_online:comfyOnline, maintenance_active:maintenanceActive}));
     }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
     res.end('<!doctype html><meta charset="utf-8"><title>维护提示测试</title><script src="/auth.js"></script>');
@@ -781,10 +781,25 @@ test('global maintenance banner appears during updates and hides when a worker i
     assert.equal(await banner.locator('svg').count(), 1);
     await page.screenshot({path:path.resolve(web, '..', '..', 'temp', 'chouka-maintenance-banner.png')});
 
-    maintenance = false;
+    comfyOnline = true;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await banner.waitFor({state:'visible'});
+    assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(), '部分节点正在维护更新，其他可用节点仍可正常使用。');
+    await banner.waitFor({state:'hidden', timeout:7000});
+    const repeatedHealth = page.waitForResponse(response => response.url().endsWith('/api/health'));
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await repeatedHealth;
+    assert.equal(await banner.isHidden(), true, '同一轮部分维护不应每次轮询都重复提示');
+
+    comfyOnline = false;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await banner.waitFor({state:'visible'});
+    assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(), '系统正在维护更新，当前暂无可用执行节点，请稍后再使用。');
+
+    maintenanceActive = false;
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await banner.waitFor({state:'hidden'});
-    maintenance = true;
+    maintenanceActive = true;
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await banner.waitFor({state:'visible'});
     await page.setViewportSize({width:320, height:740});
@@ -810,7 +825,7 @@ test('global maintenance banner appears during updates and hides when a worker i
       await new Promise(resolve => setTimeout(resolve, 20));
     }
     assert.ok(healthRequests > requestsBeforeStall, '悬挂探针必须已经发出');
-    maintenance = false; stallHealth = false;
+    maintenanceActive = false; stallHealth = false;
     await page.waitForTimeout(4200);
     await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
     await banner.waitFor({state:'hidden'});
