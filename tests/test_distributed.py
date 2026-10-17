@@ -315,6 +315,83 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(request["skipped_count"], 1)
         self.assertEqual(self.store.list_workers()[0]["sync_status"], "idle")
 
+    def test_primary_node_is_skipped_by_sync_and_clears_previous_sync_failure(self):
+        capabilities = {
+            "node_classes": ["KSampler", "SaveImage"],
+            "supports_file_sync": True,
+            "supports_code_restart": True,
+        }
+        primary = self.store.register_worker("GPU-primary", capabilities)
+        primary_id = primary["worker_id"]
+        self.store.heartbeat(primary_id, comfy_online=True, busy=False)
+        request = self.store.request_sync_all()
+        self.store.heartbeat(
+            primary_id, comfy_online=True, busy=False,
+            maintenance={
+                "request_id": request["request_id"], "status": "error",
+                "message": "主节点不应保留的旧同步失败",
+            },
+        )
+        self.store.heartbeat(
+            primary_id, capabilities={**capabilities, "is_primary_node": True},
+            comfy_online=True, busy=False,
+        )
+        for status in ("running", "done"):
+            reply = self.store.heartbeat(
+                primary_id, comfy_online=True, busy=False,
+                maintenance={
+                    "request_id": "obsolete-primary-sync", "status": status,
+                    "message": "主节点旧同步报告",
+                },
+            )
+            self.assertEqual(reply["maintenance_ack"], {
+                "request_id": "obsolete-primary-sync", "status": status,
+            })
+
+        worker = next(item for item in self.store.list_workers()
+                      if item["id"] == primary_id)
+        self.assertTrue(worker["is_primary_node"])
+        self.assertEqual(worker["sync_status"], "idle")
+        self.assertEqual(worker["state"], "idle")
+        sync_fields = self.store.db.execute(
+            """SELECT sync_request_id, sync_message, sync_requested_at,
+                      sync_started_at, sync_finished_at
+               FROM workers WHERE id = ?""",
+            (primary_id,),
+        ).fetchone()
+        self.assertEqual(list(sync_fields), [None, None, None, None, None])
+        self.store.enqueue("primary-job", {"graph": {}}, ["KSampler"])
+        self.assertEqual(self.store.acquire(primary_id)["job_id"], "primary-job")
+        update = self.store.request_sync_all()
+        self.assertEqual(update["primary_count"], 1)
+        self.assertEqual(update["worker_count"], 0)
+        self.assertEqual(update["skipped_count"], 1)
+
+    def test_primary_with_stale_sync_state_still_participates_in_vram_dispatch(self):
+        gib = 1024 ** 3
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "GPU 32GB", "vram_total": 32 * gib}],
+        })
+        primary = self.store.register_worker("GPU-primary-48GB", {
+            "node_classes": ["KSampler"], "is_primary_node": True,
+            "devices": [{"type": "cuda", "name": "GPU 48GB", "vram_total": 48 * gib}],
+        })
+        primary_id = primary["worker_id"]
+        self.store.heartbeat(primary_id, comfy_online=True, busy=False)
+        with self.store.db:
+            self.store.db.execute(
+                "UPDATE workers SET sync_status = 'error' WHERE id = ?", (primary_id,)
+            )
+        self.store.enqueue("primary-vram-job", {
+            "graph": {}, "capability": "minimax_h3_ref_2pass",
+        }, ["KSampler"])
+
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.assertEqual(
+            self.store.acquire(primary_id)["job_id"], "primary-vram-job"
+        )
+
     def test_sync_all_queues_latest_worker_and_blocks_jobs_until_finished(self):
         newest = self.store.register_worker(
             "GPU-01", {

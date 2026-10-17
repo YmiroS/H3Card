@@ -2,6 +2,7 @@
   "server_url": "https://<linux-controller-host>",
   "enrollment_token": "replace-with-controller-token",
   "worker_name": "GPU-PC-01",
+  "is_primary_node": false,
   "comfy_url": "http://127.0.0.1:8188",
   "comfy_input_dir": "E:/ComfyUI_Mie_V33/ComfyUI/input",
   "heartbeat_seconds": 10,

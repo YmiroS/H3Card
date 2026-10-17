@@ -162,6 +162,10 @@ def _worker_name_key(name):
     return str(name).strip().casefold()
 
 
+def _primary_node(capabilities):
+    return isinstance(capabilities, dict) and capabilities.get("is_primary_node") is True
+
+
 def _json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -345,6 +349,7 @@ class DistributedStore:
             ).fetchall()
             worker_ids = []
             skipped_count = 0
+            primary_count = 0
             seen_names = set()
             for row in rows:
                 name_key = _worker_name_key(row["name"])
@@ -352,6 +357,9 @@ class DistributedStore:
                     continue
                 seen_names.add(name_key)
                 capabilities = json.loads(row["capabilities_json"] or "{}")
+                if _primary_node(capabilities):
+                    primary_count += 1
+                    continue
                 if (not isinstance(capabilities, dict)
                         or not capabilities.get("supports_code_restart")):
                     skipped_count += 1
@@ -371,6 +379,7 @@ class DistributedStore:
             "request_id": request_id,
             "worker_count": len(worker_ids),
             "skipped_count": skipped_count,
+            "primary_count": primary_count,
         }
 
     def _record_temperature_locked(self, worker_id, telemetry, now):
@@ -468,8 +477,37 @@ class DistributedStore:
 
             sync_request_id = row["sync_request_id"]
             sync_status = row["sync_status"] or "idle"
+            stored_capabilities = None
+            if isinstance(capabilities, dict):
+                effective_capabilities = capabilities
+            else:
+                stored_capabilities = json.loads(row["capabilities_json"] or "{}")
+                effective_capabilities = stored_capabilities
+            is_primary = _primary_node(effective_capabilities)
             maintenance_ack = None
-            if isinstance(maintenance, dict):
+            if is_primary:
+                if isinstance(maintenance, dict):
+                    report_request_id = str(maintenance.get("request_id") or "")
+                    report_status = str(maintenance.get("status") or "")
+                    if (report_request_id
+                            and report_status in {"running", "done", "error"}):
+                        maintenance_ack = {
+                            "request_id": report_request_id,
+                            "status": report_status,
+                        }
+                if sync_request_id or sync_status != "idle":
+                    self.db.execute(
+                        """UPDATE workers
+                           SET sync_request_id = NULL, sync_status = 'idle',
+                               sync_message = NULL, sync_requested_at = NULL,
+                               sync_started_at = NULL, sync_finished_at = NULL,
+                               updated_at = ?
+                           WHERE id = ?""",
+                        (now, worker_id),
+                    )
+                sync_request_id = None
+                sync_status = "idle"
+            elif isinstance(maintenance, dict):
                 report_request_id = str(maintenance.get("request_id") or "")
                 report_status = str(maintenance.get("status") or "")
                 if (report_request_id == sync_request_id
@@ -530,7 +568,7 @@ class DistributedStore:
             if capabilities is not None or telemetry is not None:
                 merged_capabilities = (
                     dict(capabilities) if capabilities is not None
-                    else json.loads(row["capabilities_json"] or "{}")
+                    else stored_capabilities
                 )
                 if not isinstance(merged_capabilities, dict):
                     merged_capabilities = {}
@@ -600,12 +638,13 @@ class DistributedStore:
             item["comfy_online"] = bool(item["comfy_online"])
             item["busy"] = bool(item["busy"])
             item["capabilities"] = json.loads(item.pop("capabilities_json") or "{}")
+            item["is_primary_node"] = _primary_node(item["capabilities"])
             online = now - item["last_seen"] <= self.offline_seconds
             if not online:
                 item["state"] = "offline"
-            elif item.get("sync_status") in {"pending", "running"}:
+            elif not item["is_primary_node"] and item.get("sync_status") in {"pending", "running"}:
                 item["state"] = "syncing"
-            elif item.get("sync_status") == "error":
+            elif not item["is_primary_node"] and item.get("sync_status") == "error":
                 item["state"] = "error"
             elif not item["enabled"]:
                 item["state"] = "disabled"
@@ -638,26 +677,29 @@ class DistributedStore:
             ).fetchone()
             if not worker or not worker["enabled"] or not worker["comfy_online"]:
                 return None
-            if worker["sync_status"] in ("pending", "running", "error"):
+            capabilities = json.loads(worker["capabilities_json"] or "{}")
+            if (not _primary_node(capabilities)
+                    and worker["sync_status"] in ("pending", "running", "error")):
                 return None
             if now - worker["last_seen"] > self.offline_seconds:
                 return None
             if worker["busy"] or worker["current_job_id"]:
                 return None
-            capabilities = json.loads(worker["capabilities_json"] or "{}")
             available_nodes = set(capabilities.get("node_classes") or [])
             current_vram = primary_gpu_vram_bytes(capabilities.get("devices"))
             idle_workers = self.db.execute(
-                """SELECT id, capabilities_json FROM workers
+                """SELECT id, capabilities_json, sync_status FROM workers
                    WHERE id != ? AND retired = 0 AND enabled = 1 AND comfy_online = 1
                      AND busy = 0 AND current_job_id IS NULL
-                     AND sync_status NOT IN ('pending', 'running', 'error')
                      AND last_seen >= ?""",
                 (worker_id, now - self.offline_seconds),
             ).fetchall()
-            idle_capabilities = [
-                json.loads(item["capabilities_json"] or "{}") for item in idle_workers
-            ]
+            idle_capabilities = []
+            for item in idle_workers:
+                other_capabilities = json.loads(item["capabilities_json"] or "{}")
+                if (_primary_node(other_capabilities)
+                        or item["sync_status"] not in ("pending", "running", "error")):
+                    idle_capabilities.append(other_capabilities)
             rows = self.db.execute(
                 "SELECT * FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
             ).fetchall()
