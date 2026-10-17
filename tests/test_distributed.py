@@ -17,7 +17,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "worker"))
 
-from distributed import DistributedStore, HIGH_VRAM_GPU_POLICY, WorkerBusyError
+from distributed import (
+    DistributedStore, HIGH_VRAM_GPU_POLICY, WorkerBusyError,
+    capability_model_inventory, worker_capability_comparisons,
+)
 from agent import AgentError, JobFailed, WorkerAgent
 
 
@@ -175,6 +178,138 @@ class ModelDispatchTest(unittest.TestCase):
         self.caps["input_choices"]["CustomLoader"]["checkpoint"] = ["exact.gguf"]
         self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
         self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+
+class WorkerCapabilityComparisonTest(unittest.TestCase):
+    def setUp(self):
+        self.primary_caps = {
+            "agent_version": 5,
+            "node_classes": ["CheckpointLoader", "CustomModelLoader", "KSampler"],
+            "input_choices": {
+                "CheckpointLoader": {
+                    "ckpt_name": ["models/v1/model.safetensors", "models/v2/model.safetensors"],
+                    "mode": ["fast", "quality"],
+                },
+                "CustomModelLoader": {
+                    "file": ["models/custom.gguf"],
+                    "precision": ["fp8", "fp16"],
+                },
+            },
+            "input_types": {
+                "CheckpointLoader": {"ckpt_name": "COMBO", "mode": "COMBO"},
+                "CustomModelLoader": {"file": "COMBO", "precision": "COMBO"},
+            },
+            "is_primary_node": True,
+        }
+
+    def worker(self, worker_id, caps, *, primary=False, state="idle"):
+        return {
+            "id": worker_id,
+            "state": state,
+            "is_primary_node": primary,
+            "capabilities": caps,
+        }
+
+    def test_model_inventory_uses_exact_model_inputs_and_suffixes_only(self):
+        inventory = capability_model_inventory(self.primary_caps)
+        self.assertEqual(inventory, {
+            ("CheckpointLoader", "ckpt_name", "models/v1/model.safetensors"),
+            ("CheckpointLoader", "ckpt_name", "models/v2/model.safetensors"),
+            ("CustomModelLoader", "file", "models/custom.gguf"),
+        })
+        self.assertIsNone(capability_model_inventory({"input_choices": {}}))
+        self.assertIsNone(capability_model_inventory({
+            "input_choices": {"Broken": {"model": "not-a-list"}},
+            "input_types": {},
+        }))
+
+    def test_comparison_reports_exact_missing_models_without_duplicate_missing_nodes(self):
+        worker_caps = json.loads(json.dumps(self.primary_caps))
+        worker_caps["node_classes"] = ["CheckpointLoader", "KSampler", "ExtraNode"]
+        worker_caps["input_choices"]["CheckpointLoader"]["ckpt_name"] = [
+            "models/v1/model.safetensors",
+            "other/model.safetensors",
+        ]
+        worker_caps["input_choices"].pop("CustomModelLoader")
+        worker_caps["input_types"].pop("CustomModelLoader")
+        baseline, workers = worker_capability_comparisons([
+            self.worker("primary", self.primary_caps, primary=True),
+            self.worker("worker", worker_caps),
+        ])
+
+        self.assertEqual(baseline, {
+            "status": "ready", "worker_id": "primary", "agent_version": 5,
+        })
+        self.assertEqual(workers[0]["capability_comparison"]["status"], "primary")
+        comparison = workers[1]["capability_comparison"]
+        self.assertEqual(comparison["status"], "missing")
+        self.assertEqual(comparison["missing_node_classes"], ["CustomModelLoader"])
+        self.assertEqual(comparison["extra_node_classes"], ["ExtraNode"])
+        self.assertEqual(comparison["missing_models"], [{
+            "node_class": "CheckpointLoader", "input": "ckpt_name",
+            "name": "models/v2/model.safetensors",
+        }])
+        self.assertNotIn("models/custom.gguf", {
+            model["name"] for model in comparison["missing_models"]
+        })
+        self.assertEqual(comparison["extra_models"], [{
+            "node_class": "CheckpointLoader", "input": "ckpt_name",
+            "name": "other/model.safetensors",
+        }])
+
+    def test_missing_or_ambiguous_primary_never_claims_a_complete_inventory(self):
+        worker = self.worker("worker", self.primary_caps)
+        baseline, compared = worker_capability_comparisons([worker])
+        self.assertEqual(baseline["status"], "none")
+        self.assertEqual(compared[0]["capability_comparison"]["status"], "unknown")
+
+        other_primary = self.worker("primary-2", self.primary_caps, primary=True)
+        baseline, compared = worker_capability_comparisons([
+            self.worker("primary-1", self.primary_caps, primary=True), other_primary,
+        ])
+        self.assertEqual(baseline["status"], "ambiguous")
+        self.assertTrue(all(
+            item["capability_comparison"]["status"] == "unknown" for item in compared
+        ))
+
+    def test_offline_and_legacy_inventories_are_explicit(self):
+        legacy_caps = {
+            "agent_version": 4,
+            "node_classes": ["CheckpointLoader", "CustomModelLoader"],
+        }
+        unavailable_primary = self.worker(
+            "primary", self.primary_caps, primary=True, state="error"
+        )
+        unavailable_primary["comfy_online"] = False
+        baseline, workers = worker_capability_comparisons([
+            unavailable_primary,
+            self.worker("offline", self.primary_caps, state="offline"),
+            self.worker("legacy", legacy_caps),
+        ])
+        self.assertEqual(baseline["status"], "stale")
+        self.assertEqual(workers[1]["capability_comparison"]["status"], "stale")
+        self.assertEqual(workers[1]["capability_comparison"]["model_inventory_status"], "complete")
+        self.assertEqual(workers[2]["capability_comparison"]["status"], "unknown")
+        self.assertEqual(workers[2]["capability_comparison"]["model_inventory_status"], "unknown")
+        self.assertEqual(
+            workers[2]["capability_comparison"]["missing_node_classes"], ["KSampler"]
+        )
+
+    def test_extra_only_inventory_is_compatible_without_duplicate_extra_models(self):
+        worker_caps = json.loads(json.dumps(self.primary_caps))
+        worker_caps["node_classes"].append("ExtraLoader")
+        worker_caps["input_choices"]["ExtraLoader"] = {
+            "model_name": ["extra/model.safetensors"],
+        }
+        worker_caps["input_types"]["ExtraLoader"] = {"model_name": "COMBO"}
+        _, workers = worker_capability_comparisons([
+            self.worker("primary", self.primary_caps, primary=True),
+            self.worker("worker", worker_caps),
+        ])
+        comparison = workers[1]["capability_comparison"]
+        self.assertEqual(comparison["status"], "complete")
+        self.assertEqual(comparison["extra_node_classes"], ["ExtraLoader"])
+        self.assertEqual(comparison["extra_models"], [])
 
 
 class DistributedStoreTest(unittest.TestCase):
