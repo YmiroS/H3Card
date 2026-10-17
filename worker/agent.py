@@ -6,6 +6,7 @@ import copy
 import csv
 import ctypes
 import json
+import math
 import mimetypes
 import os
 import platform
@@ -117,24 +118,26 @@ class WorkerAgent:
 
     @staticmethod
     def _nvidia_gpus():
-        command = [
-            "nvidia-smi",
-            "--query-gpu=index,name,utilization.gpu,memory.used,memory.total",
-            "--format=csv,noheader,nounits",
-        ]
-        try:
-            result = subprocess.run(
-                command, capture_output=True, text=True, encoding="utf-8",
-                errors="replace", timeout=5, check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except (OSError, subprocess.TimeoutExpired, ValueError):
-            return []
-        if result.returncode != 0:
+        fields = "index,name,utilization.gpu,memory.used,memory.total"
+        # 旧驱动可能不认识温度字段；失败时只回退一次，不丢掉原有资源指标。
+        for query in (fields + ",temperature.gpu", fields):
+            command = ["nvidia-smi", "--query-gpu=" + query,
+                       "--format=csv,noheader,nounits"]
+            try:
+                result = subprocess.run(
+                    command, capture_output=True, text=True, encoding="utf-8",
+                    errors="replace", timeout=5, check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                return []
+            if result.returncode == 0:
+                break
+        else:
             return []
 
         gpus = []
-        for row in csv.reader(result.stdout.splitlines()):
+        for row in csv.reader(result.stdout.splitlines(), skipinitialspace=True):
             if len(row) < 5:
                 continue
             try:
@@ -151,8 +154,17 @@ class WorkerAgent:
             except ValueError:
                 memory_used = None
                 memory_total = None
+            temperature = None
+            if len(row) >= 6:
+                try:
+                    value = float(row[5].strip())
+                    if math.isfinite(value) and 0 <= value <= 150:
+                        temperature = value
+                except ValueError:
+                    pass
             gpus.append({
                 "index": index,
+                "temperature_c": temperature,
                 "name": row[1].strip(),
                 "utilization_percent": utilization,
                 "memory_used_bytes": memory_used,

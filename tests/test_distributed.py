@@ -368,6 +368,47 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(worker["state"], "idle")
         self.assertEqual(self.store.acquire(newest_id)["job_id"], "job-1")
 
+    def test_temperature_history_survives_maintenance_and_failed_sync_stays_blocked(self):
+        worker = self.store.register_worker("GPU-maintenance", {
+            "node_classes": ["KSampler"], "supports_code_restart": True,
+            "supports_file_sync": True,
+        })
+        worker_id = worker["worker_id"]
+        now = time.time()
+        with mock.patch("distributed.time.time", return_value=now):
+            self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+            request = self.store.request_sync_all()
+            self.store.enqueue("temperature-maintenance-job", {"graph": {}}, ["KSampler"])
+            points = []
+            for offset, status in enumerate(("running", "error")):
+                at = now + offset * 10
+                points.append({"at": at, "temperature_c": 65 + offset})
+                with mock.patch("distributed.time.time", return_value=at):
+                    reply = self.store.heartbeat(
+                        worker_id, comfy_online=True, busy=False,
+                        telemetry={"collected_at": at, "gpus": [
+                            {"index": 255, "temperature_c": 65 + offset},
+                        ]},
+                        maintenance={"request_id": request["request_id"],
+                                     "status": status, "message": "温度与维护组合回归"},
+                    )
+                    self.assertEqual(reply["maintenance_ack"]["status"], status)
+                    self.assertIsNone(self.store.acquire(worker_id))
+                    rows = {row["id"]: row for row in self.store.list_workers()}
+                    self.assertEqual(rows[worker_id]["state"], "syncing" if status == "running" else "error")
+                    self.assertEqual(self.store.temperature_history(
+                        worker_id, gpu_index=255, now=at)["points"], points)
+            # 失败状态不能被随后一个普通的在线、空闲心跳解除。
+            self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+            self.assertIsNone(self.store.acquire(worker_id))
+            self.store.heartbeat(
+                worker_id, comfy_online=True, busy=False,
+                maintenance={"request_id": request["request_id"], "status": "done"},
+            )
+            self.assertEqual(self.store.acquire(worker_id)["job_id"], "temperature-maintenance-job")
+            self.assertEqual(self.store.temperature_history(
+                worker_id, gpu_index=255, now=now + 10)["points"], points)
+
     def test_heartbeat_merges_telemetry_without_dropping_capabilities(self):
         telemetry = {
             "hostname": "RENDER-01",
@@ -751,6 +792,7 @@ class WorkerTelemetryTest(unittest.TestCase):
             "index": 0,
             "name": "NVIDIA GeForce RTX 4090",
             "utilization_percent": 73.0,
+            "temperature_c": None,
             "memory_used_bytes": 12288 * 1024 ** 2,
             "memory_total_bytes": 24564 * 1024 ** 2,
         }])

@@ -45,7 +45,7 @@ from costs import CostLedger
 from capacity import make_spec, export_csv, model_summary_from_graph, _hash as capacity_output_key
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
-    MAX_4090_HIGH_QUALITY_DURATION_SECONDS, WorkerBusyError, can_run_capability,
+    MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError, can_run_capability,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -59,6 +59,7 @@ from server.edit_api import register_edit_routes
 from server.edit_export import ExportBusyError
 from server.image_controls import image_controls, patch_image_controls
 from server.director_bridge import import_director, link_director, project_director, reference_storyboard, sync_card_job
+from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -1900,6 +1901,23 @@ async def api_workers(request):
     return web.json_response({"workers": distributed_store(request.app).list_workers()})
 
 
+async def api_worker_temperature(request):
+    require_admin(request)
+    try:
+        gpu_index = int(request.query.get("gpu_index", "0"))
+        minutes = int(request.query.get("minutes", "30"))
+    except (ValueError, TypeError):
+        raise web.HTTPBadRequest(reason="显卡编号或时间范围无效")
+    if not 0 <= gpu_index <= TEMPERATURE_MAX_GPU_INDEX or minutes not in (30, 120, 1440):
+        raise web.HTTPBadRequest(reason="显卡编号或时间范围无效")
+    try:
+        result = distributed_store(request.app).temperature_history(
+            request.match_info["worker_id"], gpu_index=gpu_index, minutes=minutes)
+    except KeyError:
+        raise web.HTTPNotFound(reason="Worker 不存在")
+    return web.json_response(result)
+
+
 async def api_worker_enabled(request):
     body = await request.json()
     enabled = bool(body.get("enabled"))
@@ -3029,7 +3047,30 @@ async def capacity_report(request):
 
 
 async def api_capacity(request):
-    return web.json_response(await capacity_report(request))
+    report = await capacity_report(request)
+    # aiohttp 的默认协商只匹配子串，需先处理 q=0、通配符与优先级。
+    qualities = {}
+    for item in request.headers.get("Accept-Encoding", "").lower().split(","):
+        coding, *parameters = item.strip().split(";")
+        quality = 1.0
+        for parameter in parameters:
+            key, separator, value = parameter.strip().partition("=")
+            if key == "q":
+                quality = float(value) if separator and re.fullmatch(r"(?:0(?:\.\d{0,3})?|1(?:\.0{0,3})?)", value) else 0.0
+        if coding:
+            qualities[coding] = quality
+    candidates = [(qualities.get(coding, qualities.get("*", 0.0)), coding)
+                  for coding in ("gzip", "deflate")]
+    candidates.append((qualities.get("identity", 0.0 if qualities.get("*") == 0 else 1.0), "identity"))
+    quality, coding = max(candidates, key=lambda item: item[0])
+    if quality == 0:
+        raise web.HTTPNotAcceptable(headers={"Vary": "Accept-Encoding"})
+    body = await asyncio.to_thread(lambda: json.dumps(report).encode("utf-8"))
+    response = web.Response(body=body, content_type="application/json", charset="utf-8",
+                            headers={"Vary": "Accept-Encoding"}, zlib_executor_size=65536)
+    if coding != "identity":
+        response.enable_compression(force=web.ContentCoding(coding))
+    return response
 
 
 async def api_capacity_export(request):
@@ -3261,6 +3302,7 @@ async def api_health(request):
     return web.json_response({
         "ok": True, "mode": EXECUTION_MODE,
         "server_time": time.time(), "started_at": STARTED_AT,
+        "sandbox": request.app.get("admin_sandbox", False),
         "comfy_online": comfy_online,
         "maintenance_active": maintenance_active,
         "capabilities": len(CAPS), "jobs": len(JOBS), "client_id": CLIENT_ID,
@@ -3276,13 +3318,19 @@ async def on_start(app):
     app["auth_store"] = await asyncio.to_thread(AuthStore, app["auth_path"])
     app["resource_access"] = await asyncio.to_thread(
         ResourceAccess, app["auth_store"], ROOT, COMFY_INPUT)
+    trace_configs = []
+    if app.get("admin_sandbox"):
+        trace = aiohttp.TraceConfig()
+        trace.on_request_start.append(deny_outbound)
+        trace_configs.append(trace)
     app["session"] = aiohttp.ClientSession(
-        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10))
+        timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
+        trace_configs=trace_configs)
     if app["local_test"]:
         await setup_local_test_auth(app)
-    else:
+    elif not app.get("admin_sandbox"):
         setup_dingtalk(app, app["auth_store"])
-    if not CONTROLLER_MODE:
+    if not CONTROLLER_MODE and not app.get("admin_sandbox"):
         for pid, job in JOBS.items():
             if local_completion_waiting(job):
                 schedule_local_completion(app, app["session"], pid, job)
@@ -3372,12 +3420,17 @@ async def no_cache(request, response):
 
 def make_app(auth_path=None):
     local_test = os.environ.get("CHOUKA_LOCAL_TEST") == "1"
+    admin_sandbox = os.environ.get("CHOUKA_ADMIN_SANDBOX") == "1"
     if local_test and (CONTROLLER_MODE or EXECUTION_MODE != "local"):
         raise RuntimeError("免登录测试只能使用 local 执行模式，不能用于 controller")
+    if admin_sandbox:
+        if local_test or not CONTROLLER_MODE:
+            raise RuntimeError("管理隔离验收必须使用完整鉴权的 controller 模式")
+        validate_runtime(ROOT, auth_path or os.environ.get("CHOUKA_AUTH_DB") or ROOT / "data" / "auth.db")
     n = load_caps()
     load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2,
-                          middlewares=[auth_middleware, project_write_lock])
+                          middlewares=[sandbox_guard, auth_middleware, project_write_lock])
     app["comfy_lock"] = asyncio.Lock()
     app["cleanup_pending"] = {pid for pid, job in JOBS.items()
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
@@ -3386,7 +3439,8 @@ def make_app(auth_path=None):
     app["capacity_probe_state"] = {"task": None}
     app["lifecycle"] = {"shutting_down": False}
     app["local_test"] = local_test
-    app["bind_host"] = "127.0.0.1" if local_test else "0.0.0.0"
+    app["admin_sandbox"] = admin_sandbox
+    app["bind_host"] = "127.0.0.1" if local_test or admin_sandbox else "0.0.0.0"
     if local_test:
         app["auth_path"] = Path(auth_path or ROOT / "data" / "auth-local-test.db")
     else:
@@ -3452,6 +3506,7 @@ def make_app(auth_path=None):
     app.router.add_get("/api/artifact/{pid}/{name}", api_artifact)
     if CONTROLLER_MODE:
         app.router.add_get("/api/workers", api_workers)
+        app.router.add_get("/api/workers/{worker_id}/temperature", api_worker_temperature)
         app.router.add_get("/api/costs", api_costs)
         app.router.add_get("/api/capacity", api_capacity)
         app.router.add_get("/api/capacity/export", api_capacity_export)
@@ -3462,22 +3517,24 @@ def make_app(auth_path=None):
         app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
         app.router.add_delete("/api/workers/{worker_id}", api_worker_delete)
         app.router.add_post("/api/admin/workers/sync-all", api_workers_sync_all)
-        app.router.add_post("/agent/v1/register", api_agent_register)
-        app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)
-        app.router.add_post("/agent/v1/jobs/acquire", api_agent_acquire)
-        app.router.add_post("/agent/v1/jobs/{pid}/start", api_agent_start)
-        app.router.add_get("/agent/v1/jobs/{pid}/inputs/{name}", api_agent_input)
-        app.router.add_post("/agent/v1/jobs/{pid}/event", api_agent_event)
-        app.router.add_post("/agent/v1/jobs/{pid}/artifact", api_agent_artifact)
-        app.router.add_post("/agent/v1/jobs/{pid}/complete", api_agent_complete)
-        app.router.add_post("/agent/v1/jobs/{pid}/failed", api_agent_failed)
+        if not admin_sandbox:
+            app.router.add_post("/agent/v1/register", api_agent_register)
+            app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)
+            app.router.add_post("/agent/v1/jobs/acquire", api_agent_acquire)
+            app.router.add_post("/agent/v1/jobs/{pid}/start", api_agent_start)
+            app.router.add_get("/agent/v1/jobs/{pid}/inputs/{name}", api_agent_input)
+            app.router.add_post("/agent/v1/jobs/{pid}/event", api_agent_event)
+            app.router.add_post("/agent/v1/jobs/{pid}/artifact", api_agent_artifact)
+            app.router.add_post("/agent/v1/jobs/{pid}/complete", api_agent_complete)
+            app.router.add_post("/agent/v1/jobs/{pid}/failed", api_agent_failed)
     up = ROOT / "data" / "uploads"
     up.mkdir(parents=True, exist_ok=True)
     app.router.add_get("/api/upload/{name}", api_upload_file)
     app.router.add_get("/admin/permissions", permissions_page)
     app.router.add_get("/teams", teams_page)
     # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
-    for name in ("app.js", "style.css", "director.js", "director.css", "director_edit.js"):
+    for name in ("app.js", "style.css", "director.js", "director.css", "director_edit.js",
+                 "admin-shell.css", "admin-shell.js", "controller-page.js", "costs-page.js"):
         app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
     app.on_shutdown.append(close_presence_connections)
@@ -3487,7 +3544,9 @@ def make_app(auth_path=None):
     if CONTROLLER_MODE and not ENROLLMENT_TOKEN:
         print("[抽卡系统] 警告：未配置 CHOUKA_ENROLLMENT_TOKEN，Worker 注册已禁用")
     print(f"[抽卡系统] 本机   http://127.0.0.1:{PORT}")
-    if local_test:
+    if admin_sandbox:
+        print("[抽卡系统] 本地管理验收：独立数据副本、完整鉴权，仅监听 127.0.0.1，禁止外联与执行任务。")
+    elif local_test:
         print("[抽卡系统] 本地免登录测试：仅监听 127.0.0.1，使用独立测试身份，不迁移正式账号或历史权限。")
     else:
         for ip in lan_ips():
