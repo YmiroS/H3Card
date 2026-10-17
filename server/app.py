@@ -45,7 +45,7 @@ from costs import CostLedger
 from capacity import make_spec, export_csv, model_summary_from_graph, _hash as capacity_output_key
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
-    MAX_4090_HIGH_QUALITY_DURATION_SECONDS, can_run_capability,
+    MAX_4090_HIGH_QUALITY_DURATION_SECONDS, WorkerBusyError, can_run_capability,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1909,6 +1909,19 @@ async def api_worker_enabled(request):
     return web.json_response({"ok": True, "enabled": enabled})
 
 
+async def api_worker_delete(request):
+    require_admin(request)
+    try:
+        retired = distributed_store(request.app).retire_worker(
+            request.match_info["worker_id"]
+        )
+    except WorkerBusyError as exc:
+        raise web.HTTPConflict(reason=str(exc)) from exc
+    if not retired:
+        raise web.HTTPNotFound(reason="Worker 不存在")
+    return web.json_response({"ok": True})
+
+
 async def api_workers_sync_all(request):
     require_admin(request)
     result = distributed_store(request.app).request_sync_all()
@@ -3447,6 +3460,7 @@ def make_app(auth_path=None):
         app.router.add_post("/api/capacity/jobs/{pid}/probe-outputs", api_capacity_probe_outputs)
         app.router.add_post("/api/capacity/workers/{worker_id}", api_capacity_worker)
         app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
+        app.router.add_delete("/api/workers/{worker_id}", api_worker_delete)
         app.router.add_post("/api/admin/workers/sync-all", api_workers_sync_all)
         app.router.add_post("/agent/v1/register", api_agent_register)
         app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)
