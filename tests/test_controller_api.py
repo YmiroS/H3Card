@@ -1724,7 +1724,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             "type": "sync_files", "request_id": payload["request_id"],
         }, heartbeat["commands"])
 
-    async def test_regular_users_see_maintenance_until_any_worker_is_available(self):
+    async def test_regular_users_see_maintenance_while_any_worker_sync_is_incomplete(self):
         syncing = self.store.register_worker(
             "gpu-syncing", {
                 "node_classes": ["KSampler"], "supports_file_sync": True,
@@ -1746,6 +1746,16 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.store.heartbeat(
             syncing["worker_id"], comfy_online=False, busy=False,
             maintenance={
+                "request_id": update["request_id"], "status": "running",
+                "message": "正在更新",
+            },
+        )
+        health = await (await self.client.get("/api/health")).json()
+        self.assertTrue(health["maintenance_active"])
+
+        self.store.heartbeat(
+            syncing["worker_id"], comfy_online=False, busy=False,
+            maintenance={
                 "request_id": update["request_id"], "status": "error",
                 "message": "重启失败",
             },
@@ -1755,6 +1765,17 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
 
         ready = self.store.register_worker("gpu-ready", {"node_classes": ["KSampler"]})
         self.store.heartbeat(ready["worker_id"], comfy_online=True, busy=False)
+        health = await (await self.client.get("/api/health")).json()
+        self.assertTrue(health["maintenance_active"])
+        self.assertTrue(health["comfy_online"])
+
+        self.store.heartbeat(
+            syncing["worker_id"], comfy_online=True, busy=False,
+            maintenance={
+                "request_id": update["request_id"], "status": "done",
+                "message": "更新完成",
+            },
+        )
         health = await (await self.client.get("/api/health")).json()
         self.assertFalse(health["maintenance_active"])
         self.assertTrue(health["comfy_online"])
