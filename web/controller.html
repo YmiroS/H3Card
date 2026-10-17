@@ -67,8 +67,10 @@ tr:last-child td { border-bottom:0; }
 .usage-head { display:flex; justify-content:space-between; gap:8px; color:#7f8590; font-size:10px; }
 .usage-head span:last-child { color:#bec2c9; font-family:"Cascadia Code",Consolas,monospace; white-space:nowrap; }
 .usage .bar { height:5px; margin-top:4px; }
-.worker-foot { display:flex; justify-content:space-between; gap:10px; margin-top:11px; padding-top:9px; color:var(--muted); border-top:1px solid var(--line); font-size:10px; }
+.worker-foot { display:flex; align-items:center; justify-content:space-between; gap:10px; margin-top:11px; padding-top:9px; color:var(--muted); border-top:1px solid var(--line); font-size:10px; }
 .worker-foot span { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.worker-delete { flex:none; min-height:44px; padding:8px 12px; color:var(--bad); border-color:rgba(244,63,94,.4); background:rgba(244,63,94,.08); font-size:11px; }
+.worker-delete:hover { color:#fff; border-color:var(--bad); background:rgba(244,63,94,.2); }
 .job-origin { min-width:180px; white-space:normal; }
 .job-origin strong,.job-origin span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .job-origin strong { color:#e5e7eb; font-weight:550; }
@@ -133,6 +135,7 @@ const STATUS = {idle:"空闲",busy:"忙碌",syncing:"正在更新",offline:"离�
 const SYNC_STATUS = {idle:"尚未更新",pending:"等待空闲",running:"更新并重启中",done:"更新重启完成",error:"更新重启失败"};
 const $ = id => document.getElementById(id);
 const text = (id,value) => { $(id).textContent = value; };
+let refreshVersion=0;
 
 async function get(path) {
   return H3Auth.request(path,{cache:"no-store"});
@@ -324,11 +327,17 @@ function renderWorkers(items,jobs,projects) {
     card.appendChild(resources);
 
     const foot=make("div","worker-foot");
+    const heartbeat=make("span","",`心跳 ${ago(worker.last_seen)}`);
+    heartbeat.title=when(worker.last_seen);
+    const deleteButton=make("button","worker-delete","删除设备");
+    deleteButton.type="button";
+    deleteButton.setAttribute("aria-label",`删除设备 ${displayName}`);
+    deleteButton.onclick=()=>deleteWorker(worker,deleteButton);
     foot.append(
       make("span","",`节点能力 ${(caps.node_classes||[]).length} 个`),
-      make("span","",`心跳 ${ago(worker.last_seen)}`),
+      heartbeat,
+      deleteButton,
     );
-    foot.lastElementChild.title=when(worker.last_seen);
     card.appendChild(foot); container.appendChild(card);
   }
 }
@@ -373,11 +382,13 @@ function renderConfig(health) {
   for (const [name,value] of values) { const row=document.createElement("tr"); td(row,name,"muted"); td(row,value); rows.appendChild(row); }
 }
 async function refresh() {
+  const version=++refreshVersion;
   try {
     const [health,status,workerData,jobData,projectData]=await Promise.all([
       get("/api/health"),get("/api/status"),get("/api/workers"),
       get("/api/jobs"),get("/api/projects"),
     ]);
+    if (version!==refreshVersion) return;
     const workers=workerData.workers||[];
     const jobs=jobData.jobs||[];
     const projects=projectData.projects||[];
@@ -390,8 +401,22 @@ async function refresh() {
     $("error").style.display="none";
     text("refresh-state",`最后刷新：${new Date().toLocaleTimeString("zh-CN",{hour12:false})}`);
   } catch (error) {
+    if (version!==refreshVersion) return;
     $("error").textContent=`读取中间层信息失败：${error.message}`; $("error").style.display="block";
     text("refresh-state","连接失败");
+  }
+}
+async function deleteWorker(worker,button) {
+  const name=worker.name||"未命名执行端";
+  if (!confirm(`确认删除设备“${name}”？\n\n设备会从列表中移除，历史任务和账单不会删除。设备后续重新注册时会重新出现。`)) return;
+  button.disabled=true;
+  try {
+    await H3Auth.request(`/api/workers/${encodeURIComponent(worker.id)}`,{method:"DELETE"});
+    await refresh();
+  } catch (error) {
+    $("error").textContent=`删除设备失败：${error.message}`;
+    $("error").style.display="block";
+    button.disabled=false;
   }
 }
 async function syncAllWorkers() {
