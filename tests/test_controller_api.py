@@ -1738,6 +1738,50 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             "type": "sync_files", "request_id": payload["request_id"],
         }, heartbeat["commands"])
 
+    async def test_primary_node_is_excluded_from_sync_and_maintenance_status(self):
+        capabilities = {
+            "node_classes": ["KSampler"], "supports_file_sync": True,
+            "supports_code_restart": True,
+        }
+        credentials = self.store.register_worker("gpu-primary", capabilities)
+        worker_id = credentials["worker_id"]
+        self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+        update = self.store.request_sync_all()
+        self.store.heartbeat(
+            worker_id, comfy_online=True, busy=False,
+            maintenance={
+                "request_id": update["request_id"], "status": "error",
+                "message": "旧同步失败",
+            },
+        )
+        self.assertTrue((await (await self.client.get("/api/health")).json())["maintenance_active"])
+
+        self.store.heartbeat(
+            worker_id, capabilities={**capabilities, "is_primary_node": True},
+            comfy_online=True, busy=False,
+        )
+        health = await (await self.client.get("/api/health")).json()
+        self.assertFalse(health["maintenance_active"])
+        self.assertTrue(health["comfy_online"])
+        workers = (await (await self.client.get("/api/workers")).json())["workers"]
+        self.assertTrue(workers[0]["is_primary_node"])
+        self.assertEqual(workers[0]["sync_status"], "idle")
+        capacity = await (await self.client.get("/api/capacity")).json()
+        machine = next(item for item in capacity["workers"] if item["id"] == worker_id)
+        self.assertEqual(machine["state"], "idle")
+
+        response = await self.client.post(
+            "/api/admin/workers/sync-all", headers=self.headers, json={}
+        )
+        self.assertEqual(response.status, 202, await response.text())
+        result = await response.json()
+        self.assertEqual(result["worker_count"], 0)
+        self.assertEqual(result["primary_count"], 1)
+        heartbeat = self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+        self.assertNotIn("sync_files", {
+            command["type"] for command in heartbeat["commands"]
+        })
+
     async def test_admin_can_delete_worker_and_fresh_registration_reappears(self):
         credentials = self.store.register_worker(
             "GPU-A6000-01", {

@@ -128,6 +128,11 @@ test('controller deletes an obsolete worker with confirmation and CSRF', async (
     id:'worker-a6000', name:'GPU-A6000-01', state:'offline', enabled:true,
     comfy_online:false, busy:false, sync_status:'pending', sync_message:'等待节点空闲',
     last_seen:1789000000, capabilities:{node_classes:['KSampler'], telemetry:{hostname:'DESKTOP-A6000'}},
+  }, {
+    id:'worker-primary', name:'GPU-5090-01', state:'idle', enabled:true,
+    comfy_online:true, busy:false, is_primary_node:true,
+    sync_status:'running', sync_message:'不应展示的旧同步状态', last_seen:1789535399,
+    capabilities:{is_primary_node:true, node_classes:['KSampler'], telemetry:{hostname:'MAIN-PC'}},
   }];
   let deletion = null, rejectDeletion = true, holdWorkers = false, heldWorkers = null, receivedWorkers;
   const unexpected = [];
@@ -140,7 +145,7 @@ test('controller deletes an obsolete worker with confirmation and CSRF', async (
     if (req.method === 'DELETE' && url.pathname === '/api/workers/worker-a6000') {
       deletion={method:req.method,path:url.pathname,csrf:req.headers['x-csrf-token']};
       if(rejectDeletion)return json(res,{error:'Worker 当前有执行中的任务'},409);
-      workers=[]; return json(res,{ok:true});
+      workers=workers.filter(worker=>worker.id!=='worker-a6000'); return json(res,{ok:true});
     }
     if (req.method === 'POST' && url.pathname === '/api/auth/presence') {
       req.resume(); return json(res,{online_users:1});
@@ -181,15 +186,20 @@ test('controller deletes an obsolete worker with confirmation and CSRF', async (
     await button.click();await page.getByRole('alert').waitFor();
     assert.match(await page.locator('#error-message').textContent(),/Worker 当前有执行中的任务/);
     await button.waitFor({state:'visible'});await page.waitForFunction(()=>!document.querySelector('[data-delete-worker]').disabled);
-    assert.equal(await page.locator('#worker-rows [data-worker]').count(),1,'409保留设备并可重试');
+    assert.equal(await page.locator('#worker-rows [data-worker]').count(),2,'409保留设备并可重试');
     rejectDeletion=false;holdWorkers=true;const oldRead=new Promise(resolve=>{receivedWorkers=resolve;});
     await page.locator('#refresh').click();await oldRead;
     const deleted=page.waitForResponse(response=>response.request().method()==='DELETE');await button.click();await deleted;
     heldWorkers();
-    await page.waitForFunction(()=>document.querySelectorAll('#worker-rows [data-worker]').length===0);
+    await page.waitForFunction(()=>document.querySelectorAll('#worker-rows [data-worker]').length===1);
     assert.deepEqual(deletion,{method:'DELETE',path:'/api/workers/worker-a6000',csrf:'delete-csrf'});
     assert.match(dialogs[0],/历史任务和账单不会删除/);
-    assert.equal(await page.getByText('还没有注册执行端',{exact:true}).isVisible(),true,'删除前的迟到读取不得让设备重新出现');
+    const primaryRow=page.locator('#worker-rows tr').filter({hasText:'GPU-5090-01'});
+    assert.match(await primaryRow.textContent(),/主节点/);
+    assert.match(await primaryRow.textContent(),/主节点 · 无需同步/);
+    assert.match(await primaryRow.textContent(),/可接任务/);
+    assert.doesNotMatch(await primaryRow.textContent(),/不应展示的旧同步状态/);
+    assert.doesNotMatch(await page.locator('#worker-rows').textContent(),/GPU-A6000-01/,'删除前的迟到读取不得让设备重新出现');
     assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
   } finally {
     if (browser) await browser.close();

@@ -1200,10 +1200,15 @@ class CapacityStore:
             if worker_id and wid != worker_id:
                 continue
             last_seen = _num(worker.get("last_seen"))
+            caps = worker.get("capabilities_json")
+            caps = caps if isinstance(caps, dict) else {}
+            is_primary = caps.get("is_primary_node") is True
             if last_seen is None or time.time() - last_seen > getattr(self.store, "offline_seconds", 30):
                 state = "offline"
-            elif worker.get("sync_status") in {"pending", "running"}:
+            elif not is_primary and worker.get("sync_status") in {"pending", "running"}:
                 state = "syncing"
+            elif not is_primary and worker.get("sync_status") == "error":
+                state = "error"
             elif not worker.get("enabled", True):
                 state = "disabled"
             elif not worker.get("comfy_online"):
@@ -1212,8 +1217,6 @@ class CapacityStore:
                 state = "busy" if worker.get("busy") or worker.get("current_job_id") else "idle"
             # 当前清单可能合入人工补录，不能污染上面用于主机归属的原始硬件。
             hardware = dict(worker_hardware[wid])
-            caps = worker.get("capabilities_json")
-            caps = caps if isinstance(caps, dict) else {}
             agent_version = _num(caps.get("agent_version"))
             flag = caps.get("supports_capacity_telemetry")
             supports_capacity_telemetry = bool(agent_version is not None and agent_version >= 4

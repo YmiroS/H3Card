@@ -82,7 +82,7 @@ async function withFixture(options, run) {
     '/api/workers': () => ({body:{workers:workers(at)}}),
     '/api/jobs': () => ({body:{jobs:jobs(at)}}),
     '/api/projects': () => ({body:{projects:[{id:'project-a', name:'真实项目'}]}}),
-    '/api/admin/workers/sync-all': () => ({body:{worker_count:3, skipped_count:0}}),
+    '/api/admin/workers/sync-all': () => ({body:{worker_count:3, primary_count:0, skipped_count:0}}),
     '/api/costs': request => {
       const from = Number(request.url.searchParams.get('from'));
       const days = from ? Math.round((at - from) / 86400) : 0;
@@ -425,14 +425,15 @@ test('更新并重启使用真实确认和CSRF；失败可重试；读取失败�
     await page.locator('#sync-all').click();
     assert.match(await page.locator('dialog').textContent(), /更新全部节点.*ComfyUI.*models.*user.*chouka.*重启.*ComfyUI.*Worker/s);
     assert.equal(await page.locator('dialog [type=submit]').textContent(), '确认更新');
+    assert.match(await page.locator('dialog').textContent(), /主节点.*不会参与更新/);
     assert.doesNotMatch(await page.locator('dialog').textContent(), /手动更新 requirements/);
     assert.equal(requests.filter(request => request.url.pathname.includes('sync-all')).length, 0, '打开确认窗不能立即写入');
     await page.locator('dialog [type=submit]').click();
     await page.waitForFunction(() => document.querySelector('dialog [role=alert]').textContent.includes('真实同步失败'));
-    handlers['/api/admin/workers/sync-all'] = () => ({body:{worker_count:3, skipped_count:1}});
+    handlers['/api/admin/workers/sync-all'] = () => ({body:{worker_count:3, primary_count:1, skipped_count:1}});
     await page.locator('dialog [type=submit]').click();
     await page.waitForFunction(() => !document.querySelector('dialog'));
-    assert.match(await page.locator('#admin-toast').textContent(), /3.*1/s);
+    assert.match(await page.locator('#admin-toast').textContent(), /3.*主节点.*1.*旧版.*1/s);
     handlers['/api/status'] = () => ({status:500, body:{error:'状态读取失败'}});
     await page.locator('#refresh').click();
     await page.waitForFunction(() => !document.querySelector('#error').hidden);
