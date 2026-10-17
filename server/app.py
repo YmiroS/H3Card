@@ -245,10 +245,19 @@ def record_api_cost(app, capability, result, elapsed_ms, body):
         )
 
 
-def controller_comfy_online(app):
+def controller_comfy_online(app, workers=None):
     if not CONTROLLER_MODE:
         return STATE["comfy_online"]
-    return any(w["state"] in ("idle", "busy") for w in distributed_store(app).list_workers())
+    workers = distributed_store(app).list_workers() if workers is None else workers
+    return any(w["state"] in ("idle", "busy") for w in workers)
+
+
+def controller_maintenance_active(app, workers=None):
+    if not CONTROLLER_MODE:
+        return False
+    workers = distributed_store(app).list_workers() if workers is None else workers
+    updating = any(w.get("sync_status") in ("pending", "running", "error") for w in workers)
+    return updating and not controller_comfy_online(app, workers)
 
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
@@ -3228,14 +3237,20 @@ async def api_costs(request):
 
 async def api_health(request):
     user = require_user(request)
-    if user["role"] != "admin":
-        return web.json_response({"ok": True, "mode": EXECUTION_MODE,
-                                  "comfy_online": controller_comfy_online(request.app)})
     workers = distributed_store(request.app).list_workers() if CONTROLLER_MODE else []
+    comfy_online = controller_comfy_online(request.app, workers)
+    maintenance_active = controller_maintenance_active(request.app, workers)
+    if user["role"] != "admin":
+        return web.json_response({
+            "ok": True, "mode": EXECUTION_MODE,
+            "comfy_online": comfy_online,
+            "maintenance_active": maintenance_active,
+        })
     return web.json_response({
         "ok": True, "mode": EXECUTION_MODE,
         "server_time": time.time(), "started_at": STARTED_AT,
-        "comfy_online": controller_comfy_online(request.app),
+        "comfy_online": comfy_online,
+        "maintenance_active": maintenance_active,
         "capabilities": len(CAPS), "jobs": len(JOBS), "client_id": CLIENT_ID,
         "workers": len(workers),
         "online_workers": sum(w["state"] != "offline" for w in workers),
