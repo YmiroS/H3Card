@@ -45,7 +45,8 @@ from costs import CostLedger
 from capacity import make_spec, export_csv, model_summary_from_graph, _hash as capacity_output_key
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
-    MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError, can_run_capability,
+    MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError,
+    can_run_capability, worker_capability_comparisons,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1903,7 +1904,10 @@ async def api_agent_failed(request):
 
 
 async def api_workers(request):
-    return web.json_response({"workers": distributed_store(request.app).list_workers()})
+    baseline, workers = worker_capability_comparisons(
+        distributed_store(request.app).list_workers()
+    )
+    return web.json_response({"comparison_baseline": baseline, "workers": workers})
 
 
 async def api_worker_temperature(request):

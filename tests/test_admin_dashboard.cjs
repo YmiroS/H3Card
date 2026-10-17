@@ -15,7 +15,12 @@ function deferred() { let resolve; const promise = new Promise(done => { resolve
 function workers(at) {
   return [
     {id:'worker-a', name:'真实双卡节点', state:'busy', enabled:true, comfy_online:true, busy:true,
-      current_job_id:'job-0', last_seen:at - 2, sync_status:'done', capabilities:{node_classes:['A', 'B'], telemetry:{
+      current_job_id:'job-0', last_seen:at - 2, sync_status:'done',
+      capability_comparison:{status:'missing', model_inventory_status:'missing',
+        missing_node_classes:['MissingNode<script>window.injected=2</script>'], extra_node_classes:['WorkerOnlyNode'],
+        missing_models:[{node_class:'CheckpointLoader', input:'ckpt_name', name:'models/<img src=x onerror="window.injected=3">.safetensors'}],
+        extra_models:[{node_class:'CheckpointLoader', input:'ckpt_name', name:'models/worker-only.safetensors'}]},
+      capabilities:{agent_version:5, node_classes:['A', 'B'], telemetry:{
         hostname:'WIN-A', collected_at:at - 2,
         gpus:[
           {index:0, name:'RTX 4090', utilization_percent:27, memory_used_bytes:6 * 1024 ** 3, memory_total_bytes:24 * 1024 ** 3, temperature_c:55},
@@ -23,10 +28,13 @@ function workers(at) {
         ], memory:{used_bytes:32 * 1024 ** 3, total_bytes:128 * 1024 ** 3},
       }}},
     {id:'worker-idle', name:'空闲节点', state:'idle', enabled:true, comfy_online:true, busy:false,
-      last_seen:at - 1, capabilities:{telemetry:{collected_at:at - 1, gpus:[{index:0, name:'未知温度显卡', utilization_percent:null, temperature_c:null}]}}},
+      is_primary_node:true, last_seen:at - 1,
+      capability_comparison:{status:'primary', model_inventory_status:'complete', missing_node_classes:[], extra_node_classes:[], missing_models:[], extra_models:[]},
+      capabilities:{agent_version:5, telemetry:{collected_at:at - 1, gpus:[{index:0, name:'未知温度显卡', utilization_percent:null, temperature_c:null}]}}},
     {id:'worker-offline', name:'离线节点', state:'offline', enabled:true, comfy_online:true, busy:false,
       last_seen:at - 80000, sync_status:'error', sync_message:'真实同步错误',
-      capabilities:{telemetry:{collected_at:at - 80000, gpus:[{index:0, name:'旧显卡', temperature_c:99, utilization_percent:99}]}}},
+      capability_comparison:{status:'stale', model_inventory_status:'unknown', missing_node_classes:['LegacyMissingNode'], extra_node_classes:[], missing_models:[], extra_models:[]},
+      capabilities:{agent_version:4, telemetry:{collected_at:at - 80000, gpus:[{index:0, name:'旧显卡', temperature_c:99, utilization_percent:99}]}}},
   ];
 }
 function jobs(at) {
@@ -79,7 +87,7 @@ async function withFixture(options, run) {
       server_time:at, started_at:at - 1000, comfy_online:true, jobs:35, capabilities:34,
       llm:{ok:true, model:'真实模型'}, sandbox:state.sandbox === true, maintenance_active:state.maintenance === true}}),
     '/api/status': () => ({body:{running_count:1, queued_count:0}}),
-    '/api/workers': () => ({body:{workers:workers(at)}}),
+    '/api/workers': () => ({body:{comparison_baseline:{status:'ready', worker_id:'worker-idle', agent_version:5}, workers:workers(at)}}),
     '/api/jobs': () => ({body:{jobs:jobs(at)}}),
     '/api/projects': () => ({body:{projects:[{id:'project-a', name:'真实项目'}]}}),
     '/api/admin/workers/sync-all': () => ({body:{worker_count:3, primary_count:0, skipped_count:0}}),
@@ -236,6 +244,18 @@ test('运行六概览保留真实模式、多GPU比例、状态色、最近30条
     assert.equal(await page.locator('#job-rows tr').nth(2).locator('[role=meter]').count(), 0);
     assert.equal(await page.locator('#job-rows img').count(), 0);
     assert.equal(await page.evaluate(() => window.injected), undefined);
+    assert.match(await page.locator('#worker-rows tr').first().textContent(), /Worker v5.*模型不全 · 缺 1 个；节点不全 · 缺 1 个/s);
+    assert.match(await page.locator('#worker-rows tr').nth(1).textContent(), /Worker v5.*主节点基准/s);
+    assert.match(await page.locator('#worker-rows tr').last().textContent(), /Worker v4.*节点离线 · 最后清单：模型清单未知；节点不全 · 缺 1 个/s);
+    await page.locator('[data-worker="worker-a"]').click();
+    const inventoryDialog = page.locator('dialog');
+    assert.match(await inventoryDialog.textContent(), /清单状态.*模型不全.*比较基准.*空闲节点.*缺失节点类.*MissingNode<script>.*缺失模型.*models\/<img.*\.safetensors.*CheckpointLoader · ckpt_name.*额外节点类.*WorkerOnlyNode/s);
+    assert.equal(await inventoryDialog.locator('img, script').count(), 0, '清单中的节点名与模型名只能作为文本显示');
+    assert.equal(await page.evaluate(() => window.injected), undefined);
+    await closeDialog(page);
+    await page.locator('#worker-rows [data-worker="worker-offline"]').click();
+    assert.match(await page.locator('dialog').textContent(), /模型清单未知；节点不全.*缺失节点类.*LegacyMissingNode.*缺失模型 未知.*无法判断/s);
+    await closeDialog(page);
     const colors = await page.locator('.f-worker-status .f-chip').evaluateAll(nodes => nodes.map(node => getComputedStyle(node).color));
     assert.deepEqual(colors, ['rgb(245, 201, 106)', 'rgb(123, 217, 157)', 'rgb(251, 113, 133)']);
     const receptions = await page.locator('.f-reception').allTextContents();
@@ -265,6 +285,26 @@ test('运行六概览保留真实模式、多GPU比例、状态色、最近30条
       await page.setViewportSize({width, height:1000});
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, width + ' 宽度不能整页横溢');
     }
+  });
+});
+
+test('节点详情完整显示并滚动承载长模型缺失清单', async () => {
+  await withFixture({}, async fixture => {
+    const {page, handlers, at} = fixture;
+    handlers['/api/workers'] = () => {
+      const items = workers(at);
+      items[0].capability_comparison.missing_models = Array.from({length:80}, (_, index) => ({
+        node_class:'CheckpointLoader', input:'ckpt_name', name:`models/version-${index}/model.safetensors`,
+      }));
+      return {body:{comparison_baseline:{status:'ready', worker_id:'worker-idle', agent_version:5}, workers:items}};
+    };
+    await dashboard(fixture);
+    assert.match(await page.locator('#worker-rows tr').first().textContent(), /模型不全 · 缺 80 个/);
+    await page.locator('[data-worker="worker-a"]').click();
+    const models = page.locator('dialog .inventory-list').nth(1);
+    assert.equal(await models.locator('li').count(), 80);
+    assert.equal(await models.evaluate(node => node.scrollHeight > node.clientHeight), true, '长清单必须在详情内滚动');
+    assert.match(await models.locator('li').last().textContent(), /models\/version-79\/model\.safetensors/);
   });
 });
 

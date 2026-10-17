@@ -1681,7 +1681,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         dashboard = await response.text()
         self.assertIn("<title>运行面板 · Chouka</title>", dashboard)
         self.assertIn('id="worker-rows"', dashboard)
-        self.assertIn("GPU 利用率", dashboard)
+        self.assertIn("GPU / 显存", dashboard)
         self.assertIn("一键更新全部节点", dashboard)
         self.assertIn('src="/admin-shell.js"', dashboard)
         self.assertIn('src="/controller-page.js"', dashboard)
@@ -1781,6 +1781,55 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertNotIn("sync_files", {
             command["type"] for command in heartbeat["commands"]
         })
+
+    async def test_workers_api_compares_versions_models_and_nodes_to_primary(self):
+        primary_caps = {
+            "agent_version": 5,
+            "is_primary_node": True,
+            "node_classes": ["CheckpointLoader", "KSampler"],
+            "input_choices": {
+                "CheckpointLoader": {
+                    "ckpt_name": ["models/v1.safetensors", "models/v2.safetensors"],
+                },
+            },
+            "input_types": {"CheckpointLoader": {"ckpt_name": "COMBO"}},
+        }
+        worker_caps = {
+            "agent_version": 4,
+            "node_classes": ["CheckpointLoader"],
+            "input_choices": {
+                "CheckpointLoader": {"ckpt_name": ["models/v1.safetensors"]},
+            },
+            "input_types": {"CheckpointLoader": {"ckpt_name": "COMBO"}},
+        }
+        primary = self.store.register_worker("gpu-primary", primary_caps)
+        worker = self.store.register_worker("gpu-worker", worker_caps)
+        self.store.heartbeat(primary["worker_id"], comfy_online=True, busy=False)
+        self.store.heartbeat(worker["worker_id"], comfy_online=True, busy=False)
+
+        response = await self.client.get("/api/workers")
+        self.assertEqual(response.status, 200, await response.text())
+        payload = await response.json()
+        self.assertEqual(payload["comparison_baseline"], {
+            "status": "ready", "worker_id": primary["worker_id"], "agent_version": 5,
+        })
+        by_id = {item["id"]: item for item in payload["workers"]}
+        self.assertEqual(
+            by_id[primary["worker_id"]]["capability_comparison"]["status"], "primary"
+        )
+        comparison = by_id[worker["worker_id"]]["capability_comparison"]
+        self.assertEqual(comparison["status"], "missing")
+        self.assertEqual(comparison["missing_node_classes"], ["KSampler"])
+        self.assertEqual(comparison["missing_models"], [{
+            "node_class": "CheckpointLoader", "input": "ckpt_name",
+            "name": "models/v2.safetensors",
+        }])
+
+        self.auth.create_user("inventory-viewer", auth_support.PASSWORD)
+        headers = await self.login("inventory-viewer")
+        self.assertEqual(
+            (await self.client.get("/api/workers", headers=headers)).status, 403
+        )
 
     async def test_admin_can_delete_worker_and_fresh_registration_reappears(self):
         credentials = self.store.register_worker(
