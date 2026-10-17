@@ -82,15 +82,17 @@ tr:last-child td { border-bottom:0; }
 @media (max-width:700px) { header { padding:10px 12px; flex-wrap:wrap; } header .state { order:4; width:100%; } main { padding:12px; } .worker-grid { grid-template-columns:1fr; padding:10px; } }
 </style>
 </head>
-<body>
+<body data-workspace="controller">
+<aside id="workspace-nav" aria-label="主导航">
+  <a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a>
+  <div class="workspace-footer">
+    <div class="workspace-presence" title="近 90 秒活跃用户" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人使用中</span></div>
+    <div id="account" class="account-bar"></div>
+  </div>
+</aside>
 <header>
   <h1>运行面板</h1>
   <span id="refresh-state" class="state">正在读取...</span>
-  <a href="/controller/costs">费用统计</a>
-  <a href="/controller/capacity">产能评估</a>
-  <a href="/admin/permissions">权限管理</a>
-  <a href="/">打开 Chouka Web</a>
-  <span id="account" class="account-bar"></span>
   <button id="sync-all">一键更新全部节点</button>
   <button id="refresh">立即刷新</button>
 </header>

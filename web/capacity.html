@@ -136,15 +136,22 @@ pre { white-space:pre-wrap; overflow-wrap:anywhere; color:#c2c7d0; font:12px/1.6
 #technical-details>.summary { padding:0 14px; }
 #technical-details>.section { margin:14px; }
 @media(max-width:1100px) { .worker-grid { grid-template-columns:repeat(2,minmax(0,1fr)); } .summary,.procurement { grid-template-columns:1fr; } }
-@media(max-width:700px) { .matrix-axis-col { width:104px; } .matrix-table { min-width:calc(104px + (100vw - 130px) * var(--machine-count)); } .matrix-models { grid-template-columns:1fr; } main { padding:12px; } header { padding:12px; } header .state { width:100%; order:5; } .worker-grid { grid-template-columns:1fr; padding:10px; } .metrics { grid-template-columns:1fr 1fr; } .tabs button { flex:1; padding:12px 4px; } .form-grid,.review-fields { grid-template-columns:1fr; } .demand { grid-template-columns:minmax(0,1fr) 90px; } .demand>button { grid-column:2; } }
+@media(max-width:700px) { .matrix-axis-col { width:104px; } .matrix-table { min-width:calc(104px + (100vw - var(--workspace-width) - 130px) * var(--machine-count)); } .matrix-models { grid-template-columns:1fr; } main { padding:12px; } header { padding:12px; } header .state { width:100%; order:5; } .worker-grid { grid-template-columns:1fr; padding:10px; } .metrics { grid-template-columns:1fr 1fr; } .tabs button { flex:1; padding:12px 4px; } .form-grid,.review-fields { grid-template-columns:1fr; } .demand { grid-template-columns:minmax(0,1fr) 90px; } .demand>button { grid-column:2; } }
+@media(max-width:480px) { .demand { grid-template-columns:minmax(0,1fr); } .demand>button { grid-column:auto; justify-self:end; } }
 @media(prefers-reduced-motion:reduce) { * { scroll-behavior:auto !important; transition:none !important; } }
 </style>
 </head>
-<body>
+<body data-workspace="capacity">
+<aside id="workspace-nav" aria-label="主导航">
+  <a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a>
+  <div class="workspace-footer">
+    <div class="workspace-presence" title="近 90 秒活跃用户" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人使用中</span></div>
+    <div id="account" class="account-bar"></div>
+  </div>
+</aside>
 <header>
   <h1>产能评估</h1><span id="refresh-state" class="state" role="status">正在验证身份…</span>
-  <a href="/controller">运行面板</a><a href="/controller/costs">费用统计</a>
-  <span id="account" class="account-bar"></span><button id="refresh" type="button">立即刷新</button>
+  <button id="refresh" type="button">立即刷新</button>
 </header>
 <main>
   <div id="error" class="error" role="alert" hidden></div>
