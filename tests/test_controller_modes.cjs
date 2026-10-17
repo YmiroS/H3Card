@@ -121,6 +121,83 @@ test('recent jobs show their recorded mode separately from card names', async ()
   }
 });
 
+test('controller deletes an obsolete worker with confirmation and CSRF', async () => {
+  const root = path.join(__dirname, '..', 'web');
+  const html = readFileSync(path.join(root, 'controller.html'));
+  let workers = [{
+    id:'worker-a6000', name:'GPU-A6000-01', state:'offline', enabled:true,
+    comfy_online:false, busy:false, sync_status:'pending', sync_message:'等待节点空闲',
+    last_seen:1789000000, capabilities:{node_classes:['KSampler'], telemetry:{hostname:'DESKTOP-A6000'}},
+  }];
+  let deletion = null, rejectDeletion = true, holdWorkers = false, heldWorkers = null, receivedWorkers;
+  const unexpected = [];
+  const json = (res, body, status=200) => {
+    res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'});
+    res.end(JSON.stringify(body));
+  };
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (req.method === 'DELETE' && url.pathname === '/api/workers/worker-a6000') {
+      deletion={method:req.method,path:url.pathname,csrf:req.headers['x-csrf-token']};
+      if(rejectDeletion)return json(res,{error:'Worker 当前有执行中的任务'},409);
+      workers=[]; return json(res,{ok:true});
+    }
+    if (req.method === 'POST' && url.pathname === '/api/auth/presence') {
+      req.resume(); return json(res,{online_users:1});
+    }
+    const payloads={
+      '/api/auth/me':{user:{id:'admin',username:'admin',role:'admin'},csrf_token:'delete-csrf'},
+      '/api/health':{ok:true,mode:'controller',server_time:1789535400,started_at:1789535300,comfy_online:true},
+      '/api/status':{running_count:0,queued_count:0},
+      '/api/jobs':{jobs:[]}, '/api/projects':{projects:[]},
+    };
+    if (url.pathname === '/api/workers') {
+      if(holdWorkers){holdWorkers=false;const old=structuredClone(workers);heldWorkers=()=>json(res,{workers:old});receivedWorkers();return;}
+      return json(res,{workers});
+    }
+    if (Object.hasOwn(payloads,url.pathname)) return json(res,payloads[url.pathname]);
+    const files={'/auth.js':'auth.js','/admin-shell.js':'admin-shell.js','/controller-page.js':'controller-page.js','/admin-shell.css':'admin-shell.css','/icon.png':'icon.png','/favicon.png':'favicon.png'};
+    if(Object.hasOwn(files,url.pathname)){
+      const file=files[url.pathname];res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'image/png');
+      return res.end(readFileSync(path.join(root,file)));
+    }
+    if(url.pathname==='/controller'){res.setHeader('Content-Type','text/html; charset=utf-8');return res.end(html);}
+    unexpected.push(req.method+' '+url.pathname);req.resume();res.writeHead(404);res.end();
+  });
+  await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
+  let browser;
+  try {
+    browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
+    const page = await browser.newPage({viewport:{width:1280,height:900}});
+    const dialogs=[],errors=[];let accept=false;
+    page.on('dialog', dialog => { dialogs.push(dialog.message()); return accept?dialog.accept():dialog.dismiss(); });
+    page.on('pageerror',error=>errors.push(error.message));
+    await page.goto('http://127.0.0.1:' + server.address().port + '/controller');
+    const button=page.getByRole('button',{name:'删除设备 GPU-A6000-01'});await button.waitFor();
+    assert.equal(await button.textContent(),'删除设备');
+    assert.ok((await button.boundingBox()).height >= 44);
+    await page.locator('#auto-refresh').uncheck();
+    await button.click();assert.equal(deletion,null,'取消确认不得发送删除');accept=true;
+    await button.click();await page.getByRole('alert').waitFor();
+    assert.match(await page.locator('#error-message').textContent(),/Worker 当前有执行中的任务/);
+    await button.waitFor({state:'visible'});await page.waitForFunction(()=>!document.querySelector('[data-delete-worker]').disabled);
+    assert.equal(await page.locator('#worker-rows [data-worker]').count(),1,'409保留设备并可重试');
+    rejectDeletion=false;holdWorkers=true;const oldRead=new Promise(resolve=>{receivedWorkers=resolve;});
+    await page.locator('#refresh').click();await oldRead;
+    const deleted=page.waitForResponse(response=>response.request().method()==='DELETE');await button.click();await deleted;
+    heldWorkers();
+    await page.waitForFunction(()=>document.querySelectorAll('#worker-rows [data-worker]').length===0);
+    assert.deepEqual(deletion,{method:'DELETE',path:'/api/workers/worker-a6000',csrf:'delete-csrf'});
+    assert.match(dialogs[0],/历史任务和账单不会删除/);
+    assert.equal(await page.getByText('还没有注册执行端',{exact:true}).isVisible(),true,'删除前的迟到读取不得让设备重新出现');
+    assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
+  } finally {
+    if (browser) await browser.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('H3 two-pass exposes a default-off stable switch and hides independent LoRA and TE', () => {
   const cap = JSON.parse(readFileSync(path.join(__dirname, '..', 'manifests', 'minimax_h3_ref_2pass.json'), 'utf8'));
   const spec = cap.inputs.find(input => input.key === 'stable_mode');

@@ -744,6 +744,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_post("/agent/v1/jobs/{pid}/complete", controller_app.api_agent_complete)
         application.router.add_post("/agent/v1/jobs/{pid}/failed", controller_app.api_agent_failed)
         application.router.add_get("/api/workers", controller_app.api_workers)
+        application.router.add_delete(
+            "/api/workers/{worker_id}", controller_app.api_worker_delete
+        )
         application.router.add_post(
             "/api/admin/workers/sync-all", controller_app.api_workers_sync_all
         )
@@ -1734,6 +1737,64 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn({
             "type": "sync_files", "request_id": payload["request_id"],
         }, heartbeat["commands"])
+
+    async def test_admin_can_delete_worker_and_fresh_registration_reappears(self):
+        credentials = self.store.register_worker(
+            "GPU-A6000-01", {
+                "node_classes": ["KSampler"], "supports_code_restart": True,
+            },
+        )
+        self.store.request_sync_all()
+        worker_id = credentials["worker_id"]
+        url = f"/api/workers/{worker_id}"
+
+        token = self.client.session.headers.pop("X-CSRF-Token")
+        self.assertEqual((await self.client.delete(url)).status, 403)
+        self.client.session.headers["X-CSRF-Token"] = token
+
+        response = await self.client.delete(url)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await (await self.client.get("/api/workers")).json())["workers"], [])
+        health = await (await self.client.get("/api/health")).json()
+        self.assertFalse(health["maintenance_active"])
+        agent_headers = {
+            "X-Worker-ID": worker_id,
+            "Authorization": f"Bearer {credentials['worker_token']}",
+        }
+        self.assertEqual((await self.client.post(
+            "/agent/v1/heartbeat", headers=agent_headers,
+            json={"comfy_online": True, "busy": False},
+        )).status, 401)
+
+        response = await self.client.post("/agent/v1/register", json={
+            "name": "GPU-A6000-01",
+            "enrollment_token": controller_app.ENROLLMENT_TOKEN,
+            "capabilities": {"node_classes": ["KSampler"]},
+        })
+        self.assertEqual(response.status, 201, await response.text())
+        replacement = await response.json()
+        self.assertNotEqual(replacement["worker_id"], worker_id)
+        workers = (await (await self.client.get("/api/workers")).json())["workers"]
+        self.assertEqual([worker["id"] for worker in workers], [replacement["worker_id"]])
+
+    async def test_worker_delete_requires_admin_and_rejects_active_jobs(self):
+        credentials = self.store.register_worker(
+            "gpu-active", {"node_classes": ["KSampler"]}
+        )
+        worker_id = credentials["worker_id"]
+        self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+        self.store.enqueue("active-delete", {"graph": {}}, ["KSampler"])
+        self.assertIsNotNone(self.store.acquire(worker_id))
+
+        response = await self.client.delete(f"/api/workers/{worker_id}")
+        self.assertEqual(response.status, 409, await response.text())
+        self.auth.create_user("delete-viewer", auth_support.PASSWORD)
+        headers = await self.login("delete-viewer")
+        response = await self.client.delete(
+            f"/api/workers/{worker_id}", headers=headers
+        )
+        self.assertEqual(response.status, 403)
+        self.assertEqual(self.store.list_workers()[0]["id"], worker_id)
 
     async def test_regular_users_see_maintenance_while_any_worker_sync_is_incomplete(self):
         syncing = self.store.register_worker(
