@@ -1,7 +1,7 @@
 // 使用已有临时 Playwright 与本机 Chrome；所有网络均路由到合成数据，不启动后端或访问线上。
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {readFileSync} = require('node:fs');
+const {readFileSync,existsSync} = require('node:fs');
 const {execFileSync} = require('node:child_process');
 const path = require('node:path');
 const {chromium} = require('playwright');
@@ -37,6 +37,7 @@ const PURCHASE_MODES = [
   ['minimax_h3_talk2','生视频模式 · H3 说话唱歌',['minimax_h3_talk2','minimax_h3_talk1']],
   ['minimax_h3_ref4','生视频模式 · H3图片参考',['minimax_h3_ref4']],
   ['minimax_h3_comic20','生视频模式 · 漫剧4宫格',['minimax_h3_comic20']],
+  ['minimax_h3_fusion_v2','生视频模式 · H3无损融合单采V2',['minimax_h3_fusion_v2']],
   ['minimax_h3_ref9','生视频模式 · H3全能参考',['minimax_h3_ref9']],
   ['minimax_h3_ref_2pass','生视频模式 · H3全能参考(高质量)',['minimax_h3_ref_2pass']],
 ];
@@ -204,7 +205,30 @@ except ValueError as error:
 print(json.dumps({'report':report,'write':profile,'baseline':baseline,'estimates':estimates,'mixed_error':mixed_error},ensure_ascii=False))
 connection.close()
 `;
-  return JSON.parse(execFileSync(process.env.CHOUKA_TEST_PYTHON || 'python3',['-X','utf8','-c',script,path.join(__dirname,'..'),withOutputResolution?'outputs':withModelEvidence?'evidence':'basic',String(NOW.getTime()/1000)],{encoding:'utf8'}));
+  const projectPython=path.join(__dirname,'..','.venv','bin','python');
+  const python=process.env.CHOUKA_TEST_PYTHON || (existsSync(projectPython)?projectPython:'python3');
+  return JSON.parse(execFileSync(python,['-X','utf8','-c',script,path.join(__dirname,'..'),withOutputResolution?'outputs':withModelEvidence?'evidence':'basic',String(NOW.getTime()/1000)],{encoding:'utf8'}));
+}
+// 同总数、同原组、同截止时间仍是不同快照，不能靠数量或时间戳复用证据。
+function capacitySnapshot(label,total=125) {
+  const input=purchaseFixture();
+  input.details=Array.from({length:total},(_,i)=>({...input.details[0],job_id:`${label}-${i}`,group_id:'h1'}));
+  input.details_total=total;return input;
+}
+function capacityPage(input,url) {
+  const result=structuredClone(input),start=Number(url.searchParams.get('offset'));
+  result.details=result.details.slice(start,start+Number(url.searchParams.get('limit')));return result;
+}
+function deferCapacity(state,offset=0) {
+  let resume,received;
+  const request=new Promise(resolve=>received=resolve);
+  state.holdGet=(route,url)=>{
+    if(Number(url.searchParams.get('offset'))!==offset)return route.fulfill({contentType:'application/json',body:JSON.stringify(capacityPage(state.data,url))});
+    const captured=capacityPage(state.data,url);state.holdGet=null;
+    resume=(status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(status===200?captured:{error:'快照刷新合成失败'})});
+    received(Object.fromEntries(url.searchParams));
+  };
+  return {request,release:(status)=>resume(status)};
 }
 const estimateResponse = {mode:'historical',quality:'technical',worker_id:'w1',total_seconds:12000,daily_capacity_seconds:8*3600*1*.75,machines:1,price_total:null,lines:[{group_id:'h1',quantity:100,seconds_per_unit:60,daily_units:360},{group_id:'h2',quantity:100,seconds_per_unit:60,daily_units:360}],warnings:['测算响应警告一','测算响应警告二'],assumptions:['未包含模型切换','单机并发槽位为一']};
 const tick = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -220,10 +244,28 @@ function assertEstimateRange(body, query) {
 }
 async function refresh(page) {
   const response=page.waitForResponse(r=>new URL(r.url()).pathname==='/api/capacity');
-  await page.locator('#refresh').click();await response;await loaded(page);
+  await safeClick(page,page.locator('#refresh'));await response;await loaded(page);
 }
-async function purchase(page) {await page.locator('#tab-purchase').click();await page.locator('.demand-quantity').first().fill('100');}
-async function calculate(page) {await page.locator('#estimate-submit').click();await page.waitForFunction(() => !document.querySelector('#export-estimate').disabled);}
+async function safeClick(page,locator) {
+  // 模态窗锁定期间仅用脚本模拟外部刷新/分页；普通交互仍使用真实点击。
+  if(await page.locator('dialog[open]').count())await locator.evaluate(node=>node.click());else await locator.click();
+}
+async function purchase(page) {
+  await safeClick(page,page.locator('#tab-purchase'));
+  if(await page.locator('dialog[open]').count())await page.locator('.demand-quantity').first().evaluate(node=>{node.value='100';node.dispatchEvent(new Event('input',{bubbles:true}));});
+  else await page.locator('.demand-quantity').first().fill('100');
+}
+async function calculate(page) {
+  if(await page.locator('dialog[open]').count())await page.locator('#estimate-form').evaluate(form=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
+  else await page.locator('#estimate-submit').click();
+  await page.waitForFunction(() => !document.querySelector('#export-estimate').disabled);
+}
+const dialogForm=page=>page.locator('dialog[open] form');
+const dialogSubmit=page=>dialogForm(page).locator('button[type=submit]');
+const dialogError=page=>dialogForm(page).locator('[data-operation-status]');
+async function reviewDialog(page,record) {await record.locator('.review-open').click();return dialogForm(page);}
+async function profileDialog(page,worker) {await worker.locator('.profile-details > summary').click();await worker.locator('.profile-details button').click();return dialogForm(page);}
+async function confirmProbe(page,button) {if(!await page.locator('dialog[open]').count())await button.click();await dialogSubmit(page).click();}
 const MATRIX_FIELDS=['任务规格','模型名称','模型精度','平均生成时间','样本与详情'];
 async function assertComparisonTable(page) {
   const table=page.locator('#summary-machines table.simple-table.matrix-table');
@@ -313,6 +355,9 @@ async function assertMaterialSpec(row,materials,parameters) {
   assert.equal(await row.locator('select option:checked').textContent(),materials.join(' + ')+'｜'+parameters);
 }
 async function assertModelLabels(row,names,labels) {
+  // 新 UI 分列保留文件与加载声明；原数据/角色/组合/XSS断言继续执行。
+  labels=labels.map((parts,index)=>parts.length!==1?parts:parts[0]==='无'?['精度未记录 / 待确认']:parts[0]==='INT8' && names[index]==='history-low-int8.safetensors'?['文件标记 INT8','加载配置 default（实际精度未确认）']:parts[0]==='FP8' && names[index]==='sample-fp8.safetensors'?['加载配置 FP8（fp8_e4m3fn）']:/^(?:BF16|FP\d+|INT\d+|Q\d_.+)$/.test(parts[0])?[`文件标记 ${parts[0]}`]:parts);
+  labels=labels.map(parts=>{const expected=parts.filter(part=>part!=='精度未记录 / 待确认');if(!expected.some(part=>part.startsWith('文件标记 ')))expected.unshift('文件标记未记录 / 待确认');if(!expected.some(part=>part.startsWith('加载配置 ')))expected.push('加载配置未记录 / 待确认');return expected;});
   const nameCell=row.locator('[data-label="模型名称"]'),precisionCell=row.locator('[data-label="模型精度"]');
   assert.deepEqual(await nameCell.locator('.model-name').allTextContents(),names);
   assert.deepEqual(await precisionCell.locator('.model-item').evaluateAll(nodes=>nodes.map(node=>[...node.querySelectorAll('.model-label')].map(label=>label.textContent))),labels);
@@ -324,25 +369,33 @@ test('产能看板语法与离线路由专项', async t => {
   const scripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match=>match[1]).filter(Boolean);
   for(const script of scripts) execFileSync(process.execPath,['--check','-'],{input:script});
   const browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER?{channel:process.env.CHOUKA_TEST_BROWSER}:{});
-  const contexts=[];
+  const contexts=[],states=[];
   async function setup(options={}) {
     const context=await browser.newContext({viewport:{width:1440,height:1000},timezoneId:options.timezone || 'Asia/Shanghai',acceptDownloads:true});contexts.push(context);
     const page=await context.newPage();page.setDefaultTimeout(7000);await page.clock.setFixedTime(NOW);
     const state={data:fixture(),gets:[],posts:[],exports:[],errors:[],getError:false,estimateError:false,reviewError:false,profileError:false,holdGet:null,holdEstimate:null};
+    state.unexpected=[];state.external=[];state.presence=[];states.push(state);
     if(options.data)state.data=options.data;
     page.on('pageerror',e=>state.errors.push(e.message));
+    await context.routeWebSocket('**/*',socket=>{state.external.push(socket.url());socket.close();});
     await context.route('**/*',async route=>{
       const request=route.request(),url=new URL(request.url());
       assert.equal(url.origin,'http://capacity.test','测试不允许连接外部服务');
       const json=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(data)});
-      if(url.pathname==='/auth.js')return route.fulfill({contentType:'text/javascript',body:readFileSync(path.join(web,'auth.js'),'utf8')});
+      if(['/icon.png','/favicon.png'].includes(url.pathname))return route.fulfill({contentType:'image/png',body:readFileSync(path.join(web,url.pathname.slice(1)))});
+      if(['/auth.js','/admin-shell.js','/admin-shell.css','/controller-page.js'].includes(url.pathname))return route.fulfill({contentType:url.pathname.endsWith('.css')?'text/css':'text/javascript',body:readFileSync(path.join(web,url.pathname.slice(1)),'utf8')});
+      if(url.pathname==='/api/auth/presence') {
+        assert.equal(request.method(),'POST');assert.equal(request.headers()['x-csrf-token'],'synthetic-csrf');
+        state.presence.push(request.postDataJSON());return json({online_users:7});
+      }
       if(url.pathname==='/api/auth/me')return json({user:{id:'admin',username:'合成管理员',role:options.role || 'admin'},csrf_token:'synthetic-csrf'});
       if(url.pathname==='/api/capacity') {
         state.gets.push(Object.fromEntries(url.searchParams));
         if(state.holdGet)return state.holdGet(route,url);
         if(state.getError)return json({error:'合成读取失败'},500);
         const result=structuredClone(state.data);
-        if(Number(url.searchParams.get('offset'))>=100)result.details=[{...result.details[0],job_id:'page-2-job'}];
+        if(options.pagedDetails){const start=Number(url.searchParams.get('offset'));result.details=result.details.slice(start,start+Number(url.searchParams.get('limit')));}
+        else if(Number(url.searchParams.get('offset'))>=100)result.details=[{...result.details[0],job_id:'page-2-job'}];
         return json(result);
       }
       if(url.pathname==='/api/capacity/estimate') {
@@ -386,17 +439,18 @@ test('产能看板语法与离线路由专项', async t => {
         state.data.details.find(d=>d.job_id==='captured-job').review=body;return json({ok:true});
       }
       if(url.pathname==='/api/capacity/export') {state.exports.push(Object.fromEntries(url.searchParams));return route.fulfill({contentType:'text/csv',headers:{'Content-Disposition':'attachment; filename="capacity.csv"'},body:'类别,数量\n合成,1'});}
-      const controllerPayloads={'/api/health':{mode:'controller',ok:true},'/api/status':{running_count:0,queued_count:0},'/api/workers':{workers:[]},'/api/jobs':{jobs:[]},'/api/projects':{projects:[]}};
+      const controllerPayloads={'/api/health':{mode:'controller',ok:true,maintenance_active:false},'/api/status':{running_count:0,queued_count:0},'/api/workers':{workers:[]},'/api/jobs':{jobs:[]},'/api/projects':{projects:[]}};
       if(controllerPayloads[url.pathname])return json(controllerPayloads[url.pathname]);
       if(url.pathname==='/controller')return route.fulfill({contentType:'text/html',body:readFileSync(path.join(web,'controller.html'),'utf8')});
       if(url.pathname==='/controller/capacity')return route.fulfill({contentType:'text/html',body:html});
-      return route.fulfill({contentType:'text/html',body:'<!doctype html><title>合成目标</title>'});
+      if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:'<!doctype html><title>合成目标</title>'});
+      state.unexpected.push(request.method()+' '+url.pathname);return route.fulfill({status:404,body:'未声明的夹具路由'});
     });
     await page.goto('http://capacity.test'+(options.controller?'/controller':'/controller/capacity'));
     if(!options.controller && options.role!=='user') {
       await loaded(page);
-      if(options.technical)await page.locator('#technical-details > summary').click();
-      if(options.evidence)await page.locator('#task-evidence > summary').click();
+      if(options.technical){await page.locator('#technical-details > summary').click();await page.waitForFunction(()=>document.querySelector('#machine-groups').childElementCount>0);}
+      if(options.evidence){await page.locator('#task-evidence > summary').click();await page.waitForFunction(()=>document.querySelector('#details').childElementCount>0);}
     }
     return {page,state,context};
   }
@@ -419,6 +473,74 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(await empty.locator('.business-row, select').count(),0);
       if(process.env.CHOUKA_TEST_SCREENSHOT){await positionMatrix(page);const file=path.parse(process.env.CHOUKA_TEST_SCREENSHOT);await page.screenshot({path:path.join(file.dir,file.name+'-summary-desktop.png'),fullPage:true});}
       assert.deepEqual(state.errors,[]);
+    });
+    await t.test('967原组首载不挂载折叠和隐藏区域，全部历史及各层原始证据按需可达',async()=>{
+      const input=purchaseFixture(),base=input.groups[0];
+      input.groups=Array.from({length:967},(_,i)=>({...base,id:'lazy-'+i,spec_key:'lazy-spec-'+i,
+        spec:{dimensions:{width:1024,height:1024},evidence:Array.from({length:25},(_,j)=>'完整原始字段-'+i+'-'+j)},
+        config:{cpu:'历史CPU-'+i},days:['2020-01-01','2026-10-08']}));
+      input.details=input.details.map((d,i)=>({...d,group_id:'lazy-'+i}));input.details_total=input.details.length;
+      const {page,state}=await setup({data:input});
+      for(const id of ['task-metrics','output-metrics','coverage','workers','machine-groups','scenario-filter','scenario-groups','evidence-filters','details','estimate-worker','demands']) {
+        assert.equal(await page.locator('#'+id).evaluate(n=>n.childNodes.length),0,id+'首载必须为空，不能只用CSS隐藏');
+      }
+      assert.equal(await page.locator('.summary-evidence *').count(),0,'交叉格隐藏证据不能预建');
+      assert.equal(await page.locator('.summary-spec option').count(),967,'选择器保留全部历史组');
+      assert.equal((await page.locator('#capacity-stats strong').allTextContents())[2],'967');
+      const initialNodes=await page.locator('*').count();assert.ok(initialNodes<2500,'首载节点不随原组证据子树膨胀');
+      t.diagnostic('967组合成数据首载DOM节点：'+initialNodes);
+      const summary=page.locator('.business-row');await summary.locator('select').selectOption('lazy-966');
+      await summary.locator('button').click();const detail=page.locator('#'+await summary.locator('button').getAttribute('aria-controls'));
+      assert.match(await detail.innerText(),/历史CPU-966/);assert.equal(await detail.locator('pre').count(),0);
+      await detail.locator('details > summary').click();assert.deepEqual(JSON.parse(await detail.locator('pre').textContent()).spec,input.groups[966].spec);
+      await summary.locator('button').click();await summary.locator('select').selectOption('lazy-0');
+      assert.equal(await detail.locator('*').count(),0,'折叠中切规格不重建证据');
+      await summary.locator('button').click();assert.match(await detail.innerText(),/历史CPU-0/);assert.doesNotMatch(await detail.innerText(),/历史CPU-966/);
+      await page.locator('#technical-details > summary').click();await page.locator('#machine-groups [data-group-id=lazy-966]').waitFor();
+      assert.equal(await page.locator('#machine-groups tbody tr').count(),967);assert.equal(await page.locator('#workers .worker').count(),input.workers.length);
+      assert.equal(await page.locator('#machine-groups details > :not(summary)').count(),0,'原组行仅挂载证据summary');
+      const last=page.locator('#machine-groups [data-group-id=lazy-966]');await last.locator('summary').click({noWaitAfter:true});await tick(page);await last.locator('pre').waitFor({state:'attached'});
+      assert.equal(await last.locator('details').evaluate(n=>n.open),true);assert.ok(await last.locator('pre').evaluate(n=>n.getBoundingClientRect().height>0),'末组原始证据展开后有实际布局，不能只挂载隐藏节点');
+      assert.match(await last.innerText(),/历史CPU-966/);assert.deepEqual(JSON.parse(await last.locator('pre').textContent()),input.groups[966].spec);
+      await last.locator('summary').click({noWaitAfter:true});await last.locator('summary').click({noWaitAfter:true});assert.equal(await last.locator('pre').count(),1,'重复展开不重复挂载');
+      // 完整长表验证后返回页头，避免自动滚动数十万像素影响后续页签点击。
+      await page.evaluate(()=>window.scrollTo({top:0,behavior:'instant'}));await tick(page);
+      await page.locator('#technical-details > summary').click({noWaitAfter:true});
+      await page.locator('#tab-scenarios').click();assert.equal(await page.locator('#scenario-filter option').count(),967);
+      await page.locator('#scenario-filter').selectOption(await page.locator('#scenario-filter option').last().getAttribute('value'));
+      assert.equal(await page.locator('#scenario-groups [data-group-id=lazy-966]').count(),1);
+      await page.locator('#task-evidence > summary').click();await page.locator('#evidence-group').waitFor();assert.equal(await page.locator('#evidence-group option').count(),968);
+      assert.equal(await page.locator('#details > details').count(),2);assert.equal(await page.locator('#details .evidence-content *').count(),0);
+      const task=page.locator('#details > details').nth(1);await task.locator(':scope > summary').click();await task.locator('.review-open').waitFor();
+      assert.equal(await task.locator('.review-open').count(),1);assert.equal(await task.locator('pre').count(),0);
+      await task.locator('details > summary').filter({hasText:'执行尝试'}).click();assert.deepEqual(JSON.parse(await task.locator('pre').textContent()),input.details[1].attempts);
+      await page.locator('#evidence-group').selectOption('lazy-1');await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 1 / 全集 2'));
+      assert.equal(await page.locator('#details [data-job-id=captured-job]').count(),1);
+      await purchase(page);await calculate(page);assert.equal(state.posts.at(-1).body.demands[0].group_id,'lazy-0');
+      const downloadPromise=page.waitForEvent('download');await page.locator('#export-estimate').click();assert.match(readFileSync(await (await downloadPromise).path(),'utf8'),/lazy-spec-0/);
+      await page.locator('#hours').fill('9');assert.equal(await page.locator('#export-estimate').isDisabled(),true);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('刷新按新快照重建开放区，折叠及非激活区失效到再次访问，筛选和采购动作保留',async()=>{
+      const input=purchaseFixture();input.details_total=input.details.length;
+      const {page,state}=await setup({data:input,technical:true,evidence:true});
+      await purchase(page);await calculate(page);await page.locator('#tab-scenarios').click();
+      const selected=await page.locator('#scenario-filter option').last().getAttribute('value');await page.locator('#scenario-filter').selectOption(selected);
+      state.data={...input,overview:{...input.overview,tasks:9999},groups:[...input.groups,{...input.groups[0],id:'new-group',spec_key:'new-scenario'}],
+        workers:input.workers.map(w=>({...w,name:'刷新后的机器'})),details:[{...input.details[0],job_id:'new-job'}],details_total:1};
+      await refresh(page);
+      assert.equal(await page.locator('#scenario-filter').inputValue(),selected);assert.equal(await page.locator('#scenario-filter option').count(),7);
+      assert.equal(await page.locator('#details [data-job-id=new-job]').count(),1);assert.equal(await page.locator('#evidence-group option[value=new-group]').count(),1);
+      assert.equal(await page.locator('#workers *, #machine-groups *, #summary-machines *, #estimate-worker *, #demands *').count(),0,'非激活tab刷新后不预建');
+      assert.equal(await page.locator('#export-estimate').isDisabled(),true);assert.equal((await page.locator('#capacity-stats strong').allTextContents())[1],'9,999');
+      await page.locator('#tab-machines').click();assert.match(await page.locator('#workers').innerText(),/刷新后的机器/);
+      assert.equal(await page.locator('#machine-groups tbody tr').count(),9);assert.equal(await page.locator('#task-metrics strong').first().innerText(),'9,999');
+      await page.locator('#technical-details > summary').click();await page.locator('#task-evidence > summary').click();
+      state.data={...state.data,groups:[{...input.groups[0],id:'final-group'}],details:[{...input.details[0],job_id:'final-job'}]};await refresh(page);
+      for(const id of ['workers','machine-groups','scenario-filter','scenario-groups','evidence-filters','details','estimate-worker','demands'])assert.equal(await page.locator('#'+id).evaluate(n=>n.childNodes.length),0,id+'折叠刷新后清空旧内容');
+      await page.locator('#technical-details > summary').click();await page.locator('#machine-groups [data-group-id=final-group]').waitFor();assert.equal(await page.locator('#machine-groups [data-group-id=final-group]').count(),1);
+      await page.locator('#task-evidence > summary').click();await page.locator('#details [data-job-id=final-job]').waitFor();assert.equal(await page.locator('#details [data-job-id=final-job]').count(),1);
+      await page.locator('#tab-scenarios').click();assert.equal(await page.locator('#scenario-filter option').count(),1);
+      await purchase(page);await calculate(page);assert.equal(state.posts.at(-1).body.demands[0].group_id,'final-group');assert.deepEqual(state.errors,[]);
     });
     await t.test('机器列与业务行组成单一语义矩阵，各交叉格模型绑定正确且展开详情不串位',async()=>{
       const input=summaryFixture(),{page,state}=await setup({data:input});
@@ -536,7 +658,7 @@ test('产能看板语法与离线路由专项', async t => {
       const names=await select.locator('option').allTextContents();assert.equal(new Set(names).size,3);assert.ok(names.every(n=>!n.includes('depth-5s')));assert.equal(names[0],'素材信息未记录｜请求时长 5 秒');
       assert.match(await row.innerText(),/1 分 18 秒/);await assertModelLabels(row,['sample-main-int8.safetensors'],[['INT8']]);assert.match(await row.innerText(),/仅 10 次 \/ 仅供参考/);
       await row.locator('button').click();let detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
-      for(const value of ['P90：1 分 38 秒','采集业务样本','sample-main-int8.safetensors','文件标记 INT8','非运行时检测','警告一','警告二','总样本 12','失败 1','取消 1','缓存条件','配置编号：config-1'])assert.ok((await detail.innerText()).includes(value),value);
+      for(const value of ['P90：98 秒','采集业务样本','sample-main-int8.safetensors','文件标记 INT8','非运行时检测','警告一','警告二','总样本 12','失败 1','取消 1','缓存条件','配置编号：config-1'])assert.ok((await detail.innerText()).includes(value),value);
       await select.selectOption('warm');assert.match(await row.innerText(),/32 秒/);assert.match(await detail.innerText(),/UNETLoader/);
       await select.selectOption('h1');assert.match(await row.innerText(),/1 分 0 秒/);await assertModelLabels(row,[],[]);assert.match(await detail.innerText(),/历史未记录/);assert.match(await detail.innerText(),/历史运行参考/);assert.doesNotMatch(await detail.innerText(),/sample-main-int8/);
       const image=page.locator('.business-row[data-capability=qwen_image_21_multi]');await assertModelLabels(image,['sample-fp8.safetensors'],[['FP8']]);
@@ -588,10 +710,11 @@ test('产能看板语法与离线路由专项', async t => {
       const {page,state}=await setup({data:evidenceFixture()});const row=page.locator('.business-row');await row.locator('select').selectOption('pair');
       const names=row.locator('[data-label="模型名称"]'),precision=row.locator('[data-label="模型精度"]');
       await assertModelLabels(row,['history-high-bf16.safetensors','history-low-int8.safetensors'],[['文件标记 BF16','加载配置 FP8（fp8_e4m3fn）'],['INT8']]);
+      const aligned=await row.locator('.matrix-models').evaluate(node=>{const a=[...node.querySelectorAll('[data-label="模型名称"] .model-item')],b=[...node.querySelectorAll('[data-label="模型精度"] .model-item')];return a.every((item,i)=>Math.abs(item.getBoundingClientRect().top-b[i].getBoundingClientRect().top)<1);});assert.equal(aligned,true,'同图多主模型的文件名与两类精度共用行轨道，不能因换行错配');
       assert.match(await names.locator('.model-item').nth(0).innerText(),/history-high-bf16/);assert.match(await names.locator('.model-item').nth(1).innerText(),/history-low-int8/);
       assert.doesNotMatch(await precision.locator('.model-item').nth(1).innerText(),/BF16|FP8/);
       assert.doesNotMatch(await row.innerText(),/current-main|当前工具默认配置|aux-|统一精度/);
-      assert.doesNotMatch(await row.textContent(),/非运行时检测|高噪声|低噪声|default/);
+      assert.doesNotMatch(await row.textContent(),/非运行时检测|高噪声|低噪声/);assert.match(await row.textContent(),/加载配置 default（实际精度未确认）/);
       assert.equal(await row.locator('.model-context').count(),0,'单一完整历史组合不显示长来源或组合编号');
       assert.doesNotMatch(await row.innerText(),/保留的原任务记录|任务记录组合|次记录 \/ .*次成功耗时/);
       await assertQuietModelCells(page);
@@ -710,7 +833,8 @@ test('产能看板语法与离线路由专项', async t => {
       await row.locator('button').click();const detail=page.locator('#'+await row.locator('button').getAttribute('aria-controls'));
       for(const [id,,labels,full] of cases) {
         await row.locator('select').selectOption(id);
-        await assertModelLabels(row,[id+'.safetensors'],[labels]);await assertQuietModelCells(page);
+        const unknown=['filename-default','loader-auto','empty','unknown','no-source','unrecognized','not-standard','numeric'].includes(id);
+        await assertModelLabels(row,[id+'.safetensors'],[unknown?['精度未记录 / 待确认']:full]);await assertQuietModelCells(page);
         assert.equal(await detail.isVisible(),true,'切规格保持详情展开');
         const modelDetail=detail.locator('.model-reference');assert.equal(await modelDetail.count(),1);
         for(const value of [id+'.safetensors',...full,'非运行时检测'])assert.ok((await modelDetail.innerText()).includes(value),id+'：'+value);
@@ -1094,15 +1218,20 @@ test('产能看板语法与离线路由专项', async t => {
       const input=fixture(),job='任务 /?#'+ATTACK;input.details[0].job_id=job;
       input.details.push({...input.details[0],job_id:'running-task',status:'running'},{...input.details[0],job_id:'error-task',status:'error'},{...input.details[0],job_id:'canceled-task',status:'canceled'});
       const {page,state}=await setup({data:input});assert.deepEqual(state.posts,[]);
-      assert.equal(await page.locator('#summary-machines .output-probe').count(),0);assert.equal(await page.locator('.output-probe').count(),2);
-      for(const button of await page.locator('.output-probe button').all())assert.equal(await button.isVisible(),false);
+      assert.equal(await page.locator('#summary-machines .output-probe').count(),0);assert.equal(await page.locator('.output-probe').count(),0);
+      await page.locator('#task-evidence > summary').click();await page.locator('#details > details').first().waitFor();
+      for(const record of await page.locator('#details > details').all())await record.locator(':scope > summary').click();
+      assert.equal(await page.locator('.output-probe').count(),2,'实际打开后仅done任务提供补采，运行/失败/取消均不提供');
+      for(const button of await page.locator('.output-probe button').all())assert.equal(await button.isVisible(),true);
+      await page.locator('#task-evidence > summary').click();
       await refresh(page);await page.locator('#task-evidence > summary').click();
       const task=page.locator('#details > details').first();await task.locator(':scope > summary').click();
       const probe=task.locator('.output-probe'),button=probe.locator('button'),status=probe.locator('[role=status]');
       assert.equal(await button.innerText(),'补采成品尺寸');assert.deepEqual(state.posts,[]);
       const gets=state.gets.length,summary=await page.locator('#summary-machines').textContent();
       let held;state.holdProbe=route=>{held=route;};
-      await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe button').disabled);
+      await button.click();assert.equal(state.posts.length,0,'打开确认窗不得触发补采');assert.match(await dialogForm(page).innerText(),/最多处理 4 个可信最终产物/);await page.locator('dialog [data-cancel]').last().click();assert.equal(state.posts.length,0,'取消补采不得写接口');
+      await confirmProbe(page,button);await page.waitForFunction(()=>document.querySelector('.output-probe button').disabled);
       await button.evaluate(node=>{node.click();node.dispatchEvent(new MouseEvent('click'));});await tick(page);
       assert.equal(state.posts.length,1);assert.deepEqual(state.posts[0],{path:'/api/capacity/jobs/'+encodeURIComponent(job)+'/probe-outputs',body:{offset:0},csrf:'synthetic-csrf'});
       assert.match(await status.textContent(),/正在补采/);
@@ -1111,26 +1240,26 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(await button.isEnabled(),true);assert.match(await status.textContent(),/本批处理 4 个，成功记录尺寸 3 个；可信最终产物共 6 个/);
       await tick(page);assert.equal(state.posts.length,1);assert.equal(state.gets.length,gets);
       await task.locator(':scope > summary').click();await task.locator(':scope > summary').click();assert.equal(await button.innerText(),'继续补采成品尺寸');assert.equal(state.posts.length,1);
-      state.probeResult={processed:2,recorded:1,total:6,next_offset:null};await button.click();
+      state.probeResult={processed:2,recorded:1,total:6,next_offset:null};await confirmProbe(page,button);
       await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='补采已完成');
       assert.deepEqual(state.posts.map(p=>p.body),[{offset:0},{offset:4}]);assert.equal(await button.isDisabled(),true);
       assert.match(await status.textContent(),/本批处理 2 个，成功记录尺寸 1 个；可信最终产物共 6 个。补采已完成，刷新看板查看结果/);
       assert.equal(await task.evaluate(n=>n.open),true);assert.equal(state.gets.length,gets);assert.equal(await page.locator('#summary-machines').textContent(),summary);
       await button.evaluate(n=>n.click());await tick(page);assert.equal(state.posts.length,2);
-      await refresh(page);assert.equal(state.gets.length,gets+1);assert.equal(state.posts.length,2);assert.equal(await page.locator('.output-probe button').first().textContent(),'补采成品尺寸');
+      await refresh(page);assert.equal(state.gets.length,gets+1);assert.equal(state.posts.length,2);await task.locator(':scope > summary').click();assert.equal(await task.locator('.output-probe button').textContent(),'补采成品尺寸');
       assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
     });
     await t.test('成品补采合同2：409及失败安全显示，不自动重试，继续批次失败保留offset',async()=>{
       const {page,state}=await setup({evidence:true});const task=page.locator('#details > details').first();await task.locator(':scope > summary').click();
       const probe=task.locator('.output-probe'),button=probe.locator('button'),status=probe.locator('[role=status]');
-      state.probeError={status:409,message:'没有可信 final 记录 '+ATTACK};await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe [role=status]').textContent.startsWith('补采失败'));
+      state.probeError={status:409,message:'没有可信 final 记录 '+ATTACK};await confirmProbe(page,button);await page.waitForFunction(()=>document.querySelector('.output-probe [role=status]').textContent.startsWith('补采失败'));
       assert.match(await status.textContent(),/没有可信最终产物记录，不能猜测成品尺寸/);assert.ok((await status.textContent()).includes(ATTACK));assert.equal(await status.locator('*').count(),0);assert.equal(await button.isEnabled(),true);
       await tick(page);assert.equal(state.posts.length,1);assert.equal(state.gets.length,1);
-      state.probeError=null;await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='继续补采成品尺寸');
-      state.probeError={status:500,message:ATTACK};await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe [role=status]').textContent.startsWith('补采失败'));
+      state.probeError=null;await confirmProbe(page,button);await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='继续补采成品尺寸');
+      state.probeError={status:500,message:ATTACK};await confirmProbe(page,button);await page.waitForFunction(()=>document.querySelector('.output-probe [role=status]').textContent.startsWith('补采失败'));
       assert.equal(await status.textContent(),'补采失败：'+ATTACK);assert.equal(await button.innerText(),'继续补采成品尺寸');assert.equal(await button.isEnabled(),true);
       await tick(page);assert.equal(state.posts.length,3);assert.equal(state.gets.length,1);
-      state.probeError=null;state.probeResult={processed:2,recorded:0,total:6,next_offset:null};await button.click();await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='补采已完成');
+      state.probeError=null;state.probeResult={processed:2,recorded:0,total:6,next_offset:null};await confirmProbe(page,button);await page.waitForFunction(()=>document.querySelector('.output-probe button').textContent==='补采已完成');
       assert.deepEqual(state.posts.map(p=>p.body),[{offset:0},{offset:0},{offset:4},{offset:4}]);assert.match(await status.textContent(),/成功记录尺寸 0 个/);
       assert.equal(await page.locator('main img, main script, main iframe, main [onerror]').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);assert.deepEqual(state.errors,[]);
     });
@@ -1162,7 +1291,7 @@ test('产能看板语法与离线路由专项', async t => {
         await page.setViewportSize({width,height:844});await positionMatrix(page);await assertComparisonTable(page);
         const size=await scroll.evaluate(node=>({client:node.clientWidth,scroll:node.scrollWidth,height:node.clientHeight,fullHeight:node.scrollHeight,maxHeight:parseFloat(getComputedStyle(node).maxHeight),overflow:getComputedStyle(node).overflowX,minWidth:parseFloat(getComputedStyle(node.querySelector('table')).minWidth),columns:node.querySelectorAll('thead .machine-heading').length,head:getComputedStyle(node.querySelector('thead')).display}));
         assert.ok(size.scroll>size.client,'手机只能在矩阵容器内横滚');assert.ok(size.fullHeight>size.height,'合成多业务触发容器纵向滚动');assert.ok(['auto','scroll'].includes(size.overflow));
-        assert.equal(size.minWidth,104+(width-72-130)*size.columns);assert.ok(Math.abs(size.maxHeight-844*.72)<1);assert.equal(size.head,'table-header-group');
+        assert.equal(size.minWidth,110+300*size.columns);assert.ok(Math.abs(size.maxHeight-844*.70)<1);assert.equal(size.head,'table-header-group');
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
         const fixed=await scroll.evaluate(node=>({top:node.querySelector('thead th').getBoundingClientRect().top-node.getBoundingClientRect().top,left:node.querySelector('tbody th.business-axis').getBoundingClientRect().left-node.getBoundingClientRect().left}));
         await scroll.focus();assert.equal(await scroll.evaluate(node=>document.activeElement===node),true);
@@ -1197,12 +1326,12 @@ test('产能看板语法与离线路由专项', async t => {
           assert.equal(visible.worker,end?'w4':'w1');
           const left=visible.axis.right,right=visible.container.right;
           for(const [label,box] of [['机器列头',visible.heading],['机器业务格',visible.cell]]) {
-            assert.ok(box.left>=left-1,`${width}px ${label}不被固定业务轴遮挡`);assert.ok(box.right<=right+1,`${width}px ${label}完整落在容器右边界内`);
+            assert.ok(box.left<right && box.right>left,`${width}px ${label}可通过局部横滚访问，不把固定300px机器列压缩成不可读窄格`);assert.ok(box.right-box.left>=299,`${width}px ${label}保留完整机器列宽`);
           }
           for(const item of visible.items) {
             assert.ok(item.text.trim() && item.box.width>0 && item.box.height>0);assert.ok(item.textRects.length>0);
             for(const box of [item.box,...item.textRects]) {
-              assert.ok(box.left>=left-1 && box.right<=right+1,`${width}px ${item.text}的元素与文字均完整横向可见`);
+              assert.ok(box.left>=visible.cell.left-1 && box.right<=visible.cell.right+1,`${width}px ${item.text}的元素与文字不超出自己的完整机器列，横向内容只在矩阵内滚动`);
               assert.ok(box.top>=visible.container.top-1 && box.bottom<=visible.container.bottom+1,`${width}px ${item.text}位于容器纵向可视范围`);
             }
           }
@@ -1218,24 +1347,29 @@ test('产能看板语法与离线路由专项', async t => {
       }
       assert.deepEqual(state.errors,[]);
     });
-    await t.test('运行面板与产能统计保留共享导航和底部账号，统计入口同组同样式',async()=>{
+    await t.test('运行面板与产能保留单一共享导航和底部账号，统计入口相邻同组同样式',async()=>{
       const {page,state}=await setupAdvanced({controller:true});
       await page.locator('.account-trigger').waitFor();
+      assert.equal(await page.locator('#workspace-nav[data-admin-sidebar]').count(),1);
+      assert.equal(await page.locator('.workspace-links').count(),1);
+      assert.equal(await page.locator('.sidebar,.side-actions,.admin-mobile-account').count(),0);
+      assert.equal(await page.locator('body').getAttribute('data-workspace'),'controller');
       const statistics=page.getByRole('group',{name:'统计',exact:true});
       assert.deepEqual(await statistics.locator('a').allTextContents(),['费用评估','产能统计']);
-      const value=await statistics.locator('a').evaluateAll(nodes=>nodes.map(node=>{
-        const style=getComputedStyle(node);
-        return {href:node.getAttribute('href'),padding:style.padding,border:style.border,background:style.backgroundColor};
-      }));
-      assert.deepEqual(value.map(node=>node.href),['/controller/costs','/controller/capacity']);
-      for(const key of ['padding','border','background'])assert.equal(value[0][key],value[1][key]);
+      const value=await statistics.locator('a[href="/controller/costs"]').evaluate(node=>{
+        const next=node.nextElementSibling,a=getComputedStyle(node),b=getComputedStyle(next);
+        return {href:next.getAttribute('href'),label:next.textContent,tag:next.tagName,parent:next.parentNode===node.parentNode,padding:[a.padding,b.padding],border:[a.border,b.border],background:[a.backgroundColor,b.backgroundColor]};
+      });
+      assert.equal(value.href,'/controller/capacity');assert.equal(value.label,'产能统计');assert.equal(value.tag,'A');assert.equal(value.parent,true);
+      for(const key of ['padding','border','background'])assert.equal(value[key][0],value[key][1]);
       assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'),'/controller');
-      await statistics.getByRole('link',{name:'产能统计',exact:true}).click();
-      await loaded(page);
+      assert.equal(await page.locator('#workspace-nav .workspace-footer #account.account-bar').count(),1);
+      await page.getByRole('link',{name:'产能统计',exact:true}).click();await loaded(page);
       assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'),'/controller/capacity');
-      assert.equal(await page.locator('#workspace-nav .workspace-footer #account').count(),1);
-      assert.equal(await page.locator('#online-count').count(),1,'机器在线数量不得与共享使用人数重名');
-      assert.deepEqual(state.errors,[]);
+      assert.equal(await page.locator('#account,.account-trigger').count(),2);
+      assert.equal(await page.locator('#online-count').count(),1,'机器在线数量不能与共享使用人数重名');
+      assert.equal(await page.locator('#workspace-nav .workspace-presence b').count(),1);
+      assert.deepEqual(state.posts,[],'导航不得产生任何业务写请求');assert.deepEqual(state.errors,[]);
     });
     await t.test('真实 auth 鉴权；任务与产物分开，完整聚合不受 100 条分页影响',async()=>{
       const {page,state}=await setupAdvanced();
@@ -1364,19 +1498,20 @@ test('产能看板语法与离线路由专项', async t => {
     });
     await t.test('历史不可验收；采集记录人工标签、未验收 null、零合格、失败与 CSRF；成功仍刷新全历史',async()=>{
       const {page,state}=await setupAdvanced();assert.equal(await page.locator('[data-job-id="history-job"] form').count(),0);
-      const record=page.locator('[data-job-id="captured-job"]');await record.locator(':scope > summary').click();await record.locator('select').selectOption('standard');await record.locator('.review-form button').click();assert.match(await record.locator('.review-form [role=status]').innerText(),/标准场景编号/);assert.equal(state.posts.length,0);
+      const record=page.locator('[data-job-id="captured-job"]');await record.locator(':scope > summary').click();const form=await reviewDialog(page,record);
+      await form.locator('select').selectOption('standard');await dialogSubmit(page).click();assert.match(await dialogError(page).innerText(),/标准场景编号/);assert.equal(state.posts.length,0);
       await page.clock.setFixedTime(new Date(NOW.getTime()+60000));
-      await record.locator('input:not([type=number])').fill('bench-001');await record.locator('textarea').fill('人工复核，不是自动验证');await record.locator('.review-form button').click();await loaded(page);await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('bench-001'));
+      await form.locator('[name=benchmark_id]').fill('bench-001');await form.locator('textarea').fill('人工复核，不是自动验证');await dialogSubmit(page).click();await loaded(page);await page.locator('dialog').waitFor({state:'detached'});await record.locator(':scope > summary').click();await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('bench-001'));
       assert.deepEqual(state.posts.at(-1).body,{accepted:null,source:'standard',benchmark_id:'bench-001',note:'人工复核，不是自动验证'});assert.equal(state.posts.at(-1).csrf,'synthetic-csrf');
-      await record.locator(':scope > summary').click();await record.locator('input[type=number]').fill('0');await record.locator('.review-form button').click();await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('人工合格数量：0'));
+      await reviewDialog(page,record);await form.locator('input[type=number]').fill('0');await dialogSubmit(page).click();await loaded(page);await page.locator('dialog').waitFor({state:'detached'});await record.locator(':scope > summary').click();await page.waitForFunction(()=>document.querySelector('[data-job-id="captured-job"]').textContent.includes('人工合格数量：0'));
       assert.equal(state.posts.at(-1).body.accepted,0);assert.equal(state.gets.length,3);for(const query of state.gets)assertHistoryQuery(query);
-      await record.locator(':scope > summary').click();state.reviewError=true;await record.locator('.review-form button').click();await page.waitForFunction(()=>document.querySelector('.review-form [role=status]').textContent.includes('保存失败'));assert.match(await record.locator('.review-form [role=status]').innerText(),/合成验收保存失败/);
+      state.reviewError=true;await reviewDialog(page,record);await dialogSubmit(page).click();await page.waitForFunction(()=>document.querySelector('[data-operation-status]').textContent.includes('保存失败'));assert.match(await dialogError(page).innerText(),/合成验收保存失败/);assert.equal(await form.locator('[name=benchmark_id]').inputValue(),'bench-001');
     });
     await t.test('所有来源文本、规格、证据、警告与错误安全渲染，不截掉警告',async()=>{
       const input=fixture();input.workers[0].name=ATTACK;input.workers[0].hardware.cpu=ATTACK;input.groups[0].capability_name=ATTACK;input.groups[0].dimensions={injected:ATTACK};input.groups[0].warnings=Array.from({length:7},(_,i)=>`${ATTACK} 警告${i}`);input.details[1].outputs=[{name:ATTACK}];input.details[1].review.note=ATTACK;
       const {page,state}=await setupAdvanced({data:input});assert.equal(await page.locator('main img').count(),0);assert.equal(await page.evaluate(()=>window.injected),undefined);
       assert.ok((await page.locator('#workers').innerText()).includes(ATTACK));const row=await page.locator('#machine-groups [data-group-id=h1]').innerText();for(const warning of input.groups[0].warnings)assert.ok(row.includes(warning));
-      await page.locator('[data-job-id=captured-job] > summary').click();assert.ok((await page.locator('[data-job-id=captured-job]').innerText()).includes(ATTACK));assert.deepEqual(state.errors,[]);
+      await page.locator('[data-job-id=captured-job] > summary').click();await page.locator('[data-job-id=captured-job] .review-open').waitFor();assert.ok((await page.locator('[data-job-id=captured-job]').innerText()).includes(ATTACK));assert.deepEqual(state.errors,[]);
     });
     await t.test('空态、读取失败及全历史刷新恢复不把未知当 0，移除分组导出不影响测算导出',async()=>{
       const input={period:{},overview:{tasks:0,done:0,error:0,canceled:0},workers:[],groups:[],details:[],details_total:0};const {page,state}=await setupAdvanced({data:input});
@@ -1400,7 +1535,7 @@ test('产能看板语法与离线路由专项', async t => {
     await t.test('后端日期列表、配置快照和人工来源按实际口径展示',async()=>{
       const input=fixture();input.groups[3].days=['2026-10-01','2026-10-02','2026-10-03'];input.groups[3].samples=35;input.groups[3].config={cpu:'执行时 CPU',gpus:[{name:'执行时 GPU',memory_total_bytes:8*1024**3}]};input.groups[3].config_source='manual+reported';input.groups[3].reviewed=30;input.workers[0].hardware_source='manual+reported';
       const {page}=await setupAdvanced({data:input});const row=page.locator('#machine-groups [data-group-id=c1]');assert.match(await row.innerText(),/样本 35 \/ 3 天/);assert.doesNotMatch(await row.innerText(),/参考样本不足/);assert.match(await row.innerText(),/已人工验收 30/);
-      await row.locator('summary').click();assert.match(await row.innerText(),/执行时 GPU/);assert.match(await row.innerText(),/机器上报 \+ 人工声明/);assert.match(await row.innerText(),/2026-10-03/);
+      await row.locator('summary').click();await row.locator('pre').waitFor();assert.match(await row.innerText(),/执行时 GPU/);assert.match(await row.innerText(),/机器上报 \+ 人工声明/);assert.match(await row.innerText(),/2026-10-03/);
       const procurement=structuredClone(input);procurement.groups=procurement.groups.filter(g=>g.source==='captured' && g.config_id==='config-1').map(g=>({...g,capability:g.capability==='depth_video'?'zimage_t2i':g.capability}));
       const actual=await setupPurchase({data:procurement});await purchase(actual.page);await calculate(actual.page);const evidence=await estimateEvidence(actual.page);
       assert.match(await evidence.innerText(),/执行时 CPU/);assert.match(await evidence.innerText(),/当前配置仅作清单参考/);
@@ -1409,9 +1544,10 @@ test('产能看板语法与离线路由专项', async t => {
       for(const action of ['page','refresh']) {
         const {page,state,context}=await setupPurchase();let release,received;const saved=new Promise(resolve=>received=resolve);
         await context.route('**/api/capacity/jobs/*/review',route=>{release=()=>route.fulfill({contentType:'application/json',body:'{"ok":true}'});received();});
-        await page.locator('[data-job-id=captured-job] > summary').click();await page.locator('[data-job-id=captured-job] .review-form button').click();await saved;
+        await page.locator('[data-job-id=captured-job] > summary').click();await reviewDialog(page,page.locator('[data-job-id=captured-job]'));await dialogSubmit(page).click();await saved;
+        assert.equal(await dialogForm(page).getAttribute('aria-busy'),'true');assert.equal(await dialogSubmit(page).isDisabled(),true);
         const later=new Date(NOW.getTime()+60000);await page.clock.setFixedTime(later);
-        if(action==='page') {await page.locator('#next').click();await page.waitForSelector('[data-job-id=page-2-job]');assertHistoryQuery(state.gets.at(-1),NOW,100);}
+        if(action==='page') {await safeClick(page,page.locator('#next'));await page.waitForSelector('[data-job-id=page-2-job]');assertHistoryQuery(state.gets.at(-1),NOW,100);}
         else {await refresh(page);assertHistoryQuery(state.gets.at(-1),later);}
         await purchase(page);await calculate(page);assertEstimateRange(state.posts.at(-1).body,state.gets.at(-1));
         await release();await page.waitForFunction(()=>document.querySelector('#refresh-state').textContent.includes('人工标记已更新'));
@@ -1454,35 +1590,37 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(await page.locator('#scenario-filter option').count(),3);
       assert.deepEqual(await page.locator('#scenario-groups tr[data-group-id]').evaluateAll(nodes=>nodes.map(n=>n.dataset.groupId)),['cold']);
       const value=await page.locator('#scenario-filter option').evaluateAll(nodes=>nodes.find(n=>n.textContent.includes('加载节点缓存')).value);
-      await page.locator('#scenario-filter').selectOption(value);await page.locator('#scenario-groups summary').click();
+      await page.locator('#scenario-filter').selectOption(value);await page.locator('#scenario-groups summary').click();await page.locator('#scenario-groups pre').waitFor();
       assert.match(await page.locator('#scenario-groups').innerText(),/UNETLoader/);
       assert.deepEqual(await page.locator('#scenario-groups tr[data-group-id]').evaluateAll(nodes=>nodes.map(n=>n.dataset.groupId)),['warm']);
     });
     await t.test('机器补录入口、部分字段提交、GiB 转字节、人工来源及历史快照不改写',async()=>{
-      const input=fixture();input.groups[3].config={cpu:'旧快照 CPU'};const {page,state}=await setupAdvanced({data:input});const worker=page.locator('[data-worker-id=w1]'),form=worker.locator('.profile-form');
-      await worker.locator('.profile-details summary').click();await form.locator('button').click();assert.match(await form.locator('[role=status]').innerText(),/没有需要保存/);assert.equal(state.posts.length,0);
+      const input=fixture();input.groups[3].config={cpu:'旧快照 CPU'};const {page,state}=await setupAdvanced({data:input});const worker=page.locator('[data-worker-id=w1]'),form=await profileDialog(page,worker);
+      assert.equal(await form.locator('.profile-form input').count(),7);assert.ok(await form.locator('.profile-form input').evaluateAll(nodes=>nodes.every(n=>n.value==='')),'人工配置7字段留空起步，不把当前上报冒充新声明');
+      const bounds=await form.evaluate(node=>({dialog:node.closest('dialog').getBoundingClientRect().height,form:node.getBoundingClientRect().height}));assert.ok(bounds.dialog<=bounds.form+3,'配置弹窗按内容自适应高度，不被原生上下inset拉出大块空白');
+      await dialogSubmit(page).click();assert.match(await dialogError(page).innerText(),/没有需要保存/);assert.equal(state.posts.length,0);
       await form.locator('[name=host_id]').fill('host-confirmed');await form.locator('[name=cpu]').fill('人工确认 CPU');await form.locator('[name=memory_total_bytes]').fill('128');await form.locator('[name=environment_id]').fill('env-v2');await form.locator('[name=model_version]').fill('model-v3');await form.locator('[name=disk]').fill('2TB NVMe');await form.locator('[name=note]').fill('人工盘点，不是历史快照');
-      await page.clock.setFixedTime(new Date(NOW.getTime()+60000));await form.locator('button').click();await page.waitForFunction(()=>!document.querySelector('#write-status').hidden);
+      await page.clock.setFixedTime(new Date(NOW.getTime()+60000));await dialogSubmit(page).click();await page.waitForFunction(()=>!document.querySelector('#write-status').hidden);await page.locator('dialog').waitFor({state:'detached'});
       assert.equal(state.gets.length,2);assertHistoryQuery(state.gets.at(-1));
       const post=state.posts.at(-1);assert.equal(post.path,'/api/capacity/workers/w1');assert.equal(post.csrf,'synthetic-csrf');assert.deepEqual(post.body,{host_id:'host-confirmed',cpu:'人工确认 CPU',memory_total_bytes:128*1024**3,environment_id:'env-v2',model_version:'model-v3',disk:'2TB NVMe',note:'人工盘点，不是历史快照'});
       assert.match(await worker.innerText(),/机器上报 \+ 人工声明/);assert.match(await worker.innerText(),/2TB NVMe/);assert.match(await page.locator('#write-status').innerText(),/不回写历史快照/);assert.deepEqual(state.data.groups[3].config,{cpu:'旧快照 CPU'});
-      await worker.locator('.profile-details summary').click();await form.locator('[name=cpu]').fill('');await form.locator('[name=note]').fill('仅更新备注');await form.locator('button').click();await page.waitForFunction(()=>document.querySelector('[data-worker-id=w1]').textContent.includes('仅更新备注'));assert.deepEqual(state.posts.at(-1).body,{note:'仅更新备注'});
+      await profileDialog(page,worker);await form.locator('[name=cpu]').fill('');await form.locator('[name=note]').fill('仅更新备注');await dialogSubmit(page).click();await page.waitForFunction(()=>document.querySelector('[data-worker-id=w1]').textContent.includes('仅更新备注'));assert.deepEqual(state.posts.at(-1).body,{note:'仅更新备注'});
     });
     await t.test('机器补录失败保留输入；非法内存不发请求；手机表单无溢出',async()=>{
-      const {page,state}=await setupAdvanced();await page.setViewportSize({width:320,height:844});const worker=page.locator('[data-worker-id=w2]'),form=worker.locator('.profile-form');await worker.locator('.profile-details summary').click();
-      assert.equal(await form.locator('[name=memory_total_bytes]').inputValue(),'');await form.locator('[name=memory_total_bytes]').fill('-1');await form.locator('button').click();assert.equal(state.posts.length,0);
-      await form.locator('[name=memory_total_bytes]').fill('9999999999999999');await form.locator('button').click();assert.match(await form.locator('[role=status]').innerText(),/安全正整数/);assert.equal(state.posts.length,0);
-      await form.locator('[name=memory_total_bytes]').fill('');await form.locator('[name=cpu]').fill('待确认 CPU');state.profileError=true;await form.locator('button').click();await page.waitForFunction(()=>document.querySelector('[data-worker-id=w2] .profile-form [role=status]').textContent.includes('保存失败'));
-      assert.match(await form.locator('[role=status]').innerText(),/合成配置保存失败/);assert.equal(await form.locator('[name=cpu]').inputValue(),'待确认 CPU');assert.equal(await form.locator('button').isDisabled(),false);assert.deepEqual(state.posts.at(-1).body,{cpu:'待确认 CPU'});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
+      const {page,state}=await setupAdvanced();await page.setViewportSize({width:320,height:844});const worker=page.locator('[data-worker-id=w2]'),form=await profileDialog(page,worker);
+      assert.equal(await form.locator('[name=memory_total_bytes]').inputValue(),'');await form.locator('[name=memory_total_bytes]').fill('-1');await dialogSubmit(page).click();assert.equal(state.posts.length,0);
+      await form.locator('[name=memory_total_bytes]').fill('9999999999999999');await dialogSubmit(page).click();assert.match(await dialogError(page).innerText(),/安全正整数/);assert.equal(state.posts.length,0);
+      await form.locator('[name=memory_total_bytes]').fill('');await form.locator('[name=cpu]').fill('待确认 CPU');state.profileError=true;await dialogSubmit(page).click();await page.waitForFunction(()=>document.querySelector('[data-operation-status]').textContent.includes('保存失败'));
+      assert.match(await dialogError(page).innerText(),/合成配置保存失败/);assert.equal(await form.locator('[name=cpu]').inputValue(),'待确认 CPU');assert.equal(await dialogSubmit(page).isDisabled(),false);assert.deepEqual(state.posts.at(-1).body,{cpu:'待确认 CPU'});assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
     });
     await t.test('机器补录与分页交错时清空依据，晚到分页不能恢复过时数据或测算',async()=>{
       for(const pending of [false,true]) {
         const {page,state,context}=await setupPurchase();let release,received;const saved=new Promise(resolve=>received=resolve);
         await context.route('**/api/capacity/workers/w1',route=>{release=()=>route.fulfill({contentType:'application/json',body:'{"source":"manual"}'});received();});
-        const worker=page.locator('[data-worker-id=w1]');await worker.locator('.profile-details summary').click();await worker.locator('[name=note]').fill('异步补录');await worker.locator('.profile-form button').click();await saved;
+        const worker=page.locator('[data-worker-id=w1]'),form=await profileDialog(page,worker);await form.locator('[name=note]').fill('异步补录');await dialogSubmit(page).click();await saved;assert.equal(await form.getAttribute('aria-busy'),'true');
         let releasePage,receivedPage;const paged=new Promise(resolve=>receivedPage=resolve);
         if(pending)state.holdGet=route=>{state.holdGet=null;releasePage=()=>route.fulfill({contentType:'application/json',body:JSON.stringify(fixture())});receivedPage();};
-        await page.locator('#next').click();
+        await safeClick(page,page.locator('#next'));
         if(pending)await paged;
         else {await page.waitForSelector('[data-job-id=page-2-job]');await purchase(page);await calculate(page);}
         assertHistoryQuery(state.gets.at(-1),NOW,100);await release();await page.waitForFunction(()=>document.querySelector('#refresh-state').textContent.includes('机器配置已更新'));
@@ -1522,8 +1660,8 @@ test('产能看板语法与离线路由专项', async t => {
       state.data=report;await refresh(page);
       await page.locator('#tab-scenarios').click();const choices=await page.locator('#scenario-filter option').evaluateAll(nodes=>nodes.map(n=>({value:n.value,text:n.textContent})));
       const selected=choices.find(c=>c.text.includes('contract-bench-a'));assert.ok(selected);await page.locator('#scenario-filter').selectOption(selected.value);assert.equal(await page.locator('#scenario-groups tr[data-group-id]').count(),1);
-      await page.locator('#tab-machines').click();await page.setViewportSize({width:390,height:844});await page.locator('.profile-details summary').click();
-      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);assert.equal(await page.locator('.profile-form [name=note]').inputValue(),'契约备注不进入配置快照');assert.match(await page.locator('.profile-form [name=cpu]').inputValue(),/契约 CPU/);assert.doesNotMatch(await page.locator('#workers').innerText(),/"logical_cores"/);
+      await page.locator('#tab-machines').click();await page.setViewportSize({width:390,height:844});const form=await profileDialog(page,page.locator('.worker').first());
+      assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);assert.equal(await form.locator('[name=note]').inputValue(),'');assert.equal(await form.locator('[name=cpu]').inputValue(),'');await form.locator('details > summary').click();assert.match(await form.innerText(),/契约备注不进入配置快照/);assert.match(await form.innerText(),/契约 CPU/);assert.doesNotMatch(await page.locator('#workers').innerText(),/"logical_cores"/);
       if(process.env.CHOUKA_TEST_SCREENSHOT){const file=path.parse(process.env.CHOUKA_TEST_SCREENSHOT);await page.screenshot({path:path.join(file.dir,file.name+'-contract.png'),fullPage:true});}
       assert.deepEqual(state.errors,[]);
     });
@@ -1558,10 +1696,10 @@ test('产能看板语法与离线路由专项', async t => {
       for(const warning of history.warnings)assert.ok((await detail.innerText()).includes(warning));
       assert.deepEqual(state.errors,[]);
     });
-    await t.test('采购合同1：彻底删除可变口径控件，11模式与卡片清单及所有真实route别名对照',async()=>{
+    await t.test('采购合同1：彻底删除可变口径控件，12模式与卡片清单及所有真实route别名对照',async()=>{
       const cards=JSON.parse(readFileSync(path.join(__dirname,'..','manifests','_cards.json'),'utf8'));
       const modes=cards.filter(c=>['card_image','card_video'].includes(c.id)).flatMap(c=>c.modes.map(m=>({id:m.id,label:(c.id==='card_image'?'生图模式':'生视频模式')+' · '+m.name,routes:[m.id,...Object.values(m.modelSwitch || {}),...Object.values(m.ladder || {})]})));
-      assert.deepEqual(PURCHASE_MODES.map(m=>m.slice(0,2)),modes.map(m=>[m.id,m.label]));assert.equal(modes.length,11);
+      assert.deepEqual(PURCHASE_MODES.map(m=>m.slice(0,2)),modes.map(m=>[m.id,m.label]));assert.equal(modes.length,12);
       for(const mode of modes)assert.ok(mode.routes.every(route=>PURCHASE_MODES.find(m=>m[0]===mode.id)[2].includes(route)),mode.id+' 卡片路由遗漏');
       const {page,state}=await setupPurchase();await purchase(page);
       assert.equal(await page.locator('#mode,#quality,#baseline,#availability,#utilization').count(),0,'不能以 hidden 保留旧口径 DOM');
@@ -1603,7 +1741,7 @@ test('产能看板语法与离线路由专项', async t => {
         purchaseGroup('null','zimage_i2i',{mean_seconds:null}),purchaseGroup('zero','flux2_klein_edit',{mean_seconds:0}),purchaseGroup('negative','flux2_klein_storyboard9',{mean_seconds:-5}),
         purchaseGroup('unmeasured','minimax_h3_ref4',{measured:0}),purchaseGroup('negative-measured','minimax_h3_ref9',{measured:-1}),purchaseGroup('missing-measured','minimax_h3_talk1',{measured:null})];
       const {page,state}=await setupPurchase({data:purchaseData(groups)});await page.locator('#tab-purchase').click();
-      assert.equal(await page.locator('.demand-group option').count(),11);assert.equal(await page.locator('.demand-group option:not(:disabled)').count(),0);assert.equal(await page.locator('#estimate-submit').isDisabled(),true);
+      assert.equal(await page.locator('.demand-group option').count(),12);assert.equal(await page.locator('.demand-group option:not(:disabled)').count(),0);assert.equal(await page.locator('#estimate-submit').isDisabled(),true);
       assert.equal(await page.locator('.demand-group').isDisabled(),true);assert.equal(await page.locator('.demand-quantity').isDisabled(),true);assert.equal(await page.locator('#add-demand').isDisabled(),true);
       assert.match(await page.locator('#panel-purchase').innerText(),/样本|耗时|证据/);assert.equal(state.posts.length,0);assert.equal(await page.locator('#export-estimate').isDisabled(),true);
       state.data.groups.push(purchaseGroup('positive','qwen_image_21_i2i',{mean_seconds:.4,measured:1}));await refresh(page);await purchase(page);await page.locator('.demand-group').selectOption('zimage_i2i');await calculate(page);
@@ -1691,6 +1829,164 @@ test('产能看板语法与离线路由专项', async t => {
       }
       assert.equal(state.posts.length,3);assert.deepEqual(state.errors,[]);
     });
+    await t.test('五视口全离线空态按内容排布，大屏不撑高标题导航与指标且离线记录不冒充在线',async()=>{
+      const input=fixture();input.workers=input.workers.map(w=>({...w,state:'offline'}));
+      const {page,state}=await setup({data:input});
+      for(const [width,height] of [[2560,1440],[1920,1080],[1440,1000],[390,844],[320,844]]) {
+        await page.setViewportSize({width,height});
+        const layout=await page.evaluate(()=>({align:getComputedStyle(document.querySelector('main.capacity-page')).alignContent,header:document.querySelector('header.page-header').getBoundingClientRect().height,tabs:document.querySelector('.tabs').getBoundingClientRect().height,metric:document.querySelector('#capacity-stats .metric').getBoundingClientRect().height,overflow:document.documentElement.scrollWidth>innerWidth}));
+        assert.equal(layout.align,'start');assert.equal(layout.overflow,false,width+'px 空态不整页横滚');
+        if(width>=1440) {assert.ok(layout.header<=160,width+'px 页头按内容高度');assert.ok(layout.tabs<=72,width+'px 导航不撑高');assert.ok(layout.metric<=140,width+'px 指标卡不撑高');}
+        assert.match(await page.locator('#summary-machines').innerText(),/当前没有在线机器/);assert.equal(await page.locator('#capacity-stats strong').first().innerText(),'0');
+      }
+      await page.locator('#include-offline').check();assert.equal(await page.locator('.matrix-table').count(),1);assert.match(await page.locator('#summary-machines').innerText(),/离线/);assert.equal(await page.locator('#capacity-stats strong').first().innerText(),'0');assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('完整UI共享壳层、四统计、跨页原组筛选与本地分页不改变真实聚合或发送写请求',async()=>{
+      const input=fixture(),original=input.details[1];input.details=Array.from({length:125},(_,i)=>({...original,job_id:'filter-job-'+i,group_id:i<100?'h1':'c1',status:i%2?'done':'error',source:i<100?'historical':'captured'}));input.details_total=125;
+      const {page,state}=await setup({data:input,pagedDetails:true,evidence:true});
+      assert.equal(await page.locator('body.admin-page').count(),1);assert.equal(await page.locator('main.capacity-page').count(),1);assert.equal(await page.locator('#workspace-nav .workspace-link[aria-current=page]').getAttribute('href'),'/controller/capacity');assert.equal(await page.locator('#account .account-name').textContent(),'合成管理员');assert.equal(await page.locator('#workspace-nav[data-admin-sidebar]').count(),1);assert.equal(await page.locator('#account.account-bar').count(),1);assert.equal(await page.locator('.sidebar,.side-actions,.admin-mobile-account').count(),0);
+      assert.deepEqual(await page.locator('#capacity-stats strong').allTextContents(),['1','3,213','8','3,190']);
+      const before=await page.locator('#capacity-stats').textContent();assert.equal(await page.locator('#details > details').count(),100);
+      await page.locator('#evidence-group').selectOption('c1');await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 25 / 全集 125'));
+      assert.equal(await page.locator('#details > details').count(),25);assert.equal(await page.locator('[data-job-id=filter-job-100]').count(),1);assert.equal(await page.locator('[data-job-id=filter-job-0]').count(),0);
+      assert.equal(state.gets.length,2);assertHistoryQuery(state.gets[1],NOW,100);assert.equal(await page.locator('#capacity-stats').textContent(),before);
+      await page.locator('#evidence-size').selectOption('10');await page.waitForFunction(()=>document.querySelector('#detail-count').textContent.startsWith('当前 10 / 总计 25'));
+      await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#page-note').textContent==='第 2 页');assert.equal(await page.locator('[data-job-id=filter-job-110]').count(),1);assert.equal(state.gets.length,2);
+      await page.locator('#evidence-status').selectOption('done');await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 12 / 全集 125'));assert.equal(await page.locator('#page-note').innerText(),'第 1 页');
+      await page.locator('#evidence-source').selectOption('historical');await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 0 / 全集 125'));assert.match(await page.locator('#details').innerText(),/当前页没有任务证据/);assert.equal(await page.locator('#next').isDisabled(),true);
+      assert.equal(await page.locator('#capacity-stats').textContent(),before);assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('跨页证据筛选晚到响应不覆盖刷新后的新快照，失败不冒充筛选完成',async()=>{
+      const input=fixture();input.details=Array.from({length:101},(_,i)=>({...input.details[0],job_id:'old-filter-'+i,group_id:'h1'}));input.details_total=101;
+      const {page,state}=await setup({data:input,pagedDetails:true,evidence:true});let release,received;const pending=new Promise(resolve=>received=resolve);
+      state.holdGet=(route,url)=>{assert.equal(url.searchParams.get('offset'),'100');state.holdGet=null;release=()=>route.fulfill({contentType:'application/json',body:JSON.stringify({...input,details:[input.details[100]]})});received();};
+      await page.locator('#evidence-source').selectOption('historical');await pending;
+      state.data={...input,details:[{...input.details[0],job_id:'new-filter-job'}],details_total:1};await refresh(page);await release();await tick(page);
+      assert.equal(await page.locator('[data-job-id=new-filter-job]').count(),1);assert.equal(await page.locator('[data-job-id^=old-filter-]').count(),0);assert.match(await page.locator('#evidence-state').innerText(),/筛选 1 \/ 全集 1/);
+      state.data=input;state.getError=false;await page.locator('#evidence-source').selectOption('');await refresh(page);state.getError=true;await page.locator('#evidence-status').selectOption('done');await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('证据筛选失败'));
+      assert.equal(await page.locator('#details > details').count(),0);assert.equal(await page.locator('#next').isDisabled(),true);assert.match(await page.locator('#detail-count').innerText(),/未完成/);assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('证据快照竞态1：刷新窄窗口拒绝旧data筛选和分页，保留可读视图及新快照完整证据',async()=>{
+      const {page,state}=await setup({data:capacitySnapshot('window-old'),pagedDetails:true,evidence:true});
+      const previous=await page.locator('#details').textContent(),stats=await page.locator('#capacity-stats').textContent();
+      const gate=deferCapacity(state);state.data=capacitySnapshot('window-new');state.data.overview.tasks=9876;
+      const later=new Date(NOW.getTime()+60000);await page.clock.setFixedTime(later);
+      await page.locator('#refresh').click();await gate.request;
+      for(const id of ['evidence-group','evidence-status','evidence-source','evidence-size','previous','next','open-evidence','include-offline','scenario-filter'])assert.equal(await page.locator('#'+id).isDisabled(),true,id+'刷新中禁用');
+      assert.equal(await page.locator('.summary-spec').first().isDisabled(),true);
+      assert.equal(await page.locator('#details').textContent(),previous);assert.equal(await page.locator('#capacity-stats').textContent(),stats);
+      await page.locator('.summary-detail-toggle').first().click();assert.equal(await page.locator('[data-evidence-entry]').first().isDisabled(),true,'刷新中才懒挂载的任务证据入口也应禁用');
+      assert.equal(await page.evaluate(()=>allEvidence()),null,'ready=false时全集读取本身也不能启动');
+      await page.evaluate(()=>{
+        const select=document.querySelector('#evidence-status');select.value='done';select.dispatchEvent(new Event('change',{bubbles:true}));
+        filterEvidence();showEvidence('h1');document.querySelector('#next').onclick();document.querySelector('#previous').onclick();
+      });
+      await tick(page);assert.equal(state.gets.length,2,'刷新未提交时不能启动任何证据分页请求');
+      assert.equal(await page.locator('#details').textContent(),previous,'被守卫的筛选不能清空旧可读证据');
+      await gate.release();await loaded(page);
+      await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
+      assert.equal(state.gets.length,3);assertHistoryQuery(state.gets[2],later,100);
+      assert.equal(await page.locator('[data-job-id^=window-old]').count(),0);assert.equal(await page.locator('[data-job-id=window-new-0]').count(),1);
+      assert.equal((await page.locator('#capacity-stats strong').allTextContents())[1],'9,876');assert.equal(await page.locator('#evidence-status').isEnabled(),true);
+      assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('证据快照竞态2：旧pending成功或失败晚到不能清除新pending，重复筛选共享新读取',async()=>{
+      for(const status of [200,500]) {
+        const {page,state}=await setup({data:capacitySnapshot('pending-old'),pagedDetails:true,evidence:true});
+        const oldGate=deferCapacity(state,100);await page.locator('#evidence-group').selectOption('h1');await oldGate.request;
+        await page.evaluate(()=>{window.oldEvidenceRead=Promise.resolve(evidencePending.promise || evidencePending).catch(()=>null);});
+        state.data=capacitySnapshot('pending-new');const newGate=deferCapacity(state,100);
+        await page.locator('#refresh').click();await newGate.request;
+        await page.evaluate(()=>{window.newEvidencePending=evidencePending;});
+        await oldGate.release(status);await page.evaluate(()=>window.oldEvidenceRead);await tick(page);
+        assert.equal(await page.evaluate(()=>evidencePending===window.newEvidencePending),true,'旧finally不能清掉新pending');
+        await page.locator('#evidence-status').selectOption('done');await tick(page);assert.equal(state.gets.length,4,'新pending应被同快照筛选复用');
+        await newGate.release();await loaded(page);await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
+        assert.equal(await page.locator('[data-job-id=pending-new-0]').count(),1);assert.equal(await page.locator('[data-job-id^=pending-old]').count(),0);
+        assert.equal(await page.locator('#error').isVisible(),false);assert.deepEqual(state.errors,[]);
+      }
+    });
+    await t.test('证据快照竞态3：旧pending晚于新cache返回不能覆盖，新全集本地翻页不重新读取',async()=>{
+      const {page,state}=await setup({data:capacitySnapshot('cache-old'),pagedDetails:true,evidence:true});
+      const oldGate=deferCapacity(state,100);await page.locator('#evidence-size').selectOption('10');await oldGate.request;
+      await page.evaluate(()=>{window.oldEvidenceRead=Promise.resolve(evidencePending.promise || evidencePending).catch(()=>null);});
+      state.data=capacitySnapshot('cache-new');await refresh(page);
+      await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
+      await page.evaluate(()=>{window.newEvidenceCache=evidenceCache;});
+      await oldGate.release();await page.evaluate(()=>window.oldEvidenceRead);await tick(page);
+      assert.equal(await page.evaluate(()=>evidenceCache===window.newEvidenceCache),true,'旧响应不能提交到新快照cache');
+      await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#page-note').textContent==='第 2 页');
+      assert.equal(await page.locator('[data-job-id=cache-new-10]').count(),1);assert.equal(await page.locator('[data-job-id^=cache-old]').count(),0);
+      assert.equal(state.gets.length,4);assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('证据快照竞态4：相同截止与总数的新旧快照不复用缓存，统计与采购仍引用新原组',async()=>{
+      const {page,state}=await setup({data:capacitySnapshot('equal-old'),pagedDetails:true,evidence:true});
+      await page.locator('#evidence-group').selectOption('h1');await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
+      state.data=capacitySnapshot('equal-new');state.data.groups[0].mean_seconds=135;await refresh(page);
+      assert.equal(state.gets.length,4);assert.ok(state.gets.every(query=>query.to===state.gets[0].to));
+      assert.equal(await page.locator('[data-job-id=equal-new-0]').count(),1);assert.equal(await page.locator('[data-job-id^=equal-old]').count(),0);
+      await page.locator('#evidence-size').selectOption('10');await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#page-note').textContent==='第 2 页');
+      assert.equal(await page.locator('[data-job-id=equal-new-10]').count(),1);assert.equal(state.gets.length,4);
+      assert.deepEqual(await page.locator('#capacity-stats strong').allTextContents(),['1','3,213','8','3,190']);
+      await purchase(page);await calculate(page);assert.equal(state.posts.at(-1).body.demands[0].group_id,'h1');assertEstimateRange(state.posts.at(-1).body,state.gets[0]);
+      assert.match(await page.locator('#estimate-result').innerText(),/13,500/);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('证据快照竞态5：刷新失败清除不确定依据，旧pending晚到无效且重试恢复筛选分页采购',async()=>{
+      const {page,state}=await setup({data:capacitySnapshot('failed-old'),pagedDetails:true,evidence:true});
+      const oldGate=deferCapacity(state,100);await page.locator('#evidence-size').selectOption('10');await oldGate.request;
+      await page.evaluate(()=>{window.oldEvidenceRead=Promise.resolve(evidencePending.promise || evidencePending).catch(()=>null);});
+      const failed=deferCapacity(state);await page.locator('#refresh').click();await failed.request;await failed.release(500);
+      await page.waitForFunction(()=>document.querySelector('#refresh-state').textContent==='读取失败');
+      assert.match(await page.locator('#error').innerText(),/快照刷新合成失败/);assert.equal(await page.locator('#evidence-size').count(),0);
+      const count=state.gets.length;
+      await page.evaluate(()=>{filterEvidence();showEvidence('h1');document.querySelector('#next').onclick();document.querySelector('#previous').onclick();});
+      await page.locator('#tab-scenarios').click();await page.locator('#tab-purchase').click();await tick(page);
+      assert.equal(state.gets.length,count);assert.equal(await page.locator('#estimate-submit').isDisabled(),true);
+      state.data=capacitySnapshot('failed-retry');await refresh(page);await oldGate.release();await page.evaluate(()=>window.oldEvidenceRead);await tick(page);
+      assert.equal(await page.locator('#error').isVisible(),false);assert.equal(await page.locator('#evidence-size').inputValue(),'10');assert.equal(await page.locator('#evidence-size').isEnabled(),true);
+      await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#page-note').textContent==='第 2 页');assert.equal(await page.locator('[data-job-id=failed-retry-10]').count(),1);
+      assert.equal(await page.locator('[data-job-id^=failed-old]').count(),0);await purchase(page);await calculate(page);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('证据快照竞态6：证据与采购尚无DOM时刷新和切视图安全，提交后才懒挂载',async()=>{
+      const {page,state}=await setup({data:capacitySnapshot('lazy-old'),pagedDetails:true});
+      assert.equal(await page.locator('#evidence-group').count(),0);assert.equal(await page.locator('#demands > *').count(),0);
+      const gate=deferCapacity(state);state.data=capacitySnapshot('lazy-new');await page.locator('#refresh').click();await gate.request;
+      await page.locator('#task-evidence > summary').click();await page.locator('#tab-scenarios').click();await page.locator('#tab-purchase').click();
+      await page.evaluate(()=>{filterEvidence();showEvidence();document.querySelector('#next').onclick();});await tick(page);
+      assert.equal(await page.locator('#evidence-group').count(),0,'未提交时不能挂载旧快照筛选DOM');assert.equal(await page.locator('#demands > *').count(),0);
+      assert.equal(state.gets.length,2);assert.equal(await page.locator('#refresh').isEnabled(),true);assert.equal(await page.locator('#tab-machines').isEnabled(),true);
+      await gate.release();await loaded(page);assert.equal(await page.locator('#evidence-group').count(),1);assert.equal(await page.locator('#details > details').count(),100);
+      assert.equal(await page.locator('[data-job-id=lazy-new-0]').count(),1);await page.locator('#evidence-group').selectOption('h1');
+      await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
+      await purchase(page);await calculate(page);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('证据快照竞态7：人工写后同截止重载必须替换证据全集，保留原统计与采购口径',async()=>{
+      const input=capacitySnapshot('write-old');input.details[1]={...input.details[1],job_id:'captured-job',source:'captured'};
+      const {page,state}=await setup({data:input,pagedDetails:true,evidence:true});
+      await page.locator('#evidence-group').selectOption('h1');await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
+      const record=page.locator('[data-job-id=captured-job]');await record.locator(':scope > summary').click();const form=await reviewDialog(page,record);await form.locator('textarea').fill('写后新标记');
+      state.data.details=state.data.details.map(d=>d.job_id==='captured-job'?d:{...d,job_id:d.job_id.replace('write-old','write-new')});
+      await dialogSubmit(page).click();await page.locator('dialog').waitFor({state:'detached'});await loaded(page);
+      assert.equal(state.gets.length,4);assert.ok(state.gets.every(query=>query.to===state.gets[0].to));
+      assert.equal(await page.locator('[data-job-id=write-new-0]').count(),1);assert.equal(await page.locator('[data-job-id^=write-old]').count(),0);
+      await record.locator(':scope > summary').click();await record.locator('.review-open').waitFor();assert.match(await record.innerText(),/写后新标记/);
+      assert.deepEqual(await page.locator('#capacity-stats strong').allTextContents(),['1','3,213','8','3,190']);
+      await purchase(page);await calculate(page);assert.equal(state.posts.at(-1).body.demands[0].group_id,'h1');assertEstimateRange(state.posts.at(-1).body,state.gets[0]);assert.deepEqual(state.errors,[]);
+    });
+    await t.test('补采确认、异常响应、CSRF与旧测算失效互相独立，不改写验收或技术资格',async()=>{
+      const input=purchaseFixture(),before=structuredClone(input),{page,state}=await setupPurchase({data:input});await purchase(page);await calculate(page);assert.equal(await page.locator('#export-estimate').isEnabled(),true);
+      await page.locator('#tab-machines').click();const task=page.locator('[data-job-id=history-job]');await task.locator(':scope > summary').click();const button=task.locator('.output-probe button');
+      state.probeResult={processed:5,recorded:1,total:6,next_offset:5};await confirmProbe(page,button);await page.waitForFunction(()=>document.querySelector('[data-operation-status]').textContent.includes('响应格式无效'));
+      assert.equal(await page.locator('#export-estimate').isDisabled(),true);assert.equal(await dialogSubmit(page).isEnabled(),true);assert.equal(await page.locator('dialog[open]').count(),1);assert.deepEqual(state.posts.at(-1).body,{offset:0});assert.equal(state.posts.at(-1).csrf,'synthetic-csrf');
+      state.probeResult={processed:4,recorded:1,total:6,next_offset:4};await dialogSubmit(page).click();await page.locator('dialog').waitFor({state:'detached'});
+      assert.deepEqual(state.posts.at(-1).body,{offset:0});assert.deepEqual(state.data.details.map(d=>d.review),before.details.map(d=>d.review));assert.deepEqual(state.data.groups.map(g=>g.eligible),before.groups.map(g=>g.eligible));
+      await page.locator('#tab-purchase').click();assert.equal(await page.locator('#estimate-submit').isDisabled(),true);assert.equal(await page.locator('#export-estimate').isDisabled(),true);await refresh(page);await purchase(page);await calculate(page);assert.deepEqual(state.errors,[]);
+    });
     await t.test('普通身份不能读取产能 API',async()=>{const {page,state}=await setupAdvanced({role:'user'});await page.waitForURL('http://capacity.test/');assert.equal(state.gets.length,0);});
+    for(const state of states) {
+      assert.deepEqual(state.unexpected,[],'所有静态/API请求必须命中白名单，不允许额外业务写入');
+      assert.deepEqual(state.external,[],'不允许WebSocket外联');
+      assert.ok(state.presence.length>0,'真实auth presence继续运行');
+    }
   } finally {await Promise.all(contexts.map(context=>context.close()));await browser.close();}
 });

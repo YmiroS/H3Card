@@ -1069,7 +1069,7 @@ class CapacityStore:
         return len(valid), valid, sorted(set(warnings))
 
     @staticmethod
-    def _attempt_evidence(attempt, config, spec):
+    def _attempt_evidence(attempt, config, spec, condition=None):
         warnings = []
         assigned, started = attempt["assigned_at"], attempt["started_at"]
         ended, released = attempt["ended_at"], attempt["released_at"]
@@ -1106,7 +1106,8 @@ class CapacityStore:
                 warnings.append("存在亚秒或超一小时耗时异常，保留样本待核查")
         if measurement.get("graph_changed") is True or (not failed and measurement.get("graph_changed") is not False):
             warnings.append("执行图变化未确认或已修改")
-        condition = _cache_condition(attempt, spec)
+        if condition is None:
+            condition = _cache_condition(attempt, spec)
         if isinstance(_load(attempt.get("cache_json"), None), dict):
             warnings.append("缓存节点记录无效，缓存影响未知")
         elif condition["kind"] == "unknown":
@@ -1121,6 +1122,17 @@ class CapacityStore:
             raise ValueError("开始时间必须早于结束时间")
         if type(limit) is not int or not 1 <= limit <= 1000 or type(offset) is not int or offset < 0:
             raise ValueError("分页参数无效，limit 范围为 1..1000")
+        # 只在本次报告内按完整 JSON 复用解析；区分无效 JSON 的默认值和合法 null。
+        parsed_json, missing = {}, object()
+
+        def load(value, default=None):
+            if not isinstance(value, str):
+                return _load(value, default)
+            if value not in parsed_json:
+                parsed_json[value] = _load(value, missing)
+            result = parsed_json[value]
+            return default if result is missing else result
+
         with self.lock:
             ledger = self._rows("cost_events")
             tasks = {r["job_id"]: r for r in self._rows("capacity_tasks")}
@@ -1130,14 +1142,28 @@ class CapacityStore:
             for attempt in self._rows("capacity_attempts"):
                 attempts.setdefault(attempt["job_id"], []).append(attempt)
             metadata = self._rows("capacity_worker_metadata")
-            historical_reviews = {r["job_id"]: _load(r["review_json"], {}) for r in self._rows("capacity_reviews")}
-            recovered_outputs = {r["job_id"]: _load(r["outputs_json"]) for r in
+            historical_reviews = {r["job_id"]: load(r["review_json"], {}) for r in self._rows("capacity_reviews")}
+            recovered_outputs = {r["job_id"]: load(r["outputs_json"]) for r in
                                  self._rows("capacity_output_recovery")}
             # 与账本/快照在同一把锁内读取；精简测试库可能没有调度表，不创建或伪造历史。
             archived = {}
             if self.db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='dispatch_jobs'").fetchone():
                 archived = {r["job_id"]: r["payload_json"] for r in
                             self.db.execute("SELECT job_id,payload_json FROM dispatch_jobs")}
+        # 索引必须覆盖全部历史配置和当前 Worker，不能随当前筛选或人工展示补录缩小。
+        host_workers, worker_hardware = {}, {}
+        for config in configs.values():
+            config["hardware_json"] = load(config["hardware_json"])
+            host_id = (config["hardware_json"] or {}).get("host_id")
+            if host_id:
+                host_workers.setdefault(host_id, set()).add(config["worker_id"])
+        for wid, worker in workers.items():
+            caps = load(worker.get("capabilities_json"), {})
+            worker["capabilities_json"] = caps if isinstance(caps, dict) else {}
+            hardware = worker_hardware[wid] = _hardware(worker)
+            if hardware.get("host_id"):
+                host_workers.setdefault(hardware["host_id"], set()).add(wid)
+
         def selected(row):
             return ((start is None or row["created_at"] >= start)
                     and (end is None or row["created_at"] < end)
@@ -1157,7 +1183,7 @@ class CapacityStore:
             event = dict(events.get(job_id, {}))
             job_attempts = attempts.get(job_id, [])
             current = next((a for a in job_attempts if a["id"] == task["current_attempt"]), None)
-            legacy = _load(task["spec_json"], {}).get("version") is None
+            legacy = load(task["spec_json"], {}).get("version") is None
             event.update({"job_id": job_id,
                           "capability": event.get("capability", task["capability"]) if task["capability"] == "unknown" else task["capability"],
                           "created_at": event.get("created_at", task["created_at"]) if legacy else task["created_at"],
@@ -1184,8 +1210,9 @@ class CapacityStore:
                 state = "error"
             else:
                 state = "busy" if worker.get("busy") or worker.get("current_job_id") else "idle"
-            hardware = _hardware(worker)
-            caps = _load(worker.get("capabilities_json"), {})
+            # 当前清单可能合入人工补录，不能污染上面用于主机归属的原始硬件。
+            hardware = dict(worker_hardware[wid])
+            caps = worker.get("capabilities_json")
             caps = caps if isinstance(caps, dict) else {}
             agent_version = _num(caps.get("agent_version"))
             flag = caps.get("supports_capacity_telemetry")
@@ -1194,7 +1221,7 @@ class CapacityStore:
             metas = [m for m in metadata if m["worker_id"] == wid]
             if metas:
                 # 当前清单可展示人工备注；执行快照和 CSV 分组不携带备注。
-                hardware.update(_load(max(metas, key=lambda m: m["valid_from"])["hardware_json"], {}))
+                hardware.update(load(max(metas, key=lambda m: m["valid_from"])["hardware_json"], {}))
             worker_stats[wid] = {"id": wid, "name": _text(worker.get("name")), "state": state,
                                  "last_seen": last_seen, "hardware": hardware, "tasks": 0,
                                  "agent_version": agent_version, "supports_capacity_telemetry": supports_capacity_telemetry,
@@ -1205,10 +1232,11 @@ class CapacityStore:
                 continue
             job_id, wid, status = event["job_id"], event.get("worker_id"), event["status"]
             task = tasks.get(job_id)
-            spec = _load(task["spec_json"], {}) if task else {"dimensions": _dimensions(_load(event.get("dimensions_json"), {}))}
+            # 图等嵌套证据只读共享；版本补全、旧账本维度及指纹必须保持任务局部。
+            spec = dict(load(task["spec_json"], {})) if task else {"dimensions": _dimensions(load(event.get("dimensions_json"), {}))}
             if task and spec.get("version") is None:
                 # 保留账本真正已知的规格，但绝不补造提交图、版本及输出。
-                spec["dimensions"] = _dimensions(_load(event.get("dimensions_json"), {}))
+                spec["dimensions"] = _dimensions(load(event.get("dimensions_json"), {}))
                 spec["spec_key"] = _hash([event["capability"], spec["dimensions"], "legacy"])
             job_attempts = sorted(attempts.get(job_id, []), key=lambda a: (a["assigned_at"], a["id"]))
             current = next((a for a in job_attempts if task and a["id"] == task["current_attempt"]), None)
@@ -1221,7 +1249,7 @@ class CapacityStore:
                 spec["warnings"] = [w for w in spec.get("warnings", []) if w != "模型版本未知；模型名称不等于版本"]
                 spec["complete"] = not spec["warnings"]
                 spec["spec_key"] = _hash({k: v for k, v in spec.items() if k not in {"spec_key", "warnings"}})
-            review = (_load(task["review_json"], {}) if task else historical_reviews.get(job_id, {})) or {}
+            review = (load(task["review_json"], {}) if task else historical_reviews.get(job_id, {})) or {}
             review = {"accepted": review.get("accepted"), "source": review.get("source", "business"),
                       "benchmark_id": review.get("benchmark_id"), "note": review.get("note")}
             source = ("standard" if review["source"] == "standard" else "captured") if task else "historical"
@@ -1242,26 +1270,28 @@ class CapacityStore:
                 warnings.append("成功任务耗时未知或无效，未自动补零")
             if runtime is not None and ((status == "done" and runtime < 1) or runtime > 3600):
                 warnings.append("存在亚秒或超一小时耗时异常，保留样本待核查")
-            raw_outputs = _load(task["outputs_json"], None) if task else None
+            raw_outputs = load(task["outputs_json"], None) if task else None
             count, valid, output_warnings = self._technical(spec, status, raw_outputs)
             if not task:
                 count = None
             warnings.extend(output_warnings)
             occupied_values, public_attempts, cache_conditions = [], [], {}
             for attempt in job_attempts:
+                attempt = dict(attempt, measurements_json=load(attempt["measurements_json"]),
+                               cache_json=load(attempt["cache_json"]))
                 condition = _cache_condition(attempt, spec)
                 if condition["kind"] != "loss_only":
                     cache_conditions[_json(condition)] = condition
-                occupied, reasons = self._attempt_evidence(attempt, configs.get(attempt["config_id"]), spec)
+                occupied, reasons = self._attempt_evidence(attempt, configs.get(attempt["config_id"]), spec, condition)
                 occupied_values.append(occupied)
                 warnings.extend(reasons)
                 public_attempts.append({k: attempt[k] for k in ("id", "worker_id", "worker_name", "config_id",
                                                                "assigned_at", "started_at", "ended_at", "released_at", "status")})
                 public_attempts[-1].update({"occupied_seconds": occupied, "release_known": attempt["released_at"] is not None,
                                            "gap": bool(attempt["gap"]), "cache_condition": condition,
-                                           "measurements": _load(attempt["measurements_json"]),
-                                           "cached_nodes": _load(attempt["cache_json"]) if isinstance(_load(attempt["cache_json"]), list) else None,
-                                           "cache_invalid": isinstance(_load(attempt["cache_json"]), dict), "warnings": reasons})
+                                           "measurements": attempt["measurements_json"],
+                                           "cached_nodes": attempt["cache_json"] if isinstance(attempt["cache_json"], list) else None,
+                                           "cache_invalid": isinstance(attempt["cache_json"], dict), "warnings": reasons})
             config_id = current["config_id"] if current else None
             if not job_attempts:
                 warnings.append("没有完整执行尝试记录")
@@ -1272,12 +1302,8 @@ class CapacityStore:
                 warnings.append("执行端未知或已删除且无历史配置快照，主机归属未知")
             current_hardware = _load(configs.get(config_id, {}).get("hardware_json"), {})
             host_id = current_hardware.get("host_id")
-            if host_id:
-                host_workers = {c["worker_id"] for c in configs.values()
-                                if _load(c["hardware_json"], {}).get("host_id") == host_id}
-                host_workers.update(w for w, row in workers.items() if _hardware(row).get("host_id") == host_id)
-                if len(host_workers) > 1:
-                    warnings.append("同主机存在多个 Worker，资源槽位隔离未经验证")
+            if host_id and len(host_workers.get(host_id, ())) > 1:
+                warnings.append("同主机存在多个 Worker，资源槽位隔离未经验证")
             spec_key = spec.get("spec_key") or _hash([event["capability"], spec.get("dimensions", {})])
             conditions = [cache_conditions[key] for key in sorted(cache_conditions)]
             cache_condition = (conditions[0] if len(conditions) == 1 else
