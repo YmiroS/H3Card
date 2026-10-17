@@ -169,10 +169,11 @@
   let user = null, csrf = '', stopped = false, pendingMe = null, localTest = false;
   let presenceStarted = false, presencePending = null;
   let maintenanceStarted = false, maintenancePending = null;
+  let maintenanceMode = 'clear', maintenanceHideTimer = null;
   const controllers = new Set(), timers = new Set();
   function invalidate(redirect = true) {
     stopped = true; user = null; csrf = '';
-    setMaintenanceBanner(false);
+    clearMaintenanceHideTimer(); maintenanceMode = 'clear'; setMaintenanceBanner(false);
     controllers.forEach(c => c.abort()); timers.forEach(clearInterval); timers.clear();
     window.dispatchEvent(new Event('h3auth:expired'));
     if (redirect && location.pathname !== '/login') location.replace('/login');
@@ -230,6 +231,9 @@
       if (!document.hidden) refreshPresence().catch(() => {});
     });
   }
+  const MAINTENANCE_BLOCKED_MESSAGE = '系统正在维护更新，当前暂无可用执行节点，请稍后再使用。';
+  const MAINTENANCE_PARTIAL_MESSAGE = '部分节点正在维护更新，其他可用节点仍可正常使用。';
+  const MAINTENANCE_NOTICE_MS = 5000;
   function maintenanceBanner() {
     if (window !== window.top || !document.body) return null;
     let banner = document.getElementById('maintenance-banner');
@@ -243,19 +247,41 @@
     icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><path d="M8 9h8M8 13h5"/></svg>';
     const ticker = document.createElement('div'); ticker.className = 'maintenance-banner-ticker';
     const track = document.createElement('div'); track.className = 'maintenance-banner-track';
-    const message = '系统正在维护更新，当前暂无可用执行节点，请稍后再使用。';
     for (let index = 0; index < 2; index++) {
       const item = document.createElement('span'); item.className = 'maintenance-banner-message';
-      item.textContent = message;
+      item.textContent = MAINTENANCE_BLOCKED_MESSAGE;
       if (index) item.setAttribute('aria-hidden', 'true');
       track.append(item);
     }
     ticker.append(track); banner.append(icon, ticker); document.body.prepend(banner);
     return banner;
   }
-  function setMaintenanceBanner(active) {
+  function setMaintenanceBanner(active, message) {
     const banner = active ? maintenanceBanner() : document.getElementById('maintenance-banner');
-    if (banner) banner.hidden = !active;
+    if (!banner) return;
+    if (message) banner.querySelectorAll('.maintenance-banner-message').forEach(item => { item.textContent = message; });
+    banner.hidden = !active;
+  }
+  function clearMaintenanceHideTimer() {
+    if (maintenanceHideTimer !== null) clearTimeout(maintenanceHideTimer);
+    maintenanceHideTimer = null;
+  }
+  function updateMaintenanceBanner(data) {
+    const nextMode = data.maintenance_active !== true
+      ? 'clear' : data.comfy_online === true ? 'partial' : 'blocked';
+    if (nextMode === maintenanceMode) return;
+    maintenanceMode = nextMode; clearMaintenanceHideTimer();
+    if (nextMode === 'clear') {
+      setMaintenanceBanner(false);
+    } else if (nextMode === 'blocked') {
+      setMaintenanceBanner(true, MAINTENANCE_BLOCKED_MESSAGE);
+    } else {
+      setMaintenanceBanner(true, MAINTENANCE_PARTIAL_MESSAGE);
+      maintenanceHideTimer = setTimeout(() => {
+        maintenanceHideTimer = null;
+        if (maintenanceMode === 'partial') setMaintenanceBanner(false);
+      }, MAINTENANCE_NOTICE_MS);
+    }
   }
   async function refreshMaintenance() {
     if (stopped || document.hidden) return;
@@ -265,7 +291,7 @@
       maintenancePending = request('/api/health', {
         cache:'no-store', signal:timeoutController.signal,
       }).then(data => {
-        setMaintenanceBanner(data.maintenance_active === true);
+        updateMaintenanceBanner(data);
         return data;
       }).finally(() => {
         clearTimeout(timeout); maintenancePending = null;

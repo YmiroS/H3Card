@@ -929,8 +929,8 @@ test('新版工作区跨页面保留唯一导航和底部真实账号，键盘�
   } finally {if(browser)await browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 });
 
-test('真实维护通知真/假切换、减少动画和超时恢复，不新增业务写入', async () => {
-  let maintenance=true,stallHealth=false,healthRequests=0,stalledReceived;
+test('真实维护分级、短暂部分维护、减少动画和超时恢复，不新增业务写入', async () => {
+  let maintenance=true,comfyOnline=false,stallHealth=false,healthRequests=0,stalledReceived;
   const unexpected=[],external=[],errors=[];
   const server=createServer((req,res)=>{
     const pathname=new URL(req.url,'http://localhost').pathname;
@@ -938,7 +938,7 @@ test('真实维护通知真/假切换、减少动画和超时恢复，不新增�
     if(pathname==='/auth.js'){res.setHeader('Content-Type','text/javascript');return res.end(readFileSync(path.join(web,'auth.js')));}
     if(pathname==='/api/auth/me')return json({user:{id:'u1',username:'viewer',role:'user'},csrf_token:'maintenance-csrf'});
     if(pathname==='/api/auth/presence'&&req.method==='POST'){assert.equal(req.headers['x-csrf-token'],'maintenance-csrf');req.resume();return json({online_users:1});}
-    if(pathname==='/api/health'&&req.method==='GET'){healthRequests++;if(stallHealth){stalledReceived?.();return;}return json({ok:true,comfy_online:!maintenance,maintenance_active:maintenance});}
+    if(pathname==='/api/health'&&req.method==='GET'){healthRequests++;if(stallHealth){stalledReceived?.();return;}return json({ok:true,comfy_online:comfyOnline,maintenance_active:maintenance});}
     if(pathname==='/admin-shell.css'){res.setHeader('Content-Type','text/css');return res.end(readFileSync(path.join(web,'admin-shell.css')));}
     if(pathname==='/'){res.setHeader('Content-Type','text/html; charset=utf-8');return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><title>维护提示测试</title><main><h1>管理页标题</h1></main><script src="/auth.js"></script>');}
     unexpected.push(req.method+' '+pathname);req.resume();res.writeHead(404);res.end();
@@ -956,6 +956,12 @@ test('真实维护通知真/假切换、减少动画和超时恢复，不新增�
     assert.deepEqual({...visual,animation:undefined},{position:'fixed',top:'0px',background:'rgb(185, 28, 28)',role:'status',live:'polite',iconBeforeMessage:true,animation:undefined});assert.notEqual(visual.animation,'none');
     assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(),'系统正在维护更新，当前暂无可用执行节点，请稍后再使用。');assert.equal(await banner.locator('svg').count(),1);
     const checkHealth=async()=>{const reply=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/health');await page.evaluate(()=>maintenanceIntervals.filter(timer=>timer.ms===5000).forEach(timer=>timer.fn()));await reply;};
+    comfyOnline=true;await checkHealth();
+    assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(),'部分节点正在维护更新，其他可用节点仍可正常使用。');
+    await banner.waitFor({state:'hidden',timeout:7000});
+    await checkHealth();assert.equal(await banner.isHidden(),true,'同一轮部分维护不能每次轮询重复提示');
+    comfyOnline=false;await checkHealth();await banner.waitFor({state:'visible'});
+    assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(),'系统正在维护更新，当前暂无可用执行节点，请稍后再使用。');
     maintenance=false;await checkHealth();await banner.waitFor({state:'hidden'});maintenance=true;await checkHealth();await banner.waitFor({state:'visible'});
     assert.equal(await banner.count(),1);
     await page.evaluate(()=>{document.body.classList.add('admin-page');document.body.dataset.workspace='controller';const link=document.createElement('link');link.rel='stylesheet';link.href='/admin-shell.css';document.head.append(link);});

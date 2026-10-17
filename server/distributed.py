@@ -52,6 +52,10 @@ def _temperature_gpu_index(value):
             and 0 <= value <= TEMPERATURE_MAX_GPU_INDEX)
 
 
+class WorkerBusyError(RuntimeError):
+    pass
+
+
 def literal_model_name(graph, value):
     seen = set()
     while isinstance(value, list):
@@ -154,6 +158,10 @@ def _hash_token(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
 
+def _worker_name_key(name):
+    return str(name).strip().casefold()
+
+
 def _json(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
@@ -187,6 +195,7 @@ class DistributedStore:
                     name TEXT NOT NULL,
                     token_hash TEXT NOT NULL,
                     enabled INTEGER NOT NULL DEFAULT 1,
+                    retired INTEGER NOT NULL DEFAULT 0,
                     last_seen REAL NOT NULL,
                     comfy_online INTEGER NOT NULL DEFAULT 0,
                     busy INTEGER NOT NULL DEFAULT 0,
@@ -240,6 +249,8 @@ class DistributedStore:
                 self.db.execute("ALTER TABLE workers ADD COLUMN last_capability_id TEXT")
             if "last_model_family" not in columns:
                 self.db.execute("ALTER TABLE workers ADD COLUMN last_model_family TEXT")
+            if "retired" not in columns:
+                self.db.execute("ALTER TABLE workers ADD COLUMN retired INTEGER NOT NULL DEFAULT 0")
             sync_columns = {
                 "sync_request_id": "TEXT",
                 "sync_status": "TEXT NOT NULL DEFAULT 'idle'",
@@ -271,7 +282,7 @@ class DistributedStore:
             return False
         with self.lock:
             row = self.db.execute(
-                "SELECT token_hash FROM workers WHERE id = ?", (worker_id,)
+                "SELECT token_hash FROM workers WHERE id = ? AND retired = 0", (worker_id,)
             ).fetchone()
         return bool(row and hmac.compare_digest(row["token_hash"], _hash_token(token)))
 
@@ -279,10 +290,49 @@ class DistributedStore:
         now = time.time()
         with self.lock, self.db:
             cur = self.db.execute(
-                "UPDATE workers SET enabled = ?, updated_at = ? WHERE id = ?",
+                "UPDATE workers SET enabled = ?, updated_at = ? WHERE id = ? AND retired = 0",
                 (1 if enabled else 0, now, worker_id),
             )
         return cur.rowcount > 0
+
+    def retire_worker(self, worker_id):
+        now = time.time()
+        with self.lock, self.db:
+            self._requeue_expired_locked(now)
+            target = self.db.execute(
+                "SELECT name FROM workers WHERE id = ? AND retired = 0", (worker_id,)
+            ).fetchone()
+            if not target:
+                return False
+            name_key = _worker_name_key(target["name"])
+            registrations = [
+                row for row in self.db.execute(
+                    "SELECT id, name, current_job_id FROM workers WHERE retired = 0"
+                ).fetchall()
+                if _worker_name_key(row["name"]) == name_key
+            ]
+            worker_ids = [row["id"] for row in registrations]
+            placeholders = ",".join("?" for _ in worker_ids)
+            active = any(row["current_job_id"] for row in registrations)
+            if not active:
+                active = self.db.execute(
+                    f"""SELECT 1 FROM dispatch_jobs
+                        WHERE worker_id IN ({placeholders})
+                          AND status IN ({','.join('?' for _ in LIVE_DISPATCH)})
+                        LIMIT 1""",
+                    (*worker_ids, *LIVE_DISPATCH),
+                ).fetchone() is not None
+            if active:
+                raise WorkerBusyError("Worker 当前有执行中的任务")
+            self.db.execute(
+                f"""UPDATE workers
+                    SET retired = 1, enabled = 0, comfy_online = 0, busy = 0,
+                        current_job_id = NULL, sync_request_id = NULL,
+                        sync_status = 'idle', sync_message = NULL, updated_at = ?
+                    WHERE id IN ({placeholders})""",
+                (now, *worker_ids),
+            )
+        return True
 
     def request_sync_all(self):
         now = time.time()
@@ -290,13 +340,14 @@ class DistributedStore:
         with self.lock, self.db:
             rows = self.db.execute(
                 """SELECT id, name, capabilities_json FROM workers
+                   WHERE retired = 0
                    ORDER BY name COLLATE NOCASE, created_at DESC, id DESC"""
             ).fetchall()
             worker_ids = []
             skipped_count = 0
             seen_names = set()
             for row in rows:
-                name_key = row["name"].strip().casefold()
+                name_key = _worker_name_key(row["name"])
                 if name_key in seen_names:
                     continue
                 seen_names.add(name_key)
@@ -409,7 +460,7 @@ class DistributedStore:
             self._requeue_expired_locked(now)
             row = self.db.execute(
                 """SELECT id, capabilities_json, sync_request_id, sync_status
-                   FROM workers WHERE id = ?""",
+                   FROM workers WHERE id = ? AND retired = 0""",
                 (worker_id,),
             ).fetchone()
             if not row:
@@ -532,17 +583,19 @@ class DistributedStore:
         now = time.time()
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM workers ORDER BY name COLLATE NOCASE, created_at DESC, id DESC"
+                """SELECT * FROM workers WHERE retired = 0
+                   ORDER BY name COLLATE NOCASE, created_at DESC, id DESC"""
             ).fetchall()
         workers = []
         seen_names = set()
         for row in rows:
-            name_key = row["name"].strip().casefold()
+            name_key = _worker_name_key(row["name"])
             if name_key in seen_names:
                 continue
             seen_names.add(name_key)
             item = dict(row)
             item.pop("token_hash", None)
+            item.pop("retired", None)
             item["enabled"] = bool(item["enabled"])
             item["comfy_online"] = bool(item["comfy_online"])
             item["busy"] = bool(item["busy"])
@@ -581,7 +634,7 @@ class DistributedStore:
         with self.lock, self.db:
             self._requeue_expired_locked(now)
             worker = self.db.execute(
-                "SELECT * FROM workers WHERE id = ?", (worker_id,)
+                "SELECT * FROM workers WHERE id = ? AND retired = 0", (worker_id,)
             ).fetchone()
             if not worker or not worker["enabled"] or not worker["comfy_online"]:
                 return None
@@ -596,7 +649,7 @@ class DistributedStore:
             current_vram = primary_gpu_vram_bytes(capabilities.get("devices"))
             idle_workers = self.db.execute(
                 """SELECT id, capabilities_json FROM workers
-                   WHERE id != ? AND enabled = 1 AND comfy_online = 1
+                   WHERE id != ? AND retired = 0 AND enabled = 1 AND comfy_online = 1
                      AND busy = 0 AND current_job_id IS NULL
                      AND sync_status NOT IN ('pending', 'running', 'error')
                      AND last_seen >= ?""",
