@@ -24,6 +24,16 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
     async def asyncSetUp(self):
         # 先建好管理员并标记就绪，make_app 启动时打开同一个账号库。
         self.auth_setup()
+        # 装配测试不连接真实 ComfyUI、不启动外部审批，也不载入实际任务。
+        patches = (
+            mock.patch.object(controller_app, 'ws_loop', new=mock.AsyncMock()),
+            mock.patch.object(controller_app, 'setup_dingtalk', return_value=None),
+            mock.patch.object(controller_app, 'load_jobs', return_value=None),
+            mock.patch.dict(controller_app.JOBS, {}, clear=True),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
         application = controller_app.make_app(auth_path=self.root / "data" / "auth.db")
         self.old_project_dir = controller_app.PROJ_DIR
         controller_app.PROJ_DIR = self.root / "data" / "projects"
@@ -58,6 +68,26 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.get('/controller/capacity')).status, 404)
         self.assertEqual((await self.client.get('/permissions.html')).status, 404)
         self.assertEqual((await self.client.get('/app.js')).status, 200)
+
+    async def test_local_admin_modules_remain_explicit_authenticated_routes(self):
+        routes = {
+            '/admin-shell.css': 'text/css',
+            '/admin-shell.js': 'text/javascript',
+            '/controller-page.js': 'text/javascript',
+            '/costs-page.js': 'text/javascript',
+        }
+        for route, content_type in routes.items():
+            with self.subTest(route=route):
+                response = await self.client.get(route)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.content_type, content_type)
+                self.assertGreater(len(await response.read()), 0)
+        self.client.session.cookie_jar.clear()
+        for route in routes:
+            with self.subTest(route=route, anonymous=True):
+                response = await self.client.get(route, allow_redirects=False)
+                self.assertEqual(response.status, 302)
+                self.assertTrue(response.headers['Location'].startswith('/login'))
 
     async def test_online_presence_requires_login_and_counts_active_user(self):
         response = await self.client.post('/api/auth/presence', headers=self.headers)
@@ -533,6 +563,56 @@ class CapacityProbeWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.Aut
         self.application["costs"].finish_job(self.pid, "done", now + 61, worker["worker_id"])
         controller_app.JOBS[self.pid] = dict(job, status="done")
         self.url = f"/api/capacity/jobs/{self.pid}/probe-outputs"
+
+    async def test_controller_temperature_maintenance_and_submitter_metadata_coexist(self):
+        submitter = self.auth.create_user('maintenance-submitter', PASSWORD)
+        with self.auth.db:
+            self.auth.db.execute('UPDATE users SET display_name=? WHERE id=?', ('提交组员', submitter['id']))
+        self.register_job(self.pid, 'capacity-project', owner=submitter)
+        controller_app.JOBS[self.pid].update(
+            project='capacity-project', projectName='维护期间的项目',
+            card='maintenance-card', cardName='主角卡片',
+        )
+        worker = self.store.register_worker('维护温度组合机器', {
+            'node_classes': ['KSampler'], 'supports_code_restart': True,
+        })
+        update = self.store.request_sync_all()
+        at = time.time()
+        self.store.heartbeat(
+            worker['worker_id'], comfy_online=True, busy=False,
+            telemetry={'collected_at': at, 'gpus': [{'index': 255, 'temperature_c': 72}]},
+            maintenance={'request_id': update['request_id'], 'status': 'error', 'message': '模拟同步失败'},
+        )
+        response = await self.client.get('/api/health')
+        self.assertEqual(response.status, 200)
+        health = await response.json()
+        self.assertFalse(health['sandbox'])
+        self.assertTrue(health['maintenance_active'])
+        self.assertFalse(health['comfy_online'])
+        self.assertEqual(health['workers'], 2)
+        temperature_url = f"/api/workers/{worker['worker_id']}/temperature"
+        response = await self.client.get(temperature_url + '?gpu_index=255')
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())['points'], [{'at': at, 'temperature_c': 72}])
+        self.assertEqual((await self.client.get(temperature_url + '?gpu_index=256')).status, 400)
+        listed = await (await self.client.get('/api/jobs')).json()
+        job = next(item for item in listed['jobs'] if item['id'] == self.pid)
+        self.assertEqual((job['submitter_id'], job['submitter_username'], job['submitter_display_name']),
+                         (submitter['id'], 'maintenance-submitter', '提交组员'))
+        self.assertEqual((job['projectName'], job['cardName']), ('维护期间的项目', '主角卡片'))
+        detail = await (await self.client.get(f'/api/job/{self.pid}')).json()
+        self.assertEqual(detail['submitter_display_name'], '提交组员')
+        self.assertNotIn('submitter_display_name', controller_app.JOBS[self.pid])
+
+        await self.login('maintenance-submitter')
+        health = await (await self.client.get('/api/health')).json()
+        self.assertEqual(set(health), {'ok', 'mode', 'comfy_online', 'maintenance_active'})
+        self.assertTrue(health['maintenance_active'])
+        self.assertEqual((await self.client.get(temperature_url)).status, 403)
+        self.auth.set_grant(submitter['id'], self.admin['id'], 'read')
+        detail = await (await self.client.get(f'/api/job/{self.pid}')).json()
+        self.assertEqual(detail['permission'], 'read')
+        self.assertFalse(any(key.startswith('submitter_') for key in detail))
 
     async def test_make_app_probe_route_state_admin_and_csrf_are_really_wired(self):
         self.assertEqual(self.application["capacity_probe_state"], {"task": None})

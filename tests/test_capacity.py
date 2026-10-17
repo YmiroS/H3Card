@@ -13,6 +13,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from server import capacity as capacity_module
 from server.capacity import CapacityStore, export_csv, make_spec, model_summary, model_summary_from_graph
 
 
@@ -1787,6 +1788,194 @@ class CapacityTests(unittest.TestCase):
             self.assertEqual(self.capacity.output_recovery("saved"), [])
         self.assertEqual(self.db.execute("SELECT COUNT(*),probed_at FROM capacity_output_recovery").fetchone()[:],
                          (1, 5678))
+
+    def test_report_host_index_includes_filtered_current_and_deleted_historical_workers(self):
+        self.capture("primary")
+        warning = "同主机存在多个 Worker，资源槽位隔离未经验证"
+        self.assertNotIn(warning, self.capacity.report(worker_id="w1")["details"][0]["warnings"])
+        other = self.add_worker("w2", host_id="host-w1")
+        with patch("server.capacity._hardware", wraps=capacity_module._hardware) as hardware:
+            report = self.capacity.report(worker_id="w1")
+            self.assertEqual(hardware.call_count, 2)
+        self.assertEqual([worker["id"] for worker in report["workers"]], ["w1"])
+        self.assertIn(warning, report["details"][0]["warnings"])
+        self.capture("other", worker=other)
+        self.db.execute("DELETE FROM workers WHERE id='w2'")
+        report = self.capacity.report(worker_id="w1")
+        self.assertIn(warning, report["details"][0]["warnings"])
+        self.assertFalse(report["groups"][0]["eligible"])
+        self.assertEqual(report["overview"]["tasks"], 1)
+
+    def test_report_host_index_deduplicates_worker_configs_and_ignores_display_metadata(self):
+        self.capture("old")
+        changed = dict(self.worker)
+        caps = json.loads(changed["capabilities_json"])
+        caps["environment_id"] = "env-v2"
+        changed["capabilities_json"] = json.dumps(caps)
+        self.capture("new", worker=changed)
+        self.add_worker("w2")
+        self.capacity.update_worker("w1", {"host_id": "host-w2"})
+        report = self.capacity.report(worker_id="w1")
+        self.assertEqual(report["workers"][0]["hardware"]["host_id"], "host-w2")
+        self.assertEqual(len(report["groups"]), 2)
+        self.assertTrue(all(group["config"]["host_id"] == "host-w1" for group in report["groups"]))
+        self.assertTrue(all("同主机存在多个 Worker" not in "".join(row["warnings"])
+                            for row in report["details"]))
+        # 合法 JSON 字符串也不是能力对象，不能二次解码出伪造的主机归属。
+        nested = json.dumps(json.dumps({"host_id": "host-w1"}))
+        self.db.execute("UPDATE workers SET capabilities_json=? WHERE id='w2'", (nested,))
+        report = self.capacity.report(worker_id="w1")
+        self.assertTrue(all("同主机存在多个 Worker" not in "".join(row["warnings"])
+                            for row in report["details"]))
+
+    def test_report_parses_full_json_once_and_reuses_attempt_conditions_only_per_report(self):
+        for index in range(3):
+            self.capture("shared-" + str(index))
+        cache_json = json.dumps([{"id": "1", "type": None}])
+        self.db.execute("UPDATE capacity_attempts SET cache_json=?", (cache_json,))
+        spec_json = self.db.execute("SELECT spec_json FROM capacity_tasks LIMIT 1").fetchone()[0]
+        measurement_json = self.db.execute("SELECT measurements_json FROM capacity_attempts LIMIT 1").fetchone()[0]
+        hardware_json = self.db.execute("SELECT hardware_json FROM capacity_configs LIMIT 1").fetchone()[0]
+        values = (spec_json, measurement_json, cache_json, hardware_json, self.worker["capabilities_json"])
+        with patch("server.capacity.json.loads", wraps=json.loads) as decode, \
+                patch("server.capacity._cache_condition", wraps=capacity_module._cache_condition) as condition:
+            first = self.capacity.report()
+            self.assertEqual(condition.call_count, 3)
+            for value in values:
+                self.assertEqual(sum(call.args[0] == value for call in decode.call_args_list), 1)
+            self.assertEqual(first, self.capacity.report())
+            self.assertEqual(condition.call_count, 6)
+            for value in values:
+                self.assertEqual(sum(call.args[0] == value for call in decode.call_args_list), 2)
+        changed = json.dumps([{"id": "2", "type": "KSampler"}])
+        self.db.execute("UPDATE capacity_attempts SET cache_json=? WHERE job_id='shared-2'", (changed,))
+        after = self.capacity.report()
+        self.assertEqual(len(after["groups"]), 2)
+        self.assertEqual(first["groups"][0]["cache_condition"]["kind"], "loaders")
+        task = next(row for row in after["details"] if row["job_id"] == "shared-2")
+        self.assertEqual(task["cache_condition"]["kind"], "execution")
+        self.assertFalse(next(group for group in after["groups"] if group["id"] == task["group_id"])["eligible"])
+
+    def test_attempt_evidence_optional_condition_preserves_direct_call_behavior(self):
+        attempt_id = self.capture()
+        attempt = dict(self.db.execute("SELECT * FROM capacity_attempts WHERE id=?", (attempt_id,)).fetchone())
+        config = dict(self.db.execute("SELECT * FROM capacity_configs WHERE id=?", (attempt["config_id"],)).fetchone())
+        spec = json.loads(self.db.execute("SELECT spec_json FROM capacity_tasks").fetchone()[0])
+        for cache, measurement, status in (
+                (None, None, "done"), ("null", "null", "error"),
+                ('{"invalid":true}', '{"invalid":true}', "done"),
+                ('[{"id":"1","type":null}]', json.dumps(self.measurements()), "done"),
+                ('[{"id":"2","type":"KSampler"}]', json.dumps(self.measurements()), "done"),
+                ("broken", "broken", "canceled")):
+            with self.subTest(cache=cache, status=status):
+                row = dict(attempt, cache_json=cache, measurements_json=measurement, status=status)
+                expected = self.capacity._attempt_evidence(row, config, spec)
+                condition = capacity_module._cache_condition(row, spec)
+                self.assertEqual(self.capacity._attempt_evidence(row, config, spec, condition), expected)
+                row["cache_json"] = capacity_module._load(cache)
+                row["measurements_json"] = capacity_module._load(measurement)
+                parsed_config = dict(config, hardware_json=json.loads(config["hardware_json"]))
+                self.assertEqual(self.capacity._attempt_evidence(row, parsed_config, spec, condition), expected)
+
+    def test_report_shared_spec_keeps_worker_model_versions_task_local(self):
+        params = dict(self.params)
+        params.pop("model_version")
+        payload = self.make_payload(params=params)
+        for job, worker in (("z-version-one", self.add_worker("w2", model_version="model-v1")),
+                            ("y-version-two", self.add_worker("w3", model_version="model-v2")),
+                            ("a-unknown", self.worker)):
+            self.capture(job, payload=payload, worker=worker)
+        stored = [row[0] for row in self.db.execute("SELECT spec_json FROM capacity_tasks")]
+        self.assertEqual(len(set(stored)), 1)
+        database = list(self.db.iterdump())
+        report = self.capacity.report()
+        rows = {row["job_id"]: row for row in report["details"]}
+        specs = {job: row["spec"] for job, row in rows.items()}
+        self.assertEqual(specs["z-version-one"]["model_version"], "model-v1")
+        self.assertEqual(specs["y-version-two"]["model_version"], "model-v2")
+        self.assertIsNone(specs["a-unknown"]["model_version"])
+        self.assertNotIn("model_version_source", specs["a-unknown"])
+        self.assertIn("模型版本未知；模型名称不等于版本", specs["a-unknown"]["warnings"])
+        self.assertEqual(len({spec["spec_key"] for spec in specs.values()}), 3)
+        self.assertEqual(len({row["group_id"] for row in rows.values()}), 3)
+        self.assertEqual(list(self.db.iterdump()), database)
+        self.assertEqual(self.capacity.report(), report)
+
+    def test_report_shared_legacy_spec_keeps_dimensions_task_local(self):
+        for job, width in (("legacy-a", 512), ("legacy-z", 1024)):
+            self.historical(job, dims={"width": width, "height": 512})
+            self.capacity.assigned(job, self.worker, "lease-" + job, 1000)
+        stored = [row[0] for row in self.db.execute("SELECT spec_json FROM capacity_tasks")]
+        self.assertEqual(len(set(stored)), 1)
+        report = self.capacity.report()
+        specs = {row["job_id"]: row["spec"] for row in report["details"]}
+        self.assertEqual(specs["legacy-a"]["dimensions"], {"width": 512, "height": 512})
+        self.assertEqual(specs["legacy-z"]["dimensions"], {"width": 1024, "height": 512})
+        self.assertNotEqual(specs["legacy-a"]["spec_key"], specs["legacy-z"]["spec_key"])
+
+    def test_report_invalid_json_default_does_not_replace_valid_null(self):
+        self.capture()
+        self.db.execute("UPDATE capacity_tasks SET spec_json='broken',review_json='broken',outputs_json='broken'")
+        self.db.execute("UPDATE capacity_attempts SET measurements_json='null',cache_json='null'")
+        detail = self.capacity.report()["details"][0]
+        self.assertIsNone(detail["outputs"])
+        self.assertIsNone(detail["attempts"][0]["measurements"])
+        self.assertIsNone(detail["attempts"][0]["cached_nodes"])
+        self.assertFalse(detail["attempts"][0]["cache_invalid"])
+        self.assertIsNone(detail["review"]["accepted"])
+        self.assertEqual(detail["spec"]["dimensions"], {})
+
+    def test_report_verified_csv_and_purchase_recompute_after_review_write(self):
+        for job in ("accepted-a", "accepted-b"):
+            self.capture(job)
+            self.capacity.review(job, {"accepted": 1})
+        before = self.capacity.report()
+        self.assertTrue(before["groups"][0]["eligible"])
+        technical_payload = self.estimate_payload(price=12345)
+        accepted_payload = dict(technical_payload, quality="accepted")
+        technical = self.capacity.estimate(technical_payload)
+        accepted = self.capacity.estimate(accepted_payload)
+        self.assertEqual(before, self.capacity.report())
+        self.assertEqual(export_csv(before), export_csv(self.capacity.report()))
+        self.assertEqual(self.capacity.estimate(technical_payload), technical)
+        self.assertEqual(self.capacity.estimate(accepted_payload), accepted)
+        self.capacity.review("accepted-a", {"accepted": 0})
+        after = self.capacity.report()
+        self.assertEqual(before["groups"][0]["accepted"], 2)
+        self.assertEqual(after["groups"][0]["accepted"], 1)
+        self.assertEqual(before["groups"][0]["id"], after["groups"][0]["id"])
+        self.assertEqual(self.capacity.estimate(technical_payload), technical)
+        self.assertEqual(self.capacity.estimate(accepted_payload)["total_seconds"], accepted["total_seconds"] * 2)
+        row = next(csv.DictReader(io.StringIO(export_csv(after).lstrip("\ufeff"))))
+        self.assertEqual(float(row["qualified_seconds_per_unit"]), after["groups"][0]["qualified_seconds_per_unit"])
+        self.assertEqual(float(row["seconds_per_unit"]), before["groups"][0]["seconds_per_unit"])
+
+    def test_report_changed_fallback_keeps_csv_statistics_and_purchase_formulas(self):
+        for job in ("same-a", "same-b", "other-capability"):
+            self.historical(job)
+            self.archive(job, capability="video" if job == "other-capability" else "image")
+        before = self.capacity.report()
+        before_csv = export_csv(before)
+        payload = self.estimate_payload(mode="historical", price=12345)
+        estimate = self.capacity.estimate(payload)
+        self.assertEqual(before, self.capacity.report())
+        self.assertEqual(before_csv, export_csv(self.capacity.report()))
+        self.assertEqual(before["groups"][0]["model_evidence"]["recorded_samples"], 2)
+        changed = json.dumps({"capability": "image", "graph": ModelSummaryTests.graph("changed_bf16.safetensors")})
+        self.db.execute("UPDATE dispatch_jobs SET payload_json=? WHERE job_id='same-a'", (changed,))
+        database = list(self.db.iterdump())
+        after = self.capacity.report()
+        self.assertEqual(self.without_model_evidence(before), self.without_model_evidence(after))
+        self.assertEqual(after["groups"][0]["model_evidence"]["recorded_samples"], 2)
+        self.assertEqual(len(after["groups"][0]["model_evidence"]["variants"]), 2)
+        self.assertEqual(self.capacity.estimate(payload), estimate)
+        old_csv = list(csv.DictReader(io.StringIO(before_csv.lstrip("\ufeff"))))
+        new_csv = list(csv.DictReader(io.StringIO(export_csv(after).lstrip("\ufeff"))))
+        self.assertEqual(json.loads(new_csv[0]["model_evidence"]), after["groups"][0]["model_evidence"])
+        for row in old_csv + new_csv:
+            row.pop("model_evidence")
+        self.assertEqual(old_csv, new_csv)
+        self.assertEqual(list(self.db.iterdump()), database)
 
     def test_restart_keeps_attempts_and_schema_is_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:

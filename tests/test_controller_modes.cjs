@@ -20,7 +20,7 @@ test('recent jobs show their recorded mode separately from card names', async ()
   ];
   const payloads = {
     '/api/auth/me': {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'test-csrf'},
-    '/api/health': {ok:true, mode:'controller', server_time:1789535400, started_at:1789535300},
+    '/api/health': {ok:true, mode:'controller', server_time:1789535400, started_at:1789535300, maintenance_active:false},
     '/api/status': {running_count:1, queued_count:1},
     '/api/workers': {workers:[]},
     '/api/jobs': {jobs},
@@ -28,54 +28,75 @@ test('recent jobs show their recorded mode separately from card names', async ()
     '/api/projects': {projects:[{id:'project-1', name:'模式展示测试', owner_id:'admin', permission:'operate', cards:0}]},
     '/api/projects/project-1': {id:'project-1', name:'模式展示测试', permission:'operate', cards:[], edges:[], groups:[], view:{}, rev:0},
   };
+  const unexpected = [], external = [], presence = [];
   const server = createServer((req, res) => {
-    if (req.url === '/api/auth/presence') {
-      req.resume(); res.setHeader('Content-Type', 'application/json'); return res.end('{"online_users":1}');
-    }
-    const files = {'/':'index.html', '/auth.js':'auth.js', '/app.js':'app.js', '/style.css':'style.css',
-      '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
-    const file = files[new URL(req.url, 'http://localhost').pathname];
-    if (file) {
-      res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript; charset=utf-8'
-        : file.endsWith('.css') ? 'text/css' : file.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
-      return res.end(readFileSync(path.join(__dirname, '..', 'web', file)));
-    }
-    if (Object.hasOwn(payloads, req.url)) {
+    const url = new URL(req.url, 'http://localhost').pathname;
+    if (req.method === 'POST' && url === '/api/auth/presence') {
+      presence.push(req.headers['x-csrf-token']); req.resume();
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify(payloads[req.url]));
-    } else {
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end(html);
+      return res.end(JSON.stringify({online_users:1}));
     }
+    const files = {'/':'index.html', '/auth.js':'auth.js', '/admin-shell.js':'admin-shell.js',
+      '/controller-page.js':'controller-page.js', '/admin-shell.css':'admin-shell.css',
+      '/app.js':'app.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+    if (req.method === 'GET' && Object.hasOwn(files, url)) {
+      const name = files[url];
+      res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript; charset=utf-8'
+        : name.endsWith('.css') ? 'text/css' : name.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
+      return res.end(readFileSync(path.join(__dirname, '..', 'web', name)));
+    }
+    if (req.method === 'GET' && Object.hasOwn(payloads, url)) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.end(JSON.stringify(payloads[url]));
+    }
+    if (req.method === 'GET' && url === '/controller') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.end(html);
+    }
+    unexpected.push(req.method + ' ' + req.url); req.resume(); res.writeHead(404); res.end();
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
   try {
     browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
-    const page = await browser.newPage({viewport:{width:1440, height:1000}});
+    const context = await browser.newContext({viewport:{width:1440, height:1000}, serviceWorkers:'block'});
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    await context.route('**/*', route => {
+      if (new URL(route.request().url()).origin === origin) return route.continue();
+      external.push(route.request().url()); return route.abort();
+    });
+    await context.routeWebSocket('**/*', socket => {
+      if (new URL(socket.url()).host !== new URL(origin).host) external.push(socket.url());
+      socket.close();
+    });
+    const page = await context.newPage(); page.setDefaultTimeout(10000);
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto('http://127.0.0.1:' + server.address().port + '/controller');
+    await page.goto(origin + '/controller');
     await page.waitForFunction(() => document.querySelectorAll('#job-rows tr').length === 5);
-    assert.deepEqual(await page.locator('thead th').allTextContents(),
-      ['状态', '姓名 / 项目 / 卡片', '模式', '过程进度', '执行端', '创建时间', '耗时 / 错误']);
-    assert.deepEqual(await page.locator('#job-rows .job-mode').allTextContents(),
+    assert.deepEqual(await page.locator('.jobs-table thead th').allTextContents(),
+      ['状态', '姓名 / 项目 / 卡片', '模式', '过程进度 / 步骤', '执行端', '创建时间', '耗时 / 错误']);
+    assert.deepEqual(await page.locator('#job-rows .job-mode').evaluateAll(cells => cells.map(cell => cell.firstChild.textContent)),
       ['H3全能参考(高质量)', 'H3图生视频', 'legacy_video_mode', '未记录', jobs[4].name]);
     assert.equal(await page.locator('#job-rows .job-mode').first().getAttribute('title'), 'minimax_h3_ref_2pass');
     assert.equal(await page.locator('#job-rows .job-origin').first().innerText(), '张三\n模式展示测试\n卡片 · 生视频');
-    assert.deepEqual(await page.locator('.job-submitter').allTextContents(), ['张三', '张三', 'zhangsan', '未记录提交人', jobs[4].submitter_display_name]);
-    assert.equal(await page.locator('#job-rows .job-origin').first().getAttribute('title'), '张三 - 模式展示测试 - 生视频');
+    assert.deepEqual(await page.locator('#job-rows .job-origin').evaluateAll(cells => cells.map(cell => cell.firstChild.textContent)),
+      ['张三', '张三', 'zhangsan', '未记录提交人', jobs[4].submitter_display_name]);
+    assert.deepEqual(await page.locator('#job-rows .job-origin .cell-secondary').first().textContent(), '模式展示测试');
+    assert.equal(await page.locator('#workspace-nav[data-admin-sidebar], #account .account-trigger').count(), 2);
+    assert.equal(await page.locator('.sidebar, .side-actions, .admin-mobile-account').count(), 0);
     assert.equal(await page.locator('#job-rows tr').first().locator('td').count(), 7);
     assert.equal(await page.locator('#job-rows img').count(), 0);
     assert.equal(await page.evaluate(() => window.injected), undefined);
     jobs[0].cardName = '已改名的卡片';
     await page.locator('#refresh').click();
     await page.waitForFunction(() => document.querySelector('#job-rows .job-origin').textContent.includes('已改名的卡片'));
-    assert.equal(await page.locator('#job-rows .job-mode').first().textContent(), 'H3全能参考(高质量)');
+    assert.equal(await page.locator('#job-rows .job-mode').first().evaluate(cell => cell.firstChild.textContent), 'H3全能参考(高质量)');
+    assert.equal(await page.locator('#job-rows .job-mode .cell-secondary').first().textContent(), 'high-quality');
     if (process.env.CHOUKA_TEST_SCREENSHOT) {
       await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT, fullPage:true});
     }
-    await page.goto('http://127.0.0.1:' + server.address().port + '/');
+    await page.goto(origin + '/');
     await page.locator('#jobsbtn').click();
     await page.waitForFunction(() => document.querySelectorAll('.jrow').length === 5);
     assert.deepEqual(await page.locator('.jowner').allTextContents(), ['张三', '张三', 'zhangsan', '未记录提交人', jobs[4].submitter_display_name]);
@@ -84,10 +105,14 @@ test('recent jobs show their recorded mode separately from card names', async ()
     assert.equal(await page.evaluate(() => window.injected), undefined);
     jobs[0].submitter_display_name = '李四';
     await page.evaluate(() => pollJobs());
-    assert.equal(await page.locator('.jowner').first().textContent(), '李四', 'polling refreshes names without a status change');
+    assert.equal(await page.locator('.jowner').first().textContent(), '李四', '状态不变时轮询也更新提交人姓名');
     assert.equal(await page.locator('.jrow').first().locator('.st').textContent(), '已完成');
     await page.evaluate(() => { H3Auth.user.role = 'user'; el.jobs._sig = null; renderJobs(); });
-    assert.equal(await page.locator('.jowner').count(), 0, 'ordinary accounts keep their existing task presentation');
+    assert.equal(await page.locator('.jowner').count(), 0, '普通账号保持既有任务展示，不增加管理员提交人字段');
+    assert.ok(presence.length > 0);
+    assert.ok(presence.every(csrf => csrf === 'test-csrf'), '真实presence保留CSRF');
+    assert.deepEqual(unexpected, [], '不允许任何额外业务请求或写入');
+    assert.deepEqual(external, [], '不允许HTTP或WebSocket外联');
     assert.deepEqual(errors, []);
   } finally {
     if (browser) await browser.close();
@@ -104,7 +129,8 @@ test('controller deletes an obsolete worker with confirmation and CSRF', async (
     comfy_online:false, busy:false, sync_status:'pending', sync_message:'等待节点空闲',
     last_seen:1789000000, capabilities:{node_classes:['KSampler'], telemetry:{hostname:'DESKTOP-A6000'}},
   }];
-  let deletion = null;
+  let deletion = null, rejectDeletion = true, holdWorkers = false, heldWorkers = null, receivedWorkers;
+  const unexpected = [];
   const json = (res, body, status=200) => {
     res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'});
     res.end(JSON.stringify(body));
@@ -113,6 +139,7 @@ test('controller deletes an obsolete worker with confirmation and CSRF', async (
     const url = new URL(req.url, 'http://localhost');
     if (req.method === 'DELETE' && url.pathname === '/api/workers/worker-a6000') {
       deletion={method:req.method,path:url.pathname,csrf:req.headers['x-csrf-token']};
+      if(rejectDeletion)return json(res,{error:'Worker 当前有执行中的任务'},409);
       workers=[]; return json(res,{ok:true});
     }
     if (req.method === 'POST' && url.pathname === '/api/auth/presence') {
@@ -124,31 +151,46 @@ test('controller deletes an obsolete worker with confirmation and CSRF', async (
       '/api/status':{running_count:0,queued_count:0},
       '/api/jobs':{jobs:[]}, '/api/projects':{projects:[]},
     };
-    if (url.pathname === '/api/workers') return json(res,{workers});
-    if (Object.hasOwn(payloads,url.pathname)) return json(res,payloads[url.pathname]);
-    if (url.pathname === '/auth.js') {
-      res.setHeader('Content-Type','text/javascript; charset=utf-8');
-      return res.end(readFileSync(path.join(root,'auth.js')));
+    if (url.pathname === '/api/workers') {
+      if(holdWorkers){holdWorkers=false;const old=structuredClone(workers);heldWorkers=()=>json(res,{workers:old});receivedWorkers();return;}
+      return json(res,{workers});
     }
-    res.setHeader('Content-Type','text/html; charset=utf-8'); res.end(html);
+    if (Object.hasOwn(payloads,url.pathname)) return json(res,payloads[url.pathname]);
+    const files={'/auth.js':'auth.js','/admin-shell.js':'admin-shell.js','/controller-page.js':'controller-page.js','/admin-shell.css':'admin-shell.css','/icon.png':'icon.png','/favicon.png':'favicon.png'};
+    if(Object.hasOwn(files,url.pathname)){
+      const file=files[url.pathname];res.setHeader('Content-Type',file.endsWith('.js')?'text/javascript':file.endsWith('.css')?'text/css':'image/png');
+      return res.end(readFileSync(path.join(root,file)));
+    }
+    if(url.pathname==='/controller'){res.setHeader('Content-Type','text/html; charset=utf-8');return res.end(html);}
+    unexpected.push(req.method+' '+url.pathname);req.resume();res.writeHead(404);res.end();
   });
   await new Promise(resolve => server.listen(0,'127.0.0.1',resolve));
   let browser;
   try {
     browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
     const page = await browser.newPage({viewport:{width:1280,height:900}});
-    const dialogs=[];
-    page.on('dialog', dialog => { dialogs.push(dialog.message()); dialog.accept(); });
+    const dialogs=[],errors=[];let accept=false;
+    page.on('dialog', dialog => { dialogs.push(dialog.message()); return accept?dialog.accept():dialog.dismiss(); });
+    page.on('pageerror',error=>errors.push(error.message));
     await page.goto('http://127.0.0.1:' + server.address().port + '/controller');
-    const card=page.locator('.worker-card'); await card.waitFor();
-    const button=card.getByRole('button',{name:'删除设备 GPU-A6000-01'});
+    const button=page.getByRole('button',{name:'删除设备 GPU-A6000-01'});await button.waitFor();
     assert.equal(await button.textContent(),'删除设备');
     assert.ok((await button.boundingBox()).height >= 44);
-    await button.click();
-    await page.waitForFunction(() => document.querySelectorAll('.worker-card').length === 0);
+    await page.locator('#auto-refresh').uncheck();
+    await button.click();assert.equal(deletion,null,'取消确认不得发送删除');accept=true;
+    await button.click();await page.getByRole('alert').waitFor();
+    assert.match(await page.locator('#error-message').textContent(),/Worker 当前有执行中的任务/);
+    await button.waitFor({state:'visible'});await page.waitForFunction(()=>!document.querySelector('[data-delete-worker]').disabled);
+    assert.equal(await page.locator('#worker-rows [data-worker]').count(),1,'409保留设备并可重试');
+    rejectDeletion=false;holdWorkers=true;const oldRead=new Promise(resolve=>{receivedWorkers=resolve;});
+    await page.locator('#refresh').click();await oldRead;
+    const deleted=page.waitForResponse(response=>response.request().method()==='DELETE');await button.click();await deleted;
+    heldWorkers();
+    await page.waitForFunction(()=>document.querySelectorAll('#worker-rows [data-worker]').length===0);
     assert.deepEqual(deletion,{method:'DELETE',path:'/api/workers/worker-a6000',csrf:'delete-csrf'});
     assert.match(dialogs[0],/历史任务和账单不会删除/);
-    assert.equal(await page.locator('#worker-empty').isVisible(),true);
+    assert.equal(await page.getByText('还没有注册执行端',{exact:true}).isVisible(),true,'删除前的迟到读取不得让设备重新出现');
+    assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
   } finally {
     if (browser) await browser.close();
     server.closeAllConnections();
@@ -208,7 +250,7 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
     if (req.method === 'GET') {
       if (url === '/api/auth/me') return json(res, {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'fixture-csrf'});
       if (url === '/api/cards') return json(res, {cards, capabilities, comfy_online:true});
-      if (url === '/api/health') return json(res, {comfy_online:true});
+      if (url === '/api/health') return json(res, {comfy_online:true, maintenance_active:false});
       if (url === '/api/jobs') return json(res, {jobs:[]});
       if (url === '/api/projects') return json(res, {projects:[{...project, cards:project.cards.length}]});
       if (url === '/api/projects/' + project.id) return json(res, project);
