@@ -1454,6 +1454,7 @@ function showEmpty() {
   resetCardMedia();
   el.empty.style.display = "";
   el.world.innerHTML = ""; el.wires.innerHTML = "";
+  wireFlowObserver?.disconnect(); wirePaths.clear(); el.wires.classList.remove('has-flow');
   el.ptitle.textContent = "";
   el.dock.style.display = "none"; el.fit.style.display = "none";
   el.hint.textContent = "";
@@ -2624,6 +2625,29 @@ function cardBox(id) {
 /** 选中的连线。存的是 PROJ.edges 里那条对象本身（不是下标）——
     删节点、换路由都会重排数组，下标会指到别人身上去。 */
 let selEdge = null;
+let wireFlowObserver = null;
+const wirePaths = new Map();
+
+function wireRelations(project, selectedIds) {
+  const nodes = new Set(project.cards.map(c => c.id)), incoming = new Map(), outgoing = new Map();
+  for (const e of project.edges) {
+    if (!nodes.has(e.from) || !nodes.has(e.to)) continue;
+    if (!incoming.has(e.to)) incoming.set(e.to, []);
+    if (!outgoing.has(e.from)) outgoing.set(e.from, []);
+    incoming.get(e.to).push(e); outgoing.get(e.from).push(e);
+  }
+  const walk = (adjacent, endpoint) => {
+    const edges = new Set(), seen = new Set(), pending = [...selectedIds].filter(id => nodes.has(id));
+    while (pending.length) {
+      const id = pending.pop();
+      if (seen.has(id)) continue;
+      seen.add(id);
+      for (const e of adjacent.get(id) || []) { edges.add(e); pending.push(e[endpoint]); }
+    }
+    return edges;
+  };
+  return { upstream: walk(incoming, 'from'), downstream: walk(outgoing, 'to') };
+}
 
 /** 风格顺着这根产物线往下传吗（见 styleCards）。风格继承**没有自己的连线**，
     它借的就是这根产物线；不画在线上这件事就是隐形的。 */
@@ -2641,8 +2665,52 @@ function edgeWord(e) {
     : `${nm(a)} → ${nm(b)}${e.version ? `（固定分镜版本 · ${e.version.job} · 第 ${e.version.index + 1} 张）` : ''}`;
 }
 
-function drawWires() {
-  el.wires.innerHTML = "";
+function paintWireFlow() {
+  wireFlowObserver?.disconnect();
+  const selected = selEdge || NODE_EDITOR ? [] : selIds.size ? [...selIds] : selId ? [selId] : [];
+  const { upstream, downstream } = PROJ && selected.length ? wireRelations(PROJ, selected) : { upstream: new Set(), downstream: new Set() };
+  el.wires.classList.toggle('has-flow', !!(upstream.size || downstream.size));
+  const active = upstream.size || downstream.size;
+  if (!active) el.wires.querySelector('defs')?.remove();
+  if (active && !el.wires.querySelector('defs')) {
+    const defs = document.createElementNS(SVGNS, 'defs');
+    for (const direction of ['up', 'down', 'both']) {
+      const marker = document.createElementNS(SVGNS, 'marker');
+      for (const [key, value] of Object.entries({id:`wire-arrow-${direction}`,class:`flow-${direction}`,viewBox:'0 0 10 8',refX:9,refY:4,markerWidth:10,markerHeight:8,markerUnits:'userSpaceOnUse',orient:'auto'})) marker.setAttribute(key, value);
+      const arrow = document.createElementNS(SVGNS, 'polygon'); arrow.setAttribute('points', '0,0 9,4 0,8 2.5,4');
+      marker.append(arrow); defs.append(marker);
+    }
+    el.wires.append(defs);
+    if (!wireFlowObserver) wireFlowObserver = new IntersectionObserver(entries => {
+      for (const entry of entries) entry.target.classList.toggle('in-view', entry.isIntersecting);
+    }, {root:el.stage, rootMargin:'80px'});
+  }
+  for (const [e, paths] of wirePaths) {
+    const direction = upstream.has(e) ? downstream.has(e) ? 'both' : 'up' : downstream.has(e) ? 'down' : '';
+    paths.line.classList.toggle('sel', e === selEdge);
+    paths.line.classList.toggle('related', !!direction);
+    paths.carry?.classList.toggle('related', !!direction);
+    if (!direction) { paths.flow?.remove(); paths.flow = null; continue; }
+    if (!paths.flow) {
+      paths.flow = document.createElementNS(SVGNS, 'path');
+      paths.flow.setAttribute('d', paths.line.getAttribute('d'));
+      paths.flow.setAttribute('aria-hidden', 'true');
+      paths.flow.classList.add('flow');
+      el.wires.append(paths.flow);
+    }
+    paths.flow.classList.remove('flow-up', 'flow-down', 'flow-both');
+    paths.flow.classList.add(`flow-${direction}`);
+    paths.flow.setAttribute('marker-end', `url(#wire-arrow-${direction})`);
+    wireFlowObserver.observe(paths.flow);
+  }
+}
+
+function drawWires(rebuild = true) {
+  // 选择态只更新覆盖层，不重算几何或重建分组，保留双击事件目标。
+  if (!rebuild) { paintWireFlow(); paintSel(); return; }
+  wireFlowObserver?.disconnect(); wirePaths.clear();
+  el.wires.innerHTML = '';
+  if (!PROJ) { el.wires.classList.remove('has-flow'); paintSel(); return; }
   for (const e of PROJ.edges) {
     const a = cardBox(e.from), b = cardBox(e.to);
     if (!a || !b) continue;
@@ -2669,10 +2737,12 @@ function drawWires() {
     });
     // 风格线画成虚线：它传的是文字不是产物，跟"上一张的图接给下一张"是两件事，
     // 画成同一根实线会让人以为风格节点也出图
-    mk([isTextEdge(e) ? "txt" : "", e === selEdge ? "sel" : ""].filter(Boolean).join(" "));
+    const line = mk(isTextEdge(e) ? 'txt' : '');
     // 再叠一层紫虚线 = 这根产物线上还捎着风格
-    if (carriesStyle(e)) mk("carry");
+    const carry = carriesStyle(e) ? mk('carry') : null;
+    wirePaths.set(e, {line, carry, flow:null});
   }
+  paintWireFlow();
   paintSel();               // 框选的虚线框和顶部工具条跟着节点位置走
   paintGroups();            // 分组框也一样（拖动时每帧重算）
 }
@@ -2863,8 +2933,8 @@ function paintGroups() {
       if (ev.button !== 0) return;
       ev.stopPropagation(); ev.preventDefault();
       // 点分组框 = 选中这组（出虚线框和工具条），再拖着走就是整组一起动
-      selIds = new Set(g.cards);
-      paintSel();
+      selIds = new Set(g.cards); selEdge = null;
+      drawWires(false);
       beginCardsMove(ev, [...g.cards].map(cardOf).filter(Boolean));
     };
     lb.ondblclick = (ev) => { ev.stopPropagation(); renameGroup(g); };
@@ -2971,8 +3041,8 @@ function delEdge(e) {
 /* ================= 交互：拖节点 / 平移 / 缩放 / 连线 ================= */
 function pick(id) {
   selId = id;
-  selIds.clear(); paintSel();                          // 点单个节点 = 放弃框选
-  if (selEdge) { selEdge = null; drawWires(); }      // 选中的线和选中的节点只留一个
+  selIds.clear();                                    // 点单个节点 = 放弃框选
+  selEdge = null; drawWires(false);                  // 连线流向随节点选择刷新
   for (const c of PROJ.cards) if (c._el) c._el.classList.toggle("sel", c.id === id);
   openHistory(id);      // 先开栏子再摆面板：面板要按变窄之后的画布找位置
   openPanel(id);
@@ -3165,10 +3235,9 @@ function bindGlobal() {
     // 左键点空白：清掉选中；拖动框选节点。
     ev.preventDefault();
     closeMenu(); closeJobs();
-    selId = null; closePanel();
-    if (selEdge) { selEdge = null; drawWires(); }
+    selId = null; closePanel(); selEdge = null;
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
-    selIds.clear(); paintSel();
+    selIds.clear(); drawWires(false);
     const s = { mx: ev.clientX, my: ev.clientY };
     let moved = false;
     const mv = (e) => {
@@ -3197,7 +3266,7 @@ function bindGlobal() {
         selIds.clear();
         pick(id);
       } else {
-        paintSel();
+        drawWires(false);
         if (selIds.size) toast(`选中 ${selIds.size} 个节点：拖动整体移动 · 右键对齐 / 批量删除 · Delete 全删 · 上方按钮打组 / 批量重命名 / 批量删除`);
       }
     };
@@ -3446,9 +3515,8 @@ function bindGlobal() {
     if (el.jobs.style.display !== "none") { closeJobs(); return; }
     closeMenu(); tipHide();
     if (NODE_EDITOR) return;
-    selId = null; closePanel();
-    if (selEdge) { selEdge = null; drawWires(); }
-    selIds.clear(); paintSel();                  // Esc 也收掉框选
+    selId = null; closePanel(); selEdge = null;
+    selIds.clear(); drawWires(false);            // Esc 也收掉框选和流向
     for (const c of (PROJ ? PROJ.cards : [])) if (c._el) c._el.classList.remove("sel");
   });
 
@@ -7891,7 +7959,7 @@ async function focusTask(j) {
   view.x = r.width / 2 - (c.x + cardW(c) / 2) * view.k;
   view.y = r.height / 3 - c.y * view.k;
   applyView();
-  selId = c.id;
+  selId = c.id; selIds.clear(); selEdge = null; drawWires(false);
   for (const o of PROJ.cards) if (o._el) o._el.classList.toggle("sel", o.id === c.id);
   openPanel(c.id); placePanel(); placeJobs(); saveView();
 }
