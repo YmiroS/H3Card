@@ -204,7 +204,7 @@ except ValueError as error:
 print(json.dumps({'report':report,'write':profile,'baseline':baseline,'estimates':estimates,'mixed_error':mixed_error},ensure_ascii=False))
 connection.close()
 `;
-  return JSON.parse(execFileSync(process.env.CHOUKA_TEST_PYTHON || 'python3',['-c',script,path.join(__dirname,'..'),withOutputResolution?'outputs':withModelEvidence?'evidence':'basic',String(NOW.getTime()/1000)],{encoding:'utf8'}));
+  return JSON.parse(execFileSync(process.env.CHOUKA_TEST_PYTHON || 'python3',['-X','utf8','-c',script,path.join(__dirname,'..'),withOutputResolution?'outputs':withModelEvidence?'evidence':'basic',String(NOW.getTime()/1000)],{encoding:'utf8'}));
 }
 const estimateResponse = {mode:'historical',quality:'technical',worker_id:'w1',total_seconds:12000,daily_capacity_seconds:8*3600*1*.75,machines:1,price_total:null,lines:[{group_id:'h1',quantity:100,seconds_per_unit:60,daily_units:360},{group_id:'h2',quantity:100,seconds_per_unit:60,daily_units:360}],warnings:['测算响应警告一','测算响应警告二'],assumptions:['未包含模型切换','单机并发槽位为一']};
 const tick = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
@@ -1162,7 +1162,7 @@ test('产能看板语法与离线路由专项', async t => {
         await page.setViewportSize({width,height:844});await positionMatrix(page);await assertComparisonTable(page);
         const size=await scroll.evaluate(node=>({client:node.clientWidth,scroll:node.scrollWidth,height:node.clientHeight,fullHeight:node.scrollHeight,maxHeight:parseFloat(getComputedStyle(node).maxHeight),overflow:getComputedStyle(node).overflowX,minWidth:parseFloat(getComputedStyle(node.querySelector('table')).minWidth),columns:node.querySelectorAll('thead .machine-heading').length,head:getComputedStyle(node.querySelector('thead')).display}));
         assert.ok(size.scroll>size.client,'手机只能在矩阵容器内横滚');assert.ok(size.fullHeight>size.height,'合成多业务触发容器纵向滚动');assert.ok(['auto','scroll'].includes(size.overflow));
-        assert.equal(size.minWidth,104+(width-130)*size.columns);assert.ok(Math.abs(size.maxHeight-844*.72)<1);assert.equal(size.head,'table-header-group');
+        assert.equal(size.minWidth,104+(width-72-130)*size.columns);assert.ok(Math.abs(size.maxHeight-844*.72)<1);assert.equal(size.head,'table-header-group');
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true);
         const fixed=await scroll.evaluate(node=>({top:node.querySelector('thead th').getBoundingClientRect().top-node.getBoundingClientRect().top,left:node.querySelector('tbody th.business-axis').getBoundingClientRect().left-node.getBoundingClientRect().left}));
         await scroll.focus();assert.equal(await scroll.evaluate(node=>document.activeElement===node),true);
@@ -1218,14 +1218,24 @@ test('产能看板语法与离线路由专项', async t => {
       }
       assert.deepEqual(state.errors,[]);
     });
-    await t.test('运行面板入口紧邻费用统计右侧，同级同样式',async()=>{
-      const {page}=await setupAdvanced({controller:true});
-      const value=await page.locator('header a[href="/controller/costs"]').evaluate(node=>{
-        const next=node.nextElementSibling,a=getComputedStyle(node),b=getComputedStyle(next);
-        return {href:next.getAttribute('href'),label:next.textContent,tag:next.tagName,parent:next.parentNode===node.parentNode,padding:[a.padding,b.padding],border:[a.border,b.border],background:[a.backgroundColor,b.backgroundColor]};
-      });
-      assert.equal(value.href,'/controller/capacity');assert.equal(value.label,'产能评估');assert.equal(value.tag,'A');assert.equal(value.parent,true);
-      for(const key of ['padding','border','background'])assert.equal(value[key][0],value[key][1]);
+    await t.test('运行面板与产能统计保留共享导航和底部账号，统计入口同组同样式',async()=>{
+      const {page,state}=await setupAdvanced({controller:true});
+      await page.locator('.account-trigger').waitFor();
+      const statistics=page.getByRole('group',{name:'统计',exact:true});
+      assert.deepEqual(await statistics.locator('a').allTextContents(),['费用评估','产能统计']);
+      const value=await statistics.locator('a').evaluateAll(nodes=>nodes.map(node=>{
+        const style=getComputedStyle(node);
+        return {href:node.getAttribute('href'),padding:style.padding,border:style.border,background:style.backgroundColor};
+      }));
+      assert.deepEqual(value.map(node=>node.href),['/controller/costs','/controller/capacity']);
+      for(const key of ['padding','border','background'])assert.equal(value[0][key],value[1][key]);
+      assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'),'/controller');
+      await statistics.getByRole('link',{name:'产能统计',exact:true}).click();
+      await loaded(page);
+      assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'),'/controller/capacity');
+      assert.equal(await page.locator('#workspace-nav .workspace-footer #account').count(),1);
+      assert.equal(await page.locator('#online-count').count(),1,'机器在线数量不得与共享使用人数重名');
+      assert.deepEqual(state.errors,[]);
     });
     await t.test('真实 auth 鉴权；任务与产物分开，完整聚合不受 100 条分页影响',async()=>{
       const {page,state}=await setupAdvanced();

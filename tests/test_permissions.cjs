@@ -39,7 +39,7 @@ test('所有页面统一CK标签图标，品牌图片保持透明及原始比例
       assert.equal(await favicon.count(), 1, `${name} 必须声明唯一标签图标`);
       assert.equal(await favicon.getAttribute('href'), '/favicon.png?v=ck05');
       const icons = page.locator('img[src$="icon.png"], img[src$="auth-logo.png"]');
-      const expected = ['index', 'login', 'permissions', 'teams'].includes(name) ? 1 : name === 'director' ? 2 : 0;
+      const expected = name === 'director' ? 2 : 1;
       assert.equal(await icons.count(), expected, `${name} 品牌入口不可遗漏`);
       for (const icon of await icons.all()) {
         await icon.evaluate(image => image.decode());
@@ -511,6 +511,7 @@ test('workspace navigation keeps account actions at the bottom across pages and 
   let localTest = false;
   const mutations = [];
   const files = {'/':'index.html', '/director':'director.html', '/teams':'teams.html',
+    '/controller':'controller.html', '/admin/permissions':'permissions.html', '/controller/costs':'costs.html', '/controller/capacity':'capacity.html',
     '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/director.js':'director.js',
     '/director.css':'director.css', '/director_edit.js':'director_edit.js', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
   const reply = (res, body, status = 200) => { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(body)); };
@@ -526,7 +527,11 @@ test('workspace navigation keeps account actions at the bottom across pages and 
       }); return;
     }
     const payloads = {'/api/cards':{cards:[], capabilities:{}, comfy_online:false, director_schema:1},
-      '/api/projects':{projects:[], teams:[]}, '/api/jobs':{jobs:[]}, '/api/health':{comfy_online:false},
+      '/api/projects':{projects:[], teams:[]}, '/api/jobs':{jobs:[]}, '/api/health':{ok:true, mode:'controller', comfy_online:false},
+      '/api/status':{running_count:0, queued_count:0}, '/api/workers':{workers:[]},
+      '/api/admin/users':{users:[{...user, enabled:true}]}, '/api/admin/grants':{grants:[]}, '/api/admin/registrations':{requests:[]},
+      '/api/costs':{overview:Object.fromEntries(['retail_min','retail_max','retail_mid','retail_known_tasks','retail_unknown_tasks','total_cost','actual_cost','estimated_cost','gpu_hours','electricity_cost','api_cost','failed_waste','unknown_cost_tasks','running_accrued','tasks','done','error','canceled'].map(key=>[key,0])), by_category:[], by_capability:[], by_worker:[], jobs:[], pricing_version:'test', currency:'CNY'},
+      '/api/capacity':{overview:{}, workers:[], groups:[], details:[], details_total:0},
       '/api/teams':{teams:[]}, '/api/team-candidates':{users:[]}};
     if (Object.hasOwn(payloads, pathname)) return reply(res, payloads[pathname]);
     if (pathname === '/login') { res.setHeader('Content-Type','text/html'); return res.end('<h1>登录</h1>'); }
@@ -575,6 +580,8 @@ test('workspace navigation keeps account actions at the bottom across pages and 
     await page.emulateMedia({reducedMotion:'no-preference'});
     assert.equal(await page.locator('#topbar #account, #topbar #directorbtn').count(), 0);
     assert.deepEqual(await page.locator('.workspace-link').allTextContents(), ['画布', '导演工作台', '项目组', '运行面板', '账号与权限', '费用评估', '产能统计']);
+    assert.deepEqual(await page.getByRole('group', {name:'工作区', exact:true}).locator('a').allTextContents(), ['画布', '导演工作台']);
+    assert.deepEqual(await page.getByRole('group', {name:'管理', exact:true}).locator('a').allTextContents(), ['项目组', '运行面板', '账号与权限']);
     const statistics = page.getByRole('group', {name:'统计', exact:true});
     assert.deepEqual(await statistics.locator('a').allTextContents(), ['费用评估', '产能统计']);
     assert.deepEqual(await statistics.locator('a').evaluateAll(links => links.map(link => link.getAttribute('href'))), ['/controller/costs', '/controller/capacity']);
@@ -646,6 +653,39 @@ test('workspace navigation keeps account actions at the bottom across pages and 
     assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'), '/teams');
     await page.setViewportSize({width:375, height:812});
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
+    for (const [label, route, key] of [['运行面板','/controller','controller'], ['账号与权限','/admin/permissions','permissions'], ['费用评估','/controller/costs','costs'], ['产能统计','/controller/capacity','capacity']]) {
+      await page.locator('#workspace-nav').getByRole('link', {name:label, exact:true}).click();
+      await page.waitForURL(origin + route); await trigger.waitFor();
+      assert.equal(await page.locator('body').getAttribute('data-workspace'), key);
+      assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'), route);
+      assert.equal(await page.locator('#account').count(), 1);
+      assert.equal(await page.locator('#workspace-nav .workspace-footer #account').count(), 1);
+      assert.equal(await page.locator('header a, header #account').count(), 0, 'page headers no longer create separate navigation or account areas');
+      await page.waitForFunction(() => document.querySelector('.workspace-presence b').textContent === '7');
+      for (const width of [375, 1440]) {
+        await page.setViewportSize({width, height:900});
+        await page.mouse.move(width - 10, 70);
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, route + ' fits ' + width + 'px');
+        assert.equal((await rail.boundingBox()).width, 72);
+        assert.ok((await trigger.boundingBox()).y > 790);
+      }
+      await trigger.click(); await menu.getByRole('button', {name:'用户信息', exact:true}).click();
+      assert.deepEqual(await page.getByRole('dialog', {name:'用户信息', exact:true}).locator('dd').allTextContents(), ['张三','admin-account','管理员','admin-1']);
+      await page.keyboard.press('Escape'); await page.locator('.auth-dialog').waitFor({state:'detached'});
+      assert.equal(await trigger.evaluate(el => el === document.activeElement), true);
+      if (key === 'controller' || key === 'costs' || key === 'capacity') {
+        await page.getByRole('button', {name:'立即刷新', exact:true}).click();
+        await page.waitForFunction(() => /最后刷新|更新于/.test(document.querySelector('#refresh-state').textContent));
+      }
+      assert.equal(await page.locator('#error').innerText(), '');
+      await page.mouse.move(20, 38);
+      await page.screenshot({path:path.resolve(web, '..', '..', 'temp', 'chouka-workspace-' + key + '.png')});
+      assert.equal(page.context().pages().length, 1, 'workspace links stay in the current tab');
+    }
+    await page.getByRole('link', {name:'画布', exact:true}).click();
+    await page.waitForURL(origin + '/'); await trigger.waitFor();
+    await page.goBack(); await trigger.waitFor();
+    assert.equal(await page.locator('.workspace-link[aria-current="page"]').getAttribute('href'), '/controller/capacity');
     const touch = await browser.newPage({viewport:{width:375, height:812}, hasTouch:true, isMobile:true});
     try {
       touch.on('pageerror', error => errors.push(error.message));
@@ -671,6 +711,7 @@ test('workspace navigation keeps account actions at the bottom across pages and 
     await page.goto(origin); await trigger.waitFor();
     assert.deepEqual(await page.locator('.workspace-link').allTextContents(), ['画布', '导演工作台', '项目组']);
     assert.equal(await page.getByRole('group', {name:'统计', exact:true}).count(), 0);
+    assert.deepEqual(await page.getByRole('group', {name:'管理', exact:true}).locator('a').allTextContents(), ['项目组']);
     user = {...user, team_leader:false, display_name:'<img src=x onerror=alert(1)>'};
     await page.goto(origin); await trigger.waitFor();
     assert.deepEqual(await page.locator('.workspace-link').allTextContents(), ['画布', '导演工作台']);
