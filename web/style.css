@@ -1388,6 +1388,20 @@ body[data-workspace="canvas"] #main { min-width: 0; }
 #wires path.tmp { stroke: rgba(255,255,255,.88); stroke-width: 2.2; stroke-dasharray: none; filter: none; }
 #wires path.txt { stroke: rgba(255,255,255,.24); stroke-dasharray: 3 5; filter: none; }
 #wires path.carry { stroke: rgba(167,139,250,.54); stroke-width: 1.2; filter: none; opacity: 1; }
+#wires .flow-up { --wire-flow: #7dd3fc; }
+#wires .flow-down { --wire-flow: #5eead4; }
+#wires .flow-both { --wire-flow: #c4b5fd; }
+#wires.has-flow path:not(.hit):not(.related):not(.flow) { opacity: .22; }
+#wires path.related { stroke-width: 2; }
+#wires path.flow {
+  stroke: var(--wire-flow); stroke-width: 2.6; stroke-linecap: round; stroke-dasharray: 5 19;
+  pointer-events: none; filter: none; animation: wire-flow 1s linear infinite paused;
+}
+#wires path.flow.in-view { animation-play-state: running; }
+#wires marker { overflow: visible; }
+#wires marker polygon { fill: var(--wire-flow); }
+@keyframes wire-flow { from { stroke-dashoffset: 0; } to { stroke-dashoffset: -24; } }
+@media (prefers-reduced-motion: reduce) { #wires path.flow { animation: none; } }
 
 /* Workflow node cards — mirrors open-canvas CanvasNode. */
 .card {
