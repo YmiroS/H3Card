@@ -56,6 +56,12 @@ class WorkerCapacityIdentityTest(WorkerFixture, unittest.TestCase):
         for key, value in old_state.items():
             self.assertEqual(stored[key], value)
 
+    def test_primary_role_is_available_before_scan_and_rejects_sync_commands(self):
+        worker = self.make_worker(is_primary_node=True)
+        self.assertIs(worker.capabilities["is_primary_node"], True)
+        worker.queue_sync({"type": "sync_files", "request_id": "ignored"})
+        self.assertIsNone(worker.pending_sync)
+
     def test_explicit_shared_identity_overrides_and_persists(self):
         first = self.make_worker(capacity_host_id="shared-installation")
         second = self.make_worker(capacity_host_id="shared-installation")
@@ -321,7 +327,8 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_scan_capabilities_uses_comfy_devices_and_explicit_versions_only(self):
         self.worker.config.update(capacity_environment_id="env-verified",
-                                  capacity_model_version="model-verified")
+                                  capacity_model_version="model-verified",
+                                  is_primary_node=True)
         device = {"name": "actual CUDA device", "type": "cuda", "index": 2,
                   "vram_total": 1234, "vram_free": 123}
         self.worker._json_request = mock.AsyncMock(side_effect=[
@@ -339,6 +346,7 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caps["telemetry"]["execution_device"], hardware["execution_device"])
         self.assertEqual(caps["agent_version"], 5)
         self.assertEqual(caps["supports_capacity_telemetry"], 1)
+        self.assertIs(caps["is_primary_node"], True)
         self.assertNotIn("private-", json.dumps(caps))
         self.assertEqual(self.worker._json_request.await_count, 2)
 

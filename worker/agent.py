@@ -57,7 +57,9 @@ class WorkerAgent:
         self.current = None
         self.comfy_lock = asyncio.Lock()
         self.release_failed = None
-        self.capabilities = {}
+        self.capabilities = {
+            "is_primary_node": self.is_primary_node,
+        }
         self.telemetry = {}
         self.last_capability_scan = 0.0
         self.last_telemetry_scan = 0.0
@@ -78,6 +80,10 @@ class WorkerAgent:
         else:
             self.sync_report = None
         self.stop_event = asyncio.Event()
+
+    @property
+    def is_primary_node(self):
+        return self.config.get("is_primary_node") is True
 
     def _load_state(self):
         if not self.state_path.exists():
@@ -306,6 +312,7 @@ class WorkerAgent:
             "supports_capacity_telemetry": 1,
             "supports_file_sync": True,
             "supports_code_restart": True,
+            "is_primary_node": self.is_primary_node,
         }
         self.last_capability_scan = time.time()
         return self.capabilities
@@ -365,6 +372,9 @@ class WorkerAgent:
         print("[Worker] ComfyUI 已确认显存释放，恢复接单。", flush=True)
 
     def queue_sync(self, command):
+        if self.is_primary_node:
+            print("[Worker] 主节点不执行文件同步请求", flush=True)
+            return
         request_id = str(command.get("request_id") or "")
         if not request_id:
             return
