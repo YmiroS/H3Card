@@ -29,7 +29,7 @@ class SandboxBoundaryTests(unittest.TestCase):
                              ('POST', '/api/admin/workers/sync-all'), ('POST', '/api/text'),
                              ('POST', '/api/rewrite'), ('GET', '/api/file'),
                              ('GET', '/api/media'), ('POST', '/api/projects'),
-                             ('POST', '/api/auth/register')]:
+                             ('POST', '/api/auth/register'), ('DELETE', '/api/workers/example')]:
             self.assertFalse(allowed(method, path), (method, path))
 
     def test_creative_ui_resources_are_read_only(self):

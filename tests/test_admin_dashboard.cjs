@@ -700,6 +700,9 @@ test('维护health真和假与本地隔离、温度history并存，暂停业务�
     assert.equal(await page.locator('dialog').count(), 0);
     assert.match(await page.locator('#admin-toast').textContent(), /隔离副本/);
     assert.equal(requests.filter(request => request.url.pathname.includes('sync-all')).length, 0);
+    assert.equal(await page.locator('[data-delete-worker]').evaluateAll(buttons=>buttons.length>0&&buttons.every(button=>button.disabled)),true,'隔离副本禁用设备删除');
+    await page.locator('[data-delete-worker]').first().evaluate(button=>{button.disabled=false;button.click();});
+    assert.equal(requests.filter(request=>request.method==='DELETE').length,0,'绕过禁用控件也不能删除副本设备');
     assert.equal(requests.filter(request => request.url.pathname.includes('/temperature')).length, 1);
   });
 });

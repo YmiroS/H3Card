@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 import os
 import sqlite3
@@ -16,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "worker"))
 
-from distributed import DistributedStore, HIGH_VRAM_GPU_POLICY
+from distributed import DistributedStore, HIGH_VRAM_GPU_POLICY, WorkerBusyError
 from agent import AgentError, JobFailed, WorkerAgent
 
 
@@ -255,6 +256,58 @@ class DistributedStoreTest(unittest.TestCase):
             self.store.db.execute("SELECT COUNT(*) FROM workers").fetchone()[0], 2
         )
         self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
+
+    def test_retire_worker_hides_all_same_name_registrations_and_preserves_history(self):
+        newest = self.store.register_worker(
+            "GPU-01", {"node_classes": ["KSampler", "SaveImage"]}
+        )
+        self.store.heartbeat(newest["worker_id"], comfy_online=True, busy=False)
+        self.store.enqueue("historical-job", {"graph": {}}, ["KSampler"])
+        assignment = self.store.acquire(newest["worker_id"])
+        self.assertTrue(self.store.finish(
+            "historical-job", newest["worker_id"], assignment["lease_token"], "done"
+        ))
+
+        self.assertTrue(self.store.retire_worker(newest["worker_id"]))
+
+        self.assertEqual(self.store.list_workers(), [])
+        self.assertFalse(self.store.authenticate(self.worker_id, self.worker_token))
+        self.assertFalse(self.store.authenticate(
+            newest["worker_id"], newest["worker_token"]
+        ))
+        rows = self.store.db.execute(
+            "SELECT id, retired FROM workers ORDER BY created_at"
+        ).fetchall()
+        self.assertEqual([row["retired"] for row in rows], [1, 1])
+        history = self.store.db.execute(
+            "SELECT worker_id, status FROM dispatch_jobs WHERE job_id = 'historical-job'"
+        ).fetchone()
+        self.assertEqual(dict(history), {
+            "worker_id": newest["worker_id"], "status": "done",
+        })
+
+        replacement = self.store.register_worker(
+            "gpu-01", {"node_classes": ["KSampler", "SaveImage"]}
+        )
+        self.store.heartbeat(replacement["worker_id"], comfy_online=True, busy=False)
+        self.assertEqual(
+            [worker["id"] for worker in self.store.list_workers()],
+            [replacement["worker_id"]],
+        )
+
+    def test_retire_worker_rejects_active_assignments(self):
+        self.store.enqueue("active-job", {"graph": {}}, ["KSampler"])
+        self.assertIsNotNone(self.store.acquire(self.worker_id))
+
+        with self.assertRaisesRegex(WorkerBusyError, "执行中的任务"):
+            self.store.retire_worker(self.worker_id)
+
+        self.assertEqual(self.store.list_workers()[0]["id"], self.worker_id)
+        self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
+        time.sleep(self.store.lease_seconds + 0.02)
+        self.assertTrue(self.store.retire_worker(self.worker_id))
+        self.assertEqual(self.store.dispatch_status("active-job"), "queued")
+        self.assertEqual(self.store.list_workers(), [])
 
     def test_sync_all_skips_workers_without_sync_support(self):
         request = self.store.request_sync_all()
@@ -694,6 +747,13 @@ class DistributedStoreMigrationTest(unittest.TestCase):
                     current_job_id TEXT, capabilities_json TEXT NOT NULL DEFAULT '{}',
                     created_at REAL NOT NULL, updated_at REAL NOT NULL
                 )""")
+                token_hash = hashlib.sha256(b"legacy-token").hexdigest()
+                db.execute(
+                    """INSERT INTO workers
+                       (id, name, token_hash, last_seen, created_at, updated_at)
+                       VALUES ('legacy-worker', 'Legacy GPU', ?, 1, 1, 1)""",
+                    (token_hash,),
+                )
                 db.commit()
             finally:
                 db.close()
@@ -705,6 +765,15 @@ class DistributedStoreMigrationTest(unittest.TestCase):
                 self.assertIn("sync_request_id", columns)
                 self.assertIn("sync_status", columns)
                 self.assertIn("sync_finished_at", columns)
+                self.assertIn("retired", columns)
+                self.assertEqual(
+                    store.db.execute(
+                        "SELECT retired FROM workers WHERE id='legacy-worker'"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertTrue(store.authenticate("legacy-worker", "legacy-token"))
+                self.assertEqual(store.list_workers()[0]["id"], "legacy-worker")
             finally:
                 store.close()
 
