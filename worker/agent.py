@@ -5,6 +5,7 @@ import asyncio
 import copy
 import csv
 import ctypes
+import hashlib
 import json
 import math
 import mimetypes
@@ -32,19 +33,127 @@ class JobFailed(AgentError):
         self.canceled = canceled
 
 
+def worker_mutex_name(config_path):
+    normalized = str(Path(config_path).resolve()).replace("/", "\\").casefold()
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+    return "Global\\ChoukaWorker-" + digest
+
+
+def restart_in_progress(config_path):
+    config_path = Path(config_path).resolve()
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+        state_value = Path(config.get("state_file", "worker-state.json"))
+        state_path = state_value if state_value.is_absolute() else config_path.parent / state_value
+        state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
+    except (OSError, ValueError) as exc:
+        raise AgentError(f"无法读取 Worker 重启状态：{exc}") from exc
+    maintenance = state.get("maintenance")
+    if not isinstance(maintenance, dict) or maintenance.get("status") != "restarting":
+        return False
+    try:
+        deadline = float(maintenance.get("deadline") or 0)
+    except (TypeError, ValueError) as exc:
+        raise AgentError(f"Worker 重启期限无效：{exc}") from exc
+    return deadline > time.time()
+
+
+def worker_instance_status(config_path):
+    if os.name != "nt":
+        return False
+    kernel32 = ctypes.windll.kernel32
+    open_mutex = kernel32.OpenMutexW
+    open_mutex.restype = ctypes.c_void_p
+    handle = open_mutex(0x00100000, False, worker_mutex_name(config_path))
+    if handle:
+        kernel32.CloseHandle(handle)
+        return True
+    error = kernel32.GetLastError()
+    if error != 2:
+        raise AgentError(f"无法检查 Worker 是否已运行，Windows 错误码 {error}")
+    if restart_in_progress(config_path):
+        return True
+
+    command = r"""
+$target = [IO.Path]::GetFullPath($env:CHOUKA_WORKER_CONFIG).Replace('/', '\').ToLowerInvariant()
+$leaf = [IO.Path]::GetFileName($target).ToLowerInvariant()
+$legacy = [IO.Path]::GetFullPath($env:CHOUKA_LEGACY_CONFIG).Replace('/', '\').ToLowerInvariant()
+$allowLegacyRelative = $target -eq $legacy
+$python = [IO.Path]::GetFullPath($env:CHOUKA_WORKER_PYTHON).Replace('/', '\').ToLowerInvariant()
+$selfPid = [int]$env:CHOUKA_STATUS_PID
+Get-CimInstance Win32_Process | Where-Object {
+  $line = [string]$_.CommandLine
+  $normalized = $line.Replace('/', '\').ToLowerInvariant()
+  $executable = ([string]$_.ExecutablePath).Replace('/', '\').ToLowerInvariant()
+  $configMatch = [regex]::Match(
+    $normalized, '(?:^|\s)--config(?:=|\s+)(?:"([^"]+)"|(\S+))'
+  )
+  $configValue = if ($configMatch.Groups[1].Success) {
+    $configMatch.Groups[1].Value
+  } else {
+    $configMatch.Groups[2].Value
+  }
+  $_.ProcessId -ne $selfPid -and
+    $executable -eq $python -and
+    $normalized.Contains('agent.py') -and
+    $configMatch.Success -and
+    -not $normalized.Contains('--instance-status') -and
+    ($configValue -eq $target -or
+      ($allowLegacyRelative -and $configValue -eq ('worker\' + $leaf)))
+} | Select-Object -First 1 -ExpandProperty ProcessId
+"""
+    environment = os.environ.copy()
+    environment["CHOUKA_WORKER_CONFIG"] = str(Path(config_path).resolve())
+    environment["CHOUKA_LEGACY_CONFIG"] = str(Path(__file__).resolve().with_name("config.json"))
+    environment["CHOUKA_WORKER_PYTHON"] = sys.executable
+    environment["CHOUKA_STATUS_PID"] = str(os.getpid())
+    try:
+        result = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20, check=False, env=environment,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise AgentError(f"无法检查旧版 Worker 进程：{exc}") from exc
+    if result.returncode != 0:
+        raise AgentError("无法检查旧版 Worker 进程")
+    return bool(result.stdout.strip())
+
+
+def acquire_worker_mutex(config_path):
+    if os.name != "nt":
+        return None
+    kernel32 = ctypes.windll.kernel32
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.restype = ctypes.c_void_p
+    handle = create_mutex(None, False, worker_mutex_name(config_path))
+    if not handle:
+        raise AgentError(f"无法创建 Worker 单实例锁，Windows 错误码 {kernel32.GetLastError()}")
+    if kernel32.GetLastError() == 183:
+        kernel32.CloseHandle(handle)
+        raise AgentError("相同配置的 Worker 已在运行")
+    return handle
+
+
+def close_worker_mutex(handle):
+    if handle and os.name == "nt":
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
 class WorkerAgent:
-    def __init__(self, config_path):
+    def __init__(self, config_path, restart_token=None):
         self.config_path = Path(config_path).resolve()
         self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        self.restart_token = str(restart_token or "")
+        self.fresh_capabilities_ready = False
         self.server = str(self.config["server_url"]).rstrip("/")
         self.comfy = str(self.config.get("comfy_url", "http://127.0.0.1:8188")).rstrip("/")
         self.comfy_ws = self.comfy.replace("http://", "ws://", 1).replace(
             "https://", "wss://", 1
         ) + "/ws"
         self.comfy_input = Path(self.config["comfy_input_dir"]).resolve()
-        state_value = self.config.get("state_file", "worker-state.json")
-        state_path = Path(state_value)
-        self.state_path = state_path if state_path.is_absolute() else self.config_path.parent / state_path
+        self.state_path = self.configured_path("state_file", "worker-state.json")
         self.state = self._load_state()
         # 安装标识不依赖 hostname；同机多个 Worker 由管理员显式配置相同标识。
         host_id = (str(self.config.get("capacity_host_id") or "").strip()
@@ -85,6 +194,10 @@ class WorkerAgent:
     def is_primary_node(self):
         return self.config.get("is_primary_node") is True
 
+    def configured_path(self, key, default):
+        value = Path(self.config.get(key, default))
+        return value if value.is_absolute() else (self.config_path.parent / value).resolve()
+
     def _load_state(self):
         if not self.state_path.exists():
             return {}
@@ -92,9 +205,14 @@ class WorkerAgent:
 
     def _save_state(self):
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        tmp = self.state_path.with_name(
+            self.state_path.name + f".tmp.{os.getpid()}"
+        )
+        try:
+            tmp.write_text(json.dumps(self.state, ensure_ascii=False, indent=2), encoding="utf-8")
+            os.replace(tmp, self.state_path)
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _ssl_context(self):
         ca_file = self.config.get("ca_file")
@@ -269,8 +387,12 @@ class WorkerAgent:
                 self._json_request("GET", self.comfy + "/system_stats"),
                 self._json_request("GET", self.comfy + "/object_info"),
             )
+            if (not isinstance(stats, dict) or not isinstance(nodes, dict)
+                    or not nodes or "KSampler" not in nodes):
+                raise AgentError("ComfyUI 能力接口尚未完整就绪")
         except Exception as exc:
             self.comfy_online = False
+            self.fresh_capabilities_ready = False
             print(f"[Worker] ComfyUI 不可用：{exc}")
             return self.capabilities or None
         self.comfy_online = True
@@ -315,6 +437,7 @@ class WorkerAgent:
             "is_primary_node": self.is_primary_node,
         }
         self.last_capability_scan = time.time()
+        self.fresh_capabilities_ready = True
         return self.capabilities
 
     async def local_status(self):
@@ -386,24 +509,15 @@ class WorkerAgent:
         print(f"[Worker] 已收到文件同步请求：{request_id}", flush=True)
 
     def sync_script_path(self):
-        configured = self.config.get("sync_script")
-        if configured:
-            path = Path(configured)
-            return path if path.is_absolute() else (self.config_path.parent / path).resolve()
-        return self.config_path.parent.parent / "同步主节点模型和用户.bat"
+        return self.configured_path("sync_script", "../同步主节点模型和用户.bat")
 
     def code_repo_path(self):
-        configured = self.config.get("code_repo")
-        if configured:
-            path = Path(configured)
-            return path if path.is_absolute() else (self.config_path.parent / path).resolve()
-        return self.config_path.parent.parent
+        return self.configured_path("code_repo", "..")
 
     def node_launcher_path(self):
         configured = self.config.get("node_launcher")
         if configured:
-            path = Path(configured)
-            return path if path.is_absolute() else (self.config_path.parent / path).resolve()
+            return self.configured_path("node_launcher", configured)
         devices = self.capabilities.get("devices") or self._nvidia_gpus()
         gpu_names = [
             str(item.get("name") or "").casefold()
@@ -505,14 +619,24 @@ class WorkerAgent:
             raise AgentError(f"找不到节点重启程序：{helper}")
         if not launcher.is_file():
             raise AgentError(f"找不到当前 GPU 的启动脚本：{launcher}")
+        await self.run_local_command(
+            "cmd.exe", "/d", "/c", "call", self.batch_command_name(launcher), "check",
+            cwd=launcher.parent, timeout=30,
+        )
 
         timeout = max(float(self.config.get("restart_timeout_seconds", 300)), 60.0)
+        restart_token = uuid.uuid4().hex
+        log_path = self.configured_path("restart_log", "logs/restart-node.log")
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         maintenance = {
             "request_id": request_id,
+            "restart_token": restart_token,
             "status": "restarting",
+            "phase": "starting_supervisor",
             "message": f"代码已更新至 {commit[:12]}，正在重启 ComfyUI 和 Worker",
             "target_commit": commit,
             "deadline": time.time() + timeout,
+            "log_path": str(log_path),
         }
         self.state["maintenance"] = maintenance
         self._save_state()
@@ -522,22 +646,41 @@ class WorkerAgent:
             | getattr(subprocess, "CREATE_NO_WINDOW", 0)
         )
         try:
-            process = await asyncio.create_subprocess_exec(
-                sys.executable, str(helper),
-                "--config", str(self.config_path),
-                "--worker-pid", str(os.getpid()),
-                "--launcher", str(launcher),
-                cwd=str(repo),
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
-                creationflags=flags,
-            )
-            await asyncio.sleep(0.5)
-            if process.returncode is not None:
-                raise AgentError(f"节点重启程序提前退出：{process.returncode}")
-        except Exception:
-            self.state.pop("maintenance", None)
+            with log_path.open("ab", buffering=0) as output:
+                process = await asyncio.create_subprocess_exec(
+                    sys.executable, str(helper),
+                    "--config", str(self.config_path),
+                    "--worker-pid", str(os.getpid()),
+                    "--launcher", str(launcher),
+                    "--request-id", request_id,
+                    "--restart-token", restart_token,
+                    cwd=str(repo),
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=output,
+                    stderr=asyncio.subprocess.STDOUT,
+                    creationflags=flags,
+                )
+            acknowledgement_deadline = time.monotonic() + 15
+            while time.monotonic() < acknowledgement_deadline:
+                await asyncio.sleep(0.2)
+                if process.returncode is not None:
+                    raise AgentError(
+                        f"节点重启程序提前退出：{process.returncode}；日志：{log_path}"
+                    )
+                state = self._load_state()
+                reported = state.get("maintenance")
+                if (isinstance(reported, dict)
+                        and reported.get("restart_token") == restart_token
+                        and reported.get("phase") == "waiting_for_old_worker"):
+                    self.state = state
+                    break
+            else:
+                process.terminate()
+                raise AgentError(f"节点重启程序未确认接管；日志：{log_path}")
+        except Exception as exc:
+            message = f"重启监督器接管失败：{exc}"
+            maintenance.update(status="error", phase="error", message=message)
+            self.state["maintenance"] = maintenance
             self._save_state()
             raise
         self.sync_report = {
@@ -568,8 +711,11 @@ class WorkerAgent:
             }
             return
         if time.time() >= float(maintenance.get("deadline") or 0):
+            log_path = maintenance.get("log_path")
             message = "节点已重启，但 ComfyUI 未在限定时间内恢复就绪"
-            maintenance.update(status="error", message=message)
+            if log_path:
+                message += f"；日志：{log_path}"
+            maintenance.update(status="error", phase="error", message=message)
             self._save_state()
             self.sync_report = {
                 "request_id": request_id,
@@ -577,10 +723,14 @@ class WorkerAgent:
                 "message": message,
             }
             return
-        if self.comfy_online and "node_classes" in self.capabilities:
+        matching_restart = (
+            self.restart_token
+            and self.restart_token == maintenance.get("restart_token")
+        )
+        if matching_restart and self.comfy_online and self.fresh_capabilities_ready:
             commit = str(maintenance.get("target_commit") or "")[:12]
             message = f"代码 {commit} 已拉取，ComfyUI 和 Worker 已重启并就绪"
-            maintenance.update(status="ready", message=message)
+            maintenance.update(status="ready", phase="ready", message=message)
             self._save_state()
             self.sync_report = {
                 "request_id": request_id,
@@ -687,6 +837,7 @@ class WorkerAgent:
                     maintenance = self.state.get("maintenance")
                     if (isinstance(maintenance, dict)
                             and maintenance.get("request_id") == self.sync_report.get("request_id")):
+                        self.state["last_restart_result"] = dict(maintenance)
                         self.state.pop("maintenance", None)
                         self._save_state()
                     self.sync_report = None
@@ -1147,13 +1298,27 @@ class WorkerAgent:
 def main():
     parser = argparse.ArgumentParser(description="Chouka distributed ComfyUI worker")
     parser.add_argument("--config", required=True, help="Worker JSON configuration file")
+    parser.add_argument("--instance-status", action="store_true")
+    parser.add_argument("--restart-token", default="")
     args = parser.parse_args()
+    if args.instance_status:
+        try:
+            raise SystemExit(0 if worker_instance_status(args.config) else 1)
+        except AgentError as exc:
+            print(f"[Worker] {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+    handle = None
     try:
-        asyncio.run(WorkerAgent(args.config).run())
+        if not args.restart_token and restart_in_progress(args.config):
+            raise AgentError("节点正在执行同步重启，不能启动重复 Worker")
+        handle = acquire_worker_mutex(args.config)
+        asyncio.run(WorkerAgent(args.config, restart_token=args.restart_token).run())
     except KeyboardInterrupt:
         pass
     except Exception as exc:
         raise SystemExit(f"[Worker] 启动失败：{exc}") from exc
+    finally:
+        close_worker_mutex(handle)
 
 
 if __name__ == "__main__":

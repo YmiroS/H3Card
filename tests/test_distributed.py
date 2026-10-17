@@ -1,4 +1,5 @@
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -21,7 +22,11 @@ from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, WorkerBusyError,
     capability_model_inventory, worker_capability_comparisons,
 )
-from agent import AgentError, JobFailed, WorkerAgent
+from agent import (
+    AgentError, JobFailed, WorkerAgent, acquire_worker_mutex, close_worker_mutex,
+    restart_in_progress, worker_instance_status, worker_mutex_name,
+)
+import restart_node
 
 
 class ModelDispatchTest(unittest.TestCase):
@@ -1249,6 +1254,72 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[0][1][-2:], ("--upgrade", "--non-interactive"))
         self.assertEqual(calls[-1][1], ("sync-1", "abc123def456"))
 
+    async def test_restart_handoff_waits_for_supervisor_ack_and_keeps_log(self):
+        process = mock.Mock(returncode=None)
+        process.terminate = mock.Mock()
+        self.agent.stop_event = asyncio.Event()
+        self.agent.config = {"restart_timeout_seconds": 60}
+        self.agent.run_local_command = mock.AsyncMock(return_value="paths valid")
+        self.agent._save_state = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            worker_dir = repo / "worker"
+            worker_dir.mkdir()
+            helper = worker_dir / "restart_node.py"
+            helper.write_text("", encoding="utf-8")
+            launcher = repo / "启动Windows节点.bat"
+            launcher.write_text("", encoding="utf-8")
+            self.agent.config_path = worker_dir / "config.json"
+
+            def acknowledged_state():
+                state = copy.deepcopy(self.agent.state)
+                state["maintenance"]["phase"] = "waiting_for_old_worker"
+                return state
+
+            self.agent._load_state = mock.Mock(side_effect=acknowledged_state)
+            with mock.patch.object(self.agent, "code_repo_path", return_value=repo), \
+                 mock.patch.object(self.agent, "node_launcher_path", return_value=launcher), \
+                 mock.patch("agent.os.name", "nt"), \
+                 mock.patch("agent.uuid.uuid4", return_value=mock.Mock(hex="restart-1")), \
+                 mock.patch("agent.asyncio.create_subprocess_exec", new=mock.AsyncMock(return_value=process)) as spawn:
+                await self.agent.schedule_node_restart("sync-1", "abc123def456")
+
+        self.assertTrue(self.agent.stop_event.is_set())
+        self.assertEqual(self.agent.state["maintenance"]["phase"], "waiting_for_old_worker")
+        command = spawn.await_args.args
+        self.assertIn("--restart-token", command)
+        self.assertEqual(command[command.index("--restart-token") + 1], "restart-1")
+        self.assertIsNot(spawn.await_args.kwargs["stdout"], asyncio.subprocess.DEVNULL)
+        self.agent.run_local_command.assert_awaited_once()
+
+    async def test_restart_supervisor_spawn_failure_is_persisted_without_stopping_worker(self):
+        self.agent.stop_event = asyncio.Event()
+        self.agent.config = {"restart_timeout_seconds": 60}
+        self.agent.run_local_command = mock.AsyncMock(return_value="paths valid")
+        self.agent._save_state = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            worker_dir = repo / "worker"
+            worker_dir.mkdir()
+            (worker_dir / "restart_node.py").write_text("", encoding="utf-8")
+            launcher = repo / "启动Windows节点.bat"
+            launcher.write_text("", encoding="utf-8")
+            self.agent.config_path = worker_dir / "config.json"
+            with mock.patch.object(self.agent, "code_repo_path", return_value=repo), \
+                 mock.patch.object(self.agent, "node_launcher_path", return_value=launcher), \
+                 mock.patch("agent.os.name", "nt"), \
+                 mock.patch("agent.asyncio.create_subprocess_exec", new=mock.AsyncMock(
+                     side_effect=OSError("spawn failed")
+                 )):
+                with self.assertRaisesRegex(OSError, "spawn failed"):
+                    await self.agent.schedule_node_restart("sync-1", "abc123def456")
+
+        self.assertFalse(self.agent.stop_event.is_set())
+        self.assertEqual(self.agent.state["maintenance"]["status"], "error")
+        self.assertEqual(self.agent.state["maintenance"]["phase"], "error")
+        self.assertIn("spawn failed", self.agent.state["maintenance"]["message"])
+        self.assertEqual(self.agent._save_state.call_count, 2)
+
     @unittest.skipUnless(os.name == "nt", "Windows cmd.exe behavior")
     async def test_local_batch_runs_from_directory_with_shell_metacharacters(self):
         with tempfile.TemporaryDirectory(prefix="sync & path ") as directory:
@@ -1283,8 +1354,11 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
     def test_restarted_worker_only_reports_done_after_comfy_capabilities_load(self):
         self.agent.state["maintenance"] = {
             "request_id": "sync-1", "status": "restarting",
+            "restart_token": "restart-1",
             "target_commit": "abc123def456", "deadline": time.time() + 60,
         }
+        self.agent.restart_token = "restart-1"
+        self.agent.fresh_capabilities_ready = True
         self.agent.capabilities = {"node_classes": ["KSampler"]}
         self.agent.comfy_online = True
         self.agent._save_state = mock.Mock()
@@ -1295,11 +1369,32 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.agent.state["maintenance"]["status"], "ready")
         self.agent._save_state.assert_called_once_with()
 
+    def test_old_worker_cannot_report_replacement_restart_as_ready(self):
+        self.agent.state["maintenance"] = {
+            "request_id": "sync-1", "status": "restarting",
+            "restart_token": "replacement-only",
+            "target_commit": "abc123def456", "deadline": time.time() + 60,
+        }
+        self.agent.restart_token = ""
+        self.agent.fresh_capabilities_ready = True
+        self.agent.capabilities = {"node_classes": ["KSampler"]}
+        self.agent.comfy_online = True
+        self.agent._save_state = mock.Mock()
+
+        self.agent.refresh_restart_report()
+
+        self.assertEqual(self.agent.sync_report["status"], "running")
+        self.assertEqual(self.agent.state["maintenance"]["status"], "restarting")
+        self.agent._save_state.assert_not_called()
+
     def test_restart_does_not_report_late_comfy_recovery_as_success(self):
         self.agent.state["maintenance"] = {
             "request_id": "sync-1", "status": "restarting",
+            "restart_token": "restart-1",
             "target_commit": "abc123def456", "deadline": time.time() - 1,
         }
+        self.agent.restart_token = "restart-1"
+        self.agent.fresh_capabilities_ready = True
         self.agent.capabilities = {"node_classes": ["KSampler"]}
         self.agent.comfy_online = True
         self.agent._save_state = mock.Mock()
@@ -1308,6 +1403,183 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self.agent.sync_report["status"], "error")
         self.assertEqual(self.agent.state["maintenance"]["status"], "error")
+
+    def test_worker_mutex_identity_uses_canonical_case_insensitive_config_path(self):
+        path = ROOT / "worker/config.example.json"
+        self.assertEqual(worker_mutex_name(path), worker_mutex_name(str(path).upper()))
+        self.assertTrue(worker_mutex_name(path).startswith("Global\\ChoukaWorker-"))
+
+    def test_restart_in_progress_blocks_tokenless_worker_during_handoff(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            state_path = root / "state.json"
+            config_path.write_text(json.dumps({"state_file": "state.json"}), encoding="utf-8")
+            state_path.write_text(json.dumps({"maintenance": {
+                "status": "restarting", "deadline": time.time() + 60,
+            }}), encoding="utf-8")
+            self.assertTrue(restart_in_progress(config_path))
+            state_path.write_text(json.dumps({"maintenance": {
+                "status": "restarting", "deadline": time.time() - 1,
+            }}), encoding="utf-8")
+            self.assertFalse(restart_in_progress(config_path))
+
+    def test_restart_in_progress_rejects_malformed_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "config.json"
+            config_path.write_text(json.dumps({"state_file": "state.json"}), encoding="utf-8")
+            (root / "state.json").write_text(json.dumps({"maintenance": {
+                "status": "restarting", "deadline": "invalid",
+            }}), encoding="utf-8")
+            with self.assertRaisesRegex(AgentError, "重启期限无效"):
+                restart_in_progress(config_path)
+
+    @unittest.skipUnless(os.name == "nt", "Windows named mutex behavior")
+    def test_worker_mutex_blocks_duplicate_for_same_config(self):
+        path = ROOT / "worker/config.example.json"
+        handle = acquire_worker_mutex(path)
+        try:
+            self.assertTrue(worker_instance_status(path))
+            with self.assertRaisesRegex(AgentError, "已在运行"):
+                acquire_worker_mutex(path)
+        finally:
+            close_worker_mutex(handle)
+        self.assertFalse(worker_instance_status(path))
+
+    @unittest.skipUnless(os.name == "nt", "Windows CIM behavior")
+    def test_legacy_cim_fallback_does_not_match_same_named_config_elsewhere(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.json"
+            config_path.write_text(json.dumps({"state_file": "state.json"}), encoding="utf-8")
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)",
+                 "agent.py", "--config", r"worker\config.json"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                time.sleep(0.5)
+                self.assertTrue(worker_instance_status(ROOT / "worker/config.json"))
+                self.assertFalse(worker_instance_status(config_path))
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+
+    @unittest.skipUnless(os.name == "nt", "Windows CIM behavior")
+    def test_legacy_cim_fallback_requires_exact_absolute_config_argument(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "worker-a.json"
+            config_path.write_text(json.dumps({"state_file": "state.json"}), encoding="utf-8")
+            other_path = Path(str(config_path) + ".backup")
+            process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(30)",
+                 "agent.py", "--config", str(other_path)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            try:
+                time.sleep(0.5)
+                self.assertFalse(worker_instance_status(config_path))
+            finally:
+                process.terminate()
+                process.wait(timeout=10)
+
+    def test_wait_for_process_exit_rejects_wait_failed(self):
+        kernel32 = mock.Mock()
+        kernel32.OpenProcess.return_value = 123
+        kernel32.WaitForSingleObject.return_value = 0xFFFFFFFF
+        kernel32.GetLastError.return_value = 5
+        with mock.patch.object(restart_node.ctypes, "windll", mock.Mock(kernel32=kernel32), create=True):
+            with self.assertRaisesRegex(RuntimeError, "Windows 错误码 5"):
+                restart_node.wait_for_process_exit(321, timeout=1)
+        kernel32.CloseHandle.assert_called_once_with(123)
+
+    def test_restart_result_requires_matching_token_and_propagates_error(self):
+        worker = mock.Mock()
+        worker.poll.return_value = None
+        with tempfile.TemporaryDirectory() as directory:
+            state_path = Path(directory) / "state.json"
+            state_path.write_text(json.dumps({"maintenance": {
+                "request_id": "sync-1", "restart_token": "restart-1",
+                "status": "error", "message": "ComfyUI failed",
+            }}), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "ComfyUI failed"):
+                restart_node.wait_for_restart_result(
+                    state_path, worker, time.time() + 10, "sync-1", "restart-1"
+                )
+
+            state_path.write_text(json.dumps({"last_restart_result": {
+                "request_id": "sync-1", "restart_token": "restart-1",
+                "status": "ready",
+            }}), encoding="utf-8")
+            restart_node.wait_for_restart_result(
+                state_path, worker, time.time() + 10, "sync-1", "restart-1"
+            )
+
+    def test_restart_result_ignores_mismatched_restart_token(self):
+        state = {"maintenance": {
+            "request_id": "sync-1", "restart_token": "old-token", "status": "ready",
+        }}
+        self.assertIsNone(restart_node.restart_result(state, "sync-1", "new-token"))
+
+    def test_comfy_readiness_requires_structured_system_stats(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b'{"system": {}, "devices": []}'
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(restart_node, "build_opener", return_value=opener):
+            restart_node.wait_for_comfy_ready("http://127.0.0.1:8188", time.time() + 10)
+        self.assertEqual(
+            [call.args[0] for call in opener.open.call_args_list],
+            ["http://127.0.0.1:8188/system_stats"],
+        )
+
+    def test_comfy_readiness_rejects_missing_system_stats_fields(self):
+        response = mock.MagicMock()
+        response.status = 200
+        response.read.return_value = b'{}'
+        response.__enter__.return_value = response
+        opener = mock.Mock()
+        opener.open.return_value = response
+        with mock.patch.object(restart_node, "build_opener", return_value=opener), \
+             mock.patch.object(restart_node.time, "time", side_effect=[0, 2]), \
+             mock.patch.object(restart_node.time, "sleep"):
+            with self.assertRaisesRegex(RuntimeError, "返回内容无效"):
+                restart_node.wait_for_comfy_ready("http://127.0.0.1:8188", 1)
+
+    def test_start_worker_passes_restart_token_and_persists_output(self):
+        process = mock.Mock(pid=321)
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(restart_node.subprocess, "Popen", return_value=process) as popen:
+            log_path = Path(directory) / "worker.log"
+            restart_node.start_worker(
+                ROOT / "worker/config.example.json", "restart-1", log_path
+            )
+        command = popen.call_args.args[0]
+        self.assertEqual(command[-2:], ["--restart-token", "restart-1"])
+        self.assertIs(popen.call_args.kwargs["stderr"], subprocess.STDOUT)
+
+    def test_windows_launchers_wait_for_comfy_and_deduplicate_worker(self):
+        for name in ("启动Windows节点.bat", "启动Windows节点_4090.bat",
+                     "启动Windows节点_A6000.bat"):
+            with self.subTest(name=name):
+                content = (ROOT / name).read_text(encoding="utf-8")
+                self.assertIn('--wait-comfy --config "%WORKER_CONFIG%"', content)
+                self.assertIn('--instance-status', content)
+                self.assertGreaterEqual(content.count('--instance-status'), 3)
+                self.assertIn('No duplicate was started', content)
+                self.assertNotIn('START_DELAY', content)
+                self.assertLess(
+                    content.index('--comfy-start-only'), content.index('--wait-comfy')
+                )
+                self.assertLess(
+                    content.index('--wait-comfy'), content.index('--instance-status')
+                )
+                self.assertLess(
+                    content.index('if /i "%~1"=="--comfy-only"'),
+                    content.index('--instance-status'),
+                )
 
     async def test_cancel_retains_current_until_ack_and_reuses_targeted_cleanup(self):
         task = asyncio.create_task(self.agent.execute(self.assignment))
