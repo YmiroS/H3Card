@@ -258,7 +258,8 @@ def controller_maintenance_active(app, workers=None):
         return False
     workers = distributed_store(app).list_workers() if workers is None else workers
     return any(
-        not w.get("is_primary_node")
+        w.get("state") != "offline"
+        and not w.get("is_primary_node")
         and w.get("sync_status") in ("pending", "running", "error")
         for w in workers
     )
