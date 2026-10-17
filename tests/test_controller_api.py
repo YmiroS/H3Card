@@ -1879,6 +1879,14 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         health = await (await self.client.get("/api/health")).json()
         self.assertTrue(health["maintenance_active"])
 
+        with mock.patch(
+            "distributed.time.time",
+            return_value=time.time() + self.store.offline_seconds + 1,
+        ):
+            health = await (await self.client.get("/api/health")).json()
+        self.assertFalse(health["maintenance_active"])
+        self.assertFalse(health["comfy_online"])
+
         ready = self.store.register_worker("gpu-ready", {"node_classes": ["KSampler"]})
         self.store.heartbeat(ready["worker_id"], comfy_online=True, busy=False)
         health = await (await self.client.get("/api/health")).json()
