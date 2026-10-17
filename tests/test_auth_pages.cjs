@@ -18,7 +18,7 @@ const staticFiles = new Map([
 ]);
 const apiMethods = new Map([
   ['/api/auth/me', 'GET'], ['/api/auth/login', 'POST'], ['/api/auth/register', 'POST'],
-  ['/api/auth/presence', 'POST'],
+  ['/api/auth/presence', 'POST'], ['/api/health', 'GET'],
 ]);
 const session = {user:{id:'fixture-user', username:'fixture-account', role:'user'}, csrf_token:'fixture-csrf'};
 const registration = {username:'fixture-account', display_name:'测试花名', password:'月光落在山间2026'};
@@ -51,6 +51,7 @@ async function withFixture(options, run) {
   const handlers = {
     '/api/auth/me': () => unauthorized,
     '/api/auth/presence': () => ({status:200, body:{online_users:1}}),
+    '/api/health': () => ({status:200, body:{ok:true, comfy_online:true, maintenance_active:false}}),
     '/api/auth/login': () => ({status:200, body:session}),
     '/api/auth/register': request => ({status:201, body:{
       username:request.body.username, display_name:request.body.display_name, status:'pending',

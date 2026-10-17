@@ -105,6 +105,41 @@
   @media (prefers-reduced-motion: reduce) {
     #workspace-nav :is(.workspace-link, .workspace-brand > span, .workspace-link > span, .workspace-nav-label, .account-name) { transition: none; }
   }
+  #maintenance-banner {
+    position: fixed; inset: 0 0 auto 0; z-index: 1000; min-height: 40px;
+    display: grid; grid-template-columns: 48px minmax(0, 1fr); overflow: hidden;
+    color: #fff; background: #b91c1c; border-bottom: 1px solid #fca5a5;
+    box-shadow: 0 5px 18px #450a0a66; font: 600 13px/40px "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    pointer-events: none;
+  }
+  #maintenance-banner[hidden] { display: none; }
+  .maintenance-banner-icon {
+    display: grid; place-items: center; min-height: 40px; background: #991b1b;
+    border-right: 1px solid #fecaca66;
+  }
+  .maintenance-banner-icon svg { width: 20px; height: 20px; }
+  .maintenance-banner-ticker { min-width: 0; overflow: hidden; }
+  .maintenance-banner-track {
+    display: flex; width: max-content;
+    animation: maintenance-banner-scroll 18s linear infinite;
+  }
+  .maintenance-banner-message {
+    width: calc(100vw - 48px); box-sizing: border-box; padding: 0 56px;
+    white-space: nowrap; text-align: center;
+  }
+  @keyframes maintenance-banner-scroll { to { transform: translateX(-50%); } }
+  @media (max-width: 640px) {
+    #maintenance-banner { grid-template-columns: 42px minmax(0, 1fr); font-size: 12px; }
+    .maintenance-banner-message { width: calc(100vw - 42px); padding-inline: 28px; }
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .maintenance-banner-track { width: 100%; min-width: 0; animation: none; }
+    .maintenance-banner-message {
+      min-width: 0; width: 100%; padding: 8px 16px; white-space: normal;
+      line-height: 1.45; overflow: visible; text-overflow: clip;
+    }
+    .maintenance-banner-message[aria-hidden="true"] { display: none; }
+  }
   .auth-dialog {
     /* 主样式表有 * { margin: 0 } 全局重置，会吃掉原生 dialog 的 margin:auto 居中，
        这里必须显式声明，否则弹窗会跑到角落 */
@@ -132,9 +167,11 @@
 (() => {
   let user = null, csrf = '', stopped = false, pendingMe = null, localTest = false;
   let presenceStarted = false, presencePending = null;
+  let maintenanceStarted = false, maintenancePending = null;
   const controllers = new Set(), timers = new Set();
   function invalidate(redirect = true) {
     stopped = true; user = null; csrf = '';
+    setMaintenanceBanner(false);
     controllers.forEach(c => c.abort()); timers.forEach(clearInterval); timers.clear();
     window.dispatchEvent(new Event('h3auth:expired'));
     if (redirect && location.pathname !== '/login') location.replace('/login');
@@ -192,10 +229,62 @@
       if (!document.hidden) refreshPresence().catch(() => {});
     });
   }
+  function maintenanceBanner() {
+    if (window !== window.top || !document.body) return null;
+    let banner = document.getElementById('maintenance-banner');
+    if (banner) return banner;
+    banner = document.createElement('div');
+    banner.id = 'maintenance-banner'; banner.hidden = true;
+    banner.setAttribute('role', 'status'); banner.setAttribute('aria-live', 'polite');
+    banner.setAttribute('aria-atomic', 'true'); banner.setAttribute('aria-label', '系统维护通知');
+    const icon = document.createElement('span'); icon.className = 'maintenance-banner-icon';
+    icon.setAttribute('aria-hidden', 'true');
+    icon.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15a4 4 0 0 1-4 4H8l-5 3V7a4 4 0 0 1 4-4h10a4 4 0 0 1 4 4z"/><path d="M8 9h8M8 13h5"/></svg>';
+    const ticker = document.createElement('div'); ticker.className = 'maintenance-banner-ticker';
+    const track = document.createElement('div'); track.className = 'maintenance-banner-track';
+    const message = '系统正在维护更新，当前暂无可用执行节点，请稍后再使用。';
+    for (let index = 0; index < 2; index++) {
+      const item = document.createElement('span'); item.className = 'maintenance-banner-message';
+      item.textContent = message;
+      if (index) item.setAttribute('aria-hidden', 'true');
+      track.append(item);
+    }
+    ticker.append(track); banner.append(icon, ticker); document.body.prepend(banner);
+    return banner;
+  }
+  function setMaintenanceBanner(active) {
+    const banner = active ? maintenanceBanner() : document.getElementById('maintenance-banner');
+    if (banner) banner.hidden = !active;
+  }
+  async function refreshMaintenance() {
+    if (stopped || document.hidden) return;
+    if (!maintenancePending) {
+      const timeoutController = new AbortController();
+      const timeout = setTimeout(() => timeoutController.abort(), 4000);
+      maintenancePending = request('/api/health', {
+        cache:'no-store', signal:timeoutController.signal,
+      }).then(data => {
+        setMaintenanceBanner(data.maintenance_active === true);
+        return data;
+      }).finally(() => {
+        clearTimeout(timeout); maintenancePending = null;
+      });
+    }
+    return maintenancePending;
+  }
+  function startMaintenance() {
+    if (window !== window.top || maintenanceStarted) return;
+    maintenanceStarted = true;
+    refreshMaintenance().catch(() => {});
+    every(refreshMaintenance, 5000);
+    document.addEventListener('visibilitychange', () => {
+      if (!document.hidden) refreshMaintenance().catch(() => {});
+    });
+  }
   async function me() {
     if (!pendingMe) pendingMe = request('/api/auth/me', {cache:'no-store'}).then(data => {
       user = data.user; csrf = data.csrf_token; localTest = data.local_test === true;
-      startPresence();
+      startPresence(); startMaintenance();
       return user;
     }).finally(() => { pendingMe = null; });
     return pendingMe;

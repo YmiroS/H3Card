@@ -688,6 +688,99 @@ test('workspace navigation keeps account actions at the bottom across pages and 
   }
 });
 
+test('global maintenance banner appears during updates and hides when a worker is available', async () => {
+  let maintenance = true, stallHealth = false, healthRequests = 0;
+  const session = {user:{id:'u1', username:'viewer', role:'user'}, csrf_token:'test-csrf'};
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, 'http://localhost');
+    if (url.pathname === '/auth.js') {
+      res.setHeader('Content-Type', 'text/javascript'); return res.end(readFileSync(path.join(web, 'auth.js')));
+    }
+    if (url.pathname === '/api/auth/me') {
+      res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify(session));
+    }
+    if (url.pathname === '/api/auth/presence') {
+      req.resume(); res.setHeader('Content-Type', 'application/json'); return res.end('{"online_users":1}');
+    }
+    if (url.pathname === '/api/health') {
+      healthRequests++;
+      if (stallHealth) return;
+      res.setHeader('Content-Type', 'application/json');
+      return res.end(JSON.stringify({ok:true, comfy_online:!maintenance, maintenance_active:maintenance}));
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end('<!doctype html><meta charset="utf-8"><title>维护提示测试</title><script src="/auth.js"></script>');
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  let browser;
+  try {
+    browser = await chromium.launch(browserOptions);
+    const page = await browser.newPage({viewport:{width:1280, height:720}});
+    const errors = []; page.on('pageerror', error => errors.push(error.message));
+    await page.goto('http://127.0.0.1:' + server.address().port + '/');
+    await page.evaluate(() => H3Auth.requireUser());
+    const banner = page.locator('#maintenance-banner');
+    await banner.waitFor({state:'visible'});
+    const visual = await banner.evaluate(element => {
+      const style = getComputedStyle(element);
+      const icon = element.querySelector('.maintenance-banner-icon').getBoundingClientRect();
+      const ticker = element.querySelector('.maintenance-banner-ticker').getBoundingClientRect();
+      return {
+        position:style.position, top:style.top, background:style.backgroundColor,
+        role:element.getAttribute('role'), live:element.getAttribute('aria-live'),
+        iconBeforeMessage:icon.right <= ticker.left,
+        animation:getComputedStyle(element.querySelector('.maintenance-banner-track')).animationName,
+      };
+    });
+    assert.equal(visual.position, 'fixed'); assert.equal(visual.top, '0px');
+    assert.equal(visual.background, 'rgb(185, 28, 28)');
+    assert.deepEqual([visual.role, visual.live], ['status', 'polite']);
+    assert.equal(visual.iconBeforeMessage, true); assert.notEqual(visual.animation, 'none');
+    assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(), '系统正在维护更新，当前暂无可用执行节点，请稍后再使用。');
+    assert.equal(await banner.locator('svg').count(), 1);
+    await page.screenshot({path:path.resolve(web, '..', '..', 'temp', 'chouka-maintenance-banner.png')});
+
+    maintenance = false;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await banner.waitFor({state:'hidden'});
+    maintenance = true;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await banner.waitFor({state:'visible'});
+    await page.setViewportSize({width:320, height:740});
+    await page.emulateMedia({reducedMotion:'reduce'});
+    const reduced = await banner.locator('.maintenance-banner-message').first().evaluate(element => {
+      const style = getComputedStyle(element);
+      return {
+        animation:getComputedStyle(element.parentElement).animationName,
+        whiteSpace:style.whiteSpace, textOverflow:style.textOverflow,
+        fullWidth:element.scrollWidth <= element.clientWidth,
+        fullHeight:element.scrollHeight <= element.clientHeight,
+      };
+    });
+    assert.deepEqual(reduced, {
+      animation:'none', whiteSpace:'normal', textOverflow:'clip',
+      fullWidth:true, fullHeight:true,
+    });
+
+    stallHealth = true;
+    const requestsBeforeStall = healthRequests;
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    for (let index = 0; index < 50 && healthRequests === requestsBeforeStall; index++) {
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    assert.ok(healthRequests > requestsBeforeStall, '悬挂探针必须已经发出');
+    maintenance = false; stallHealth = false;
+    await page.waitForTimeout(4200);
+    await page.evaluate(() => document.dispatchEvent(new Event('visibilitychange')));
+    await banner.waitFor({state:'hidden'});
+    assert.deepEqual(errors, []);
+  } finally {
+    if (browser) await browser.close();
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  }
+});
+
 test('real auth client expires protected sessions and allows a subsequent anonymous login', async () => {
   let expired = false;
   const session = {user:{id:'u1', username:'admin', role:'admin'}, csrf_token:'test-csrf'};

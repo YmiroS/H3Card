@@ -1724,6 +1724,41 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             "type": "sync_files", "request_id": payload["request_id"],
         }, heartbeat["commands"])
 
+    async def test_regular_users_see_maintenance_until_any_worker_is_available(self):
+        syncing = self.store.register_worker(
+            "gpu-syncing", {
+                "node_classes": ["KSampler"], "supports_file_sync": True,
+                "supports_code_restart": True,
+            },
+        )
+        self.store.heartbeat(syncing["worker_id"], comfy_online=True, busy=False)
+        update = self.store.request_sync_all()
+        self.auth.create_user("viewer", auth_support.PASSWORD)
+        await self.login("viewer")
+
+        response = await self.client.get("/api/health")
+        health = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(health["maintenance_active"])
+        self.assertFalse(health["comfy_online"])
+        self.assertNotIn("workers", health)
+
+        self.store.heartbeat(
+            syncing["worker_id"], comfy_online=False, busy=False,
+            maintenance={
+                "request_id": update["request_id"], "status": "error",
+                "message": "重启失败",
+            },
+        )
+        health = await (await self.client.get("/api/health")).json()
+        self.assertTrue(health["maintenance_active"])
+
+        ready = self.store.register_worker("gpu-ready", {"node_classes": ["KSampler"]})
+        self.store.heartbeat(ready["worker_id"], comfy_online=True, busy=False)
+        health = await (await self.client.get("/api/health")).json()
+        self.assertFalse(health["maintenance_active"])
+        self.assertTrue(health["comfy_online"])
+
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
         self.own_project("project-1")
         self.register_asset("test.png", "project-1")
