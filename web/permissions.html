@@ -1,268 +1,237 @@
 <!doctype html>
-<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>账号与权限 · 抽卡系统</title><link rel="icon" type="image/png" href="/favicon.png?v=ck05"><link rel="stylesheet" href="/style.css"></head>
-<body class="auth-page permissions-page">
-<main class="perm-page">
-<header class="perm-header">
-  <div class="brandmark"><img src="/icon.png" alt=""><b>抽卡系统</b></div>
-  <nav aria-label="管理导航">
-    <a class="tbtn" href="/controller">运行面板</a>
-    <a class="tbtn" href="/controller/costs">费用统计</a>
-    <a class="tbtn" href="/teams">项目组</a>
-    <a class="tbtn" href="/">画布</a>
-  </nav>
-  <div id="account" class="account-bar"></div>
-</header>
-<div class="perm-intro">
-  <h1>账号与权限</h1>
-  <p>管理团队账号、组长权限、全画布访问权限与历史画布归属。</p>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>账号与权限 · 抽卡系统</title><link rel="icon" type="image/png" href="/favicon.png?v=ck05">
+<link rel="stylesheet" href="/admin-shell.css">
+<style>
+.permissions-page .permissions-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:var(--gap);align-items:start}
+.permissions-page .section-heading{flex-wrap:wrap}.permissions-page .page-status:empty,.permissions-page [role=alert]:empty,.permissions-page .f-status:empty{display:none}
+.permissions-page .page-status{padding:14px 20px;border:1px solid #6f3e4b;background:#24171d;border-radius:10px;color:#fda4b4;overflow-wrap:anywhere}
+.permissions-page .accounts-table{min-width:1050px}.permissions-page .accounts-table td:first-child{min-width:160px}.permissions-page .row-actions{min-width:320px}.permissions-page .perm-identity{display:grid;gap:3px;overflow-wrap:anywhere}.permissions-page .perm-username{font-weight:550}.permissions-page .perm-user-id{display:block;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.permissions-page .f-chip.on{color:#7bd99d;border-color:#355d43;background:#19281f}.permissions-page .f-chip.off{color:#fb7185;border-color:#6d3541;background:#2c1b22}.permissions-page .f-chip.admin{color:#a6d9f4}.permissions-page .registration-table{min-width:600px}.permissions-page .grant-form{grid-template-columns:repeat(3,minmax(0,1fr));padding-top:0}.permissions-page .grant-form button{justify-self:start}.permissions-page .allocation-tools{display:flex;align-items:end;gap:16px;flex-wrap:wrap;padding:0 24px 24px}.permissions-page .allocation-filters{display:grid;grid-template-columns:repeat(2,minmax(150px,1fr));gap:14px;flex:1}.permissions-page .allocation-batch{display:flex;align-items:end;gap:12px;flex-wrap:wrap}.permissions-page .allocation-batch .field{min-width:210px}.permissions-page #project-selected{align-self:center;font-size:13px;color:var(--muted)}.permissions-page .history-scroll{max-height:620px}.permissions-page .history-scroll th{position:sticky;top:0;background:var(--panel);z-index:1}.permissions-page .allocation-table td{overflow-wrap:anywhere}.permissions-page .perm-id{max-width:240px;font-size:12px;color:var(--muted)}.permissions-page .allocation-table .team-space{display:block;font-size:12px;color:var(--muted);margin-top:4px}.permissions-page .refresh-note{font-size:12px;color:var(--muted)}.permissions-page .dialog-list{max-height:320px;overflow:auto}.permissions-page .dialog-list table{min-width:620px}.permissions-page .dialog-list td{overflow-wrap:anywhere}.permissions-page .dialog-list th{position:sticky;top:0;background:var(--panel)}.permissions-page .notice-box{overflow-wrap:anywhere}.permissions-page .table-wrap{scrollbar-gutter:stable}.permissions-page .metric-value{min-height:1.25em}
+.permissions-page .accounts-scroll,.permissions-page .registrations-scroll{max-height:520px}.permissions-page :is(.accounts-scroll,.registrations-scroll) th{position:sticky;top:0;background:var(--panel);z-index:1}.permissions-page .section-nav{display:flex;gap:8px;flex-wrap:wrap}.permissions-page .section-nav a{display:flex;align-items:center;min-height:44px;padding:9px 14px;border:1px solid var(--line);border-radius:8px;background:var(--panel);font-size:14px;color:var(--text)}.permissions-page .section-nav a:hover{background:var(--hover);text-decoration:none}.permissions-page h2[id]{scroll-margin-top:24px}.permissions-page h2[id]:focus-visible{outline:2px solid var(--blue);outline-offset:4px}
+@media(max-width:1100px){.permissions-page .permissions-grid{grid-template-columns:1fr}}
+@media(max-width:767px){.permissions-page .allocation-tools{padding:0 18px 18px;display:grid}.permissions-page .allocation-filters{grid-template-columns:1fr}.permissions-page .allocation-batch{display:grid}.permissions-page .allocation-batch .field{min-width:0}.permissions-page .grant-form{grid-template-columns:1fr}.permissions-page .header-actions{width:100%}}
+</style>
+</head>
+<body class="admin-page permissions-page" data-workspace="permissions">
+<main id="main" tabindex="-1"><div class="page">
+<header class="card page-header"><div><h1>账号与权限</h1><div class="page-caption"><p class="subtitle">管理账号、画布访问与历史画布归属</p></div></div><div class="header-actions"><span id="refresh-note" class="refresh-note" role="status">正在加载真实数据…</span><button id="refresh" type="button" disabled>刷新数据</button></div></header>
+<p id="error" class="page-status" role="alert"></p>
+<section class="metrics" aria-label="权限概览">
+<article class="card metric"><div class="metric-content"><p class="metric-label">账号总数</p><p id="metric-users" class="metric-value">—</p><p class="metric-note">角色与独立组长权限分别管理</p></div></article>
+<article class="card metric"><div class="metric-content"><p class="metric-label">启用账号</p><p id="metric-enabled" class="metric-value">—</p><p class="metric-note">停用不会删除账号或画布授权</p></div></article>
+<article class="card metric"><div class="metric-content"><p class="metric-label">待审批注册</p><p id="metric-pending" class="metric-value">—</p><p class="metric-note">仅由钉钉指定审批人处理</p></div></article>
+<article class="card metric"><div class="metric-content"><p class="metric-label">画布授权</p><p id="metric-grants" class="metric-value">—</p><p class="metric-note">访问者 A → 所有者 B</p></div></article>
+</section>
+<nav class="section-nav" aria-label="权限管理分区"><a href="#accounts-heading">账号管理</a><a href="#registrations-heading">注册申请</a><a href="#grants-heading">画布授权</a><a href="#history-heading">历史画布分配</a></nav>
+<section class="card" aria-labelledby="accounts-heading">
+<div class="section-heading"><div><h2 id="accounts-heading" tabindex="-1">账号管理</h2><p class="section-subtitle">账号角色只有管理员和普通用户，组长权限独立设置。</p></div><button id="create-user" type="button" class="primary" disabled>新建账号</button></div>
+<div class="table-wrap accounts-scroll" tabindex="0" role="region" aria-label="账号列表"><table class="accounts-table"><thead><tr><th scope="col">账号 / ID</th><th scope="col">姓名 / 花名</th><th scope="col">角色</th><th scope="col">独立组长权限</th><th scope="col">启用状态</th><th scope="col">审批</th><th scope="col">操作</th></tr></thead><tbody id="users"><tr><td colspan="7">正在加载账号…</td></tr></tbody></table></div>
+<p class="table-note">启停、角色、组长权限及重置密码均需确认。初始密码至少 8 位，请勿使用常见弱密码；创建后交给本人，登录后可自行修改。</p>
+</section>
+<div class="permissions-grid">
+<section class="card" aria-labelledby="registrations-heading"><div class="section-heading"><h2 id="registrations-heading" tabindex="-1">注册申请</h2><span class="small muted">仅查看钉钉审批结果</span></div>
+<div class="f-pad form-grid"><p class="notice-box">自主注册由钉钉群内两位指定审批人在卡片上处理，任意一人先决生效。网页不提供通过或拒绝操作。</p><p id="outbox-status" class="f-status" role="status"></p></div>
+<div class="table-wrap registrations-scroll" tabindex="0" role="region" aria-label="注册申请列表"><table class="registration-table"><thead><tr><th scope="col">账号</th><th scope="col">姓名 / 花名</th><th scope="col">状态</th><th scope="col">申请时间</th><th scope="col">审批人</th></tr></thead><tbody id="registrations"><tr><td colspan="5">正在加载注册申请…</td></tr></tbody></table></div></section>
+<section class="card" aria-labelledby="grants-heading"><div class="section-heading"><h2 id="grants-heading" tabindex="-1">画布授权</h2><span class="small muted">访问者 A → 所有者 B</span></div>
+<div class="f-pad"><p class="notice-box">A 可以查看或操作 B 当前及以后创建的全部画布；可操作包含删除。授权不传递，管理员天然可访问全部画布。停用账号的授权不会令其恢复登录权限。</p></div>
+<form id="grant" class="grant-form"><label class="field">访问者 A<select name="viewer_id" required disabled></select></label><label class="field">所有者 B<select name="owner_id" required disabled></select></label><label class="field">权限<select name="permission"><option value="read">只读</option><option value="operate">可操作（含删除）</option></select></label><button id="grant-submit" class="primary" disabled>保存授权</button><p id="grant-error" class="danger small" role="alert"></p></form>
+<div class="table-wrap" tabindex="0" role="region" aria-label="画布授权列表"><table class="grant-table"><thead><tr><th scope="col">访问者 A</th><th scope="col">方向</th><th scope="col">所有者 B</th><th scope="col">权限</th><th scope="col">操作</th></tr></thead><tbody id="grants"><tr><td colspan="5">正在加载授权…</td></tr></tbody></table></div></section>
 </div>
-<p id="error" role="alert"></p>
-
-<section class="perm-section" aria-labelledby="accounts-heading">
-  <div class="perm-description">
-    <h2 id="accounts-heading">账号</h2>
-    <p class="auth-note">密码至少 8 位，无需组合大小写、数字或符号，请勿使用 12345678 等常见弱密码。创建后把初始密码告诉本人，登录后可自行修改。</p>
-  </div>
-  <div class="perm-content">
-  <form id="create" class="form-row">
-    <label class="fld"><span>账号名</span><input name="username" autocomplete="off" required></label>
-    <label class="fld"><span>初始密码</span><input name="password" type="password" autocomplete="new-password" required minlength="8"></label>
-    <label class="fld"><span>角色</span><select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
-    <label class="fld"><span>项目组权限</span><span><input name="team_leader" type="checkbox"> 组长</span></label>
-    <button class="btn primary">创建账号</button>
-  </form>
-  <div class="table-scroll" tabindex="0" role="region" aria-label="账号列表"><table class="perm-table"><thead><tr><th scope="col">账号</th><th scope="col">姓名 / 花名</th><th scope="col">角色 / 项目组权限</th><th scope="col">状态</th><th scope="col">审批</th><th scope="col">操作</th></tr></thead><tbody id="users"></tbody></table></div>
-  </div>
+<section class="card" aria-labelledby="history-heading"><div class="section-heading"><h2 id="history-heading" tabindex="-1">历史画布分配</h2><span class="small muted">仅个人空间 / 每次最多 1000 个</span></div>
+<div class="f-pad"><p class="notice-box">画布内容和历史费用不变。新所有者的授权访问者将获得相应权限（可操作包含删除）；原所有者及其授权访问者可能失去访问权限。管理员仍可访问全部画布。项目组画布由成员关系授权，不能改为个人归属。</p></div>
+<div class="allocation-tools"><div class="allocation-filters"><label class="field">搜索名称 / ID<input id="project-search" type="search" autocomplete="off" placeholder="输入画布名称或 ID"></label><label class="field">当前所有者<select id="project-owner"><option value="">全部所有者</option></select></label></div>
+<form id="assign" class="allocation-batch"><label class="field">目标账号（仅启用账号）<select name="owner_id" required></select></label><span id="project-selected" role="status">已选 0 个画布</span><button id="assign-submit" class="primary" disabled>分配所选画布</button><button id="clear-selection" type="button" disabled>清空选择</button></form></div>
+<p id="assign-status" class="table-note f-status" role="status"></p>
+<div class="table-wrap history-scroll" tabindex="0" role="region" aria-label="历史画布列表"><table class="allocation-table"><thead><tr><th scope="col"><input id="project-all" type="checkbox" aria-label="全选当前筛选结果中的个人画布" disabled></th><th scope="col">画布名称</th><th scope="col">画布 ID</th><th scope="col">当前所有者</th><th scope="col">空间</th></tr></thead><tbody id="projects"><tr><td colspan="5">正在加载画布…</td></tr></tbody></table></div>
+<p class="table-note">搜索或切换当前所有者会清空选择。全选只选择当前筛选结果中的个人画布，项目组画布不可选；超过 1000 个时请缩小筛选范围。</p>
 </section>
-
-<section class="perm-section" aria-labelledby="registrations-heading">
-  <div class="perm-description">
-    <h2 id="registrations-heading">注册申请</h2>
-    <p class="auth-note">自主注册由钉钉群内两位指定审批人在卡片上处理，任意一人先决生效；此处仅查看状态，不提供网页审批。</p>
-  </div>
-  <div class="perm-content">
-  <p id="outbox-status" class="auth-note" role="status"></p>
-  <div class="table-scroll" tabindex="0" role="region" aria-label="注册申请列表"><table class="perm-table"><thead><tr><th scope="col">账号</th><th scope="col">姓名 / 花名</th><th scope="col">状态</th><th scope="col">申请时间</th><th scope="col">审批人</th></tr></thead><tbody id="registrations"></tbody></table></div>
-  </div>
-</section>
-
-<section class="perm-section" aria-labelledby="grants-heading">
-  <div class="perm-description">
-    <h2 id="grants-heading">画布授权</h2>
-    <p class="auth-note">允许访问者查看（或操作）所有者<b>当前和以后创建的全部画布</b>；可操作包含删除。授权不传递，管理员天然可访问全部画布。</p>
-  </div>
-  <div class="perm-content">
-  <form id="grant" class="form-row">
-    <label class="fld"><span>访问者 A</span><select name="viewer_id" required></select></label>
-    <span class="grant-arrow" aria-hidden="true">→</span>
-    <label class="fld"><span>所有者 B</span><select name="owner_id" required></select></label>
-    <label class="fld"><span>权限</span><select name="permission"><option value="read">只读</option><option value="operate">可操作（含删除）</option></select></label>
-    <button class="btn primary">保存授权</button>
-  </form>
-  <div class="table-scroll" tabindex="0" role="region" aria-label="画布授权列表"><table class="perm-table"><thead><tr><th scope="col">访问者 A</th><th scope="col" aria-label="授权方向"></th><th scope="col">所有者 B</th><th scope="col">权限</th><th scope="col">操作</th></tr></thead><tbody id="grants"></tbody></table></div>
-  </div>
-</section>
-
-<section class="perm-section perm-history" aria-labelledby="history-heading">
-  <div class="perm-description">
-    <h2 id="history-heading">历史画布分配</h2>
-    <p class="auth-note">选择个人空间画布并分配给对应账号，每次最多 1000 个。项目组画布由成员关系授权，不能在这里改为个人归属。画布内容和历史费用不变；新所有者的授权访问者将获得相应权限，原所有者及其授权访问者可能失去访问权限。</p>
-  </div>
-  <div class="perm-content">
-  <div class="perm-toolbar">
-  <div class="form-row perm-filters">
-    <label class="fld"><span>搜索名称 / ID</span><input id="project-search" type="search" autocomplete="off" placeholder="画布名称或 ID"></label>
-    <label class="fld"><span>当前所有者</span><select id="project-owner"><option value="">全部所有者</option></select></label>
-  </div>
-  <form id="assign" class="form-row perm-batch">
-    <label class="fld"><span>目标用户（仅启用账号）</span><select name="owner_id" required></select></label>
-    <span id="project-selected" role="status">已选 0 个画布</span>
-    <button id="assign-submit" class="btn primary" disabled>分配所选画布</button>
-  </form>
-  </div>
-  <p id="assign-status" class="auth-note" role="status"></p>
-  <div class="table-scroll" tabindex="0" role="region" aria-label="历史画布列表"><table class="perm-table perm-projects"><thead><tr><th scope="col"><input id="project-all" type="checkbox" aria-label="全选当前筛选结果"></th><th scope="col">画布名称</th><th scope="col">空间</th><th scope="col">ID</th><th scope="col">当前所有者</th></tr></thead><tbody id="projects"></tbody></table></div>
-  </div>
-</section>
-</main>
-<script src="/auth.js"></script><script>
+</div></main>
+<script src="/auth.js"></script><script src="/admin-shell.js"></script><script>
+'use strict';
+(() => {
 const $ = id => document.getElementById(id);
-let users = [], projects = [], assigning = false;
+let users = [], projects = [], grants = [], loading = false, ready = false, assigning = false, mutationBusy = false;
 const selectedProjects = new Set();
-const projectOwner = project => project.owner_username || users.find(u => String(u.id) === String(project.owner_id))?.username || '未知用户';
+const h = value => AdminUI.escape(String(value ?? ''));
+const userById = id => users.find(user => String(user.id) === String(id));
+const userName = user => (user?.username || '未知账号') + (user?.display_name?.trim() ? '（' + user.display_name.trim() + '）' : '');
+const userLabel = id => userName(userById(id)) + '（ID: ' + id + '）';
+const projectOwner = project => userName({display_name:project.owner_display_name || userById(project.owner_id)?.display_name, username:project.owner_username || userById(project.owner_id)?.username});
 const ownerLabel = project => projectOwner(project) + '（ID: ' + project.owner_id + '）';
+const cell = (row, value) => { const td = document.createElement('td'); td.textContent = value; row.append(td); return td; };
+function identity(name, id) {
+  const wrap = document.createElement('span'); wrap.className = 'perm-identity';
+  const title = document.createElement('span'); title.className = 'perm-username'; title.textContent = name;
+  const meta = document.createElement('span'); meta.className = 'perm-user-id'; meta.textContent = 'ID: ' + id;
+  wrap.append(title, meta); return wrap;
+}
+function chip(text, cls = '') { const node = document.createElement('span'); node.className = 'f-chip ' + cls; node.textContent = text; return node; }
+function emptyRow(body, text, columns) { const row = document.createElement('tr'); cell(row, text).colSpan = columns; body.append(row); }
+function button(parent, text, action, cls = '') {
+  const node = document.createElement('button'); node.type = 'button'; node.className = cls; node.textContent = text;
+  node.onclick = action; parent.append(node);
+}
 function filteredProjects() {
   const search = $('project-search').value.trim().toLowerCase(), owner = $('project-owner').value;
   return projects.filter(p => (!owner || String(p.owner_id) === owner) && (!search || String(p.name || '').toLowerCase().includes(search) || String(p.id).toLowerCase().includes(search)));
 }
-function updateSelection() {
-  const visible = filteredProjects().filter(project => !project.team_id), count = visible.filter(p => selectedProjects.has(p.id)).length;
-  $('project-selected').textContent = '已选 ' + selectedProjects.size + ' 个画布';
+function syncControls() {
+  const busy = loading || mutationBusy || !ready;
+  $('refresh').disabled = loading || mutationBusy; $('create-user').disabled = busy; $('grant-submit').disabled = busy;
+  for (const node of document.querySelectorAll('#users button, #grants button, #grant select')) node.disabled = busy;
+  const visible = filteredProjects().filter(p => !p.team_id), count = visible.filter(p => selectedProjects.has(p.id)).length;
+  $('project-selected').textContent = '已选 ' + selectedProjects.size + ' 个画布' + (selectedProjects.size > 1000 ? '（超过 1000 个上限）' : '');
   $('project-all').checked = visible.length > 0 && count === visible.length;
   $('project-all').indeterminate = count > 0 && count < visible.length;
-  $('project-all').disabled = assigning || !visible.length;
-  $('assign-submit').disabled = assigning || !selectedProjects.size || !users.some(u => u.enabled && String(u.id) === $('assign').elements.owner_id.value);
-  $('assign-submit').textContent = assigning ? '分配中…' : '分配所选画布';
+  $('project-all').disabled = busy || assigning || !visible.length;
+  $('clear-selection').disabled = busy || assigning || !selectedProjects.size;
+  $('assign-submit').disabled = busy || assigning || !selectedProjects.size || !users.some(u => u.enabled && String(u.id) === $('assign').elements.owner_id.value);
+  for (const node of [$('project-search'), $('project-owner'), $('assign').elements.owner_id]) node.disabled = busy || assigning;
+  for (const input of $('projects').querySelectorAll('input')) input.disabled = busy || assigning || input.dataset.team === 'true';
 }
 function renderProjects() {
-  $('projects').replaceChildren();
-  const visible = filteredProjects();
-  for (const project of visible) {
-    const row = document.createElement('tr'), checkbox = document.createElement('input');
-    checkbox.type = 'checkbox'; checkbox.checked = selectedProjects.has(project.id); checkbox.disabled = assigning || !!project.team_id;
-    checkbox.setAttribute('aria-label', '选择画布 ' + (project.name || '未命名画布') + '（' + project.id + '）');
-    checkbox.onchange = () => { if (checkbox.checked) selectedProjects.add(project.id); else selectedProjects.delete(project.id); updateSelection(); };
-    cell(row,'').append(checkbox); cell(row,project.name || '未命名画布');
-    cell(row, project.team_name ? '项目组：' + project.team_name : '个人空间');
-    const projectId = cell(row,project.id); projectId.className = 'perm-id'; projectId.title = String(project.id);
-    cell(row,'').append(identity(projectOwner(project), project.owner_id));
-    $('projects').append(row);
+  const body = $('projects'); body.replaceChildren();
+  for (const project of filteredProjects()) {
+    const row = document.createElement('tr'), input = document.createElement('input');
+    input.type = 'checkbox'; input.checked = selectedProjects.has(project.id); input.dataset.team = String(!!project.team_id);
+    input.setAttribute('aria-label', '选择画布 ' + (project.name || '未命名画布') + '（' + project.id + '）');
+    input.onchange = () => { if (input.checked) selectedProjects.add(project.id); else selectedProjects.delete(project.id); syncControls(); };
+    cell(row, '').append(input); cell(row, project.name || '未命名画布');
+    const idCell = cell(row, project.id); idCell.className = 'perm-id';
+    cell(row, '').append(identity(projectOwner(project), project.owner_id));
+    const space = cell(row, project.team_id ? '项目组：' + (project.team_name || project.team_id) : '个人空间');
+    if (project.team_id) { const note = document.createElement('span'); note.className = 'team-space'; note.textContent = '由成员关系授权，不可改为个人归属'; space.append(note); }
+    body.append(row);
   }
-  if (!visible.length) { const row = document.createElement('tr'); cell(row,'暂无符合条件的画布').colSpan = 5; $('projects').append(row); }
-  $('project-search').disabled = assigning; $('project-owner').disabled = assigning; $('assign').elements.owner_id.disabled = assigning;
-  updateSelection();
+  if (!body.children.length) emptyRow(body, '暂无符合条件的画布，请尝试更换搜索词或当前所有者。', 5);
+  syncControls();
 }
-function refreshProjectOptions() {
-  const owner = $('project-owner'), previousOwner = owner.value, target = $('assign').elements.owner_id, previousTarget = target.value;
-  owner.replaceChildren(); target.replaceChildren();
-  const all = document.createElement('option'); all.value = ''; all.textContent = '全部所有者'; owner.append(all);
-  const owners = new Map(projects.map(p => [String(p.owner_id), projectOwner(p)]));
-  for (const [id, name] of owners) { const option = document.createElement('option'); option.value = id; option.textContent = name; owner.append(option); }
-  if (owners.has(previousOwner)) owner.value = previousOwner;
-  const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '请选择目标用户'; target.append(placeholder);
-  for (const user of users.filter(u => u.enabled)) { const option = document.createElement('option'); option.value = user.id; option.textContent = user.username; option.title = user.username + '（ID: ' + user.id + '）'; target.append(option); }
-  if ([...target.options].some(o => o.value === previousTarget)) target.value = previousTarget;
-  selectedProjects.clear(); renderProjects();
+function setOptions(select, entries, placeholder) {
+  const previous = select.value; select.replaceChildren(new Option(placeholder, ''));
+  for (const [id, name] of entries) select.append(new Option(name, String(id)));
+  if ([...select.options].some(option => option.value === previous)) select.value = previous;
 }
-const cell = (row, value) => { const td = document.createElement('td'); td.textContent = value; row.append(td); return td; };
-// 账号以用户名为主信息，完整 ID 保留为辅助信息，不改变提交值。
-function identity(name, id) {
-  const wrap = document.createElement('span'); wrap.className = 'perm-identity';
-  const avatar = document.createElement('span'); avatar.className = 'perm-avatar'; avatar.setAttribute('aria-hidden', 'true'); avatar.textContent = Array.from(String(name))[0]?.toUpperCase() || '?';
-  const detail = document.createElement('span'); detail.className = 'perm-identity-detail';
-  const username = document.createElement('span'); username.className = 'perm-username'; username.textContent = name; username.title = String(name);
-  const meta = document.createElement('span'); meta.className = 'perm-user-id'; meta.textContent = 'ID: ' + id; meta.title = 'ID: ' + id;
-  detail.append(username, meta); wrap.append(avatar, detail); return wrap;
-}
-function button(parent, title, action, cls = '') {
-  const b = document.createElement('button');
-  b.className = ('btn sm ' + cls).trim(); b.textContent = title;
-  b.onclick = () => perform(action); parent.append(b);
-}
-const chip = (text, cls) => {
-  const span = document.createElement('span'); span.className = 'chip' + (cls ? ' ' + cls : '');
-  const dot = document.createElement('i'); dot.className = 'd';
-  span.append(dot, document.createTextNode(text)); return span;
-};
-async function perform(action) { $('error').textContent = ''; try { await action(); await refresh(); } catch (e) { $('error').textContent = e.message; } }
-async function refresh() {
-  const [u,g,p] = await Promise.all([H3Auth.request('/api/admin/users'), H3Auth.request('/api/admin/grants'), H3Auth.request('/api/projects')]); users = u.users; projects = p.projects;
-  refreshProjectOptions();
+function render() {
+  $('metric-users').textContent = users.length;
+  $('metric-enabled').textContent = users.filter(user => user.enabled).length;
+  $('metric-grants').textContent = grants.length;
   $('users').replaceChildren();
   for (const user of users) {
-    const row = document.createElement('tr'); cell(row,'').append(identity(user.username, user.id));
-    cell(row, user.display_name || '—');
-    const roles = cell(row,''); roles.className = 'acts';
-    roles.append(chip(user.role === 'admin' ? '管理员' : '普通用户', user.role === 'admin' ? 'admin' : ''));
-    if (user.team_leader) roles.append(chip('组长', 'op'));
-    cell(row,'').append(chip(user.enabled ? '启用' : '已停用', user.enabled ? 'on' : 'off'));
-    const approval = {approved: ['已通过','on'], pending: ['待审批',''], rejected: ['已拒绝','off']}[user.approval_status] || ['—',''];
-    cell(row,'').append(chip(approval[0], approval[1]));
-    const acts = cell(row,''); acts.className = 'acts';
-    const base = '/api/admin/users/' + encodeURIComponent(user.id);
-    button(acts,user.enabled ? '停用' : '启用', () => H3Auth.json(base,'PATCH',{enabled:!user.enabled}), 'danger');
-    button(acts,user.role === 'admin' ? '设为普通用户' : '设为管理员', async () => { if (confirm('确认修改账号角色？')) await H3Auth.json(base,'PATCH',{role:user.role === 'admin' ? 'user' : 'admin'}); });
-    button(acts,user.team_leader ? '取消组长权限' : '设为组长', async () => {
-      if (confirm(user.team_leader ? '取消后该用户不能再创建或管理项目组，确认继续？' : '授予该用户创建和管理项目组的权限？')) {
-        await H3Auth.json(base,'PATCH',{team_leader:!user.team_leader});
-      }
-    });
-    button(acts,'重置密码', async () => {
-      const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog';
-      dialog.innerHTML = '<form><h2>重置 <b></b> 的密码</h2>'
-        + '<label class="fld"><span>新密码（至少 8 位）</span><input type="password" name="password" autocomplete="new-password" required minlength="8"></label>'
-        + '<p role="alert"></p><footer><button type="button" class="btn">取消</button><button class="btn primary">确认重置</button></footer></form>';
-      dialog.querySelector('h2 b').textContent = user.username;
-      dialog.querySelector('[type=button]').onclick = () => dialog.remove();
-      dialog.querySelector('form').onsubmit = async event => { event.preventDefault(); try { await H3Auth.json(base+'/password','POST',{password:event.currentTarget.elements.password.value}); dialog.remove(); } catch(e) { dialog.querySelector('[role=alert]').textContent = e.message; } };
-      document.body.append(dialog); dialog.showModal();
-    });
+    const row = document.createElement('tr'); cell(row, '').append(identity(user.username, user.id));
+    cell(row, user.display_name || '—'); cell(row, '').append(chip(user.role === 'admin' ? '管理员' : '普通用户', user.role === 'admin' ? 'admin' : ''));
+    cell(row, user.team_leader ? '是' : '否'); cell(row, '').append(chip(user.enabled ? '启用' : '已停用', user.enabled ? 'on' : 'off'));
+    const approval = {approved:'已通过', pending:'待审批', rejected:'已拒绝'}; cell(row, approval[user.approval_status] || '—');
+    const actions = document.createElement('div'); actions.className = 'row-actions'; cell(row, '').append(actions);
+    button(actions, user.enabled ? '停用' : '启用', () => accountAction(user, 'enabled'), user.enabled ? 'danger' : '');
+    button(actions, '修改角色', () => accountAction(user, 'role'));
+    button(actions, user.team_leader ? '取消组长权限' : '设为组长', () => accountAction(user, 'leader'));
+    button(actions, '重置密码', () => accountAction(user, 'password'));
     $('users').append(row);
   }
-  for (const name of ['viewer_id','owner_id']) { const select = $('grant').elements[name], previous = select.value; select.replaceChildren(); for (const user of users) { const option = document.createElement('option'); option.value = user.id; option.textContent = user.username; select.append(option); } if ([...select.options].some(o => o.value === previous)) select.value = previous; }
-  const username = id => users.find(u => String(u.id) === String(id))?.username || String(id);
+  if (!users.length) emptyRow($('users'), '暂无账号。', 7);
+  const entries = users.map(user => [user.id, userLabel(user.id)]);
+  for (const name of ['viewer_id', 'owner_id']) setOptions($('grant').elements[name], entries, '请选择账号');
+  setOptions($('assign').elements.owner_id, entries.filter(([id]) => userById(id)?.enabled), '请选择目标账号');
+  setOptions($('project-owner'), [...new Map(projects.map(project => [String(project.owner_id), ownerLabel(project)])).entries()], '全部所有者');
   $('grants').replaceChildren();
-  for (const grant of g.grants) {
-    const row = document.createElement('tr'); cell(row,'').append(identity(username(grant.viewer_id), grant.viewer_id));
-    const arrow = cell(row,''); arrow.className = 'grant-arrow'; arrow.textContent = '→';
-    cell(row,'').append(identity(username(grant.owner_id), grant.owner_id));
-    cell(row,'').append(chip(grant.permission === 'operate' ? '可操作（含删除）' : '只读', grant.permission === 'operate' ? 'op' : ''));
-    const acts = cell(row,''); acts.className = 'acts';
-    button(acts,'撤销', async () => { if (confirm('撤销后 A 立即失去对 B 全部画布的访问。确认撤销？')) await H3Auth.request(`/api/admin/grants/${encodeURIComponent(grant.viewer_id)}/${encodeURIComponent(grant.owner_id)}`,{method:'DELETE'}); }, 'danger');
+  for (const grant of grants) {
+    const row = document.createElement('tr'); cell(row, '').append(identity(userName(userById(grant.viewer_id)), grant.viewer_id)); cell(row, '→');
+    cell(row, '').append(identity(userName(userById(grant.owner_id)), grant.owner_id));
+    cell(row, grant.permission === 'operate' ? '可操作（含删除）' : '只读');
+    button(cell(row, ''), '撤销', () => openOperation({title:'确认撤销授权', body:`<p>${h(userLabel(grant.viewer_id))} → ${h(userLabel(grant.owner_id))}</p><p class="notice-box danger">撤销后访问者失去这条授权带来的全部画布访问权。管理员天然权限、项目组成员关系和其他独立授权不受影响。</p>`, submitLabel:'确认撤销授权', action:() => H3Auth.request('/api/admin/grants/' + encodeURIComponent(grant.viewer_id) + '/' + encodeURIComponent(grant.owner_id), {method:'DELETE'}), message:'已撤销画布授权'}), 'danger');
     $('grants').append(row);
   }
-  if (!g.grants.length) {
-    const row = document.createElement('tr');
-    cell(row, '暂无画布授权。选择访问者与所有者后保存，即可授予全画布访问权限。').colSpan = 5;
-    $('grants').append(row);
-  }
-  await refreshRegistrations();
+  if (!grants.length) emptyRow($('grants'), '暂无画布授权。选择访问者与所有者后保存。', 5);
+  renderProjects();
 }
 async function refreshRegistrations() {
-  let data;
-  try { data = await H3Auth.request('/api/admin/registrations'); }
-  catch (e) { $('outbox-status').textContent = '注册申请信息加载失败：' + e.message; return; }
-  const statusText = {pending: '待审批', approved: '已通过', rejected: '已拒绝'};
-  const statusClass = {pending: '', approved: 'on', rejected: 'off'};
-  $('registrations').replaceChildren();
-  for (const item of data.requests) {
-    const row = document.createElement('tr');
-    cell(row, item.username); cell(row, item.display_name || '—');
-    cell(row,'').append(chip(statusText[item.status] || item.status, statusClass[item.status] || ''));
-    cell(row, item.created_at ? new Date(item.created_at * 1000).toLocaleString('zh-CN', {hour12: false}) : '—');
-    cell(row, item.decided_by || '—');
-    $('registrations').append(row);
-  }
-  if (!data.requests.length) {
-    const row = document.createElement('tr');
-    cell(row, '暂无自主注册申请。').colSpan = 5;
-    $('registrations').append(row);
-  }
-  const backlog = data.outbox || {pending: 0};
-  if (backlog.pending > 0) {
-    const oldest = backlog.oldest_at ? new Date(backlog.oldest_at * 1000).toLocaleString('zh-CN', {hour12: false}) : '';
-    $('outbox-status').textContent = '审批通知积压 ' + backlog.pending + ' 条（最早 ' + oldest + '），系统会自动重试投递。';
-  } else {
-    $('outbox-status').textContent = '审批通知投递正常。';
+  try {
+    const data = await H3Auth.request('/api/admin/registrations');
+    $('registrations').replaceChildren();
+    for (const item of data.requests) {
+      const row = document.createElement('tr'); cell(row, item.username); cell(row, item.display_name || '—');
+      cell(row, ({pending:'待审批', approved:'已通过', rejected:'已拒绝'})[item.status] || item.status);
+      cell(row, item.created_at ? new Date(item.created_at * 1000).toLocaleString('zh-CN', {hour12:false}) : '—'); cell(row, item.decided_by || '—'); $('registrations').append(row);
+    }
+    if (!data.requests.length) emptyRow($('registrations'), '暂无自主注册申请。', 5);
+    $('metric-pending').textContent = data.requests.filter(item => item.status === 'pending').length;
+    const backlog = data.outbox || {pending:0};
+    $('outbox-status').textContent = backlog.pending > 0 ? '审批通知积压 ' + backlog.pending + ' 条（最早 ' + (backlog.oldest_at ? new Date(backlog.oldest_at * 1000).toLocaleString('zh-CN', {hour12:false}) : '时间未知') + '），系统会自动重试投递。' : '审批通知投递正常。';
+  } catch (error) {
+    $('metric-pending').textContent = '—'; $('outbox-status').textContent = '注册申请信息加载失败：' + error.message;
+    $('registrations').replaceChildren(); emptyRow($('registrations'), '暂时无法加载注册申请，请点击刷新数据重试。', 5);
   }
 }
+async function refresh() {
+  if (loading) return;
+  loading = true; syncControls(); $('refresh-note').textContent = '正在加载真实数据…';
+  try {
+    const [u, g, p] = await Promise.all([H3Auth.request('/api/admin/users'), H3Auth.request('/api/admin/grants'), H3Auth.request('/api/projects')]);
+    users = u.users; grants = g.grants; projects = p.projects; ready = true; selectedProjects.clear(); render();
+    await refreshRegistrations();
+    $('refresh-note').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12:false});
+  } catch (error) { ready = false; $('refresh-note').textContent = '加载失败，请刷新重试'; throw error; }
+  finally { loading = false; syncControls(); $('refresh').disabled = mutationBusy; }
+}
+// 变更与刷新分开处理：后端已成功时不把刷新失败伪装成提交失败，避免重复变更。
+async function changed(message) {
+  AdminUI.toast(message);
+  try { await refresh(); } catch (error) { $('error').textContent = '操作已成功，但列表刷新失败，请点击刷新数据后继续：' + error.message; }
+}
+function openOperation({title, body, submitLabel, action, message, afterSuccess}) {
+  if (mutationBusy || !ready) return;
+  return AdminUI.dialog({title, body, submitLabel, onSubmit:async form => {
+    if (mutationBusy) throw new Error('另一项操作正在提交，请稍后重试。');
+    mutationBusy = true; syncControls(); $('error').textContent = '';
+    try { await action(form); afterSuccess?.(); await changed(message); }
+    finally { mutationBusy = false; syncControls(); }
+  }});
+}
+const passwordField = '<label class="field">新密码（至少 8 位）<input name="password" type="password" minlength="8" maxlength="1024" autocomplete="new-password" required></label><p class="notice-box">密码无需组合大小写、数字或符号，请勿使用 12345678 等常见弱密码。密码不会显示在列表中。</p>';
+$('create-user').onclick = () => {
+  const dialog = openOperation({title:'新建账号', body:'<div class="form-grid"><label class="field">账号名<input name="username" required maxlength="128" autocomplete="off"></label>' + passwordField + '<label class="field">角色<select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label><label class="check-label"><input name="team_leader" type="checkbox">独立授予组长权限</label><p class="notice-box">创建后账号启用并标记为已通过。请把初始密码交给本人，登录后可自行修改。</p></div>', submitLabel:'创建账号', action:form => H3Auth.json('/api/admin/users', 'POST', {username:form.elements.username.value.trim(), password:form.elements.password.value, role:form.elements.role.value, team_leader:form.elements.team_leader.checked}), message:'账号已创建'});
+  if (dialog) dialog.querySelector('form').id = 'create';
+};
+function accountAction(user, action) {
+  const target = '<p>目标账号：<b>' + h(userLabel(user.id)) + '</b></p>', base = '/api/admin/users/' + encodeURIComponent(user.id);
+  if (action === 'password') return openOperation({title:'重置密码', body:target + passwordField + '<p class="notice-box danger">该账号现有会话将失效，需要使用新密码重新登录。请妥善告知本人。</p>', submitLabel:'确认重置密码', action:form => H3Auth.json(base + '/password', 'POST', {password:form.elements.password.value}), message:'密码已重置'});
+  if (action === 'role') return openOperation({title:'修改账号角色', body:target + '<label class="field">角色<select name="role"><option value="user"' + (user.role === 'user' ? ' selected' : '') + '>普通用户</option><option value="admin"' + (user.role === 'admin' ? ' selected' : '') + '>管理员</option></select></label><p class="notice-box danger">管理员天然可访问全部画布。组长权限独立，不随此操作改变。修改角色会使该账号现有会话失效；最后一位启用管理员受系统保护。</p>', submitLabel:'确认修改角色', action:form => H3Auth.json(base, 'PATCH', {role:form.elements.role.value}), message:'账号角色已修改'});
+  const enabled = action === 'enabled', next = enabled ? !user.enabled : !user.team_leader;
+  const title = enabled ? (next ? '启用账号' : '停用账号') : (next ? '授予组长权限' : '取消组长权限');
+  const risk = enabled ? (next ? '启用不会跳过钉钉注册审批，审批状态保持不变。' : '停用后该账号不能继续登录，现有会话失效。不会删除既有项目组关系或画布授权；最后一位启用管理员受系统保护。') : (next ? '授予该用户创建项目组和管理自己创建项目组的权限，不会成为管理员，也不能管理其他人的项目组。现有会话失效后需重新登录。' : '取消后不能继续创建或管理项目组，现有会话失效。既有组长归属和成员关系不会被迁移。');
+  return openOperation({title, body:target + '<p class="notice-box">' + risk + '</p>', submitLabel:'确认' + title, action:() => H3Auth.json(base, 'PATCH', enabled ? {enabled:next} : {team_leader:next}), message:title + '成功'});
+}
+$('grant').onsubmit = event => {
+  event.preventDefault(); if (!ready || mutationBusy) return;
+  const form = event.currentTarget, viewer = form.elements.viewer_id.value, owner = form.elements.owner_id.value, permission = form.elements.permission.value;
+  $('grant-error').textContent = '';
+  if (!userById(viewer) || !userById(owner)) { $('grant-error').textContent = '请选择有效账号。'; return; }
+  if (viewer === owner) { $('grant-error').textContent = '访问者和所有者不能是同一个账号。'; return; }
+  openOperation({title:'确认画布授权', body:`<p>访问者 A：${h(userLabel(viewer))}</p><p>所有者 B：${h(userLabel(owner))}</p><p>权限：<b>${permission === 'operate' ? '可操作（含删除）' : '只读'}</b></p><p class="notice-box danger">覆盖所有者当前和以后创建的全部画布。可操作包含删除；授权不传递。已有同向授权将被更新。停用账号不会因此恢复登录。</p>`, submitLabel:'确认保存授权', action:() => H3Auth.json('/api/admin/grants', 'PUT', {viewer_id:viewer, owner_id:owner, permission}), message:'画布授权已保存'});
+};
 $('project-search').oninput = $('project-owner').onchange = () => { selectedProjects.clear(); renderProjects(); };
 $('project-all').onchange = event => { selectedProjects.clear(); if (event.currentTarget.checked) for (const project of filteredProjects().filter(project => !project.team_id)) selectedProjects.add(project.id); renderProjects(); };
-$('assign').elements.owner_id.onchange = updateSelection;
-$('assign').onsubmit = async event => {
-  event.preventDefault();
-  if (assigning) return;
+$('clear-selection').onclick = () => { selectedProjects.clear(); renderProjects(); };
+$('assign').elements.owner_id.onchange = syncControls;
+$('assign').onsubmit = event => {
+  event.preventDefault(); if (assigning || mutationBusy || !ready) return;
   const target = users.find(u => u.enabled && String(u.id) === $('assign').elements.owner_id.value);
-  const chosen = filteredProjects().filter(p => selectedProjects.has(p.id));
+  const chosen = filteredProjects().filter(p => !p.team_id && selectedProjects.has(p.id)).map(p => ({...p}));
   if (!target || !chosen.length) return;
   if (chosen.length > 1000) { $('error').textContent = '每次最多分配 1000 个画布，请缩小筛选范围后再选择。'; return; }
-  const targetLabel = target.username + '（ID: ' + target.id + '）';
-  const list = chosen.map(p => '画布：' + (p.name || '未命名画布') + '\nID: ' + p.id + '\n旧归属：' + ownerLabel(p) + '\n目标：' + targetLabel).join('\n\n');
-  if (!confirm('确认分配以下 ' + chosen.length + ' 个画布？\n\n' + list + '\n\n画布内容和历史费用不变。目标用户的授权访问者也会获得相应权限（可操作包含删除）；原所有者及其授权访问者可能失去访问权限。管理员仍可访问全部画布。')) return;
-  assigning = true; $('error').textContent = ''; $('assign-status').textContent = ''; renderProjects();
-  try {
-    const result = await H3Auth.json('/api/admin/projects/assign','POST',{owner_id:target.id, projects:chosen.map(p => ({project_id:p.id,owner_id:p.owner_id}))});
-    selectedProjects.clear();
-    $('assign-status').textContent = '分配成功：已将 ' + result.count + ' 个画布分配给 ' + targetLabel + '。';
-    try { await refresh(); } catch (e) { $('error').textContent = '分配已成功，但列表刷新失败，请刷新页面后继续：' + e.message; projects = []; renderProjects(); }
-  } catch (e) { $('error').textContent = e.message; }
-  finally { assigning = false; renderProjects(); }
+  const rows = chosen.map(project => `<tr><td>${h(project.name || '未命名画布')}</td><td>${h(project.id)}</td><td>${h(ownerLabel(project))}</td><td>${h(userLabel(target.id))}</td></tr>`).join('');
+  openOperation({title:'确认分配 ' + chosen.length + ' 个画布', body:`<p>目标账号：<b>${h(userLabel(target.id))}</b></p><p class="notice-box danger">画布内容和历史费用不变。目标用户的授权访问者也会获得相应权限（可操作包含删除）；原所有者及其授权访问者可能失去访问权限。管理员仍可访问全部画布。项目组画布不参与分配。</p><div class="dialog-list" tabindex="0" role="region" aria-label="画布分配确认明细"><table><thead><tr><th>画布名称</th><th>画布 ID</th><th>旧归属</th><th>目标归属</th></tr></thead><tbody>${rows}</tbody></table></div>`, submitLabel:'确认分配所列画布', action:async () => {
+    assigning = true; syncControls();
+    try {
+      const result = await H3Auth.json('/api/admin/projects/assign', 'POST', {owner_id:target.id, projects:chosen.map(p => ({project_id:p.id, owner_id:p.owner_id}))});
+      selectedProjects.clear(); $('assign-status').textContent = '分配成功：已将 ' + result.count + ' 个画布分配给 ' + userLabel(target.id) + '。';
+    } finally { assigning = false; syncControls(); }
+  }, message:'画布归属已分配'});
 };
-$('create').onsubmit = event => { event.preventDefault(); const form = event.currentTarget; perform(async () => {
-  const data = Object.fromEntries(new FormData(form));
-  data.team_leader = form.elements.team_leader.checked;
-  await H3Auth.json('/api/admin/users','POST',data); form.reset();
-}); };
-$('grant').onsubmit = event => { event.preventDefault(); const body = Object.fromEntries(new FormData(event.currentTarget)); perform(() => H3Auth.json('/api/admin/grants','PUT',body)); };
-H3Auth.requireUser(true).then(() => { H3Auth.mountAccount($('account')); return refresh(); }).catch(e => { $('error').textContent = e.message; });
-</script></body></html>
+$('refresh').onclick = async () => { $('error').textContent = ''; try { await refresh(); } catch (error) { $('error').textContent = error.message; } };
+H3Auth.requireUser(true).then(async user => { await AdminUI.mount({page:'permissions', user}); await refresh(); }).catch(error => { $('error').textContent = error.message; });
+})();
+</script>
+</body></html>

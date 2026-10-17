@@ -776,8 +776,12 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(response.status, 200)
         self.assertIn("产能评估", await response.text())
         dashboard = await (await self.client.get("/controller")).text()
-        self.assertLess(dashboard.index('href="/controller/costs"'),
-                        dashboard.index('href="/controller/capacity"'))
+        self.assertIn('src="/admin-shell.js"', dashboard)
+        shell = (ROOT / 'web/admin-shell.js').read_text(encoding='utf-8')
+        self.assertIn("H3Auth.mountAccount", shell)
+        navigation = (ROOT / 'web/auth.js').read_text(encoding='utf-8')
+        self.assertLess(navigation.index("add('costs', '费用评估', '/controller/costs')"),
+                        navigation.index("add('capacity', '产能统计', '/controller/capacity')"))
         report = await (await self.client.get("/api/capacity")).json()
         self.assertEqual(report["overview"]["tasks"], 0)
         self.assertEqual((await self.client.get("/capacity.html")).status, 404)
@@ -1672,19 +1676,26 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         response = await self.client.get("/controller")
         self.assertEqual(response.status, 200)
         dashboard = await response.text()
-        self.assertIn("<title>运行面板</title>", dashboard)
-        self.assertIn('id="worker-cards" class="worker-grid"', dashboard)
+        self.assertIn("<title>运行面板 · Chouka</title>", dashboard)
+        self.assertIn('id="worker-rows"', dashboard)
         self.assertIn("GPU 利用率", dashboard)
-        self.assertIn("一键同步全部节点", dashboard)
-        self.assertIn("/controller/costs", dashboard)
+        self.assertIn("一键更新全部节点", dashboard)
+        self.assertIn('src="/admin-shell.js"', dashboard)
+        self.assertIn('src="/controller-page.js"', dashboard)
+        shell = (ROOT / 'web/admin-shell.js').read_text(encoding='utf-8')
+        self.assertIn("H3Auth.mountAccount", shell)
+        navigation = (ROOT / 'web/auth.js').read_text(encoding='utf-8')
+        self.assertIn("add('costs', '费用评估', '/controller/costs')", navigation)
 
         response = await self.client.get("/controller/costs")
         self.assertEqual(response.status, 200)
         costs_page = await response.text()
-        self.assertIn("<title>费用统计</title>", costs_page)
+        self.assertIn("<title>费用统计 · Chouka</title>", costs_page)
         self.assertIn("建议收费区间", costs_page)
         self.assertIn("内部总成本", costs_page)
-        self.assertIn('limit:"2000"', costs_page)
+        self.assertIn('src="/costs-page.js"', costs_page)
+        costs_script = (ROOT / 'web/costs-page.js').read_text(encoding='utf-8')
+        self.assertIn("limit:'2000'", costs_script)
 
         response = await self.client.get("/api/health")
         self.assertEqual(response.status, 200)
@@ -1697,6 +1708,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         credentials = self.store.register_worker(
             "gpu-sync", {
                 "node_classes": ["KSampler"], "supports_file_sync": True,
+                "supports_code_restart": True,
             }
         )
         self.store.heartbeat(
@@ -1722,6 +1734,62 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn({
             "type": "sync_files", "request_id": payload["request_id"],
         }, heartbeat["commands"])
+
+    async def test_regular_users_see_maintenance_while_any_worker_sync_is_incomplete(self):
+        syncing = self.store.register_worker(
+            "gpu-syncing", {
+                "node_classes": ["KSampler"], "supports_file_sync": True,
+                "supports_code_restart": True,
+            },
+        )
+        self.store.heartbeat(syncing["worker_id"], comfy_online=True, busy=False)
+        update = self.store.request_sync_all()
+        self.auth.create_user("viewer", auth_support.PASSWORD)
+        await self.login("viewer")
+
+        response = await self.client.get("/api/health")
+        health = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertTrue(health["maintenance_active"])
+        self.assertFalse(health["comfy_online"])
+        self.assertNotIn("workers", health)
+
+        self.store.heartbeat(
+            syncing["worker_id"], comfy_online=False, busy=False,
+            maintenance={
+                "request_id": update["request_id"], "status": "running",
+                "message": "正在更新",
+            },
+        )
+        health = await (await self.client.get("/api/health")).json()
+        self.assertTrue(health["maintenance_active"])
+
+        self.store.heartbeat(
+            syncing["worker_id"], comfy_online=False, busy=False,
+            maintenance={
+                "request_id": update["request_id"], "status": "error",
+                "message": "重启失败",
+            },
+        )
+        health = await (await self.client.get("/api/health")).json()
+        self.assertTrue(health["maintenance_active"])
+
+        ready = self.store.register_worker("gpu-ready", {"node_classes": ["KSampler"]})
+        self.store.heartbeat(ready["worker_id"], comfy_online=True, busy=False)
+        health = await (await self.client.get("/api/health")).json()
+        self.assertTrue(health["maintenance_active"])
+        self.assertTrue(health["comfy_online"])
+
+        self.store.heartbeat(
+            syncing["worker_id"], comfy_online=True, busy=False,
+            maintenance={
+                "request_id": update["request_id"], "status": "done",
+                "message": "更新完成",
+            },
+        )
+        health = await (await self.client.get("/api/health")).json()
+        self.assertFalse(health["maintenance_active"])
+        self.assertTrue(health["comfy_online"])
 
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
         self.own_project("project-1")

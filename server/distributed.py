@@ -3,6 +3,7 @@
 import hashlib
 import hmac
 import json
+import math
 import secrets
 import sqlite3
 import threading
@@ -25,6 +26,30 @@ MODEL_INPUT_NAMES = frozenset({
     "upscale_model", "diffusion_model", "text_encoder_name",
 })
 MODEL_FILE_SUFFIXES = (".safetensors", ".gguf", ".ckpt", ".pth", ".pt", ".bin", ".onnx")
+TEMPERATURE_SAMPLE_SECONDS = 10
+TEMPERATURE_GAP_SECONDS = 60
+TEMPERATURE_RETENTION_SECONDS = 48 * 3600
+TEMPERATURE_MAX_AGE_SECONDS = 120
+TEMPERATURE_FUTURE_SECONDS = 5
+TEMPERATURE_MAX_GPU_INDEX = 255
+TEMPERATURE_MAX_BATCH = 64
+TEMPERATURE_CLEANUP_LIMIT = 1000
+# 24 小时、每 10 秒一条，含闭区间两端；断线标记也受最终点数上限约束。
+TEMPERATURE_MAX_POINTS = 8641
+
+
+def _finite_number(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _temperature_gpu_index(value):
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 0 <= value <= TEMPERATURE_MAX_GPU_INDEX)
 
 
 def literal_model_name(graph, value):
@@ -197,6 +222,17 @@ class DistributedStore:
                     ON dispatch_jobs(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_dispatch_worker
                     ON dispatch_jobs(worker_id, status);
+
+                CREATE TABLE IF NOT EXISTS worker_temperature_samples (
+                    worker_id TEXT NOT NULL,
+                    gpu_index INTEGER NOT NULL CHECK(gpu_index BETWEEN 0 AND 255),
+                    collected_at REAL NOT NULL,
+                    temperature_c REAL CHECK(temperature_c BETWEEN 0 AND 150),
+                    PRIMARY KEY(worker_id, gpu_index, collected_at),
+                    FOREIGN KEY(worker_id) REFERENCES workers(id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_worker_temperature_time
+                    ON worker_temperature_samples(collected_at);
                 """
             )
             columns = {row[1] for row in self.db.execute("PRAGMA table_info(workers)")}
@@ -266,7 +302,7 @@ class DistributedStore:
                 seen_names.add(name_key)
                 capabilities = json.loads(row["capabilities_json"] or "{}")
                 if (not isinstance(capabilities, dict)
-                        or not capabilities.get("supports_file_sync")):
+                        or not capabilities.get("supports_code_restart")):
                     skipped_count += 1
                     continue
                 worker_ids.append(row["id"])
@@ -284,6 +320,85 @@ class DistributedStore:
             "request_id": request_id,
             "worker_count": len(worker_ids),
             "skipped_count": skipped_count,
+        }
+
+    def _record_temperature_locked(self, worker_id, telemetry, now):
+        # 清理只走时间索引，每次限制删除量，不在心跳里扫描整张历史表。
+        self.db.execute(
+            """DELETE FROM worker_temperature_samples WHERE rowid IN (
+                   SELECT rowid FROM worker_temperature_samples
+                   WHERE collected_at < ? ORDER BY collected_at LIMIT ?
+               )""",
+            (now - TEMPERATURE_RETENTION_SECONDS, TEMPERATURE_CLEANUP_LIMIT),
+        )
+        if not isinstance(telemetry, dict):
+            return
+        at = telemetry.get("collected_at")
+        if (not _finite_number(at)
+                or not now - TEMPERATURE_MAX_AGE_SECONDS <= at <= now + TEMPERATURE_FUTURE_SECONDS):
+            return
+        gpus = telemetry.get("gpus")
+        if not isinstance(gpus, list):
+            return
+        seen = set()
+        for gpu in gpus[:TEMPERATURE_MAX_BATCH]:
+            if not isinstance(gpu, dict):
+                continue
+            index = gpu.get("index")
+            if not _temperature_gpu_index(index) or index in seen:
+                continue
+            seen.add(index)
+            latest = self.db.execute(
+                """SELECT collected_at FROM worker_temperature_samples
+                   WHERE worker_id = ? AND gpu_index = ?
+                   ORDER BY collected_at DESC LIMIT 1""", (worker_id, index),
+            ).fetchone()
+            # 保留原始时间；重放、乱序及过密样本都不能伪装成新观测。
+            if latest and at - latest["collected_at"] < TEMPERATURE_SAMPLE_SECONDS:
+                continue
+            value = gpu.get("temperature_c")
+            if not _finite_number(value) or not 0 <= value <= 150:
+                value = None
+            self.db.execute(
+                """INSERT OR IGNORE INTO worker_temperature_samples
+                   (worker_id, gpu_index, collected_at, temperature_c) VALUES (?, ?, ?, ?)""",
+                (worker_id, index, at, value),
+            )
+
+    def temperature_history(self, worker_id, gpu_index=0, minutes=30, now=None):
+        """返回原始温度时间点和断线标记；未知 Worker 抛出 KeyError。"""
+        if not _temperature_gpu_index(gpu_index):
+            raise ValueError("gpu_index 必须为 0 到 255 的整数")
+        if isinstance(minutes, bool) or not isinstance(minutes, int) or not 1 <= minutes <= 1440:
+            raise ValueError("minutes 必须为 1 到 1440 的整数")
+        now = time.time() if now is None else now
+        if not _finite_number(now) or now < 0:
+            raise ValueError("now 必须为有效时间戳")
+        start = now - minutes * 60
+        with self.lock:
+            if not self.db.execute("SELECT 1 FROM workers WHERE id = ?", (worker_id,)).fetchone():
+                raise KeyError("未知 Worker")
+            rows = self.db.execute(
+                """SELECT collected_at, temperature_c FROM worker_temperature_samples
+                   WHERE worker_id = ? AND gpu_index = ? AND collected_at >= ? AND collected_at <= ?
+                   ORDER BY collected_at LIMIT ?""",
+                (worker_id, gpu_index, start, now, TEMPERATURE_MAX_POINTS),
+            ).fetchall()
+        points = []
+        previous = None
+        for row in rows:
+            at = row["collected_at"]
+            if previous is not None and at - previous > TEMPERATURE_GAP_SECONDS:
+                points.append({"at": previous + TEMPERATURE_GAP_SECONDS, "temperature_c": None})
+            points.append({"at": at, "temperature_c": row["temperature_c"]})
+            previous = at
+        # 末尾失联同样断线，但空历史绝不从当前 telemetry 补造过去。
+        if previous is not None and now - previous > TEMPERATURE_GAP_SECONDS:
+            points.append({"at": previous + TEMPERATURE_GAP_SECONDS, "temperature_c": None})
+        return {
+            "worker_id": worker_id, "gpu_index": gpu_index, "minutes": minutes,
+            "from": start, "to": now, "gap_seconds": TEMPERATURE_GAP_SECONDS,
+            "points": points[:TEMPERATURE_MAX_POINTS], "server_time": now,
         }
 
     def heartbeat(self, worker_id, *, capabilities=None, telemetry=None,
@@ -376,6 +491,11 @@ class DistributedStore:
             self.db.execute(
                 f"UPDATE workers SET {', '.join(fields)} WHERE id = ?", values
             )
+            # 只消费本次实际携带的遥测，不把已存快照按接收时间重复采样。
+            temperature_telemetry = telemetry
+            if temperature_telemetry is None and isinstance(capabilities, dict):
+                temperature_telemetry = capabilities.get("telemetry")
+            self._record_temperature_locked(worker_id, temperature_telemetry, now)
             observed = self.db.execute(
                 "SELECT * FROM workers WHERE id = ?", (worker_id,),
             ).fetchone()
@@ -432,6 +552,8 @@ class DistributedStore:
                 item["state"] = "offline"
             elif item.get("sync_status") in {"pending", "running"}:
                 item["state"] = "syncing"
+            elif item.get("sync_status") == "error":
+                item["state"] = "error"
             elif not item["enabled"]:
                 item["state"] = "disabled"
             elif not item["comfy_online"]:
@@ -463,7 +585,7 @@ class DistributedStore:
             ).fetchone()
             if not worker or not worker["enabled"] or not worker["comfy_online"]:
                 return None
-            if worker["sync_status"] in ("pending", "running"):
+            if worker["sync_status"] in ("pending", "running", "error"):
                 return None
             if now - worker["last_seen"] > self.offline_seconds:
                 return None
@@ -475,7 +597,9 @@ class DistributedStore:
             idle_workers = self.db.execute(
                 """SELECT id, capabilities_json FROM workers
                    WHERE id != ? AND enabled = 1 AND comfy_online = 1
-                     AND busy = 0 AND current_job_id IS NULL AND last_seen >= ?""",
+                     AND busy = 0 AND current_job_id IS NULL
+                     AND sync_status NOT IN ('pending', 'running', 'error')
+                     AND last_seen >= ?""",
                 (worker_id, now - self.offline_seconds),
             ).fetchall()
             idle_capabilities = [

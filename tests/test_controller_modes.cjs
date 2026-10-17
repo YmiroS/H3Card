@@ -8,60 +8,111 @@ const { chromium } = require('playwright');
 
 test('recent jobs show their recorded mode separately from card names', async () => {
   const html = readFileSync(path.join(__dirname, '..', 'web', 'controller.html'));
-  const base = {project:'project-1', cardName:'生视频', created:1789535317, progress:1};
+  const base = {project:'project-1', cardName:'生视频', created:1789535317, progress:1,
+    submitter_id:'member', submitter_username:'zhangsan', submitter_display_name:'张三'};
   const jobs = [
     {...base, id:'high-quality', status:'done', capability:'minimax_h3_ref_2pass', name:'H3全能参考(高质量)'},
     {...base, id:'image-video', status:'running', capability:'minimax_h3_i2v', name:'H3图生视频', progress:0.5},
-    {...base, id:'legacy-id', status:'queued', capability:'legacy_video_mode', progress:0},
-    {...base, id:'legacy-unknown', status:'done'},
-    {...base, id:'escaped-name', status:'error', name:'<img src=x onerror="window.injected=true">'},
+    {...base, id:'legacy-id', status:'queued', capability:'legacy_video_mode', progress:0, submitter_display_name:' '},
+    {...base, id:'legacy-unknown', status:'done', submitter_display_name:null, submitter_username:null},
+    {...base, id:'escaped-name', status:'error', name:'<img src=x onerror="window.injected=true">',
+      submitter_display_name:'<img src=x onerror="window.injected=true">'},
   ];
   const payloads = {
     '/api/auth/me': {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'test-csrf'},
-    '/api/health': {ok:true, mode:'controller', server_time:1789535400, started_at:1789535300},
+    '/api/health': {ok:true, mode:'controller', server_time:1789535400, started_at:1789535300, maintenance_active:false},
     '/api/status': {running_count:1, queued_count:1},
     '/api/workers': {workers:[]},
     '/api/jobs': {jobs},
-    '/api/projects': {projects:[{id:'project-1', name:'模式展示测试'}]},
+    '/api/cards': {cards:[], capabilities:{}, comfy_online:false},
+    '/api/projects': {projects:[{id:'project-1', name:'模式展示测试', owner_id:'admin', permission:'operate', cards:0}]},
+    '/api/projects/project-1': {id:'project-1', name:'模式展示测试', permission:'operate', cards:[], edges:[], groups:[], view:{}, rev:0},
   };
+  const unexpected = [], external = [], presence = [];
   const server = createServer((req, res) => {
-    if (req.url === '/auth.js') {
-      res.setHeader('Content-Type', 'text/javascript; charset=utf-8');
-      return res.end(readFileSync(path.join(__dirname, '..', 'web', 'auth.js')));
-    }
-    if (Object.hasOwn(payloads, req.url)) {
+    const url = new URL(req.url, 'http://localhost').pathname;
+    if (req.method === 'POST' && url === '/api/auth/presence') {
+      presence.push(req.headers['x-csrf-token']); req.resume();
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
-      res.end(JSON.stringify(payloads[req.url]));
-    } else {
-      res.setHeader('Content-Type', 'text/html; charset=utf-8');
-      res.end(html);
+      return res.end(JSON.stringify({online_users:1}));
     }
+    const files = {'/':'index.html', '/auth.js':'auth.js', '/admin-shell.js':'admin-shell.js',
+      '/controller-page.js':'controller-page.js', '/admin-shell.css':'admin-shell.css',
+      '/app.js':'app.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+    if (req.method === 'GET' && Object.hasOwn(files, url)) {
+      const name = files[url];
+      res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript; charset=utf-8'
+        : name.endsWith('.css') ? 'text/css' : name.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
+      return res.end(readFileSync(path.join(__dirname, '..', 'web', name)));
+    }
+    if (req.method === 'GET' && Object.hasOwn(payloads, url)) {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+      return res.end(JSON.stringify(payloads[url]));
+    }
+    if (req.method === 'GET' && url === '/controller') {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+      return res.end(html);
+    }
+    unexpected.push(req.method + ' ' + req.url); req.resume(); res.writeHead(404); res.end();
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
   try {
     browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
-    const page = await browser.newPage({viewport:{width:1440, height:1000}});
+    const context = await browser.newContext({viewport:{width:1440, height:1000}, serviceWorkers:'block'});
+    const origin = 'http://127.0.0.1:' + server.address().port;
+    await context.route('**/*', route => {
+      if (new URL(route.request().url()).origin === origin) return route.continue();
+      external.push(route.request().url()); return route.abort();
+    });
+    await context.routeWebSocket('**/*', socket => {
+      if (new URL(socket.url()).host !== new URL(origin).host) external.push(socket.url());
+      socket.close();
+    });
+    const page = await context.newPage(); page.setDefaultTimeout(10000);
     const errors = [];
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto('http://127.0.0.1:' + server.address().port + '/controller');
+    await page.goto(origin + '/controller');
     await page.waitForFunction(() => document.querySelectorAll('#job-rows tr').length === 5);
-    assert.deepEqual(await page.locator('thead th').allTextContents(),
-      ['状态', '项目 / 卡片', '模式', '过程进度', '执行端', '创建时间', '耗时 / 错误']);
-    assert.deepEqual(await page.locator('#job-rows .job-mode').allTextContents(),
+    assert.deepEqual(await page.locator('.jobs-table thead th').allTextContents(),
+      ['状态', '姓名 / 项目 / 卡片', '模式', '过程进度 / 步骤', '执行端', '创建时间', '耗时 / 错误']);
+    assert.deepEqual(await page.locator('#job-rows .job-mode').evaluateAll(cells => cells.map(cell => cell.firstChild.textContent)),
       ['H3全能参考(高质量)', 'H3图生视频', 'legacy_video_mode', '未记录', jobs[4].name]);
     assert.equal(await page.locator('#job-rows .job-mode').first().getAttribute('title'), 'minimax_h3_ref_2pass');
-    assert.equal(await page.locator('#job-rows .job-origin').first().innerText(), '模式展示测试\n卡片 · 生视频');
+    assert.equal(await page.locator('#job-rows .job-origin').first().innerText(), '张三\n模式展示测试\n卡片 · 生视频');
+    assert.deepEqual(await page.locator('#job-rows .job-origin').evaluateAll(cells => cells.map(cell => cell.firstChild.textContent)),
+      ['张三', '张三', 'zhangsan', '未记录提交人', jobs[4].submitter_display_name]);
+    assert.deepEqual(await page.locator('#job-rows .job-origin .cell-secondary').first().textContent(), '模式展示测试');
+    assert.equal(await page.locator('#workspace-nav[data-admin-sidebar], #account .account-trigger').count(), 2);
+    assert.equal(await page.locator('.sidebar, .side-actions, .admin-mobile-account').count(), 0);
     assert.equal(await page.locator('#job-rows tr').first().locator('td').count(), 7);
     assert.equal(await page.locator('#job-rows img').count(), 0);
     assert.equal(await page.evaluate(() => window.injected), undefined);
     jobs[0].cardName = '已改名的卡片';
     await page.locator('#refresh').click();
     await page.waitForFunction(() => document.querySelector('#job-rows .job-origin').textContent.includes('已改名的卡片'));
-    assert.equal(await page.locator('#job-rows .job-mode').first().textContent(), 'H3全能参考(高质量)');
+    assert.equal(await page.locator('#job-rows .job-mode').first().evaluate(cell => cell.firstChild.textContent), 'H3全能参考(高质量)');
+    assert.equal(await page.locator('#job-rows .job-mode .cell-secondary').first().textContent(), 'high-quality');
     if (process.env.CHOUKA_TEST_SCREENSHOT) {
       await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT, fullPage:true});
     }
+    await page.goto(origin + '/');
+    await page.locator('#jobsbtn').click();
+    await page.waitForFunction(() => document.querySelectorAll('.jrow').length === 5);
+    assert.deepEqual(await page.locator('.jowner').allTextContents(), ['张三', '张三', 'zhangsan', '未记录提交人', jobs[4].submitter_display_name]);
+    assert.match(await page.locator('.jrow .nm').first().getAttribute('title'), /^张三 - 模式展示测试 - 已改名的卡片/);
+    assert.equal(await page.locator('.jrow img').count(), 0);
+    assert.equal(await page.evaluate(() => window.injected), undefined);
+    jobs[0].submitter_display_name = '李四';
+    await page.evaluate(() => pollJobs());
+    assert.equal(await page.locator('.jowner').first().textContent(), '李四', '状态不变时轮询也更新提交人姓名');
+    assert.equal(await page.locator('.jrow').first().locator('.st').textContent(), '已完成');
+    await page.evaluate(() => { H3Auth.user.role = 'user'; el.jobs._sig = null; renderJobs(); });
+    assert.equal(await page.locator('.jowner').count(), 0, '普通账号保持既有任务展示，不增加管理员提交人字段');
+    assert.ok(presence.length > 0);
+    assert.ok(presence.every(csrf => csrf === 'test-csrf'), '真实presence保留CSRF');
+    assert.deepEqual(unexpected, [], '不允许任何额外业务请求或写入');
+    assert.deepEqual(external, [], '不允许HTTP或WebSocket外联');
     assert.deepEqual(errors, []);
   } finally {
     if (browser) await browser.close();
@@ -122,7 +173,7 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
     if (req.method === 'GET') {
       if (url === '/api/auth/me') return json(res, {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'fixture-csrf'});
       if (url === '/api/cards') return json(res, {cards, capabilities, comfy_online:true});
-      if (url === '/api/health') return json(res, {comfy_online:true});
+      if (url === '/api/health') return json(res, {comfy_online:true, maintenance_active:false});
       if (url === '/api/jobs') return json(res, {jobs:[]});
       if (url === '/api/projects') return json(res, {projects:[{...project, cards:project.cards.length}]});
       if (url === '/api/projects/' + project.id) return json(res, project);
