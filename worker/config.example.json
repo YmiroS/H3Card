@@ -11,5 +11,7 @@
   "state_file": "worker-state.json",
   "code_branch": "main",
   "node_launcher": "",
-  "restart_timeout_seconds": 300
+  "restart_timeout_seconds": 300,
+  "restart_log": "logs/restart-node.log",
+  "worker_log": "logs/worker.log"
 }

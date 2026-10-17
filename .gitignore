@@ -12,6 +12,7 @@ __pycache__/
 /.env.controller
 /worker/config.json
 /worker/worker-state*.json
+/worker/logs/
 
 # 软删除的项目文件
 *.deleted

@@ -332,7 +332,7 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         device = {"name": "actual CUDA device", "type": "cuda", "index": 2,
                   "vram_total": 1234, "vram_free": 123}
         self.worker._json_request = mock.AsyncMock(side_effect=[
-            {"devices": [device], "system": {}}, {"Sampler": {}},
+            {"devices": [device], "system": {}}, {"KSampler": {}},
         ])
         with mock.patch.object(self.worker, "_nvidia_gpus", return_value=[{"name": "other GPU"}]), \
              mock.patch.object(self.worker, "_system_memory", return_value=None):
@@ -352,6 +352,7 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_model_choices_include_required_optional_empty_and_rescan_removals(self):
         nodes = {
+            "KSampler": {},
             "UNETLoader": {"input": {"required": {
                 "unet_name": [["original.safetensors"], {}],
                 "weight_dtype": [["default", "fp8_e4m3fn"], {}],

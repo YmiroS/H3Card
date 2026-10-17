@@ -8,39 +8,83 @@ import re
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
+from urllib.error import URLError
 from urllib.parse import urlparse
+from urllib.request import ProxyHandler, build_opener
 
 
-def state_path_for(config_path, config):
-    value = Path(config.get("state_file", "worker-state.json"))
+def configured_path(config_path, config, key, default):
+    value = Path(config.get(key, default))
     return value if value.is_absolute() else config_path.parent / value
 
 
-def update_maintenance(state_path, *, status, message):
+def state_path_for(config_path, config):
+    return configured_path(config_path, config, "state_file", "worker-state.json")
+
+
+def configure_logging(config_path, config):
+    log_path = configured_path(
+        config_path, config, "restart_log", "logs/restart-node.log"
+    )
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    output = log_path.open("a", encoding="utf-8", buffering=1)
+    sys.stdout = output
+    sys.stderr = output
+    return log_path
+
+
+def log_event(message):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}", flush=True)
+
+
+def update_maintenance(state_path, *, request_id=None, expected_restart_token=None, **values):
     state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.exists() else {}
     maintenance = state.get("maintenance")
     if not isinstance(maintenance, dict):
-        return
-    maintenance.update(status=status, message=message[:1000])
-    temporary = state_path.with_suffix(state_path.suffix + ".tmp")
-    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    os.replace(temporary, state_path)
+        return False
+    if request_id is not None and maintenance.get("request_id") != request_id:
+        return False
+    if (expected_restart_token is not None
+            and maintenance.get("restart_token") != expected_restart_token):
+        return False
+    if "message" in values:
+        values["message"] = str(values["message"])[:1000]
+    maintenance.update(values)
+    temporary = state_path.with_name(state_path.name + f".tmp.{os.getpid()}")
+    try:
+        temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, state_path)
+    finally:
+        temporary.unlink(missing_ok=True)
+    return True
 
 
 def wait_for_process_exit(pid, timeout=60):
     synchronize = 0x00100000
-    handle = ctypes.windll.kernel32.OpenProcess(synchronize, False, int(pid))
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(synchronize, False, int(pid))
     if not handle:
-        if ctypes.windll.kernel32.GetLastError() == 5:
+        error = kernel32.GetLastError()
+        if error == 87:
+            return
+        if error == 5:
             raise RuntimeError("没有权限确认旧 Worker 是否已经退出")
-        return
+        raise RuntimeError(f"无法确认旧 Worker 状态，Windows 错误码 {error}")
     try:
-        result = ctypes.windll.kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+        result = kernel32.WaitForSingleObject(handle, int(timeout * 1000))
+        if result == 0:
+            return
         if result == 0x00000102:
             raise RuntimeError("旧 Worker 未在限定时间内退出")
+        if result == 0xFFFFFFFF:
+            raise RuntimeError(
+                f"等待旧 Worker 退出失败，Windows 错误码 {kernel32.GetLastError()}"
+            )
+        raise RuntimeError(f"等待旧 Worker 返回未知状态 {result}")
     finally:
-        ctypes.windll.kernel32.CloseHandle(handle)
+        kernel32.CloseHandle(handle)
 
 
 def listening_pid(port):
@@ -106,20 +150,48 @@ def stop_comfy(comfy_url):
     raise RuntimeError(detail.strip() or f"ComfyUI PID {pid} 未能退出")
 
 
-def start_launcher(launcher):
+def wait_for_comfy_ready(comfy_url, deadline):
+    parsed = urlparse(comfy_url)
+    if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
+        raise RuntimeError("自动重启只支持本机 ComfyUI 地址")
+    opener = build_opener(ProxyHandler({}))
+    last_error = "服务尚未响应"
+    while time.time() < deadline:
+        try:
+            endpoint = "/system_stats"
+            with opener.open(comfy_url.rstrip("/") + endpoint, timeout=10) as response:
+                if response.status != 200:
+                    raise RuntimeError(f"{endpoint} 返回 HTTP {response.status}")
+                payload = json.load(response)
+            if (not isinstance(payload, dict)
+                    or not isinstance(payload.get("system"), dict)
+                    or not isinstance(payload.get("devices"), list)):
+                raise RuntimeError(f"{endpoint} 返回内容无效")
+            log_event("ComfyUI 已通过 /system_stats 就绪检查")
+            return
+        except (OSError, ValueError, RuntimeError, URLError) as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            time.sleep(2)
+    raise RuntimeError(f"ComfyUI 未在限定时间内恢复就绪：{last_error}")
+
+
+def start_launcher(launcher, timeout=300):
     if re.search(r'[\s&|<>^()%!\"]', launcher.name):
         raise RuntimeError(f"启动脚本文件名包含 cmd 不安全字符：{launcher.name}")
+    log_event(f"执行 ComfyUI 启动脚本：{launcher}")
     flags = (
         getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     )
     process = subprocess.Popen(
-        ["cmd.exe", "/d", "/c", "call", f".\\{launcher.name}", "--comfy-only"],
+        ["cmd.exe", "/d", "/c", "call", f".\\{launcher.name}", "--comfy-start-only"],
         cwd=str(launcher.parent),
         creationflags=flags,
+        stdout=getattr(sys.stdout, "buffer", sys.stdout),
+        stderr=subprocess.STDOUT,
     )
     try:
-        returncode = process.wait(timeout=60)
+        returncode = process.wait(timeout=max(float(timeout), 60.0))
     except subprocess.TimeoutExpired as exc:
         process.kill()
         raise RuntimeError("节点启动脚本未在限定时间内返回") from exc
@@ -127,27 +199,46 @@ def start_launcher(launcher):
         raise RuntimeError(f"节点启动脚本退出码 {returncode}")
 
 
-def start_worker(config_path):
+def start_worker(config_path, restart_token, worker_log):
     agent = Path(__file__).resolve().with_name("agent.py")
     flags = (
         getattr(subprocess, "CREATE_NEW_CONSOLE", 0)
         | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     )
-    return subprocess.Popen(
-        [sys.executable, "-u", str(agent), "--config", str(config_path)],
-        cwd=str(agent.parent), creationflags=flags,
-    )
+    worker_log.parent.mkdir(parents=True, exist_ok=True)
+    with worker_log.open("ab", buffering=0) as output:
+        worker = subprocess.Popen(
+            [sys.executable, "-u", str(agent), "--config", str(config_path),
+             "--restart-token", restart_token],
+            cwd=str(agent.parent), creationflags=flags,
+            stdout=output, stderr=subprocess.STDOUT,
+        )
+    log_event(f"已启动新 Worker PID {worker.pid}；日志：{worker_log}")
+    return worker
 
 
-def wait_for_restart_result(state_path, worker, deadline):
+def restart_result(state, request_id, restart_token):
+    for key in ("maintenance", "last_restart_result"):
+        result = state.get(key)
+        if (isinstance(result, dict)
+                and result.get("request_id") == request_id
+                and result.get("restart_token") == restart_token):
+            return result
+    return None
+
+
+def wait_for_restart_result(state_path, worker, deadline, request_id, restart_token):
     while time.time() < deadline:
         if worker.poll() is not None:
             raise RuntimeError(f"新 Worker 提前退出：{worker.returncode}")
         state = json.loads(state_path.read_text(encoding="utf-8"))
-        maintenance = state.get("maintenance")
-        status = maintenance.get("status") if isinstance(maintenance, dict) else None
-        if status in {"ready", "error"}:
+        result = restart_result(state, request_id, restart_token)
+        status = result.get("status") if result else None
+        if status == "ready":
+            log_event("新 Worker 已完成新鲜能力扫描并恢复就绪")
             return
+        if status == "error":
+            raise RuntimeError(str(result.get("message") or "新 Worker 报告重启失败"))
         time.sleep(1)
     raise RuntimeError("ComfyUI 和 Worker 未在限定时间内恢复就绪")
 
@@ -155,33 +246,90 @@ def wait_for_restart_result(state_path, worker, deadline):
 def main():
     parser = argparse.ArgumentParser(description="Restart a Chouka Windows node")
     parser.add_argument("--config", required=True)
-    parser.add_argument("--worker-pid", required=True, type=int)
-    parser.add_argument("--launcher", required=True)
+    parser.add_argument("--worker-pid", type=int)
+    parser.add_argument("--launcher")
+    parser.add_argument("--request-id")
+    parser.add_argument("--restart-token")
+    parser.add_argument("--wait-comfy", action="store_true")
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
-    launcher = Path(args.launcher).resolve()
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    log_path = configure_logging(config_path, config)
+    comfy_url = str(config.get("comfy_url", "http://127.0.0.1:8188"))
+    timeout = max(float(config.get("restart_timeout_seconds", 300)), 60.0)
+    if args.wait_comfy:
+        try:
+            wait_for_comfy_ready(comfy_url, time.time() + timeout)
+        except Exception as exc:
+            log_event(f"ComfyUI 就绪检查失败：{type(exc).__name__}: {exc}")
+            raise SystemExit(1) from exc
+        return
+    if args.worker_pid is None or not args.launcher:
+        parser.error("重启节点需要 --worker-pid 和 --launcher")
+
+    launcher = Path(args.launcher).resolve()
+    if not launcher.is_file():
+        raise SystemExit(f"节点重启失败：找不到启动脚本 {launcher}")
     state_path = state_path_for(config_path, config)
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    maintenance = state.get("maintenance")
+    if not isinstance(maintenance, dict) or not maintenance.get("request_id"):
+        raise SystemExit("节点重启失败：缺少维护状态")
+    request_id = str(args.request_id or maintenance["request_id"])
+    if request_id != str(maintenance.get("request_id")):
+        raise SystemExit("节点重启失败：维护请求已变化")
+    existing_token = str(maintenance.get("restart_token") or "")
+    restart_token = str(args.restart_token or existing_token or uuid.uuid4().hex)
+    if existing_token and existing_token != restart_token:
+        raise SystemExit("节点重启失败：重启令牌不匹配")
+    deadline = float(maintenance.get("deadline") or time.time() + timeout)
+    worker_log = configured_path(config_path, config, "worker_log", "logs/worker.log")
     old_worker_exited = False
     worker = None
     try:
+        update_maintenance(
+            state_path, request_id=request_id,
+            restart_token=restart_token, phase="waiting_for_old_worker",
+            log_path=str(log_path),
+        )
+        log_event(f"重启监督器已接管请求 {request_id}，等待旧 Worker PID {args.worker_pid} 退出")
         wait_for_process_exit(args.worker_pid)
         old_worker_exited = True
-        stop_comfy(str(config.get("comfy_url", "http://127.0.0.1:8188")))
-        start_launcher(launcher)
-        worker = start_worker(config_path)
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        maintenance = state.get("maintenance") or {}
-        deadline = float(maintenance.get("deadline") or time.time() + 300)
-        wait_for_restart_result(state_path, worker, deadline)
+        update_maintenance(
+            state_path, request_id=request_id,
+            expected_restart_token=restart_token, phase="stopping_comfy",
+        )
+        stop_comfy(comfy_url)
+        update_maintenance(
+            state_path, request_id=request_id,
+            expected_restart_token=restart_token, phase="starting_comfy",
+        )
+        start_launcher(launcher, max(deadline - time.time() + 10, 60))
+        wait_for_comfy_ready(comfy_url, deadline)
+        update_maintenance(
+            state_path, request_id=request_id,
+            expected_restart_token=restart_token, phase="waiting_for_worker",
+        )
+        worker = start_worker(config_path, restart_token, worker_log)
+        wait_for_restart_result(
+            state_path, worker, deadline, request_id, restart_token
+        )
+        log_event("ComfyUI 与 Worker 均已完成重启")
     except Exception as exc:
-        message = f"节点重启失败：{type(exc).__name__}: {exc}"
+        message = f"节点重启失败：{type(exc).__name__}: {exc}；日志：{log_path}"
+        log_event(message)
         worker_alive = worker is not None and worker.poll() is None
-        if not worker_alive:
-            update_maintenance(state_path, status="error", message=message)
+        update_maintenance(
+            state_path, request_id=request_id,
+            expected_restart_token=restart_token,
+            status="error", phase="error", message=message,
+        )
         if old_worker_exited and not worker_alive:
-            start_worker(config_path)
+            try:
+                start_worker(config_path, restart_token, worker_log)
+            except Exception as recovery_exc:
+                log_event(f"恢复 Worker 启动失败：{type(recovery_exc).__name__}: {recovery_exc}")
         raise SystemExit(message) from exc
 
 
