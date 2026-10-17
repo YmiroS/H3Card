@@ -74,6 +74,16 @@ def literal_model_name(graph, value):
     return value if isinstance(value, str) else None
 
 
+def _is_model_selector(input_name, options, *, combo=False, resolved=None):
+    return input_name in MODEL_INPUT_NAMES or combo and (
+        isinstance(resolved, str) and resolved.lower().endswith(MODEL_FILE_SUFFIXES)
+        or isinstance(options, list) and any(
+            isinstance(option, str) and option.lower().endswith(MODEL_FILE_SUFFIXES)
+            for option in options
+        )
+    )
+
+
 def has_required_models(graph, capabilities):
     choices_by_class = capabilities.get("input_choices") or {}
     types_by_class = capabilities.get("input_types") or {}
@@ -89,13 +99,9 @@ def has_required_models(graph, capabilities):
             options = choices.get(name)
             input_type = types.get(name)
             resolved = literal_model_name(graph, value)
-            is_model = name in MODEL_INPUT_NAMES or (
-                (name in choices or input_type == "COMBO") and (
-                    (resolved is not None and resolved.lower().endswith(MODEL_FILE_SUFFIXES))
-                    or (isinstance(options, list) and any(
-                        isinstance(option, str) and option.lower().endswith(MODEL_FILE_SUFFIXES)
-                        for option in options))
-                )
+            is_model = _is_model_selector(
+                name, options, combo=name in choices or input_type == "COMBO",
+                resolved=resolved,
             )
             if not is_model:
                 continue
@@ -106,6 +112,140 @@ def has_required_models(graph, capabilities):
             if not isinstance(options, list) or resolved is None or resolved not in options:
                 return False
     return True
+
+
+def capability_model_inventory(capabilities):
+    if not isinstance(capabilities, dict):
+        return None
+    choices_by_class = capabilities.get("input_choices")
+    types_by_class = capabilities.get("input_types")
+    if not isinstance(choices_by_class, dict) or not isinstance(types_by_class, dict):
+        return None
+    inventory = set()
+    for node_class, choices in choices_by_class.items():
+        if not isinstance(node_class, str) or not isinstance(choices, dict):
+            return None
+        types = types_by_class.get(node_class, {})
+        if not isinstance(types, dict):
+            return None
+        for input_name, options in choices.items():
+            if not isinstance(input_name, str) or not isinstance(options, list):
+                return None
+            model_input = _is_model_selector(input_name, options, combo=True)
+            if not model_input:
+                continue
+            inventory.update(
+                (node_class, input_name, option)
+                for option in options if isinstance(option, str)
+            )
+    return inventory
+
+
+def _empty_capability_comparison(status, model_status="unknown"):
+    return {
+        "status": status,
+        "model_inventory_status": model_status,
+        "missing_node_classes": [],
+        "extra_node_classes": [],
+        "missing_models": [],
+        "extra_models": [],
+    }
+
+
+def _capability_comparison(primary_capabilities, primary_models, worker_capabilities, *,
+                           primary=False, stale=False):
+    if primary:
+        model_status = "complete" if primary_models is not None else "unknown"
+        return _empty_capability_comparison("primary", model_status)
+
+    primary_nodes = primary_capabilities.get("node_classes")
+    worker_nodes = worker_capabilities.get("node_classes")
+    if (not isinstance(primary_nodes, list) or not isinstance(worker_nodes, list)
+            or any(not isinstance(item, str) for item in primary_nodes + worker_nodes)):
+        return _empty_capability_comparison("stale" if stale else "unknown")
+
+    primary_node_set = set(primary_nodes)
+    worker_node_set = set(worker_nodes)
+    missing_nodes = primary_node_set - worker_node_set
+    extra_nodes = worker_node_set - primary_node_set
+    worker_models = capability_model_inventory(worker_capabilities)
+    if primary_models is None or worker_models is None:
+        model_status = "unknown"
+        missing_models = set()
+        extra_models = set()
+    else:
+        missing_models = {
+            item for item in primary_models - worker_models if item[0] not in missing_nodes
+        }
+        extra_models = {
+            item for item in worker_models - primary_models if item[0] not in extra_nodes
+        }
+        model_status = "missing" if missing_models else "complete"
+
+    if stale:
+        status = "stale"
+    elif model_status == "unknown":
+        status = "unknown"
+    elif missing_nodes or missing_models:
+        status = "missing"
+    else:
+        status = "complete"
+
+    def model_items(items):
+        return [
+            {"node_class": node_class, "input": input_name, "name": name}
+            for node_class, input_name, name in sorted(items)
+        ]
+
+    return {
+        "status": status,
+        "model_inventory_status": model_status,
+        "missing_node_classes": sorted(missing_nodes),
+        "extra_node_classes": sorted(extra_nodes),
+        "missing_models": model_items(missing_models),
+        "extra_models": model_items(extra_models),
+    }
+
+
+def worker_capability_comparisons(workers):
+    primary_workers = [worker for worker in workers if worker.get("is_primary_node") is True]
+    if len(primary_workers) != 1:
+        status = "none" if not primary_workers else "ambiguous"
+        baseline = {"status": status, "worker_id": None, "agent_version": None}
+        compared = []
+        for worker in workers:
+            item = dict(worker)
+            item["capability_comparison"] = _empty_capability_comparison("unknown")
+            compared.append(item)
+        return baseline, compared
+
+    primary_worker = primary_workers[0]
+    primary_capabilities = primary_worker.get("capabilities")
+    if not isinstance(primary_capabilities, dict):
+        primary_capabilities = {}
+    baseline_stale = (primary_worker.get("state") == "offline"
+                      or primary_worker.get("comfy_online") is False)
+    baseline = {
+        "status": "stale" if baseline_stale else "ready",
+        "worker_id": primary_worker.get("id"),
+        "agent_version": primary_capabilities.get("agent_version"),
+    }
+    primary_models = capability_model_inventory(primary_capabilities)
+    compared = []
+    for worker in workers:
+        item = dict(worker)
+        capabilities = worker.get("capabilities")
+        if not isinstance(capabilities, dict):
+            capabilities = {}
+        item["capability_comparison"] = _capability_comparison(
+            primary_capabilities,
+            primary_models,
+            capabilities,
+            primary=worker.get("id") == primary_worker.get("id"),
+            stale=worker.get("state") == "offline" or worker.get("comfy_online") is False,
+        )
+        compared.append(item)
+    return baseline, compared
 
 
 def primary_gpu(devices):
