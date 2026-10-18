@@ -29,6 +29,7 @@ function canvas() {
     importOutput:async output => { imported.push(output); return {ref:output.url}; },
   });
   vm.runInContext(`const cardOf = id => PROJ.cards.find(c => c.id === id);\n`
+    + block('function paintCompositeInputs(', 'function paint(c)')
     + block('function mediaSlotsForOutputs(', 'function cardBox(')
     + block('function edgeWord(', 'function drawWires(')
     + block('async function pollJobs(', '/* ================= 任务浮窗'), context);

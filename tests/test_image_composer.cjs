@@ -284,7 +284,12 @@ test('image composer: real uploads, layer edits, draft reload, PNG pixels, histo
       const input = dialog.getByLabel(label,{exact:true});
       await input.fill(String(value)); await input.press('Tab'); await expect(input).toHaveValue(String(value));
     }
-    async function choose(name) { await dialog.locator('.ic-layer-name').filter({hasText:new RegExp('^' + name + '$')}).click(); }
+    async function choose(name) {
+      // The layer list now shows the original filename below its thumbnail;
+      // the user-editable layer alias is still preserved in the draft/controls.
+      const filename = {'红色':'red.png','蓝色':'blue.png'}[name] || name;
+      await dialog.locator('.ic-layer-name').filter({hasText:filename}).click();
+    }
     async function savedCard() { return (await api(page,`/api/projects/${project.id}`)).cards.find(c => c.id === 'composite'); }
     await field('画布宽度 / px',64); await field('画布高度 / px',48);
     await dialog.locator('input[type=file]').setInputFiles([
@@ -312,9 +317,9 @@ test('image composer: real uploads, layer edits, draft reload, PNG pixels, histo
       if (name === '红色') await field('透明度 / %',100);
     }
     await choose('蓝色'); await dialog.getByRole('button',{name:'置底',exact:true}).click();
-    await expect(dialog.locator('.ic-layer-name').first()).toHaveText('红色');
+    await expect(dialog.locator('.ic-layer-name').first()).toHaveText('red.png');
     await dialog.getByRole('button',{name:'置顶',exact:true}).click();
-    await expect(dialog.locator('.ic-layer-name').first()).toHaveText('蓝色');
+    await expect(dialog.locator('.ic-layer-name').first()).toHaveText('blue.png');
     // Delete/Ctrl+Z must operate only on layers, never the selected outer card.
     const outerBefore = await page.evaluate(() => ({ids:PROJ.cards.map(c => c.id),edges:structuredClone(PROJ.edges)}));
     await dialog.getByRole('button',{name:'适应窗口',exact:true}).focus();
@@ -413,6 +418,343 @@ test('image composer: real uploads, layer edits, draft reload, PNG pixels, histo
     fs.writeFileSync(path.join(folder,'report.json'),JSON.stringify(report,null,2));
     try { if (browser) await browser.close(); } finally { if (fixture) await fixture.stop(); }
   }
+});
+
+// These fixtures use only the isolated server's real upload/resources APIs. Asset
+// cards bypass importOutput; generation-like cards deliberately exercise it.
+async function referenceProject(page, count, generated = false) {
+  const project = await api(page,'/api/projects','POST',{name:'隔离合成输入连线验收'});
+  await api(page,`/api/projects/${project.id}/cards`,'POST',{card:{...compositeCard(),x:480,y:80}});
+  const sources = [];
+  for (let i = 0; i < count; i++) {
+    const rgb = [30 + i * 20, 210 - i * 17, 40 + i * 23];
+    const filename = `reference-${i + 1}.png`;
+    const uploaded = await page.evaluate(async ({id,filename,bytes}) => {
+      const form = new FormData();
+      form.append('file',new File([Uint8Array.from(atob(bytes),c => c.charCodeAt(0))],filename,{type:'image/png'}));
+      return H3Auth.request(`/api/upload?project=${id}&local_only=1`,{method:'POST',body:form});
+    },{id:project.id,filename,bytes:solidPNG(...rgb).toString('base64')});
+    assert.equal(uploaded.files.length,1,'Seed each source with a real isolated upload');
+    const output = {...uploaded.files[0],filename};
+    assert.equal(output.kind,'image'); assert.ok(output.ref); assert.ok(output.url);
+    const source = {id:`source-${i + 1}`,type:generated ? 'card_image' : 'card_asset',
+      cap:generated ? 'zimage_t2i' : 'asset',name:`真实输入图片 ${i + 1}`,x:40,y:80 + i * 260,
+      params:{},assets:{},outputs:[output],status:'done'};
+    await api(page,`/api/projects/${project.id}/cards`,'POST',{card:source});
+    sources.push({card:source,rgb});
+  }
+  await openProject(page,project.id);
+  return {project,sources};
+}
+async function assertCompositeReferences(page, expected, pending = []) {
+  const card = page.locator('#world .card[data-id="composite"]');
+  const strip = card.locator(':scope > .body + .composite-inputs');
+  await expect(strip).toBeVisible();
+  await expect(strip.locator('[data-composite-reference]')).toHaveCount(expected.length + pending.length);
+  await expect(strip.locator('.composite-input-label')).toHaveText(`引用图片 · ${expected.length + pending.length}/8`);
+  const keys = await strip.locator('[data-composite-reference]').evaluateAll(nodes => nodes.map(n => n.dataset.compositeReference));
+  assert.deepEqual(keys.sort(),[...expected.map(item => item.slot),...pending].sort(),'Each reserved/filled slot is shown exactly once');
+  for (const {slot,asset,rgb} of expected) {
+    const button = strip.locator(`[data-composite-reference="${slot}"]`), image = button.locator('img');
+    await expect(button).toBeVisible(); await expect(button).toBeEnabled();
+    await expect(button).toHaveAttribute('aria-label',new RegExp(asset.origin || asset.filename));
+    await expect(image).toBeVisible();
+    await expect(image).toHaveAttribute('src','/api/thumbnail?url=' + encodeURIComponent(asset.url));
+    await expect.poll(() => image.evaluate(img => img.complete && img.naturalWidth === 8)).toBe(true);
+    if (rgb) {
+      const pixel = await image.evaluate(img => {
+        const canvas = document.createElement('canvas'); canvas.width = canvas.height = 8;
+        const context = canvas.getContext('2d'); context.drawImage(img,0,0);
+        return [...context.getImageData(0,0,1,1).data];
+      });
+      assert.deepEqual(pixel,[...rgb,255],`Visible ${slot} thumbnail matches its actual source, not another reference/output`);
+    }
+  }
+  for (const slot of pending) {
+    const button = strip.locator(`[data-composite-reference="${slot}"]`);
+    await expect(button).toBeVisible(); await expect(button).toBeDisabled();
+    await expect(button).toContainText('导入中'); await expect(button.locator('img')).toHaveCount(0);
+  }
+}
+async function assertCompositePanelOpen(page, expectedSlots) {
+  await page.evaluate(() => pick('composite'));
+  const details = page.locator('#panel details').filter({has:page.locator('summary').filter({hasText:'连接图片素材'})});
+  await expect(details).toHaveCount(1);
+  assert.equal(await details.evaluate(node => node.open),true,'Connected-image details default open without a summary click');
+  await expect(details.locator('.slot.filled')).toHaveCount(expectedSlots.length);
+  for (const slot of expectedSlots) await expect(details.locator(`.slot[data-key="${slot}"] img`)).toBeVisible();
+}
+async function referenceFixture(t, prefix, run) {
+  const folder = fs.mkdtempSync(path.join(os.tmpdir(),prefix));
+  const report = {folder,browserOutbound:[],pageErrors:[]};
+  t.diagnostic('Isolated input-reference evidence: ' + folder);
+  let fixture, browser, page;
+  try {
+    fixture = await bootFixture(folder);
+    const launched = await launch(fixture,report); browser = launched.browser;
+    page = await loadPage(launched.context,fixture,report);
+    await run({page,fixture,folder,report});
+    const audit = await api(page,'/__fixture/audit'); report.audit = audit;
+    assertIsolation(audit,report,folder);
+    assert.deepEqual(audit.writes.filter(w => /^\/api\/(generate|text|rewrite)$/.test(w.path)),[],
+      'Reference linking and PNG output never submit generation');
+    for (const upload of audit.writes.filter(w => w.path === '/api/upload')) {
+      assert.equal(upload.query.local_only,'1','Seed/import/export uploads stay local and never contact a worker');
+      assert.equal(upload.content_type,'multipart/form-data');
+    }
+  } catch (error) {
+    report.error = error.stack;
+    if (page && !page.isClosed()) {
+      report.liveState = await page.evaluate(() => ({cards:PROJ?.cards.map(plain),edges:PROJ?.edges,
+        references:[...document.querySelectorAll('[data-composite-reference]')].map(node =>
+          ({slot:node.dataset.compositeReference,text:node.textContent,disabled:node.disabled}))})).catch(() => null);
+      await page.screenshot({path:path.join(folder,'failure.png'),fullPage:true}).catch(() => {});
+    }
+    throw error;
+  } finally {
+    if (fixture && page && !page.isClosed()) report.finalAudit = await api(page,'/__fixture/audit').catch(() => null);
+    fs.writeFileSync(path.join(folder,'report.json'),JSON.stringify(report,null,2));
+    try { if (browser) await browser.close(); } finally { if (fixture) await fixture.stop(); }
+  }
+}
+
+test('image composer inputs: sequential real sources, visible references, output, reload, disconnect and eight-slot limit', {timeout:180000}, async t => {
+  await referenceFixture(t,'chouka-image-composer-inputs-',async ({page,folder,report}) => {
+    const {project,sources} = await referenceProject(page,9);
+    report.project = project.id; report.sources = sources;
+    const saved = () => api(page,`/api/projects/${project.id}`);
+    const references = indices => indices.map(i => ({slot:`images[${i}]`,asset:sources[i].card.outputs[0],rgb:sources[i].rgb}));
+    for (let i = 0; i < 2; i++) {
+      await page.evaluate(async id => { await linkTo(cardOf(id),cardOf('composite')); },sources[i].card.id);
+      await settle(page);
+      await assertCompositeReferences(page,references(Array.from({length:i + 1},(_,j) => j)));
+    }
+    let snapshot = await saved();
+    assert.deepEqual(snapshot.edges.map(e => ({from:e.from,to:e.to,slot:e.slot,slots:e.slots})),[
+      {from:'source-1',to:'composite',slot:'images[0]',slots:['images[0]']},
+      {from:'source-2',to:'composite',slot:'images[1]',slots:['images[1]']},
+    ]);
+    assert.deepEqual(snapshot.cards.find(c => c.id === 'composite').outputs,[],'Input references are not card outputs');
+    assert.equal(await page.locator('#wires path.hit').count(),2);
+    await assertCompositePanelOpen(page,['images[0]','images[1]']);
+    await page.screenshot({path:path.join(folder,'two-inputs.png'),fullPage:true});
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id);
+    await assertCompositeReferences(page,references([0,1]));
+    await assertCompositePanelOpen(page,['images[0]','images[1]']);
+    assert.deepEqual((await saved()).edges,snapshot.edges,'Save/reload keeps both distinct source bindings');
+    for (let i = 0; i < 2; i++) assert.deepEqual(await page.evaluate(slot => plain(cardOf('composite')).assets[slot],`images[${i}]`),sources[i].card.outputs[0]);
+
+    // Produce a real local PNG through the editor: output painting must leave the
+    // separate input strip intact, with the original source images still visible.
+    await page.locator('#panel').getByRole('button',{name:'编辑合成',exact:true}).click();
+    const dialog = page.locator('dialog[data-image-composer]');
+    await expect(dialog.getByRole('button',{name:'保存编辑稿',exact:true})).toBeEnabled();
+    for (const [label,value] of [['画布宽度 / px','64'],['画布高度 / px','48']]) {
+      await dialog.getByLabel(label,{exact:true}).fill(value); await dialog.getByLabel(label,{exact:true}).press('Tab');
+    }
+    await expect(dialog.locator('.ic-layer')).toHaveCount(2,'Both wired images become layers without manually adding sources');
+    await dialog.getByRole('button',{name:'合成 PNG',exact:true}).click();
+    await expect.poll(async () => (await saved()).cards.find(c => c.id === 'composite').outputs.length).toBe(1);
+    await expect(dialog.getByRole('button',{name:'保存编辑稿',exact:true})).toBeEnabled();
+    await dialog.getByRole('button',{name:'关闭',exact:true}).click(); await settle(page);
+    const withOutput = (await saved()).cards.find(c => c.id === 'composite'), output = withOutput.outputs[0];
+    const preview = page.locator('#world .card[data-id="composite"] > .body img').first();
+    await expect(preview).toBeVisible(); await expect.poll(() => preview.evaluate(img => CARD_MEDIA.get(img)?.fullURL || img.getAttribute('src'))).toBe(output.url);
+    await assertCompositeReferences(page,references([0,1]));
+    await page.screenshot({path:path.join(folder,'output-with-inputs.png'),fullPage:true});
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id); await assertCompositeReferences(page,references([0,1]));
+    await expect.poll(() => preview.evaluate(img => CARD_MEDIA.get(img)?.fullURL || img.getAttribute('src'))).toBe(output.url);
+
+    // Use the real wire deletion command and a trusted Delete key, not direct
+    // mutation of assets/edges, so exactly the selected connection is cleared.
+    await page.evaluate(() => pickEdge(PROJ.edges.find(e => e.from === 'source-1' && e.to === 'composite')));
+    await page.keyboard.press('Delete'); await settle(page);
+    await assertCompositeReferences(page,references([1]));
+    snapshot = await saved();
+    const afterDisconnect = snapshot.cards.find(c => c.id === 'composite');
+    assert.equal('images[0]' in afterDisconnect.assets,false);
+    assert.deepEqual(afterDisconnect.assets['images[1]'],sources[1].card.outputs[0]);
+    assert.deepEqual(afterDisconnect.outputs,[output]);
+    assert.deepEqual(afterDisconnect.params,withOutput.params,'Disconnect never changes the editor draft');
+    assert.deepEqual(snapshot.edges.map(e => e.from),['source-2']);
+    assert.equal(await page.locator('#wires path.hit').count(),1);
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id); await assertCompositeReferences(page,references([1]));
+
+    // Refill the freed slot and every remaining supported slot. A ninth source
+    // must be rejected without displacing any of the existing eight references.
+    for (const i of [0,2,3,4,5,6,7]) {
+      await page.evaluate(async id => { await linkTo(cardOf(id),cardOf('composite')); },sources[i].card.id);
+    }
+    await settle(page); await assertCompositeReferences(page,references([0,1,2,3,4,5,6,7]));
+    const full = await saved();
+    assert.equal(full.edges.length,8); assert.equal(new Set(full.edges.flatMap(e => e.slots)).size,8);
+    await page.evaluate(async () => { await linkTo(cardOf('source-9'),cardOf('composite')); });
+    await settle(page);
+    const rejected = await saved();
+    assert.deepEqual(rejected.edges,full.edges,'Ninth source must not replace any occupied edge');
+    assert.deepEqual(rejected.cards.find(c => c.id === 'composite'),full.cards.find(c => c.id === 'composite'));
+    await assertCompositeReferences(page,references([0,1,2,3,4,5,6,7]));
+    await expect.poll(() => preview.evaluate(img => CARD_MEDIA.get(img)?.fullURL || img.getAttribute('src'))).toBe(output.url);
+    assert.equal(await page.locator('#wires path.hit').count(),8);
+    assert.equal(await page.locator('#world .card:not([data-id="composite"]) .composite-inputs').count(),0,'Strip is scoped to image_composite only');
+    report.finalProject = rejected;
+    await page.screenshot({path:path.join(folder,'eight-inputs.png'),fullPage:true});
+    const audit = await api(page,'/__fixture/audit');
+    assert.equal(audit.writes.filter(w => w.path === '/api/upload').length,10,'Nine real seed uploads plus one PNG export; asset-card links never reupload');
+  });
+});
+
+test('image composer editor: wired layers auto-load once, thumbnails, preserved transforms and intentional deletion', {timeout:150000}, async t => {
+  await referenceFixture(t,'chouka-image-composer-linked-layers-',async ({page,folder,report}) => {
+    const {project,sources} = await referenceProject(page,4);
+    report.project = project.id;
+    const savedComposition = async () => (await api(page,`/api/projects/${project.id}`)).cards.find(c => c.id === 'composite').params.composition;
+    const dialog = page.locator('dialog[data-image-composer]');
+    const save = dialog.getByRole('button',{name:'保存编辑稿',exact:true});
+    const filename = i => sources[i].card.outputs[0].origin || sources[i].card.outputs[0].filename;
+    const layer = i => dialog.locator('.ic-layer-name').filter({hasText:filename(i)});
+    async function open(count) {
+      await page.evaluate(() => pick('composite'));
+      await page.locator('#panel').getByRole('button',{name:'编辑合成',exact:true}).click();
+      await expect(save).toBeEnabled(); await expect(dialog.locator('.ic-layer')).toHaveCount(count);
+      await expect(dialog.locator('[role=alert]:not([hidden])')).toHaveCount(0);
+    }
+    async function close() { await dialog.getByRole('button',{name:'关闭',exact:true}).click(); await expect(dialog).toHaveCount(0); }
+    async function saveClose() { await save.click(); await expect(save).toBeEnabled(); await settle(page); await close(); }
+    async function thumbnailAndFilename(button, name) {
+      await expect(button).toBeVisible();
+      await expect(button.locator('.ic-asset-name')).toHaveText(name);
+      const thumbnail = button.locator('.ic-thumbnail :is(img,canvas)').first();
+      await expect(thumbnail).toBeVisible();
+      await expect.poll(() => thumbnail.evaluate(node => node.tagName === 'CANVAS'
+        ? node.width > 0 && node.height > 0 : node.complete && node.naturalWidth > 0)).toBe(true);
+      const bounds = await button.evaluate(node => {
+        const image = node.querySelector('.ic-thumbnail').getBoundingClientRect(), text = node.querySelector('.ic-asset-name').getBoundingClientRect();
+        return {imageBottom:image.bottom,textTop:text.top};
+      });
+      assert.ok(bounds.textTop >= bounds.imageBottom - 1,'Filename is below the visible thumbnail, not replacing or covering it');
+    }
+    for (const source of sources.slice(0,2)) await page.evaluate(async id => { await linkTo(cardOf(id),cardOf('composite')); },source.card.id);
+    await settle(page); await open(2);
+    for (let i = 0; i < 2; i++) await thumbnailAndFilename(layer(i),filename(i));
+    await expect(layer(2)).toHaveCount(0); await expect(layer(3)).toHaveCount(0,'Unwired canvas sources stay manual');
+    for (let i = 0; i < 4; i++) {
+      const source = dialog.locator('.ic-sources button').filter({hasText:filename(i)});
+      await thumbnailAndFilename(source,filename(i));
+    }
+    // Edit actual layer controls, then prove the existing layer IDs and geometry
+    // survive automatic merge/reopen rather than being rebuilt from input assets.
+    await layer(0).click();
+    await dialog.getByLabel('锁定宽高比',{exact:true}).uncheck();
+    for (const [label,value] of [['X / px','17'],['Y / px','11'],['宽度 / px','24'],['高度 / px','16'],['角度 / °','23'],['透明度 / %','65']]) {
+      await dialog.getByLabel(label,{exact:true}).fill(value); await dialog.getByLabel(label,{exact:true}).press('Tab');
+    }
+    await page.screenshot({path:path.join(folder,'wired-layers-and-source-thumbnails.png'),fullPage:true});
+    await saveClose(); const initial = await savedComposition();
+    assert.equal(initial.layers.length,2);
+    const edited = initial.layers.find(item => item.asset.ref === sources[0].card.outputs[0].ref);
+    assert.deepEqual({x:edited.x,y:edited.y,width:edited.width,height:edited.height,angle:edited.angle,opacity:edited.opacity},
+      {x:17,y:11,width:24,height:16,angle:23,opacity:.65});
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id); await open(2); await saveClose();
+    assert.deepEqual((await savedComposition()).layers,initial.layers,'Reopening two wired images never duplicates layers or resets transforms');
+
+    await page.evaluate(async () => { await linkTo(cardOf('source-3'),cardOf('composite')); }); await settle(page);
+    await open(3); await thumbnailAndFilename(layer(2),filename(2)); await saveClose();
+    const three = await savedComposition();
+    for (const original of initial.layers) assert.deepEqual(three.layers.find(item => item.id === original.id),original,'Adding a new connected image retains previous layers exactly');
+    assert.equal(three.layers.filter(item => item.asset.ref === sources[2].card.outputs[0].ref).length,1);
+    await open(3); await saveClose();
+    assert.deepEqual((await savedComposition()).layers,three.layers,'New third input is auto-added only once');
+
+    await open(3); await layer(0).click();
+    await dialog.getByRole('button',{name:'适应窗口',exact:true}).focus(); await page.keyboard.press('Delete');
+    await expect(dialog.locator('.ic-layer')).toHaveCount(2); await saveClose();
+    const deleted = await savedComposition();
+    assert.equal(deleted.layers.some(item => item.asset.ref === sources[0].card.outputs[0].ref),false);
+    assert.equal((await api(page,`/api/projects/${project.id}`)).edges.length,3,'Layer deletion does not disconnect the live input');
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id); await open(2);
+    await expect(layer(0)).toHaveCount(0,'An intentionally deleted wired layer must not resurrect after save/reload/reopen');
+    await expect(layer(3)).toHaveCount(0,'Unwired fourth source is still not added automatically');
+    await dialog.locator('.ic-sources button').filter({hasText:filename(3)}).click();
+    await expect(dialog.locator('.ic-layer')).toHaveCount(3); await thumbnailAndFilename(layer(3),filename(3));
+    await saveClose(); const manual = await savedComposition();
+    assert.equal(manual.layers.filter(item => item.asset.ref === sources[3].card.outputs[0].ref).length,1,'Standalone source is added only by its source button');
+    for (const original of deleted.layers) assert.deepEqual(manual.layers.find(item => item.id === original.id),original);
+    await open(3); await expect(layer(0)).toHaveCount(0); await close();
+    report.initial = initial; report.three = three; report.deleted = deleted; report.manual = manual;
+    const audit = await api(page,'/__fixture/audit');
+    assert.equal(audit.writes.filter(w => w.path === '/api/upload').length,4,'Automatic/manual layer addition reuses real resources without reuploading');
+  });
+});
+
+test('image composer inputs: concurrent real imports reserve distinct slots while first upload is pending', {timeout:120000}, async t => {
+  await referenceFixture(t,'chouka-image-composer-concurrent-',async ({page,folder,report}) => {
+    const {project,sources} = await referenceProject(page,2,true);
+    report.project = project.id; report.sources = sources;
+    const before = await api(page,'/__fixture/audit');
+    assert.equal(before.writes.filter(w => w.path === '/api/upload').length,2,'Real source seeding is counted separately from imports');
+    let release, stalled = 0;
+    const gate = new Promise(resolve => { release = resolve; });
+    const imports = [], downloads = [];
+    page.on('request', request => {
+      const url = new URL(request.url());
+      if (request.method() === 'POST' && url.pathname === '/api/upload') imports.push({path:url.pathname,query:Object.fromEntries(url.searchParams)});
+      if (request.method() === 'GET' && request.resourceType() === 'fetch' && sources.some(s => new URL(s.card.outputs[0].url,page.url()).href === request.url())) downloads.push(url.pathname);
+    });
+    // Intercept timing only: continue the actual multipart upload to the real
+    // server after releasing the promise. No mocked resource/import responses.
+    await page.route('**/api/upload?*',async route => {
+      if (route.request().method() === 'POST' && ++stalled === 1) await gate;
+      await route.continue();
+    });
+    try {
+      await page.evaluate(() => { window.composerLinks = [linkTo(cardOf('source-1'),cardOf('composite'))]; });
+      await expect.poll(() => stalled).toBe(1);
+      assert.equal(await page.evaluate(() => !!cardOf('composite').assets['images[0]']),false,'First real upload is still held before its asset exists');
+      await assertCompositeReferences(page,[],['images[0]']);
+      await page.evaluate(() => { window.composerLinks.push(linkTo(cardOf('source-2'),cardOf('composite'))); });
+      await expect.poll(() => page.evaluate(() => !!cardOf('composite').assets['images[1]']),{timeout:15000}).toBe(true);
+      await page.evaluate(async () => { await window.composerLinks[1]; });
+      const pending = await page.evaluate(() => ({edges:structuredClone(PROJ.edges),assets:plain(cardOf('composite')).assets}));
+      assert.deepEqual(pending.edges.map(e => ({from:e.from,slot:e.slot,slots:e.slots})),[
+        {from:'source-1',slot:'images[0]',slots:['images[0]']},
+        {from:'source-2',slot:'images[1]',slots:['images[1]']},
+      ],'Incoming edge reservations, not just populated assets, determine the next slot');
+      assert.equal('images[0]' in pending.assets,false);
+      assert.ok(pending.assets['images[1]']?.ref,'Second import completes without waiting for the first upload');
+      await assertCompositeReferences(page,[{slot:'images[1]',asset:pending.assets['images[1]'],rgb:sources[1].rgb}],['images[0]']);
+      assert.equal(await page.locator('#wires path.hit').count(),2);
+      report.pending = pending;
+      await page.screenshot({path:path.join(folder,'first-upload-pending.png'),fullPage:true});
+      release();
+      await page.evaluate(async () => { await Promise.all(window.composerLinks); }); await settle(page);
+      const saved = await api(page,`/api/projects/${project.id}`), composite = saved.cards.find(c => c.id === 'composite');
+      assert.deepEqual(saved.edges,pending.edges,'First upload finishing must preserve both original edge owners');
+      assert.deepEqual(Object.keys(composite.assets).sort(),['images[0]','images[1]']);
+      assert.notEqual(composite.assets['images[0]'].ref,composite.assets['images[1]'].ref,'Distinct imports must not overwrite the same slot');
+      const expected = sources.map((source,i) => ({slot:`images[${i}]`,asset:composite.assets[`images[${i}]`],rgb:source.rgb}));
+      for (const [i,source] of sources.entries()) {
+        const response = await page.request.get(new URL(composite.assets[`images[${i}]`].url,page.url()).href);
+        assert.equal(response.status(),200); assert.deepEqual(await response.body(),solidPNG(...source.rgb));
+      }
+      await assertCompositeReferences(page,expected); await assertCompositePanelOpen(page,['images[0]','images[1]']);
+      await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+      await openProject(page,project.id); await assertCompositeReferences(page,expected);
+      assert.deepEqual((await api(page,`/api/projects/${project.id}`)).edges,saved.edges);
+      assert.equal(imports.length,2,'Exactly two real import uploads, excluding the two API seed uploads');
+      for (const upload of imports) assert.deepEqual(upload.query,{project:project.id,local_only:'1'});
+      for (const source of sources) assert.ok(downloads.includes(new URL(source.card.outputs[0].url,page.url()).pathname),'Generation-like source goes through real importOutput download');
+      const audit = await api(page,'/__fixture/audit');
+      assert.equal(audit.writes.filter(w => w.path === '/api/upload').length,4,'Two source uploads and two completed import uploads');
+      report.imports = imports; report.downloads = downloads; report.finalProject = saved;
+      await page.screenshot({path:path.join(folder,'both-imports-preserved.png'),fullPage:true});
+    } finally { release(); }
+  });
 });
 
 test('image composer backend guard and real read-only ACL (intentional rejected generate is separate)', {timeout:90000}, async t => {

@@ -520,6 +520,7 @@ test('连通守卫：五种模式只读不读尺寸不写入，菜单回调撤�
 
 // 删除和素材引用清理也直接抽取生产实现，不在夹具里复刻删除算法。
 const deletion = [
+  block('function paintCompositeInputs(', 'function paint(c)'),
   block('const STYLE_SLOT =', '/* ================= 文本节点片'),
   block('function mediaSlotsForOutputs(', '/** 用户手动换掉某一格'),
   block('function askDelMany(', '\nfunction pickEdge('),

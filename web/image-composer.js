@@ -3,7 +3,7 @@
   'use strict';
   const ownScript = document.currentScript;
   const base = new URL('.', ownScript?.src || location.href);
-  const MAX_SIDE = 8192, MAX_PIXELS = 32000000, MAX_LAYERS = 100;
+  const MAX_SIDE = 8192, MAX_PIXELS = 32000000, MAX_LAYERS = 100, MAX_LINKED_IDENTITIES = 512;
   const MAX_DECODED = 64000000, MAX_BYTES = 64 * 1024 * 1024;
   let dependencies;
   const copy = value => JSON.parse(JSON.stringify(value));
@@ -21,6 +21,8 @@
     if (!/^https?:$/.test(url.protocol) || url.origin !== location.origin || url.username || url.password || !controlledPath || url.hash) {
       throw new Error('仅支持本站受控媒体地址（/api/file、/api/upload/文件名、/api/artifact/项目/文件名）；不接受其他路径、外站、data 或 blob 地址。');
     }
+    url.searchParams.sort();
+    if (url.href.length > 8192) throw new Error('图片地址过长。');
     return url.href;
   }
   function assetJSON(value) {
@@ -30,6 +32,18 @@
     const asset = JSON.parse(text);
     mediaURL(asset.url);
     return asset;
+  }
+  function assetName(asset) {
+    const basename = value => typeof value === 'string' ? value.trim().split(/[\\/]/).filter(Boolean).at(-1) : '';
+    return String(basename(asset.origin) || basename(asset.filename) || asset.name || '图片').slice(0,200);
+  }
+  function assetIdentities(asset) {
+    const keys = [`url:${mediaURL(asset.url)}`];
+    if (typeof asset.ref === 'string' && asset.ref.trim()) {
+      if (asset.ref.length > 8192) throw new Error('图片资源标识过长。');
+      keys.push(`ref:${asset.ref}`);
+    }
+    return keys;
   }
   function normalize(value) {
     const text = JSON.stringify(value || {version:1, width:1920, height:1080, background:'transparent', layers:[]});
@@ -47,7 +61,12 @@
       if (![l.x,l.y,l.angle,l.opacity].every(Number.isFinite) || Math.abs(l.x) > 100000 || Math.abs(l.y) > 100000 || Math.abs(l.angle) > 36000 || l.opacity < 0 || l.opacity > 1) throw new Error('图层位置、角度或透明度无效。');
       return {id:l.id, name:String(l.name || '图片').slice(0,200), asset:assetJSON(l.asset), x:l.x, y:l.y, width:l.width, height:l.height, angle:l.angle, opacity:l.opacity, visible:l.visible !== false, locked:!!l.locked};
     });
-    return {version:1, width:s.width, height:s.height, background:s.background, layers:s.layers};
+    const normalized = {version:1, width:s.width, height:s.height, background:s.background, layers:s.layers};
+    if (s.linkedSources !== undefined) {
+      if (!Array.isArray(s.linkedSources) || s.linkedSources.length > MAX_LINKED_IDENTITIES || s.linkedSources.some(key => typeof key !== 'string' || !key || key.length > 8196)) throw new Error('已连接图片记录无效（最多 512 条有界资源标识）。');
+      normalized.linkedSources = [...new Set(s.linkedSources)];
+    }
+    return normalized;
   }
   async function inspectImage(blob) {
     // Inspect dimensions before full decoding: compressed oversized images must not allocate huge bitmaps.
@@ -126,7 +145,7 @@
     if (text !== undefined) node.textContent = text;
     return node;
   }
-  async function open({state, sources = [], upload, onSave, onExport, canEdit = () => true} = {}) {
+  async function open({state, sources = [], linkedSources = [], upload, onSave, onExport, canEdit = () => true} = {}) {
     const dialog = el('dialog', 'chouka-composer image-composer-dialog');
     dialog.setAttribute('data-image-composer', '');
     const headingId = `composer-${uid()}`;
@@ -217,6 +236,23 @@
       object.setControlsVisibility({ml:!ratio.checked,mr:!ratio.checked,mt:!ratio.checked,mb:!ratio.checked});
       return object;
     }
+    function thumbnail(asset) {
+      const url = mediaURL(asset.url), frame = el('span', 'ic-thumbnail'), bitmap = images.get(url);
+      frame.setAttribute('aria-hidden', 'true'); frame.draggable = false;
+      if (bitmap) {
+        // Reuse decoded pixels: rebuilding the layer list must not fetch the image again.
+        const preview = el('canvas'), scale = Math.min(1, 220 / bitmap.width, 120 / bitmap.height); preview.draggable = false;
+        preview.width = Math.max(1, Math.round(bitmap.width * scale)); preview.height = Math.max(1, Math.round(bitmap.height * scale));
+        preview.getContext('2d').drawImage(bitmap, 0, 0, preview.width, preview.height); frame.append(preview);
+      } else {
+        const preview = el('img'); preview.alt = ''; preview.loading = 'lazy'; preview.decoding = 'async'; preview.draggable = false;
+        const original = new URL(url);
+        preview.src = /^\/api\/(upload|artifact)\//.test(original.pathname)
+          ? `/api/thumbnail?url=${encodeURIComponent(original.pathname + original.search)}` : url;
+        frame.append(preview);
+      }
+      return frame;
+    }
     function selectedLayer() { return model?.layers.find(l => l.id === selected); }
     function rebuild() {
       if (!canvas || !model) return;
@@ -246,7 +282,11 @@
     function travel(delta) {
       const index = historyIndex + delta;
       if (index < 0 || index >= history.length) return;
-      model = JSON.parse(history[index]); historyIndex = index; rebuild();
+      const linkedSeen = model.linkedSources;
+      model = JSON.parse(history[index]);
+      // Undo can remove an auto-added layer, but must not make it reappear next open.
+      if (linkedSeen) model.linkedSources = [...new Set([...(model.linkedSources || []), ...linkedSeen])];
+      historyIndex = index; history[index] = JSON.stringify(model); rebuild();
     }
     function resizeView() {
       if (!canvas || !model || dead) return;
@@ -347,7 +387,9 @@
       for (const item of [...model.layers].reverse()) {
         const row = el('div', `ic-layer${selected === item.id ? ' is-selected' : ''}`);
         row.draggable = !busy && allowed(); row.dataset.layerId = item.id;
-        const select = el('button', 'ic-layer-name', item.name); select.type = 'button'; select.title = item.name;
+        const filename = assetName(item.asset);
+        const select = el('button', 'ic-layer-name'); select.type = 'button'; select.title = filename; select.dataset.layerAction = 'select';
+        select.append(thumbnail(item.asset), el('span', 'ic-asset-name', filename));
         select.setAttribute('aria-pressed', String(selected === item.id)); select.disabled = busy || !allowed();
         select.addEventListener('click', () => {
           if (!editable()) return;
@@ -357,8 +399,10 @@
         });
         const visible = el('button', 'ic-layer-toggle', item.visible ? '隐藏' : '显示'); visible.type = 'button';
         visible.setAttribute('aria-label', `${item.visible ? '隐藏' : '显示'} ${item.name}`);
+        visible.setAttribute('aria-pressed', String(item.visible)); visible.dataset.layerAction = 'visible'; visible.title = visible.getAttribute('aria-label');
         const lock = el('button', 'ic-layer-toggle', item.locked ? '解锁' : '锁定'); lock.type = 'button';
         lock.setAttribute('aria-label', `${item.locked ? '解锁' : '锁定'} ${item.name}`);
+        lock.setAttribute('aria-pressed', String(item.locked)); lock.dataset.layerAction = 'lock'; lock.title = lock.getAttribute('aria-label');
         visible.disabled = lock.disabled = busy || !allowed();
         visible.addEventListener('click', () => change(() => { item.visible = !item.visible; }));
         lock.addEventListener('click', () => change(() => { item.locked = !item.locked; }));
@@ -378,12 +422,13 @@
             const [movingLayer] = model.layers.splice(from,1); model.layers.splice(target,0,movingLayer); selected = moving;
           });
         });
-        row.append(select,visible,lock); layerList.append(row);
+        const controls = el('div', 'ic-layer-controls'); controls.append(visible,lock);
+        row.append(select,controls); layerList.append(row);
       }
       refreshPermission();
       if (restoreCanvasFocus && !busy) canvas?.upperCanvasEl.focus({preventScroll:true});
     }
-    async function appendAssets(assets) {
+    async function appendAssets(assets, linkedSeen) {
       if (model.layers.length + assets.length > MAX_LAYERS) throw new Error('最多添加 100 个图层。');
       const added = [];
       for (const value of assets) {
@@ -391,10 +436,31 @@
         const asset = assetJSON(value), bitmap = await getImage(asset);
         if (!allowed()) throw new Error('编辑权限已失效，未添加图片。');
         const scale = Math.max(1 / Math.min(bitmap.width,bitmap.height), Math.min(1, model.width / bitmap.width, model.height / bitmap.height));
-        added.push({id:uid(), name:String(asset.name || (typeof asset.origin === 'string' && asset.origin) || asset.filename || '图片').slice(0,200), asset, x:0, y:0, width:bitmap.width * scale, height:bitmap.height * scale, angle:0, opacity:1, visible:true, locked:false});
+        added.push({id:uid(), name:assetName(asset), asset, x:0, y:0, width:bitmap.width * scale, height:bitmap.height * scale, angle:0, opacity:1, visible:true, locked:false});
       }
-      model = normalize({...model, layers:model.layers.concat(added)});
+      if (!allowed()) throw new Error('编辑权限已失效，未添加图片。');
+      model = normalize({...model, ...(linkedSeen ? {linkedSources:linkedSeen} : {}), layers:model.layers.concat(added)});
       selected = added.at(-1)?.id || selected; rebuild(); checkpoint();
+    }
+    async function appendLinkedSources() {
+      if (!Array.isArray(linkedSources) || linkedSources.length > MAX_LINKED_IDENTITIES) throw new Error('已连接图片列表无效或过多（最多 512 项）。');
+      if (!linkedSources.length) return;
+      const seen = new Set(model.linkedSources || []), known = new Set(seen), represented = new Set(), pending = [];
+      for (const layer of model.layers) for (const key of assetIdentities(layer.asset)) represented.add(key);
+      for (const value of linkedSources) {
+        const asset = assetJSON(value), keys = assetIdentities(asset);
+        if (keys.some(key => known.has(key) || represented.has(key))) for (const key of keys) known.add(key);
+        if (!keys.some(key => seen.has(key) || represented.has(key))) pending.push(asset);
+        for (const key of keys) seen.add(key);
+        if (seen.size > MAX_LINKED_IDENTITIES) throw new Error('已连接图片记录已达 512 条上限，请使用“添加图片”手动添加新素材。');
+      }
+      if (!allowed()) throw new Error('编辑权限已失效，未添加图片。');
+      if (known.size !== (model.linkedSources || []).length) {
+        // Remember matching legacy layers even if a different linked image fails to load.
+        model = normalize({...model, linkedSources:[...known]}); checkpoint();
+      }
+      // Commit new imports and their identities together; failed loads keep existing layers intact.
+      await appendAssets(pending, [...seen]);
     }
     async function validateFile(file) {
       if (!/^image\/(png|jpeg|webp|gif|bmp|x-ms-bmp)$/i.test(file.type) || !file.size || file.size > MAX_BYTES) throw new Error(`${file.name || '粘贴文件'}：仅支持常见位图格式，且文件需在 64 MiB 以内。`);
@@ -523,19 +589,26 @@
             } catch (error) { model = before; rebuild(); showError(error); }
           });
         }
-        const initial = normalize(state);
-        for (const layer of initial.layers) {
+        if (!model) {
+          const initial = normalize(state);
+          for (const layer of initial.layers) {
+            if (!allowed()) throw new Error('只读：当前没有编辑权限，或原工具卡已失效。仅可关闭。');
+            await getImage(layer.asset);
+          }
           if (!allowed()) throw new Error('只读：当前没有编辑权限，或原工具卡已失效。仅可关闭。');
-          await getImage(layer.asset);
+          model = initial; dirtyBase = JSON.stringify(model);
+          history = []; historyIndex = -1; rebuild(); checkpoint();
         }
-        if (!allowed()) throw new Error('只读：当前没有编辑权限，或原工具卡已失效。仅可关闭。');
-        model = initial; dirtyBase = JSON.stringify(model); ready = true;
-        history = []; historyIndex = -1; rebuild(); checkpoint();
+        ready = true;
+        try { await appendLinkedSources(); }
+        catch (error) { showError(error); retryButton.hidden = false; }
         sourceList.replaceChildren();
         for (const source of sources) {
           try {
-            const asset = assetJSON(source);
-            button(sourceList, String(asset.name || (typeof asset.origin === 'string' && asset.origin) || asset.filename || '画布图片').slice(0,200), () => run('正在添加画布图片…', () => appendAssets([asset])));
+            const asset = assetJSON(source), name = assetName(asset);
+            const add = button(sourceList, '', () => run('正在添加画布图片…', () => appendAssets([asset])));
+            add.title = name; add.setAttribute('aria-label', `添加 ${name}`);
+            add.append(thumbnail(asset), el('span', 'ic-asset-name', name));
           } catch (error) { showError(error); }
         }
         if (!sources.length) sourceList.append(el('p', 'ic-hint', '当前画布没有可用的图片素材。'));
