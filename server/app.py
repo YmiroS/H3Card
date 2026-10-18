@@ -300,8 +300,11 @@ def load_caps():
         controls = image_controls(m["id"])
         if controls is not None:
             m["imageControls"] = controls
-        gp = ROOT / m["graph"]
-        m["_graph_ok"] = gp.exists()
+        if m.get("execution") == "browser":
+            m["_graph_ok"] = False
+        else:
+            gp = ROOT / m["graph"]
+            m["_graph_ok"] = gp.exists()
         CAPS[m["id"]] = m
     cards_file = ROOT / "manifests" / "_cards.json"
     CARDS[:] = json.loads(cards_file.read_text(encoding="utf-8")) if cards_file.exists() else []
@@ -329,6 +332,8 @@ def mode_ok(md):
     if md.get("route"):
         md["route"] = {k: r for k, r in md["route"].items() if graph_ok(r["cap"])}
         return bool(md["route"])
+    if CAPS.get(md["id"], {}).get("execution") == "browser":
+        return True
     return graph_ok(md["id"])
 
 
@@ -989,6 +994,7 @@ async def api_reload(request):
 
 
 async def api_upload(request):
+    local_only = request.query.get("local_only") == "1"
     project_id = request.query.get("project")
     await require_project(request, project_id, operate=True)
     reader = await request.multipart()
@@ -999,18 +1005,21 @@ async def api_upload(request):
             continue
         raw = await part.read()
         name = part.filename or "upload.png"
+        if local_only and kind_of(name) != "image":
+            raise web.HTTPBadRequest(text="仅本地上传只支持图片")
         # 中文/特殊字符文件名会在 ComfyUI 侧引发路径问题，统一改 ASCII
         safe = f"ck_{uuid.uuid4().hex[:12]}{Path(name).suffix.lower()}"
         local = ROOT / "data" / "uploads" / safe
         local.parent.mkdir(parents=True, exist_ok=True)
-        await resource_call(request.app, "register", project_id, "upload", safe, state="pending")
+        await resource_call(request.app, "register", project_id, "upload", safe,
+                            state="pending", external=local_only)
         temporary = local.with_suffix(local.suffix + ".part")
         await asyncio.to_thread(temporary.write_bytes, raw)
         await require_project(request, project_id, operate=True)
         os.replace(temporary, local)
         await resource_call(request.app, "publish", "upload", safe)
-        # 视频原片只作备份，生成提交时再把转码 MP4 交给本地 ComfyUI 或 Worker。
-        ref = f"chouka/{safe}" if CONTROLLER_MODE or kind_of(safe) == "video" else await comfy_upload(
+        # 浏览器图片合成和视频原片先留在本地，明确提交生成时再交给 ComfyUI 或 Worker。
+        ref = f"chouka/{safe}" if local_only or CONTROLLER_MODE or kind_of(safe) == "video" else await comfy_upload(
             session, part.name, safe, raw
         )
         item = {"ref": ref, "kind": kind_of(safe), "origin": name,
@@ -1093,6 +1102,8 @@ async def api_generate(request):
     cap = CAPS.get(cid)
     if not cap:
         raise web.HTTPBadRequest(reason=f"未知能力 {cid}")
+    if cap.get("execution") == "browser":
+        raise web.HTTPBadRequest(text="此能力在浏览器中执行，请在图片合成编辑器中合成输出")
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
@@ -3543,7 +3554,8 @@ def make_app(auth_path=None):
     app.router.add_get("/teams", teams_page)
     # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
     for name in ("app.js", "style.css", "director.js", "director.css", "director_edit.js",
-                 "admin-shell.css", "admin-shell.js", "controller-page.js", "costs-page.js"):
+                 "admin-shell.css", "admin-shell.js", "controller-page.js", "costs-page.js",
+                 "image-composer.js", "image-composer.css", "vendor/fabric.min.js"):
         app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
     app.on_shutdown.append(close_presence_connections)

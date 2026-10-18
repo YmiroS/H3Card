@@ -89,6 +89,37 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                 self.assertEqual(response.status, 302)
                 self.assertTrue(response.headers['Location'].startswith('/login'))
 
+    async def test_image_composer_assets_use_explicit_authenticated_routes(self):
+        assets = {
+            '/image-composer.js': ('text/javascript', b'// composer fixture'),
+            '/image-composer.css': ('text/css', b'/* composer fixture */'),
+            '/vendor/fabric.min.js': ('text/javascript', b'// fabric fixture'),
+        }
+        # 使用临时静态资源；不依赖另一 agent 的编辑器，也不写业务 web/data。
+        for route, (_content_type, content) in assets.items():
+            path = self.root / 'web' / route.lstrip('/')
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        hidden = self.root / 'web' / 'vendor' / 'private.js'
+        hidden.write_bytes(b'not public')
+        with mock.patch.object(controller_app, 'ROOT', self.root):
+            for route, (content_type, content) in assets.items():
+                with self.subTest(route=route):
+                    response = await self.client.get(route)
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.content_type, content_type)
+                    self.assertEqual(await response.read(), content)
+            for route in ('/vendor/', '/vendor/private.js', '/image-composer.js.map',
+                          '/web/image-composer.js', '/vendor/%2e%2e/server/app.py'):
+                with self.subTest(unlisted=route):
+                    self.assertEqual((await self.client.get(route)).status, 404)
+            self.client.session.cookie_jar.clear()
+            for route in assets:
+                with self.subTest(route=route, anonymous=True):
+                    response = await self.client.get(route, allow_redirects=False)
+                    self.assertEqual(response.status, 302)
+                    self.assertTrue(response.headers['Location'].startswith('/login'))
+
     async def test_online_presence_requires_login_and_counts_active_user(self):
         response = await self.client.post('/api/auth/presence', headers=self.headers)
         self.assertEqual(response.status, 200)

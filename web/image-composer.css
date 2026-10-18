@@ -1,0 +1,80 @@
+/* Scoped to the native modal; no global editor or Fabric overrides. */
+dialog.chouka-composer {
+  --ic-bg:#0e1416; --ic-panel:#151d1f; --ic-field:#101719; --ic-line:#33423e;
+  --ic-text:#ecf3ef; --ic-muted:#acbcb4; --ic-accent:#a0e7cb; --ic-error:#ffb3a5;
+  box-sizing:border-box; color-scheme:dark; color:var(--ic-text); background:var(--ic-bg);
+  width:min(1600px,97vw); height:94dvh; max-width:97vw; max-height:96dvh;
+  margin:auto; padding:0; border:1px solid #4b665b; border-radius:14px;
+  font:13px/1.5 "Segoe UI","Microsoft YaHei",sans-serif; overflow:hidden;
+  box-shadow:0 24px 100px #000a;
+}
+dialog.chouka-composer[open] { display:flex; flex-direction:column; }
+.chouka-composer::backdrop { background:#050a0cdb; }
+.chouka-composer *, .chouka-composer *::before, .chouka-composer *::after { box-sizing:border-box; }
+.chouka-composer [hidden] { display:none!important; }
+.chouka-composer button, .chouka-composer input { font:inherit; }
+.chouka-composer button { cursor:pointer; }
+.chouka-composer button:disabled, .chouka-composer input:disabled { opacity:.4; cursor:not-allowed; }
+.chouka-composer :is(button,input):focus-visible { outline:2px solid var(--ic-accent); outline-offset:2px; }
+.chouka-composer .ic-head { display:flex; align-items:center; gap:18px; padding:14px 20px; border-bottom:1px solid var(--ic-line); flex:none; }
+.chouka-composer .ic-head h2 { margin:0; font-size:19px; font-weight:600; color:var(--ic-text); }
+.chouka-composer .ic-local { flex:1; color:var(--ic-muted); font-size:12px; }
+.chouka-composer .ic-status { flex:none; min-height:30px; padding:5px 20px; color:var(--ic-accent); border-bottom:1px solid var(--ic-line); overflow-wrap:anywhere; }
+.chouka-composer .ic-error { flex:none; padding:10px 20px; background:#3b2423; color:var(--ic-error); border-bottom:1px solid #714540; max-height:100px; overflow:auto; overflow-wrap:anywhere; }
+.chouka-composer .ic-body { display:grid; grid-template-columns:252px minmax(0,1fr) 258px; flex:1; min-height:0; }
+.chouka-composer .ic-left, .chouka-composer .ic-right { background:var(--ic-panel); padding:16px; overflow:auto; min-width:0; overscroll-behavior:contain; scrollbar-width:thin; }
+.chouka-composer .ic-left { border-right:1px solid var(--ic-line); }
+.chouka-composer .ic-right { border-left:1px solid var(--ic-line); }
+.chouka-composer h3 { margin:0 0 12px; font-size:13px; font-weight:600; color:var(--ic-text); }
+.chouka-composer h3:not(:first-child) { margin-top:24px; padding-top:16px; border-top:1px solid var(--ic-line); }
+.chouka-composer .ic-center { display:flex; flex-direction:column; min-width:0; min-height:0; padding:12px; gap:10px; }
+.chouka-composer .ic-toolbar { display:flex; gap:6px; align-items:center; flex-wrap:wrap; flex:none; }
+.chouka-composer .ic-button { width:auto; min-height:36px; padding:7px 10px; margin:0; color:var(--ic-text); background:#22302a; border:1px solid #456052; border-radius:6px; white-space:normal; line-height:1.4; transition:background .15s,border-color .15s; }
+.chouka-composer .ic-button:hover:not(:disabled) { background:#30473a; border-color:#82b59c; }
+.chouka-composer .ic-primary { background:var(--ic-accent); color:#10291f; border-color:var(--ic-accent); font-weight:600; min-width:104px; }
+.chouka-composer .ic-primary:hover:not(:disabled) { background:#c3f7df; color:#10291f; }
+.chouka-composer .ic-zoom { margin-left:auto; font-size:12px; color:var(--ic-muted); font-variant-numeric:tabular-nums; }
+.chouka-composer .ic-viewport { flex:1; min-height:160px; min-width:0; display:flex; align-items:center; justify-content:center; overflow:auto; padding:16px; background:#080d0f; border:1px solid #293b34; border-radius:8px; overscroll-behavior:contain; }
+.chouka-composer .ic-viewport .canvas-container { flex:none; box-shadow:0 0 0 1px #66776d,0 8px 28px #0008; background-color:#d5dad6; background-image:linear-gradient(45deg,#acb8af 25%,transparent 25%),linear-gradient(-45deg,#acb8af 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#acb8af 75%),linear-gradient(-45deg,transparent 75%,#acb8af 75%); background-size:20px 20px; background-position:0 0,0 10px,10px -10px,-10px 0; }
+.chouka-composer .ic-viewport canvas { display:block; max-width:none; max-height:none; touch-action:none; }
+.chouka-composer .ic-hint { font-size:12px; color:var(--ic-muted); line-height:1.65; margin:8px 0; overflow-wrap:anywhere; }
+.chouka-composer .ic-center>.ic-hint { flex:none; margin:0; }
+.chouka-composer .ic-layers { display:grid; gap:6px; min-height:66px; max-height:39vh; overflow:auto; padding:3px; margin:0 -3px; scrollbar-width:thin; }
+.chouka-composer .ic-empty { font-size:12px; line-height:1.7; padding:12px; color:var(--ic-muted); border:1px dashed var(--ic-line); border-radius:6px; margin:0; }
+.chouka-composer .ic-layer { display:grid; grid-template-columns:minmax(0,1fr) auto auto; gap:3px; padding:4px; border:1px solid var(--ic-line); border-radius:6px; background:#10181a; }
+.chouka-composer .ic-layer.is-selected { border-color:var(--ic-accent); background:#233b2f; }
+.chouka-composer .ic-layer.is-dragover { outline:2px dashed var(--ic-accent); outline-offset:1px; }
+.chouka-composer .ic-layer button { min-height:34px; padding:5px; color:var(--ic-text); border:0; border-radius:4px; background:transparent; }
+.chouka-composer .ic-layer button:hover:not(:disabled) { background:#a0e7cb19; }
+.chouka-composer .ic-layer-name { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; text-align:left; font-size:12px; }
+.chouka-composer .ic-layer-toggle { font-size:11px; color:var(--ic-muted); }
+.chouka-composer .ic-layer-actions { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:6px; margin-top:12px; }
+.chouka-composer .ic-sources { display:grid; gap:7px; margin-top:12px; }
+.chouka-composer .ic-sources .ic-button { width:100%; text-align:left; overflow-wrap:anywhere; }
+.chouka-composer .ic-field { display:flex; flex-direction:column; gap:6px; margin:0 0 14px; min-width:0; color:var(--ic-muted); font-size:12px; }
+.chouka-composer .ic-field-grid { display:grid; grid-template-columns:minmax(0,1fr) minmax(0,1fr); gap:0 10px; }
+.chouka-composer .ic-field input { width:100%; min-width:0; min-height:36px; border:1px solid #40544a; background:var(--ic-field); color:var(--ic-text); border-radius:5px; padding:7px 8px; margin:0; outline:none; font-variant-numeric:tabular-nums; }
+.chouka-composer .ic-field input[type=color] { height:38px; padding:4px; cursor:pointer; }
+.chouka-composer .ic-switch { flex-direction:row; justify-content:space-between; align-items:center; min-height:36px; gap:12px; cursor:pointer; }
+.chouka-composer .ic-switch input[type=checkbox] { appearance:none; -webkit-appearance:none; position:relative; flex:none; width:38px; height:22px; min-height:22px; padding:0; border:1px solid #56665f; border-radius:20px; background:#35433c; cursor:pointer; transition:background .15s; }
+.chouka-composer .ic-switch input[type=checkbox]::after { content:""; position:absolute; width:16px; height:16px; top:2px; left:2px; border-radius:50%; background:#e9f1ec; box-shadow:0 1px 3px #0006; transition:transform .15s; }
+.chouka-composer .ic-switch input[type=checkbox]:checked { background:#73bd98; border-color:#91d4b1; }
+.chouka-composer .ic-switch input[type=checkbox]:checked::after { transform:translateX(16px); }
+.chouka-composer .ic-footer { flex:none; display:flex; align-items:center; justify-content:flex-end; gap:10px; padding:12px 20px; border-top:1px solid var(--ic-line); background:var(--ic-panel); }
+.chouka-composer .ic-footer>.ic-hint { flex:1; margin:0; }
+@media (min-width:1700px) { .chouka-composer .ic-body { grid-template-columns:280px minmax(0,1fr) 280px; } }
+@media (max-width:1100px) { .chouka-composer .ic-body { grid-template-columns:205px minmax(0,1fr) 215px; } .chouka-composer .ic-left,.chouka-composer .ic-right { padding:10px; } .chouka-composer .ic-center { padding:8px; } .chouka-composer .ic-toolbar .ic-button { padding:6px; } }
+@media (max-width:760px) {
+  dialog.chouka-composer { width:98vw; max-width:98vw; height:96dvh; max-height:98dvh; border-radius:9px; }
+  .chouka-composer .ic-body { grid-template-columns:minmax(0,1fr) minmax(0,1fr); overflow:auto; align-content:start; }
+  .chouka-composer .ic-center { grid-column:1 / -1; grid-row:1; height:49dvh; min-height:310px; }
+  .chouka-composer .ic-left,.chouka-composer .ic-right { overflow:visible; border-top:1px solid var(--ic-line); }
+  .chouka-composer .ic-left { grid-column:1; border-right:0; } .chouka-composer .ic-right { grid-column:2; }
+  .chouka-composer .ic-head { padding:10px 12px; gap:10px; } .chouka-composer .ic-local { display:none; } .chouka-composer .ic-head h2 { flex:1; font-size:17px; }
+  .chouka-composer .ic-footer { flex-wrap:wrap; padding:10px 12px; } .chouka-composer .ic-footer>.ic-hint { flex-basis:100%; }
+  .chouka-composer .ic-layer-actions { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .chouka-composer .ic-field-grid { grid-template-columns:minmax(0,1fr); }
+  .chouka-composer .ic-button,.chouka-composer .ic-layer button,.chouka-composer .ic-field input { min-height:44px; }
+  .chouka-composer .ic-switch input[type=checkbox] { min-height:22px; }
+}
+@media (prefers-reduced-motion:reduce) { .chouka-composer *, .chouka-composer *::after { transition:none!important; } }

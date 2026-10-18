@@ -297,7 +297,7 @@ test('filled asset slots preview on click and replace/download through the conte
     const PROJ = {id:'asset-test'}, canOperate = () => true, requireOperate = () => true;
     const trackNodeWork = work => work;
     ${block('const projectUploadUrl =', 'async function api(')}
-    const slotName = s => s.label, gridWord = () => false, modeOf = () => null, tipHide = () => {};
+    const slotName = s => s.label, gridWord = () => false, modeOf = () => null, capOf = () => null, tipHide = () => {};
     const toast = message => { throw Error(message); };
     window.saved = 0; window.detached = [];
     const save = () => window.saved++;
