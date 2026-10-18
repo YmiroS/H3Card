@@ -3326,20 +3326,14 @@ function bindGlobal() {
       });
     });
 
-    // 新建工具节点 - 展开显示每个模式
-    const toolCards = CARDS.filter(d => d.kind === "tool");
-    if (toolCards.length > 0) {
+    // 工具共用一张卡，具体功能在参数面板左下角切换。
+    const toolCard = CARDS.find(d => d.id === "card_tools");
+    if (toolCard) {
       menu.push({ group: "工具" });
-      toolCards.forEach(def => {
-        def.modes.forEach(md => {
-          menu.push({
-            icon: def.icon || "◻",
-            text: md.name,
-            run: () => {
-              addCard(def.id, at.x, at.y, modeCap(md));
-            }
-          });
-        });
+      menu.push({
+        icon: toolCard.icon || "◻",
+        text: "工具",
+        run: () => addCard(toolCard.id, at.x, at.y),
       });
     }
 
