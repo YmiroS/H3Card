@@ -1475,7 +1475,7 @@ body[data-workspace="canvas"] #main { min-width: 0; }
 .card .rz:hover::after { border-color: rgba(255,255,255,.7); }
 
 /* History sidebar */
-#hist { width: 340px; flex-basis: 340px; background: #0e1014; border-left-color: var(--line); box-shadow: none; }
+#hist { --hist-width: 340px; background: #0e1014; border-left-color: var(--line); box-shadow: none; }
 #hist .hhd { min-height: 60px; padding: 13px 14px; border-bottom-color: var(--line); }
 #hist .hhd b { color: #f4f4f5; font-size: 13px; letter-spacing: 0; text-shadow: none; }
 #hist .hhd .n { padding: 2px 7px; color: #858a94; background: rgba(255,255,255,.05); border-radius: 8px; }
@@ -1608,7 +1608,7 @@ body[data-workspace="canvas"] #main { min-width: 0; }
 
 @media (max-width: 1050px) {
   #side { width: 236px; flex-basis: 236px; }
-  #hist { width: 290px; flex-basis: 290px; }
+  #hist { --hist-width: 290px; }
   #panel { width: min(680px, calc(100vw - 32px)); }
 }
 button:focus-visible, a:focus-visible {
@@ -1639,7 +1639,7 @@ button:focus-visible, a:focus-visible {
   #side { width: 220px; flex-basis: 220px; }
   body[data-workspace="canvas"] #side { position: fixed; top: 60px; bottom: 0; left: var(--workspace-width); z-index: 40; transition: none; }
   body.collapsed #side { width: 0; flex-basis: 0; }
-  #hist { position: fixed; inset: 0 0 0 auto; z-index: 80; width: min(320px, 90vw); box-shadow: -20px 0 60px rgba(0,0,0,.45); }
+  #hist { --hist-width: 320px; position: fixed; inset: 0 0 0 auto; z-index: 80; width: min(var(--hist-width), 90vw); box-shadow: -20px 0 60px rgba(0,0,0,.45); }
   #topbar .crumb, #topbar .crumb-sep, #hint { display: none; }
   #panel { width: calc(100vw - 24px); }
   #dock .dockb { padding: 8px; }
