@@ -78,10 +78,13 @@ const projectUploadUrl = () => {
   if (!PROJ?.id) throw new Error('请先打开可操作画布');
   return `/api/upload?project=${encodeURIComponent(PROJ.id)}`;
 };
-const uploadAsset = async file => {
+const uploadAsset = async (file, localOnly = false) => {
   if (!requireOperate()) throw new Error('此画布只读');
+  const project = PROJ;
   const form = new FormData(); form.append('file', file, file.name);
-  const data = await api(projectUploadUrl(), {method:'POST', body:form});
+  const url = projectUploadUrl() + (localOnly ? '&local_only=1' : '');
+  const data = await api(url, {method:'POST', body:form});
+  if (PROJ !== project || !canOperate()) throw new Error('画布已切换或权限已变化，上传已取消');
   const asset = data.files?.[0] || data;
   if (!asset?.url || !asset?.ref) throw new Error('上传接口未返回素材');
   return asset;
@@ -1532,6 +1535,7 @@ function canvasHistoryStep(redo = false) {
 // save() is also called by asynchronous GPU completion.
 for (const event of ["pointerdown", "keydown", "beforeinput", "paste", "drop", "change"]) {
   document.addEventListener(event, ev => {
+    if (ev.target.closest?.('[data-image-composer]')) return;
     if (!PROJ || NODE_EDITOR || !canOperate() || (ev.type === "keydown" && ((ev.ctrlKey || ev.metaKey) && /^(z|y)$/i.test(ev.key)))) return;
     beginCanvasEdit(ev.type === "beforeinput" ? "typing" : "action");
   }, true);
@@ -3448,6 +3452,7 @@ function bindGlobal() {
 
   document.addEventListener('paste', handleClipboardPaste);
   document.addEventListener("keydown", (ev) => {
+    if (document.querySelector('dialog[data-image-composer][open]')) return;
     // 大图开着时左右键翻同一个节点的下一个产物（分镜九宫格）
     if (el.view.style.display !== "none" && (ev.key === "ArrowLeft" || ev.key === "ArrowRight")) {
       ev.preventDefault(); stepViewer(ev.key === "ArrowRight" ? 1 : -1); return;
@@ -4385,7 +4390,7 @@ async function pasteClipboardMedia(files, project, target) {
       clipboardReferencePlan(target,kind);
       const ext = /\.([a-z0-9]+)$/i.exec(file.name || '')?.[1].toLowerCase();
       const upload = CLIPBOARD_MEDIA_EXT[ext] ? file : new File([file],`${file.name || '剪贴板素材'}.${CLIPBOARD_MEDIA_MIME[file.type]}`,{type:file.type});
-      const item = await uploadAsset(upload);
+      const item = await uploadAsset(upload, capOf(target)?.execution === "browser");
       if (!valid()) return;
       if (item.kind !== kind) throw new Error('上传素材类型不匹配，未创建节点或引用');
       // 旧的排队 PUT 会读取届时的 cards；先排空，避免把尚未建卡的素材 ID 提前提交。
@@ -4423,7 +4428,7 @@ async function pasteClipboardMedia(files, project, target) {
   }
 }
 function handleClipboardPaste(event) {
-  if (event.defaultPrevented) return;
+  if (event.defaultPrevented || document.querySelector('dialog[data-image-composer][open]')) return;
   const target = clipboardPasteTarget();
   if (!target) return;
   const data = event.clipboardData;
@@ -4576,8 +4581,9 @@ async function linkTo(from, to) {
     for (let i = 0; i < edge.slots.length; i++) {
       const output = outputs[i];
       if (!output) break;
-      const imported = isAsset(from) ? JSON.parse(JSON.stringify(output))
-        : await importOutput(output);
+      const localOutput = capOf(from)?.execution === "browser" && output.ref?.startsWith("chouka/");
+      const imported = isAsset(from) || localOutput ? JSON.parse(JSON.stringify(output))
+        : await importOutput(output, capOf(to)?.execution === "browser");
       // 导入期间用户可能已经删线；异步返回后不能把刚清掉的引用重新塞回来。
       if (!PROJ || !PROJ.edges.includes(edge)) return;
       to.assets[edge.slots[i]] = imported;
@@ -4709,7 +4715,7 @@ async function spawnDownstream(from, at, cx, cy) {
 }
 
 /** 把 ComfyUI 输出目录里的产物搬进 input 目录，得到可用的 LoadImage 值 */
-async function importOutput(out) {
+async function importOutput(out, localOnly = false) {
   const project = PROJ;
   if (!canOperate()) throw new Error('此画布只读，不能导入素材');
   // 二进制产物不走 JSON 包装，但必须带同源会话并明确检查响应。
@@ -4719,7 +4725,7 @@ async function importOutput(out) {
   if (PROJ !== project || !canOperate()) throw new Error('画布已切换或权限已变化，导入已取消');
   const filename = out.filename || new URL(out.url, location.href).pathname.split('/').pop() || '历史产物';
   const file = new File([blob], filename.split(/[\\/]/).pop(), {type:blob.type});
-  return uploadAsset(file);
+  return uploadAsset(file, localOnly);
 }
 
 // 项目保留原片 url/ref 用于备份下载；播放器和后端实际提交的工作流使用转码 MP4。
@@ -5282,6 +5288,82 @@ function histRun(c, h, cur) {
   return box;
 }
 
+/* ================= 浏览器图片合成 ================= */
+async function openImageComposer(c) {
+  if (!requireOperate()) return;
+  if (!canSave()) return toast("请先复制示例画布，再保存图片合成");
+  if (document.querySelector('dialog[data-image-composer][open]')) return;
+  const project = PROJ;
+  const valid = () => PROJ === project && canSave() && cardOf(c.id) === c && c.cap === "image_composite";
+  const check = () => { if (!valid()) throw new Error("画布、节点或权限已变化，请关闭编辑器后重新打开"); };
+  const store = async (state, output) => {
+    check();
+    localFlushes++;
+    try {
+      beginCanvasEdit();
+      c.params.composition = JSON.parse(JSON.stringify(state));
+      for (const key of Object.keys(c.assets)) if (key.startsWith("composite:")) delete c.assets[key];
+      for (const layer of state.layers) c.assets[`composite:${layer.id}`] = { ...layer.asset };
+      if (output) {
+        c.outputs = [output]; c.status = "done"; c.progress = 1;
+        c.job = null; c.seed = null; c.ms = null; c.error = null; c.step = "";
+        pushHistory(c, { id: `local:${uid()}`, capability: c.cap });
+        for (const edge of project.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version)) {
+          const target = cardOf(edge.to);
+          if (!target) continue;
+          const slots = edgeSlots(edge); edge.slots = slots;
+          slots.forEach((slot, index) => {
+            if (index === 0) target.assets[slot] = { ...output };
+            else delete target.assets[slot];
+          });
+          paintKind(target);
+        }
+      }
+      recordCanvasEdit();
+      clearTimeout(saveTimer); saveTimer = null;
+      const saved = await enqueueSave(project.id);
+      if (!saved.ok) throw saved.error || new Error("合成保存失败，请重试");
+      check();
+      paint(c); drawWires();
+      if (el.panel._id === c.id) openPanel(c.id);
+      if (output && el.hist._id === c.id) openHistory(c.id);
+    } finally {
+      localFlushes--; flushPendingProjectSync();
+    }
+  };
+  try {
+    if (c._create) await c._create;
+    check();
+    if (!window.ChoukaImageComposer) throw new Error("图片合成组件未加载，请强制刷新页面");
+    const sources = new Map();
+    const addSource = (asset, name) => {
+      if (asset?.kind !== "image" || !asset.url || sources.has(asset.url)) return;
+      sources.set(asset.url, { ...asset, name: name || asset.origin || asset.filename || "图片" });
+    };
+    for (const asset of Object.values(c.assets || {})) addSource(asset, asset?.origin);
+    for (const card of project.cards) {
+      if (card === c) continue;
+      for (const asset of Object.values(card.assets || {})) addSource(asset, `${titleOf(card)} · ${asset?.origin || "素材"}`);
+      for (const output of card.outputs || []) addSource(output, `${titleOf(card)} · 产物`);
+      for (const history of card.history || []) for (const output of history.outputs || [])
+        addSource(output, `${titleOf(card)} · 历史产物`);
+    }
+    await window.ChoukaImageComposer.open({
+      state: c.params.composition ? JSON.parse(JSON.stringify(c.params.composition)) : null,
+      sources: [...sources.values()], canEdit: valid,
+      upload: async file => { check(); const asset = await uploadAsset(file, true); check(); return asset; },
+      onSave: state => store(state),
+      onExport: async (blob, state) => {
+        check();
+        const asset = await uploadAsset(new File([blob], `composition_${Date.now()}.png`, { type: "image/png" }), true);
+        check();
+        await store(state, { ...asset, filename: asset.origin });
+        toast("图片合成已保存，可从输出端口连接下游节点");
+      },
+    });
+  } catch (error) { toast("图片合成：" + error.message); }
+}
+
 /* ================= 参数面板 ================= */
 function closePanel() {
   el.panel.style.display = "none"; el.panel._id = null;
@@ -5388,6 +5470,7 @@ function openPanel(id) {
     el.panel.appendChild(m);
   }
   if (!cap) { el.panel.appendChild(errBox("能力不可用")); return placePanel(); }
+  const localComposite = cap.id === "image_composite" && cap.execution === "browser";
 
   // 合并模式的槽位按图槽最多那条画（它是超集），但默认值得取「按当前张数真正会跑的
   // 那条」。不这么做的话，面板显示的是首尾帧那条的示例提示词，只传一张图跑的却是
@@ -5415,6 +5498,15 @@ function openPanel(id) {
   const clipboardHint = document.createElement('div'); clipboardHint.className = 'knobnote clipboard-media-hint';
   clipboardHint.textContent = 'Ctrl / Cmd + V：粘贴截图或图片 / 视频文件，自动创建素材节点并引用到空槽；不覆盖已有引用。复制文件需浏览器提供文件数据，仅路径文字无法导入。';
   body.appendChild(clipboardHint);
+  if (localComposite) {
+    clipboardHint.textContent = "浏览器本地合成，不占 GPU。打开编辑器后可上传多张图片，也可从当前画布的素材和历史产物中选择。拖动位置、缩放图片，在图层列表调整遮挡顺序。";
+    const summary = document.createElement("div"); summary.className = "knobnote";
+    const draft = c.params.composition;
+    summary.textContent = draft
+      ? `编辑稿：${draft.width} × ${draft.height} · ${draft.layers.length} 个图层。保存编辑可继续修改；合成输出后可连接下游。`
+      : "尚未创建编辑稿。点击下方「编辑合成」开始，默认画布 1920 × 1080，可修改尺寸和背景。";
+    body.appendChild(summary);
+  }
   if (NODE_EDITOR) {
     const supplement = directorSupplement(c);
     if (supplement.length) {
@@ -5428,7 +5520,13 @@ function openPanel(id) {
   // 放在提示词前面：漫剧那种一图一提示词的工作流，tab 是跟着图长出来的，
   // 先看到图槽才讲得通
   const media = specs.filter(x => MEDIA.includes(x.type));
-  if (media.length) body.appendChild(referenceSlots(c, media, md));
+  if (media.length) {
+    if (localComposite) {
+      const inputs = document.createElement("details");
+      const label = document.createElement("summary"); label.textContent = "连接图片素材（可选，编辑器中添加为图层）";
+      inputs.append(label, referenceSlots(c, media, md)); body.appendChild(inputs);
+    } else body.appendChild(referenceSlots(c, media, md));
+  }
 
   // --- 音频选区 ---
   // 起止点不画成两个文本框：要裁哪一段全靠听（第几秒开始唱），手打 "0:05" 得先知道
@@ -5514,18 +5612,20 @@ function openPanel(id) {
       foot.appendChild(modelBtn);
     }
 
-    const pb = document.createElement("button");
-    pb.className = "tcap";
-    const cb = paramsBrief(c, cap);
-    pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
-    pb.title = "点开弹窗：清晰度、画面比例、时长等参数";
-    pb.onclick = (ev) => { ev.stopPropagation(); openResPop(c, pb); };
-    foot.appendChild(pb);
+    if (!localComposite) {
+      const pb = document.createElement("button");
+      pb.className = "tcap";
+      const cb = paramsBrief(c, cap);
+      pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
+      pb.title = "点开弹窗：清晰度、画面比例、时长等参数";
+      pb.onclick = (ev) => { ev.stopPropagation(); openResPop(c, pb); };
+      foot.appendChild(pb);
+    }
   }
   const running = c.status === "queued" || c.status === "running";
   const info = document.createElement("span");
   info.style.cssText = "color:#8a8a94;font-size:12px";
-  info.textContent = cap.outputType === "video" ? "输出：视频" : "输出：图片";
+  info.textContent = localComposite ? "本地合成 · 输出 PNG" : cap.outputType === "video" ? "输出：视频" : "输出：图片";
   // 上一轮跑了多久：视频一轮动辄几分钟，这个数得在面板里也报一声（节点脚上一直有）
   if (c.status === "done" && c.ms > 0) info.textContent += ` · 上次 ${fmtEla(c.ms)}`;
   foot.appendChild(info);
@@ -5537,7 +5637,9 @@ function openPanel(id) {
     foot.appendChild(cn);
   }
   const go = document.createElement("button");
-  go.className = "go"; go.textContent = "↑"; go.title = "运行";
+  go.className = "go"; go.textContent = localComposite ? "编辑合成" : "↑";
+  go.title = localComposite ? "打开图片合成编辑器（不使用 ComfyUI）" : "运行";
+  if (localComposite) go.style.cssText = "width:auto;min-width:96px;padding:0 14px;border-radius:8px;font-size:13px;flex-shrink:0";
   go.disabled = running;
   go.onclick = () => run(c);
   foot.appendChild(go);
@@ -7297,7 +7399,7 @@ function pickFile(c, s) {
     const f = el.picker.files[0]; el.picker.value = "";
     if (!f) return;
     try {
-      putAsset(c, s, await uploadAsset(f));
+      putAsset(c, s, await uploadAsset(f, capOf(c)?.execution === "browser"));
       openPanel(c.id); save();
     } catch (e) { workFailure = e; toast("上传失败：" + e.message); }
   })());
@@ -7661,6 +7763,7 @@ async function runCard(c) {
   if (c.status === "queued" || c.status === "running") return;
   const cap = capOf(c);
   if (!cap) return toast("能力不可用");
+  if (cap.id === "image_composite" && cap.execution === "browser") return openImageComposer(c);
   if (c.director_shot) {
     clearTimeout(saveTimer); saveTimer = null;
     await saveChain;
@@ -7750,7 +7853,7 @@ async function pollJobs() {
               continue;
             }
             try {
-              const imported = await importOutput(outputs[i]);
+              const imported = await importOutput(outputs[i], capOf(to)?.execution === "browser");
               // 导入期间删线/删节点后，这份迟到的结果不能把引用复活。
               if (PROJ && PROJ.edges.includes(e) && cardOf(to.id)) to.assets[slots[i]] = imported;
             } catch (err) {

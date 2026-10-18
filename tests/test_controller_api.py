@@ -2518,6 +2518,253 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIsNone(worker["current_job_id"])
 
 
+class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
+    async def asyncSetUp(self):
+        self.auth_setup()
+        self.addCleanup(self.auth_teardown)
+        self.own_project("p")
+        # 读取发布清单，但所有上传、项目写入仅发生在临时 ROOT。
+        patches = (
+            mock.patch.dict(controller_app.CAPS, {}, clear=True),
+            mock.patch.object(controller_app, "CARDS", []),
+            mock.patch.object(controller_app, "CONTROLLER_MODE", False),
+            mock.patch.dict(controller_app.JOBS, {}, clear=True),
+            mock.patch.object(controller_app, "PROJ_DIR", self.root / "data" / "projects"),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        controller_app.load_caps()
+        patch = mock.patch.object(controller_app, "ROOT", self.root)
+        patch.start()
+        self.addCleanup(patch.stop)
+        application = self.build_app()
+        application["session"] = mock.MagicMock()
+        application["cleanup_pending"] = set()
+        application["cleanup_tasks"] = {}
+        application.router.add_get("/api/cards", controller_app.api_cards)
+        application.router.add_post("/api/generate", controller_app.api_generate)
+        application.router.add_post("/api/upload", controller_app.api_upload)
+        application.router.add_get("/api/upload/{name}", controller_app.api_upload_file)
+        application.router.add_post("/api/projects/{pid}/cards", controller_app.api_project_card_create)
+        application.router.add_put("/api/projects/{pid}", controller_app.api_project_save)
+        await self.start_client(application)
+        self.addAsyncCleanup(self.client.close)
+
+    async def upload(self, filename="图层.png", local_only="1"):
+        form = aiohttp.FormData(quote_fields=False)
+        form.add_field("file", b"image-composer-test", filename=filename,
+                       content_type="application/octet-stream")
+        query = {"project": "p"}
+        if local_only is not None:
+            query["local_only"] = local_only
+        return await self.client.post("/api/upload", params=query, data=form)
+
+    async def test_cards_expose_browser_mode_without_graph_or_gpu_metadata(self):
+        response = await self.client.get("/api/cards")
+        self.assertEqual(response.status, 200)
+        payload = await response.json()
+        cap = payload["capabilities"]["image_composite"]
+        self.assertEqual(cap["execution"], "browser")
+        self.assertEqual((cap["name"], cap["kind"], cap["card"], cap["outputType"]),
+                         ("图片合成", "tool", "card_tools", "image"))
+        self.assertEqual((cap["images"], cap["audios"], cap["videos"]), (8, 0, 0))
+        self.assertEqual(cap["slotLimits"]["image"], {"min": 0, "max": 8})
+        self.assertEqual(cap["inputs"], [
+            {"key": f"images[{i}]", "label": f"图片{i + 1}", "type": "image", "required": False}
+            for i in range(8)
+        ])
+        for key in ("graph", "output", "billing", "cost", "pricing", "_graph_ok"):
+            self.assertNotIn(key, cap)
+        self.assertFalse(controller_app.CAPS[cap["id"]]["_graph_ok"])
+        card = next(item for item in payload["cards"] if item["id"] == "card_tools")
+        self.assertEqual(card["modes"][-1], {
+            "id": "image_composite", "name": "图片合成", "slots": "img8+aud0+vid0"})
+        self.assertEqual(card["modes"][0]["id"], "rmbg_cutout")
+        self.assertFalse(controller_app.mode_ok({"id": "missing"}))
+        # browser 豁免只用于具体能力，不扩大现有路由工作流规则。
+        self.assertFalse(controller_app.mode_ok({
+            "id": "route", "route": {"image": {"cap": "image_composite"}}}))
+
+    async def test_generate_rejects_browser_in_local_and_controller_even_dry_run(self):
+        with mock.patch.object(controller_app, "generation_assets", new=mock.AsyncMock()) as assets, \
+             mock.patch.object(controller_app, "patch_graph") as graph, \
+             mock.patch.object(controller_app, "local_submit", new=mock.AsyncMock()) as submit, \
+             mock.patch.object(self.auth, "register_job", wraps=self.auth.register_job) as register:
+            for controller in (False, True):
+                for dry_run in (False, True):
+                    with self.subTest(controller=controller, dry_run=dry_run), \
+                         mock.patch.object(controller_app, "CONTROLLER_MODE", controller):
+                        response = await self.client.post("/api/generate", json={
+                            "project": "p", "capability": "image_composite", "dry_run": dry_run})
+                        self.assertEqual(response.status, 400)
+                        self.assertEqual(await response.text(),
+                                         "此能力在浏览器中执行，请在图片合成编辑器中合成输出")
+            assets.assert_not_awaited()
+            graph.assert_not_called()
+            submit.assert_not_awaited()
+            register.assert_not_called()
+        self.assertEqual(controller_app.JOBS, {})
+
+    async def test_local_only_upload_is_authorized_published_and_deferred_until_generation(self):
+        with mock.patch.object(controller_app, "comfy_upload", new=mock.AsyncMock()) as comfy, \
+             mock.patch.object(self.access, "register", wraps=self.access.register) as register, \
+             mock.patch.object(self.access, "publish", wraps=self.access.publish) as publish:
+            response = await self.upload()
+            self.assertEqual(response.status, 200, await response.text())
+            item = (await response.json())["files"][0]
+            name = item["url"].rsplit("/", 1)[1]
+            self.assertEqual(item, {"ref": f"chouka/{name}", "kind": "image",
+                                    "origin": "图层.png", "url": f"/api/upload/{name}"})
+            register.assert_called_once_with("p", "upload", name, state="pending", external=True)
+            publish.assert_called_once_with("upload", name)
+            row = self.access.lookup("upload", name)
+            self.assertEqual((row["state"], row["external"]), ("ready", 1))
+            self.assertTrue(self.access.authorize(self.admin["id"], "upload", name, "p"))
+            path = self.root / "data" / "uploads" / name
+            self.assertEqual(path.read_bytes(), b"image-composer-test")
+            self.assertFalse(path.with_suffix(".png.part").exists())
+            download = await self.client.get(item["url"])
+            self.assertEqual(download.status, 200)
+            self.assertEqual(await download.read(), b"image-composer-test")
+            comfy.assert_not_awaited()
+            self.assertEqual(self.access.pending_external_uploads([item["ref"]]), [name])
+            # 明确进入普通 GPU 生成时才通过现有 external 通路转交，并且只转交一次。
+            comfy.return_value = item["ref"]
+            request = types.SimpleNamespace(app=self.client.app)
+            assets = {"images[0]": item["ref"]}
+            self.assertEqual(await controller_app.generation_assets(request, assets, "p"), assets)
+            comfy.assert_awaited_once_with(self.client.app["session"], "file", name, b"image-composer-test")
+            self.assertEqual(self.access.lookup("upload", name)["external"], 0)
+            await controller_app.generation_assets(request, assets, "p")
+            comfy.assert_awaited_once()
+
+    async def test_ordinary_upload_behavior_is_unchanged(self):
+        cases = ((False, None, "image.png"), (False, "0", "image.png"),
+                 (False, None, "sound.wav"), (True, None, "image.png"),
+                 (True, "1", "image.png"))
+        for controller, local_only, filename in cases:
+            with self.subTest(controller=controller, local_only=local_only, filename=filename), \
+                 mock.patch.object(controller_app, "CONTROLLER_MODE", controller), \
+                 mock.patch.object(controller_app, "comfy_upload", new=mock.AsyncMock(
+                     return_value="comfy/custom-ref.png")) as comfy:
+                response = await self.upload(filename, local_only)
+                self.assertEqual(response.status, 200, await response.text())
+                item = (await response.json())["files"][0]
+                name = item["url"].rsplit("/", 1)[1]
+                if controller:
+                    comfy.assert_not_awaited()
+                    self.assertEqual(item["ref"], f"chouka/{name}")
+                else:
+                    comfy.assert_awaited_once_with(self.client.app["session"], "file", name,
+                                                  b"image-composer-test")
+                    self.assertEqual(item["ref"], "comfy/custom-ref.png")
+                self.assertEqual(self.access.lookup("upload", name)["external"], int(local_only == "1"))
+
+    async def test_local_only_rejects_non_images_before_storage_or_registration(self):
+        with mock.patch.object(controller_app, "comfy_upload", new=mock.AsyncMock()) as comfy, \
+             mock.patch.object(self.access, "register", wraps=self.access.register) as register:
+            for filename in ("video.mp4", "sound.wav", "document.txt", "image.svg"):
+                with self.subTest(filename=filename):
+                    response = await self.upload(filename)
+                    self.assertEqual(response.status, 400)
+                    self.assertIn("只支持图片", await response.text())
+            register.assert_not_called()
+            comfy.assert_not_awaited()
+        self.assertFalse((self.root / "data" / "uploads").exists())
+
+    async def test_upload_requires_session_csrf_and_project_operate_permission(self):
+        outsider = self.auth.create_user("outsider", auth_support.PASSWORD)
+        with mock.patch.object(controller_app, "comfy_upload", new=mock.AsyncMock()) as comfy:
+            self.client.session.cookie_jar.clear()
+            self.assertEqual((await self.upload()).status, 401)
+            self.client.session.headers.update(await self.login("outsider"))
+            self.assertEqual((await self.upload()).status, 404)
+            self.auth.set_grant(outsider["id"], self.admin["id"], "read")
+            self.assertEqual((await self.upload()).status, 403)
+            self.auth.set_grant(outsider["id"], self.admin["id"], "operate")
+            self.client.session.headers["X-CSRF-Token"] = "invalid"
+            self.assertEqual((await self.upload()).status, 403)
+            comfy.assert_not_awaited()
+        self.assertFalse((self.root / "data" / "uploads").exists())
+
+    async def test_local_only_upload_rechecks_permission_before_publishing(self):
+        outsider = self.auth.create_user("collaborator", auth_support.PASSWORD)
+        self.auth.set_grant(outsider["id"], self.admin["id"], "operate")
+        self.client.session.headers.update(await self.login("collaborator"))
+        original = controller_app.require_project
+        checks = 0
+
+        async def revoke_before_second_check(request, pid, operate=False):
+            nonlocal checks
+            checks += 1
+            if checks == 2:
+                self.auth.set_grant(outsider["id"], self.admin["id"], "read")
+            return await original(request, pid, operate=operate)
+
+        with mock.patch.object(controller_app, "require_project", side_effect=revoke_before_second_check), \
+             mock.patch.object(controller_app, "comfy_upload", new=mock.AsyncMock()) as comfy, \
+             mock.patch.object(self.access, "publish", wraps=self.access.publish) as publish:
+            response = await self.upload()
+            self.assertEqual(response.status, 403)
+            self.assertEqual(checks, 2)
+            publish.assert_not_called()
+            comfy.assert_not_awaited()
+        files = list((self.root / "data" / "uploads").iterdir())
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].suffix, ".part")
+        row = self.access.lookup("upload", files[0].name.removesuffix(".part"))
+        self.assertEqual((row["state"], row["external"]), ("pending", 1))
+
+    async def test_browser_state_outputs_and_local_history_save_without_gpu_job(self):
+        layer = (await (await self.upload()).json())["files"][0]
+        output = (await (await self.upload("合成.png")).json())["files"][0]
+        response = await self.client.post("/api/projects/p/cards", json={"card": {
+            "id": "composite-card", "type": "card_tools", "cap": "image_composite",
+            "params": {}, "assets": {}, "outputs": [],
+        }})
+        self.assertEqual(response.status, 200, await response.text())
+        created = await response.json()
+        card = created["card"]
+        card.update({
+            "params": {"composition": {"width": 1024, "height": 768, "layers": [
+                {"id": "layer-1", "asset": layer, "left": 10, "top": 20}]}},
+            "assets": {"composite:layer-1": layer["ref"]},
+            "outputs": [{**output, "filename": output["origin"]}],
+            "history": [{"job": "local:test", "capability": "image_composite",
+                         "assets": {"composite:layer-1": layer["ref"]},
+                         "outputs": [{**output, "filename": output["origin"]}]}],
+            "status": "done", "progress": 1, "job": None,
+        })
+        response = await self.client.put("/api/projects/p", json={
+            "rev": created["project"]["rev"], "cards": [card]})
+        self.assertEqual(response.status, 200, await response.text())
+        saved = json.loads((self.root / "data" / "projects" / "p.json").read_text(encoding="utf-8"))
+        self.assertEqual(saved["cards"][0], card)
+        self.assertEqual(controller_app.JOBS, {})
+
+        # 即便当前账号可访问另一个画布，也不能把未绑定本画布的引用夹入图层/历史/输出。
+        self.own_project("other")
+        self.access.register("other", "upload", "other.png")
+        for field in ("assets", "outputs", "history"):
+            forged = json.loads(json.dumps(card))
+            if field == "assets":
+                forged[field]["composite:layer-1"] = "chouka/other.png"
+            elif field == "outputs":
+                forged[field] = [{"url": "/api/upload/other.png"}]
+            else:
+                forged[field][0]["outputs"] = [{"url": "/api/upload/other.png"}]
+            with self.subTest(field=field):
+                response = await self.client.put("/api/projects/p", json={
+                    "rev": saved["rev"], "cards": [forged]})
+                self.assertEqual(response.status, 404)
+        self.assertEqual(json.loads((self.root / "data" / "projects" / "p.json").read_text(
+            encoding="utf-8")), saved)
+        self.auth.create_user("asset-outsider", auth_support.PASSWORD)
+        self.client.session.headers.update(await self.login("asset-outsider"))
+        self.assertEqual((await self.client.get(output["url"])).status, 404)
+
+
 class LocalSubmissionTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.app = {"comfy_lock": asyncio.Lock(), "cleanup_pending": set(), "session": object()}

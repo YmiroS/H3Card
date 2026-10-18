@@ -1,0 +1,77 @@
+{
+ "id": "image_composite",
+ "name": "图片合成",
+ "execution": "browser",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "image",
+ "images": 8,
+ "audios": 0,
+ "videos": 0,
+ "slots": "img8+aud0+vid0",
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 8
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "note": "在浏览器中进行多图层合成，GPU 不参与，不走生成工作流。卡片可连接 8 张图片，也可在图片合成编辑器中上传更多图层。",
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片1",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[1]",
+   "label": "图片2",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[2]",
+   "label": "图片3",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[3]",
+   "label": "图片4",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[4]",
+   "label": "图片5",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[5]",
+   "label": "图片6",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[6]",
+   "label": "图片7",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[7]",
+   "label": "图片8",
+   "type": "image",
+   "required": false
+  }
+ ]
+}
