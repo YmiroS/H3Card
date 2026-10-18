@@ -1255,7 +1255,8 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[-1][1], ("sync-1", "abc123def456"))
 
     async def test_restart_handoff_waits_for_supervisor_ack_and_keeps_log(self):
-        process = mock.Mock(returncode=None)
+        process = mock.Mock()
+        process.poll.return_value = None
         process.terminate = mock.Mock()
         self.agent.stop_event = asyncio.Event()
         self.agent.config = {"restart_timeout_seconds": 60}
@@ -1281,15 +1282,17 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                  mock.patch.object(self.agent, "node_launcher_path", return_value=launcher), \
                  mock.patch("agent.os.name", "nt"), \
                  mock.patch("agent.uuid.uuid4", return_value=mock.Mock(hex="restart-1")), \
-                 mock.patch("agent.asyncio.create_subprocess_exec", new=mock.AsyncMock(return_value=process)) as spawn:
+                 mock.patch("agent.subprocess.Popen", return_value=process) as spawn, \
+                 mock.patch("agent.asyncio.create_subprocess_exec", new=mock.AsyncMock()) as async_spawn:
                 await self.agent.schedule_node_restart("sync-1", "abc123def456")
 
         self.assertTrue(self.agent.stop_event.is_set())
         self.assertEqual(self.agent.state["maintenance"]["phase"], "waiting_for_old_worker")
-        command = spawn.await_args.args
+        command = spawn.call_args.args[0]
         self.assertIn("--restart-token", command)
         self.assertEqual(command[command.index("--restart-token") + 1], "restart-1")
-        self.assertIsNot(spawn.await_args.kwargs["stdout"], asyncio.subprocess.DEVNULL)
+        self.assertIsNot(spawn.call_args.kwargs["stdout"], subprocess.DEVNULL)
+        async_spawn.assert_not_awaited()
         self.agent.run_local_command.assert_awaited_once()
 
     async def test_restart_supervisor_spawn_failure_is_persisted_without_stopping_worker(self):
@@ -1308,9 +1311,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             with mock.patch.object(self.agent, "code_repo_path", return_value=repo), \
                  mock.patch.object(self.agent, "node_launcher_path", return_value=launcher), \
                  mock.patch("agent.os.name", "nt"), \
-                 mock.patch("agent.asyncio.create_subprocess_exec", new=mock.AsyncMock(
-                     side_effect=OSError("spawn failed")
-                 )):
+                 mock.patch("agent.subprocess.Popen", side_effect=OSError("spawn failed")):
                 with self.assertRaisesRegex(OSError, "spawn failed"):
                     await self.agent.schedule_node_restart("sync-1", "abc123def456")
 
