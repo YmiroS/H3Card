@@ -98,6 +98,38 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         response = await self.client.post('/api/auth/presence', headers=self.headers)
         self.assertEqual(response.status, 401)
 
+    async def test_system_presence_counts_accounts_without_opening_a_canvas(self):
+        self.auth.create_user('viewer', PASSWORD)
+        for username, expected in (('admin', 1), ('admin', 1), ('viewer', 2)):
+            self.client.session.cookie_jar.clear()
+            headers = await self.login(username)
+            response = await self.client.post('/api/auth/presence', headers=headers)
+            self.assertEqual(response.status, 200)
+            self.assertEqual((await response.json())['online_users'], expected)
+        self.assertFalse(self.client.app['presence_rooms'])
+
+    async def test_system_presence_expires_inactive_accounts(self):
+        viewer = self.auth.create_user('viewer', PASSWORD)
+        active = self.client.app['online_presence']
+        window = self.client.app['online_presence_window']
+        active[viewer['id']] = time.monotonic() - window - 1
+        response = await self.client.post('/api/auth/presence', headers=self.headers)
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await response.json())['online_users'], 1)
+        self.assertNotIn(viewer['id'], active)
+
+    async def test_navigation_distinguishes_system_online_from_canvas_presence(self):
+        for route in ('/', '/director', '/admin-shell.js'):
+            with self.subTest(route=route):
+                response = await self.client.get(route)
+                self.assertEqual(response.status, 200)
+                text = await response.text()
+                self.assertIn('Chouka 系统在线用户（近 90 秒活跃，按账号去重）', text)
+                self.assertIn('<b>--</b> 人在线', text)
+                self.assertNotIn('人使用中', text)
+        response = await self.client.get('/app.js')
+        self.assertIn('${users.size} 人使用中', await response.text())
+
     async def test_auth_page_assets_are_explicitly_public(self):
         self.client.session.cookie_jar.clear()
         for route in ('/login', '/login.html'):
