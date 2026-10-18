@@ -93,7 +93,7 @@
     document.querySelector('[data-admin-sidebar]')?.remove();document.querySelector('.admin-skip')?.remove();
     document.body.dataset.workspace=page==='dashboard'?'controller':page;
     const side=document.createElement('aside');side.id='workspace-nav';side.dataset.adminSidebar='';side.setAttribute('aria-label','主导航');
-    side.innerHTML='<a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a><div class="workspace-footer"><div class="workspace-presence" title="近 90 秒活跃用户" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人使用中</span></div><div class="account-bar" id="account"></div></div>';
+    side.innerHTML='<a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a><div class="workspace-footer"><div class="workspace-presence" title="Chouka 系统在线用户（近 90 秒活跃，按账号去重）" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人在线</span></div><div class="account-bar" id="account"></div></div>';
     const skip=document.createElement('a');skip.className='skip-link admin-skip';skip.href=`#${main?.id||'main'}`;skip.textContent='跳到主内容';document.body.prepend(skip,side);
     // 导航、角色入口和账号菜单统一复用新版工作区，不再维护第二套管理侧栏。
     H3Auth.mountAccount(side.querySelector('#account'));
