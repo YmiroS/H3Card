@@ -3193,7 +3193,7 @@ function bindGlobal() {
   el.selbar.append(gb, rb, db);
   // 双保险：工具条按下的那一漏到画布去（画布会把它当框选起点）
   el.selbar.onmousedown = (ev) => ev.stopPropagation();
-  addEventListener("resize", () => { placePanel(); placeJobs(); paintSel(); });
+  addEventListener("resize", () => { clampHistoryToViewport(); placePanel(); placeJobs(); paintSel(); });
 
   // Ctrl+V 粘在鼠标那儿，所以一直记着鼠标落在世界坐标的哪个位置
   el.stage.addEventListener("mousemove", (ev) => {
@@ -5030,6 +5030,42 @@ function closeHistory() {
   el.hist._id = null;
 }
 
+function historyWidth(width) {
+  return Math.max(240, Math.min(width, Math.min(720, innerWidth * .65)));
+}
+
+function clampHistoryToViewport() {
+  if (!el.hist || el.hist.style.display === "none") return;
+  const width = el.hist.getBoundingClientRect().width;
+  const clamped = historyWidth(width);
+  if (clamped !== width) el.hist.style.setProperty("--hist-width", `${clamped}px`);
+}
+
+function bindHistoryResize(handle) {
+  const applyWidth = (width) => {
+    el.hist.style.setProperty("--hist-width", `${historyWidth(width)}px`);
+    placePanel(); placeJobs(); paintSel();
+  };
+  handle.onpointerdown = (ev) => {
+    if (ev.button !== 0) return;
+    ev.preventDefault();
+    const startX = ev.clientX, startWidth = el.hist.getBoundingClientRect().width;
+    el.hist.classList.add("resizing");
+    handle.setPointerCapture(ev.pointerId);
+    handle.onpointermove = (moveEv) => applyWidth(startWidth + startX - moveEv.clientX);
+    handle.onpointerup = handle.onpointercancel = () => {
+      el.hist.classList.remove("resizing");
+      handle.onpointermove = handle.onpointerup = handle.onpointercancel = null;
+    };
+  };
+  handle.onkeydown = (ev) => {
+    if (ev.key !== "ArrowLeft" && ev.key !== "ArrowRight") return;
+    ev.preventDefault();
+    const step = ev.shiftKey ? 40 : 16;
+    applyWidth(el.hist.getBoundingClientRect().width + (ev.key === "ArrowLeft" ? step : -step));
+  };
+}
+
 function openHistory(id) {
   const c = PROJ && PROJ.cards.find(x => x.id === id);
   if (!c) return closeHistory();
@@ -5037,6 +5073,12 @@ function openHistory(id) {
   seedHistory(c);
   const list = document.createElement("div"); list.className = "hlist";
   const cap = capOf(c);
+
+  const resize = document.createElement("button");
+  resize.className = "hresize"; resize.type = "button";
+  resize.title = "左右拖动调整历史产物栏宽度";
+  resize.setAttribute("aria-label", "调整历史产物栏宽度");
+  bindHistoryResize(resize);
 
   const hd = document.createElement("div"); hd.className = "hhd";
   hd.innerHTML = `<b>历史产物</b><span class="n"></span><button class="x" title="收起">✕</button>`;
@@ -5052,7 +5094,7 @@ function openHistory(id) {
   for (const [i, h] of c.history.entries()) list.appendChild(histRun(c, h, i === 0));
 
   el.hist.innerHTML = "";
-  el.hist.append(hd, list);
+  el.hist.append(resize, hd, list);
   el.hist._id = id;
   el.hist.style.display = "";
   // 摆面板的活交给紧跟着的 openPanel()：那时画布已经被栏子挤窄，量出来的边界才是对的
