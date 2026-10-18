@@ -647,25 +647,26 @@ class WorkerAgent:
         )
         try:
             with log_path.open("ab", buffering=0) as output:
-                process = await asyncio.create_subprocess_exec(
-                    sys.executable, str(helper),
-                    "--config", str(self.config_path),
-                    "--worker-pid", str(os.getpid()),
-                    "--launcher", str(launcher),
-                    "--request-id", request_id,
-                    "--restart-token", restart_token,
+                process = subprocess.Popen(
+                    [sys.executable, str(helper),
+                     "--config", str(self.config_path),
+                     "--worker-pid", str(os.getpid()),
+                     "--launcher", str(launcher),
+                     "--request-id", request_id,
+                     "--restart-token", restart_token],
                     cwd=str(repo),
-                    stdin=asyncio.subprocess.DEVNULL,
+                    stdin=subprocess.DEVNULL,
                     stdout=output,
-                    stderr=asyncio.subprocess.STDOUT,
+                    stderr=subprocess.STDOUT,
                     creationflags=flags,
                 )
             acknowledgement_deadline = time.monotonic() + 15
             while time.monotonic() < acknowledgement_deadline:
                 await asyncio.sleep(0.2)
-                if process.returncode is not None:
+                returncode = process.poll()
+                if returncode is not None:
                     raise AgentError(
-                        f"节点重启程序提前退出：{process.returncode}；日志：{log_path}"
+                        f"节点重启程序提前退出：{returncode}；日志：{log_path}"
                     )
                 state = self._load_state()
                 reported = state.get("maintenance")
