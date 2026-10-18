@@ -2270,8 +2270,46 @@ function applySize(c) {
   body.style.height = (c.h && !body.classList.contains("grid")) ? c.h + "px" : "";
 }
 
+function paintCompositeInputs(c) {
+  const d = c._el; if (!d) return;
+  let box = d.querySelector('.composite-inputs');
+  if (c.cap !== 'image_composite') { box?.remove(); return; }
+  const slots = (capOf(c)?.inputs || []).filter(s => s.type === 'image');
+  const reserved = new Set((PROJ?.edges || []).filter(e => e.to === c.id && !isTextEdge(e)).flatMap(edgeSlots));
+  const inputs = slots.filter(s => c.assets?.[s.key] || reserved.has(s.key));
+  const signature = JSON.stringify(inputs.map(s => [s.key, c.assets?.[s.key], reserved.has(s.key)]));
+  if (box?.dataset.signature === signature) return;
+  if (!box) {
+    box = document.createElement('div'); box.className = 'composite-inputs';
+    d.querySelector('.body').after(box);
+  }
+  box.dataset.signature = signature; box.replaceChildren();
+  const label = document.createElement('div'); label.className = 'composite-input-label';
+  label.textContent = `引用图片 · ${inputs.length}/${slots.length}`; box.append(label);
+  if (!inputs.length) {
+    const hint = document.createElement('div'); hint.className = 'composite-input-hint';
+    hint.textContent = '从图片节点连线，或在编辑器中上传图片'; box.append(hint); return;
+  }
+  const list = document.createElement('div'); list.className = 'composite-input-list'; box.append(list);
+  for (const spec of inputs) {
+    const asset = c.assets?.[spec.key], button = document.createElement('button');
+    button.type = 'button'; button.dataset.compositeReference = spec.key;
+    button.title = `${spec.label} · ${asset?.origin || asset?.filename || (asset ? '查看引用图片' : '正在导入')}`;
+    button.setAttribute('aria-label', button.title); button.disabled = !asset?.url;
+    if (asset?.url) {
+      const image = document.createElement('img'); image.src = cardThumbnailURL(asset.url) || asset.url;
+      image.alt = spec.label; image.loading = 'lazy'; image.draggable = false; button.append(image);
+      button.onmousedown = event => event.stopPropagation();
+      button.onclick = event => { event.stopPropagation(); openAsset(asset); };
+    }
+    const badge = document.createElement('span'); badge.textContent = asset ? spec.label : '导入中';
+    button.append(badge); list.append(button);
+  }
+}
+
 function paint(c) {
   const d = c._el; if (!d) return;
+  paintCompositeInputs(c);
   const body = d.querySelector(".body");
   const st = d.querySelector(".st"), meta = d.querySelector(".meta");
   const bar = d.querySelector(".bar i");
@@ -2450,7 +2488,7 @@ function paint(c) {
                         + (c.step ? ` · ${c.step}` : "")
     : s === "done" ? (fmtEla(c.ms) ? `已完成 · ${fmtEla(c.ms)}` : "已完成")
     : s === "error" ? "失败"
-    : s === "canceled" ? "已取消" : "待生成";
+    : s === "canceled" ? "已取消" : c.cap === "image_composite" ? "待合成" : "待生成";
   st.title = st.textContent;           // 挤成省略号时鼠标悬停还能看全
   bar.style.width = (s === "running" || s === "queued" ? (c.progress || 0.02) * 100 : s === "done" ? 100 : 0) + "%";
   meta.textContent = c.error ? String(c.error).slice(0, 40)
@@ -2554,11 +2592,12 @@ function mediaSlotsForOutputs(to, baseSlot, outputs, freeOnly = true) {
   const cap = to && capOf(to);
   if (!match || !cap) return [baseSlot];
   const slotType = match[1], start = +match[2], kind = outputs[0] && outputs[0].kind;
+  const reserved = freeOnly ? new Set((PROJ?.edges || []).filter(e => e.to === to.id && !isTextEdge(e)).flatMap(edgeSlots)) : null;
   const slots = (cap.inputs || [])
     .filter(s => {
       const sm = new RegExp(`^${slotType}\\[(\\d+)\\]$`).exec(s.key);
       return sm && +sm[1] >= start && (!kind || s.type === kind)
-        && (!freeOnly || !(to.assets || {})[s.key]);
+        && (!freeOnly || (!(to.assets || {})[s.key] && !reserved.has(s.key)));
     })
     .sort((a, b) => parseInt(/\[(\d+)\]/.exec(a.key)[1], 10)
       - parseInt(/\[(\d+)\]/.exec(b.key)[1], 10))
@@ -2596,6 +2635,9 @@ function removeEdges(edges, clearAssets = true) {
   if (!gone.size) return false;
   if (clearAssets) for (const e of gone) clearEdgeAssets(e);
   PROJ.edges = PROJ.edges.filter(e => !gone.has(e));
+  for (const id of new Set([...gone].map(e => e.to))) {
+    const target = cardOf(id); if (target) paintCompositeInputs(target);
+  }
   return true;
 }
 
@@ -4464,7 +4506,8 @@ function mediaCount(c, kind) {
 
 function firstFreeSlot(c, kind) {
   const cap = capOf(c); if (!cap) return null;
-  return cap.inputs.find(s => s.type === kind && !c.assets[s.key]) || null;
+  const reserved = new Set((PROJ?.edges || []).filter(e => e.to === c.id && !isTextEdge(e)).flatMap(edgeSlots));
+  return cap.inputs.find(s => s.type === kind && !c.assets?.[s.key] && !reserved.has(s.key)) || null;
 }
 
 /** 把一个文本节点接到别的节点上。不搬文件、不占素材槽 ——
@@ -4569,7 +4612,7 @@ async function linkTo(from, to) {
     slots: mediaSlotsForOutputs(to, spec.key, outputs),
   };
   PROJ.edges.push(edge);
-  drawWires(); paintStyles();
+  paintCompositeInputs(to); drawWires(); paintStyles();
   try {
     // 风格是顺着这根线传下来的（没有单独的连线），接线那一刻就说一句，不然是隐形的
     const inh = styleTexts(to).length && promptSpecs(capOf(to)).length;
@@ -4589,11 +4632,15 @@ async function linkTo(from, to) {
       to.assets[edge.slots[i]] = imported;
     }
 
-    paintKind(to);
+    paintKind(to); drawWires();
     // 如果切换了模式，强制重新打开面板以显示新的槽位和参数
     if (modeSwitched || selId === to.id) openPanel(to.id);
     save();
   } catch (e) {
+    if (PROJ?.edges.includes(edge)) {
+      removeEdges([edge]); paintCompositeInputs(to); drawWires(); paintStyles();
+      if (selId === to.id) openPanel(to.id);
+    }
     save();
     toast("引用失败：" + e.message);
   }
@@ -5348,9 +5395,11 @@ async function openImageComposer(c) {
       for (const history of card.history || []) for (const output of history.outputs || [])
         addSource(output, `${titleOf(card)} · 历史产物`);
     }
+    const linkedSources = (capOf(c)?.inputs || []).filter(s => s.type === 'image')
+      .map(s => c.assets[s.key]).filter(asset => asset?.kind === 'image' && asset.url);
     await window.ChoukaImageComposer.open({
       state: c.params.composition ? JSON.parse(JSON.stringify(c.params.composition)) : null,
-      sources: [...sources.values()], canEdit: valid,
+      linkedSources, sources: [...sources.values()], canEdit: valid,
       upload: async file => { check(); const asset = await uploadAsset(file, true); check(); return asset; },
       onSave: state => store(state),
       onExport: async (blob, state) => {
@@ -5499,7 +5548,7 @@ function openPanel(id) {
   clipboardHint.textContent = 'Ctrl / Cmd + V：粘贴截图或图片 / 视频文件，自动创建素材节点并引用到空槽；不覆盖已有引用。复制文件需浏览器提供文件数据，仅路径文字无法导入。';
   body.appendChild(clipboardHint);
   if (localComposite) {
-    clipboardHint.textContent = "浏览器本地合成，不占 GPU。打开编辑器后可上传多张图片，也可从当前画布的素材和历史产物中选择。拖动位置、缩放图片，在图层列表调整遮挡顺序。";
+    clipboardHint.textContent = "浏览器本地合成，不占 GPU。已连接的图片打开编辑器时自动加入图层，也可上传图片或从画布素材中选择添加。拖动位置、缩放图片，在图层列表调整遮挡顺序。";
     const summary = document.createElement("div"); summary.className = "knobnote";
     const draft = c.params.composition;
     summary.textContent = draft
@@ -5522,8 +5571,8 @@ function openPanel(id) {
   const media = specs.filter(x => MEDIA.includes(x.type));
   if (media.length) {
     if (localComposite) {
-      const inputs = document.createElement("details");
-      const label = document.createElement("summary"); label.textContent = "连接图片素材（可选，编辑器中添加为图层）";
+      const inputs = document.createElement("details"); inputs.open = true;
+      const label = document.createElement("summary"); label.textContent = "连接图片素材（打开编辑器时自动加入图层）";
       inputs.append(label, referenceSlots(c, media, md)); body.appendChild(inputs);
     } else body.appendChild(referenceSlots(c, media, md));
   }
@@ -7010,6 +7059,7 @@ function paintTitle(c) {
     路由节点还没放素材时两路都可能，标「跟素材」；放进去那一刻 paintTitle 会重刷。
     跟着 paintTitle 一起刷：换模式、换路由、按张数换能力都会改产出类型。 */
 function paintKind(c) {
+  paintCompositeInputs(c);
   const k = c._el && c._el.querySelector(".cf .kt");
   if (!k) return;
   // 风格节点不出东西，徽标位上说清它是干什么的 —— 不然它长得跟别的节点一样，
