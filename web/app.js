@@ -1133,6 +1133,17 @@ function hoverTip(node, contentGetter) {
 }
 
 /* ================= 启动 ================= */
+function rememberedProject() {
+  if (!H3Auth.user?.id) return null;
+  try {
+    const id = localStorage.getItem(`chouka:last-project:${H3Auth.user.id}`);
+    return projects.find(project => project.id === id) || null;
+  } catch { return null; }
+}
+function rememberProject(id) {
+  if (NODE_EDITOR || !H3Auth.active || !H3Auth.user?.id) return;
+  try { localStorage.setItem(`chouka:last-project:${H3Auth.user.id}`, id); } catch {}
+}
 const bootReady = (async function boot() {
   try {
     await H3Auth.requireUser();
@@ -1143,7 +1154,7 @@ const bootReady = (async function boot() {
   } catch (e) { toast("后端未就绪：" + e.message); if (!H3Auth.active) return; }
   await loadProjects();
   bindGlobal();
-  // 一进来就打开示例（locked 那个），新用户不用先面对一张空画布
+  // 显式链接优先，其次恢复本账号上次画布；首次进入仍打开示例。
   const target = new URLSearchParams(location.search);
   const projectId = target.get("project"), cardId = target.get("card");
   if (projectId) {
@@ -1153,8 +1164,12 @@ const bootReady = (async function boot() {
   } else if (NODE_EDITOR) {
     restoreNodeEditor();
   } else {
-    const demo = projects.find(p => p.locked);
-    if (demo) await openProject(demo.id);
+    const previous = rememberedProject();
+    if (previous) await openProject(previous.id);
+    if (!PROJ) {
+      const demo = projects.find(p => p.locked);
+      if (demo) await openProject(demo.id);
+    }
   }
   await health();
   H3Auth.every(health, 5000);
@@ -1449,6 +1464,7 @@ async function openProject(pid) {
   }
   // 断线重连后可能有节点状态是 running，交给轮询自己收尾
   render();
+  rememberProject(PROJ.id);
   connectPresence(PROJ.id);
   loadProjects();
 }

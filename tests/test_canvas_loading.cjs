@@ -199,9 +199,9 @@ async function fixtureServer(videoBytes, audioBytes, highRes) {
       return item;
     };
     if (state.heldPaths.has(url.pathname)) { delayed(() => json(res,{ok:true})); return; }
-    if (url.pathname === '/api/auth/me') return json(res,{user:{id:'tester',username:'tester',role:'user'},csrf_token:'fixture-csrf'});
+    if (url.pathname === '/api/auth/me') return json(res,{user:state.user || {id:'tester',username:'tester',role:'user'},csrf_token:'fixture-csrf'});
     if (url.pathname === '/api/cards') return json(res,state.manifests);
-    if (url.pathname === '/api/projects') return json(res,{projects:state.projects.map(p => ({...p,cards:p.cards.length,edges:undefined,groups:undefined})),teams:[]});
+    if (url.pathname === '/api/projects') return json(res,{projects:state.projects.map(p => ({...p,cards:p.cards.length,edges:undefined,groups:undefined})),teams:state.teams || []});
     if (/^\/api\/projects\/[^/]+$/.test(url.pathname)) {
       const p = state.projects.find(p => p.id === decodeURIComponent(url.pathname.split('/').pop()));
       return json(res,p || {error:'不存在'},p ? 200 : 404);
@@ -287,6 +287,106 @@ async function assertReclaimed(page, oldURLs) {
   const probe = await page.evaluate(() => ({revoked:__canvasProbe.revoked,created:__canvasProbe.created}));
   for (const url of oldURLs) assert.ok(probe.revoked.includes(url),`旧 BlobURL 未回收：${url}`);
 }
+
+test('上次画布：真实页面按账号恢复，链接优先且失效记录安全回退', {timeout:60000}, async t => {
+  const fixture = await fixtureServer(Buffer.alloc(0), Buffer.alloc(0), {});
+  const demo = {...project('demo', []), locked:true};
+  const personal = project('personal', []);
+  const shared = {...project('shared', [], 'read'), owner_id:'owner', shared_personally:true};
+  const team = {...project('team', []), team_id:'group'};
+  Object.assign(fixture.state, {projects:[demo,personal,shared,team], teams:[{id:'group',name:'测试项目组'}], manifests});
+  let browser;
+  try {
+    browser = await chromium.launch({channel:process.env.CHOUKA_TEST_BROWSER || 'chrome'});
+    const context = await browser.newContext(), page = await context.newPage();
+    const errors = [];
+    page.on('pageerror', error => errors.push(error.message));
+    const key = 'chouka:last-project:tester';
+    const visit = async (query = '') => {
+      await page.goto(fixture.origin + '/' + query);
+      await page.evaluate(() => bootReady);
+      return page.evaluate(() => PROJ?.id || null);
+    };
+    const stored = () => page.evaluate(key => localStorage.getItem(key), key);
+    await t.test('首次默认示例，点击画布后重进及刷新都恢复最后选择', async () => {
+      assert.equal(await visit(), 'demo');
+      await page.locator('#plist .pitem').filter({hasText:personal.name}).click();
+      await page.waitForFunction(() => PROJ?.id === 'personal');
+      assert.equal(await stored(), 'personal');
+      assert.equal(await visit(), 'personal');
+      await page.reload(); await page.evaluate(() => bootReady);
+      assert.equal(await page.evaluate(() => PROJ.id), 'personal');
+      assert.equal(await page.locator('#plist .pitem.on .nm').innerText(), personal.name);
+    });
+    await t.test('共享只读及项目组画布恢复时同步切换空间', async () => {
+      assert.equal(await visit('?project=shared'), 'shared');
+      assert.equal(await visit(), 'shared');
+      assert.equal(await page.evaluate(() => selectedSpace), 'shared');
+      assert.equal(await page.evaluate(() => canOperate()), false);
+      assert.equal(await page.locator('#plist .pitem.on .nm').innerText(), shared.name);
+      assert.equal(await visit('?project=team'), 'team');
+      assert.equal(await visit(), 'team');
+      assert.equal(await page.evaluate(() => selectedSpace), 'team:group');
+    });
+    await t.test('显式链接覆盖记忆，打开失败不覆盖已保存选择', async () => {
+      assert.equal(await visit('?project=personal'), 'personal');
+      assert.equal(await stored(), 'personal');
+      assert.equal(await visit('?project=missing'), null);
+      assert.equal(await stored(), 'personal');
+      assert.equal(await visit(), 'personal');
+    });
+    await t.test('不同账号互不覆盖，重新登录原账号仍恢复自己的画布', async () => {
+      fixture.state.user = {id:'other',username:'other',role:'user'};
+      assert.equal(await visit(), 'demo');
+      assert.equal(await visit('?project=shared'), 'shared');
+      assert.equal(await stored(), 'personal');
+      fixture.state.user = null;
+      assert.equal(await visit(), 'personal');
+      assert.equal(await page.evaluate(() => localStorage.getItem('chouka:last-project:other')), 'shared');
+    });
+    await t.test('编辑器入口不自动恢复也不改写主画布记忆', async () => {
+      assert.equal(await visit('?editor=1'), null);
+      assert.equal(await stored(), 'personal');
+      assert.equal(await visit('?editor=1&project=shared'), 'shared');
+      assert.equal(await stored(), 'personal');
+    });
+    await t.test('已删除或已撤权画布不会发起详情请求，回退示例', async () => {
+      fixture.state.projects = [demo,shared,team];
+      fixture.state.requests = [];
+      assert.equal(await visit(), 'demo');
+      assert.equal(fixture.state.requests.some(r => r.path === '/api/projects/personal'), false);
+      assert.equal(await stored(), 'demo');
+    });
+    await t.test('列表后详情加载失败仍回退，空列表保持空画布', async () => {
+      await page.evaluate(key => localStorage.setItem(key, 'shared'), key);
+      await page.route('**/api/projects/shared', route => route.fulfill({status:503,json:{error:'暂时不可用'}}));
+      assert.equal(await visit(), 'demo');
+      await page.unroute('**/api/projects/shared');
+      fixture.state.projects = [];
+      assert.equal(await visit(), null);
+      assert.equal(await page.locator('#empty').isVisible(), true);
+    });
+    await t.test('浏览器禁止存储时仍可正常进入和打开画布', async () => {
+      fixture.state.projects = [demo,personal];
+      const blocked = await browser.newContext();
+      try {
+        await blocked.addInitScript(() => Object.defineProperty(window, 'localStorage', {get() { throw new DOMException('禁用存储', 'SecurityError'); }}));
+        const p = await blocked.newPage();
+        p.on('pageerror', error => errors.push(error.message));
+        await p.goto(fixture.origin); await p.evaluate(() => bootReady);
+        assert.equal(await p.evaluate(() => PROJ.id), 'demo');
+        await p.locator('#plist .pitem').filter({hasText:personal.name}).click();
+        await p.waitForFunction(() => PROJ?.id === 'personal');
+      } finally { await blocked.close(); }
+    });
+    assert.deepEqual(errors, []);
+    assert.deepEqual(fixture.state.writes, [], '恢复选择不应写入画布内容');
+    await context.close();
+  } finally {
+    if (browser) await browser.close();
+    await fixture.close();
+  }
+});
 
 test('画布加载专项：实际页面、本地 HTTP 和真实 Chrome', {timeout:120000}, async t => {
   const directory = mkdtempSync(path.join(tmpdir(),'h3card-canvas-loading-'));
