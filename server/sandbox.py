@@ -15,7 +15,7 @@ READ_APIS = {'/api/health', '/api/status', '/api/workers', '/api/jobs',
              '/api/projects', '/api/cards', '/api/team-candidates', '/api/teams',
              '/api/capacity', '/api/capacity/export', '/api/costs', '/api/auth/me'}
 AUTH_WRITES = {'/api/auth/login', '/api/auth/logout', '/api/auth/password',
-               '/api/auth/presence'}
+               '/api/auth/presence', '/api/auth/phone', '/api/auth/register'}
 
 
 def validate_runtime(root, auth_path):

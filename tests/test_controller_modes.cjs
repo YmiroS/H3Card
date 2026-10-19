@@ -38,7 +38,9 @@ test('recent jobs show their recorded mode separately from card names', async ()
     }
     const files = {'/':'index.html', '/auth.js':'auth.js', '/admin-shell.js':'admin-shell.js',
       '/controller-page.js':'controller-page.js', '/admin-shell.css':'admin-shell.css',
-      '/app.js':'app.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+      '/app.js':'app.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png',
+      '/image-composer.css':'image-composer.css', '/vendor/fabric.min.js':'vendor/fabric.min.js',
+      '/image-composer.js':'image-composer.js'};
     if (req.method === 'GET' && Object.hasOwn(files, url)) {
       const name = files[url];
       res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript; charset=utf-8'
@@ -254,7 +256,9 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
     res.end(JSON.stringify(value));
   };
   const files = {'/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js',
-    '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+    '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png',
+    '/image-composer.css':'image-composer.css', '/vendor/fabric.min.js':'vendor/fabric.min.js',
+    '/image-composer.js':'image-composer.js'};
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost').pathname;
     if (req.method === 'GET') {

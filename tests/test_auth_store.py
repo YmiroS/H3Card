@@ -13,10 +13,18 @@ from unittest.mock import ANY, patch
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
-from server.auth import auth_middleware, register_auth_routes, require_project
+from server.auth import COOKIE, auth_middleware, register_auth_routes, require_project
 from server.auth_store import AuthError, AuthStore
 
 PASSWORD = 'a-long-test-password'
+INVALID_PHONES = (
+    None, True, False, 13800138000, 13800138000.0, [], {}, ['13800138000'],
+    '', '   ', '1380013800', '138001380000', '12800138000', '10800138000',
+    '23800138000', '+8613800138000', '138-00138000', '1380013800a',
+    '138 0138000', '13800\n38000', '13800138000\x00',
+    '１３８００１３８０００', '١٣٨٠٠١٣٨٠٠٠', '1380013800１', '1380013800١',
+    '1380013800¹',
+)
 
 
 class PasswordPolicyTests(unittest.TestCase):
@@ -60,7 +68,7 @@ class StoreTests(unittest.TestCase):
         for value in ('riverpa', '12345678', 'Password', '111111111111'):
             operations = (
                 lambda: self.store.create_user('new-user', value),
-                lambda: self.store.create_registration('new-user', value, '新人'),
+                lambda: self.store.create_registration('new-user', value, '新人', '13800138000'),
                 lambda: self.store.reset_password(self.owner, value),
                 lambda: self.store.change_password(self.owner, PASSWORD, value, session['token']),
             )
@@ -82,7 +90,7 @@ class StoreTests(unittest.TestCase):
         self.store.reset_password(user['id'], 'mountain')
         self.assertIsNone(self.store.get_session(session['token']))
         self.store.login('new-user', 'mountain')
-        request = self.store.create_registration('new-registration', 'riverpad', '新人')
+        request = self.store.create_registration('new-registration', 'riverpad', '新人', '13800138000')
         self.assertEqual(request['status'], 'pending')
         card = self.store.registration_card_data(request['request_id'])
         self.store.decide_registration(card['out_track_id'], 'approved', 'corp', 'approver')
@@ -116,6 +124,95 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.get_session(session['token']))
         with self.assertRaises(AuthError):
             self.store.login('admin', PASSWORD)
+
+    def test_phone_trim_persistence_and_sessions_are_preserved(self):
+        self.assertEqual(self.store.get_user(self.owner)['phone'], '')
+        session = self.store.login('owner', PASSWORD)
+        second = self.store.login('owner', PASSWORD)
+        sessions_before = set(map(tuple, self.store.db.execute('SELECT * FROM sessions')))
+        user_before = dict(self.store._user(self.owner))
+        for second_digit in '3456789':
+            phone = f'1{second_digit}800138000'
+            with self.subTest(phone=phone):
+                result = self.store.set_phone(self.owner, f' \t{phone}\r\n',
+                                              session_token=session['token'])
+                self.assertEqual(result['id'], self.owner)
+                self.assertEqual(result['phone'], phone)
+                self.assertEqual(dict(self.store._user(self.owner)), user_before | {'phone': phone})
+                self.assertEqual(set(map(tuple, self.store.db.execute('SELECT * FROM sessions'))),
+                                 sessions_before)
+        self.store.close()
+        self.store = AuthStore(self.path)
+        for token in (session['token'], second['token']):
+            self.assertEqual(self.store.get_session(token)['user']['phone'], phone)
+        self.assertEqual(self.store.get_session(session['token'])['csrf_token'], session['csrf_token'])
+        self.assertEqual(self.store.get_user(self.owner)['phone'], phone)
+        self.assertEqual(self.store.login('owner', PASSWORD)['user']['phone'], phone)
+        listed = {user['id']: user for user in self.store.list_users()}
+        self.assertEqual(listed[self.owner]['phone'], phone)
+        self.assertEqual(listed[self.viewer]['phone'], '')
+
+    def test_invalid_phone_types_and_formats_do_not_write(self):
+        session = self.store.login('owner', PASSWORD)
+        self.store.set_phone(self.owner, '13800138000', session_token=session['token'])
+        before = dict(self.store._user(self.owner))
+        for phone in INVALID_PHONES:
+            with self.subTest(phone=phone):
+                with self.assertRaises(AuthError) as ctx:
+                    self.store.set_phone(self.owner, phone, session_token=session['token'])
+                self.assertEqual(ctx.exception.status, 400)
+                self.assertEqual(dict(self.store._user(self.owner)), before)
+                self.assertIsNotNone(self.store.get_session(session['token']))
+
+    def test_phone_rejects_invalid_sessions_and_other_users_tokens(self):
+        other = self.store.login('admin', PASSWORD)
+        for state in ('expired', 'logout', 'disabled', 'pending', 'rejected', 'other',
+                      'missing', 'empty', 'unknown'):
+            with self.subTest(state=state):
+                session = self.store.login('owner', PASSWORD)
+                token = session['token']
+                self.store.set_phone(self.owner, '13800138000', session_token=token)
+                if state == 'expired':
+                    self.store.db.execute('UPDATE sessions SET expires_at=0 WHERE token_hash=?',
+                                          (hashlib.sha256(token.encode()).hexdigest(),))
+                elif state == 'logout':
+                    self.store.logout(token)
+                elif state == 'disabled':
+                    # 保留会话行，验证禁用状态本身就足以拒绝写入。
+                    self.store.db.execute('UPDATE users SET enabled=0 WHERE id=?', (self.owner,))
+                elif state in ('pending', 'rejected'):
+                    self.store.db.execute('UPDATE users SET approval_status=? WHERE id=?',
+                                          (state, self.owner))
+                elif state == 'other':
+                    token = other['token']
+                elif state == 'missing':
+                    token = None
+                elif state == 'empty':
+                    token = ''
+                elif state == 'unknown':
+                    token = 'unknown-session-token'
+                before = set(map(tuple, self.store.db.execute('SELECT * FROM users')))
+                try:
+                    with self.assertRaises(AuthError) as ctx:
+                        self.store.set_phone(self.owner, '13900139000', session_token=token)
+                    self.assertEqual(ctx.exception.status, 401)
+                    self.assertEqual(set(map(tuple, self.store.db.execute('SELECT * FROM users'))), before)
+                    self.assertFalse(self.store.db.in_transaction)
+                finally:
+                    self.store.db.execute("UPDATE users SET enabled=1,approval_status='approved' WHERE id=?",
+                                          (self.owner,))
+        self.assertIsNotNone(self.store.get_session(other['token']))
+
+    def test_team_candidates_omit_phone_even_when_populated(self):
+        self.store.set_user(self.owner, team_leader=True)
+        viewer = self.store.login('viewer', PASSWORD)
+        self.store.set_phone(self.viewer, '13800138000', session_token=viewer['token'])
+        leader = self.store.login('owner', PASSWORD)
+        candidates = self.store.list_team_candidates(self.owner, leader['token'])
+        self.assertIn(self.viewer, {user['id'] for user in candidates})
+        for user in candidates:
+            self.assertNotIn('phone', user)
+        self.assertEqual(self.store.get_user(self.viewer)['phone'], '13800138000')
 
     def test_grants_future_nontransitive_and_jobs(self):
         self.store.set_grant(self.viewer, self.owner, 'read')
@@ -529,7 +626,7 @@ class StoreTests(unittest.TestCase):
         self.store.set_project_view(self.viewer, 'personal', 12.0, -34.0, 0.8)
         self.store.register_job('legacy-job', 'personal', self.owner)
         session = self.store.login('viewer', PASSWORD)
-        self.store.create_registration('pending-user', PASSWORD, '待审批')
+        self.store.create_registration('pending-user', PASSWORD, '待审批', '13800138000')
         self.store.set_ready()
         legacy = self.path.parent / 'v5.sqlite'
         migrations = Path(__file__).resolve().parents[1] / 'server/migrations'
@@ -541,8 +638,9 @@ class StoreTests(unittest.TestCase):
             tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
             before = {}
             for table in tables:
-                rows = [tuple(row) for row in self.store.db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
-                before[table] = rows
+                columns = ','.join(row[1] for row in db.execute(f'PRAGMA table_info({table})'))
+                rows = [tuple(row) for row in self.store.db.execute(f'SELECT {columns} FROM {table} ORDER BY rowid')]
+                before[table] = (columns, rows)
                 db.execute(f'DELETE FROM {table}')
                 if rows:
                     placeholders = ','.join('?' for _ in rows[0])
@@ -552,11 +650,11 @@ class StoreTests(unittest.TestCase):
             db.close()
         migrated = AuthStore(legacy)
         try:
-            self.assertEqual(migrated.db.execute('PRAGMA user_version').fetchone()[0], 6)
-            for table, rows in before.items():
+            self.assertEqual(migrated.db.execute('PRAGMA user_version').fetchone()[0], 7)
+            for table, (columns, rows) in before.items():
                 with self.subTest(table=table):
                     self.assertEqual([tuple(row) for row in migrated.db.execute(
-                        f'SELECT * FROM {table} ORDER BY rowid')], rows)
+                        f'SELECT {columns} FROM {table} ORDER BY rowid')], rows)
             self.assertEqual(migrated.list_grants(), [owner_grant])
             self.assertTrue(migrated.is_ready())
             self.assertEqual(migrated.get_session(session['token'])['user']['id'], self.viewer)
@@ -570,10 +668,109 @@ class StoreTests(unittest.TestCase):
         finally:
             migrated.close()
 
+    def test_v5_phone_migration_preserves_existing_data_and_reopens_idempotently(self):
+        legacy = self.path.parent / 'v5.sqlite'
+        migrations = Path(__file__).resolve().parents[1] / 'server/migrations'
+        token = 'existing-v5-session'
+        now = time.time()
+        with sqlite3.connect(legacy) as db:
+            db.execute('PRAGMA foreign_keys=ON')
+            # 显式执行旧版迁移构造真实 v5，不能用最新版建库后伪改版本号。
+            for name in ('001_auth.sql', '002_registration.sql', '003_teams.sql',
+                         '004_project_shares.sql', '005_project_user_views.sql'):
+                db.executescript((migrations / name).read_text(encoding='utf-8'))
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 5)
+            self.assertNotIn('phone', {row[1] for row in db.execute('PRAGMA table_info(users)')})
+            password_hash = self.store._user(self.owner)['password_hash']
+            db.executemany('INSERT INTO users(id,username,username_key,password_hash,role,enabled,'
+                           'version,created_at,display_name,approval_status,team_leader) '
+                           'VALUES(?,?,?,?,?,?,?,?,?,?,?)', [
+                ('old-owner', 'old-owner', 'old-owner', password_hash, 'admin', 1, 3,
+                 100.0, '旧组长', 'approved', 1),
+                ('old-viewer', 'old-viewer', 'old-viewer', password_hash, 'user', 1, 2,
+                 101.0, '旧组员', 'approved', 0),
+            ])
+            db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',
+                       (hashlib.sha256(token.encode()).hexdigest(), 'old-owner', 'old-csrf',
+                        now + 86400, now))
+            db.execute("INSERT INTO teams VALUES('old-team','旧项目组','old-owner','active',100,101)")
+            db.executemany('INSERT INTO team_members VALUES(?,?,?)',
+                           [('old-team', 'old-owner', 100), ('old-team', 'old-viewer', 101)])
+            db.executemany('INSERT INTO project_acl VALUES(?,?,?,?,?)', [
+                ('old-personal', 'old-owner', 'active', 100, None),
+                ('old-team-project', 'old-owner', 'active', 101, 'old-team'),
+            ])
+            db.execute("INSERT INTO user_grants VALUES('old-viewer','old-owner','read')")
+            db.execute("INSERT INTO job_acl VALUES('old-job','old-personal','old-owner')")
+            db.execute("INSERT INTO project_user_shares VALUES('old-personal','old-viewer',102)")
+            db.execute("INSERT INTO project_team_shares VALUES('old-personal','old-team',103)")
+            db.execute("INSERT INTO project_user_views VALUES('old-personal','old-viewer',10,-20,0.75,104)")
+            db.execute("UPDATE auth_meta SET value='1' WHERE key='ready'")
+            columns = {}
+            before = {}
+            for (table,) in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"):
+                columns[table] = [row[1] for row in db.execute(f'PRAGMA table_info("{table}")')]
+                before[table] = set(map(tuple, db.execute(f'SELECT * FROM "{table}"')))
+        db.close()
+
+        # 首次升级及重复重开都不应修改旧字段、会话、画布和授权关系。
+        for opening in range(2):
+            with self.subTest(opening=opening):
+                store = AuthStore(legacy)
+                try:
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 7)
+                    info = [row for row in store.db.execute('PRAGMA table_info(users)') if row['name'] == 'phone']
+                    self.assertEqual(len(info), 1)
+                    self.assertEqual((info[0]['type'], info[0]['notnull'], info[0]['dflt_value']),
+                                     ('TEXT', 1, "''"))
+                    for table, names in columns.items():
+                        selected = ','.join(f'"{name}"' for name in names)
+                        self.assertEqual(set(map(tuple, store.db.execute(f'SELECT {selected} FROM "{table}"'))),
+                                         before[table], table)
+                    self.assertEqual([user['phone'] for user in store.list_users()], ['', ''])
+                    session = store.get_session(token)
+                    self.assertEqual(session['user']['id'], 'old-owner')
+                    self.assertEqual(session['user']['phone'], '')
+                    self.assertEqual(session['csrf_token'], 'old-csrf')
+                    self.assertTrue(store.is_ready())
+                    self.assertEqual(store.project_permission('old-viewer', 'old-personal'), 'operate')
+                    self.assertEqual(store.project_permission('old-viewer', 'old-team-project'), 'operate')
+                    shares = store.list_project_shares('old-personal', 'old-owner')
+                    self.assertEqual(shares['user_ids'], ['old-viewer'])
+                    self.assertEqual(shares['team_ids'], ['old-team'])
+                    self.assertEqual(store.get_project_view('old-viewer', 'old-personal'),
+                                     {'x': 10.0, 'y': -20.0, 'k': 0.75})
+                    self.assertEqual(store.list_project_jobs('old-personal'), ['old-job'])
+                    self.assertEqual(store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+                finally:
+                    store.close()
+
+    def test_v6_phone_migration_preserves_global_grants_and_reopens(self):
+        legacy = self.path.parent / 'v6.sqlite'
+        migrations = Path(__file__).resolve().parents[1] / 'server/migrations'
+        with sqlite3.connect(legacy) as db:
+            for script in sorted(migrations.glob('00[1-6]_*.sql')):
+                db.executescript(script.read_text(encoding='utf-8'))
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 6)
+            db.execute("INSERT INTO users VALUES('v6-user','legacy','legacy','x','user',1,0,100,'旧账号','approved',0)")
+            db.execute("INSERT INTO global_canvas_grants VALUES('v6-user','operate')")
+            before = tuple(db.execute('SELECT * FROM users').fetchone())
+        for opening in range(2):
+            with self.subTest(opening=opening):
+                store = AuthStore(legacy)
+                try:
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 7)
+                    self.assertEqual(tuple(store.db.execute('SELECT * FROM users').fetchone()), before + ('',))
+                    self.assertEqual(tuple(store.db.execute('SELECT * FROM global_canvas_grants').fetchone()),
+                                     ('v6-user', 'operate'))
+                    self.assertEqual(store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
+                finally:
+                    store.close()
+
     def test_unknown_schema_rejected(self):
         path = Path(self.tmp.name) / 'future.sqlite'
         db = sqlite3.connect(path)
-        db.execute('PRAGMA user_version=7')
+        db.execute('PRAGMA user_version=8')
         db.close()
         with self.assertRaises(AuthError):
             AuthStore(path)
@@ -592,8 +789,64 @@ class RegistrationStoreTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def _register(self, username='zhangsan', display_name='张三', password=PASSWORD):
-        return self.store.create_registration(username, password, display_name)
+    def _register(self, username='zhangsan', display_name='张三', password=PASSWORD,
+                  phone='13800138000'):
+        return self.store.create_registration(username, password, display_name, phone)
+
+    def test_registration_requires_valid_phone_without_side_effects(self):
+        tables = ('users', 'registration_requests', 'notification_outbox')
+        before = {table: set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}')))
+                  for table in tables}
+        with self.assertRaises(TypeError):
+            self.store.create_registration('zhangsan', PASSWORD, '张三')
+        for phone in INVALID_PHONES:
+            with self.subTest(phone=phone):
+                with self.assertRaises(AuthError) as ctx:
+                    self._register(phone=phone)
+                self.assertEqual(ctx.exception.status, 400)
+                for table in tables:
+                    self.assertEqual(set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}'))),
+                                     before[table], table)
+        self.assertEqual(self.store.list_registrations(), [])
+        self.assertEqual(self.store.outbox_backlog()['pending'], 0)
+
+    def test_registration_phone_is_trimmed_persisted_and_kept_after_approval(self):
+        request = self._register(phone=' \t13800138000\r\n')
+        user = next(user for user in self.store.list_users() if user['username'] == 'zhangsan')
+        self.assertEqual(user['phone'], '13800138000')
+        self.assertEqual(self.store.db.execute('SELECT phone FROM users WHERE id=?',
+                                              (user['id'],)).fetchone()[0], '13800138000')
+        self.assertNotIn('phone', request)
+        self.store.close()
+        self.store = AuthStore(self.path)
+        self.assertEqual(self.store.get_user(user['id'])['phone'], '13800138000')
+        card = self.store.registration_card_data(request['request_id'])
+        self.assertNotIn('phone', card)
+        self.assertNotIn('13800138000', str(card))
+        self.store.decide_registration(card['out_track_id'], 'approved', 'corp', 'approver')
+        self.assertEqual(self.store.login('zhangsan', PASSWORD)['user']['phone'], '13800138000')
+
+    def test_failed_registration_preserves_existing_phone_and_records(self):
+        session = self.store.login('admin', PASSWORD)
+        self.store.set_phone(self.admin, '13800138000', session_token=session['token'])
+        request = self._register()
+        card = self.store.registration_card_data(request['request_id'])
+        for state, username, expected in (('approved', 'admin', 409),
+                                          ('pending', 'ZHANGSAN', 409),
+                                          ('rejected', 'zhangsan', 403)):
+            with self.subTest(state=state):
+                if state == 'rejected':
+                    self.store.decide_registration(card['out_track_id'], 'rejected', 'corp', 'approver')
+                before = {table: set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}')))
+                          for table in ('users', 'registration_requests', 'notification_outbox')}
+                with self.assertRaises(AuthError) as ctx:
+                    self._register(username=username, phone='13900139000')
+                self.assertEqual(ctx.exception.status, expected)
+                for table, rows in before.items():
+                    self.assertEqual(set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}'))),
+                                     rows, table)
+                self.assertEqual(self.store.get_user(self.admin)['phone'], '13800138000')
+                self.assertEqual(self.store.get_user(card['user_id'])['phone'], '13800138000')
 
     def test_v1_database_migrates_to_v2(self):
         legacy = self.path.parent / 'legacy.sqlite'
@@ -613,7 +866,8 @@ class RegistrationStoreTests(unittest.TestCase):
             self.assertFalse(users[0]['team_leader'])
             self.assertEqual(store._user('u1')['enabled'], 1)
             self.assertTrue(store.is_ready())
-            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 6)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 7)
+            self.assertEqual(users[0]['phone'], '')
             self.assertIsNone(store.get_project('legacy-project')['team_id'])
             self.assertEqual(store.list_project_shares('legacy-project', 'u1')['user_ids'], [])
         finally:
@@ -657,6 +911,7 @@ class RegistrationStoreTests(unittest.TestCase):
         self.assertEqual(row['decided_by'], '431661')
         session = self.store.login('zhangsan', PASSWORD)
         self.assertEqual(session['user']['approval_status'], 'approved')
+        self.assertEqual(session['user']['phone'], '13800138000')
         self.assertIsNotNone(self.store.get_session(session['token']))
 
     def test_decision_reject_blocks_and_reapply_forbidden(self):
@@ -740,6 +995,8 @@ class RegistrationStoreTests(unittest.TestCase):
         self.assertEqual(rows[0]['display_name'], '李四')
         self.assertEqual(rows[0]['status'], 'pending')
         self.assertNotIn('password', ' '.join(rows[0].keys()))
+        self.assertNotIn('phone', rows[0])
+        self.assertNotIn('13800138000', str(rows))
 
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
@@ -807,6 +1064,111 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/auth/logout', headers={'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']})
         self.assertEqual(response.status, 200)
         self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
+
+    async def test_phone_self_service_me_login_and_admin_list(self):
+        session = await self.login('user')
+        self.assertEqual(session['user']['phone'], '')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        self.store.set_ready()
+        self.store.create_project('p', self.uid)
+        # 补录由前端提示；后端业务接口暂不增加手机号门禁。
+        self.assertEqual((await self.client.get('/api/business')).status, 200)
+        self.assertEqual((await self.client.post('/api/project', headers=headers)).status, 200)
+        self.assertEqual((await self.client.get('/api/admin/users')).status, 403)
+        token = self.client.session.cookie_jar.filter_cookies(self.client.make_url('/'))[COOKIE].value
+        with patch.object(self.store, 'set_phone', wraps=self.store.set_phone) as set_phone:
+            response = await self.client.post('/api/auth/phone', json={'phone': ' \t13800138000\n'},
+                                              headers=headers)
+            self.assertEqual(response.status, 200, await response.text())
+            set_phone.assert_called_once_with(self.uid, ' \t13800138000\n', session_token=token)
+        self.assertEqual((await response.json())['user']['phone'], '13800138000')
+        self.assertNotIn('Set-Cookie', response.headers)
+        response = await self.client.get('/api/auth/me')
+        self.assertEqual(response.status, 200)
+        identity = await response.json()
+        self.assertEqual(identity['user']['id'], self.uid)
+        self.assertEqual(identity['user']['phone'], '13800138000')
+        self.assertEqual(identity['csrf_token'], session['csrf_token'])
+        self.assertEqual(self.store.get_session(token)['user']['phone'], '13800138000')
+        self.assertEqual((await self.client.get('/api/admin/users')).status, 403)
+        self.assertEqual((await self.login('user'))['user']['phone'], '13800138000')
+        await self.login()
+        response = await self.client.get('/api/admin/users')
+        self.assertEqual(response.status, 200)
+        users = {user['id']: user for user in (await response.json())['users']}
+        self.assertEqual(users[self.uid]['phone'], '13800138000')
+        self.assertTrue(all('phone' in user for user in users.values()))
+        self.assertEqual(next(user for user in users.values() if user['username'] == 'admin')['phone'], '')
+
+    async def test_phone_requires_login_same_origin_and_csrf(self):
+        url = '/api/auth/phone'
+        body = {'phone': '13800138000'}
+        response = await self.client.post(url, json=body, headers={'Origin': self.origin})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(self.store.get_user(self.uid)['phone'], '')
+        session = await self.login('user')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        before = set(map(tuple, self.store.db.execute('SELECT * FROM users')))
+        for invalid_headers in (
+            {'Origin': self.origin},
+            {**headers, 'X-CSRF-Token': 'wrong-csrf'},
+            {**headers, 'Origin': 'https://evil.invalid'},
+            {'X-CSRF-Token': session['csrf_token']},
+            {**headers, 'Sec-Fetch-Site': 'cross-site'},
+        ):
+            with self.subTest(headers=invalid_headers):
+                response = await self.client.post(url, json=body, headers=invalid_headers)
+                self.assertEqual(response.status, 403, await response.text())
+                self.assertEqual(set(map(tuple, self.store.db.execute('SELECT * FROM users'))), before)
+        response = await self.client.post(url, json=body, headers=headers)
+        self.assertEqual(response.status, 200, await response.text())
+
+    async def test_phone_rejects_invalid_json_types_formats_and_identity_fields(self):
+        session = await self.login('user')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        self.store.set_phone(self.uid, '13800138000', session_token=(
+            self.client.session.cookie_jar.filter_cookies(self.client.make_url('/'))[COOKIE].value))
+        admin = next(user['id'] for user in self.store.list_users() if user['role'] == 'admin')
+        bodies = [{}, [], None, '13800138000']
+        bodies.extend({'phone': value} for value in INVALID_PHONES)
+        bodies.extend({'phone': '13900139000', field: admin} for field in ('uid', 'user_id', 'id'))
+        bodies.append({'phone': '13900139000', 'uid': self.uid})
+        before = set(map(tuple, self.store.db.execute('SELECT * FROM users')))
+        for body in bodies:
+            with self.subTest(body=body):
+                response = await self.client.post('/api/auth/phone', json=body, headers=headers)
+                self.assertEqual(response.status, 400, await response.text())
+                self.assertEqual(set(map(tuple, self.store.db.execute('SELECT * FROM users'))), before)
+        response = await self.client.post('/api/auth/phone', data=b'{',
+                                          headers={**headers, 'Content-Type': 'application/json'})
+        self.assertEqual(response.status, 400)
+        self.assertEqual(set(map(tuple, self.store.db.execute('SELECT * FROM users'))), before)
+        self.assertEqual((await self.client.get('/api/auth/me')).status, 200)
+
+    async def test_phone_rejects_expired_logged_out_and_inactive_http_sessions(self):
+        for state in ('expired', 'logout', 'disabled', 'pending', 'rejected'):
+            with self.subTest(state=state):
+                session = await self.login('user')
+                headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+                token = self.client.session.cookie_jar.filter_cookies(self.client.make_url('/'))[COOKIE].value
+                if state == 'expired':
+                    self.store.db.execute('UPDATE sessions SET expires_at=0 WHERE token_hash=?',
+                                          (hashlib.sha256(token.encode()).hexdigest(),))
+                elif state == 'logout':
+                    response = await self.client.post('/api/auth/logout', headers=headers)
+                    self.assertEqual(response.status, 200)
+                elif state == 'disabled':
+                    self.store.db.execute('UPDATE users SET enabled=0 WHERE id=?', (self.uid,))
+                else:
+                    self.store.db.execute('UPDATE users SET approval_status=? WHERE id=?', (state, self.uid))
+                try:
+                    response = await self.client.post('/api/auth/phone', json={'phone': '13800138000'},
+                                                      headers=headers)
+                    self.assertEqual(response.status, 401, await response.text())
+                    self.assertEqual(self.store.get_user(self.uid)['phone'], '')
+                finally:
+                    self.store.db.execute("UPDATE users SET enabled=1,approval_status='approved' WHERE id=?",
+                                          (self.uid,))
 
     async def test_admin_assign_projects(self):
         admin = self.store.list_users()[0]['id']
@@ -976,6 +1338,8 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_team_api_requires_leader_and_manages_members(self):
         member = self.store.create_user('member', PASSWORD)
+        member_session = self.store.login('member', PASSWORD)
+        self.store.set_phone(member['id'], '13800138000', session_token=member_session['token'])
         normal = self.store.create_user('normal', PASSWORD)
         self.store.set_user(self.uid, team_leader=True)
         self.store.set_ready()
@@ -984,8 +1348,13 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/teams', json={'name': '项目一组'}, headers=headers)
         self.assertEqual(response.status, 201)
         team = (await response.json())['team']
-        candidates = await (await self.client.get('/api/team-candidates')).json()
+        response = await self.client.get('/api/team-candidates')
+        self.assertEqual(response.status, 200)
+        candidates = await response.json()
         self.assertIn(member['id'], {user['id'] for user in candidates['users']})
+        for user in candidates['users']:
+            self.assertNotIn('phone', user)
+        self.assertNotIn('13800138000', str(candidates))
         response = await self.client.post(f"/api/teams/{team['id']}/members",
                                           json={'user_id': member['id']}, headers=headers)
         self.assertEqual(response.status, 201)
@@ -1073,15 +1442,20 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_register_flow_over_http(self):
         url = '/api/auth/register'
-        body = {'username': 'wangwu', 'display_name': '王五', 'password': PASSWORD}
+        body = {'username': 'wangwu', 'display_name': '王五', 'password': PASSWORD,
+                'phone': '13800138000'}
         # 审批通道未配置：fail-closed，不产生申请
+        before = set(map(tuple, self.store.db.execute('SELECT * FROM users')))
         self.assertEqual((await self.client.post(url, json=body, headers={'Origin': self.origin})).status, 503)
+        self.assertEqual(set(map(tuple, self.store.db.execute('SELECT * FROM users'))), before)
+        self.assertEqual(self.store.list_registrations(), [])
+        self.assertEqual(self.store.outbox_backlog()['pending'], 0)
         self.client.server.app['dingtalk'] = {'stub': True}
         # 来源校验与字段校验
         self.assertEqual((await self.client.post(url, json=body)).status, 403)
         self.assertEqual((await self.client.post(url, json={'username': 'a'}, headers={'Origin': self.origin})).status, 400)
         self.assertEqual((await self.client.post(
-            url, json={'username': 'wangwu', 'display_name': '王五', 'password': 'short'},
+            url, json={**body, 'password': 'short'},
             headers={'Origin': self.origin})).status, 400)
         # 提交成功 → 201，待审账号不能登录
         response = await self.client.post(url, json=body, headers={'Origin': self.origin})
@@ -1097,6 +1471,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.store.decide_registration(card['out_track_id'], 'approved', 'corp', '431661')
         ok = await self.client.post('/api/auth/login', json={'username': 'wangwu', 'password': PASSWORD}, headers={'Origin': self.origin})
         self.assertEqual(ok.status, 200)
+        self.assertEqual((await ok.json())['user']['phone'], '13800138000')
         admin = await self.login()
         registrations = await self.client.get('/api/admin/registrations',
                                               headers={'Origin': self.origin})
@@ -1104,8 +1479,40 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         payload = await registrations.json()
         self.assertEqual(payload['requests'][0]['display_name'], '王五')
         self.assertEqual(payload['requests'][0]['status'], 'approved')
+        self.assertNotIn('phone', payload['requests'][0])
+        self.assertNotIn('13800138000', str(payload['requests']))
         # 测试内没有发件箱 worker：send + update 两条任务保持待投递状态
         self.assertEqual(payload['outbox']['pending'], 2)
+        self.client.server.app['dingtalk'] = None
+
+    async def test_register_missing_and_invalid_phone_leave_no_records_or_phone_loss(self):
+        self.client.server.app['dingtalk'] = {'stub': True}
+        session = self.store.login('user', PASSWORD)
+        self.store.set_phone(self.uid, '13800138000', session_token=session['token'])
+        body = {'username': 'new-registration', 'display_name': '新人', 'password': PASSWORD}
+        before = {table: set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}')))
+                  for table in ('users', 'registration_requests', 'notification_outbox')}
+        for invalid in [body] + [{**body, 'phone': phone} for phone in INVALID_PHONES]:
+            with self.subTest(body=invalid):
+                # 每个输入校验场景独立计数；注册限流另有专门测试，不在此处掩盖 400。
+                self.client.server.app['_auth_register_limits'].clear()
+                response = await self.client.post('/api/auth/register', json=invalid,
+                                                  headers={'Origin': self.origin})
+                self.assertEqual(response.status, 400, await response.text())
+                for table, rows in before.items():
+                    self.assertEqual(set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}'))),
+                                     rows, table)
+                self.assertEqual(self.store.get_user(self.uid)['phone'], '13800138000')
+        self.client.server.app['_auth_register_limits'].clear()
+        response = await self.client.post('/api/auth/register', json={
+            **body, 'phone': ' \t13800138000\r\n'}, headers={'Origin': self.origin})
+        self.assertEqual(response.status, 201, await response.text())
+        self.assertEqual((await response.json())['status'], 'pending')
+        user = next(user for user in self.store.list_users() if user['username'] == body['username'])
+        self.assertEqual(user['phone'], '13800138000')
+        self.assertEqual(len(self.store.list_registrations()), 1)
+        self.assertEqual(self.store.outbox_backlog()['pending'], 1)
+        self.assertEqual(self.store.get_user(self.uid)['phone'], '13800138000')
         self.client.server.app['dingtalk'] = None
 
     async def test_eight_character_password_policy_over_http(self):
@@ -1115,6 +1522,7 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         for value, expected in (('12345678', 400), ('riverpad', 201)):
             response = await self.client.post('/api/auth/register', json={
                 'username': 'new-registration', 'display_name': '新人', 'password': value,
+                'phone': '13800138000',
             }, headers=headers)
             self.assertEqual(response.status, expected)
             response = await self.client.post('/api/admin/users', json={
@@ -1139,16 +1547,25 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
     async def test_register_duplicate_and_casefold(self):
         self.client.server.app['dingtalk'] = {'stub': True}
         url = '/api/auth/register'
-        body = {'username': 'wangwu', 'display_name': '王五', 'password': PASSWORD}
+        body = {'username': 'wangwu', 'display_name': '王五', 'password': PASSWORD,
+                'phone': '13800138000'}
         self.assertEqual((await self.client.post(url, json=body, headers={'Origin': self.origin})).status, 201)
+        before = {table: set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}')))
+                  for table in ('users', 'registration_requests', 'notification_outbox')}
+        body['phone'] = '13900139000'
         self.assertEqual((await self.client.post(url, json=body, headers={'Origin': self.origin})).status, 409)
-        # 大小写不同视为同名，同样冲突
+        # 大小写不同视为同名，同样冲突，失败提交不得覆盖原号码或新增任务。
         self.assertEqual((await self.client.post(url, json={**body, 'username': 'WANGWU'}, headers={'Origin': self.origin})).status, 409)
+        for table, rows in before.items():
+            self.assertEqual(set(map(tuple, self.store.db.execute(f'SELECT * FROM {table}'))), rows, table)
+        user = next(user for user in self.store.list_users() if user['username'] == 'wangwu')
+        self.assertEqual(user['phone'], '13800138000')
         self.client.server.app['dingtalk'] = None
 
     async def test_register_rate_limit(self):
         self.client.server.app['dingtalk'] = {'stub': True}
-        body = {'username': 'spam', 'display_name': '刷', 'password': PASSWORD}
+        body = {'username': 'spam', 'display_name': '刷', 'password': PASSWORD,
+                'phone': '13800138000'}
         statuses = []
         for _ in range(6):
             response = await self.client.post('/api/auth/register', json=body,
