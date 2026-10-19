@@ -138,6 +138,26 @@ class CostLedger:
                 except ValueError:
                     pass
 
+        # 重启后的 backfill 只有派发图，没有原始 params；成片规格必须从同一张图恢复。
+        for node in graph.values():
+            if not isinstance(node, dict) or node.get("class_type") not in {"CreateVideo", "VHS_VideoCombine"}:
+                continue
+            output = node.get("inputs") or {}
+            link = output.get("images")
+            if (not isinstance(link, list) or len(link) != 2
+                    or not str(link[0]).startswith("follow_reference_scale_")):
+                continue
+            scaled = graph[str(link[0])]["inputs"]
+            fps = output.get("fps", output.get("frame_rate"))
+            if node["class_type"] == "CreateVideo":
+                seconds = dims["source_duration"]
+            else:
+                trim = graph[str(scaled["image"][0])]["inputs"]
+                seconds = round(trim["length"] / fps, 9)
+            dims.update(width=scaled["width"], height=scaled["height"], duration=seconds,
+                        output_width=scaled["width"], output_height=scaled["height"],
+                        output_duration=seconds, output_fps=fps, output_count=1)
+
         if capability == "minimax_h3_comic20":
             dims["segment_count"] = max(1, dims.get("image_count") or 0)
         return {k: v for k, v in dims.items() if v is not None}

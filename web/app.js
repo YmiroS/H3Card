@@ -419,14 +419,14 @@ const MULT = 32;
 
 /** 正算：比例 + megapixels -> [宽, 高]，与 ResolutionSelector 逐步一致 */
 function resFromMP(ratio, mp) {
-  const [wr, hr] = RATIO_WH[ratio] || [1, 1];
+  const [wr, hr] = Array.isArray(ratio) ? ratio : RATIO_WH[ratio] || [1, 1];
   const scale = Math.sqrt(mp * 1024 * 1024 / (wr * hr));
   return [Math.round(wr * scale / MULT) * MULT, Math.round(hr * scale / MULT) * MULT];
 }
 /** 反算：想让短边正好落在 p 上，megapixels 该给多少。
     32 的取整网格上不是每个 megapixels 都能命中，所以按 0.01 往两边试，验算命中为准。*/
 function mpForP(ratio, p) {
-  const [wr, hr] = RATIO_WH[ratio] || [1, 1];
+  const [wr, hr] = Array.isArray(ratio) ? ratio : RATIO_WH[ratio] || [1, 1];
   const scale = p / Math.min(wr, hr);
   const base = Math.round(scale * scale * wr * hr / (1024 * 1024) * 100) / 100;
   for (const d of [0, 1, -1, 2, -2, 3, -3]) {
@@ -547,6 +547,82 @@ function imageClarityPicker(c, cap, onchange) {
 
 const whClaritySteps = cap => cap.outputType === "video"
   ? H3_P.map(p => ({ id: `${p}p`, label: `${p}p`, val: p })) : CLARITY_STEPS;
+const videoFollowSpec = {
+  key: "follow_reference_video", label: "跟随参考视频比例和时长", type: "select",
+  appearance: "switch", options: ["off", "on"], default: "on",
+};
+const supportsVideoFollow = cap => cap?.kind === "gen" && cap.outputType === "video"
+  && cap.id.startsWith("minimax_h3_") && cap.inputs.some(s => s.type === "video");
+const referenceVideo = (c, cap) => supportsVideoFollow(cap)
+  ? cap.inputs.filter(s => s.type === "video").map(s => c.assets?.[s.key]).find(a => a?.ref) : null;
+const followingVideo = (c, cap) => (c.params.follow_reference_video ?? "on") === "on" ? referenceVideo(c, cap) : null;
+const videoMetadataReady = a => a && [a.width, a.height, a.duration].every(v => Number.isFinite(+v) && +v > 0);
+const referenceMetadata = new WeakMap();
+
+function referenceDimensions(c, cap, source, multiple = 2) {
+  const value = key => c.params[key] ?? cap.inputs.find(s => s.key === key)?.default;
+  const mp = cap.inputs.some(s => s.key === "megapixels");
+  const scale = mp ? Math.sqrt(+value("megapixels") * 1024 * 1024 / (source.width * source.height))
+    : Math.min(+value("width"), +value("height")) / Math.min(source.width, source.height);
+  const upscale = multiple === 2 && cap.id === "minimax_h3_ref_2pass" ? +value("scale_by") : 1;
+  return [source.width, source.height].map(v => Math.max(multiple, Math.round(v * scale * upscale / multiple) * multiple));
+}
+function referenceRatio(source) {
+  let w = Math.round(source.width), h = Math.round(source.height);
+  let a = w, b = h;
+  while (b) { [a, b] = [b, a % b]; }
+  return `${w / a}:${h / a}`;
+}
+async function ensureReferenceMetadata(c, cap = CAPS[runCap(c)] || capOf(c)) {
+  const source = followingVideo(c, cap);
+  if (!source || videoMetadataReady(source)) return;
+  if (referenceMetadata.has(source)) return referenceMetadata.get(source).promise;
+  const project = PROJ;
+  const state = {};
+  referenceMetadata.set(source, state);
+  state.promise = api("/api/media?ref=" + encodeURIComponent(source.ref) + "&project=" + encodeURIComponent(project.id))
+    .then(info => {
+      if (!videoMetadataReady(info)) throw new Error("无法读取参考视频的比例和时长，请重新导入视频");
+      if (PROJ !== project || !project.cards.includes(c) || referenceVideo(c, cap) !== source) return;
+      Object.assign(source, info);
+      save();
+    }).catch(error => { state.error = error.message; throw error; });
+  return state.promise;
+}
+function refreshReferencePreview(c) {
+  if (!PROJ?.cards.includes(c) || el.panel._id !== c.id) return;
+  const cap = CAPS[runCap(c)] || capOf(c);
+  const button = el.panel.querySelector('button[title^="点开弹窗"]');
+  if (button) button.textContent = `⚙ ${paramsBrief(c, cap) || "参数"}`;
+  if (el.respop._card === c && el.respop.style.display !== "none") {
+    if (el.respop._cap !== cap.id) closeResPop();
+    else el.respop._refill();
+  }
+}
+function videoFollowControl(c, cap, onchange) {
+  const box = document.createElement("div"); box.className = "reference-follow";
+  box.appendChild(rowEl(c, videoFollowSpec, () => {
+    onchange();
+    ensureReferenceMetadata(c, cap).catch(() => {}).finally(() => refreshReferencePreview(c));
+  }));
+  const note = document.createElement("div"); note.className = "knobnote"; note.setAttribute("role", "status");
+  const source = followingVideo(c, cap);
+  note.textContent = !referenceVideo(c, cap) ? "引入视频后默认沿用它的画面比例和总时长，清晰度仍可调整。"
+    : !source ? "已关闭，可手动设置比例和时长。"
+    : videoMetadataReady(source) ? `参考 ${referenceRatio(source)} · ${+source.duration} 秒 → ${referenceDimensions(c, cap, source).join(" × ")}；输出尺寸按偶数像素对齐。`
+    : referenceMetadata.get(source)?.error || "正在读取参考视频的比例和时长…";
+  box.appendChild(note);
+  if (source && referenceMetadata.get(source)?.error) {
+    const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重新读取";
+    retry.onclick = () => {
+      referenceMetadata.delete(source);
+      ensureReferenceMetadata(c, cap).catch(() => {}).finally(() => refreshReferencePreview(c));
+      onchange();
+    };
+    box.appendChild(retry);
+  }
+  return box;
+}
 const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length"]);
 const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
   !RES_PARAM_KEYS.has(s.key) && !MEDIA.includes(s.type) && s.type !== "textarea"
@@ -576,12 +652,16 @@ function openResPop(c, anchor) {
       位置不动：只换 innerHTML，left/top 留在 style 上。 */
   let expanded = false;
   const refill = () => {
+    const focused = el.respop.contains(document.activeElement) ? document.activeElement.id : null;
     el.respop.innerHTML = "";
+    if (supportsVideoFollow(cap)) el.respop.appendChild(videoFollowControl(c, cap, () => { refill(); position(); }));
     if (hasResolution) el.respop.appendChild(clarityPicker(c, cap, refill));
     if (params.length) {
       const pwrap = document.createElement("div"); pwrap.className = cap.imageControls ? "pwrap image-basic" : "pwrap";
       if (hasResolution) pwrap.style.marginTop = "12px";
       for (const s of params) {
+        if (followingVideo(c, cap) && (s.key === "preview_seconds"
+          || (s.key === "duration" && !cap.inputs.some(x => x.key === "preview_seconds")))) continue;
         const row = rowEl(c, s);
         for (const input of row.querySelectorAll("input, select")) {
           input.addEventListener("input", refreshBrief);
@@ -614,9 +694,17 @@ function openResPop(c, anchor) {
     el.respop.appendChild(x);
     // 面板底部 ⚙ 胶囊的摘要跟着新选择变，不重建整个面板。
     refreshBrief();
+    if (focused) document.getElementById(focused)?.focus({preventScroll: true});
+  };
+  el.respop._card = c; el.respop._cap = cap.id;
+  el.respop._refill = () => {
+    refill();
+    const bounds = el.respop.getBoundingClientRect();
+    if (bounds.top < 8 || bounds.bottom > innerHeight - 8) position();
   };
   refill();
   el.respop.style.display = "";
+  ensureReferenceMetadata(c, cap).catch(() => {}).finally(() => refreshReferencePreview(c));
   // 打开或展开专属参数时避让底部按钮；选择比例和清晰度时不重新定位。
   function position() {
     if (el.respop.style.display === "none" || !anchor.isConnected) return;
@@ -632,7 +720,10 @@ function openResPop(c, anchor) {
   }
   position();
 }
-const closeResPop = () => (el.respop.style.display = "none");
+const closeResPop = () => {
+  el.respop.style.display = "none";
+  el.respop._card = null; el.respop._refill = null;
+};
 
 /** 清晰度+比例选择器。能换的比例/清晰度按这个节点当前能力的参数体系画：
     有 aspect_ratio+megapixels 的走 H3 那套；width+height 的（文生图）算像素面积折 K 档。
@@ -644,6 +735,7 @@ function clarityPicker(c, cap, onchange) {
   const resolutionSpec = cap.inputs.find(x => x.key === "resolution");
   const wSpec = cap.inputs.find(x => x.key === "width") && cap.inputs.find(x => x.key === "height");
   const stlSpec = cap.inputs.find(x => x.key === "scale_to_length");
+  const source = followingVideo(c, cap);
 
   const wrap = document.createElement("div"); wrap.className = "cpick";
 
@@ -729,7 +821,7 @@ function clarityPicker(c, cap, onchange) {
   // 两套体系都有比例：select 那套（H3）直接换档；width/height 那套（文生图）
   // 把比例记在 c.params._ratio，宽高每次照 比例×清晰度 现算（选哪个另一个跟着变）
   const isWH = !arSpec && wSpec;
-  if (arSpec || isWH) {
+  if ((arSpec || isWH) && !source) {
     // 文生图当前比例：记过 _ratio 用它；没记过就从现有宽高反推最接近的档；都没有给默认 3:4
     const cur = arSpec
       ? (c.params.aspect_ratio != null ? c.params.aspect_ratio : arSpec.default)
@@ -794,13 +886,13 @@ function clarityPicker(c, cap, onchange) {
   // 实际只有 384p，跟工作流默认（说话 0.4MP=480p、漫剧 0.5MP=544p、参考 0.7MP=640p）
   // 完全对不上号，选中态也亮不出来。
   const mpRatio = mpSpec
-    ? (c.params.aspect_ratio != null ? c.params.aspect_ratio
+    ? (videoMetadataReady(source) ? [source.width, source.height] : c.params.aspect_ratio != null ? c.params.aspect_ratio
       : (cap.inputs.find(x => x.key === "aspect_ratio") || { default: "16:9 (Widescreen)" }).default)
     : null;
   if (mpSpec || wSpec) {
     const steps = [];
     if (mpSpec) {
-      const hi = mpSpec.max ?? 1.1;
+      const hi = source ? 16 : mpSpec.max ?? 1.1;
       for (const p of H3_P) {
         const v = mpForP(mpRatio, p);
         if (v > hi + 0.01) continue;
@@ -834,6 +926,10 @@ function clarityPicker(c, cap, onchange) {
         b.title = isW
           ? `${Math.round(s.val * r[1] / r[2] / multiple) * multiple} × ${s.val}`
           : `${s.val} × ${Math.round(s.val * r[2] / r[1] / multiple) * multiple}`;
+      }
+      if (videoMetadataReady(source)) {
+        const params = { ...c.params, ...(mpSpec ? {megapixels: s.val} : {width: s.val, height: s.val}) };
+        b.title = referenceDimensions({...c, params}, cap, source).join(" × ");
       }
       b.onclick = () => {
         if (mpSpec) { c.params.megapixels = s.val; }
@@ -894,6 +990,10 @@ function whStep(cap, c) {
     没有分辨率参数的能力返回 null（胶囊就只写「参数」）。 */
 function paramsBrief(c, cap) {
   if (!cap) return null;
+  const source = followingVideo(c, cap);
+  if (source) return videoMetadataReady(source)
+    ? `参考 ${referenceRatio(source)} · ${Math.min(...referenceDimensions(c, cap, source))}p · ${+source.duration}秒`
+    : "跟随参考 · 待读取";
   if (cap.imageControls) {
     const current = imageSettings(c, cap);
     return `${current.ratio === "original" ? "原图" : current.ratio} · ${current.clarity}`;
@@ -5723,6 +5823,10 @@ function openPanel(id) {
 
   placePanel();
   body.scrollTop = scrolled;      // 必须等内容进了 DOM 才有 scrollHeight 可滚
+  refreshReferencePreview(c);
+  if (followingVideo(c, rcap || cap)) {
+    ensureReferenceMetadata(c, rcap || cap).catch(() => {}).finally(() => refreshReferencePreview(c));
+  }
 }
 
 function errBox(t) { const d = document.createElement("div"); d.className = "err"; d.textContent = t; return d; }
@@ -6994,10 +7098,11 @@ async function rewritePrompt(c, s, model) {
   // **解析 @引用**：将 @卡片名 替换为 <Picture N> 等标签
   const resolvedPrompt = resolveCardMentions(src, c);
 
-  const pl = payloadOf(c);
   c._rwBusy = true; c._rwErr = null;
   repanel(c);
   try {
+    await ensureReferenceMetadata(c);
+    const pl = payloadOf(c);
     // prompt 是解析后的词，接入的文本另外给 —— 让模型把文本融进输出里。用户选「优化后」时
     // 提交的就是这份输出原样，系统不再拼文本节点（payloadOf），所以必须融进去
     const r = await jpost("/api/rewrite", {
@@ -7569,7 +7674,7 @@ function addAssetCard() {
   });
 }
 
-function rowEl(c, s) {
+function rowEl(c, s, onchange) {
   const row = document.createElement("div"); row.className = "row";
   const lb = document.createElement("label"); lb.textContent = s.label; lb.title = s.hint || s.label;
   row.appendChild(lb);
@@ -7619,7 +7724,7 @@ function rowEl(c, s) {
     };
     toggle.onclick = () => {
       c.params[s.key] = toggle.getAttribute("aria-checked") === "true" ? "off" : "on";
-      sync(); save();
+      sync(); save(); onchange && onchange();
     };
     sync(); row.appendChild(toggle);
   } else if (s.type === "select" && s.options) {
@@ -7812,6 +7917,14 @@ function payloadOf(c) {
     if (supplement.length && s.key === "prompt") params[s.key] += "\n" + supplement.join("\n");
   }
   applyInputPresets(cap, params);
+  if (supportsVideoFollow(cap)) {
+    params.follow_reference_video = c.params.follow_reference_video ?? "on";
+    const source = followingVideo(c, cap);
+    if (videoMetadataReady(source)) {
+      if (cap.inputs.some(s => s.key === "preview_seconds")) params.preview_seconds = 0;
+      else params.duration = +source.duration;
+    }
+  }
   if (cap.imageControls) {
     const selected = imageSettings(c, cap);
     params.image_ratio = selected.ratio;
@@ -7855,6 +7968,7 @@ async function runCard(c) {
   c.error = null; c.progress = 0; c.status = "queued"; c.outputs = []; c.ms = null; c.step = "";
   paint(c); openPanel(c.id);      // status 一进 queued，paint 就把画面区换成加载态
   try {
+    await ensureReferenceMetadata(c);
     const pl = payloadOf(c);
     const job = await jpost("/api/generate", pl);
     c.job = job.id; c.seed = job.seed; c.status = job.status;

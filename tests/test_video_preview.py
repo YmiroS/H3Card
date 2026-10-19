@@ -1,6 +1,10 @@
 import asyncio
+import ast
+import copy
 import json
+import math
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -14,6 +18,7 @@ sys.path.insert(0, str(ROOT / "server"))
 sys.path.insert(0, str(ROOT / "tests"))
 import app as controller_app
 import auth_support
+from capacity import CapacityStore
 from video_preview import VideoPreviews
 
 
@@ -319,6 +324,537 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtur
         self.assertEqual(len(await response.read()), 32)
         response = await self.client.get(asset["url"])
         self.assertEqual(await response.read(), original)
+
+
+class FollowReferenceVideoTest(unittest.TestCase):
+    """真实 manifest/图的离线补丁测试，不启动 HTTP、数据库或生成服务。"""
+    capabilities = ("minimax_h3_ref9", "minimax_h3_ref_2pass",
+                    "minimax_h3_fusion_v2", "minimax_h3_character_transfer")
+    ref = "chouka/reference.mp4"
+
+    def cap(self, cid):
+        return json.loads((ROOT / "manifests" / f"{cid}.json").read_text(encoding="utf-8"))
+
+    def graph(self, cap):
+        return json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
+
+    def patch(self, cid, info=None, params=None, assets=None):
+        cap = self.cap(cid)
+        metadata = {"width": 1000, "height": 733, "duration": 6, "has_audio": True}
+        if info is not None:
+            metadata.update(info)
+        params = {"seed": 42, "follow_reference_video": "on", **(params or {})}
+        assets = {"video[0]": self.ref, "images[0]": "chouka/person.png"} if assets is None else assets
+        with mock.patch.object(controller_app, "probe_video", side_effect=AssertionError("must use cache")):
+            graph = controller_app.patch_graph(cap, params, assets, {self.ref: metadata})
+        return cap, params, graph
+
+    def output(self, graph, character=False):
+        return next(node["inputs"] for node in graph.values()
+                    if node["class_type"] == ("CreateVideo" if character else "VHS_VideoCombine"))
+
+    def test_all_four_caps_follow_arbitrary_ratio_and_keep_templates_models(self):
+        for cid in self.capabilities:
+            with self.subTest(cid=cid):
+                cap = self.cap(cid)
+                before = (ROOT / cap["graph"]).read_bytes()
+                original = self.graph(cap)
+                _, _, baseline = self.patch(cid, params={"follow_reference_video": "off"})
+                _, params, graph = self.patch(cid)
+                character = cid.endswith("character_transfer")
+                if character:
+                    # 人物迁移保持原手动短边 352，而不是默认长边 640。
+                    ideal_width, ideal_height = 352 * 1000 / 733, 352
+                    planner = graph["11"]["inputs"]
+                    self.assertEqual((planner["width"], planner["height"]),
+                                     (round(ideal_width / 32) * 32, round(ideal_height / 32) * 32))
+                    self.assertEqual(params["preview_seconds"], 0)
+                else:
+                    mp = next(s["default"] for s in cap["inputs"] if s["key"] == "megapixels")
+                    ideal_width = math.sqrt(mp * 1024 * 1024 * 1000 / 733)
+                    ideal_height = math.sqrt(mp * 1024 * 1024 * 733 / 1000)
+                    selectors = {s["target"]["node"] for s in cap["inputs"] if s["key"] == "aspect_ratio"}
+                    for node in graph.values():
+                        for link in node["inputs"].values():
+                            self.assertFalse(isinstance(link, list) and len(link) == 2
+                                             and link[0] in selectors and link[1] in (0, 1))
+                        if node["class_type"] == "MiniMaxH3ReferenceToVideo":
+                            self.assertEqual((node["inputs"]["width"], node["inputs"]["height"]),
+                                             (round(ideal_width / 32) * 32, round(ideal_height / 32) * 32))
+                    for selector in selectors:
+                        self.assertEqual(graph[selector], original[selector])
+                    self.assertEqual(params["duration"], 6)
+                output = self.output(graph, character)
+                scale = graph[output["images"][0]]
+                self.assertEqual(scale["class_type"], "ImageScale")
+                scale = scale["inputs"]
+                factor = 1.5 if cid.endswith("ref_2pass") else 1
+                self.assertEqual((scale["width"], scale["height"]),
+                                 (round(ideal_width * factor / 2) * 2,
+                                  round(ideal_height * factor / 2) * 2))
+                self.assertLessEqual(abs(scale["width"] - ideal_width * factor), 1)
+                self.assertLessEqual(abs(scale["height"] - ideal_height * factor), 1)
+                self.assertEqual((scale["upscale_method"], scale["crop"]), ("bicubic", "disabled"))
+                for nid, node in original.items():
+                    if any(part in node["class_type"] for part in
+                           ("UNETLoader", "CLIPLoader", "VAELoader", "LoraLoader", "KSamplerSelect",
+                            "ManualSigmas", "BasicScheduler", "SamplerCustomAdvanced", "FiniteSegmentSampler")):
+                        self.assertEqual(graph[nid], baseline[nid])
+                for nid in graph.keys() - original.keys():
+                    self.assertRegex(graph[nid]["_meta"]["title"], r"[\u4e00-\u9fff]")
+                self.assertEqual((ROOT / cap["graph"]).read_bytes(), before)
+
+    def test_capacity_and_costs_use_final_delivery_not_generation_dimensions(self):
+        for cid in self.capabilities:
+            with self.subTest(cid=cid):
+                cap, params, graph = self.patch(
+                    cid, {"width": 720, "height": 1280, "duration": 10.013},
+                    {"duration": 7, "output_width": 999, "output_duration": 1})
+                output = self.output(graph, cid.endswith("character_transfer"))
+                scaled = graph[output["images"][0]]["inputs"]
+                dims = controller_app.CostLedger.dimensions(
+                    None, cid, params, {"video[0]": self.ref}, graph,
+                    lambda ref: {"duration": 10.013})
+                self.assertEqual((dims["width"], dims["height"], dims["duration"]),
+                                 (scaled["width"], scaled["height"], 10.013))
+                self.assertEqual(params["duration"], 7 if cid.endswith("character_transfer") else 10.013)
+                for recorded in (dims, {}):
+                    spec = controller_app.make_spec(cid, {**params, "output_kind": "video"}, graph, recorded)
+                    expected = spec["expected"]
+                    self.assertEqual((expected["width"], expected["height"], expected["duration"]),
+                                     (scaled["width"], scaled["height"], 10.013))
+                    actual = {**expected, "valid": True, "bytes": 100000}
+                    count, _, warnings = CapacityStore._technical(spec, "done", [actual])
+                    self.assertEqual(count, 1)
+                    self.assertEqual(warnings, [])
+
+    def test_follow_delivery_dimensions_and_estimates_survive_dispatch_backfill(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ledger = controller_app.CostLedger(Path(folder) / "costs.db", ROOT / "pricing.json")
+            try:
+                ledger.db.execute("CREATE TABLE dispatch_jobs(job_id TEXT,status TEXT,worker_id TEXT,"
+                                  "payload_json TEXT,created_at REAL,updated_at REAL)")
+                snapshots = {}
+                for cid in self.capabilities:
+                    _, params, graph = self.patch(
+                        cid, {"width": 1000, "height": 738, "duration": 19.125},
+                        {"width": 768, "height": 768, "duration": 7})
+                    assets = {"video[0]": self.ref, "images[0]": "chouka/person.png"}
+                    ledger.record_job({"id": cid, "capability": cid, "status": "queued", "created": 1},
+                                      params, assets, graph, lambda ref: {"duration": 19.125})
+                    payload = json.dumps({"capability": cid, "graph": graph, "assets": assets})
+                    ledger.db.execute("INSERT INTO dispatch_jobs VALUES (?,?,?,?,?,?)",
+                                      (cid, "queued", "worker", payload, 1, 1))
+                    snapshots[cid] = dict(ledger.db.execute(
+                        "SELECT * FROM cost_events WHERE job_id=?", (cid,)).fetchone())
+                ledger.db.commit()
+                ledger.backfill([])
+                for cid, before in snapshots.items():
+                    with self.subTest(cid=cid):
+                        after = dict(ledger.db.execute(
+                            "SELECT * FROM cost_events WHERE job_id=?", (cid,)).fetchone())
+                        old_dims, new_dims = (json.loads(row["dimensions_json"]) for row in (before, after))
+                        for key in ("width", "height", "duration", "output_width", "output_height",
+                                    "output_duration", "output_fps", "output_count"):
+                            self.assertEqual(new_dims[key], old_dims[key], key)
+                        for key in ("estimated_min_micros", "estimated_max_micros"):
+                            self.assertEqual(after[key], before[key], key)
+            finally:
+                ledger.close()
+
+    def test_follow_without_reference_does_not_trust_client_delivery_contract(self):
+        forged = {"output_" + key: 999 for key in ("width", "height", "duration", "fps", "count")}
+        for cid in self.capabilities[:3]:
+            with self.subTest(cid=cid):
+                _, params, _ = self.patch(cid, params=forged, assets={})
+                self.assertTrue(all(key not in params for key in forged))
+
+    def test_default_off_and_no_video_preserve_old_patched_graph(self):
+        for cid in self.capabilities:
+            cap = self.cap(cid)
+            assets = {"video[0]": self.ref, "images[0]": "chouka/person.png"}
+            metadata = {self.ref: {"duration": 20, "has_audio": True}}
+            with self.subTest(cid=cid), mock.patch.object(controller_app, "probe_video") as probe:
+                baseline = controller_app.patch_graph(cap, {"seed": 42}, assets, metadata)
+                for switch in ("off", True, "ON", None):
+                    graph = controller_app.patch_graph(
+                        cap, {"seed": 42, "follow_reference_video": switch}, assets, metadata)
+                    self.assertEqual(graph, baseline)
+                if not cid.endswith("character_transfer"):
+                    without = controller_app.patch_graph(cap, {"seed": 42}, {}, {})
+                    followed = controller_app.patch_graph(
+                        cap, {"seed": 42, "follow_reference_video": "on"}, {}, {})
+                    self.assertEqual(followed, without)
+                probe.assert_not_called()
+
+    def test_six_seconds_pad_158_but_trim_144_not_slow_motion(self):
+        for cid in self.capabilities[:3]:
+            with self.subTest(cid=cid):
+                cap, _, graph = self.patch(cid)
+                original = self.graph(cap)
+                for nid, node in graph.items():
+                    if node["class_type"] == "MiniMaxH3ReferenceToVideo":
+                        self.assertEqual(node["inputs"]["length"], 158)
+                    elif node["class_type"].startswith("VHS_LoadVideo"):
+                        self.assertEqual(node["inputs"]["force_rate"], 24)
+                        self.assertEqual(node["inputs"]["frame_load_cap"], 158)
+                        self.assertEqual(node["inputs"]["video"], self.ref)
+                output = self.output(graph)
+                scale = graph[output["images"][0]]["inputs"]
+                trim = graph[scale["image"][0]]
+                self.assertEqual(trim["class_type"], "ImageFromBatch")
+                self.assertEqual(trim["inputs"], {"image": self.output(original)["images"],
+                                                  "batch_index": 0, "length": 144})
+                self.assertEqual(output["frame_rate"], 24)
+                self.assertFalse(output["trim_to_audio"])
+                self.assertEqual(output["audio"], self.output(original)["audio"])
+
+    def test_fractional_seconds_preserve_exact_duration(self):
+        for cid in self.capabilities[:3]:
+            for seconds in (6.013, 0.25, 16.127):
+                with self.subTest(cid=cid, seconds=seconds):
+                    cap, params, graph = self.patch(cid, {"duration": seconds})
+                    n = max(1, round(seconds * 24))
+                    output = self.output(graph)
+                    scale = graph[output["images"][0]]["inputs"]
+                    self.assertEqual(graph[scale["image"][0]]["inputs"]["length"], n)
+                    self.assertAlmostEqual(n / output["frame_rate"], seconds)
+                    self.assertEqual(params["duration"], seconds)
+                    duration_spec = next(s for s in cap["inputs"] if s["key"] == "duration")
+                    self.assertEqual(graph[duration_spec["target"]["node"]]["inputs"]["value"], seconds)
+
+    def test_reference_shorter_than_five_frames_is_rejected_before_generation(self):
+        for cid in self.capabilities[:3]:
+            for seconds in (0.02, 0.1):
+                with self.subTest(cid=cid, seconds=seconds), self.assertRaises(web.HTTPBadRequest) as error:
+                    self.patch(cid, {"duration": seconds})
+                self.assertIn("至少需要 5 帧", error.exception.reason)
+
+    def test_real_frame_limit_not_manifest_fifteen_seconds(self):
+        for seconds in (16, 30, 149.6666666667):
+            _, _, graph = self.patch(self.capabilities[0], {"duration": seconds})
+            reference = next(n for n in graph.values() if n["class_type"] == "MiniMaxH3ReferenceToVideo")
+            self.assertLessEqual(reference["inputs"]["length"], 3600)
+        for seconds in (150, 200, 1e308):
+            with self.subTest(seconds=seconds), self.assertRaises(web.HTTPBadRequest) as error:
+                self.patch(self.capabilities[0], {"duration": seconds})
+            self.assertRegex(error.exception.reason, "3600|时长超出")
+
+    def test_megapixels_custom_scale_and_portrait_not_capped_by_manifest(self):
+        _, _, graph = self.patch(self.capabilities[1], {"width": 731, "height": 1024},
+                                 {"megapixels": 2.5, "scale_by": 2})
+        output = self.output(graph)
+        scale = graph[output["images"][0]]["inputs"]
+        self.assertEqual(scale["width"], round(math.sqrt(2.5 * 1024 * 1024 * 731 / 1024) * 2 / 2) * 2)
+        self.assertEqual(scale["height"], round(math.sqrt(2.5 * 1024 * 1024 * 1024 / 731) * 2 / 2) * 2)
+        self.assertEqual(graph["199"]["inputs"]["scale_by"], 2)
+
+    def test_megapixels_accepts_above_manifest_but_rejects_above_actual_sixteen_mp(self):
+        for mp in (1.31, 2.5, 16):
+            with self.subTest(mp=mp):
+                _, _, graph = self.patch(self.capabilities[0], {"width": 1, "height": 1},
+                                         {"megapixels": mp})
+                output = self.output(graph)
+                scale = graph[output["images"][0]]["inputs"]
+                self.assertEqual(scale["width"], round(math.sqrt(mp) * 1024 / 2) * 2)
+        for mp in (16.000001, 17, float("inf"), float("nan"), 0, -1):
+            with self.subTest(mp=mp), self.assertRaises(web.HTTPBadRequest):
+                self.patch(self.capabilities[0], params={"megapixels": mp})
+
+    def test_generation_width_height_actual_inclusive_node_boundaries(self):
+        for width, height in ((16384, 32), (32, 16384), (32, 32)):
+            with self.subTest(width=width, height=height):
+                _, _, graph = self.patch(self.capabilities[3], {"width": width, "height": height},
+                                         {"width": 32, "height": 32})
+                self.assertEqual((graph["11"]["inputs"]["width"], graph["11"]["inputs"]["height"]),
+                                 (width, height))
+        for width, height in ((16416, 32), (32, 16416)):
+            with self.subTest(width=width, height=height), self.assertRaises(web.HTTPBadRequest):
+                self.patch(self.capabilities[3], {"width": width, "height": height},
+                           {"width": 32, "height": 32})
+        with self.assertRaises(web.HTTPBadRequest):
+            self.patch(self.capabilities[3], params={"width": 1, "height": 1})
+
+    def test_character_long_video_disables_preview_preserves_segments_and_sampler(self):
+        cap, params, graph = self.patch(self.capabilities[3], {"duration": 300.013, "has_audio": False},
+                                       {"duration": 7, "preview_seconds": 5, "width": 960, "height": 544})
+        self.assertEqual(params["duration"], 7)
+        self.assertEqual(params["preview_seconds"], 0)
+        planner = graph["11"]["inputs"]
+        self.assertEqual(planner["generation_seconds"], 7)
+        self.assertEqual(min(planner["width"], planner["height"]), 544)
+        timeline = json.loads(planner["timeline_data"])
+        self.assertEqual(timeline["selection"]["duration"], 7)
+        self.assertEqual(timeline["videoClips"][0]["duration"], 300.013)
+        self.assertFalse(timeline["videoClips"][0]["hasAudio"])
+        self.assertEqual(timeline["segmentConfig"], {"count": 0, "segments": []})
+        self.assertEqual(graph["43"]["inputs"]["overlap_frames"], 48)
+        self.assertFalse(any(node["class_type"] == "ImageFromBatch" for node in graph.values()))
+        self.assertAlmostEqual(self.output(graph, True)["fps"], round(300.013 * 24) / 300.013)
+        original = self.graph(cap)
+        self.assertEqual(graph["30"]["inputs"], {**original["30"]["inputs"], "seed": 42})
+        self.assertEqual(graph["23"]["inputs"]["audio"], original["23"]["inputs"]["audio"])
+
+    def test_muted_references_disconnect_audio_only(self):
+        for cid in self.capabilities[:2]:
+            with self.subTest(cid=cid):
+                cap, _, graph = self.patch(cid, {"has_audio": False})
+                spec = next(s for s in cap["inputs"] if s["type"] == "video")
+                for drop in spec["dropIfNoAudio"]:
+                    self.assertNotIn(drop["input"], graph[drop["node"]]["inputs"])
+                references = next(n["inputs"] for n in graph.values()
+                                  if n["class_type"] == "MiniMaxH3ReferenceToVideo")
+                self.assertIn("ref_videos.ref_video_0", references)
+
+    def test_invalid_server_metadata_rejected_even_if_client_supplies_dimensions(self):
+        for key in ("width", "height", "duration"):
+            for invalid in (None, 0, -1, "invalid", float("nan"), float("inf")):
+                with self.subTest(key=key, invalid=invalid), self.assertRaises(web.HTTPBadRequest):
+                    self.patch(self.capabilities[0], {key: invalid},
+                               {"width": 1920, "height": 1080, "duration": 5,
+                                "video_metadata": {"width": 1920, "height": 1080, "duration": 5}})
+        with mock.patch.object(controller_app, "probe_video", return_value={}) as probe:
+            with self.assertRaises(web.HTTPBadRequest):
+                controller_app.patch_graph(self.cap(self.capabilities[0]),
+                                           {"follow_reference_video": "on"}, {"video[0]": self.ref})
+            probe.assert_called_once_with(self.ref)
+
+    def test_extreme_ratios_generation_and_final_size_limits_are_errors(self):
+        for info, params in (({"width": 1e9, "height": 1}, {}),
+                             ({"width": 1, "height": 1e9}, {}),
+                             ({"width": 1, "height": 1}, {"megapixels": 1e5}),
+                             ({"width": 1, "height": 1}, {"megapixels": 1e-9}),
+                             ({}, {"megapixels": float("nan")}),
+                             ({}, {"scale_by": 100})):
+            with self.subTest(info=info, params=params), self.assertRaises(web.HTTPBadRequest):
+                self.patch(self.capabilities[1], info, params)
+
+    def test_first_populated_slot_server_probe_and_stable_noncolliding_ids(self):
+        cap = self.cap(self.capabilities[0])
+        spec = copy.deepcopy(next(s for s in cap["inputs"] if s["type"] == "video"))
+        spec["key"] = "video[1]"
+        cap["inputs"].insert(1, spec)
+        params = {"follow_reference_video": "on", "seed": 42}
+        info = {"width": 977, "height": 733, "duration": 7, "has_audio": True}
+        with mock.patch.object(controller_app, "probe_video", return_value=info) as probe:
+            graph = controller_app.patch_graph(cap, params, {"video[1]": self.ref})
+            probe.assert_called_once_with(self.ref)
+        self.assertEqual(params["duration"], 7)
+        template = self.graph(cap)
+        template["follow_reference_trim_38"] = {"class_type": "PrimitiveInt", "inputs": {"value": 123}}
+        with mock.patch.object(controller_app.Path, "read_text", return_value=json.dumps(template)):
+            one = controller_app.patch_graph(cap, dict(params), {"video[1]": self.ref}, {self.ref: info})
+            two = controller_app.patch_graph(cap, dict(params), {"video[1]": self.ref}, {self.ref: info})
+        self.assertEqual(one, two)
+        self.assertEqual(one["follow_reference_trim_38"], template["follow_reference_trim_38"])
+        self.assertIn("follow_reference_trim_38_1", one)
+
+    def test_non_generation_or_image_output_ignores_switch(self):
+        for field, value in (("kind", "tool"), ("outputType", "image")):
+            cap = self.cap(self.capabilities[0])
+            cap[field] = value
+            with mock.patch.object(controller_app, "probe_video", return_value={"has_audio": True}):
+                baseline = controller_app.patch_graph(cap, {"seed": 42}, {"video[0]": self.ref})
+                followed = controller_app.patch_graph(
+                    cap, {"seed": 42, "follow_reference_video": "on"}, {"video[0]": self.ref})
+            self.assertEqual(followed, baseline)
+
+
+class InstalledVideoNodeContractTest(unittest.TestCase):
+    """执行本机节点的纯计算函数；不导入模型依赖，也不执行图内采样。"""
+    def load_function(self, relative, name, namespace, class_name=None):
+        path = ROOT.parent / "ComfyUI" / relative
+        if not path.is_file():
+            self.skipTest(f"Local node source unavailable: {path}")
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        body = tree.body
+        if class_name:
+            body = next(node.body for node in body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        function = next(node for node in body if isinstance(node, ast.FunctionDef) and node.name == name)
+        function.decorator_list = []
+        future = ast.parse("from __future__ import annotations").body[0]
+        module = ast.Module(body=[future, function], type_ignores=[])
+        exec(compile(module, str(path), "exec"), namespace)
+        return namespace[name]
+
+    def test_point_seven_mp_matches_installed_resolution_selector(self):
+        namespace = {"math": math, "ASPECT_RATIOS": {"16:9 (Widescreen)": (16, 9)},
+                     "io": mock.Mock(NodeOutput=lambda *values: values)}
+        execute = self.load_function("comfy_extras/nodes_resolution.py", "execute", namespace,
+                                     "ResolutionSelector")
+        actual = execute(None, "16:9 (Widescreen)", 0.7, 32)
+        _, _, graph = FollowReferenceVideoTest().patch(
+            "minimax_h3_ref9", {"width": 16, "height": 9}, {"megapixels": 0.7})
+        reference = next(node["inputs"] for node in graph.values()
+                         if node["class_type"] == "MiniMaxH3ReferenceToVideo")
+        self.assertEqual((reference["width"], reference["height"]), actual)
+
+    def test_installed_long_plan_sampler_and_output_trim_use_rounded_source_frames(self):
+        base = "custom_nodes/ComfyUI-MiniMaxH3-TimelineDirector/"
+        finite_path = base + "minimax_h3_finite_segments.py"
+        timeline_path = base + "minimax_h3_timeline_director.py"
+        namespace = {"copy": copy, "math": math, "H3_FPS": 24, "FPS": 24,
+                     "io": mock.Mock(NodeOutput=lambda *values, **kwargs: values)}
+        self.load_function(timeline_path, "_require_timeline_plan", namespace)
+        self.load_function(timeline_path, "_aligned_h3_length", namespace)
+        self.load_function(base + "experimental_latent_guide.py", "_valid_guide_frames", namespace)
+        for name in ("_synchronized_audio_assets", "_require_finite_plan", "_finite_plan_for_segment"):
+            self.load_function(finite_path, name, namespace)
+        prepare = self.load_function(finite_path, "_prepare_long_reference_plan", namespace)
+        sample = self.load_function(finite_path, "execute", namespace, "MiniMaxH3FiniteSegmentSampler")
+        trim = self.load_function(finite_path, "execute", namespace, "MiniMaxH3FiniteOutputTrim")
+        builder = mock.Mock()
+        builder.node.side_effect = lambda class_type, **inputs: mock.Mock(
+            out=mock.Mock(side_effect=lambda index: [inputs["id"], index]))
+        namespace.update(GraphBuilder=mock.Mock(return_value=builder),
+                         drift_control_step_count=lambda sigmas: 8)
+
+        class Frames:
+            def __init__(self, count):
+                self.shape = (count, 1, 1, 3)
+
+            def __getitem__(self, selection):
+                return Frames(len(range(*selection.indices(self.shape[0]))))
+
+            def clone(self):
+                return self
+
+        for seconds in (5.013, 10.019, 300.013):
+            with self.subTest(seconds=seconds):
+                _, _, graph = FollowReferenceVideoTest().patch(
+                    "minimax_h3_character_transfer", {"duration": seconds}, {"duration": 7})
+                timeline = json.loads(graph["11"]["inputs"]["timeline_data"])
+                source = {"type": "MINIMAX_H3_TIMELINE_PLAN", "timeline": timeline,
+                          "generation_seconds": 7, "width": 480, "height": 352}
+                finite = prepare(source, "Keep source motion", 48, True)
+                n = round(seconds * 24)
+                self.assertEqual(finite["target_output_frames"], n)
+                builder.reset_mock()
+                outputs = sample(None, None, None, None, None, finite, None, None, 42, True)
+                trim_calls = [call for call in builder.node.call_args_list
+                              if call.args[0] == "MiniMaxH3FiniteOutputTrim"]
+                self.assertEqual(len(trim_calls), 1)
+                self.assertEqual(trim_calls[0].kwargs["output_frames"], n)
+                self.assertEqual(outputs[1], ["trim_auto_segment_output", 0])
+                trimmed = trim(None, Frames(finite["assembled_frames_before_trim"]), None, n)
+                self.assertEqual(trimmed[0].shape[0], n)
+                fps = graph["23"]["inputs"]["fps"]
+                self.assertTrue(1 <= fps <= 120)  # 本机 CreateVideo schema 的实际边界。
+                self.assertAlmostEqual(trimmed[0].shape[0] / fps, seconds)
+
+
+class FollowReferenceProbeTest(unittest.TestCase):
+    def probe(self, video, following="", audio=True):
+        audio_stream = "  Stream #0:0: Audio: aac, 48000 Hz, stereo\n" if audio else ""
+        stderr = ("Input #0, mov, from 'reference.mov':\n"
+                  "  Duration: 00:00:06.25, start: 0.000000, bitrate: 1000 kb/s\n"
+                  f"{audio_stream}"
+                  f"  Stream #0:1(und): Video: h264, yuv420p, {video}, 24 fps, 24 tbr\n"
+                  f"{following}")
+        with mock.patch.object(controller_app, "ffmpeg_bin", return_value=Path("ffmpeg")), \
+             mock.patch.object(controller_app.Path, "exists", return_value=True), \
+             mock.patch.object(controller_app.subprocess, "run", return_value=mock.Mock(stderr=stderr)) as run:
+            info = controller_app.probe_video("chouka/reference.mov")
+        self.assertEqual(run.call_args.args[0][1], "-i")
+        self.assertEqual((info["fps"], info["frames"], info["duration"]), (24, 150, 6.25))
+        self.assertEqual(info["has_audio"], audio)
+        return info
+
+    def test_silent_video_keeps_dimensions_without_inventing_audio(self):
+        info = self.probe("1920x1080", audio=False)
+        self.assertEqual((info["width"], info["height"]), (1920, 1080))
+        self.assertFalse(info["has_audio"])
+
+    def test_sar_and_rotation_display_dimensions(self):
+        cases = (("1920x1080 [SAR 1:1 DAR 16:9]", "", (1920, 1080)),
+                 ("720x576 [SAR 16:15 DAR 4:3]", "", (768, 576)),
+                 ("720x576 [SAR 16:15 DAR 4:3]", "rotation of -90.00 degrees", (576, 768)),
+                 ("1920x1080", "rotation of 90.00 degrees", (1080, 1920)),
+                 ("1920x1080", "rotation of 270.00 degrees", (1080, 1920)),
+                 ("1920x1080", "rotation of -270.00 degrees", (1080, 1920)),
+                 ("1920x1080", "rotation of 180.00 degrees", (1920, 1080)),
+                 ("1920x1080", "rotate : 270", (1080, 1920)),
+                 ("1920x1080 [SAR 0:1 DAR 16:9]", "rotate : 0", (1920, 1080)))
+        for video, rotation, expected in cases:
+            with self.subTest(video=video, rotation=rotation):
+                info = self.probe(video, f"    Side data:\n      {rotation}\n")
+                self.assertEqual((info["width"], info["height"]), expected)
+
+    def test_first_video_stream_only_and_displaymatrix_precedes_legacy_rotate(self):
+        info = self.probe("720x576 [SAR 16:15 DAR 4:3]", (
+            "    Metadata:\n      rotate : 180\n"
+            "    Side data:\n      displaymatrix: rotation of 90.00 degrees\n"
+            "  Stream #0:2: Video: h264, yuv420p, 4096x2160, 60 fps\n"
+            "    Side data:\n      displaymatrix: rotation of 180.00 degrees\n"))
+        self.assertEqual((info["width"], info["height"]), (576, 768))
+
+    def test_codec_hex_tag_is_not_mistaken_for_dimensions(self):
+        info = self.probe("(avc1 / 0x31637661), yuv420p, 1920x1080 [SAR 1:1 DAR 16:9]")
+        self.assertEqual((info["width"], info["height"]), (1920, 1080))
+
+    def test_missing_dimensions_does_not_guess(self):
+        info = self.probe("unknown dimensions")
+        self.assertNotIn("width", info)
+        self.assertNotIn("height", info)
+
+
+class FollowReferenceGenerateTest(unittest.IsolatedAsyncioTestCase):
+    """直接调用 handler，授权/资源层均 mock，不打开端口或数据库。"""
+    async def asyncSetUp(self):
+        self.cap = json.loads((ROOT / "manifests/minimax_h3_ref_2pass.json").read_text(encoding="utf-8"))
+        self.cap["_graph_ok"] = True
+        self.ref = "chouka/reference.mp4"
+        self.info = {"width": 1000, "height": 733, "duration": 6.25, "has_audio": False}
+        self.body = {"project": "p", "capability": self.cap["id"],
+                     "params": {"follow_reference_video": "on", "duration": 5, "seed": 42},
+                     "assets": {"video[0]": self.ref}, "video_metadata": {"duration": 1}}
+        self.store = mock.Mock()
+        self.request = mock.Mock(app={"distributed": self.store})
+        replacements = {
+            "authorized_body": mock.AsyncMock(return_value=self.body),
+            "generation_assets": mock.AsyncMock(return_value=self.body["assets"]),
+            "proj_path": mock.Mock(return_value=mock.Mock(read_text=mock.Mock(return_value='{"cards": []}'))),
+            "probe_video": mock.Mock(side_effect=lambda ref: dict(self.info)),
+            "require_project": mock.AsyncMock(), "require_user": mock.Mock(return_value={"id": "u"}),
+            "call_store": mock.AsyncMock(), "resource_call": mock.AsyncMock(), "save_jobs": mock.Mock(),
+            "CONTROLLER_MODE": True, "CAPS": {self.cap["id"]: self.cap},
+            "JOBS": {}, "STEPS": {}, "WEIGHTS": {},
+        }
+        for name, replacement in replacements.items():
+            patcher = mock.patch.object(controller_app, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    async def test_dispatch_duration_uses_resolved_reference_not_client_five_seconds(self):
+        for seconds in (4.013, 6.25, 16.25):
+            with self.subTest(seconds=seconds):
+                self.info["duration"] = seconds
+                self.body["params"]["duration"] = 5
+                response = await controller_app.api_generate(self.request)
+                self.assertEqual(response.status, 200)
+                payload = self.store.enqueue.call_args.args[1]
+                self.assertEqual(payload["duration_seconds"], seconds)
+                self.assertEqual(payload["graph"]["132"]["inputs"]["value"], seconds)
+                self.assertEqual(payload["gpu_policy"], controller_app.HIGH_VRAM_GPU_POLICY)
+        self.assertEqual(controller_app.probe_video.call_count, 3)
+
+    async def test_dry_run_probes_same_metadata_and_never_dispatches(self):
+        self.body["dry_run"] = True
+        response = await controller_app.api_generate(self.request)
+        changes = json.loads(response.text)["changed"]
+        self.assertEqual(changes["#132.value"][1], 6.25)
+        self.assertTrue(any("follow_reference_trim" in key for key in changes))
+        controller_app.probe_video.assert_called_once_with(self.ref)
+        self.store.enqueue.assert_not_called()
+        controller_app.call_store.assert_not_awaited()
+
+    async def test_dry_run_rejects_missing_dimensions_despite_client_metadata(self):
+        self.body["dry_run"] = True
+        self.info.pop("width")
+        self.body["params"].update(width=1920, height=1080)
+        with self.assertRaises(web.HTTPBadRequest):
+            await controller_app.api_generate(self.request)
+        self.store.enqueue.assert_not_called()
 
 
 if __name__ == "__main__":
