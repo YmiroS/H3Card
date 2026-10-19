@@ -55,10 +55,18 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         response = await self.client.get('/', allow_redirects=False)
         self.assertEqual(response.status, 302)
         self.assertTrue(response.headers['Location'].startswith('/login'))
+        response = await self.client.get('/if-studio', allow_redirects=False)
+        self.assertEqual(response.status, 302)
+        self.assertTrue(response.headers['Location'].startswith('/login'))
 
         # 登录后主页面可用；管理页只认管理员。
         self.headers = await self.login()
         self.assertEqual((await self.client.get('/')).status, 200)
+        response = await self.client.get('/if-studio')
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'https://ifs.alibaba-inc.com/', await response.read())
+        self.assertEqual((await self.client.get('/if-studio.js')).status, 200)
+        self.assertEqual((await self.client.get('/if-studio.html')).status, 404)
         self.assertEqual((await self.client.get('/admin/permissions')).status, 200)
         self.assertEqual((await self.client.get('/teams')).status, 200)
         # 根目录静态兜底已移除：直呼 .html 不再绕过页面权限。
