@@ -289,7 +289,7 @@ test('canvas separates personal, shared and team spaces when creating projects',
 test('production permissions page renders account names as text and sends authorized mutations', async () => {
   const users = [
     {id:'u1', username:'<script>alert(1)</script>', display_name:'<img src=x onerror=alert(1)>', role:'admin', enabled:true, team_leader:false},
-    {id:'u2', username:'alice', display_name:'张三', role:'user', enabled:false, team_leader:false},
+    {id:'u2', username:'alice', display_name:'张三', phone:'13800138000', role:'user', enabled:false, team_leader:false},
     {id:'u3', username:'bob', display_name:' ', role:'user', enabled:true, team_leader:false},
   ];
   const mutations = [], assignments = [], grants = [], unexpected = [], external = [];
@@ -360,14 +360,18 @@ test('production permissions page renders account names as text and sends author
     await page.waitForFunction(() => document.querySelectorAll('#users tr').length === 3);
     assert.match(await page.locator('#users').innerText(), /<script>alert\(1\)<\/script>/);
     assert.equal(await page.locator('#users script, #users img').count(), 0);
+    assert.equal(await page.locator('.accounts-table th').count(), 8);
+    assert.equal(await page.locator('.accounts-table th').nth(2).innerText(), '手机号');
+    assert.deepEqual(await page.locator('#users tr td:nth-child(3)').allTextContents(), ['未填写', '13800138000', '未填写']);
     assert.match(await page.locator('#users').innerText(), /<img src=x onerror=alert\(1\)>/);
     assert.equal(await page.locator('#grants tr').count(), 1);
     const adminLabel = '<script>alert(1)</script>（<img src=x onerror=alert(1)>）';
     // 完整ID可保留在选项尾部或辅助信息，用户名与姓名的上游格式必须完全一致。
     const optionNames = locator => locator.evaluateAll(options => options.map(option => option.textContent.replace(/（ID: [^）]*）$/, '')));
-    for (const name of ['viewer_id', 'owner_id']) {
-      assert.deepEqual(await optionNames(page.locator(`#grant select[name="${name}"] option`)), ['请选择账号', adminLabel, 'alice（张三）', 'bob']);
-    }
+    assert.deepEqual(await optionNames(page.locator('#grant select[name="viewer_id"] option')),
+      ['请选择账号', adminLabel, 'alice（张三）', 'bob']);
+    assert.deepEqual(await optionNames(page.locator('#grant select[name="owner_id"] option')),
+      ['请选择所有者 / 授权范围', '所有画布（含以后新增）', adminLabel, 'alice（张三）', 'bob']);
     assert.deepEqual(await optionNames(page.locator('#project-owner option')), ['全部所有者', 'alice（张三）', 'legacy（历史姓名）']);
     assert.deepEqual(await optionNames(page.locator('#assign select option')), ['请选择目标账号', adminLabel, 'bob']);
     assert.match(await page.locator('#grants').innerText(), /alice（张三）/);
@@ -796,12 +800,14 @@ test('permissions dialogs preserve failed inputs, clear passwords and confirm re
 });
 
 test('新版工作区跨页面保留唯一导航和底部真实账号，键盘、触摸、角色及改密退出契约不变', async () => {
-  let user = {id:'admin-1', username:'admin-account', display_name:'张三', role:'admin'}, localTest = false;
+  let user = {id:'admin-1', username:'admin-account', display_name:'张三', phone:'13800138000', role:'admin'}, localTest = false;
   const mutations = [], unexpected = [], external = [], errors = [];
   const files = {'/':'index.html', '/director':'director.html', '/teams':'teams.html', '/controller':'controller.html',
     '/admin/permissions':'permissions.html', '/controller/costs':'costs.html', '/controller/capacity':'capacity.html',
     '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/director.js':'director.js', '/director.css':'director.css',
     '/director_edit.js':'director_edit.js', '/icon.png':'icon.png', '/favicon.png':'favicon.png',
+    '/image-composer.css':'image-composer.css', '/vendor/fabric.min.js':'vendor/fabric.min.js',
+    '/image-composer.js':'image-composer.js',
     '/admin-shell.js':'admin-shell.js', '/admin-shell.css':'admin-shell.css', '/controller-page.js':'controller-page.js', '/costs-page.js':'costs-page.js'};
   const reply = (res, body, status = 200) => { res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'}); res.end(JSON.stringify(body)); };
   const server = createServer((req, res) => {
@@ -899,7 +905,7 @@ test('新版工作区跨页面保留唯一导航和底部真实账号，键盘�
       }
       await trigger.click(); await menu.getByRole('button',{name:'用户信息',exact:true}).click();
       const info=page.getByRole('dialog',{name:'用户信息',exact:true});
-      assert.deepEqual(await info.locator('dd').allTextContents(),['张三','admin-account','管理员','admin-1']);
+      assert.deepEqual(await info.locator('dd').allTextContents(),['张三','admin-account','13800138000','管理员','admin-1']);
       await page.keyboard.press('Escape'); await info.waitFor({state:'detached'});
       assert.equal(await trigger.evaluate(node=>node===document.activeElement),true);
       assert.equal(context.pages().length,1,'导航不另开标签');
