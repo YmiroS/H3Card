@@ -275,6 +275,69 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         got = await self.client.get(f"/api/projects/{created['id']}")
         self.assertEqual(got.status, 404)
 
+    async def test_global_grant_reads_operates_downgrades_and_revokes_all_canvas_access(self):
+        bob = self.auth.create_user('bob', PASSWORD)
+        personal = await (await self.client.post(
+            '/api/projects', json={'name': '个人画布'}, headers=self.headers)).json()
+        team = (await (await self.client.post(
+            '/api/teams', json={'name': '未加入的项目组'}, headers=self.headers)).json())['team']
+        shared = await (await self.client.post(
+            '/api/projects', json={'name': '项目组画布', 'team_id': team['id']}, headers=self.headers)).json()
+        grant_url = f"/api/admin/global-grants/{bob['id']}"
+        response = await self.client.put(grant_url, json={'permission': 'read'}, headers=self.headers)
+        self.assertEqual(response.status, 200, await response.text())
+        future = await (await self.client.post(
+            '/api/projects', json={'name': '授权后新增'}, headers=self.headers)).json()
+
+        bob_client = ClientSession(cookie_jar=CookieJar(unsafe=True))
+        socket = None
+        try:
+            response = await bob_client.post(str(self.client.make_url('/api/auth/login')),
+                json={'username': 'bob', 'password': PASSWORD}, headers={'Origin': self.origin})
+            session = await response.json()
+            headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+            response = await bob_client.get(str(self.client.make_url('/api/projects')))
+            listed = await response.json()
+            self.assertEqual({p['id'] for p in listed['projects']}, {personal['id'], shared['id'], future['id']})
+            self.assertTrue(all(p['permission'] == 'read' for p in listed['projects']))
+            self.assertEqual(listed['teams'], [], '画布授权不能自动加入项目组')
+            target = str(self.client.make_url(f"/api/projects/{shared['id']}"))
+            self.assertEqual((await bob_client.get(target)).status, 200)
+            update = {'rev': shared['rev'], 'cards': [], 'edges': []}
+            self.assertEqual((await bob_client.put(target, json=update, headers=headers)).status, 403)
+            self.assertEqual((await bob_client.get(str(self.client.make_url('/api/admin/users')))).status, 403)
+            self.assertEqual((await bob_client.post(str(self.client.make_url('/api/projects')),
+                json={'name': '不能越权创建', 'team_id': team['id']}, headers=headers)).status, 403)
+            socket = await bob_client.ws_connect(target + '/presence')
+            self.assertEqual((await socket.receive_json(timeout=2))['type'], 'presence')
+
+            response = await self.client.put(grant_url, json={'permission': 'operate'}, headers=self.headers)
+            self.assertEqual(response.status, 200)
+            response = await bob_client.put(target, json=update, headers=headers)
+            self.assertEqual(response.status, 200, await response.text())
+            updated = await response.json()
+            self.assertEqual((await socket.receive_json(timeout=2))['type'], 'project-changed')
+            self.assertEqual(self.auth.get_user(bob['id'])['role'], 'user')
+            self.assertEqual((await bob_client.get(str(self.client.make_url('/api/admin/users')))).status, 403)
+
+            response = await self.client.put(grant_url, json={'permission': 'read'}, headers=self.headers)
+            self.assertEqual(response.status, 200)
+            update['rev'] = updated['rev']
+            self.assertEqual((await bob_client.put(target, json=update, headers=headers)).status, 403)
+            self.assertEqual((await bob_client.get(target)).status, 200)
+            response = await self.client.delete(grant_url, headers=self.headers)
+            self.assertEqual(response.status, 200)
+            closed = await socket.receive(timeout=2)
+            self.assertIn(closed.type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
+            socket = None
+            self.assertEqual((await bob_client.get(target)).status, 404)
+            listed = await (await bob_client.get(str(self.client.make_url('/api/projects')))).json()
+            self.assertEqual(listed['projects'], [])
+        finally:
+            if socket is not None:
+                await socket.close()
+            await bob_client.close()
+
     async def test_personal_project_share_flow_for_user_and_team(self):
         with self.auth.db:
             self.auth.db.execute('UPDATE users SET display_name=? WHERE id=?', ('张三', self.admin['id']))

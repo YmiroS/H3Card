@@ -36,6 +36,99 @@ class ResourceAccessTests(unittest.TestCase):
         self.store.set_project_state('a', 'deleted')
         self.assertFalse(self.access.authorize(self.admin, 'upload', 'source.png'))
 
+    def test_global_grants_read_bound_personal_and_team_resources_and_revoke_immediately(self):
+        team = self.store.create_team('资源团队', self.admin)
+        self.store.create_project('team', self.admin, team_id=team['id'])
+        comfy = {'filename': 'result.png', 'subfolder': 'team', 'type': 'output'}
+        refs = [('upload', 'source.png', 'a'),
+                ('artifact', 'job/result.mp4', 'a'), ('comfy', comfy, 'team')]
+        for kind, locator, pid in refs[1:]:
+            self.access.register(pid, kind, locator)
+        for permission in ('read', 'operate'):
+            self.store.set_global_grant(self.b, permission)
+            for kind, locator, pid in refs:
+                with self.subTest(permission=permission, kind=kind):
+                    self.assertTrue(self.access.authorize(self.b, kind, locator))
+                    self.assertTrue(self.access.authorize(self.b, kind, locator, project_id=pid))
+                    self.assertFalse(self.access.authorize(self.b, kind, locator, project_id='b'))
+            self.store.delete_global_grant(self.b)
+            for kind, locator, pid in refs:
+                self.assertFalse(self.access.authorize(self.b, kind, locator))
+                self.assertFalse(self.access.authorize(self.b, kind, locator, project_id=pid))
+        self.assertEqual(self.store.list_teams(self.b), [])
+        self.assertEqual((self.uploads / 'source.png').read_bytes(), b'original')
+
+    def test_global_resource_access_covers_future_owner_and_team_and_preserves_owner_grants(self):
+        self.store.set_global_grant(self.b, 'read')
+        future = self.store.create_user('future', 'Future-password-123', team_leader=True)['id']
+        team = self.store.create_team('未来资源团队', future)
+        self.store.create_project('future-personal', future)
+        self.store.create_project('future-team', future, team_id=team['id'])
+        self.access.register('future-personal', 'upload', 'future-personal.png')
+        self.access.register('future-team', 'upload', 'future-team.png')
+        for name in ('source.png', 'future-personal.png', 'future-team.png'):
+            self.assertTrue(self.access.authorize(self.b, 'upload', name))
+        self.store.set_grant(self.b, self.a, 'read')
+        self.store.delete_global_grant(self.b)
+        self.assertTrue(self.access.authorize(self.b, 'upload', 'source.png'))
+        for name in ('future-personal.png', 'future-team.png'):
+            self.assertFalse(self.access.authorize(self.b, 'upload', name))
+        self.store.delete_grant(self.b, self.a)
+        self.assertFalse(self.access.authorize(self.b, 'upload', 'source.png'))
+
+    def test_global_grants_do_not_unlock_unbound_legacy_unknown_or_pending_resources(self):
+        self.access.register(None, 'upload', 'legacy.png', legacy=True)
+        self.access.register(None, 'upload', 'unbound.png')
+        self.access.register(None, 'upload', 'legacy-pending.png', legacy=True, state='pending')
+        self.access.register('a', 'upload', 'pending.png', state='pending')
+        self.access.register('a', 'upload', 'bound-legacy.png', legacy=True)
+        for permission in ('read', 'operate'):
+            self.store.set_global_grant(self.b, permission)
+            self.store.set_global_grant(self.admin, permission)
+            self.assertTrue(self.access.authorize(self.admin, 'upload', 'legacy.png'))
+            self.assertFalse(self.access.authorize(self.b, 'upload', 'legacy.png'))
+            self.assertFalse(self.access.authorize(self.admin, 'upload', 'legacy.png', project_id='a'))
+            for name in ('unbound.png', 'unknown.png', 'legacy-pending.png', 'pending.png'):
+                for user in (self.b, self.admin):
+                    with self.subTest(permission=permission, resource=name, user=user):
+                        self.assertFalse(self.access.authorize(user, 'upload', name))
+            self.assertTrue(self.access.authorize(self.b, 'upload', 'bound-legacy.png'))
+        self.store.set_project_state('a', 'deleted')
+        for user in (self.b, self.admin):
+            self.assertFalse(self.access.authorize(user, 'upload', 'bound-legacy.png'))
+
+    def test_global_resource_access_rechecks_account_and_canvas_state(self):
+        for permission in ('read', 'operate'):
+            self.store.set_global_grant(self.b, permission)
+            self.assertTrue(self.access.authorize(self.b, 'upload', 'source.png'))
+            self.store.set_user(self.b, enabled=False)
+            self.assertFalse(self.access.authorize(self.b, 'upload', 'source.png'))
+            self.store.set_user(self.b, enabled=True)
+            for status in ('pending', 'rejected', 'approved'):
+                with self.store.db:
+                    self.store.db.execute('UPDATE users SET approval_status=? WHERE id=?', (status, self.b))
+                self.assertEqual(self.access.authorize(self.b, 'upload', 'source.png'), status == 'approved')
+            for state in ('pending', 'deleted', 'active'):
+                self.store.set_project_state('a', state)
+                self.assertEqual(self.access.authorize(self.b, 'upload', 'source.png'), state == 'active')
+
+    def test_global_read_copy_is_independent_but_does_not_allow_forged_binding(self):
+        self.store.set_global_grant(self.b, 'read')
+        doc = {'assets': {'image': 'chouka/source.png'}}
+        with self.assertRaises(PermissionError):
+            self.access.validate_document(self.b, 'b', doc)
+        with self.assertRaises(PermissionError):
+            self.access.register('b', 'upload', 'source.png')
+        copied = self.access.copy_document(self.b, 'a', 'b', doc)
+        self.assertNotEqual(copied, doc)
+        self.store.delete_global_grant(self.b)
+        self.assertFalse(self.access.authorize(self.b, 'upload', 'source.png'))
+        self.assertTrue(self.access.validate_document(self.b, 'b', copied))
+        copied_name = copied['assets']['image'][7:]
+        self.assertTrue(self.access.authorize(self.b, 'upload', copied_name))
+        self.assertFalse(self.access.authorize(self.a, 'upload', copied_name))
+        self.assertEqual((self.uploads / copied_name).read_bytes(), b'original')
+
     def test_assignment_moves_resource_access_not_files(self):
         self.store.assign_projects([{'project_id': 'a', 'owner_id': self.a}], self.b)
         self.assertFalse(self.access.authorize(self.a, 'upload', 'source.png'))

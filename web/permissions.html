@@ -22,7 +22,7 @@
 <article class="card metric"><div class="metric-content"><p class="metric-label">账号总数</p><p id="metric-users" class="metric-value">—</p><p class="metric-note">角色与独立组长权限分别管理</p></div></article>
 <article class="card metric"><div class="metric-content"><p class="metric-label">启用账号</p><p id="metric-enabled" class="metric-value">—</p><p class="metric-note">停用不会删除账号或画布授权</p></div></article>
 <article class="card metric"><div class="metric-content"><p class="metric-label">待审批注册</p><p id="metric-pending" class="metric-value">—</p><p class="metric-note">仅由钉钉指定审批人处理</p></div></article>
-<article class="card metric"><div class="metric-content"><p class="metric-label">画布授权</p><p id="metric-grants" class="metric-value">—</p><p class="metric-note">访问者 A → 所有者 B</p></div></article>
+<article class="card metric"><div class="metric-content"><p class="metric-label">画布授权</p><p id="metric-grants" class="metric-value">—</p><p class="metric-note">访问者 A → 所有者 / 授权范围</p></div></article>
 </section>
 <nav class="section-nav" aria-label="权限管理分区"><a href="#accounts-heading">账号管理</a><a href="#registrations-heading">注册申请</a><a href="#grants-heading">画布授权</a><a href="#history-heading">历史画布分配</a></nav>
 <section class="card" aria-labelledby="accounts-heading">
@@ -34,10 +34,10 @@
 <section class="card" aria-labelledby="registrations-heading"><div class="section-heading"><h2 id="registrations-heading" tabindex="-1">注册申请</h2><span class="small muted">仅查看钉钉审批结果</span></div>
 <div class="f-pad form-grid"><p class="notice-box">自主注册由钉钉群内两位指定审批人在卡片上处理，任意一人先决生效。网页不提供通过或拒绝操作。</p><p id="outbox-status" class="f-status" role="status"></p></div>
 <div class="table-wrap registrations-scroll" tabindex="0" role="region" aria-label="注册申请列表"><table class="registration-table"><thead><tr><th scope="col">账号</th><th scope="col">姓名 / 花名</th><th scope="col">状态</th><th scope="col">申请时间</th><th scope="col">审批人</th></tr></thead><tbody id="registrations"><tr><td colspan="5">正在加载注册申请…</td></tr></tbody></table></div></section>
-<section class="card" aria-labelledby="grants-heading"><div class="section-heading"><h2 id="grants-heading" tabindex="-1">画布授权</h2><span class="small muted">访问者 A → 所有者 B</span></div>
-<div class="f-pad"><p class="notice-box">A 可以查看或操作 B 当前及以后创建的全部画布；可操作包含删除。授权不传递，管理员天然可访问全部画布。停用账号的授权不会令其恢复登录权限。</p></div>
-<form id="grant" class="grant-form"><label class="field">访问者 A<select name="viewer_id" required disabled></select></label><label class="field">所有者 B<select name="owner_id" required disabled></select></label><label class="field">权限<select name="permission"><option value="read">只读</option><option value="operate">可操作（含删除）</option></select></label><button id="grant-submit" class="primary" disabled>保存授权</button><p id="grant-error" class="danger small" role="alert"></p></form>
-<div class="table-wrap" tabindex="0" role="region" aria-label="画布授权列表"><table class="grant-table"><thead><tr><th scope="col">访问者 A</th><th scope="col">方向</th><th scope="col">所有者 B</th><th scope="col">权限</th><th scope="col">操作</th></tr></thead><tbody id="grants"><tr><td colspan="5">正在加载授权…</td></tr></tbody></table></div></section>
+<section class="card" aria-labelledby="grants-heading"><div class="section-heading"><h2 id="grants-heading" tabindex="-1">画布授权</h2><span class="small muted">访问者 A → 所有者 / 授权范围</span></div>
+<div class="f-pad"><p id="grant-help" class="notice-box">选择指定所有者，A 可查看或操作其当前及以后创建的全部个人画布；选择“所有画布”则覆盖全部个人和项目组画布，包括现有及未来新增画布。可操作包含删除；授权不传递，也不会成为管理员。管理员天然可访问全部画布，停用账号不会因授权恢复登录权限。</p></div>
+<form id="grant" class="grant-form" aria-describedby="grant-help"><label class="field">访问者 A<select name="viewer_id" required disabled></select></label><label class="field">所有者 / 授权范围<select name="owner_id" required disabled></select></label><label class="field">权限<select name="permission"><option value="read">只读</option><option value="operate">可操作（含删除）</option></select></label><button id="grant-submit" class="primary" disabled>保存授权</button><p id="grant-error" class="danger small" role="alert"></p></form>
+<div class="table-wrap" tabindex="0" role="region" aria-label="画布授权列表"><table class="grant-table"><thead><tr><th scope="col">访问者 A</th><th scope="col">方向</th><th scope="col">所有者 / 授权范围</th><th scope="col">权限</th><th scope="col">操作</th></tr></thead><tbody id="grants"><tr><td colspan="5">正在加载授权…</td></tr></tbody></table></div></section>
 </div>
 <section class="card" aria-labelledby="history-heading"><div class="section-heading"><h2 id="history-heading" tabindex="-1">历史画布分配</h2><span class="small muted">仅个人空间 / 每次最多 1000 个</span></div>
 <div class="f-pad"><p class="notice-box">画布内容和历史费用不变。新所有者的授权访问者将获得相应权限（可操作包含删除）；原所有者及其授权访问者可能失去访问权限。管理员仍可访问全部画布。项目组画布由成员关系授权，不能改为个人归属。</p></div>
@@ -58,6 +58,8 @@ const h = value => AdminUI.escape(String(value ?? ''));
 const userById = id => users.find(user => String(user.id) === String(id));
 const userName = user => (user?.username || '未知账号') + (user?.display_name?.trim() ? '（' + user.display_name.trim() + '）' : '');
 const userLabel = id => userName(userById(id)) + '（ID: ' + id + '）';
+const globalGrantPath = viewer => '/api/admin/global-grants/' + encodeURIComponent(viewer);
+const allCanvasScope = '全部个人和项目组画布，包括现有及未来新增画布';
 const projectOwner = project => userName({display_name:project.owner_display_name || userById(project.owner_id)?.display_name, username:project.owner_username || userById(project.owner_id)?.username});
 const ownerLabel = project => projectOwner(project) + '（ID: ' + project.owner_id + '）';
 const cell = (row, value) => { const td = document.createElement('td'); td.textContent = value; row.append(td); return td; };
@@ -132,18 +134,25 @@ function render() {
   }
   if (!users.length) emptyRow($('users'), '暂无账号。', 7);
   const entries = users.map(user => [user.id, userLabel(user.id)]);
-  for (const name of ['viewer_id', 'owner_id']) setOptions($('grant').elements[name], entries, '请选择账号');
+  setOptions($('grant').elements.viewer_id, entries, '请选择账号');
+  setOptions($('grant').elements.owner_id, [['*', '所有画布（含以后新增）'], ...entries], '请选择所有者 / 授权范围');
   setOptions($('assign').elements.owner_id, entries.filter(([id]) => userById(id)?.enabled), '请选择目标账号');
   setOptions($('project-owner'), [...new Map(projects.map(project => [String(project.owner_id), ownerLabel(project)])).entries()], '全部所有者');
   $('grants').replaceChildren();
   for (const grant of grants) {
+    const isAll = grant.scope === 'all', scopeLabel = isAll ? '所有画布（' + allCanvasScope + '）' : userLabel(grant.owner_id);
+    const route = isAll ? globalGrantPath(grant.viewer_id) : '/api/admin/grants/' + encodeURIComponent(grant.viewer_id) + '/' + encodeURIComponent(grant.owner_id);
     const row = document.createElement('tr'); cell(row, '').append(identity(userName(userById(grant.viewer_id)), grant.viewer_id)); cell(row, '→');
-    cell(row, '').append(identity(userName(userById(grant.owner_id)), grant.owner_id));
+    const scopeCell = cell(row, '');
+    if (isAll) {
+      scopeCell.textContent = '所有画布';
+      const note = document.createElement('span'); note.className = 'perm-user-id'; note.textContent = allCanvasScope; scopeCell.append(note);
+    } else scopeCell.append(identity(userName(userById(grant.owner_id)), grant.owner_id));
     cell(row, grant.permission === 'operate' ? '可操作（含删除）' : '只读');
-    button(cell(row, ''), '撤销', () => openOperation({title:'确认撤销授权', body:`<p>${h(userLabel(grant.viewer_id))} → ${h(userLabel(grant.owner_id))}</p><p class="notice-box danger">撤销后访问者失去这条授权带来的全部画布访问权。管理员天然权限、项目组成员关系和其他独立授权不受影响。</p>`, submitLabel:'确认撤销授权', action:() => H3Auth.request('/api/admin/grants/' + encodeURIComponent(grant.viewer_id) + '/' + encodeURIComponent(grant.owner_id), {method:'DELETE'}), message:'已撤销画布授权'}), 'danger');
+    button(cell(row, ''), '撤销', () => openOperation({title:'确认撤销授权', body:`<p>${h(userLabel(grant.viewer_id))} → ${h(scopeLabel)}</p><p>权限：${grant.permission === 'operate' ? '可操作（含删除）' : '只读'}</p><p class="notice-box danger">撤销后即时重新校验权限，访问者失去这条授权带来的全部画布访问权。此授权不会使其成为管理员；管理员天然权限、项目组成员关系和其他独立授权不受影响。</p>`, submitLabel:'确认撤销授权', action:() => H3Auth.request(route, {method:'DELETE'}), message:'已撤销画布授权'}), 'danger');
     $('grants').append(row);
   }
-  if (!grants.length) emptyRow($('grants'), '暂无画布授权。选择访问者与所有者后保存。', 5);
+  if (!grants.length) emptyRow($('grants'), '暂无画布授权。选择访问者与所有者 / 授权范围后保存。', 5);
   renderProjects();
 }
 async function refreshRegistrations() {
@@ -207,9 +216,12 @@ $('grant').onsubmit = event => {
   event.preventDefault(); if (!ready || mutationBusy) return;
   const form = event.currentTarget, viewer = form.elements.viewer_id.value, owner = form.elements.owner_id.value, permission = form.elements.permission.value;
   $('grant-error').textContent = '';
-  if (!userById(viewer) || !userById(owner)) { $('grant-error').textContent = '请选择有效账号。'; return; }
-  if (viewer === owner) { $('grant-error').textContent = '访问者和所有者不能是同一个账号。'; return; }
-  openOperation({title:'确认画布授权', body:`<p>访问者 A：${h(userLabel(viewer))}</p><p>所有者 B：${h(userLabel(owner))}</p><p>权限：<b>${permission === 'operate' ? '可操作（含删除）' : '只读'}</b></p><p class="notice-box danger">覆盖所有者当前和以后创建的全部画布。可操作包含删除；授权不传递。已有同向授权将被更新。停用账号不会因此恢复登录。</p>`, submitLabel:'确认保存授权', action:() => H3Auth.json('/api/admin/grants', 'PUT', {viewer_id:viewer, owner_id:owner, permission}), message:'画布授权已保存'});
+  const isAll = owner === '*'; // 仅供 UI 选择范围，绝不作为 owner_id 发送。
+  if (!userById(viewer) || (!isAll && !userById(owner))) { $('grant-error').textContent = '请选择有效账号和授权范围。'; return; }
+  if (!isAll && viewer === owner) { $('grant-error').textContent = '访问者和所有者不能是同一个账号。'; return; }
+  const scopeLabel = isAll ? '所有画布（' + allCanvasScope + '）' : userLabel(owner);
+  const scopeNotice = isAll ? '覆盖' + allCanvasScope + '，不受所有者或项目组成员关系限制。' : '覆盖所有者当前和以后创建的全部个人画布，不包含项目组画布。';
+  openOperation({title:'确认画布授权', body:`<p>访问者 A：${h(userLabel(viewer))}</p><p>所有者 / 授权范围：${h(scopeLabel)}</p><p>权限：<b>${permission === 'operate' ? '可操作（含删除）' : '只读'}</b></p><p class="notice-box danger">${h(scopeNotice)}可操作包含删除；授权不传递，也不会成为管理员。已有同范围授权将被更新，其他独立授权保留；保存后即时重新校验权限。停用账号不会因此恢复登录。</p>`, submitLabel:'确认保存授权', action:() => isAll ? H3Auth.json(globalGrantPath(viewer), 'PUT', {permission}) : H3Auth.json('/api/admin/grants', 'PUT', {viewer_id:viewer, owner_id:owner, permission}), message:'画布授权已保存'});
 };
 $('project-search').oninput = $('project-owner').onchange = () => { selectedProjects.clear(); renderProjects(); };
 $('project-all').onchange = event => { selectedProjects.clear(); if (event.currentTarget.checked) for (const project of filteredProjects().filter(project => !project.team_id)) selectedProjects.add(project.id); renderProjects(); };

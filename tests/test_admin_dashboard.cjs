@@ -104,14 +104,16 @@ async function withFixture(options, run) {
     void (async () => {
       const url = new URL(req.url, 'http://localhost');
       const key = /^\/api\/workers\/[^/]+\/temperature$/.test(url.pathname) ? 'temperature' : url.pathname;
-      if (Object.hasOwn(handlers, key)) {
-        const method = key === '/api/admin/workers/sync-all' || key.startsWith('/api/auth/') && key !== '/api/auth/me' ? 'POST' : 'GET';
+      const methodKey = req.method + ' ' + key;
+      const handlerKey = Object.hasOwn(handlers, methodKey) ? methodKey : key;
+      if (Object.hasOwn(handlers, handlerKey)) {
+        const method = handlerKey === methodKey ? req.method : key === '/api/admin/workers/sync-all' || key.startsWith('/api/auth/') && key !== '/api/auth/me' ? 'POST' : 'GET';
         if (req.method !== method) { unexpected.push(req.method + ' ' + req.url); res.writeHead(405); return res.end(); }
         const chunks = []; for await (const chunk of req) chunks.push(chunk);
         const raw = Buffer.concat(chunks).toString();
         const request = {url, method:req.method, body:raw ? JSON.parse(raw) : null, headers:req.headers};
         requests.push(request);
-        const reply = await handlers[key](request);
+        const reply = await handlers[handlerKey](request);
         if (reply.wait) await Promise.race([reply.wait, new Promise(resolve => res.once('close', resolve))]);
         if (res.destroyed) return;
         if (state.sandboxHeader && url.pathname === '/api/health') res.setHeader('X-H3Card-Sandbox', 'local-copy');
@@ -175,7 +177,7 @@ async function withFixture(options, run) {
     assert.deepEqual(unexpected, [], '只访问明确列出的本地静态资源与 API');
     assert.deepEqual(external, [], '不允许 HTTP 或 WebSocket 外联');
     assert.ok(requests.some(request => request.url.pathname === '/api/auth/presence' && request.method === 'POST'), '真实 auth.js 的 presence 必须继续运行');
-    for (const request of requests.filter(item => item.method === 'POST')) {
+    for (const request of requests.filter(item => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(item.method))) {
       assert.equal(request.headers['x-csrf-token'], 'fixture-csrf', '包括 presence 在内的写请求保留真实 CSRF');
       if (request.url.pathname !== '/api/auth/presence') {
         assert.ok(state.allowedBusinessWrites.includes(request.url.pathname), '不得产生额外业务写入：' + request.url.pathname);
@@ -186,6 +188,55 @@ async function withFixture(options, run) {
     for (const res of waiting) res.destroy();
     server.closeAllConnections(); await new Promise(resolve => server.close(resolve));
   }
+}
+const globalViewerRoute = '/api/admin/global-grants/viewer%2F%E4%B8%80';
+const ownerViewerRoute = '/api/admin/grants/viewer%2F%E4%B8%80/owner-id';
+const grantWrites = fixture => fixture.requests.filter(request => request.method !== 'GET' && request.url.pathname.startsWith('/api/admin/'));
+async function withGrantFixture(initialGrants, run) {
+  return withFixture({allowedBusinessWrites:[globalViewerRoute, ownerViewerRoute, '/api/admin/grants']}, async fixture => {
+    const {page, handlers, state} = fixture;
+    state.grants = structuredClone(initialGrants);
+    state.users = [session,
+      {id:'viewer/一', username:'访问账号', display_name:'<img src=x onerror="window.grantXss=1">', role:'user', enabled:true},
+      {id:'owner-id', username:'所有者账号', role:'user', enabled:true},
+      {id:'other-id', username:'其他账号', role:'user', enabled:true},
+    ];
+    handlers['/api/admin/users'] = () => ({body:{users:state.users}});
+    handlers['/api/admin/grants'] = () => ({body:{grants:state.grants}});
+    handlers['/api/admin/registrations'] = () => ({body:{requests:[], outbox:{pending:0}}});
+    handlers['/api/projects'] = () => ({body:{projects:[]}});
+    handlers['PUT ' + globalViewerRoute] = request => {
+      assert.deepEqual(Object.keys(request.body), ['permission'], '全局请求不得发送哨兵或 owner_id/viewer_id');
+      assert.ok(['read', 'operate'].includes(request.body.permission));
+      state.grants = state.grants.filter(grant => !(grant.viewer_id === 'viewer/一' && grant.scope === 'all'));
+      state.grants.push({viewer_id:'viewer/一', owner_id:null, scope:'all', permission:request.body.permission});
+      return {body:{ok:true}};
+    };
+    handlers['DELETE ' + globalViewerRoute] = () => {
+      state.grants = state.grants.filter(grant => !(grant.viewer_id === 'viewer/一' && grant.scope === 'all'));
+      return {body:{ok:true}};
+    };
+    handlers['PUT /api/admin/grants'] = request => {
+      assert.deepEqual(Object.keys(request.body).sort(), ['owner_id', 'permission', 'viewer_id']);
+      assert.equal(request.body.viewer_id, 'viewer/一'); assert.equal(request.body.owner_id, 'owner-id');
+      state.grants = state.grants.filter(grant => !(grant.viewer_id === request.body.viewer_id && grant.owner_id === request.body.owner_id));
+      state.grants.push({...request.body}); return {body:{ok:true}};
+    };
+    handlers['DELETE ' + ownerViewerRoute] = () => {
+      state.grants = state.grants.filter(grant => !(grant.viewer_id === 'viewer/一' && grant.owner_id === 'owner-id'));
+      return {body:{ok:true}};
+    };
+    await page.goto(fixture.origin + '/admin/permissions');
+    await page.waitForFunction(() => !document.querySelector('#grant-submit').disabled);
+    await run(fixture);
+    assert.equal(await page.locator('#grants img, dialog img').count(), 0, '账号花名必须转义为文本');
+    assert.equal(await page.evaluate(() => window.grantXss), undefined);
+    assert.deepEqual(state.users.map(user => user.role), ['admin', 'user', 'user', 'user'], '授权不修改账号角色');
+  });
+}
+async function confirmGrant(page) {
+  await page.getByRole('dialog').getByRole('button', {name:'确认保存授权', exact:true}).click();
+  await page.waitForFunction(() => !document.querySelector('dialog') && !document.querySelector('#grant-submit').disabled);
 }
 async function dashboard(fixture) {
   await fixture.page.goto(fixture.origin + '/controller');
@@ -352,6 +403,114 @@ test('异常节点局部滚动不拖长配置和任务，手机保留账号角�
     }
     await costs(fixture);
     await checkAccount(page);
+  });
+});
+
+const legacyGrant = {viewer_id:'viewer/一', owner_id:'owner-id', permission:'read'};
+const otherGlobalGrant = {viewer_id:'other-id', owner_id:null, scope:'all', permission:'read'};
+for (const permission of ['read', 'operate']) {
+  test(`所有画布 ${permission}：真实确认、取消零请求、保存仅发全局PUT且保留独立授权`, async () => {
+    const previousGlobal = {viewer_id:'viewer/一', owner_id:null, scope:'all', permission:permission === 'read' ? 'operate' : 'read'};
+    await withGrantFixture([legacyGrant, otherGlobalGrant, previousGlobal], async fixture => {
+      const {page, state} = fixture;
+      assert.equal(await page.locator('#metric-grants').textContent(), '3');
+      assert.equal(await page.getByRole('combobox', {name:/^所有者 \/ 授权范围/}).evaluate(node => node.tagName), 'SELECT');
+      assert.equal(await page.locator('#grant [name=owner_id] option[value="*"]').textContent(), '所有画布（含以后新增）');
+      assert.equal(await page.locator('#grant [name=viewer_id] option[value="*"], #assign option[value="*"]').count(), 0);
+      assert.match(await page.locator('#grant-help').textContent(), /全部个人和项目组.*现有及未来新增.*包含删除.*不会成为管理员/s);
+      const globalRow = page.locator('#grants tr').filter({hasText:'访问账号'}).filter({hasText:'所有画布'});
+      assert.match(await globalRow.textContent(), /所有画布.*全部个人和项目组.*现有及未来新增/s);
+      assert.doesNotMatch(await page.locator('#grants').textContent(), /未知账号|null|undefined/);
+      await page.getByRole('combobox', {name:/^访问者 A/}).selectOption('viewer/一');
+      await page.getByRole('combobox', {name:/^所有者 \/ 授权范围/}).selectOption('*');
+      await page.getByRole('combobox', {name:/^权限/}).selectOption(permission);
+      await page.getByRole('button', {name:'保存授权', exact:true}).click();
+      const dialog = page.getByRole('dialog', {name:'确认画布授权', exact:true});
+      assert.match(await dialog.textContent(), /访问账号.*所有画布.*全部个人和项目组.*现有及未来新增.*可操作包含删除.*不会成为管理员.*其他独立授权保留.*即时重新校验/s);
+      assert.match(await dialog.textContent(), permission === 'read' ? /权限：只读/ : /权限：可操作（含删除）/);
+      assert.equal(await dialog.locator('img').count(), 0);
+      assert.equal(grantWrites(fixture).length, 0, '打开确认窗不能写入');
+      await dialog.getByRole('button', {name:'取消', exact:true}).click();
+      await page.waitForFunction(() => !document.querySelector('dialog')); await settle(page);
+      assert.equal(grantWrites(fixture).length, 0, '取消不得发送任何授权写入');
+      assert.deepEqual(state.grants, [legacyGrant, otherGlobalGrant, previousGlobal]);
+      await page.getByRole('button', {name:'保存授权', exact:true}).click();
+      await confirmGrant(page);
+      assert.deepEqual(grantWrites(fixture).map(request => ({method:request.method, path:request.url.pathname, body:request.body})),
+        [{method:'PUT', path:globalViewerRoute, body:{permission}}]);
+      assert.deepEqual(state.grants, [legacyGrant, otherGlobalGrant, {...previousGlobal, permission}]);
+      assert.equal(await page.locator('#metric-grants').textContent(), '3', '更新同范围授权不产生重复记录');
+      assert.equal(await page.getByRole('combobox', {name:/^所有者 \/ 授权范围/}).inputValue(), '*', '刷新后保留范围选择');
+      assert.equal(await globalRow.locator('td').nth(3).textContent(), permission === 'read' ? '只读' : '可操作（含删除）');
+      for (const width of [1440, 390, 320]) {
+        await page.setViewportSize({width, height:900});
+        await page.getByRole('combobox', {name:/^所有者 \/ 授权范围/}).scrollIntoViewIfNeeded();
+        assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true, width + ' 授权页无整页横溢');
+        const box = await page.getByRole('combobox', {name:/^所有者 \/ 授权范围/}).boundingBox();
+        assert.ok(box.width > 0 && box.x >= 0 && box.x + box.width <= width + 1, '原生范围选择框保持可见可操作');
+      }
+    });
+  });
+}
+
+test('全局与所有者授权分别撤销：取消零请求、路由按scope区分且其他授权保留', async () => {
+  const globalGrant = {viewer_id:'viewer/一', owner_id:null, scope:'all', permission:'operate'};
+  await withGrantFixture([legacyGrant, globalGrant, otherGlobalGrant], async fixture => {
+    const {page, state} = fixture;
+    const globalRow = page.locator('#grants tr').filter({hasText:'访问账号'}).filter({hasText:'所有画布'});
+    await globalRow.getByRole('button', {name:'撤销', exact:true}).click();
+    assert.match(await page.getByRole('dialog').textContent(), /所有画布.*全部个人和项目组.*现有及未来新增.*可操作（含删除）.*即时重新校验.*不会使其成为管理员.*其他独立授权不受影响/s);
+    assert.doesNotMatch(await page.getByRole('dialog').textContent(), /未知账号|null/);
+    await closeDialog(page); await settle(page);
+    assert.equal(grantWrites(fixture).length, 0);
+    assert.deepEqual(state.grants, [legacyGrant, globalGrant, otherGlobalGrant]);
+    await globalRow.getByRole('button', {name:'撤销', exact:true}).click();
+    await page.getByRole('dialog').getByRole('button', {name:'确认撤销授权', exact:true}).click();
+    await page.waitForFunction(() => !document.querySelector('dialog') && document.querySelector('#metric-grants').textContent === '2');
+    assert.deepEqual(state.grants, [legacyGrant, otherGlobalGrant]);
+    assert.equal(await page.locator('#grants tr').filter({hasText:'所有画布'}).count(), 1);
+    const ownerRow = page.locator('#grants tr').filter({hasText:'所有者账号'});
+    assert.match(await ownerRow.textContent(), /访问账号.*所有者账号.*只读/s);
+    await ownerRow.getByRole('button', {name:'撤销', exact:true}).click();
+    assert.match(await page.getByRole('dialog').textContent(), /所有者账号/);
+    assert.doesNotMatch(await page.getByRole('dialog').textContent(), /所有画布/);
+    await page.getByRole('dialog').getByRole('button', {name:'确认撤销授权', exact:true}).click();
+    await page.waitForFunction(() => !document.querySelector('dialog') && document.querySelector('#metric-grants').textContent === '1');
+    assert.deepEqual(state.grants, [otherGlobalGrant]);
+    assert.deepEqual(grantWrites(fixture).map(request => ({method:request.method, path:request.url.pathname, body:request.body})),
+      [{method:'DELETE', path:globalViewerRoute, body:null}, {method:'DELETE', path:ownerViewerRoute, body:null}]);
+    assert.doesNotMatch(await page.locator('#grants').textContent(), /未知账号|null|undefined/);
+  });
+});
+
+test('旧所有者授权兼容：必填与自授权拦截、取消无请求、read和operate仍走旧PUT', async () => {
+  await withGrantFixture([otherGlobalGrant], async fixture => {
+    const {page, state} = fixture;
+    await page.getByRole('button', {name:'保存授权', exact:true}).click(); await settle(page);
+    assert.equal(await page.locator('dialog').count(), 0);
+    assert.equal(await page.locator('#grant').evaluate(form => form.checkValidity()), false);
+    await page.getByRole('combobox', {name:/^访问者 A/}).selectOption('viewer/一');
+    await page.getByRole('combobox', {name:/^所有者 \/ 授权范围/}).selectOption('viewer/一');
+    await page.getByRole('button', {name:'保存授权', exact:true}).click();
+    assert.match(await page.locator('#grant-error').textContent(), /不能是同一个账号/);
+    assert.equal(grantWrites(fixture).length, 0);
+    for (const permission of ['read', 'operate']) {
+      await page.getByRole('combobox', {name:/^所有者 \/ 授权范围/}).selectOption('owner-id');
+      await page.getByRole('combobox', {name:/^权限/}).selectOption(permission);
+      await page.getByRole('button', {name:'保存授权', exact:true}).click();
+      assert.equal(await page.locator('#grant-error').textContent(), '');
+      assert.match(await page.getByRole('dialog').textContent(), /所有者账号.*当前和以后创建.*可操作包含删除.*不会成为管理员/s);
+      assert.doesNotMatch(await page.getByRole('dialog').textContent(), /所有画布|全部个人和项目组/);
+      const before = grantWrites(fixture).length;
+      await closeDialog(page); await settle(page);
+      assert.equal(grantWrites(fixture).length, before);
+      await page.getByRole('button', {name:'保存授权', exact:true}).click();
+      await confirmGrant(page);
+      assert.deepEqual(state.grants, [otherGlobalGrant, {...legacyGrant, permission}]);
+      assert.equal(await page.locator('#grants tr').filter({hasText:'所有者账号'}).locator('td').nth(3).textContent(), permission === 'read' ? '只读' : '可操作（含删除）');
+    }
+    assert.deepEqual(grantWrites(fixture).map(request => ({method:request.method, path:request.url.pathname, body:request.body})),
+      ['read', 'operate'].map(permission => ({method:'PUT', path:'/api/admin/grants', body:{viewer_id:'viewer/一', owner_id:'owner-id', permission}})));
   });
 });
 

@@ -1198,7 +1198,8 @@ async function health() {
 
 /* ================= 项目栏 ================= */
 function projectSpaces(project) {
-  if (project.team_id) return [`team:${project.team_id}`];
+  if (project.team_id) return teams.some(team => team.id === project.team_id)
+    ? [`team:${project.team_id}`] : ['shared'];
   const own = String(project.owner_id) === String(H3Auth.user?.id);
   const spaces = own ? ['personal'] : [];
   if (!own && project.shared_personally) spaces.push('shared');

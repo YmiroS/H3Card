@@ -8,7 +8,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from collections import defaultdict
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -141,6 +141,186 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(self.store.project_permission(self.viewer, 'future'))
         self.store.delete_grant(self.viewer, self.owner)
         self.assertEqual(len(self.store.list_grants()), 1)
+
+    def test_global_grants_cover_current_and_future_personal_and_team_projects(self):
+        team = self.store.create_team('已有团队', self.admin)
+        self.store.create_project('existing-personal', self.owner)
+        self.store.create_project('existing-team', self.admin, team_id=team['id'])
+        projects = {'existing-personal', 'existing-team'}
+        for permission in ('read', 'operate'):
+            self.store.set_global_grant(self.viewer, permission)
+            future_owner = self.store.create_user('future-' + permission, PASSWORD, team_leader=True)['id']
+            future_team = self.store.create_team('未来团队-' + permission, future_owner)
+            personal_pid, team_pid = 'future-personal-' + permission, 'future-team-' + permission
+            self.store.create_project(personal_pid, future_owner)
+            self.store.create_project(team_pid, future_owner, team_id=future_team['id'])
+            projects.update((personal_pid, team_pid))
+            for pid in projects:
+                with self.subTest(permission=permission, project=pid):
+                    self.assertEqual(self.store.project_permission(self.viewer, pid), permission)
+            listed = {p['project_id']: p['permission'] for p in self.store.list_projects(self.viewer)}
+            self.assertEqual(listed, dict.fromkeys(projects, permission))
+        self.assertEqual(self.store.list_teams(self.viewer), [])
+
+    def test_global_read_preserves_stronger_existing_project_permissions(self):
+        team = self.store.create_team('成员权限', self.admin)
+        self.store.add_team_member(team['id'], self.viewer, self.admin)
+        self.store.create_project('own', self.viewer)
+        self.store.create_project('member', self.admin, team_id=team['id'])
+        for pid in ('direct-share', 'team-share', 'owner-grant', 'global-only'):
+            self.store.create_project(pid, self.owner if pid != 'global-only' else self.admin)
+        self.store.set_project_shares('direct-share', [self.viewer], [], self.owner)
+        self.store.set_project_shares('team-share', [], [team['id']], self.owner)
+        self.store.set_grant(self.viewer, self.owner, 'operate')
+        self.store.set_global_grant(self.viewer, 'read')
+        self.assertEqual(self.store.project_permission(self.viewer, 'global-only'), 'read')
+        self.assertEqual(self.store.project_permission(self.admin, 'global-only'), 'operate')
+        self.store.set_global_grant(self.admin, 'read')
+        self.assertEqual(self.store.project_permission(self.admin, 'direct-share'), 'operate')
+        for pid in ('own', 'member', 'direct-share', 'team-share', 'owner-grant'):
+            with self.subTest(project=pid):
+                self.assertEqual(self.store.project_permission(self.viewer, pid), 'operate')
+        # 分享本身也应优先，不能仅因为同一所有者的 operate 授权而通过。
+        self.store.delete_grant(self.viewer, self.owner)
+        for pid in ('direct-share', 'team-share'):
+            self.assertEqual(self.store.project_permission(self.viewer, pid), 'operate')
+        self.store.set_grant(self.viewer, self.owner, 'read')
+        self.store.set_global_grant(self.viewer, 'operate')
+        self.assertEqual(self.store.project_permission(self.viewer, 'owner-grant'), 'operate')
+
+    def test_global_grants_do_not_bypass_account_or_project_state(self):
+        team = self.store.create_team('状态检查', self.admin)
+        for state in ('active', 'pending', 'deleted'):
+            self.store.create_project('personal-' + state, self.owner, state)
+            self.store.create_project('team-' + state, self.admin, state, team_id=team['id'])
+        for permission in ('read', 'operate'):
+            self.store.set_global_grant(self.viewer, permission)
+            for prefix in ('personal-', 'team-'):
+                self.assertEqual(self.store.project_permission(self.viewer, prefix + 'active'), permission)
+                for state in ('pending', 'deleted'):
+                    self.assertIsNone(self.store.project_permission(self.viewer, prefix + state))
+                    self.assertIsNone(self.store.project_permission(self.admin, prefix + state))
+            self.assertIsNone(self.store.project_permission(self.viewer, 'missing'))
+            self.store.set_user(self.viewer, enabled=False)
+            self.assertEqual(self.store.list_projects(self.viewer), [])
+            for pid in ('personal-active', 'team-active'):
+                self.assertIsNone(self.store.project_permission(self.viewer, pid))
+            self.store.set_user(self.viewer, enabled=True)
+            for status in ('pending', 'rejected'):
+                with self.store.db:
+                    self.store.db.execute('UPDATE users SET approval_status=? WHERE id=?', (status, self.viewer))
+                with self.subTest(permission=permission, approval=status):
+                    self.assertEqual(self.store.list_projects(self.viewer), [])
+                    for pid in ('personal-active', 'team-active'):
+                        self.assertIsNone(self.store.project_permission(self.viewer, pid))
+            with self.store.db:
+                self.store.db.execute("UPDATE users SET approval_status='approved' WHERE id=?", (self.viewer,))
+
+    def test_global_operate_does_not_grant_roles_or_team_management(self):
+        team = self.store.create_team('非成员', self.admin)
+        self.store.create_project('team', self.admin, team_id=team['id'])
+        self.store.create_project('personal', self.owner)
+        before = self.store.get_user(self.viewer)
+        self.store.set_global_grant(self.viewer, 'operate')
+        self.assertEqual(self.store.get_user(self.viewer), before)
+        self.assertEqual(before['role'], 'user')
+        self.assertFalse(before['team_leader'])
+        self.assertEqual(self.store.project_permission(self.viewer, 'team'), 'operate')
+        self.assertEqual(self.store.list_teams(self.viewer), [])
+        operations = (
+            lambda: self.store.create_team('越权团队', self.viewer),
+            lambda: self.store.add_team_member(team['id'], self.viewer, self.viewer),
+            lambda: self.store.remove_team_member(team['id'], self.admin, self.viewer),
+            lambda: self.store.create_project('forbidden', self.viewer, team_id=team['id']),
+            lambda: self.store.set_project_shares('personal', [], [], self.viewer),
+        )
+        for operation in operations:
+            with self.assertRaises(AuthError) as denied:
+                operation()
+            self.assertEqual(denied.exception.status, 403)
+        self.assertIsNone(self.store.get_project('forbidden'))
+        self.assertEqual([u['id'] for u in self.store.list_teams(self.admin)[0]['members']], [self.admin])
+
+    def test_global_grant_is_nontransitive_and_independently_revocable(self):
+        self.store.create_project('owner-project', self.owner)
+        self.store.create_project('admin-project', self.admin)
+        team = self.store.create_team('独立授权', self.admin)
+        self.store.create_project('team-project', self.admin, team_id=team['id'])
+        owner_grant = self.store.set_grant(self.viewer, self.owner, 'operate')
+        self.store.set_grant(self.owner, self.viewer, 'operate')
+        global_grant = self.store.set_global_grant(self.viewer, 'read')
+        self.assertEqual(global_grant, {'viewer_id': self.viewer, 'owner_id': None,
+                                       'scope': 'all', 'permission': 'read'})
+        self.assertIn(owner_grant, self.store.list_grants())
+        self.assertIn(global_grant, self.store.list_grants())
+        self.assertNotIn('scope', owner_grant)
+        self.assertIsNone(self.store.project_permission(self.owner, 'admin-project'))
+        self.assertIsNone(self.store.project_permission(self.owner, 'team-project'))
+        self.store.delete_grant(self.viewer, self.owner)
+        self.assertEqual(self.store.project_permission(self.viewer, 'owner-project'), 'read')
+        self.store.set_grant(self.viewer, self.owner, 'operate')
+        self.store.set_global_grant(self.viewer, 'operate')
+        self.assertIsNone(self.store.project_permission(self.owner, 'admin-project'))
+        self.store.set_global_grant(self.viewer, 'read')
+        self.assertEqual(len([g for g in self.store.list_grants() if g.get('scope') == 'all']), 1)
+        self.store.delete_global_grant(self.viewer)
+        self.store.delete_global_grant(self.viewer)
+        self.assertEqual(self.store.project_permission(self.viewer, 'owner-project'), 'operate')
+        self.assertIsNone(self.store.project_permission(self.viewer, 'admin-project'))
+        self.assertIsNone(self.store.project_permission(self.viewer, 'team-project'))
+        self.assertIn(owner_grant, self.store.list_grants())
+        self.assertFalse(any(g.get('scope') == 'all' for g in self.store.list_grants()))
+
+    def test_global_grants_and_revocation_survive_restart(self):
+        self.store.create_project('personal', self.owner)
+        team = self.store.create_team('持久化', self.admin)
+        self.store.create_project('team', self.admin, team_id=team['id'])
+        owner_grant = self.store.set_grant(self.viewer, self.owner, 'read')
+        for permission in ('read', 'operate', None):
+            if permission is None:
+                self.store.delete_global_grant(self.viewer)
+            else:
+                self.store.set_global_grant(self.viewer, permission)
+            self.store.close()
+            self.store = AuthStore(self.path)
+            self.assertEqual(self.store.project_permission(self.viewer, 'team'), permission)
+            self.assertEqual(self.store.project_permission(self.viewer, 'personal'), permission or 'read')
+            self.assertIn(owner_grant, self.store.list_grants())
+            globals_ = [g for g in self.store.list_grants() if g.get('scope') == 'all']
+            self.assertEqual(len(globals_), int(permission is not None))
+
+    def test_global_grant_validation_and_actor_rechecked_inside_transaction(self):
+        for viewer, permission in ((None, 'read'), ('', 'read'), ('missing', 'read'),
+                                   (self.viewer, None), (self.viewer, 'admin'),
+                                   (self.viewer, True), (self.viewer, [])):
+            with self.subTest(viewer=viewer, permission=permission), self.assertRaises(AuthError):
+                self.store.set_global_grant(viewer, permission)
+        self.assertEqual(self.store.list_grants(), [])
+        self.store.create_user('backup-admin', PASSWORD, 'admin')
+        session = self.store.login('admin', PASSWORD)
+        self.store.set_global_grant(self.viewer, 'read', actor_id=self.admin, session_token=session['token'])
+        original = self.store._check_actor
+
+        def check_in_transaction(*args, **kwargs):
+            self.assertTrue(self.store.db.in_transaction)
+            return original(*args, **kwargs)
+
+        user_session = self.store.login('owner', PASSWORD)
+        invalid_actors = ((self.owner, user_session['token']),
+                          (self.owner, session['token']), (self.admin, None))
+        with patch.object(self.store, '_check_actor', side_effect=check_in_transaction):
+            for actor, token in invalid_actors:
+                for method, args in ((self.store.set_global_grant, (self.viewer, 'operate')),
+                                     (self.store.delete_global_grant, (self.viewer,))):
+                    with self.subTest(actor=actor, method=method.__name__), self.assertRaises(AuthError):
+                        method(*args, actor_id=actor, session_token=token)
+                    self.assertEqual(self.store.list_grants()[0]['permission'], 'read')
+            self.store.logout(session['token'])
+            for method, args in ((self.store.set_global_grant, (self.viewer, 'operate')),
+                                 (self.store.delete_global_grant, (self.viewer,))):
+                with self.assertRaises(AuthError):
+                    method(*args, actor_id=self.admin, session_token=session['token'])
+            self.assertEqual(self.store.list_grants()[0]['permission'], 'read')
 
     def test_team_members_share_team_projects_and_keep_personal_private(self):
         leader = self.store.create_user('leader', PASSWORD, team_leader=True)['id']
@@ -340,10 +520,60 @@ class StoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_project_view(self.viewer, 'shared'),
                          {'x': -30.0, 'y': 40.0, 'k': 0.75})
 
+    def test_v5_migration_preserves_existing_auth_and_project_data(self):
+        team = self.store.create_team('迁移团队', self.admin)
+        self.store.create_project('personal', self.owner)
+        self.store.create_project('team', self.admin, team_id=team['id'])
+        self.store.set_project_shares('personal', [self.viewer], [team['id']], self.owner)
+        owner_grant = self.store.set_grant(self.viewer, self.owner, 'read')
+        self.store.set_project_view(self.viewer, 'personal', 12.0, -34.0, 0.8)
+        self.store.register_job('legacy-job', 'personal', self.owner)
+        session = self.store.login('viewer', PASSWORD)
+        self.store.create_registration('pending-user', PASSWORD, '待审批')
+        self.store.set_ready()
+        legacy = self.path.parent / 'v5.sqlite'
+        migrations = Path(__file__).resolve().parents[1] / 'server/migrations'
+        db = sqlite3.connect(legacy)
+        try:
+            for script in sorted(migrations.glob('00[1-5]_*.sql')):
+                db.executescript(script.read_text(encoding='utf-8'))
+            self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 5)
+            tables = [r[0] for r in db.execute("SELECT name FROM sqlite_master WHERE type='table'")]
+            before = {}
+            for table in tables:
+                rows = [tuple(row) for row in self.store.db.execute(f'SELECT * FROM {table} ORDER BY rowid')]
+                before[table] = rows
+                db.execute(f'DELETE FROM {table}')
+                if rows:
+                    placeholders = ','.join('?' for _ in rows[0])
+                    db.executemany(f'INSERT INTO {table} VALUES ({placeholders})', rows)
+            db.commit()
+        finally:
+            db.close()
+        migrated = AuthStore(legacy)
+        try:
+            self.assertEqual(migrated.db.execute('PRAGMA user_version').fetchone()[0], 6)
+            for table, rows in before.items():
+                with self.subTest(table=table):
+                    self.assertEqual([tuple(row) for row in migrated.db.execute(
+                        f'SELECT * FROM {table} ORDER BY rowid')], rows)
+            self.assertEqual(migrated.list_grants(), [owner_grant])
+            self.assertTrue(migrated.is_ready())
+            self.assertEqual(migrated.get_session(session['token'])['user']['id'], self.viewer)
+            self.assertEqual(migrated.project_permission(self.viewer, 'personal'), 'operate')
+            self.assertIsNone(migrated.project_permission(self.viewer, 'team'))
+            migrated.set_global_grant(self.viewer, 'operate')
+            self.assertEqual(migrated.project_permission(self.viewer, 'team'), 'operate')
+            columns = migrated.db.execute('PRAGMA table_info(global_canvas_grants)').fetchall()
+            self.assertEqual([row['name'] for row in columns], ['viewer_id', 'permission'])
+            self.assertEqual(columns[0]['pk'], 1)
+        finally:
+            migrated.close()
+
     def test_unknown_schema_rejected(self):
         path = Path(self.tmp.name) / 'future.sqlite'
         db = sqlite3.connect(path)
-        db.execute('PRAGMA user_version=6')
+        db.execute('PRAGMA user_version=7')
         db.close()
         with self.assertRaises(AuthError):
             AuthStore(path)
@@ -383,7 +613,7 @@ class RegistrationStoreTests(unittest.TestCase):
             self.assertFalse(users[0]['team_leader'])
             self.assertEqual(store._user('u1')['enabled'], 1)
             self.assertTrue(store.is_ready())
-            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 5)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 6)
             self.assertIsNone(store.get_project('legacy-project')['team_id'])
             self.assertEqual(store.list_project_shares('legacy-project', 'u1')['user_ids'], [])
         finally:
@@ -525,10 +755,14 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         async def ok(request):
             return web.json_response({'ok': True})
         async def project(request):
-            return web.json_response(await require_project(request, 'p', operate=True))
+            return web.json_response(await require_project(
+                request, request.match_info.get('pid', 'p'), operate=request.method == 'POST'))
         app.router.add_get('/api/business', ok)
         app.router.add_get('/api/status', ok)
+        app.router.add_get('/api/project', project)
         app.router.add_post('/api/project', project)
+        app.router.add_get('/api/test/projects/{pid}', project)
+        app.router.add_post('/api/test/projects/{pid}', project)
         app.router.add_post('/agent/v1/test', ok)
         self.client = TestClient(TestServer(app))
         await self.client.start_server()
@@ -593,6 +827,152 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get_project('p')['owner_id'], self.uid)
         self.assertEqual((await self.client.post(url, json=body, headers=headers)).status, 409)
         self.assertEqual((await self.client.post(url, json={'projects': [None], 'owner_id': self.uid}, headers=headers)).status, 400)
+
+    async def test_global_grant_api_requires_admin_and_csrf(self):
+        self.store.set_ready()
+        url = f'/api/admin/global-grants/{self.uid}'
+        for method in ('PUT', 'DELETE'):
+            response = await self.client.request(method, url, json={'permission': 'read'})
+            self.assertEqual(response.status, 401)
+        self.assertEqual((await self.client.get('/api/admin/grants')).status, 401)
+        for leader in (False, True):
+            self.store.set_user(self.uid, team_leader=leader)
+            session = await self.login('user')
+            headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+            for method in ('PUT', 'DELETE'):
+                response = await self.client.request(method, url, json={'permission': 'read'}, headers=headers)
+                self.assertEqual(response.status, 403)
+            self.assertEqual((await self.client.get('/api/admin/grants')).status, 403)
+        session = await self.login()
+        for method in ('PUT', 'DELETE'):
+            for bad_headers in ({'Origin': self.origin},
+                                {'Origin': self.origin, 'X-CSRF-Token': 'wrong'},
+                                {'Origin': 'https://evil.test', 'X-CSRF-Token': session['csrf_token']},
+                                {'X-CSRF-Token': session['csrf_token']}):
+                with self.subTest(method=method, headers=bad_headers):
+                    response = await self.client.request(method, url, json={'permission': 'read'}, headers=bad_headers)
+                    self.assertEqual(response.status, 403)
+        self.assertEqual(self.store.list_grants(), [])
+
+    async def test_global_grant_api_rejects_invalid_requests_without_mutation_or_notification(self):
+        session = await self.login()
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        url = f'/api/admin/global-grants/{self.uid}'
+        invalid = ({}, [], None, {'permission': 'admin'}, {'permission': ''},
+                   {'permission': None}, {'permission': True}, {'permission': 1},
+                   {'permission': []}, {'permission': {}},
+                   {'permission': 'read', 'scope': 'all'},
+                   {'permission': 'operate', 'viewer_id': self.uid},
+                   {'permission': 'read', 'owner_id': self.uid})
+        with patch('server.auth.notify_access_changed') as notify:
+            for body in invalid:
+                with self.subTest(body=body):
+                    response = await self.client.put(url, json=body, headers=headers)
+                    self.assertEqual(response.status, 400, await response.text())
+            response = await self.client.put(url, data='{', headers=headers)
+            self.assertEqual(response.status, 400)
+            response = await self.client.put('/api/admin/global-grants/missing',
+                                             json={'permission': 'read'}, headers=headers)
+            self.assertEqual(response.status, 404)
+            self.assertEqual(self.store.list_grants(), [])
+            notify.assert_not_awaited()
+
+    async def test_global_grant_api_lists_downgrades_and_revokes_with_notifications(self):
+        admin = self.store.list_users()[0]['id']
+        owner = self.store.create_user('owner', PASSWORD)['id']
+        self.store.create_project('p', admin)
+        self.store.create_project('owner-project', owner)
+        owner_grant = self.store.set_grant(self.uid, owner, 'operate')
+        self.store.set_ready()
+        session = await self.login()
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        url = f'/api/admin/global-grants/{self.uid}'
+        with patch('server.auth.notify_access_changed') as notify:
+            for permission in ('operate', 'read'):
+                notify.reset_mock()
+                response = await self.client.put(url, json={'permission': permission}, headers=headers)
+                self.assertEqual(response.status, 200, await response.text())
+                grant = {'viewer_id': self.uid, 'owner_id': None, 'scope': 'all', 'permission': permission}
+                self.assertEqual((await response.json())['grant'], grant)
+                self.assertEqual(self.store.project_permission(self.uid, 'p'), permission)
+                response = await self.client.get('/api/admin/grants')
+                self.assertEqual(response.status, 200)
+                self.assertCountEqual((await response.json())['grants'], [owner_grant, grant])
+                notify.assert_awaited_once_with(ANY, user_ids=[self.uid])
+            notify.reset_mock()
+            response = await self.client.delete(url, headers=headers)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {'ok': True})
+            notify.assert_awaited_once_with(ANY, user_ids=[self.uid])
+            self.assertIsNone(self.store.project_permission(self.uid, 'p'))
+            self.assertEqual(self.store.project_permission(self.uid, 'owner-project'), 'operate')
+            response = await self.client.get('/api/admin/grants')
+            self.assertEqual((await response.json())['grants'], [owner_grant])
+        await self.login('user')
+        self.assertEqual((await self.client.get('/api/project')).status, 404)
+        self.assertEqual((await self.client.get('/api/test/projects/owner-project')).status, 200)
+
+    async def test_global_grant_http_read_operate_and_team_role_boundaries(self):
+        admin = self.store.list_users()[0]['id']
+        team = self.store.create_team('全局访问不是成员资格', admin)
+        self.store.create_project('p', admin)
+        self.store.create_project('team', admin, team_id=team['id'])
+        self.store.create_project('pending', admin, 'pending')
+        self.store.create_project('deleted', admin, 'deleted')
+        self.store.set_ready()
+        session = await self.login('user')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        for permission in ('read', 'operate'):
+            self.store.set_global_grant(self.uid, permission)
+            for url in ('/api/project', '/api/test/projects/team'):
+                response = await self.client.get(url)
+                self.assertEqual(response.status, 200)
+                self.assertEqual((await response.json())['permission'], permission)
+                response = await self.client.post(url, headers=headers)
+                self.assertEqual(response.status, 403 if permission == 'read' else 200)
+            for pid in ('pending', 'deleted', 'missing'):
+                response = await self.client.get('/api/test/projects/' + pid)
+                self.assertEqual(response.status, 404)
+            for url in ('/api/status', '/api/admin/users', '/api/admin/grants', '/api/team-candidates'):
+                self.assertEqual((await self.client.get(url)).status, 403)
+            response = await self.client.get('/api/auth/me')
+            user = (await response.json())['user']
+            self.assertEqual(user['role'], 'user')
+            self.assertFalse(user['team_leader'])
+            response = await self.client.get('/api/teams')
+            self.assertEqual((await response.json())['teams'], [])
+            response = await self.client.post('/api/teams', json={'name': '越权'}, headers=headers)
+            self.assertEqual(response.status, 403)
+            response = await self.client.post(f"/api/teams/{team['id']}/members",
+                                              json={'user_id': self.uid}, headers=headers)
+            self.assertEqual(response.status, 403)
+        self.store.set_global_grant(self.uid, 'read')
+        self.assertEqual((await self.client.post('/api/project', headers=headers)).status, 403)
+        self.store.delete_global_grant(self.uid)
+        self.assertEqual((await self.client.get('/api/project')).status, 404)
+        self.assertEqual((await self.client.get('/api/test/projects/team')).status, 404)
+
+    async def test_global_grant_api_rechecks_actor_after_middleware(self):
+        admin = self.store.list_users()[0]['id']
+        self.store.set_global_grant(self.uid, 'read')
+        url = f'/api/admin/global-grants/{self.uid}'
+        for method, name in (('PUT', 'set_global_grant'), ('DELETE', 'delete_global_grant')):
+            session = await self.login()
+            headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+            original = getattr(self.store, name)
+
+            def revoke_before_write(*args, **kwargs):
+                self.assertEqual(kwargs['actor_id'], admin)
+                self.assertTrue(kwargs['session_token'])
+                self.store.logout(kwargs['session_token'])
+                return original(*args, **kwargs)
+
+            with patch.object(self.store, name, side_effect=revoke_before_write), \
+                    patch('server.auth.notify_access_changed') as notify:
+                response = await self.client.request(method, url, json={'permission': 'operate'}, headers=headers)
+                self.assertEqual(response.status, 401, await response.text())
+                notify.assert_not_awaited()
+            self.assertEqual(self.store.list_grants()[0]['permission'], 'read')
 
     async def test_team_api_requires_leader_and_manages_members(self):
         member = self.store.create_user('member', PASSWORD)
