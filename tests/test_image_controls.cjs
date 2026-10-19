@@ -28,6 +28,7 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
   const metadata = new Map([
     ['chouka/portrait.mp4',{width:720,height:1280,duration:7.375,fps:24}],
     ['chouka/custom.mp4',{width:1000,height:800,duration:19.125,fps:30}],
+    ['chouka/wide.mp4',{width:1946,height:834,duration:4.1,fps:24}],
   ]);
   let delayedMedia, reportDelayed, persistProject=false;
   const delayedReady=new Promise(resolve=>{reportDelayed=resolve;});
@@ -41,6 +42,10 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       const ref=new URL(req.url,'http://localhost').searchParams.get('ref');mediaRequests.push(ref);
       if(ref==='chouka/delayed.mp4') { delayedMedia=()=>json(res,{width:1920,height:1080,duration:12});reportDelayed();return; }
       return json(res,metadata.get(ref)||{});
+    }
+    if (pathname === '/api/upload') {
+      req.resume();req.on('end',()=>json(res,{kind:'video',ref:'chouka/wide.mp4',url:'/wide.mp4',...metadata.get('chouka/wide.mp4')}));
+      return;
     }
     if (pathname === '/api/generate') {
       const chunks=[];req.on('data',chunk=>chunks.push(chunk));
@@ -491,57 +496,79 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
         }
       }
     });
-    await t.test('video reference follow defaults on in all four modes and preserves manual settings when off',async()=>{
+    const videoRow=label=>page.locator('#respop .pwrap .row').filter({has:page.getByText(label,{exact:true})});
+    await t.test('video references auto-select existing ratio and duration controls without a follow switch',async()=>{
       for(const cap of ['minimax_h3_ref9','minimax_h3_ref_2pass','minimax_h3_fusion_v2','minimax_h3_character_transfer']) {
         await reset(cap,'card_video');await paramsButton.click();
-        const toggle=page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true});
-        assert.equal(await toggle.getAttribute('aria-checked'),'true',cap);
+        assert.equal(await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).count(),0,cap);
+        assert.equal(await page.locator('#respop .cgrid:not(.k)').count(),1,cap);
         await page.evaluate(()=>{
           const c=PROJ.cards[0];c.params.duration=9;c.params.preview_seconds=5;
-          c.params.aspect_ratio='21:9 (Ultrawide)';
-          putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/portrait.mp4',url:'/portrait.mp4',width:720,height:1280,duration:7.375});openPanel(c.id);
+          c.params.aspect_ratio='16:9 (Widescreen)';
+          putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/wide.mp4',url:'/wide.mp4',width:1946,height:834,duration:4.1});openPanel(c.id);
         });
-        assert.equal(await page.locator('#respop .cgrid:not(.k)').count(),0,cap);
-        assert.match(await page.locator('#respop .reference-follow').innerText(),/9:16.*7.375 秒/);
+        await page.waitForFunction(()=>PROJ.cards[0].params._reference_video);
+        assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'21:9',cap);
+        const duration=videoRow(cap==='minimax_h3_character_transfer'?'单段时长(秒)':'时长(秒)');
+        assert.equal(await duration.locator('input[type=number]').inputValue(),cap==='minimax_h3_character_transfer'?'9':'4.1');
+        if(cap!=='minimax_h3_character_transfer') {
+          assert.equal(await duration.locator('input[type=range]').inputValue(),'4.1');
+          assert.equal(await duration.locator('input[type=number]').evaluate(e=>e.validity.valid),true);
+        } else assert.equal(await videoRow('仅测试前几秒').locator('input[type=number]').inputValue(),'0');
+        if(process.env.CHOUKA_TEST_SCREENSHOT && cap==='minimax_h3_ref9') await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT});
         const payload=await page.evaluate(()=>payloadOf(PROJ.cards[0]));
-        assert.equal(payload.params.follow_reference_video,'on');
-        assert.equal(payload.params.duration,cap==='minimax_h3_character_transfer'?9:7.375);
-        if(cap==='minimax_h3_character_transfer')assert.equal(payload.params.preview_seconds,0);
-        await toggle.focus();await page.keyboard.press('Space');
-        assert.equal(await toggle.getAttribute('aria-checked'),'false');
-        assert.equal(await toggle.evaluate(e=>document.activeElement===e),true,'keyboard focus remains on switch');
-        const bounds=await page.locator('#respop').boundingBox();
-        assert.ok(bounds.y>=8 && bounds.y+bounds.height<=1100-8,'expanded manual controls stay in viewport');
-        assert.equal(await page.locator('#respop .cgrid:not(.k)').count(),1);
-        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),9);
-        assert.equal(await page.evaluate(()=>PROJ.cards[0].params.preview_seconds),5);
-        assert.equal(await page.evaluate(()=>PROJ.cards[0].params.aspect_ratio),'21:9 (Ultrawide)');
-        await toggle.click();
+        assert.equal('follow_reference_video' in payload.params,false);
+        assert.equal(payload.params.duration,cap==='minimax_h3_character_transfer'?9:4.1);
+        await page.locator('#respop button[title^="画面比例 16:9"]').click();
+        await duration.locator('input[type=number]').fill('8');
+        await page.evaluate(()=>openPanel(PROJ.cards[0].id));
+        assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'16:9');
+        assert.equal(await duration.locator('input[type=number]').inputValue(),'8');
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),8);
         await page.locator('#respop .cgrid.k').getByRole('button',{name:'768p',exact:true}).click();
-        assert.equal(await toggle.getAttribute('aria-checked'),'true');
-        assert.match(await paramsButton.innerText(),/参考 9:16.*7.375秒/);
+        const bounds=await page.locator('#respop').boundingBox();
+        assert.ok(bounds.y>=8 && bounds.y+bounds.height<=1100-8,'controls stay in viewport');
         await page.evaluate(()=>{const c=PROJ.cards[0];delete c.assets['video[0]'];openPanel(c.id);});
-        assert.equal(await page.locator('#respop .cgrid:not(.k)').count(),1);
-        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),9);
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),8,'removing reference keeps edited values');
       }
     });
-    await t.test('old and linked video assets read metadata once and submit the current reference duration',async()=>{
+    await t.test('linked videos fill real parameters once and submit fractional duration without clamping',async()=>{
       await reset('minimax_h3_fusion_v2','card_video');
       const start=mediaRequests.length;
-      await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/custom.mp4',url:'/custom.mp4'});openPanel(c.id);});
+      await page.evaluate(async()=>{
+        const c=PROJ.cards[0];
+        const upstream={id:'source',type:'card_asset',params:{},assets:{},outputs:[{kind:'video',ref:'chouka/custom.mp4',url:'/custom.mp4'}]};
+        PROJ.cards.push(upstream);await linkTo(upstream,c);await syncReferenceParameters(c);
+      });
       await paramsButton.click();
-      await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===19.125);
-      assert.match(await page.locator('#respop .reference-follow').innerText(),/5:4.*19.125 秒/);
-      assert.equal(mediaRequests.length-start,1,'panel and popup share an in-flight metadata request');
-      await page.evaluate(()=>openPanel(PROJ.cards[0].id));
-      await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).click();
-      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.follow_reference_video),'off');
-      await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).click();
+      assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'4:3','nearest existing workflow preset');
+      const duration=videoRow('时长(秒)');
+      assert.equal(await duration.locator('input[type=number]').inputValue(),'19.125');
+      assert.equal(await duration.locator('input[type=range]').inputValue(),'19.125');
+      assert.equal(await duration.locator('input[type=number]').evaluate(e=>e.validity.valid),true);
+      assert.equal(mediaRequests.length-start,1,'link, panel and popup share one metadata request');
       await page.evaluate(()=>runCard(PROJ.cards[0]));
-      assert.equal(submissions.at(-1).params.duration,19.125,'does not silently clamp long video to 15s');
-      assert.equal(submissions.at(-1).params.follow_reference_video,'on');
+      assert.equal(submissions.at(-1).params.duration,19.125);
+      assert.equal(submissions.at(-1).params.aspect_ratio,'4:3 (Standard)');
+      assert.equal('follow_reference_video' in submissions.at(-1).params,false);
       assert.equal(submissions.at(-1).assets['video[0]'],'chouka/custom.mp4');
       assert.equal(mediaRequests.length-start,1);
+    });
+    await t.test('file upload selects 21:9 and source seconds in the original controls',async()=>{
+      await reset('minimax_h3_ref9','card_video');
+      const chooser=page.waitForEvent('filechooser');
+      await page.evaluate(()=>pickFile(PROJ.cards[0],CAPS[PROJ.cards[0].cap].inputs.find(s=>s.type==='video')));
+      await (await chooser).setFiles({name:'wide.mp4',mimeType:'video/mp4',buffer:Buffer.from('offline upload fixture')});
+      await page.waitForFunction(()=>PROJ.cards[0].params.duration===4.1);
+      await paramsButton.click();
+      assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'21:9');
+      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'4.1');
+      assert.equal(await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).count(),0);
+      await page.locator('#respop button[title^="画面比例 16:9"]').click();
+      await videoRow('时长(秒)').locator('input[type=number]').fill('8.5');
+      await page.evaluate(()=>runCard(PROJ.cards[0]));
+      assert.equal(submissions.at(-1).params.duration,8.5,'submission retains the manual edit');
+      assert.equal(submissions.at(-1).params.aspect_ratio,'16:9 (Widescreen)');
     });
     await t.test('late metadata cannot overwrite a replacement video and metadata failure can be retried',async()=>{
       await reset('minimax_h3_ref9','card_video');delayedMedia=null;
@@ -552,39 +579,78 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/portrait.mp4',url:'/portrait.mp4',width:720,height:1280,duration:7.375});openPanel(c.id);});
       delayedMedia();
       await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===7.375);
-      assert.match(await page.locator('#respop .reference-follow').innerText(),/9:16.*7.375 秒/);
+      assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'9:16');
+      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'7.375');
       assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),7.375);
       await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/missing.mp4',url:'/missing.mp4'});openPanel(c.id);});
       await page.getByRole('button',{name:'重新读取',exact:true}).waitFor();
-      assert.match(await page.locator('#respop .reference-follow').innerText(),/无法读取参考视频/);
+      assert.match(await page.locator('#respop [role=status]').innerText(),/无法读取参考视频/);
       metadata.set('chouka/missing.mp4',{width:960,height:640,duration:6.5});
       await page.getByRole('button',{name:'重新读取',exact:true}).click();
       await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===6.5);
-      assert.match(await page.locator('#respop .reference-follow').innerText(),/3:2.*6.5 秒/);
+      assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'3:2');
+      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'6.5');
       assert.equal(await page.getByRole('button',{name:'重新读取',exact:true}).count(),0);
     });
-    await t.test('follow switch and manual values persist across project save and reload',async()=>{
+    await t.test('manual edits made during metadata loading are not overwritten',async()=>{
+      await reset('minimax_h3_ref9','card_video');
+      let release, report;
+      const ready=new Promise(resolve=>{report=resolve;});
+      const gate=new Promise(resolve=>{release=resolve;});
+      await page.route('**/api/media?ref=chouka%2Fmanual-pending.mp4&*',async route=>{
+        report();await gate;await route.fulfill({json:{width:720,height:1280,duration:7.375}});
+      });
+      try {
+        await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/manual-pending.mp4',url:'/pending.mp4'});});
+        await ready;await paramsButton.click();
+        await page.locator('#respop button[title^="画面比例 1:1"]').click();
+        await videoRow('时长(秒)').locator('input[type=number]').fill('9');
+        release();
+        await page.waitForFunction(()=>PROJ.cards[0].params._reference_video);
+        assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'1:1');
+        assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'9');
+      } finally {release();await page.unroute('**/api/media?ref=chouka%2Fmanual-pending.mp4&*');}
+    });
+    await t.test('upstream replacement fills parameters even when the video card is not selected',async()=>{
+      await reset('minimax_h3_fusion_v2','card_video');
+      await page.evaluate(async()=>{
+        const c=PROJ.cards[0];
+        const source={id:'source',type:'card_asset',x:800,y:100,params:{},assets:{},outputs:[{kind:'video',ref:'chouka/wide.mp4',url:'/wide.mp4',width:1946,height:834,duration:4.1}]};
+        PROJ.cards.push(source);await linkTo(source,c);await syncReferenceParameters(c);
+        pick(source.id);
+        await setAssetItem(source,{kind:'video',ref:'chouka/portrait.mp4',url:'/portrait.mp4',width:720,height:1280,duration:7.375},false);
+        await syncReferenceParameters(c);
+      });
+      assert.equal(await page.evaluate(()=>PROJ.cards[0].params.aspect_ratio),'9:16 (Portrait Widescreen)');
+      assert.equal(await page.evaluate(()=>PROJ.cards[0].params.duration),7.375);
+      await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
+      assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'9:16');
+    });
+    await t.test('automatic defaults and later manual edits persist across save and reload',async()=>{
       project.locked=false;
       await reset('minimax_h3_fusion_v2','card_video');persistProject=true;
       try {
         await page.evaluate(async()=>{
-          const c=PROJ.cards[0];c.params={duration:11,aspect_ratio:'21:9 (Ultrawide)',follow_reference_video:'off'};
-          putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/portrait.mp4',url:'/portrait.mp4',width:720,height:1280,duration:7.375});
-          await enqueueSave(PROJ.id);
+          const c=PROJ.cards[0];c.params={follow_reference_video:'off'};
+          putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/wide.mp4',url:'/wide.mp4',width:1946,height:834,duration:4.1});
+          await syncReferenceParameters(c);await enqueueSave(PROJ.id);
         });
         await page.reload();await page.waitForFunction(()=>PROJ?.cards[0]?._el);
         await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
-        const toggle=page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true});
-        assert.equal(await toggle.getAttribute('aria-checked'),'false');
-        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),11);
-        await toggle.click();await page.evaluate(()=>enqueueSave(PROJ.id));
+        assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'21:9');
+        assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'4.1');
+        await page.locator('#respop button[title^="画面比例 16:9"]').click();
+        await videoRow('时长(秒)').locator('input[type=number]').fill('11');
+        await page.evaluate(()=>enqueueSave(PROJ.id));
         await page.reload();await page.waitForFunction(()=>PROJ?.cards[0]?._el);
         await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
-        assert.equal(await toggle.getAttribute('aria-checked'),'true');
-        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),7.375);
-        await toggle.click();
-        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),11);
-        assert.equal(await page.evaluate(()=>PROJ.cards[0].params.aspect_ratio),'21:9 (Ultrawide)');
+        assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'16:9');
+        assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'11');
+        assert.equal(await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).count(),0);
+        const payload=await page.evaluate(()=>payloadOf(PROJ.cards[0]));
+        assert.equal(payload.params.duration,11);
+        assert.equal(payload.params.aspect_ratio,'16:9 (Widescreen)');
+        assert.equal('follow_reference_video' in payload.params,false,'obsolete saved switch has no effect');
       } finally {persistProject=false;project.locked=true;}
     });
     assert.deepEqual(errors,[]);

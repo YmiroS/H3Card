@@ -598,20 +598,24 @@ def apply_input_presets(cap, params):
         params.update(presets[selected])
 
 
-def reference_video_settings(cap, params, uploaded, video_metadata):
-    """仅显式开启时使用服务端探测值；不把旧 API 或工具能力改成跟随模式。"""
-    if (params.get("follow_reference_video") != "on" or cap.get("kind") != "gen"
-            or cap.get("outputType") != "video"):
+def reference_video_input(cap, uploaded):
+    """仅四种 H3 视频参考能力的已填视频槽参与最终输出契约。"""
+    if (cap.get("id") not in {"minimax_h3_ref9", "minimax_h3_ref_2pass",
+                              "minimax_h3_fusion_v2", "minimax_h3_character_transfer"}
+            or cap.get("kind") != "gen" or cap.get("outputType") != "video"):
+        return None
+    return next((uploaded.get(spec["key"]) for spec in cap.get("inputs", [])
+                 if spec.get("type") == "video" and uploaded.get(spec["key"])), None)
+
+
+def resolve_reference_video_output_settings(cap, params, uploaded, video_metadata):
+    """按当前面板参数解析输出；人物迁移的总时长仍由可信来源时间线决定。"""
+    ref = reference_video_input(cap, uploaded)
+    if not ref or any(spec.get("required") and spec["type"] in ("image", "audio", "video")
+                      and not uploaded.get(spec["key"]) for spec in cap["inputs"]):
         return None
     for key in ("width", "height", "duration", "fps", "count"):
         params.pop("output_" + key, None)
-    ref = next((uploaded.get(spec["key"]) for spec in cap.get("inputs", [])
-                if spec.get("type") == "video" and uploaded.get(spec["key"])), None)
-    if not ref:
-        return None
-    if ref not in video_metadata:
-        video_metadata[ref] = probe_video(ref)
-    info = video_metadata[ref] or {}
 
     def positive(value, label):
         try:
@@ -619,13 +623,9 @@ def reference_video_settings(cap, params, uploaded, video_metadata):
         except (TypeError, ValueError, OverflowError):
             value = math.nan
         if not math.isfinite(value) or value <= 0:
-            raise web.HTTPBadRequest(reason=f"跟随参考视频：无法读取有效{label}")
+            raise web.HTTPBadRequest(reason=f"视频参考输出：无法读取有效{label}")
         return value
 
-    width = positive(info.get("width"), "宽度")
-    height = positive(info.get("height"), "高度")
-    duration = positive(info.get("duration"), "时长")
-    ratio = positive(width / height, "画面比例")
     specs = {spec["key"]: spec for spec in cap["inputs"]}
 
     def value(key):
@@ -635,39 +635,58 @@ def reference_video_settings(cap, params, uploaded, video_metadata):
 
     character = (cap.get("patch") or {}).get("kind") == "h3_character_transfer"
     if character:
-        short = min(value("width"), value("height"))
-        ideal_width, ideal_height = (short * ratio, short) if ratio >= 1 else (short, short / ratio)
+        ideal_width, ideal_height = value("width"), value("height")
+        if ref not in video_metadata:
+            video_metadata[ref] = probe_video(ref)
+        duration = positive((video_metadata[ref] or {}).get("duration"), "时长")
+        preview_seconds = max(0, float(params.get("preview_seconds") or 0))
+        if preview_seconds:
+            duration = min(duration, preview_seconds)
     else:
+        aspect_spec = specs["aspect_ratio"]
+        selected = params.get("aspect_ratio")
+        if selected in (None, ""):
+            selected = aspect_spec["default"]
+        options = [option.get("value") if isinstance(option, dict) else option
+                   for option in aspect_spec.get("options", [])]
+        if selected not in options:
+            raise web.HTTPBadRequest(reason=f"画面比例无效：{selected}")
+        match = re.match(r"^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)(?:\s|$)", selected)
+        if not match:
+            raise web.HTTPBadRequest(reason=f"画面比例无效：{selected}")
+        ratio = positive(positive(match[1], "比例宽度") / positive(match[2], "比例高度"), "画面比例")
+        params["aspect_ratio"] = selected
+        duration = value("duration")
         megapixels = value("megapixels")
         if megapixels > 16:
-            raise web.HTTPBadRequest(reason="跟随参考视频：分辨率超过 ResolutionSelector 节点上限 16MP")
+            raise web.HTTPBadRequest(reason="视频参考输出：分辨率超过 ResolutionSelector 节点上限 16MP")
         area = megapixels * 1024 * 1024
         ideal_width, ideal_height = math.sqrt(area * ratio), math.sqrt(area / ratio)
     if not all(math.isfinite(side) for side in (ideal_width, ideal_height)):
-        raise web.HTTPBadRequest(reason="跟随参考视频：比例或分辨率超出节点支持范围")
+        raise web.HTTPBadRequest(reason="视频参考输出：比例或分辨率超出节点支持范围")
     generation = tuple(round(side / 32) * 32 for side in (ideal_width, ideal_height))
     if any(side < 32 or side > 16384 for side in generation):
-        raise web.HTTPBadRequest(reason="跟随参考视频：32 对齐后的宽高必须在 32..16384，参考比例过于极端或分辨率越界")
+        raise web.HTTPBadRequest(reason="视频参考输出：32 对齐后的宽高必须在 32..16384，画面比例过于极端或分辨率越界")
     scale = value("scale_by") if cap["id"] == "minimax_h3_ref_2pass" else 1
     # 按未对齐的理想尺寸取最近偶数，每个边的量化误差不超过 1px；
     # 不从 32 对齐的生成尺寸反推比例，也不丢掉二采工作流的放大倍率。
     final_sides = (ideal_width * scale, ideal_height * scale)
     if not all(math.isfinite(side) and 1 <= side <= 16385 for side in final_sides):
-        raise web.HTTPBadRequest(reason="跟随参考视频：最终输出尺寸超出节点支持范围")
+        raise web.HTTPBadRequest(reason="视频参考输出：最终输出尺寸超出节点支持范围")
     final = tuple(round(side / 2) * 2 for side in final_sides)
     if any(side < 2 or side > 16384 for side in final):
-        raise web.HTTPBadRequest(reason="跟随参考视频：最终偶数宽高必须在 2..16384")
+        raise web.HTTPBadRequest(reason="视频参考输出：最终偶数宽高必须在 2..16384")
     if not math.isfinite(duration * 24):
-        raise web.HTTPBadRequest(reason="跟随参考视频：时长超出节点支持范围")
+        raise web.HTTPBadRequest(reason="视频参考输出：时长超出节点支持范围")
     frames = max(1, round(duration * 24))
     if not character and frames < 5:
-        raise web.HTTPBadRequest(reason="跟随参考视频：H3 视频参考至少需要 5 帧（约 0.21 秒），请使用更长的视频")
+        raise web.HTTPBadRequest(reason="视频参考输出：H3 视频参考至少需要 5 帧（约 0.21 秒），请增大输出时长")
     aligned = max(5, frames)
     aligned += (5 - aligned % 17) % 17
     if not character and aligned > 3600:
-        raise web.HTTPBadRequest(reason="跟随参考视频：H3 对齐后帧数超过节点上限 3600 帧（约 150 秒）")
+        raise web.HTTPBadRequest(reason="视频参考输出：H3 对齐后帧数超过节点上限 3600 帧（约 150 秒）")
     if character:
-        params.update(width=generation[0], height=generation[1], preview_seconds=0)
+        params.update(width=generation[0], height=generation[1])
     else:
         params["duration"] = duration
     params.update(output_width=final[0], output_height=final[1], output_duration=duration,
@@ -726,7 +745,7 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
     """按 manifest 把用户参数写进 API 工作流模板"""
     apply_input_presets(cap, params)
     video_metadata = dict(video_metadata or {})
-    follow = reference_video_settings(cap, params, uploaded, video_metadata)
+    follow = resolve_reference_video_output_settings(cap, params, uploaded, video_metadata)
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
     labels = {s["key"]: s["label"] for s in cap["inputs"]}
     missing, blank = [], []
@@ -1253,7 +1272,7 @@ async def api_generate(request):
     params = body.get("params") or {}
     uploaded = await generation_assets(request, body.get("assets") or {}, body["project"])
     source_video_duration, video_metadata = None, {}
-    if not body.get("dry_run") or params.get("follow_reference_video") == "on":
+    if not body.get("dry_run") or reference_video_input(cap, uploaded):
         source_video_duration, video_metadata = await asyncio.to_thread(
             inspect_imported_videos, cap, uploaded
         )
