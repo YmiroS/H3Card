@@ -2981,6 +2981,11 @@ async def director_index(request):
     return web.FileResponse(ROOT / "web" / "director.html")
 
 
+async def if_studio_index(request):
+    require_user(request)
+    return web.FileResponse(ROOT / "web" / "if-studio.html")
+
+
 async def controller_index(request):
     if not CONTROLLER_MODE:
         raise web.HTTPNotFound(reason="中间层运行面板只在 controller 模式提供")
@@ -3487,6 +3492,7 @@ def make_app(auth_path=None):
     app.on_response_prepare.append(no_cache)
     app.router.add_get("/", index)
     app.router.add_get("/director", director_index)
+    app.router.add_get("/if-studio", if_studio_index)
     app.router.add_get("/controller", controller_index)
     app.router.add_get("/controller/costs", controller_costs)
     app.router.add_get("/controller/capacity", controller_capacity)
@@ -3554,7 +3560,7 @@ def make_app(auth_path=None):
     app.router.add_get("/teams", teams_page)
     # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
     for name in ("app.js", "style.css", "director.js", "director.css", "director_edit.js",
-                 "admin-shell.css", "admin-shell.js", "controller-page.js", "costs-page.js",
+                 "if-studio.js", "admin-shell.css", "admin-shell.js", "controller-page.js", "costs-page.js",
                  "image-composer.js", "image-composer.css", "vendor/fabric.min.js"):
         app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
