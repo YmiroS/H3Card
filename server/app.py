@@ -433,7 +433,7 @@ AUDIO_STREAM_RE = re.compile(r"^\s*Stream #\d+:\d+.*:\s*Audio:", re.MULTILINE)
 
 
 def probe_video(ref):
-    """这份视频素材：{fps, frames, duration, has_audio}。探不到返回 {}（调用方必须有兜底）。
+    """视频素材的 fps/frames/duration/has_audio 和考虑 SAR、旋转后的显示宽高。
 
     ref 是 ComfyUI input 目录里的相对路径（"chouka/ck_xxx.mp4"），本地
     data/uploads/ 下有同名副本，先用本地那份。
@@ -466,6 +466,23 @@ def probe_video(ref):
         out["duration"] = round(int(h) * 3600 + int(m) * 60 + float(s), 3)
     if "fps" in out and "duration" in out:
         out["frames"] = int(round(out["fps"] * out["duration"]))
+    # 只读第一条视频流及其附属元数据，避免第二视频流的尺寸/旋转覆盖主画面。
+    streams = re.split(r"(?=^\s*Stream #\d+:\d+)", err, flags=re.MULTILINE)
+    video = next((stream for stream in streams
+                  if re.match(r"\s*Stream #[^\n]*:\s*Video:", stream)), "")
+    size = re.search(r"(?<![\w.])([1-9]\d*)x([1-9]\d*)(?=[\s,\[]|$)",
+                     video.lstrip().split("\n", 1)[0])
+    if size:
+        width, height = map(float, size.groups())
+        sar = re.search(r"\bSAR\s+(\d+):(\d+)", video)
+        if sar and int(sar[1]) > 0 and int(sar[2]) > 0:
+            width *= int(sar[1]) / int(sar[2])
+        rotation = re.search(r"rotation of\s+([-+\d.]+)\s+degrees", video)
+        if rotation is None:
+            rotation = re.search(r"\brotate\s*:\s*([-+\d.]+)", video)
+        if rotation and abs(float(rotation[1])) % 180 == 90:
+            width, height = height, width
+        out.update(width=width, height=height)
     return out
 
 
@@ -581,9 +598,135 @@ def apply_input_presets(cap, params):
         params.update(presets[selected])
 
 
+def reference_video_settings(cap, params, uploaded, video_metadata):
+    """仅显式开启时使用服务端探测值；不把旧 API 或工具能力改成跟随模式。"""
+    if (params.get("follow_reference_video") != "on" or cap.get("kind") != "gen"
+            or cap.get("outputType") != "video"):
+        return None
+    for key in ("width", "height", "duration", "fps", "count"):
+        params.pop("output_" + key, None)
+    ref = next((uploaded.get(spec["key"]) for spec in cap.get("inputs", [])
+                if spec.get("type") == "video" and uploaded.get(spec["key"])), None)
+    if not ref:
+        return None
+    if ref not in video_metadata:
+        video_metadata[ref] = probe_video(ref)
+    info = video_metadata[ref] or {}
+
+    def positive(value, label):
+        try:
+            value = float(value)
+        except (TypeError, ValueError, OverflowError):
+            value = math.nan
+        if not math.isfinite(value) or value <= 0:
+            raise web.HTTPBadRequest(reason=f"跟随参考视频：无法读取有效{label}")
+        return value
+
+    width = positive(info.get("width"), "宽度")
+    height = positive(info.get("height"), "高度")
+    duration = positive(info.get("duration"), "时长")
+    ratio = positive(width / height, "画面比例")
+    specs = {spec["key"]: spec for spec in cap["inputs"]}
+
+    def value(key):
+        supplied = params.get(key)
+        return positive(specs.get(key, {}).get("default") if supplied in (None, "")
+                        else supplied, key)
+
+    character = (cap.get("patch") or {}).get("kind") == "h3_character_transfer"
+    if character:
+        short = min(value("width"), value("height"))
+        ideal_width, ideal_height = (short * ratio, short) if ratio >= 1 else (short, short / ratio)
+    else:
+        megapixels = value("megapixels")
+        if megapixels > 16:
+            raise web.HTTPBadRequest(reason="跟随参考视频：分辨率超过 ResolutionSelector 节点上限 16MP")
+        area = megapixels * 1024 * 1024
+        ideal_width, ideal_height = math.sqrt(area * ratio), math.sqrt(area / ratio)
+    if not all(math.isfinite(side) for side in (ideal_width, ideal_height)):
+        raise web.HTTPBadRequest(reason="跟随参考视频：比例或分辨率超出节点支持范围")
+    generation = tuple(round(side / 32) * 32 for side in (ideal_width, ideal_height))
+    if any(side < 32 or side > 16384 for side in generation):
+        raise web.HTTPBadRequest(reason="跟随参考视频：32 对齐后的宽高必须在 32..16384，参考比例过于极端或分辨率越界")
+    scale = value("scale_by") if cap["id"] == "minimax_h3_ref_2pass" else 1
+    # 按未对齐的理想尺寸取最近偶数，每个边的量化误差不超过 1px；
+    # 不从 32 对齐的生成尺寸反推比例，也不丢掉二采工作流的放大倍率。
+    final_sides = (ideal_width * scale, ideal_height * scale)
+    if not all(math.isfinite(side) and 1 <= side <= 16385 for side in final_sides):
+        raise web.HTTPBadRequest(reason="跟随参考视频：最终输出尺寸超出节点支持范围")
+    final = tuple(round(side / 2) * 2 for side in final_sides)
+    if any(side < 2 or side > 16384 for side in final):
+        raise web.HTTPBadRequest(reason="跟随参考视频：最终偶数宽高必须在 2..16384")
+    if not math.isfinite(duration * 24):
+        raise web.HTTPBadRequest(reason="跟随参考视频：时长超出节点支持范围")
+    frames = max(1, round(duration * 24))
+    if not character and frames < 5:
+        raise web.HTTPBadRequest(reason="跟随参考视频：H3 视频参考至少需要 5 帧（约 0.21 秒），请使用更长的视频")
+    aligned = max(5, frames)
+    aligned += (5 - aligned % 17) % 17
+    if not character and aligned > 3600:
+        raise web.HTTPBadRequest(reason="跟随参考视频：H3 对齐后帧数超过节点上限 3600 帧（约 150 秒）")
+    if character:
+        params.update(width=generation[0], height=generation[1], preview_seconds=0)
+    else:
+        params["duration"] = duration
+    params.update(output_width=final[0], output_height=final[1], output_duration=duration,
+                  output_fps=frames / duration, output_count=1)
+    return {"character": character, "generation": generation, "final": final,
+            "frames": frames, "aligned": aligned, "duration": duration}
+
+
+def patch_follow_reference_video(g, cap, follow):
+    """仅改本次提交图：任意比例、H3 帧对齐，以及输出前的精确时长和偶数尺寸。"""
+    if not follow:
+        return
+    selectors = {str(spec["target"]["node"]) for spec in cap["inputs"]
+                 if spec["key"] == "aspect_ratio"
+                 and g.get(str(spec["target"]["node"]), {}).get("class_type") == "ResolutionSelector"}
+    for node in g.values():
+        for field, link in list(node["inputs"].items()):
+            if (isinstance(link, list) and len(link) == 2 and str(link[0]) in selectors
+                    and link[1] in (0, 1)):
+                node["inputs"][field] = follow["generation"][link[1]]
+        if not follow["character"]:
+            if node["class_type"] == "MiniMaxH3ReferenceToVideo":
+                node["inputs"]["length"] = follow["aligned"]
+            elif node["class_type"].startswith("VHS_LoadVideo"):
+                node["inputs"].update(force_rate=24, frame_load_cap=follow["aligned"])
+
+    def append_node(base, class_type, inputs, title):
+        nid = base
+        index = 1
+        while nid in g:
+            nid = f"{base}_{index}"
+            index += 1
+        g[nid] = {"class_type": class_type, "inputs": inputs, "_meta": {"title": title}}
+        return [nid, 0]
+
+    output_class = "CreateVideo" if follow["character"] else "VHS_VideoCombine"
+    for nid, node in list(g.items()):
+        if node["class_type"] != output_class:
+            continue
+        images = node["inputs"]["images"]
+        if not follow["character"]:
+            images = append_node(f"follow_reference_trim_{nid}", "ImageFromBatch",
+                                 {"image": images, "batch_index": 0, "length": follow["frames"]},
+                                 "裁剪参考视频对应帧数")
+            node["inputs"]["trim_to_audio"] = False
+        images = append_node(f"follow_reference_scale_{nid}", "ImageScale",
+                             {"image": images, "upscale_method": "bicubic", "crop": "disabled",
+                              "width": follow["final"][0], "height": follow["final"][1]},
+                             "校正参考视频画面比例")
+        node["inputs"]["images"] = images
+        node["inputs"]["fps" if follow["character"] else "frame_rate"] = (
+            follow["frames"] / follow["duration"])
+
+
 def patch_graph(cap, params, uploaded, video_metadata=None):
     """按 manifest 把用户参数写进 API 工作流模板"""
     apply_input_presets(cap, params)
+    video_metadata = dict(video_metadata or {})
+    follow = reference_video_settings(cap, params, uploaded, video_metadata)
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
     labels = {s["key"]: s["label"] for s in cap["inputs"]}
     missing, blank = [], []
@@ -669,6 +812,7 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
             raise web.HTTPBadRequest(reason="引用素材未提供：" + "、".join(sorted(absent)))
         g["238"]["inputs"]["value"] = re.sub(pattern, lambda match: references[match[0]], prompt)
     patch_h3_character_transfer(g, cap, params, uploaded, video_metadata)
+    patch_follow_reference_video(g, cap, follow)
     try:
         patch_image_controls(g, cap["id"], params)
     except ValueError as exc:
@@ -1107,14 +1251,14 @@ async def api_generate(request):
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
-    duration_seconds = rw.duration(cap, params) if cid == "minimax_h3_ref_2pass" else None
     uploaded = await generation_assets(request, body.get("assets") or {}, body["project"])
     source_video_duration, video_metadata = None, {}
-    if not body.get("dry_run"):
+    if not body.get("dry_run") or params.get("follow_reference_video") == "on":
         source_video_duration, video_metadata = await asyncio.to_thread(
             inspect_imported_videos, cap, uploaded
         )
     graph = patch_graph(cap, params, uploaded, video_metadata)
+    duration_seconds = rw.duration(cap, params) if cid == "minimax_h3_ref_2pass" else None
     if body.get("dry_run"):
         tpl = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
         diff = {f"#{n}.{k}": [tpl.get(n, {}).get("inputs", {}).get(k), v]

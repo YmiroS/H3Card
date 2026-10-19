@@ -24,13 +24,35 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
     edges:[], groups:[], view:{x:100,y:70,k:1},
     cards:[{id:'card',type:'card_image',cap:'zimage_t2i',x:100,y:20,params:{},assets:{},outputs:[]}]};
   const json = (res, data) => {res.setHeader('Content-Type','application/json; charset=utf-8');res.end(JSON.stringify(data));};
+  const mediaRequests=[], submissions=[];
+  const metadata = new Map([
+    ['chouka/portrait.mp4',{width:720,height:1280,duration:7.375,fps:24}],
+    ['chouka/custom.mp4',{width:1000,height:800,duration:19.125,fps:30}],
+  ]);
+  let delayedMedia, reportDelayed, persistProject=false;
+  const delayedReady=new Promise(resolve=>{reportDelayed=resolve;});
   const server = createServer((req,res) => {
     const pathname = new URL(req.url,'http://localhost').pathname;
     if (pathname === '/api/auth/me') return json(res,{user:{id:'admin',username:'admin',role:'admin'},csrf_token:'test'});
     if (pathname === '/api/cards') return json(res,{...runtime,comfy_online:true});
     if (pathname === '/api/health') return json(res,{comfy_online:true});
     if (pathname === '/api/jobs') return json(res,{jobs:[]});
+    if (pathname === '/api/media') {
+      const ref=new URL(req.url,'http://localhost').searchParams.get('ref');mediaRequests.push(ref);
+      if(ref==='chouka/delayed.mp4') { delayedMedia=()=>json(res,{width:1920,height:1080,duration:12});reportDelayed();return; }
+      return json(res,metadata.get(ref)||{});
+    }
+    if (pathname === '/api/generate') {
+      const chunks=[];req.on('data',chunk=>chunks.push(chunk));
+      req.on('end',()=>{submissions.push(JSON.parse(Buffer.concat(chunks).toString('utf8')));json(res,{id:'follow-job',status:'queued'});});
+      return;
+    }
     if (pathname === '/api/projects') return json(res,{projects:[{...project,cards:1}]});
+    if (pathname === '/api/projects/controls-test' && req.method==='PUT' && persistProject) {
+      const chunks=[];req.on('data',chunk=>chunks.push(chunk));
+      req.on('end',()=>{Object.assign(project,JSON.parse(Buffer.concat(chunks).toString('utf8')));project.rev=(project.rev||0)+1;json(res,{ok:true,rev:project.rev});});
+      return;
+    }
     if (pathname === '/api/projects/controls-test') return json(res,project);
     if (pathname === '/api/projects/controls-test/cards' && req.method === 'POST') {
       const chunks=[];
@@ -468,6 +490,102 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
           assert.match(await paramsButton.innerText(),/768p/);
         }
       }
+    });
+    await t.test('video reference follow defaults on in all four modes and preserves manual settings when off',async()=>{
+      for(const cap of ['minimax_h3_ref9','minimax_h3_ref_2pass','minimax_h3_fusion_v2','minimax_h3_character_transfer']) {
+        await reset(cap,'card_video');await paramsButton.click();
+        const toggle=page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true});
+        assert.equal(await toggle.getAttribute('aria-checked'),'true',cap);
+        await page.evaluate(()=>{
+          const c=PROJ.cards[0];c.params.duration=9;c.params.preview_seconds=5;
+          c.params.aspect_ratio='21:9 (Ultrawide)';
+          putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/portrait.mp4',url:'/portrait.mp4',width:720,height:1280,duration:7.375});openPanel(c.id);
+        });
+        assert.equal(await page.locator('#respop .cgrid:not(.k)').count(),0,cap);
+        assert.match(await page.locator('#respop .reference-follow').innerText(),/9:16.*7.375 秒/);
+        const payload=await page.evaluate(()=>payloadOf(PROJ.cards[0]));
+        assert.equal(payload.params.follow_reference_video,'on');
+        assert.equal(payload.params.duration,cap==='minimax_h3_character_transfer'?9:7.375);
+        if(cap==='minimax_h3_character_transfer')assert.equal(payload.params.preview_seconds,0);
+        await toggle.focus();await page.keyboard.press('Space');
+        assert.equal(await toggle.getAttribute('aria-checked'),'false');
+        assert.equal(await toggle.evaluate(e=>document.activeElement===e),true,'keyboard focus remains on switch');
+        const bounds=await page.locator('#respop').boundingBox();
+        assert.ok(bounds.y>=8 && bounds.y+bounds.height<=1100-8,'expanded manual controls stay in viewport');
+        assert.equal(await page.locator('#respop .cgrid:not(.k)').count(),1);
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),9);
+        assert.equal(await page.evaluate(()=>PROJ.cards[0].params.preview_seconds),5);
+        assert.equal(await page.evaluate(()=>PROJ.cards[0].params.aspect_ratio),'21:9 (Ultrawide)');
+        await toggle.click();
+        await page.locator('#respop .cgrid.k').getByRole('button',{name:'768p',exact:true}).click();
+        assert.equal(await toggle.getAttribute('aria-checked'),'true');
+        assert.match(await paramsButton.innerText(),/参考 9:16.*7.375秒/);
+        await page.evaluate(()=>{const c=PROJ.cards[0];delete c.assets['video[0]'];openPanel(c.id);});
+        assert.equal(await page.locator('#respop .cgrid:not(.k)').count(),1);
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),9);
+      }
+    });
+    await t.test('old and linked video assets read metadata once and submit the current reference duration',async()=>{
+      await reset('minimax_h3_fusion_v2','card_video');
+      const start=mediaRequests.length;
+      await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/custom.mp4',url:'/custom.mp4'});openPanel(c.id);});
+      await paramsButton.click();
+      await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===19.125);
+      assert.match(await page.locator('#respop .reference-follow').innerText(),/5:4.*19.125 秒/);
+      assert.equal(mediaRequests.length-start,1,'panel and popup share an in-flight metadata request');
+      await page.evaluate(()=>openPanel(PROJ.cards[0].id));
+      await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).click();
+      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.follow_reference_video),'off');
+      await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).click();
+      await page.evaluate(()=>runCard(PROJ.cards[0]));
+      assert.equal(submissions.at(-1).params.duration,19.125,'does not silently clamp long video to 15s');
+      assert.equal(submissions.at(-1).params.follow_reference_video,'on');
+      assert.equal(submissions.at(-1).assets['video[0]'],'chouka/custom.mp4');
+      assert.equal(mediaRequests.length-start,1);
+    });
+    await t.test('late metadata cannot overwrite a replacement video and metadata failure can be retried',async()=>{
+      await reset('minimax_h3_ref9','card_video');delayedMedia=null;
+      await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/delayed.mp4',url:'/delayed.mp4'});openPanel(c.id);});
+      await paramsButton.click();
+      await delayedReady;
+      assert.equal(typeof delayedMedia,'function');
+      await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/portrait.mp4',url:'/portrait.mp4',width:720,height:1280,duration:7.375});openPanel(c.id);});
+      delayedMedia();
+      await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===7.375);
+      assert.match(await page.locator('#respop .reference-follow').innerText(),/9:16.*7.375 秒/);
+      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),7.375);
+      await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/missing.mp4',url:'/missing.mp4'});openPanel(c.id);});
+      await page.getByRole('button',{name:'重新读取',exact:true}).waitFor();
+      assert.match(await page.locator('#respop .reference-follow').innerText(),/无法读取参考视频/);
+      metadata.set('chouka/missing.mp4',{width:960,height:640,duration:6.5});
+      await page.getByRole('button',{name:'重新读取',exact:true}).click();
+      await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===6.5);
+      assert.match(await page.locator('#respop .reference-follow').innerText(),/3:2.*6.5 秒/);
+      assert.equal(await page.getByRole('button',{name:'重新读取',exact:true}).count(),0);
+    });
+    await t.test('follow switch and manual values persist across project save and reload',async()=>{
+      project.locked=false;
+      await reset('minimax_h3_fusion_v2','card_video');persistProject=true;
+      try {
+        await page.evaluate(async()=>{
+          const c=PROJ.cards[0];c.params={duration:11,aspect_ratio:'21:9 (Ultrawide)',follow_reference_video:'off'};
+          putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/portrait.mp4',url:'/portrait.mp4',width:720,height:1280,duration:7.375});
+          await enqueueSave(PROJ.id);
+        });
+        await page.reload();await page.waitForFunction(()=>PROJ?.cards[0]?._el);
+        await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
+        const toggle=page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true});
+        assert.equal(await toggle.getAttribute('aria-checked'),'false');
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),11);
+        await toggle.click();await page.evaluate(()=>enqueueSave(PROJ.id));
+        await page.reload();await page.waitForFunction(()=>PROJ?.cards[0]?._el);
+        await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
+        assert.equal(await toggle.getAttribute('aria-checked'),'true');
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),7.375);
+        await toggle.click();
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),11);
+        assert.equal(await page.evaluate(()=>PROJ.cards[0].params.aspect_ratio),'21:9 (Ultrawide)');
+      } finally {persistProject=false;project.locked=true;}
     });
     assert.deepEqual(errors,[]);
   } finally {
