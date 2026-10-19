@@ -37,6 +37,11 @@
     "id": "flux2_klein_edit",
     "name": "参考图编辑(保人物)",
     "slots": "img2+aud0+vid0"
+   },
+   {
+    "id": "if_image",
+    "name": "IFS",
+    "slots": "img0+aud0+vid0"
    }
   ]
  },
@@ -94,6 +99,11 @@
     "id": "minimax_h3_ref_2pass",
     "name": "H3全能参考(高质量)",
     "slots": "img9+aud3+vid1"
+   },
+   {
+    "id": "if_video",
+    "name": "IFS",
+    "slots": "img0+aud0+vid0"
    }
   ]
  },

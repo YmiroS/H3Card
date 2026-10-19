@@ -1,0 +1,26 @@
+{
+  "manifest_version": 3,
+  "name": "IF Studio → Chouka 画布",
+  "version": "0.1.0",
+  "description": "由用户手动选择 IF Studio 图片或视频，将素材送到本地 Chouka 画布。",
+  "permissions": [],
+  "host_permissions": [
+    "https://ifs.alibaba-inc.com/*",
+    "http://127.0.0.1:8201/*"
+  ],
+  "background": {
+    "service_worker": "bridge.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://ifs.alibaba-inc.com/*"],
+      "js": ["if-content.js"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["http://127.0.0.1:8201/if-studio*"],
+      "js": ["chouka-content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}

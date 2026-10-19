@@ -1,0 +1,110 @@
+{
+  "qwen-image-2.0": {
+    "type": "image", "api": {"image": 3, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "官方编辑接口最多 3 张图片；文生图接口不接图片。IF 未公开实际任务模式。",
+    "source": "https://help.aliyun.com/zh/model-studio/qwen-image-edit-api"
+  },
+  "万相2.7图像生成": {
+    "type": "image", "api": {"image": 9, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "万相 2.7 图像生成／编辑最多 9 张图片；IF 未公开标准版或 Pro 版对应关系。",
+    "source": "https://help.aliyun.com/zh/model-studio/wan-image-generation-and-editing-api-reference"
+  },
+  "qwen-image-3.0": {
+    "type": "image", "api": {"image": 3, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "图像编辑接口最多 3 张图片；IF 未公开任务模式。",
+    "source": "https://help.aliyun.com/zh/model-studio/qwen-image-generation-and-editing-api-reference"
+  },
+  "z-image-turbo": {
+    "type": "image", "api": {"image": 0, "video": 0, "audio": 0},
+    "bridge": {"image": 0, "video": 0, "audio": 0},
+    "note": "官方 API 只有文生图，不提供媒体引用输入。",
+    "source": "https://help.aliyun.com/zh/model-studio/z-image-api-reference"
+  },
+  "Nano Banana 2": {
+    "type": "image", "api": {"image": null, "video": null, "audio": null},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "Google 文档分别限定主体图最多 10 张、角色图最多 4 张；不能合并视作任意 14 张。IF 未公开所用 Google API 版本。",
+    "source": "https://ai.google.dev/gemini-api/docs/image-generation"
+  },
+  "Nano Banana Pro": {
+    "type": "image", "api": {"image": null, "video": null, "audio": null},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "Google 文档分别限定主体图最多 6 张、角色图最多 5 张、风格图最多 3 张；不能合并视作任意 14 张。IF 未公开所用 Google API 版本。",
+    "source": "https://ai.google.dev/gemini-api/docs/image-generation"
+  },
+  "即梦5.0": {
+    "type": "image", "api": {"image": null, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "已找到 Seedream 5.0 Flash 接口最多 10 张图片；IF 未公布是否使用该版本，不能直接套用 10 张。",
+    "source": "https://ark.volcengine.com/region:cn-beijing/docs/seedream-5-0-pro"
+  },
+  "即梦5.0 Pro": {
+    "type": "image", "api": {"image": 10, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "官方 Pro 普通图像生成／编辑最多 10 张；图层拆解模式只能传 1 张。IF 未公开具体任务模式。",
+    "source": "https://ark.volcengine.com/region:cn-beijing/docs/seedream-5-0-pro"
+  },
+  "GPT-Image-2.5": {
+    "type": "image", "api": {"image": null, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "OpenAI 官方示例支持多张输入，但未公布统一张数上限；IF 未公开 sunburst／flare 具体版本。",
+    "source": "https://developers.openai.com/api/docs/guides/image-generation"
+  },
+  "GPT-Image-2": {
+    "type": "image", "api": {"image": null, "video": null, "audio": null},
+    "bridge": {"image": 0, "video": 0, "audio": 0},
+    "note": "官方模型列表未找到与 IF 显示名对应的 API 型号；引用类型和数量未核实。",
+    "source": "https://developers.openai.com/api/docs/models"
+  },
+  "HappyHorse-1.1视频": {
+    "type": "video", "api": {"image": 1, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "图生视频接口仅首帧图片 1 张；文生视频接口不收图片，IF 未公开采用哪一种。",
+    "source": "https://help.aliyun.com/zh/model-studio/happyhorse-image-to-video-api-reference"
+  },
+  "HappyHorse-1.0视频【内测】": {
+    "type": "video", "api": {"image": 1, "video": 0, "audio": 0},
+    "bridge": {"image": 1, "video": 0, "audio": 0},
+    "note": "图生视频接口仅首帧图片 1 张；文生视频接口不收图片，IF 未公开采用哪一种。",
+    "source": "https://help.aliyun.com/zh/model-studio/happyhorse-image-to-video-api-reference"
+  },
+  "Wan3.0视频": {
+    "type": "video", "api": {"image": 10, "video": 5, "audio": 5},
+    "bridge": {"image": 1, "video": 1, "audio": 0},
+    "note": "参考模式图片≤10、视频≤5（合计≤15 秒）、音频≤5（合计≤15 秒）；首尾帧模式各≤1 张，不能与参考模式混用。IF 未公开具体版本与模式。",
+    "source": "https://help.aliyun.com/zh/model-studio/wan3-video-generation-api-reference"
+  },
+  "星辰图生视频": {
+    "type": "video", "api": {"image": null, "video": null, "audio": null},
+    "bridge": {"image": 0, "video": 0, "audio": 0},
+    "note": "未找到可核对的官方模型 API 型号和逐类型引用上限。",
+    "source": ""
+  },
+  "Seedance 2.0": {
+    "type": "video", "api": {"image": 9, "video": 3, "audio": 3},
+    "bridge": {"image": 1, "video": 1, "audio": 0},
+    "note": "官方多模态参考最多图片 9／视频 3／音频 3，合计最多 15 项；不同版本和子任务另有限制，IF 版本未公开。",
+    "source": "https://ark.volcengine.com/region:cn-beijing/docs/seedance-2-0"
+  },
+  "Seedance 2.5": {
+    "type": "video", "api": {"image": 30, "video": 10, "audio": 10},
+    "bridge": {"image": 1, "video": 1, "audio": 0},
+    "note": "官方多模态参考图片≤30／视频≤10／音频≤10，合计≤50 项；视频和音频总参考时长≤30 秒，具体任务还有模式限制。",
+    "source": "https://ark.volcengine.com/region:cn-beijing/docs/seedance-2-5"
+  },
+  "可灵3.0 Omni": {
+    "type": "video", "api": {"image": null, "video": null, "audio": null},
+    "bridge": {"image": 0, "video": 0, "audio": 0},
+    "note": "未找到可核对的官方 v3 Omni API 输入类型和逐类型引用上限。",
+    "source": "https://kling.ai/document-api"
+  },
+  "Minimax H3": {
+    "type": "video", "api": {"image": 9, "video": 3, "audio": 3},
+    "bridge": {"image": 1, "video": 1, "audio": 0},
+    "note": "参考模式图片≤9／视频≤3／音频≤3；首尾帧模式图片各≤1，不能与参考模式混用。",
+    "source": "https://platform.minimax.io/docs/api-reference/video-generation-v2-create"
+  }
+}

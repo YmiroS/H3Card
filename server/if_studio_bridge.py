@@ -1,0 +1,413 @@
+"""Per-user loopback bridge between the Chouka browser page and the user's IF CLI."""
+import argparse
+import ipaddress
+import json
+import mimetypes
+import os
+import re
+import secrets
+import subprocess
+import tempfile
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import urlparse
+
+
+MEDIA = {'image/png': ('image', '.png', 20 * 1024 * 1024),
+         'image/jpeg': ('image', '.jpg', 20 * 1024 * 1024),
+         'image/webp': ('image', '.webp', 20 * 1024 * 1024),
+         'video/mp4': ('video', '.mp4', 50 * 1024 * 1024)}
+LIMITS_FILE = Path(__file__).resolve().parents[1] / 'manifests' / '_if_model_limits.json'
+
+
+def valid_media(content_type, prefix, size):
+    if content_type == 'image/png':
+        return prefix.startswith(b'\x89PNG\r\n\x1a\n')
+    if content_type == 'image/jpeg':
+        return prefix.startswith(b'\xff\xd8\xff')
+    if content_type == 'image/webp':
+        return prefix.startswith(b'RIFF') and prefix[8:12] == b'WEBP'
+    if content_type == 'video/mp4':
+        return len(prefix) >= 16 and prefix[4:8] == b'ftyp' and 16 <= int.from_bytes(prefix[:4], 'big') <= size
+    return False
+
+
+class Bridge(ThreadingHTTPServer):
+    allow_reuse_address = False
+
+    def __init__(self, address, origin, cli):
+        super().__init__(address, BridgeHandler)
+        self.origin = origin
+        self.cli = cli
+        self.jobs = {}
+        self.assets = {}
+        self.asset_bytes = 0
+        self.asset_slots = 0
+        self.lock = threading.Lock()
+        self.workspace = tempfile.TemporaryDirectory(prefix='chouka-ifs-')
+
+    def close(self):
+        self.server_close()
+        self.workspace.cleanup()
+
+    def command(self, *args, timeout=35):
+        try:
+            proc = subprocess.run([self.cli, *args], capture_output=True, text=True,
+                                  encoding='utf-8', errors='replace', timeout=timeout,
+                                  cwd=self.workspace.name, check=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise RuntimeError('IF CLI 不可用或请求超时，请检查本机终端') from exc
+        if proc.returncode:
+            raise RuntimeError('IF CLI 请求失败，请检查本机登录状态和网络')
+        try:
+            return json.loads(proc.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError('IF CLI 返回了非 JSON 数据') from exc
+
+    def generate(self, job_id, request, asset_path=None):
+        try:
+            flags = ['canvas', 'run', '--profile', 'buc',
+                     '--create-only', '--model', request['model']]
+            if request.get('canvas_id') and request.get('session_id'):
+                flags += ['--canvas-id', request['canvas_id'], '--session-id', request['session_id']]
+            if asset_path is not None or request.get('image'):
+                flags += ['--image', str(asset_path) if asset_path is not None else request['image']]
+            if request.get('skill'):
+                flags += ['--skill', request['skill']]
+            try:
+                created = self.command(*flags, '--', request['prompt'], timeout=60)
+            finally:
+                if asset_path is not None:
+                    asset_path.unlink(missing_ok=True)
+            if created.get('status') != 'created':
+                raise RuntimeError('IF CLI 未返回已创建的画布')
+            with self.lock:
+                self.jobs[job_id] = {'state': 'running', 'result': created}
+            folder = Path(self.workspace.name) / job_id
+            folder.mkdir()
+            poll_args = ('canvas', 'poll', '--profile', 'buc', '--canvas-id', created['canvas_id'],
+                         '--session-id', created['session_id'], '--timeout', '600', '--save-dir', str(folder))
+            result = self.command(*poll_args, timeout=630)
+            if result.get('status') == 'summary_feedback' and any(
+                    text in result.get('planning_text', '') for text in ('后台处理中', '已生成完毕')):
+                deadline = time.monotonic() + 900
+                while time.monotonic() < deadline:
+                    time.sleep(10)
+                    result = self.command(*poll_args, timeout=630)
+                    if result.get('status') != 'summary_feedback' or not any(
+                            text in result.get('planning_text', '') for text in ('后台处理中', '已生成完毕')):
+                        break
+            downloads = []
+            for item in result.get('downloaded', []):
+                path = Path(item.get('local_path', ''))
+                path = (Path(self.workspace.name) / path).resolve() if not path.is_absolute() else path.resolve()
+                if path.is_file() and path.parent == folder.resolve():
+                    downloads.append({'type': item.get('type'), 'name': path.name,
+                                      'index': len(downloads), 'url': item.get('url')})
+            result['downloaded'] = downloads
+            with self.lock:
+                self.jobs[job_id] = {'state': 'done', 'result': result}
+        except (RuntimeError, KeyError, TypeError, ValueError) as exc:
+            with self.lock:
+                self.jobs[job_id] = {'state': 'error', 'error': str(exc)}
+
+
+class BridgeHandler(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        pass
+
+    def authorized(self):
+        host = self.headers.get('Host', '')
+        if host != f'127.0.0.1:{self.server.server_port}' or self.headers.get('Origin') != self.server.origin:
+            self.send_error(403)
+            return False
+        return True
+
+    def reply(self, code, data):
+        body = json.dumps(data, ensure_ascii=False).encode('utf-8')
+        self.send_response(code)
+        self.send_header('Content-Type', 'application/json; charset=utf-8')
+        self.send_header('Content-Length', str(len(body)))
+        self.send_header('Access-Control-Allow-Origin', self.server.origin)
+        self.send_header('Vary', 'Origin')
+        self.send_header('Cache-Control', 'no-store')
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_OPTIONS(self):
+        if not self.authorized():
+            return
+        method = self.headers.get('Access-Control-Request-Method')
+        if not ((method == 'POST' and self.path in ('/runs', '/assets')) or
+                (method == 'GET' and (self.path in ('/status', '/models') or
+                                      self.path.startswith('/runs/')))):
+            self.send_error(404)
+            return
+        self.send_response(204)
+        self.send_header('Access-Control-Allow-Origin', self.server.origin)
+        self.send_header('Access-Control-Allow-Methods', method)
+        self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Chouka-IF')
+        self.send_header('Access-Control-Allow-Private-Network', 'true')
+        self.send_header('Vary', 'Origin')
+        self.end_headers()
+
+    def do_GET(self):
+        if not self.authorized():
+            return
+        if self.path == '/status':
+            try:
+                status = self.server.command('auth', 'status', '--json', timeout=10)
+                profile = status.get('profiles', {}).get('buc', {})
+                self.reply(200, {'ready': bool(profile.get('has_ifs_token')) and
+                                 profile.get('registry') == 'ifs.alibaba-inc.com'})
+            except RuntimeError as exc:
+                self.reply(503, {'error': str(exc)})
+        elif self.path == '/models':
+            try:
+                models = self.server.command('models', '--json', '--profile', 'buc', timeout=35)
+                self.reply(200, {'models': [{'display_name': m['display_name'], 'type': m['type']}
+                                            for m in models if m.get('type') in ('image', 'video')]})
+            except (RuntimeError, KeyError, TypeError) as exc:
+                self.reply(503, {'error': str(exc)})
+        elif self.path.startswith('/runs/'):
+            parts = self.path.split('/')
+            with self.server.lock:
+                job = self.server.jobs.get(parts[2]) if len(parts) >= 3 else None
+            if job is None:
+                self.reply(404, {'error': '任务不存在'})
+            elif len(parts) == 3:
+                self.reply(200, job)
+            elif len(parts) == 5 and parts[3] == 'media' and parts[4].isdigit():
+                if job['state'] != 'done':
+                    self.reply(404, {'error': '媒体尚未下载'})
+                    return
+                downloads = job['result'].get('downloaded', [])
+                index = int(parts[4])
+                if index >= len(downloads):
+                    self.reply(404, {'error': '媒体不存在'})
+                    return
+                item = downloads[index]
+                path = Path(self.server.workspace.name) / parts[2] / item['name']
+                size = path.stat().st_size
+                start, end = 0, size - 1
+                range_header = self.headers.get('Range', '')
+                if range_header:
+                    import re
+                    match = re.fullmatch(r'bytes=(\d+)-(\d*)', range_header)
+                    if not match:
+                        self.send_error(416)
+                        return
+                    start = int(match.group(1))
+                    end = min(int(match.group(2)), size - 1) if match.group(2) else size - 1
+                    if start > end or start >= size:
+                        self.send_error(416)
+                        return
+                self.send_response(206 if range_header else 200)
+                self.send_header('Content-Type', mimetypes.guess_type(path.name)[0] or 'application/octet-stream')
+                self.send_header('Content-Length', str(end - start + 1))
+                self.send_header('Accept-Ranges', 'bytes')
+                if range_header:
+                    self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
+                self.send_header('Access-Control-Allow-Origin', self.server.origin)
+                self.send_header('Cache-Control', 'no-store')
+                self.end_headers()
+                with path.open('rb') as stream:
+                    stream.seek(start)
+                    remaining = end - start + 1
+                    while remaining:
+                        chunk = stream.read(min(1024 * 1024, remaining))
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+                        remaining -= len(chunk)
+            else:
+                self.reply(404, {'error': '接口不存在'})
+        else:
+            self.reply(404, {'error': '接口不存在'})
+
+    def upload_asset(self):
+        if self.headers.get('X-Chouka-IF') != 'asset':
+            self.reply(403, {'error': '请求不被允许'})
+            return
+        content_type = self.headers.get('Content-Type')
+        media = MEDIA.get(content_type)
+        lengths = self.headers.get_all('Content-Length', [])
+        if not media or len(lengths) != 1 or not re.fullmatch(r'[0-9]{1,9}', lengths[0]):
+            self.reply(400, {'error': '不支持的素材格式或长度'})
+            return
+        kind, extension, maximum = media
+        length = int(lengths[0])
+        if not 0 < length <= maximum:
+            self.reply(400, {'error': '素材过大或为空'})
+            return
+        with self.server.lock:
+            if self.server.asset_slots >= 8 or self.server.asset_bytes + length > 100 * 1024 * 1024:
+                self.reply(429, {'error': '待使用素材过多'})
+                return
+            self.server.asset_slots += 1
+            self.server.asset_bytes += length
+        asset_id = secrets.token_urlsafe(24)
+        path = Path(self.server.workspace.name) / (secrets.token_urlsafe(24) + extension)
+        saved = False
+        try:
+            self.connection.settimeout(15)
+            prefix = self.rfile.read(min(length, 32))
+            if not valid_media(content_type, prefix, length):
+                self.reply(400, {'error': '素材内容与格式不符'})
+                return
+            with path.open('xb') as stream:
+                stream.write(prefix)
+                remaining = length - len(prefix)
+                while remaining:
+                    chunk = self.rfile.read(min(1024 * 1024, remaining))
+                    if not chunk:
+                        raise ValueError('上传未完成')
+                    stream.write(chunk)
+                    remaining -= len(chunk)
+            with self.server.lock:
+                self.server.assets[asset_id] = (path, kind, length)
+            saved = True
+            self.reply(201, {'asset_id': asset_id, 'kind': kind})
+        except (OSError, ValueError):
+            self.reply(400, {'error': '素材上传失败'})
+        finally:
+            if not saved:
+                path.unlink(missing_ok=True)
+                with self.server.lock:
+                    self.server.asset_slots -= 1
+                    self.server.asset_bytes -= length
+
+    def do_POST(self):
+        if not self.authorized():
+            return
+        if self.path == '/assets':
+            self.upload_asset()
+            return
+        if self.path != '/runs' or self.headers.get('X-Chouka-IF') != 'generate' or \
+                self.headers.get('Content-Type') != 'application/json':
+            self.reply(403, {'error': '请求不被允许'})
+            return
+        lengths = self.headers.get_all('Content-Length', [])
+        length = int(lengths[0]) if len(lengths) == 1 and re.fullmatch(r'[0-9]{1,9}', lengths[0]) else 0
+        if not 0 < length <= 12000:
+            self.reply(400, {'error': '请求内容过长或为空'})
+            return
+        try:
+            data = json.loads(self.rfile.read(length))
+            prompt = data['prompt']
+            model = data['model']
+            kind = data['type']
+            if not isinstance(prompt, str) or not 0 < len(prompt.strip()) <= 4000 or not isinstance(model, str) or \
+                    kind not in ('image', 'video'):
+                raise ValueError()
+            for key in ('canvas_id', 'session_id', 'skill'):
+                if key in data and (not isinstance(data[key], str) or len(data[key]) > 120):
+                    raise ValueError()
+            if bool(data.get('canvas_id')) != bool(data.get('session_id')):
+                raise ValueError()
+            if not isinstance(data, dict) or any(key not in (
+                    'prompt', 'model', 'type', 'canvas_id', 'session_id', 'skill', 'image', 'asset_id'
+            ) for key in data):
+                raise ValueError()
+            asset_id = data.get('asset_id')
+            if 'asset_id' in data and ('image' in data or not isinstance(asset_id, str) or
+                                       not re.fullmatch(r'[A-Za-z0-9_-]{32}', asset_id)):
+                raise ValueError()
+            image = data.get('image', '')
+            if not isinstance(image, str) or len(image) > 2048:
+                raise ValueError()
+            if image:
+                url = urlparse(image)
+                host = url.hostname
+                if url.scheme != 'https' or not host or url.username or url.password or \
+                        host == 'localhost' or host.endswith('.localhost'):
+                    raise ValueError()
+                try:
+                    address = ipaddress.ip_address(host)
+                except ValueError:
+                    address = None
+                if (address is not None and not address.is_global) or host.replace('.', '').isdigit():
+                    raise ValueError()
+            models = self.server.command('models', '--json', '--profile', 'buc', timeout=35)
+            if not any(m.get('display_name') == model and m.get('type') == kind for m in models):
+                raise ValueError()
+            if asset_id or image:
+                limits = json.loads(LIMITS_FILE.read_text(encoding='utf-8'))
+                rule = limits.get(model) if isinstance(limits, dict) else None
+                if not isinstance(rule, dict) or rule.get('type') != kind or \
+                        not isinstance(rule.get('bridge'), dict):
+                    raise ValueError()
+                bridge_limits = rule['bridge']
+                allowed = {media for media in ('image', 'video')
+                           if type(bridge_limits.get(media)) is int and bridge_limits[media] == 1}
+                if asset_id:
+                    with self.server.lock:
+                        asset = self.server.assets.get(asset_id)
+                    if asset is None or asset[1] not in allowed:
+                        raise ValueError()
+                else:
+                    suffix = Path(url.path).suffix.lower()
+                    url_kind = ('image' if suffix in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',
+                                                       '.avif', '.heic', '.heif', '.tif', '.tiff') else
+                                'video' if suffix in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v') else
+                                'audio' if suffix in ('.mp3', '.wav', '.m4a', '.aac', '.flac', '.ogg', '.opus')
+                                else None)
+                    if (url_kind and url_kind not in allowed) or not allowed:
+                        raise ValueError()
+        except (ValueError, KeyError, TypeError, OSError, UnicodeError, json.JSONDecodeError):
+            self.reply(400, {'error': '请输入有效的提示词并选择当前可用的模型'})
+            return
+        except RuntimeError as exc:
+            self.reply(503, {'error': str(exc)})
+            return
+        with self.server.lock:
+            if any(job['state'] in ('starting', 'running') for job in self.server.jobs.values()):
+                self.reply(409, {'error': '已有 IF 生成任务正在进行'})
+                return
+            asset_path = None
+            if asset_id:
+                asset = self.server.assets.pop(asset_id, None)
+                if asset is None:
+                    self.reply(400, {'error': '素材已使用或不存在'})
+                    return
+                asset_path = asset[0]
+                self.server.asset_slots -= 1
+                self.server.asset_bytes -= asset[2]
+            job_id = secrets.token_urlsafe(18)
+            self.server.jobs[job_id] = {'state': 'starting'}
+        try:
+            threading.Thread(target=self.server.generate, args=(job_id, data, asset_path), daemon=True).start()
+        except RuntimeError:
+            if asset_path is not None:
+                asset_path.unlink(missing_ok=True)
+            with self.server.lock:
+                self.server.jobs.pop(job_id, None)
+            self.reply(503, {'error': '无法启动生成任务'})
+            return
+        self.reply(202, {'id': job_id})
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Chouka per-user IF Studio loopback bridge')
+    parser.add_argument('--origin', required=True, help='Exact Chouka page origin, e.g. http://127.0.0.1:8201')
+    parser.add_argument('--port', type=int, default=8278)
+    parser.add_argument('--cli', default=str(Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'ifs' / 'ifs.exe'))
+    args = parser.parse_args()
+    origin = urlparse(args.origin)
+    if origin.scheme not in ('http', 'https') or not origin.netloc or origin.path not in ('', '/') or \
+            origin.query or origin.fragment or args.origin.rstrip('/') != f'{origin.scheme}://{origin.netloc}':
+        parser.error('--origin 必须是 Chouka 的完整、精确网页来源（不含路径）')
+    server = Bridge(('127.0.0.1', args.port), args.origin.rstrip('/'), args.cli)
+    print(f'IF Studio bridge: 127.0.0.1:{args.port} -> {server.origin}', flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.close()
+
+
+if __name__ == '__main__':
+    main()
