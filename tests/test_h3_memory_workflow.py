@@ -25,14 +25,17 @@ class H3MemoryWorkflowTest(unittest.TestCase):
             return app.patch_graph(self.cap, params or {}, self.assets)
 
     def test_video_frame_cap_follows_generation_duration(self):
-        for duration in (3, 5, 8):
+        for duration, aligned_frames in ((3, 73), (5, 124), (8, 192)):
             with self.subTest(duration=duration):
                 graph = self.graph({"duration": duration})
                 self.assertEqual(graph["132"]["inputs"]["value"], duration)
                 loader = graph["221"]["inputs"]
                 self.assertEqual(loader["force_rate"], 24)
                 self.assertEqual(loader["frame_load_cap"], graph["186"]["inputs"]["length"])
-                self.assertEqual(loader["frame_load_cap"], ["131", 1])
+                self.assertEqual(loader["frame_load_cap"], aligned_frames)
+                trims = [node for key, node in graph.items() if key.startswith("follow_reference_trim_")]
+                self.assertTrue(trims)
+                self.assertTrue(all(node["inputs"]["length"] == duration * 24 for node in trims))
                 self.assertEqual(loader["start_time"], 0)
 
     def test_one_video_three_images_and_paired_audio_are_preserved(self):

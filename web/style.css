@@ -1639,10 +1639,6 @@ button:focus-visible, a:focus-visible {
 .param-switch[aria-checked="true"] .param-switch-track { background: var(--ok); }
 .param-switch[aria-checked="true"] .param-switch-thumb { transform: translateX(20px); }
 .param-switch-state { min-width: 2em; color: var(--dim); }
-.reference-follow { margin: 0 0 12px; padding: 0 0 12px; border-bottom: 1px solid var(--line); }
-.reference-follow .row { justify-content: space-between; gap: 12px; }
-.reference-follow .row > label { width: auto; flex: 1; line-height: 1.5; }
-.reference-follow .knobnote { margin: 4px 0 0; color: var(--dim); line-height: 1.5; overflow-wrap: anywhere; }
 @media (prefers-reduced-motion: reduce) {
   .param-switch-track, .param-switch-thumb { transition: none; }
 }
