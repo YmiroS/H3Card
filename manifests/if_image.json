@@ -1,0 +1,15 @@
+{
+  "id": "if_image",
+  "name": "IF 生图",
+  "group": "图片",
+  "outputType": "image",
+  "kind": "gen",
+  "card": "image",
+  "execution": "if_studio",
+  "imageControls": {"mode": "t2i", "defaultRatio": "3:4", "defaultClarity": "720P"},
+  "slots": "img0+aud0+vid0",
+  "inputs": [
+    {"key": "prompt", "label": "生成需求", "type": "textarea", "default": ""},
+    {"key": "if_reference", "label": "参考图片 HTTPS 地址（可选）", "type": "text", "default": "", "hint": "使用 IF 可以访问的 HTTPS 图片地址。"}
+  ]
+}

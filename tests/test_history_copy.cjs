@@ -127,6 +127,7 @@ test('history uses persisted job snapshots after reload and keeps each submissio
     el:{jobs:{style:{display:'none'}}, panel:{}, hist:{}},
     api:async () => ({jobs:[job]}),
     paintJobsBtn() {}, paint() {}, drawWires() {}, toast() {}, save() {},
+    isIF:() => false, propagateCardOutputs:async () => {},
     canOperate:() => true, canTask:() => true,
   });
   vm.runInContext(

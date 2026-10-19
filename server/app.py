@@ -300,7 +300,7 @@ def load_caps():
         controls = image_controls(m["id"])
         if controls is not None:
             m["imageControls"] = controls
-        if m.get("execution") == "browser":
+        if m.get("execution") in ("browser", "if_studio"):
             m["_graph_ok"] = False
         else:
             gp = ROOT / m["graph"]
@@ -332,7 +332,7 @@ def mode_ok(md):
     if md.get("route"):
         md["route"] = {k: r for k, r in md["route"].items() if graph_ok(r["cap"])}
         return bool(md["route"])
-    if CAPS.get(md["id"], {}).get("execution") == "browser":
+    if CAPS.get(md["id"], {}).get("execution") in ("browser", "if_studio"):
         return True
     return graph_ok(md["id"])
 
@@ -979,10 +979,12 @@ async def handle_event(session, ev, remote=False, app=None):
 # HTTP 接口
 # =====================================================================
 async def api_cards(request):
+    limits_file = ROOT / "manifests" / "_if_model_limits.json"
     return web.json_response({
         "cards": CARDS,
         "capabilities": {k: {kk: vv for kk, vv in v.items() if not kk.startswith("_")}
                          for k, v in CAPS.items()},
+        "if_model_limits": json.loads(limits_file.read_text(encoding="utf-8")) if limits_file.exists() else {},
         "comfy_online": controller_comfy_online(request.app),
         "director_schema": 1,
     })
@@ -1104,6 +1106,8 @@ async def api_generate(request):
         raise web.HTTPBadRequest(reason=f"未知能力 {cid}")
     if cap.get("execution") == "browser":
         raise web.HTTPBadRequest(text="此能力在浏览器中执行，请在图片合成编辑器中合成输出")
+    if cap.get("execution") == "if_studio":
+        raise web.HTTPBadRequest(text="IF 任务须通过用户本机桥接程序提交")
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
