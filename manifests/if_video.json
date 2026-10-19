@@ -1,0 +1,19 @@
+{
+  "id": "if_video",
+  "name": "IF 生视频",
+  "group": "视频",
+  "outputType": "video",
+  "kind": "gen",
+  "card": "video",
+  "execution": "if_studio",
+  "slots": "img0+aud0+vid0",
+  "inputs": [
+    {"key": "prompt", "label": "生成需求", "type": "textarea", "default": ""},
+    {"key": "if_reference", "label": "参考图片／视频 HTTPS 地址（可选）", "type": "text", "default": "", "hint": "使用 IF 可以访问的 HTTPS 图片或视频地址。"},
+    {"key": "aspect_ratio", "label": "画面比例", "type": "select", "default": "16:9 (Widescreen)", "options": ["1:1 (Square)", "2:3 (Portrait Photo)", "3:2 (Photo)", "3:4 (Portrait Standard)", "4:3 (Standard)", "9:16 (Portrait Widescreen)", "16:9 (Widescreen)", "21:9 (Ultrawide)"]},
+    {"key": "megapixels", "label": "分辨率", "type": "slider", "default": 0.7, "min": 0.2, "max": 1.31, "step": 0.01},
+    {"key": "duration", "label": "时长(秒)", "type": "slider", "min": 5, "max": 15, "step": 1, "default": 10},
+    {"key": "seed", "label": "种子（文字参考）", "type": "seed", "default": -1, "hint": "作为内容要求传给 IF；不保证生成模型遵守随机种子。"},
+    {"key": "if_skill", "label": "IF 技能（可选）", "type": "text", "default": ""}
+  ]
+}

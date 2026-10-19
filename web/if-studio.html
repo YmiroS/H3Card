@@ -27,6 +27,21 @@
   .status[data-error="true"] { color: #ffb4bc; }
   .frame-help { margin: 0; padding: 7px 20px; color: #b8c1cc; border-bottom: 1px solid #303641; }
   .frame-help a { color: #a9dcff; }
+  .generator { margin: 16px 20px; padding: 16px; border: 1px solid #397994; border-radius: 8px; background: #1b2a34; }
+  .generator h2 { margin: 0 0 10px; font-size: 16px; }
+  .generator form { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+  .generator label { display: flex; flex-direction: column; gap: 4px; }
+  .generator .prompt { flex: 1 1 300px; }
+  .generator textarea, .generator input { width: 100%; min-height: 44px; padding: 9px; border: 1px solid #454d5b; border-radius: 8px; background: #252c36; color: #f3f4f6; font: inherit; }
+  .generator textarea { min-height: 70px; resize: vertical; }
+  .generator .reference { flex: 1 1 250px; }
+  .generator p { margin: 10px 0 0; }
+  .generator a { color: #a9dcff; }
+  .generator .media { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 12px; }
+  .generator .media img, .generator .media video { max-width: min(320px, 90vw); max-height: 260px; }
+  .extension-transfer { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin: 16px 20px; padding: 16px; border: 1px solid #397994; border-radius: 8px; background: #1b2a34; }
+  .extension-transfer[hidden], iframe[hidden] { display: none; }
+  #extension-file { flex: 1; min-width: 180px; overflow-wrap: anywhere; }
   iframe { display: block; flex: 1; width: 100%; min-height: 420px; border: 0; background: #fff; }
   @media (max-width: 640px) { .toolbar { padding: 12px; } .import { width: 100%; } }
 </style>
@@ -41,7 +56,7 @@
 </aside>
 <main>
   <header class="toolbar">
-    <div class="heading"><h1>IF Studio</h1><p>在工作区访问 IF Studio；导入下载的产物作为画布素材。</p></div>
+    <div class="heading"><h1>IF Studio</h1><p>使用本机 IF 账号生成图片或视频，并加入 Chouka 画布。</p></div>
     <div class="import">
       <label for="project">目标画布</label><select id="project" aria-label="选择目标画布"></select>
       <input id="file" type="file" accept="image/*,video/*" hidden>
@@ -50,8 +65,27 @@
     </div>
   </header>
   <p id="status" class="status" role="status" aria-live="polite">正在读取可操作画布…</p>
-  <p class="frame-help">如果下方无法显示或登录，请使用“单独打开 IF Studio”；网站是否允许嵌入由 IF Studio 决定。图片或视频请先从 IF Studio 下载，再通过上方按钮添加到画布。</p>
-  <iframe title="IF Studio 网站" src="https://ifs.alibaba-inc.com/" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+  <section class="generator" aria-label="本机 IF Studio 生成">
+    <h2>本机 IF Studio 生成</h2>
+    <form id="if-generate-form">
+      <label>类型<select id="if-type"><option value="image">图片</option><option value="video">视频</option></select></label>
+      <label>模型<select id="if-model" required></select></label>
+      <label class="prompt">生成需求<textarea id="if-prompt" required maxlength="4000" placeholder="描述需要生成的画面或视频"></textarea></label>
+      <label class="reference">参考图片／视频 HTTPS 地址（可选）<input id="if-reference" type="url" placeholder="https://…"></label>
+      <label>IF 技能（可选）<input id="if-skill" type="text" maxlength="120" placeholder="如：商品展示"></label>
+      <label><input id="if-continue" type="checkbox" disabled>继续上次 IF 画布</label>
+      <button id="if-generate" type="submit" disabled>开始生成</button>
+    </form>
+    <p id="if-bridge-status" role="status" aria-live="polite">正在连接本机桥接程序…</p>
+    <div id="if-results" class="media"></div>
+  </section>
+  <div id="extension-transfer" class="extension-transfer" hidden>
+    <span id="extension-file"></span>
+    <button id="extension-confirm" type="button">确认加入所选画布</button>
+    <button id="extension-cancel" type="button">取消</button>
+  </div>
+  <p id="frame-help" class="frame-help">如果下方无法显示或登录，请使用“单独打开 IF Studio”；网站是否允许嵌入由 IF Studio 决定。图片或视频请先从 IF Studio 下载，再通过上方按钮添加到画布。</p>
+  <iframe id="if-frame" title="IF Studio 网站" referrerpolicy="strict-origin-when-cross-origin"></iframe>
 </main>
 <script src="/auth.js"></script>
 <script src="/if-studio.js"></script>
