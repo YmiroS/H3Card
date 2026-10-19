@@ -46,7 +46,8 @@ def allowed(method, path):
                 or (path.startswith('/api/workers/') and path.endswith('/temperature')))
     if path in AUTH_WRITES or path.startswith('/api/admin/users'):
         return True
-    if path.startswith('/api/admin/grants') or path == '/api/admin/projects/assign':
+    if (path.startswith('/api/admin/grants') or path.startswith('/api/admin/global-grants/')
+            or path == '/api/admin/projects/assign'):
         return True
     if path == '/api/teams' or path.startswith('/api/teams/'):
         return True

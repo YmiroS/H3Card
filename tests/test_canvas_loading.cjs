@@ -328,6 +328,23 @@ test('上次画布：真实页面按账号恢复，链接优先且失效记录�
       assert.equal(await visit(), 'team');
       assert.equal(await page.evaluate(() => selectedSpace), 'team:group');
     });
+    await t.test('全画布授权的非成员项目组画布可从共享空间查看，不获得项目组创建权限', async () => {
+      const external = {...project('external-team', [], 'read'), owner_id:'owner', team_id:'external', team_name:'其他项目组'};
+      fixture.state.projects.push(external);
+      assert.equal(await visit('?project=external-team'), external.id);
+      assert.equal(await page.evaluate(() => selectedSpace), 'shared');
+      assert.equal(await page.locator('#plist .pitem.on .nm').innerText(), external.name);
+      assert.equal(await page.locator('#space-select option[value="team:external"]').count(), 0);
+      assert.equal(await page.evaluate(() => canOperate()), false);
+      assert.equal(await visit(), external.id);
+      external.permission = 'operate';
+      assert.equal(await visit(), external.id);
+      assert.equal(await page.evaluate(() => canOperate()), true);
+      const writes = fixture.state.writes.length;
+      await page.locator('#newproj').click();
+      assert.match(await page.locator('#toast').innerText(), /共享给我的空间不能新建画布/);
+      assert.equal(fixture.state.writes.length, writes);
+    });
     await t.test('显式链接覆盖记忆，打开失败不覆盖已保存选择', async () => {
       assert.equal(await visit('?project=personal'), 'personal');
       assert.equal(await stored(), 'personal');

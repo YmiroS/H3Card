@@ -23,7 +23,9 @@ class SandboxBoundaryTests(unittest.TestCase):
     def test_only_management_routes_are_allowed(self):
         for method, path in [('GET', '/controller'), ('GET', '/api/capacity'),
                              ('POST', '/api/auth/login'), ('POST', '/api/capacity/estimate'),
-                             ('POST', '/api/teams/test/members/batch')]:
+                             ('POST', '/api/teams/test/members/batch'),
+                             ('PUT', '/api/admin/global-grants/viewer'),
+                             ('DELETE', '/api/admin/global-grants/viewer')]:
             self.assertTrue(allowed(method, path), (method, path))
         for method, path in [('POST', '/agent/v1/heartbeat'), ('POST', '/api/generate'),
                              ('POST', '/api/admin/workers/sync-all'), ('POST', '/api/text'),

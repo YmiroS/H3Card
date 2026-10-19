@@ -54,12 +54,16 @@ class AuthStore:
             if version == 4:
                 self.db.executescript(migrations.joinpath('005_project_user_views.sql').read_text(encoding='utf-8'))
                 version = 5
-            elif version != 5:
+            if version == 5:
+                self.db.executescript(migrations.joinpath('006_global_canvas_grants.sql').read_text(encoding='utf-8'))
+                version = 6
+            elif version != 6:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
                 'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader',
                 'sessions': 'token_hash,user_id,csrf_token,expires_at,created_at',
                 'user_grants': 'viewer_id,owner_id,permission',
+                'global_canvas_grants': 'viewer_id,permission',
                 'project_acl': 'project_id,owner_id,state,created_at,team_id',
                 'teams': 'id,name,leader_id,state,created_at,updated_at',
                 'team_members': 'team_id,user_id,joined_at',
@@ -556,7 +560,29 @@ class AuthStore:
 
     def list_grants(self):
         with self.lock:
-            return [dict(row) for row in self.db.execute('SELECT * FROM user_grants ORDER BY viewer_id,owner_id')]
+            grants = [dict(row) for row in self.db.execute('SELECT * FROM user_grants ORDER BY viewer_id,owner_id')]
+            grants.extend(dict(row) | {'scope': 'all', 'owner_id': None} for row in self.db.execute(
+                'SELECT * FROM global_canvas_grants ORDER BY viewer_id'))
+            return grants
+
+    def set_global_grant(self, viewer_id, permission, *, actor_id=None, session_token=None):
+        self._identifier(viewer_id, '用户 ID')
+        if permission not in ('read', 'operate'):
+            raise AuthError('无效授权')
+        with self._tx():
+            self._check_actor(actor_id, session_token)
+            self._user(viewer_id)
+            self.db.execute(
+                'INSERT INTO global_canvas_grants(viewer_id,permission) VALUES(?,?) '
+                'ON CONFLICT(viewer_id) DO UPDATE SET permission=excluded.permission',
+                (viewer_id, permission))
+        return {'viewer_id': viewer_id, 'owner_id': None, 'scope': 'all', 'permission': permission}
+
+    def delete_global_grant(self, viewer_id, *, actor_id=None, session_token=None):
+        self._identifier(viewer_id, '用户 ID')
+        with self._tx():
+            self._check_actor(actor_id, session_token)
+            self.db.execute('DELETE FROM global_canvas_grants WHERE viewer_id=?', (viewer_id,))
 
     def set_grant(self, viewer_id, owner_id, permission, *, actor_id=None, session_token=None):
         if permission not in ('read', 'operate') or viewer_id == owner_id:
@@ -744,10 +770,15 @@ class AuthStore:
                 return None
             if user['role'] == 'admin':
                 return 'operate'
+            global_grant = self.db.execute(
+                'SELECT permission FROM global_canvas_grants WHERE viewer_id=?', (user_id,)).fetchone()
+            global_permission = global_grant[0] if global_grant else None
+            if global_permission == 'operate':
+                return 'operate'
             if project['team_id'] is not None:
                 member = self.db.execute('SELECT 1 FROM team_members WHERE team_id=? AND user_id=?',
                                          (project['team_id'], user_id)).fetchone()
-                return 'operate' if member else None
+                return 'operate' if member else global_permission
             if project['owner_id'] == user_id:
                 return 'operate'
             direct = self.db.execute(
@@ -764,7 +795,7 @@ class AuthStore:
                 return 'operate'
             row = self.db.execute('SELECT permission FROM user_grants WHERE viewer_id=? AND owner_id=?',
                                   (user_id, project['owner_id'])).fetchone()
-            return row[0] if row else None
+            return row[0] if row else global_permission
 
     def list_projects(self, user_id):
         self._identifier(user_id, '用户 ID')

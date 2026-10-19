@@ -437,6 +437,19 @@ async def delete_grant(request):
     return web.json_response({'ok': True})
 
 
+async def global_grant(request):
+    require_admin(request)
+    viewer_id = request.match_info['viewer_id']
+    if request.method == 'DELETE':
+        await admin_call(request, 'delete_global_grant', viewer_id)
+        result = {'ok': True}
+    else:
+        body = await _body(request, ('permission',))
+        result = {'grant': await admin_call(request, 'set_global_grant', viewer_id, **body)}
+    await notify_access_changed(request, user_ids=[viewer_id])
+    return web.json_response(result)
+
+
 async def assign_projects(request):
     require_admin(request)
     try:
@@ -505,3 +518,5 @@ def register_auth_routes(app, web_root):
     app.router.add_get('/api/admin/grants', grants)
     app.router.add_put('/api/admin/grants', grants)
     app.router.add_delete('/api/admin/grants/{viewer_id}/{owner_id}', delete_grant)
+    app.router.add_put('/api/admin/global-grants/{viewer_id}', global_grant)
+    app.router.add_delete('/api/admin/global-grants/{viewer_id}', global_grant)
