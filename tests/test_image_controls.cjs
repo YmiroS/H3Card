@@ -94,6 +94,45 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       }
     });
 
+    await t.test('ratio previews preserve exact labeled geometry in every picker and viewport',async t=>{
+      t.after(()=>page.setViewportSize({width:1600,height:1100}));
+      const variants = [
+        ['image', null],
+        ['legacy', {inputs:[{key:'aspect_ratio',options:['1:1'],default:'1:1'}]}],
+        ['dimensions', {inputs:[{key:'width',default:1024},{key:'height',default:1024}]}],
+        ['resolution', {inputs:[{key:'resolution',default:'1024x1024 (1:1)',options:[
+          '1024x1024 (1:1)','1344x768 (16:9)','768x1344 (9:16)',
+        ]}]}],
+      ];
+      for (const width of [1600,390]) {
+        for (const [name,definition] of variants) {
+          await page.setViewportSize({width:1600,height:1100});
+          await reset('zimage_t2i');
+          await paramsButton.click();
+          if (definition) await page.evaluate(definition=>{
+            const c=PROJ.cards[0];
+            el.respop.replaceChildren(clarityPicker(c,definition,()=>{}));
+          },definition);
+          await page.setViewportSize({width,height:1100});
+          const shapes=await page.locator('#respop .cgrid:not(.k) button').evaluateAll(buttons=>buttons.map(button=>{
+            const rect=button.querySelector('i').getBoundingClientRect();
+            const bounds=button.getBoundingClientRect();
+            return {label:button.querySelector('span').textContent,width:rect.width,height:rect.height,
+              inside:rect.left>=bounds.left && rect.right<=bounds.right && rect.top>=bounds.top && rect.bottom<=bounds.bottom};
+          }));
+          assert.equal(shapes.length,name==='resolution'?3:RATIOS.length,name);
+          for(const shape of shapes) {
+            const [w,h]=shape.label.split(':').map(Number);
+            assert.ok(Math.abs(shape.width-shape.height*w/h)<=0.04,
+              `${name} ${width}px ${shape.label}: ${shape.width}×${shape.height}`);
+            assert.ok(shape.width>0 && shape.width<=26 && shape.height>0 && shape.height<=22,
+              `${name} ${shape.label} fits the preview bounds`);
+            assert.equal(shape.inside,true,`${name} ${shape.label} stays inside its button`);
+          }
+        }
+      }
+    });
+
     await t.test('negative prompt appears only for models with an active negative-conditioning path',async()=>{
       const negative=page.locator('#panel textarea[placeholder^="负向提示词"]');
       for(const [cap] of CASES) {

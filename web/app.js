@@ -523,7 +523,7 @@ function imageClarityPicker(c, cap, onchange) {
     const button = document.createElement("button");
     const label = ratio === "original" ? "原图" : ratio;
     button.className = ratio === current.ratio ? "on" : "";
-    button.innerHTML = `<i style="aspect-ratio:${width}/${height}"></i><span>${label}</span>`;
+    button.innerHTML = `<i style="--ratio:${width / height}"></i><span>${label}</span>`;
     button.title = `画面比例 ${label}`;
     button.onclick = () => { c.params.image_ratio = ratio; save(); onchange(); };
     ratios.appendChild(button);
@@ -657,10 +657,10 @@ function clarityPicker(c, cap, onchange) {
     ratioTitle.className = "ctitle"; ratioTitle.textContent = "画面比例";
     const ratioGrid = document.createElement("div"); ratioGrid.className = "cgrid";
     for (const ratio of [...new Set(choices.map(x => x.ratio))]) {
-      const sample = choices.find(x => x.ratio === ratio);
+      const [width, height] = ratio.split(":").map(Number);
       const button = document.createElement("button");
       button.className = ratio === current.ratio ? "on" : "";
-      button.innerHTML = `<i style="aspect-ratio:${sample.width}/${sample.height}"></i><span>${ratio}</span>`;
+      button.innerHTML = `<i style="--ratio:${width / height}"></i><span>${ratio}</span>`;
       button.title = `画面比例 ${ratio}`;
       button.onclick = () => {
         const matches = choices.filter(x => x.ratio === ratio);
@@ -748,7 +748,7 @@ function clarityPicker(c, cap, onchange) {
       b.className = arSpec
         ? (r === curGrid ? "on" : (ratioToOpt(r) === cur ? "near" : ""))
         : (onWH ? "on" : "");
-      b.innerHTML = `<i style="aspect-ratio:${r[1]}/${r[2]}"></i><span>${r[0]}</span>`;
+      b.innerHTML = `<i style="--ratio:${r[1] / r[2]}"></i><span>${r[0]}</span>`;
       b.title = `画面比例 ${r[0]}`
         + (arSpec && ratioToOpt(r) !== cur ? `（工作流档位：${ratioToOpt(r)}）` : "（当前）");
       b.onclick = () => {

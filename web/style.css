@@ -886,11 +886,10 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
   font-size: 12px; font-family: var(--mono);
 }
 .cgrid button i {
-  display: block; width: 26px; flex: none;
+  display: block; width: min(26px, calc(22px * var(--ratio))); height: auto; flex: none;
+  aspect-ratio: var(--ratio);
   border: 1.5px solid #3d5a8a; border-radius: 2px; background: #10192b;
-  /* aspect-ratio 由按钮的行内 style 给（每个比例一块真实比例的小示意图）。
-     高度上限 22px：竖长的（9:16）不会把格子撑高，横扁的（21:9）自然变矮 */
-  max-height: 22px;
+  /* 在 26×22px 区域内等比缩放，不能只截断竖版高度而保留固定宽度。 */
 }
 .cgrid button:hover { color: var(--acc); border-color: #2b6d8a; }
 .cgrid button.on {
