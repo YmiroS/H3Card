@@ -68,16 +68,23 @@ class ConfigTest(unittest.TestCase):
 class CardParamsTest(unittest.TestCase):
     def test_param_map_full_and_no_secret(self):
         row = {'id': 'req-1', 'status': 'pending', 'username': 'xm', 'display_name': '小明',
-               'created_at': 1780000000.0, 'decided_by': None}
+               'created_at': 1780000000.0, 'decided_by': None, 'phone': '13800138000'}
         params = dta.build_card_params(row)
         for key in ('title', 'displayName', 'username', 'resultText', 'createTime',
                     'status', 'requestId', 'lastMessage'):
             self.assertIn(key, params)
         self.assertEqual(params['status'], 'pending')
         row.update({'status': 'approved', 'decided_by': APPROVER_A})
-        self.assertEqual(dta.build_card_params(row)['status'], 'agree')
+        approved = dta.build_card_params(row)
+        self.assertEqual(approved['status'], 'agree')
+        self.assertNotIn('phone', approved)
+        self.assertNotIn('13800138000', str(approved))
         row['status'] = 'rejected'
-        self.assertEqual(dta.build_card_params(row)['status'], 'reject')
+        rejected = dta.build_card_params(row)
+        self.assertEqual(rejected['status'], 'reject')
+        for card_params in (params, rejected):
+            self.assertNotIn('phone', card_params)
+            self.assertNotIn('13800138000', str(card_params))
         self.assertNotIn(PASSWORD, str(params))
 
 
@@ -87,7 +94,7 @@ class HandlerTest(unittest.IsolatedAsyncioTestCase):
         self.store = AuthStore(Path(self.tmp.name) / 'auth.sqlite')
         self.store.create_user('admin', PASSWORD, 'admin')
         self.handler = dta.ApprovalCardHandler(CONFIG, self.store)
-        request = self.store.create_registration('xm', PASSWORD, '小明')
+        request = self.store.create_registration('xm', PASSWORD, '小明', '13800138000')
         self.track = self.store.registration_card_data(request['request_id'])['out_track_id']
 
     def tearDown(self):
@@ -122,6 +129,11 @@ class HandlerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.list_registrations()[0]['status'], 'approved')
         session = self.store.login('xm', PASSWORD)
         self.assertEqual(session['user']['display_name'], '小明')
+        self.assertEqual(session['user']['phone'], '13800138000')
+        self.assertNotIn('13800138000', str(body['cardData']))
+        self.assertNotIn('phone', self.store.list_registrations()[0])
+        self.assertNotIn('phone', self.store.registration_card_data(
+            self.store.list_registrations()[0]['id']))
 
     async def test_second_decision_is_duplicate(self):
         await self.handler.process_data(self._data(APPROVER_A))
@@ -170,7 +182,8 @@ class ClientTest(unittest.IsolatedAsyncioTestCase):
         ])
         client = dta.DingTalkClient(CONFIG)
         row = {'id': 'r', 'status': 'pending', 'username': 'u', 'display_name': 'n',
-               'created_at': 1.0, 'decided_by': None, 'out_track_id': 'track-9'}
+               'created_at': 1.0, 'decided_by': None, 'out_track_id': 'track-9',
+               'phone': '13800138000'}
         await client.deliver_card(session, row)
         await client.deliver_card(session, row)
         token_calls = [c for c in calls if c[1].endswith('/v1.0/oauth2/accessToken')]
@@ -182,6 +195,8 @@ class ClientTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn('cardParamMap', body['cardData'])
         self.assertEqual(body['imGroupOpenDeliverModel']['robotCode'], 'key')
         self.assertEqual(deliver[2]['headers']['x-acs-dingtalk-access-token'], 'tok-1')
+        self.assertNotIn('phone', body['cardData']['cardParamMap'])
+        self.assertNotIn('13800138000', str(body))
 
     async def test_update_card_body(self):
         session, calls = self._session_with([
@@ -190,12 +205,15 @@ class ClientTest(unittest.IsolatedAsyncioTestCase):
         ])
         client = dta.DingTalkClient(CONFIG)
         row = {'id': 'r', 'status': 'rejected', 'username': 'u', 'display_name': 'n',
-               'created_at': 1.0, 'decided_by': APPROVER_A, 'out_track_id': 'track-9'}
+               'created_at': 1.0, 'decided_by': APPROVER_A, 'out_track_id': 'track-9',
+               'phone': '13800138000'}
         await client.update_card(session, row)
         update = [c for c in calls if c[1].endswith('/v1.0/card/instances')][0]
         body = update[2]['json']
         self.assertEqual(body['outTrackId'], 'track-9')
         self.assertEqual(body['cardData']['cardParamMap']['status'], 'reject')
+        self.assertNotIn('phone', body['cardData']['cardParamMap'])
+        self.assertNotIn('13800138000', str(body))
 
     async def test_failure_raises(self):
         session, _ = self._session_with([
@@ -214,7 +232,7 @@ class OutboxTaskTest(unittest.IsolatedAsyncioTestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.store = AuthStore(Path(self.tmp.name) / 'auth.sqlite')
         self.store.create_user('admin', PASSWORD, 'admin')
-        request = self.store.create_registration('xm', PASSWORD, '小明')
+        request = self.store.create_registration('xm', PASSWORD, '小明', '13800138000')
         self.request_id = request['request_id']
 
     def tearDown(self):

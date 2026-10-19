@@ -235,8 +235,8 @@ async def _browser_request(request, handler):
         _check_source(request)
         return await handler(request)
     if path == '/api/auth/register' and request.method == 'POST':
-        # 审批通道未配置时拒绝注册（fail-closed），不产生无人审批的申请。
-        if request.app.get('dingtalk') is None:
+        # 正式审批通道未配置时拒绝注册；隔离副本仅保存本地待审批申请，不外发。
+        if request.app.get('dingtalk') is None and not request.app.get('admin_sandbox'):
             raise web.HTTPServiceUnavailable(text='注册审批服务未配置，请联系管理员')
         _check_source(request)
         return await handler(request)
@@ -301,7 +301,7 @@ async def login(request):
 
 
 async def register(request):
-    body = await _body(request, ('username', 'display_name', 'password'))
+    body = await _body(request, ('username', 'display_name', 'password', 'phone'))
     _register_rate_limit(request, body['username'])
     result = await call_store(request.app, 'create_registration', **body)
     return web.json_response(result, status=201)
@@ -318,6 +318,14 @@ async def registrations(request):
 async def me(request):
     require_user(request)
     return web.json_response(request['auth_session'])
+
+
+async def phone(request):
+    user = require_user(request)
+    body = await _body(request, ('phone',))
+    updated = await call_store(request.app, 'set_phone', user['id'], body['phone'],
+                               session_token=request.cookies.get(COOKIE, ''))
+    return web.json_response({'user': updated})
 
 
 async def online_presence(request):
@@ -503,6 +511,7 @@ def register_auth_routes(app, web_root):
     app.router.add_post('/api/auth/register', register)
     app.router.add_post('/api/auth/logout', logout)
     app.router.add_post('/api/auth/password', password)
+    app.router.add_post('/api/auth/phone', phone)
     app.router.add_get('/api/teams', teams)
     app.router.add_post('/api/teams', teams)
     app.router.add_get('/api/team-candidates', team_candidates)
