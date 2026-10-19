@@ -19,9 +19,10 @@ const staticFiles = new Map([
 const apiMethods = new Map([
   ['/api/auth/me', 'GET'], ['/api/auth/login', 'POST'], ['/api/auth/register', 'POST'],
   ['/api/auth/presence', 'POST'], ['/api/health', 'GET'],
+  ['/api/auth/phone', 'POST'], ['/api/auth/logout', 'POST'],
 ]);
 const session = {user:{id:'fixture-user', username:'fixture-account', role:'user'}, csrf_token:'fixture-csrf'};
-const registration = {username:'fixture-account', display_name:'测试花名', password:'月光落在山间2026'};
+const registration = {username:'fixture-account', display_name:'测试花名', phone:'13800138000', password:'月光落在山间2026'};
 const unauthorized = {status:401, body:{error:'请先登录'}};
 const loginSubmit = '#login button[type="submit"]';
 const registerSubmit = '#register button[type="submit"]';
@@ -53,6 +54,8 @@ async function withFixture(options, run) {
     '/api/auth/presence': () => ({status:200, body:{online_users:1}}),
     '/api/health': () => ({status:200, body:{ok:true, comfy_online:true, maintenance_active:false}}),
     '/api/auth/login': () => ({status:200, body:session}),
+    '/api/auth/phone': request => ({body:{user:{...session.user, phone:request.body.phone}}}),
+    '/api/auth/logout': () => ({body:{ok:true}}),
     '/api/auth/register': request => ({status:201, body:{
       username:request.body.username, display_name:request.body.display_name, status:'pending',
     }}),
@@ -99,7 +102,7 @@ async function withFixture(options, run) {
       }
       if (req.method === 'GET' && req.url === '/') {
         res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
-        res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="/auth-logo.png"><h1 id="fixture-home">本地登录成功落点</h1>');
+        res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="/auth-logo.png"><h1 id="fixture-home">本地登录成功落点</h1>' + (options.authHome ? '<script src="/auth.js"></script><script>H3Auth.requireUser().then(() => { document.body.dataset.ready = "true"; }).catch(() => {});</script>' : ''));
         return;
       }
       unexpectedRequests.push(`${req.method} ${req.url}`);
@@ -205,6 +208,95 @@ async function settleUI(page) {
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
 
+test('缺手机号登录后必须补录，失败保留输入、禁止重复提交，保存后刷新不再弹出', async () => {
+  let current = {...session.user, phone:''}, attempts = 0, loggedIn = false;
+  const gate = deferred();
+  await withFixture({authHome:true, handlers:{
+    '/api/auth/me': () => loggedIn ? ({body:{...session, user:current}}) : unauthorized,
+    '/api/auth/login': () => { loggedIn = true; return {body:{...session, user:current}}; },
+    '/api/auth/logout': () => { loggedIn = false; return {body:{ok:true}}; },
+    '/api/auth/phone': request => {
+      attempts++;
+      if (attempts === 1) return {status:503, body:{error:'暂时无法保存，请重试'}};
+      current = {...current, phone:request.body.phone};
+      return {body:{user:current}, wait:gate.promise};
+    },
+  }}, async fixture => {
+    const {page} = fixture;
+    const signIn = async () => {
+      await ready(page);
+      await page.locator(field('login', 'username')).fill(session.user.username);
+      await page.locator(field('login', 'password')).fill(registration.password);
+      await page.locator(loginSubmit).click();
+      await page.waitForURL(`${fixture.origin}/`);
+    };
+    await signIn();
+    await page.locator('#phone-dialog[open]').waitFor();
+    assert.equal(await page.evaluate(() => document.body.dataset.ready), undefined);
+    await page.keyboard.press('Escape');
+    assert.equal(await page.locator('#phone-dialog').isVisible(), true);
+    await page.locator('#phone-dialog input').fill('12800138000');
+    await page.locator('#phone-dialog [type=submit]').click();
+    assert.equal(fixture.requests.filter(r => r.url === '/api/auth/phone').length, 0);
+    await page.locator('#phone-dialog input').fill('13800138000');
+    await page.locator('#phone-dialog [type=submit]').click();
+    await expectError(page, '#phone-error', '暂时无法保存');
+    assert.equal(await page.locator('#phone-dialog input').inputValue(), '13800138000');
+    await page.locator('#phone-dialog [type=submit]').click();
+    await page.waitForFunction(() => document.querySelector('#phone-dialog [type=submit]').disabled);
+    await page.locator('#phone-dialog form').evaluate(form => form.dispatchEvent(new Event('submit', {cancelable:true})));
+    assert.equal(attempts, 2);
+    gate.resolve();
+    await page.waitForFunction(() => document.body.dataset.ready === 'true');
+    assert.equal(await page.locator('#phone-dialog').count(), 0);
+    assert.equal(await page.evaluate(() => H3Auth.user.phone), '13800138000');
+    for (const request of fixture.requests.filter(r => r.url === '/api/auth/phone')) {
+      assert.deepEqual(request.body, {phone:'13800138000'});
+      assert.equal(request.headers['x-csrf-token'], session.csrf_token);
+    }
+    await page.reload();
+    await page.waitForFunction(() => document.body.dataset.ready === 'true');
+    assert.equal(await page.locator('#phone-dialog').count(), 0);
+    await page.evaluate(() => H3Auth.logout());
+    await page.waitForURL(`${fixture.origin}/login`);
+    await signIn();
+    await page.waitForFunction(() => document.body.dataset.ready === 'true');
+    assert.equal(await page.locator('#phone-dialog').count(), 0);
+    assert.equal(attempts, 2, '再次登录不能重复补录或重复提交');
+  });
+});
+
+for (const viewport of [{width:1440, height:900}, {width:390, height:844}]) {
+  test(`手机号弹窗在 ${viewport.width} 宽居中无溢出，支持键盘聚焦和退出`, async () => {
+    let loggedOut = false;
+    await withFixture({authHome:true, viewport, handlers:{
+      '/api/auth/me': () => loggedOut ? unauthorized : ({body:{...session, user:{...session.user, phone:''}}}),
+      '/api/auth/logout': () => { loggedOut = true; return {body:{ok:true}}; },
+    }}, async ({page}) => {
+      await page.locator('#phone-dialog[open]').waitFor();
+      const box = await page.locator('#phone-dialog').boundingBox();
+      assert.ok(Math.abs(box.x + box.width / 2 - viewport.width / 2) < 2);
+      assert.ok(Math.abs(box.y + box.height / 2 - viewport.height / 2) < 2);
+      assert.ok(box.x >= 0 && box.x + box.width <= viewport.width);
+      assert.equal(await page.evaluate(() => document.activeElement.name), 'phone');
+      for (let i = 0; i < 5; i++) {
+        await page.keyboard.press('Tab');
+        assert.equal(await page.evaluate(() => !document.activeElement.closest('a, button, input') || !!document.activeElement.closest('#phone-dialog')), true);
+      }
+      await page.locator('#phone-dialog [type=button]').click();
+      await page.waitForURL('**/login');
+      await ready(page);
+    });
+  });
+}
+
+test('本地免登录模式不触发手机号补录', async () => {
+  await withFixture({authHome:true, handlers:{'/api/auth/me': () => ({body:{...session, local_test:true, user:{...session.user, phone:''}}})}}, async ({page}) => {
+    await page.waitForFunction(() => document.body.dataset.ready === 'true');
+    assert.equal(await page.locator('#phone-dialog').count(), 0);
+  });
+});
+
 test('初始 me 检查期间禁止提交，401 后正常开放两表单', async () => {
   const gate = deferred();
   await withFixture({handlers:{'/api/auth/me': () => ({...unauthorized, wait:gate.promise})}}, async fixture => {
@@ -265,7 +357,7 @@ test('键盘切换正确移动焦点、跳过隐藏表单，返回清空两边�
     await expectPasswordsEmpty(page);
     const values = await fillRegistration(page);
     await page.locator('#register-heading').focus();
-    for (const selector of [field('register', 'username'), field('register', 'display_name'), field('register', 'password'), field('register', 'confirm_password'), registerSubmit, '#to-login']) {
+    for (const selector of [field('register', 'username'), field('register', 'display_name'), field('register', 'phone'), field('register', 'password'), field('register', 'confirm_password'), registerSubmit, '#to-login']) {
       await page.keyboard.press('Tab');
       assert.equal(await page.locator(selector).evaluate(node => node === document.activeElement), true, `Tab 应到达 ${selector}`);
     }
@@ -282,6 +374,26 @@ test('键盘切换正确移动焦点、跳过隐藏表单，返回清空两边�
     }
     await page.keyboard.press('Space');
     assert.equal(await page.evaluate(() => document.activeElement.id), 'register-heading');
+  });
+});
+
+test('注册手机号必填并校验大陆号码，非法输入不请求，成功提交包含号码', async () => {
+  await withFixture({}, async fixture => {
+    const {page} = fixture;
+    await openRegister(page);
+    await fillRegistration(page);
+    for (const phone of ['', '12800138000', '１３８００１３８０００', '1380013800']) {
+      await page.locator(field('register', 'phone')).fill(phone);
+      await page.locator(registerSubmit).click();
+      await settleUI(page);
+      assert.equal(posts(fixture).length, 0);
+      assert.equal(await page.locator(field('register', 'phone')).evaluate(input => input.checkValidity()), false);
+    }
+    await page.locator(field('register', 'phone')).fill(registration.phone);
+    await page.locator(registerSubmit).click();
+    await page.locator('#register-done').waitFor();
+    assert.deepEqual(posts(fixture).map(request => request.body), [registration]);
+    await expectValues(page, 'register', {phone:''});
   });
 });
 
@@ -422,7 +534,7 @@ test('注册成功回登录预填账号、提示待审批、清空密码，displ
     assert.equal(await page.locator('#login-panel').isVisible(), true);
     assert.equal(await page.locator('#register-panel').isHidden(), true);
     await expectValues(page, 'login', {username:'server-normalized-account'});
-    await expectValues(page, 'register', {username:'', display_name:''});
+    await expectValues(page, 'register', {username:'', display_name:'', phone:''});
     await expectPasswordsEmpty(page);
     assert.deepEqual(posts(fixture).map(request => request.body), [{...registration, display_name:displayName}]);
     assert.equal(page.url(), `${fixture.origin}/login`, '待审批不能自动登录');

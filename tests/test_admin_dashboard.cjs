@@ -863,7 +863,7 @@ test('单一工作区导航复用真实账号popover、键盘焦点与品牌，�
     assert.equal(await page.locator('#account-menu .account-action').first().evaluate(node => node === document.activeElement), true);
     await page.getByRole('button', {name:'用户信息', exact:true}).click();
     assert.deepEqual(await page.getByRole('dialog', {name:'用户信息', exact:true}).locator('dd').allTextContents(),
-      ['测试姓名', '真实测试账号', '管理员', session.id]);
+      ['测试姓名', '真实测试账号', '未填写', '管理员', session.id]);
     await closeDialog(page);
     assert.equal(await trigger.evaluate(node => node === document.activeElement), true);
     await trigger.click(); await page.locator('#account-menu .account-action').filter({hasText:'修改密码'}).click();

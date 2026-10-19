@@ -22,7 +22,9 @@ from server.sandbox import allowed, validate_runtime
 class SandboxBoundaryTests(unittest.TestCase):
     def test_only_management_routes_are_allowed(self):
         for method, path in [('GET', '/controller'), ('GET', '/api/capacity'),
-                             ('POST', '/api/auth/login'), ('POST', '/api/capacity/estimate'),
+                             ('POST', '/api/auth/login'), ('POST', '/api/auth/phone'),
+                             ('POST', '/api/auth/register'),
+                             ('POST', '/api/capacity/estimate'),
                              ('POST', '/api/teams/test/members/batch'),
                              ('PUT', '/api/admin/global-grants/viewer'),
                              ('DELETE', '/api/admin/global-grants/viewer')]:
@@ -31,8 +33,29 @@ class SandboxBoundaryTests(unittest.TestCase):
                              ('POST', '/api/admin/workers/sync-all'), ('POST', '/api/text'),
                              ('POST', '/api/rewrite'), ('GET', '/api/file'),
                              ('GET', '/api/media'), ('POST', '/api/projects'),
-                             ('POST', '/api/auth/register'), ('DELETE', '/api/workers/example')]:
+                             ('DELETE', '/api/workers/example')]:
             self.assertFalse(allowed(method, path), (method, path))
+
+    def test_phone_allowlist_is_exact_and_does_not_open_other_auth_routes(self):
+        self.assertTrue(allowed('POST', '/api/auth/phone'))
+        for path in ('/api/auth/phone/', '/api/auth/phone/other-user', '/api/auth/phones',
+                     '/api/auth/phone-extra', '/api/auth/unknown'):
+            for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+                with self.subTest(method=method, path=path):
+                    self.assertFalse(allowed(method, path))
+        for method in ('GET', 'HEAD'):
+            self.assertFalse(allowed(method, '/api/auth/phone'))
+
+    def test_register_allowlist_is_exact_and_keeps_execution_routes_closed(self):
+        self.assertTrue(allowed('POST', '/api/auth/register'))
+        for path in ('/api/auth/register/', '/api/auth/register/other-user',
+                     '/api/auth/register-extra', '/api/auth/registers',
+                     '/api/auth/unknown', '/agent/v1/register', '/api/generate'):
+            for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+                with self.subTest(method=method, path=path):
+                    self.assertFalse(allowed(method, path))
+        for method in ('GET', 'HEAD'):
+            self.assertFalse(allowed(method, '/api/auth/register'))
 
     def test_creative_ui_resources_are_read_only(self):
         for path in ('/', '/director', '/app.js', '/director.css', '/director.js', '/director_edit.js'):
@@ -318,6 +341,137 @@ class SandboxApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         response = await self.client.post('/api/admin/users', json=body, headers=headers)
         self.assertEqual(response.status, 201, await response.text())
+
+    async def test_registration_is_local_pending_with_phone_and_no_delivery(self):
+        store = self.application['auth_store']
+        self.assertTrue(self.application['admin_sandbox'])
+        self.assertIsNone(self.application.get('dingtalk'))
+        sessions_before = set(map(tuple, store.db.execute('SELECT * FROM sessions')))
+        with mock.patch.object(self.application['session'], '_request', new=mock.AsyncMock(
+                side_effect=AssertionError('注册不得发起出站请求'))) as outbound:
+            response = await self.client.post('/api/auth/register', json={
+                'username': 'local-registration', 'display_name': '本地注册',
+                'password': 'Local-Registration-74!', 'phone': ' \t13800138000\r\n',
+            }, headers={'Origin': self.origin})
+            self.assertEqual(response.status, 201, await response.text())
+            self.assertEqual(response.headers['X-H3Card-Sandbox'], 'local-copy')
+            self.assertNotIn('Set-Cookie', response.headers)
+            result = await response.json()
+            self.assertEqual(result['status'], 'pending')
+            self.assertNotIn('phone', result)
+            user = next(user for user in store.list_users() if user['username'] == 'local-registration')
+            self.assertEqual(user['approval_status'], 'pending')
+            self.assertEqual(user['phone'], '13800138000')
+            self.assertEqual(store.db.execute('SELECT phone FROM users WHERE id=?',
+                                              (user['id'],)).fetchone()[0], '13800138000')
+            self.assertEqual(set(map(tuple, store.db.execute('SELECT * FROM sessions'))), sessions_before)
+            card = store.registration_card_data(result['request_id'])
+            self.assertEqual(card['status'], 'pending')
+            self.assertNotIn('phone', card)
+            tasks = [dict(row) for row in store.db.execute('SELECT * FROM notification_outbox')]
+            self.assertEqual(len(tasks), 1)
+            self.assertEqual(tasks[0]['request_id'], result['request_id'])
+            self.assertEqual(tasks[0]['kind'], 'send_card')
+            self.assertEqual((tasks[0]['status'], tasks[0]['attempts'], tasks[0]['leased_until']),
+                             ('pending', 0, 0))
+            self.assertEqual(store.outbox_backlog()['pending'], 1)
+            denied = await self.client.post('/api/auth/login', json={
+                'username': 'local-registration', 'password': 'Local-Registration-74!',
+            }, headers={'Origin': self.origin})
+            self.assertEqual(denied.status, 403)
+            self.assertIn('审批中', (await denied.json())['error'])
+            await self.login()
+            response = await self.client.get('/api/admin/registrations')
+            self.assertEqual(response.status, 200)
+            payload = await response.json()
+            self.assertEqual(payload['requests'][0]['id'], result['request_id'])
+            self.assertEqual(payload['requests'][0]['status'], 'pending')
+            self.assertNotIn('phone', payload['requests'][0])
+            self.assertNotIn('13800138000', str(payload))
+            self.assertEqual(payload['outbox']['pending'], 1)
+            outbound.assert_not_awaited()
+        self.dingtalk.assert_not_called()
+        self.assertIsNone(self.application.get('dingtalk'))
+        self.assertNotIn('ws_task', self.application)
+
+    async def test_registration_requires_trusted_source_without_writing(self):
+        store = self.application['auth_store']
+        body = {'username': 'local-registration', 'display_name': '本地注册',
+                'password': 'Local-Registration-74!', 'phone': '13800138000'}
+        before = {table: set(map(tuple, store.db.execute(f'SELECT * FROM {table}')))
+                  for table in ('users', 'registration_requests', 'notification_outbox')}
+        for headers in ({}, {'Origin': 'https://evil.invalid'},
+                        {'Referer': 'https://evil.invalid/login'},
+                        {'Origin': self.origin, 'Sec-Fetch-Site': 'cross-site'},
+                        {'Origin': self.origin, 'Host': 'evil.invalid:18299'}):
+            with self.subTest(headers=headers):
+                response = await self.client.post('/api/auth/register', json=body, headers=headers)
+                self.assertEqual(response.status, 403, await response.text())
+                for table, rows in before.items():
+                    self.assertEqual(set(map(tuple, store.db.execute(f'SELECT * FROM {table}'))),
+                                     rows, table)
+        self.dingtalk.assert_not_called()
+
+    async def test_registration_does_not_open_similar_paths_or_other_methods(self):
+        headers = await self.login()
+        store = self.application['auth_store']
+        body = {'username': 'local-registration', 'display_name': '本地注册',
+                'password': 'Local-Registration-74!', 'phone': '13800138000'}
+        before = {table: set(map(tuple, store.db.execute(f'SELECT * FROM {table}')))
+                  for table in ('users', 'registration_requests', 'notification_outbox')}
+        for path in ('/api/auth/register/', '/api/auth/register/other-user',
+                     '/api/auth/register-extra', '/api/auth/registers', '/api/auth/unknown'):
+            for method in ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE'):
+                with self.subTest(method=method, path=path):
+                    response = await self.client.request(method, path, json=body, headers=headers)
+                    self.assertEqual(response.status, 403, path)
+                    self.assertEqual(response.headers['X-H3Card-Sandbox'], 'local-copy')
+        for method, status in (('GET', 403), ('HEAD', 403), ('PUT', 405),
+                               ('PATCH', 405), ('DELETE', 405)):
+            response = await self.client.request(method, '/api/auth/register', json=body, headers=headers)
+            self.assertEqual(response.status, status, method)
+        for table, rows in before.items():
+            self.assertEqual(set(map(tuple, store.db.execute(f'SELECT * FROM {table}'))), rows, table)
+
+    async def test_phone_self_service_keeps_auth_and_sandbox_boundaries(self):
+        url = '/api/auth/phone'
+        body = {'phone': '13800138000'}
+        response = await self.client.post(url, json=body, headers={'Origin': self.origin})
+        self.assertEqual(response.status, 401)
+        headers = await self.login('local-user', 'Local-User-74!')
+        store = self.application['auth_store']
+        uid = next(user['id'] for user in store.list_users() if user['username'] == 'local-user')
+        self.assertEqual((await self.client.get('/api/admin/users')).status, 403)
+        for invalid_headers in ({'Origin': self.origin}, {**headers, 'Origin': 'https://evil.invalid'}):
+            response = await self.client.post(url, json=body, headers=invalid_headers)
+            self.assertEqual(response.status, 403)
+            self.assertEqual(store.get_user(uid)['phone'], '')
+        response = await self.client.post(url, json={**body, 'uid': self.admin['id']}, headers=headers)
+        self.assertEqual(response.status, 400)
+        self.assertEqual(store.get_user(uid)['phone'], '')
+        self.assertEqual(store.get_user(self.admin['id'])['phone'], '')
+        response = await self.client.post(url, json={'phone': ' 13800138000 '}, headers=headers)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(response.headers['X-H3Card-Sandbox'], 'local-copy')
+        self.assertEqual((await response.json())['user']['id'], uid)
+        response = await self.client.get('/api/auth/me')
+        self.assertEqual(response.status, 200)
+        identity = await response.json()
+        self.assertEqual(identity['user']['phone'], '13800138000')
+        self.assertEqual(identity['csrf_token'], headers['X-CSRF-Token'])
+        self.assertEqual((await self.client.get('/api/admin/users')).status, 403)
+        headers = await self.login()
+        response = await self.client.get('/api/admin/users')
+        self.assertEqual(response.status, 200)
+        users = {user['id']: user for user in (await response.json())['users']}
+        self.assertEqual(users[uid]['phone'], '13800138000')
+        self.assertEqual(users[self.admin['id']]['phone'], '')
+        # 放行补录和本地注册不能连带放行相似路径或任务执行接口。
+        for path in ('/api/auth/register/other-user', '/api/auth/phone/other-user', '/api/auth/phones', '/api/generate'):
+            response = await self.client.post(path, json=body, headers=headers)
+            self.assertEqual(response.status, 403, path)
+            self.assertIn('本地隔离', (await response.json())['error'])
+        self.assertEqual(store.get_user(uid)['phone'], '13800138000')
 
     async def test_temperature_api_requires_admin_and_bounds_queries(self):
         import time
