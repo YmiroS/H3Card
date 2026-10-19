@@ -160,6 +160,21 @@
   .auth-dialog [role="alert"] { min-height: 18px; margin: 0; color: var(--err, var(--bad, #ff3b5c)); font-size: 12px; }
   .auth-dialog footer { display: flex; justify-content: flex-end; gap: 10px; }
   .auth-dialog footer .btn { padding: 10px 18px; font-size: 13px; }
+  .auth-dialog.phone-dialog { box-sizing: border-box; width: min(440px, calc(100vw - 32px));
+    max-height: calc(100dvh - 32px); overflow-y: auto; border-color: #343b47; border-radius: 12px;
+    box-shadow: 0 24px 70px #0008; font: 14px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }
+  .phone-dialog h2 { font-size: 18px; letter-spacing: 0; }
+  .phone-dialog .auth-note { color: var(--dim, var(--muted, #a5acb8)); font-size: 14px; }
+  .phone-dialog .fld { display: grid; gap: 8px; }
+  .phone-dialog .fld > span { font-size: 14px; }
+  .phone-dialog input { box-sizing: border-box; min-width: 0; min-height: 44px; border: 1px solid #424b59;
+    border-radius: 8px; background: var(--panel2, #16191f); color: var(--txt, var(--text, #f3f4f6)); font: inherit; }
+  .phone-dialog input::placeholder { color: #a5acb8; }
+  .phone-dialog :is(input, button):focus-visible { outline: 2px solid #7dd3fc; outline-offset: 3px; }
+  .phone-dialog footer .btn { min-height: 44px; border-color: #424b59; border-radius: 8px; color: #e5e7eb; }
+  .phone-dialog footer .btn.primary { color: #111318; background: #f3f4f6; border-color: #f3f4f6; }
+  .phone-dialog footer .btn:hover { color: #fff; border-color: #7dd3fc; box-shadow: none; }
+  .phone-dialog footer .btn.primary:hover { color: #111318; background: #dce1e9; }
   @media (prefers-reduced-motion: reduce) { .btn { transition: none; } }
   `;
   document.head.append(style);
@@ -316,10 +331,63 @@
     }).finally(() => { pendingMe = null; });
     return pendingMe;
   }
+  let pendingPhone = null;
+  function requirePhone() {
+    if (localTest || user.phone !== '') return Promise.resolve();
+    if (pendingPhone) return pendingPhone;
+    pendingPhone = new Promise((resolve, reject) => {
+      const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog phone-dialog';
+      dialog.id = 'phone-dialog'; dialog.setAttribute('aria-labelledby', 'phone-title');
+      dialog.setAttribute('aria-describedby', 'phone-note');
+      dialog.innerHTML = '<form><h2 id="phone-title">补充手机号</h2>'
+        + '<p id="phone-note" class="auth-note">当前账号尚未填写手机号，请补充后继续使用。手机号仅本人和管理员可见，不用于短信验证或登录。</p>'
+        + '<label class="fld"><span>手机号</span><input name="phone" type="tel" inputmode="numeric" autocomplete="tel-national" required maxlength="11" pattern="1[3-9][0-9]{9}" placeholder="请输入 11 位中国大陆手机号" aria-describedby="phone-error" autofocus></label>'
+        + '<p id="phone-error" role="alert"></p><footer><button type="button" class="btn">退出登录</button><button type="submit" class="btn primary">保存并继续</button></footer></form>';
+      const form = dialog.querySelector('form'), input = form.elements.phone;
+      const alert = dialog.querySelector('[role=alert]'), submit = dialog.querySelector('[type=submit]');
+      const exit = dialog.querySelector('[type=button]');
+      let busy = false;
+      const finish = error => {
+        window.removeEventListener('h3auth:expired', expired);
+        dialog.close(); dialog.remove();
+        if (error) reject(error); else resolve();
+      };
+      const expired = () => finish(new Error('登录已失效，请重新登录'));
+      window.addEventListener('h3auth:expired', expired, {once:true});
+      dialog.addEventListener('cancel', event => event.preventDefault());
+      dialog.addEventListener('keydown', event => event.stopPropagation());
+      input.oninput = () => { input.setCustomValidity(''); alert.textContent = ''; };
+      input.oninvalid = () => { input.setCustomValidity('请输入有效的 11 位中国大陆手机号'); };
+      exit.onclick = async () => {
+        if (busy) return;
+        busy = true; submit.disabled = exit.disabled = true;
+        await logout().catch(() => {});
+      };
+      form.onsubmit = async event => {
+        event.preventDefault();
+        if (busy) return;
+        busy = true; submit.disabled = exit.disabled = true; input.readOnly = true;
+        submit.textContent = '正在保存…'; alert.textContent = '';
+        try {
+          const data = await json('/api/auth/phone', 'POST', {phone:input.value.trim()});
+          user = data.user;
+          finish();
+        } catch (error) {
+          if (dialog.isConnected) { alert.textContent = error.message; input.focus(); }
+        } finally {
+          busy = false; submit.disabled = exit.disabled = false; input.readOnly = false;
+          submit.textContent = '保存并继续';
+        }
+      };
+      document.body.append(dialog); dialog.showModal();
+    }).finally(() => { pendingPhone = null; });
+    return pendingPhone;
+  }
   async function requireUser(admin = false) {
     const current = await me();
     if (admin && current.role !== 'admin') { location.replace('/'); throw new Error('仅管理员可访问'); }
-    return current;
+    await requirePhone();
+    return user;
   }
   function every(fn, ms) {
     if (stopped) return;
@@ -330,8 +398,8 @@
     const data = await json('/api/auth/login', 'POST', {username,password});
     user = data.user; csrf = data.csrf_token; stopped = false; return user;
   }
-  async function register(username, displayName, password) {
-    return json('/api/auth/register', 'POST', {username, display_name: displayName, password});
+  async function register(username, displayName, password, phone) {
+    return json('/api/auth/register', 'POST', {username, display_name: displayName, password, phone});
   }
   async function logout() {
     try { await json('/api/auth/logout', 'POST'); }
@@ -465,7 +533,7 @@
       const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog'; dialog.setAttribute('aria-label', '用户信息');
       dialog.innerHTML = '<form method="dialog"><h2>用户信息</h2><dl class="account-info"></dl><footer><button class="btn primary">关闭</button></footer></form>';
       const list = dialog.querySelector('dl');
-      for (const [label, value] of [['姓名 / 花名', user.display_name?.trim() || '未填写'], ['用户名', user.username], ['角色', roleText], ['用户 ID', user.id]]) {
+      for (const [label, value] of [['姓名 / 花名', user.display_name?.trim() || '未填写'], ['用户名', user.username], ['手机号', user.phone || '未填写'], ['角色', roleText], ['用户 ID', user.id]]) {
         const term = document.createElement('dt'); term.textContent = label;
         const definition = document.createElement('dd'); definition.textContent = value;
         list.append(term, definition);

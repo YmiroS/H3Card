@@ -57,10 +57,13 @@ class AuthStore:
             if version == 5:
                 self.db.executescript(migrations.joinpath('006_global_canvas_grants.sql').read_text(encoding='utf-8'))
                 version = 6
-            elif version != 6:
+            if version == 6:
+                self.db.executescript(migrations.joinpath('007_user_phone.sql').read_text(encoding='utf-8'))
+                version = 7
+            elif version != 7:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
-                'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader',
+                'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader,phone',
                 'sessions': 'token_hash,user_id,csrf_token,expires_at,created_at',
                 'user_grants': 'viewer_id,owner_id,permission',
                 'global_canvas_grants': 'viewer_id,permission',
@@ -97,12 +100,17 @@ class AuthStore:
             self.db.close()
 
     @staticmethod
-    def _safe(row):
-        return None if row is None else {'id': row['id'], 'username': row['username'],
-                                         'role': row['role'], 'enabled': bool(row['enabled']),
-                                         'display_name': row['display_name'],
-                                         'approval_status': row['approval_status'],
-                                         'team_leader': bool(row['team_leader'])}
+    def _safe(row, *, include_phone=True):
+        if row is None:
+            return None
+        user = {'id': row['id'], 'username': row['username'],
+                'role': row['role'], 'enabled': bool(row['enabled']),
+                'display_name': row['display_name'],
+                'approval_status': row['approval_status'],
+                'team_leader': bool(row['team_leader'])}
+        if include_phone:
+            user['phone'] = row['phone']
+        return user
 
     @staticmethod
     def _identifier(value, label):
@@ -240,6 +248,25 @@ class AuthStore:
             self.db.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
             return self._safe(self._user(uid))
 
+    @staticmethod
+    def _phone(phone):
+        if not isinstance(phone, str):
+            raise AuthError('请输入有效的 11 位中国大陆手机号')
+        phone = phone.strip()
+        if (len(phone) != 11 or not phone.isascii() or not phone.isdigit()
+                or phone[0] != '1' or phone[1] not in '3456789'):
+            raise AuthError('请输入有效的 11 位中国大陆手机号')
+        return phone
+
+    def set_phone(self, uid, phone, *, session_token):
+        phone = self._phone(phone)
+        with self._tx():
+            session = self.get_session(session_token)
+            if session is None or session['user']['id'] != uid:
+                raise AuthError('会话已失效，请重新登录', 401)
+            self.db.execute('UPDATE users SET phone=? WHERE id=?', (phone, uid))
+            return self._safe(self._user(uid))
+
     def _verify(self, hashed, password):
         try:
             return isinstance(password, str) and len(password) <= 1024 and self.hasher.verify(hashed, password)
@@ -277,7 +304,7 @@ class AuthStore:
 
     # ---- 用户自主注册与钉钉审批 ----
 
-    def create_registration(self, username, password, display_name):
+    def create_registration(self, username, password, display_name, phone):
         """提交注册申请：创建 pending 账号、申请记录与发卡任务（同一事务）。
 
         不创建会话；同账号重复提交、已拒绝、已存在分别给出明确错误。
@@ -285,6 +312,7 @@ class AuthStore:
         self._password(password)
         username, username_key = self._username(username)
         display_name = self._display_name(display_name)
+        phone = self._phone(phone)
         hashed = self.hasher.hash(password)
         uid = uuid.uuid4().hex
         request_id = f'reg-{uuid.uuid4().hex}'
@@ -300,9 +328,9 @@ class AuthStore:
                     raise AuthError('该账号的注册申请已被拒绝，请联系审批人', 403)
                 raise AuthError('用户名已存在', 409)
             self.db.execute(
-                'INSERT INTO users(id,username,username_key,password_hash,role,created_at,display_name,approval_status) '
-                'VALUES(?,?,?,?,?,?,?,?)',
-                (uid, username, username_key, hashed, 'user', now, display_name, 'pending'))
+                'INSERT INTO users(id,username,username_key,password_hash,role,created_at,display_name,approval_status,phone) '
+                'VALUES(?,?,?,?,?,?,?,?,?)',
+                (uid, username, username_key, hashed, 'user', now, display_name, 'pending', phone))
             self.db.execute(
                 'INSERT INTO registration_requests(id,user_id,username,display_name,status,created_at,out_track_id) '
                 'VALUES(?,?,?,?,?,?,?)',
@@ -525,7 +553,7 @@ class AuthStore:
     def list_team_candidates(self, actor_id, session_token=None):
         with self.lock:
             self._check_team_manager(actor_id, session_token=session_token)
-            return [self._safe(row) for row in self.db.execute(
+            return [self._safe(row, include_phone=False) for row in self.db.execute(
                 "SELECT * FROM users WHERE enabled=1 AND approval_status='approved' ORDER BY username_key,id")]
 
     def add_team_member(self, team_id, user_id, actor_id, session_token=None):
