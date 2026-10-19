@@ -55,7 +55,7 @@
    "type": "number",
    "default": 352,
    "min": 256,
-   "max": 1344,
+   "max": 1792,
    "step": 32,
    "target": {"node": "11", "input": "width", "vtype": "INT"}
   },
@@ -65,7 +65,7 @@
    "type": "number",
    "default": 640,
    "min": 256,
-   "max": 1344,
+   "max": 1792,
    "step": 32,
    "target": {"node": "11", "input": "height", "vtype": "INT"}
   },

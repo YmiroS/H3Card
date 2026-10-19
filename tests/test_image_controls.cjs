@@ -398,6 +398,77 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       assert.equal(Object.hasOwn(payload.params,'image_ratio'),false);
       assert.equal(Object.hasOwn(payload.params,'image_clarity'),false);
     });
+    await t.test('H3 image-to-video and first-last-frame popovers expose 768p shortcuts',async()=>{
+      for(const cap of ['minimax_h3_i2v','minimax_h3_flf2v']) {
+        await reset(cap,'card_video');await paramsButton.click();
+        const input=page.locator('#respop .cpick input[type=number]');
+        const before=await page.locator('#respop').boundingBox();
+        assert.deepEqual(await page.locator('#respop .cgrid.k button').allTextContents(),['480p','544p','640p','768p'],cap);
+        for(const [label,length] of [['480p',832],['544p',960],['640p',1152],['768p',1344]]) {
+          await page.locator('#respop .cgrid.k').getByRole('button',{name:label,exact:true}).click();
+          assert.equal(await input.inputValue(),String(length),cap);
+          assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.scale_to_length),length,cap);
+          assert.equal(await page.locator('#respop .cgrid.k button.on').innerText(),label,cap);
+          assert.equal(await page.locator('#respop').isVisible(),true);
+        }
+        const after=await page.locator('#respop').boundingBox();
+        assert.equal(after.x,before.x);assert.equal(after.y,before.y);
+        assert.match(await page.locator('#respop .cpick').innerText(),/16:9.*素材比例/s);
+        await input.fill('1024');
+        assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.scale_to_length),1024);
+        assert.equal(await page.locator('#respop .cgrid.k button.on').count(),0);
+      }
+    });
+
+    await t.test('H3 character transfer uses video clarity presets and 768p stays 32-aligned across ratios',async()=>{
+      const cap=runtime.capabilities.minimax_h3_character_transfer;
+      await reset(cap.id,'card_video');await paramsButton.click();
+      assert.deepEqual(await page.locator('#respop .cgrid.k button').allTextContents(),['480p','544p','640p','768p']);
+      assert.deepEqual(await page.evaluate(()=>{const p=payloadOf(PROJ.cards[0]).params;return [p.width,p.height];}),[352,640]);
+      for(const ratio of RATIOS) {
+        await page.locator(`#respop button[title^="画面比例 ${ratio}"]`).click();
+        const button=page.locator('#respop .cgrid.k').getByRole('button',{name:'768p',exact:true});
+        await button.click();
+        const payload=await page.evaluate(()=>payloadOf(PROJ.cards[0]));
+        const {width,height}=payload.params;
+        assert.equal(Math.min(width,height),768,ratio);
+        assert.equal(width%32,0);assert.equal(height%32,0);
+        assert.ok(width<=cap.inputs.find(s=>s.key==='width').max,ratio);
+        assert.ok(height<=cap.inputs.find(s=>s.key==='height').max,ratio);
+        assert.equal(await button.getAttribute('title'),`${width} × ${height}`);
+        assert.equal(await page.locator('#respop .cgrid.k button.on').innerText(),'768p');
+        assert.match(await paramsButton.innerText(),/768p/);
+        assert.equal(Object.hasOwn(payload.params,'megapixels'),false);
+      }
+      await page.locator('#respop button[title^="画面比例 16:9"]').click();
+      assert.deepEqual(await page.evaluate(()=>{const p=payloadOf(PROJ.cards[0]).params;return [p.width,p.height];}),[1376,768]);
+    });
+
+    await t.test('every H3 megapixel mode offers effective 768p at all workflow ratios including 21:9',async()=>{
+      const modes=Object.values(runtime.capabilities).filter(cap=>cap.id.startsWith('minimax_h3_') && cap.inputs.some(s=>s.key==='megapixels'));
+      assert.equal(modes.length,7);
+      for(const cap of modes) {
+        await reset(cap.id,'card_video');await paramsButton.click();
+        const spec=cap.inputs.find(s=>s.key==='megapixels');
+        for(const ratio of cap.inputs.find(s=>s.key==='aspect_ratio').options) {
+          const label=ratio.split(' ')[0];
+          await page.locator(`#respop button[title^="画面比例 ${label}"]`).click();
+          const button=page.locator('#respop .cgrid.k').getByRole('button',{name:'768p',exact:true});
+          assert.equal(await button.count(),1,cap.id+' '+ratio);
+          assert.equal(await button.isEnabled(),true);
+          await button.click();
+          const payload=await page.evaluate(()=>payloadOf(PROJ.cards[0]));
+          assert.equal(payload.params.aspect_ratio,ratio);
+          assert.ok(payload.params.megapixels<=spec.max,cap.id);
+          const dimensions=await page.evaluate(()=>resFromMP(PROJ.cards[0].params.aspect_ratio,PROJ.cards[0].params.megapixels));
+          assert.equal(Math.min(...dimensions),768,cap.id+' '+ratio);
+          assert.ok(dimensions.every(value=>value%32===0));
+          assert.equal(await button.getAttribute('title'),dimensions.join('×'));
+          assert.equal(await page.locator('#respop .cgrid.k button.on').innerText(),'768p');
+          assert.match(await paramsButton.innerText(),/768p/);
+        }
+      }
+    });
     assert.deepEqual(errors,[]);
   } finally {
     if(browser) await browser.close();
