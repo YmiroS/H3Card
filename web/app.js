@@ -403,10 +403,9 @@ function putAsset(c, s, file) {
      total = megapixels * 1024 * 1024        ← 注意是 1024²，不是 100 万
      scale = sqrt(total / (wr * hr))
      w = round(wr * scale / 32) * 32   h 同理
-   MiniMax H3 的原生画布（comfy_extras/nodes_minimax_h3.py:26-28）：
-     短边 768、面积上限 768*1344、宽高必须是 32 的倍数。
-   于是 16:9 下：0.4MP=864×480(480p)  0.5MP=960×544(544p)
-                0.7MP=1152×640(640p) 1.0MP=1376×768(768p，顶到原生) */
+   768×1344 是 H3 参考视频预处理的画布基准，不是生成输出面积的硬上限。
+   16:9 下：0.4MP=864×480(480p)  0.5MP=960×544(544p)
+             0.7MP=1152×640(640p) 1.0MP=1376×768(768p)。21:9 的 768p 需要 1.31MP。 */
 const RATIO_WH = {
   "1:1 (Square)": [1, 1], "2:3 (Portrait Photo)": [2, 3], "3:2 (Photo)": [3, 2],
   "3:4 (Portrait Standard)": [3, 4], "4:3 (Standard)": [4, 3],
@@ -546,6 +545,8 @@ function imageClarityPicker(c, cap, onchange) {
   return wrap;
 }
 
+const whClaritySteps = cap => cap.outputType === "video"
+  ? H3_P.map(p => ({ id: `${p}p`, label: `${p}p`, val: p })) : CLARITY_STEPS;
 const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length"]);
 const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
   !RES_PARAM_KEYS.has(s.key) && !MEDIA.includes(s.type) && s.type !== "textarea"
@@ -690,7 +691,7 @@ function clarityPicker(c, cap, onchange) {
     return wrap;
   }
 
-  // scale_to_length 模式（H3 基础视频：图生视频、说话唱歌）：只有一个数字输入框，控制最长边
+  // scale_to_length 模式：按最长边设置，p 档位以 16:9 素材为参照。
   if (stlSpec && !arSpec) {
     const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "分辨率（最长边）";
     const inp = document.createElement("input");
@@ -706,10 +707,21 @@ function clarityPicker(c, cap, onchange) {
       c.params.scale_to_length = Math.max(stlSpec.min || 512, Math.min(stlSpec.max || 1344, v));
       save(); onchange && onchange();
     };
+    const sizes = document.createElement("div"); sizes.className = "cgrid k";
+    for (const p of H3_P) {
+      const length = H3_LONG[p];
+      const button = document.createElement("button");
+      button.textContent = `${p}p`;
+      button.className = Number(inp.value) === length ? "on" : "";
+      button.disabled = length < Number(inp.min) || length > Number(inp.max);
+      button.title = `16:9 素材约 ${p}p；最长边 ${length}px，实际短边随素材比例变化`;
+      button.onclick = () => { inp.value = length; inp.oninput(); };
+      sizes.appendChild(button);
+    }
     const hint = document.createElement("div");
     hint.style.cssText = "font-size:12px;color:#8a8a94;margin-top:4px";
-    hint.textContent = `范围：${stlSpec.min || 512} ~ ${stlSpec.max || 1344}，步进 ${stlSpec.step || 32}`;
-    wrap.append(t, inp, hint);
+    hint.textContent = `档位按 16:9 素材标注，实际短边随素材比例变化。最长边范围：${stlSpec.min || 512} ~ ${stlSpec.max || 1344}，步进 ${stlSpec.step || 32}`;
+    wrap.append(t, sizes, inp, hint);
     return wrap;
   }
 
@@ -766,15 +778,14 @@ function clarityPicker(c, cap, onchange) {
     wrap.append(t, g);
   }
 
-  /** 文生图：按比例 + 清晰度档算宽高（16 步进）。清晰度档取当前选中的，
-      没选过按现有宽高折最接近的档。 */
+  /** 按比例和短边清晰度算宽高：视频按 32 对齐，图片按 16 对齐。 */
   function setWHFrom(ratio) {
-    const step = whStep(cap, c) || CLARITY_STEPS[1];
+    const step = whStep(cap, c) || whClaritySteps(cap)[1];
     const [wr, hr] = [ratio[1], ratio[2]];
     const isW = wr >= hr;
-    const short = step.val;
-    c.params.width = isW ? Math.round(short * wr / hr / 16) * 16 : short;
-    c.params.height = isW ? short : Math.round(short * hr / wr / 16) * 16;
+    const short = step.val, multiple = cap.outputType === "video" ? MULT : 16;
+    c.params.width = isW ? Math.round(short * wr / hr / multiple) * multiple : short;
+    c.params.height = isW ? short : Math.round(short * hr / wr / multiple) * multiple;
   }
 
   // ---- 清晰度 ----
@@ -792,12 +803,11 @@ function clarityPicker(c, cap, onchange) {
       const hi = mpSpec.max ?? 1.1;
       for (const p of H3_P) {
         const v = mpForP(mpRatio, p);
-        if (v > hi + 0.01) continue;   // 超宽比例下高 p 会顶穿 H3 的画布面积上限
+        if (v > hi + 0.01) continue;
         steps.push({ id: `${p}p`, label: `${p}p`, val: v, p });
       }
     } else {
-      // 文生图那套：按标准分辨率档位（短边像素）
-      for (const s of CLARITY_STEPS) {
+      for (const s of whClaritySteps(cap)) {
         steps.push({ ...s, dis: false });
       }
     }
@@ -820,10 +830,10 @@ function clarityPicker(c, cap, onchange) {
         b.title = resFromMP(mpRatio, s.val).join("×");
       } else {
         const r = RATIO_GRID.find(x => x[0] === (c.params._ratio || "3:4")) || [0, 3, 4];
-        const isW = r[1] >= r[2];
+        const isW = r[1] >= r[2], multiple = cap.outputType === "video" ? MULT : 16;
         b.title = isW
-          ? `${Math.round(s.val * r[1] / r[2] / 16) * 16} × ${s.val}`
-          : `${s.val} × ${Math.round(s.val * r[2] / r[1] / 16) * 16}`;
+          ? `${Math.round(s.val * r[1] / r[2] / multiple) * multiple} × ${s.val}`
+          : `${s.val} × ${Math.round(s.val * r[2] / r[1] / multiple) * multiple}`;
       }
       b.onclick = () => {
         if (mpSpec) { c.params.megapixels = s.val; }
@@ -859,11 +869,11 @@ function clarityPicker(c, cap, onchange) {
   return wrap;
 }
 
-/** 文生图（width/height 体系）当前对应的清晰度档：记过 _clarity 用它，
-    否则按现有短边折最接近的档。 */
+/** width/height 体系的当前清晰度档，按视频或图片的档位匹配。 */
 function whStep(cap, c) {
+  const steps = whClaritySteps(cap);
   if (c.params._clarity) {
-    const s = CLARITY_STEPS.find(x => x.id === c.params._clarity);
+    const s = steps.find(x => x.id === c.params._clarity);
     if (s) return s;
   }
   const w = cap.inputs.find(x => x.key === "width");
@@ -873,7 +883,7 @@ function whStep(cap, c) {
   if (!cw || !ch) return null;
   const short = Math.min(cw, ch);
   let best = null, bd = Infinity;
-  for (const s of CLARITY_STEPS) {
+  for (const s of steps) {
     const d = Math.abs(s.val - short);
     if (d < bd) { bd = d; best = s; }
   }
@@ -7729,13 +7739,14 @@ function augRes(c, s, row) {
   for (const p of H3_P) {
     const v = s.key === "megapixels" ? mpForP(ratio, p) : H3_LONG[p];
     const b = document.createElement("button"); b.textContent = p + "p";
-    // 超宽比例下高 p 会顶穿 H3 的面积上限（21:9 的 768p 要 1.31MP），直接禁掉
     if (v > s.max) {
       b.disabled = true;
-      b.title = `${ratio} 下 ${p}p 需要 ${v} 百万像素，超过 H3 的画布上限 ${s.max}`;
+      b.title = s.key === "megapixels"
+        ? `${ratio} 下 ${p}p 需要 ${v} 百万像素，超过当前参数上限 ${s.max}`
+        : `最长边 ${v}px 超过当前参数上限 ${s.max}`;
     } else {
-      b.title = p === 768 ? "H3 原生短边（768×1344），再往上是训练分布外，只会更慢更糊"
-        : `短边 ${p}`;
+      b.title = s.key === "megapixels" ? `${resFromMP(ratio, v).join("×")} · 短边 ${p}p`
+        : `16:9 素材约 ${p}p；最长边 ${v}px，实际短边随素材比例变化`;
       b.onclick = () => setAll(v);
     }
     pre.appendChild(b);
