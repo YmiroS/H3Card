@@ -18,6 +18,7 @@ document.addEventListener("contextmenu", (ev) => ev.preventDefault());
 
 let CARDS = [];            // 节点种类（生图 / 生视频）
 let CAPS = {};             // 能力清单
+let ifModelLimits = {};    // 官方 API 参考上限与本机 IF 可提交上限
 let PROJ = null;           // 当前项目
 let projects = [];
 let teams = [];
@@ -173,6 +174,28 @@ const modelOf = (c) => Object.entries((modeOf(c) || {}).modelSwitch || {})
 const MODEL_SWITCH_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen Image Edit 2511",
   qwen2512: "Qwen Image 2512（双阶段）", qwen21: "Qwen Image 2.1",
   da3: "Depth Anything 3", depthcrafter: "DepthCrafter" };
+const IF_BRIDGE = "http://127.0.0.1:8278";
+let ifModels = [], ifModelsPromise = null, ifModelsAttempted = false, ifModelsError = "";
+const isIF = c => capOf(c)?.execution === "if_studio";
+async function ifRequest(path, options = {}) {
+  const response = await fetch(IF_BRIDGE + path, {...options, credentials: "omit"});
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || `本机桥接返回 ${response.status}`);
+  return data;
+}
+function loadIFModels() {
+  if (ifModelsPromise) return ifModelsPromise;
+  ifModelsAttempted = true;
+  ifModelsPromise = (async () => {
+    const status = await ifRequest("/status");
+    if (!status.ready) throw new Error("请先在本机登录 IF CLI");
+    ifModels = (await ifRequest("/models")).models;
+    ifModelsError = "";
+    return ifModels;
+  })().catch(error => { ifModelsError = error.message; throw error; })
+    .finally(() => { ifModelsPromise = null; if (el.panel._id) openPanel(el.panel._id); });
+  return ifModelsPromise;
+}
 /** 节点显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
     路由节点同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
     最后兜底用模式名而不是裸 id：风格节点在 CAPS 里根本没有条目（它不是能力）。 */
@@ -337,7 +360,28 @@ function runCap(c) {
   const n = Math.max(filledImgs(c), steps[0]);      // 一张都没传时按最低档算
   return md.ladder[String(steps.filter(s => s <= n).pop())] || c.cap;
 }
-const capOf = (c) => CAPS[c.cap] || null;
+const capOf = (c) => {
+  const cap = CAPS[c.cap];
+  if (!cap || cap.execution !== "if_studio") return cap || null;
+  const available = ifModels.filter(entry => entry.type === cap.outputType);
+  const model = ifModelLimits[c.params?.if_model] ? c.params.if_model
+    : available[0]?.display_name || c.params?.if_model;
+  const limits = ifModelLimits[model];
+  const bridge = limits?.type === cap.outputType ? limits.bridge : null;
+  const inputs = cap.inputs.filter(s => s.key !== "if_reference" || bridge?.image || bridge?.video)
+    .map(s => s.key === "if_reference" ? {...s,
+      label:`参考${bridge?.image ? "图片" : ""}${bridge?.image && bridge?.video ? "／" : ""}${bridge?.video ? "视频" : ""} HTTPS 地址（可选）`} : s);
+  if (bridge?.image) inputs.push({key:"images[0]", label:"参考图片", type:"image"});
+  if (bridge?.video) inputs.push({key:"video[0]", label:"参考视频", type:"video"});
+  for (const [key, asset] of Object.entries(c.assets || {})) {
+    if (asset && ((key === "images[0]" && asset.kind === "image")
+        || (key === "video[0]" && asset.kind === "video"))
+        && !inputs.some(s => s.key === key))
+      inputs.push({key, label:asset.kind === "image" ? "已保留的参考图片" : "已保留的参考视频", type:asset.kind});
+  }
+  return {...cap, inputs, slotLimits:{image:{max:bridge?.image || 0},
+    video:{max:bridge?.video || 0}, audio:{max:0}}};
+};
 
 /** 路由节点上放进这种素材该切到哪一路（已经在那一路上就返回 null）。
     和 ladder 不一样，这里两条工作流的参数完全不同，画不出一张"并集"面板，
@@ -651,7 +695,7 @@ const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
 
 /** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度、画面比例和当前模式的常规参数。 */
 function openResPop(c, anchor) {
-  const cap = CAPS[runCap(c)] || capOf(c);
+  const cap = isIF(c) ? capOf(c) : CAPS[runCap(c)] || capOf(c);
   const hasResolution = cap && (cap.imageControls || cap.inputs.some(x => RES_PARAM_KEYS.has(x.key)));
   const params = cap?.imageControls
     ? ["steps", "seed"].map(key => cap.inputs.find(s => s.key === key && !s.mirror)).filter(Boolean)
@@ -694,7 +738,8 @@ function openResPop(c, anchor) {
     if (cap.imageControls) {
       const special = cap.inputs.filter(s => !MEDIA.includes(s.type) && s.type !== "textarea"
         && s.type !== "seed" && s.key !== "steps" && !RES_PARAM_KEYS.has(s.key) && !s.mirror && !s.rangeOf
-        && !(cap.imageControls.mode === "t2i" && s.key === "encode_resolution"));
+        && !(cap.imageControls.mode === "t2i" && s.key === "encode_resolution")
+        && !(isIF(c) && s.key === "if_reference"));
       if (special.length) {
         const details = document.createElement("details"); details.className = "image-advanced"; details.open = expanded;
         const summary = document.createElement("summary"); summary.textContent = "模型专属参数";
@@ -1270,7 +1315,7 @@ const bootReady = (async function boot() {
     await H3Auth.requireUser();
     H3Auth.mountAccount(document.getElementById('account'));
     const d = await api("/api/cards", { cache: "no-store" });
-    CARDS = d.cards; CAPS = d.capabilities;
+    CARDS = d.cards; CAPS = d.capabilities; ifModelLimits = d.if_model_limits || {};
     el.dot.classList.toggle("on", !!d.comfy_online);
   } catch (e) { toast("后端未就绪：" + e.message); if (!H3Auth.active) return; }
   await loadProjects();
@@ -1586,6 +1631,9 @@ async function openProject(pid) {
   }
   // 断线重连后可能有节点状态是 running，交给轮询自己收尾
   render();
+  for (const card of PROJ.cards) {
+    if (isIF(card) && card.job && card.status === "running") pollIF(card, PROJ.id);
+  }
   rememberProject(PROJ.id);
   connectPresence(PROJ.id);
   loadProjects();
@@ -2622,13 +2670,15 @@ function paint(c) {
   const s = c.status;
   st.className = "st" + (s === "running" || s === "queued" ? " run" : s === "done" ? " done" : s === "error" ? " err" : "");
   st.textContent = s === "queued" ? (!c.job ? "正在提交…" : c.queue_remaining > 1 ? `排队中 (${c.queue_remaining})` : "排队中")
-    : s === "running" ? `生成中 ${Math.round((c.progress || 0) * 100)}%`
+    : s === "running" ? (isIF(c) && !(c.progress > 0) ? "生成中" : `生成中 ${Math.round((c.progress || 0) * 100)}%`)
                         + (c.step ? ` · ${c.step}` : "")
     : s === "done" ? (fmtEla(c.ms) ? `已完成 · ${fmtEla(c.ms)}` : "已完成")
     : s === "error" ? "失败"
     : s === "canceled" ? "已取消" : c.cap === "image_composite" ? "待合成" : "待生成";
   st.title = st.textContent;           // 挤成省略号时鼠标悬停还能看全
-  bar.style.width = (s === "running" || s === "queued" ? (c.progress || 0.02) * 100 : s === "done" ? 100 : 0) + "%";
+  bar.style.width = (s === "running" || s === "queued"
+    ? isIF(c) && !(c.progress > 0) ? 0 : (c.progress || 0.02) * 100
+    : s === "done" ? 100 : 0) + "%";
   meta.textContent = c.error ? String(c.error).slice(0, 40)
     : outs.length > 1 ? `${outs.length} 张`
     : out ? String(out.filename || out.origin || out.url || "").split(/[\\/]/).pop().slice(-22) : "";
@@ -4646,6 +4696,8 @@ function mediaCount(c, kind) {
 function firstFreeSlot(c, kind) {
   const cap = capOf(c); if (!cap) return null;
   const reserved = new Set((PROJ?.edges || []).filter(e => e.to === c.id && !isTextEdge(e)).flatMap(edgeSlots));
+  if (isIF(c) && (!mediaLimit(cap, kind)
+      || cap.inputs.some(s => MEDIA.includes(s.type) && (c.assets?.[s.key] || reserved.has(s.key))))) return null;
   return cap.inputs.find(s => s.type === kind && !c.assets?.[s.key] && !reserved.has(s.key)) || null;
 }
 
@@ -4715,7 +4767,7 @@ async function linkTo(from, to) {
   // 普通「生视频」节点默认是图生视频。给它接视频时自动切到第一个真正收视频的模式
   //（现在就是 H3 全能参考），不能再把 mp4 假装成参考图塞进 LoadImage。
   const currentCap = capOf(to);
-  if (toDef && toDef.id === "card_video" && out.kind === "video"
+  if (toDef && toDef.id === "card_video" && out.kind === "video" && !isIF(to)
       && !(currentCap && currentCap.inputs.some(s => s.type === "video"))) {
     const videoMode = toDef.modes.find(md => modeTakes(md, "video"));
     if (videoMode) {
@@ -5171,12 +5223,18 @@ const HIST_MAX = 20;               // 每个节点留 20 轮；再往前的去 C
 /** 把节点刚出的这一轮记进历史（最新的在最前面） */
 function pushHistory(c, job) {
   const outs = c.outputs || [];
-  if (!outs.length) return;
+  const ifRun = isIF(c);
+  if (!outs.length && !ifRun) return;
   c.history = c.history || [];
-  if (c.history.some(h => h.job === job.id)) return;
+  const existing = c.history.find(h => h.job === job.id);
+  if (existing) {
+    if (ifRun) Object.assign(existing, {status:c.status, ms:c.ms ?? null, outputs:outs});
+    return;
+  }
   c.history.unshift({
     ts: Date.now(), job: job.id, seed: c.seed != null ? c.seed : null,
     cap: job.capability, ms: c.ms != null ? c.ms : null, outputs: outs,
+    ...(ifRun ? {status:c.status} : {}),
     // 只读任务提交时落盘的快照，不能用运行期间可能改过的卡片参数补历史。
     ...(job.prompts ? { prompts: job.prompts.map(p => ({ ...p })) } : {}),
   });
@@ -5326,7 +5384,8 @@ function histRun(c, h, cur) {
   rh.querySelector(".tag").textContent = cur ? "最新" : histTime(h.ts);
   rh.querySelector(".nm").textContent = cur ? histTime(h.ts) : capName;
   rh.querySelector(".cnt").textContent =
-    [outs.length > 1 ? `${outs.length} 张` : "", fmtEla(h.ms)].filter(Boolean).join(" · ");
+    [h.status === "running" ? "生成中" : h.status === "error" ? "失败" :
+      outs.length > 1 ? `${outs.length} 张` : "", fmtEla(h.ms)].filter(Boolean).join(" · ");
   rh.title = capName;
 
   const rg = document.createElement("div");
@@ -5460,12 +5519,14 @@ function histRun(c, h, cur) {
   for (const p of prompts) {
     const rp = document.createElement("details"); rp.className = "rp";
     const section = document.createElement("div"); section.className = "history-prompt";
-    const sm = document.createElement("summary"); sm.textContent = "当时提交的" + p.label;
+    const sm = document.createElement("summary");
+    sm.textContent = p.key === "if_original" ? "原始提示词" :
+      p.key === "if_submitted" ? "提交给 IF CLI 的提示词" : "当时提交的" + p.label;
     const cpBtn = document.createElement("button");
     cpBtn.textContent = "复制";
     cpBtn.type = "button";
     cpBtn.className = "history-prompt-copy";
-    cpBtn.title = "复制当时提交的" + p.label;
+    cpBtn.title = "复制" + sm.textContent;
     cpBtn.onclick = () => copyHistoryText(p.text, "已复制" + p.label);
     const tx = document.createElement("div"); tx.textContent = p.text || "（本次提交为空）";
     rp.append(sm, tx);
@@ -5630,6 +5691,7 @@ function openPanel(id) {
   const c = PROJ.cards.find(x => x.id === id);
   if (!c) return closePanel();
   const def = defOf(c), cap = capOf(c);
+  if (isIF(c) && !ifModelsAttempted) loadIFModels().catch(() => {});
   // 切 tab / 传图都会整块重画，同一个节点要留住滚动位置，不然每次都弹回顶部
   const old = el.panel.querySelector(".pbody");
   const scrolled = (old && el.panel._id === id) ? old.scrollTop : 0;
@@ -5686,7 +5748,32 @@ function openPanel(id) {
   el.panel.appendChild(body);
   const clipboardHint = document.createElement('div'); clipboardHint.className = 'knobnote clipboard-media-hint';
   clipboardHint.textContent = 'Ctrl / Cmd + V：粘贴截图或图片 / 视频文件，自动创建素材节点并引用到空槽；不覆盖已有引用。复制文件需浏览器提供文件数据，仅路径文字无法导入。';
+  if (isIF(c)) {
+    clipboardHint.textContent = ifModelsError
+      ? `本机 IF 不可用：${ifModelsError}。请先安装并登录 IF CLI、启动本机桥接，点模型按钮可重试。`
+      : "IF 使用本机账号生成；从素材卡连线或在下方添加引用。本机 IF CLI 目前只支持一张图片或一段视频，不支持音频及多引用。";
+  }
   body.appendChild(clipboardHint);
+  if (isIF(c)) {
+    const available = ifModels.filter(entry => entry.type === cap.outputType);
+    const name = ifModelLimits[c.params.if_model] ? c.params.if_model
+      : available[0]?.display_name || c.params.if_model;
+    const limit = ifModelLimits[name];
+    const summary = document.createElement("div"); summary.className = "knobnote";
+    const format = value => value == null ? "未核实" : String(value);
+    summary.textContent = limit
+      ? `官方 API 同名模型/家族参考上限：图片 ${format(limit.api.image)} · 视频 ${format(limit.api.video)} · 音频 ${format(limit.api.audio)}。${limit.note} IF 未公布内部模型版本和多素材转发规则；画布实际可提交图片 ${limit.bridge.image}／视频 ${limit.bridge.video}，且合计最多 1 项；音频暂不可提交。画面比例、清晰度、时长等参数会作为生成内容发送，不是 IF API 参数，模型不保证严格遵守。`
+      : "该 IF 模型尚无可核对的官方 API 上限，暂不开放新的画布引用。";
+    if (Object.values(c.assets || {}).some(asset => asset && MEDIA.includes(asset.kind)
+        && !limit?.bridge?.[asset.kind]))
+      summary.textContent += " 已连接的引用保持原样，但不适用于当前模型；可切回原模型或手动移除，运行时不会忽略它。";
+    body.appendChild(summary);
+    if (limit?.source) {
+      const source = document.createElement("a"); source.href = limit.source;
+      source.target = "_blank"; source.rel = "noopener noreferrer";
+      source.textContent = "查看官方 API 文档"; body.appendChild(source);
+    }
+  }
   if (localComposite) {
     clipboardHint.textContent = "浏览器本地合成，不占 GPU。已连接的图片打开编辑器时自动加入图层，也可上传图片或从画布素材中选择添加。拖动位置、缩放图片，在图层列表调整遮挡顺序。";
     const summary = document.createElement("div"); summary.className = "knobnote";
@@ -5715,6 +5802,10 @@ function openPanel(id) {
       const label = document.createElement("summary"); label.textContent = "连接图片素材（打开编辑器时自动加入图层）";
       inputs.append(label, referenceSlots(c, media, md)); body.appendChild(inputs);
     } else body.appendChild(referenceSlots(c, media, md));
+  }
+  if (c.cap === "if_image") {
+    const reference = specs.find(s => s.key === "if_reference");
+    if (reference) body.appendChild(rowEl(c, reference));
   }
 
   // --- 音频选区 ---
@@ -5771,13 +5862,22 @@ function openPanel(id) {
     const modeTitle = def.id === "card_video" ? "生视频模式"
       : def.id === "card_tools" ? "工具箱模式" : "生图模式";
     const currentMode = modeOf(c) || def.modes[0];
-    const modeButton = capBtn(`${def.icon} ${currentMode.name}`, modeTitle,
-      () => def.modes.map(mo => ({
+    const modeButton = capBtn(`${def.icon} ${currentMode.name}`, modeTitle, () => {
+      const modeItem = mo => ({
         icon: def.icon,
         text: mo.name + (modeHas(mo, c.cap) ? "（当前）" : ""),
         tip: () => modeBriefEl(c, mo, mo.name),
-        run: () => { tipHide(); closeResPop(); switchImageCapability(c, modeCap(mo, modelOf(c))); openPanel(id); paintTitle(c); save(); },
-      })));
+        run: () => {
+          if (isIF(c) && ["queued", "running"].includes(c.status)) return toast("请等待本机 IF 任务结束后再切换模式");
+          tipHide(); closeResPop(); switchImageCapability(c, modeCap(mo, modelOf(c)));
+          openPanel(id); paintTitle(c); save();
+        },
+      });
+      return def.id === "card_video" || def.id === "card_image"
+        ? [{group: "本地 API"}, ...def.modes.filter(mo => mo.id !== "if_video" && mo.id !== "if_image").map(modeItem),
+          {group: "云端 API"}, ...def.modes.filter(mo => mo.id === "if_video" || mo.id === "if_image").map(modeItem)]
+        : def.modes.map(modeItem);
+    });
     hoverTip(modeButton, () => modeBriefEl(c, currentMode, currentMode.name));
     foot.appendChild(modeButton);
 
@@ -5799,6 +5899,19 @@ function openPanel(id) {
         }))
       );
       foot.appendChild(modelBtn);
+    } else if (isIF(c)) {
+      const available = ifModels.filter(entry => entry.type === cap.outputType);
+      const chosen = available.find(entry => entry.display_name === c.params.if_model)?.display_name || available[0]?.display_name;
+      const modelBtn = capBtn(chosen || "选择 IF 模型", "IF 模型", () => available.length
+        ? available.map(entry => ({
+          text: entry.display_name + (entry.display_name === chosen ? "（当前）" : ""),
+          run: () => {
+            c.params.if_model = entry.display_name; openPanel(id); save();
+          },
+        }))
+        : [{text: ifModelsError ? "重试连接本机 IF" : "正在读取本机 IF 模型…",
+            run: () => loadIFModels().catch(error => toast(error.message))}]);
+      foot.appendChild(modelBtn);
     }
 
     if (!localComposite) {
@@ -5806,7 +5919,7 @@ function openPanel(id) {
       pb.className = "tcap";
       const cb = paramsBrief(c, cap);
       pb.textContent = cb ? `⚙ ${cb}` : "⚙ 参数";
-      pb.title = "点开弹窗：清晰度、画面比例、时长等参数";
+      pb.title = isIF(c) ? "点开弹窗：比例、清晰度、时长等以内容发送" : "点开弹窗：清晰度、画面比例、时长等参数";
       pb.onclick = (ev) => { ev.stopPropagation(); openResPop(c, pb); };
       foot.appendChild(pb);
     }
@@ -5818,7 +5931,7 @@ function openPanel(id) {
   // 上一轮跑了多久：视频一轮动辄几分钟，这个数得在面板里也报一声（节点脚上一直有）
   if (c.status === "done" && c.ms > 0) info.textContent += ` · 上次 ${fmtEla(c.ms)}`;
   foot.appendChild(info);
-  if (running && c.job) {
+  if (running && c.job && !isIF(c)) {
     const cn = document.createElement("button");
     cn.className = "cancel"; cn.textContent = "取消";
     cn.onclick = () => cancel(c);
@@ -7388,7 +7501,8 @@ function referenceSlots(c, specs, md) {
       const max = mediaLimit(cap, kind);
       if (max) limits.push(`${KIND_ZH[kind] || kind} ${max}`);
     }
-    head.textContent = `引用上限：${limits.join(" · ")}`;
+    head.textContent = limits.length ? `引用上限：${limits.join(" · ")}`
+      + (isIF(c) ? "（图片或视频合计 1 项）" : "") : "当前模型不支持画布素材引用";
   }
   wrap.appendChild(head);
   const imageSpecs = filled.filter(s => s.type === "image");
@@ -7412,7 +7526,7 @@ function referenceSlots(c, specs, md) {
       const max = mediaLimit(cap, kind);
       const count = filled.filter(s => s.type === kind).length;
       const next = specs.find(s => s.type === kind && !(c.assets || {})[s.key]);
-      if (!max || count >= max || !next) continue;
+      if (!max || count >= max || !next || (isIF(c) && filled.length)) continue;
       const b = document.createElement("button"); b.className = "refadd";
       b.textContent = `＋ 添加${KIND_ZH[kind] || kind}（${count}/${max}）`;
       b.title = `${KIND_ZH[kind] || kind}引用上限 ${max}`;
@@ -7957,6 +8071,161 @@ function run(c) {
   c._runPromise = trackNodeWork(runCard(c).finally(() => { delete c._runPromise; }));
   return c._runPromise;
 }
+async function runIF(c) {
+  const project = PROJ, capability = c.cap;
+  try {
+    const models = await loadIFModels();
+    if (PROJ !== project || !canOperate() || !project.cards.includes(c) || c.cap !== capability) return;
+    const type = capOf(c).outputType;
+    const model = models.filter(entry => entry.type === type)
+      .find(entry => entry.display_name === c.params.if_model)
+      || (!c.params.if_model && models.find(entry => entry.type === type));
+    if (!model) throw new Error("当前 IF 模型不可用，请重新选择模型");
+    const originalPrompt = String(c.params.prompt || "");
+    const prompt = originalPrompt.trim();
+    if (!prompt) throw new Error("请先填写 IF 生成需求");
+    const limit = ifModelLimits[model.display_name];
+    if (!limit || limit.type !== type) throw new Error("该 IF 模型尚无可核对的输入规格");
+    const references = Object.values(c.assets || {}).filter(asset => asset && MEDIA.includes(asset.kind));
+    if (references.length > 1) throw new Error("本机 IF CLI 只能接收一项图片或视频引用，请先移除多余素材");
+    const reference = references[0];
+    if (reference && !limit.bridge[reference.kind])
+      throw new Error(`所选模型不能通过本机 IF CLI 接收${KIND_ZH[reference.kind] || reference.kind}引用`);
+    if (reference && c.params.if_reference?.trim())
+      throw new Error("已连接画布素材，请清空参数中的 HTTPS 引用地址，不能同时提交两项引用");
+    const data = {type, model: model.display_name, prompt: withStyle(resolveCardMentions(prompt, c), styleTexts(c))};
+    const supplement = directorSupplement(c);
+    if (supplement.length) data.prompt += "\n" + supplement.join("\n");
+    const cap = capOf(c), specs = cap.inputs;
+    const requirements = [];
+    if (type === "image") {
+      const {ratio, clarity} = imageSettings(c, cap);
+      const [widthRatio, heightRatio] = ratio.split(":").map(Number);
+      const short = CLARITY_STEPS.find(s => s.id === clarity).val;
+      const width = widthRatio >= heightRatio ? Math.round(short * widthRatio / heightRatio / 16) * 16 : short;
+      const height = widthRatio >= heightRatio ? short : Math.round(short * heightRatio / widthRatio / 16) * 16;
+      requirements.push(`分辨率 ${width}×${height}`);
+    } else {
+      const ar = specs.find(s => s.key === "aspect_ratio");
+      const mp = specs.find(s => s.key === "megapixels");
+      const ratioValue = c.params.aspect_ratio ?? ar.default;
+      const pixels = Number(c.params.megapixels ?? mp.default);
+      const resolution = resFromMP(ratioValue,
+        Number.isFinite(pixels) && pixels >= mp.min && pixels <= mp.max ? pixels : mp.default);
+      const spec = specs.find(s => s.key === "duration");
+      const seconds = Number(c.params.duration ?? spec.default);
+      requirements.push(`分辨率 ${resolution[0]}×${resolution[1]}`,
+        `视频时长约 ${Number.isFinite(seconds) && seconds >= spec.min && seconds <= spec.max ? seconds : spec.default} 秒`);
+      const seed = Number(c.params.seed ?? -1);
+      if (Number.isSafeInteger(seed) && seed >= 0) requirements.push(`随机种子参考 ${seed}`);
+    }
+    data.prompt += `\n\n生成规格（作为内容要求）：${requirements.join("，")}。`;
+    if (type === "video") data.prompt = `最终交付必须是由「${model.display_name}」生成的视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n${data.prompt}`;
+    if (c.params.if_reference?.trim()) {
+      if (!limit.bridge.image && !limit.bridge.video) throw new Error("该模型不支持已确认的媒体引用");
+      data.image = c.params.if_reference.trim();
+    }
+    if (type === "video" && c.params.if_skill?.trim()) data.skill = c.params.if_skill.trim();
+    if (reference) {
+      const url = new URL(reference.url, location.href);
+      if (url.origin !== location.origin) throw new Error("IF 仅能上传当前画布内的本机素材");
+      const response = await fetch(url, {credentials:"same-origin"});
+      if (!response.ok) throw new Error("无法读取画布引用素材");
+      const blob = await response.blob();
+      const allowed = reference.kind === "image" ? ["image/png", "image/jpeg", "image/webp"] : ["video/mp4"];
+      if (!allowed.includes(blob.type) || blob.size > (reference.kind === "image" ? 20 : 50) * 1024 * 1024)
+        throw new Error("IF 画布引用只支持不超过 20 MB 的 PNG/JPEG/WebP 或不超过 50 MB 的 MP4");
+      const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
+      data.asset_id = uploaded.asset_id;
+      if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability) return;
+    }
+    c.params.if_model = model.display_name;
+    c.status = "queued"; c.error = null; c.progress = null; c.outputs = []; c.ms = null;
+    c.step = "正在提交至本机 IF"; c.job = null; c.if_started = Date.now();
+    paint(c); if (el.panel._id === c.id) openPanel(c.id);
+    const job = await ifRequest("/runs", {method: "POST",
+      headers: {"Content-Type": "application/json", "X-Chouka-IF": "generate"}, body: JSON.stringify(data)});
+    c.job = job.id; c.if_job_cap = capability; c.status = "running"; c.step = "IF 正在生成";
+    pushHistory(c, {id:job.id, capability, prompts:[
+      {key:"if_original", label:"原始提示词", text:originalPrompt},
+      {key:"if_submitted", label:"提交给 IF CLI 的提示词", text:data.prompt},
+    ]});
+    if (el.hist._id === c.id) openHistory(c.id);
+    save(false);
+    pollIF(c, project.id);
+  } catch (error) {
+    if (PROJ !== project || !project.cards.includes(c)) return;
+    c.status = "error"; c.error = error.message; c.step = ""; c.job = null;
+    toast(error.message); save(false);
+  }
+  if (PROJ === project && project.cards.includes(c)) {
+    paint(c); if (el.panel._id === c.id) openPanel(c.id);
+  }
+}
+
+async function pollIF(c, projectId) {
+  if (c._ifPolling || PROJ?.id !== projectId || !canOperate() || !isIF(c)
+      || !PROJ.cards.includes(c) || !c.job || c.status !== "running") return;
+  c._ifPolling = true;
+  let retry = false;
+  try {
+    const job = await ifRequest(`/runs/${encodeURIComponent(c.job)}`);
+    if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
+    if (job.state === "starting" || job.state === "running") {
+      c.step = job.state === "starting" ? "IF 正在创建画布" : "IF 正在生成";
+      retry = true;
+      return;
+    }
+    if (job.state === "error") throw new Error(job.error || "IF 生成失败");
+    const downloaded = job.result?.downloaded || [];
+    const expected = capOf(c).outputType;
+    const waiting = /请确认|确认后|回复["“]?确认/.test(job.result?.planning_text || "");
+    if (!downloaded.length) throw new Error(waiting
+      ? `IF 要求确认规划或故事板，未直接生成${KIND_ZH[expected]}；请在 IF 网站查看该会话。`
+      : `IF 未返回${KIND_ZH[expected]}产物，请在 IF 网站查看该会话。`);
+    const outputs = [];
+    for (const item of downloaded) {
+      if (item.type !== capOf(c).outputType) continue;
+      const response = await fetch(`${IF_BRIDGE}/runs/${encodeURIComponent(c.job)}/media/${item.index}`, {credentials: "omit"});
+      if (!response.ok) {
+        if (response.status >= 500 || response.status === 429) throw new TypeError("IF 产物暂不可读取");
+        throw new Error("无法读取 IF 产物");
+      }
+      const file = new File([await response.blob()], item.name);
+      if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
+      const asset = await uploadAsset(file, item.type === "image");
+      outputs.push({...asset, filename: item.name});
+    }
+    if (!outputs.length) throw new Error(expected === "video" && downloaded.some(item => item.type === "image")
+      ? `IF 只生成了故事板图片，尚未生成视频${waiting ? "，并要求确认下一步" : ""}；请在 IF 网站查看该会话。`
+      : `IF 返回的媒体类型与当前${KIND_ZH[expected]}节点不符，请在 IF 网站查看该会话。`);
+    c.outputs = outputs; c.status = "done"; c.step = ""; c.error = null;
+    c.ms = Date.now() - (c.if_started || Date.now());
+    pushHistory(c, {id: c.job, capability: c.if_job_cap || c.cap});
+    if (el.hist._id === c.id) openHistory(c.id);
+    await propagateCardOutputs(c);
+    if (PROJ?.id === projectId && PROJ.cards.includes(c)) save(false);
+  } catch (error) {
+    if (PROJ?.id !== projectId || !PROJ.cards.includes(c)) return;
+    if (error instanceof TypeError || /桥接请求失败|Failed to fetch/.test(error.message)) {
+      c.step = "IF 连接或产物读取中断，正在重试";
+      retry = true;
+    } else {
+      c.status = "error"; c.error = error.message; c.step = "";
+      c.ms = Date.now() - (c.if_started || Date.now());
+      if (c.job) pushHistory(c, {id:c.job, capability:c.if_job_cap || c.cap});
+      if (el.hist._id === c.id) openHistory(c.id);
+      toast(error.message); save(false);
+    }
+  } finally {
+    c._ifPolling = false;
+    if (PROJ?.id === projectId && PROJ.cards.includes(c)) {
+      paint(c); if (el.panel._id === c.id) openPanel(c.id);
+      if (retry) setTimeout(() => pollIF(c, projectId), 2500);
+    }
+  }
+}
+
 async function runCard(c) {
   if (!requireOperate()) return;
   if (isStyle(c)) return toast("风格节点不用运行：它只把风格并进挂着的那几个节点的提示词");
@@ -7965,6 +8234,7 @@ async function runCard(c) {
   const cap = capOf(c);
   if (!cap) return toast("能力不可用");
   if (cap.id === "image_composite" && cap.execution === "browser") return openImageComposer(c);
+  if (cap.execution === "if_studio") return runIF(c);
   if (c.director_shot) {
     clearTimeout(saveTimer); saveTimer = null;
     await saveChain;
@@ -7998,6 +8268,28 @@ async function cancel(c) {
   try { await jpost(`/api/job/${c.job}/cancel`); } catch (e) { toast(e.message); }
 }
 
+async function propagateCardOutputs(c) {
+  const project = PROJ;
+  drawWires();
+  for (const e of project.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version)) {
+    const to = project.cards.find(x => x.id === e.to);
+    if (!to) continue;
+    const outputs = c.outputs || [], slots = edgeSlots(e);
+    e.slots = slots;
+    for (let i = 0; i < slots.length; i++) {
+      if (!outputs[i]) { delete to.assets[slots[i]]; continue; }
+      try {
+        const imported = await importOutput(outputs[i], capOf(to)?.execution === "browser");
+        if (PROJ === project && project.edges.includes(e) && cardOf(to.id)) to.assets[slots[i]] = imported;
+      } catch (error) { console.error("导入产物失败:", error); }
+    }
+    if (PROJ !== project) return;
+    refreshVideoParameters(to);
+    paintKind(to);
+    if (el.panel._id === to.id) openPanel(to.id);
+  }
+}
+
 /** 一次把所有任务捞回来：右上角的计数要算上别的项目/别处提交的活儿，
     所以不能只按当前项目的节点一张张问。 */
 async function pollJobs() {
@@ -8009,7 +8301,7 @@ async function pollJobs() {
   if (el.jobs.style.display !== "none") renderJobs();
   if (!PROJ || !canOperate()) return;
   const projectId = PROJ.id;
-  const live = PROJ.cards.filter(c => c.job && ["queued", "running"].includes(c.status));
+  const live = PROJ.cards.filter(c => c.job && !isIF(c) && ["queued", "running"].includes(c.status));
   if (!live.length) return;
   let dirty = false;
   for (const c of live) {
@@ -8037,36 +8329,7 @@ async function pollJobs() {
       if (c.status === "done") {
         pushHistory(c, j);
         if (el.hist._id === c.id) openHistory(c.id);
-        drawWires();
-        // 下游已连线的节点自动吃掉新产物（风格线传的是文字，没有产物可搬，跳过）
-        // 固定分镜线的素材已经落在目标槽中；上游重跑不能替换已采用版本。
-        for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version)) {
-          const to = PROJ.cards.find(x => x.id === e.to);
-          if (!to) continue;
-
-          // 只更新这根线实际绑定的格。这样用户手动换掉其中一格后，上游重跑不会再抢回来；
-          // 上游这轮少产物时，多出来的旧引用也同步清掉。
-          const outputs = c.outputs || [];
-          const slots = edgeSlots(e);
-          e.slots = slots;              // 老项目第一次跑到这里时顺便升级绑定记录
-          for (let i = 0; i < slots.length; i++) {
-            if (!outputs[i]) {
-              delete to.assets[slots[i]];
-              continue;
-            }
-            try {
-              const imported = await importOutput(outputs[i], capOf(to)?.execution === "browser");
-              // 导入期间删线/删节点后，这份迟到的结果不能把引用复活。
-              if (PROJ && PROJ.edges.includes(e) && cardOf(to.id)) to.assets[slots[i]] = imported;
-            } catch (err) {
-              console.error('导入产物失败:', err);
-            }
-          }
-
-          refreshVideoParameters(to);
-          paintKind(to);
-          if (el.panel._id === to.id) openPanel(to.id);
-        }
+        await propagateCardOutputs(c);
       }
       if (c.status === "error") toast(c.error || "生成失败");
     }

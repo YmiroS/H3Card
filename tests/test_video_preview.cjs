@@ -110,5 +110,5 @@ test('all video entry points use the shared preview loader', () => {
   }
   assert.ok(source.includes("fetch(new URL(out.url, location.href), {credentials:'same-origin'})"),
     'importOutput must fetch the original with its session');
-  assert.ok(source.includes('return uploadAsset(file)'), 'importOutput must use the authorized upload path');
+  assert.ok(source.includes('return uploadAsset(file, localOnly)'), 'importOutput must use the authorized upload path');
 });

@@ -55,10 +55,28 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         response = await self.client.get('/', allow_redirects=False)
         self.assertEqual(response.status, 302)
         self.assertTrue(response.headers['Location'].startswith('/login'))
+        response = await self.client.get('/if-studio', allow_redirects=False)
+        self.assertEqual(response.status, 302)
+        self.assertTrue(response.headers['Location'].startswith('/login'))
 
         # 登录后主页面可用；管理页只认管理员。
         self.headers = await self.login()
         self.assertEqual((await self.client.get('/')).status, 200)
+        response = await self.client.get('/if-studio')
+        self.assertEqual(response.status, 200)
+        self.assertIn(b'https://ifs.alibaba-inc.com/', await response.read())
+        self.assertEqual((await self.client.get('/if-studio.js')).status, 200)
+        card_data = await (await self.client.get('/api/cards')).json()
+        for card_id, capability in (('card_image', 'if_image'), ('card_video', 'if_video')):
+            card = next(card for card in card_data['cards'] if card['id'] == card_id)
+            self.assertIn(capability, [mode['id'] for mode in card['modes']])
+            self.assertEqual(card_data['capabilities'][capability]['execution'], 'if_studio')
+        self.assertEqual(len(card_data['if_model_limits']), 18)
+        self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['api'],
+                         {'image': 10, 'video': 5, 'audio': 5})
+        self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['bridge'],
+                         {'image': 1, 'video': 1, 'audio': 0})
+        self.assertEqual((await self.client.get('/if-studio.html')).status, 404)
         self.assertEqual((await self.client.get('/admin/permissions')).status, 200)
         self.assertEqual((await self.client.get('/teams')).status, 200)
         # 根目录静态兜底已移除：直呼 .html 不再绕过页面权限。
