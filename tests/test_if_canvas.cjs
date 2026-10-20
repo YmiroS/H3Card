@@ -34,6 +34,20 @@ test('IF duration limits match the supplied model table, with unknown ranges pre
     assert.deepEqual([ifModelLimits[name].duration.min, ifModelLimits[name].duration.max], range, name);
   }
 });
+test('IF canvas links preserve full IDs and reject unsafe destinations', () => {
+  const source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const helper = source.slice(source.indexOf('function ifCanvasURL('), source.indexOf('function ifCanvasLink('));
+  const normalize = require('node:vm').runInNewContext(helper + '; ifCanvasURL', {URL});
+  const id = 'c_OcBXJf2Bd0CxY-', url = 'https://ifs.alibaba-inc.com/#/canvas/' + id;
+  assert.equal(normalize({canvas_id:id}), url);
+  assert.equal(normalize({canvas_url:url}), url);
+  for (const bad of ['javascript:alert(1)', 'https://ifs.alibaba-inc.com.evil.test/#/canvas/' + id,
+    'https://evil.test/#/canvas/' + id, 'https://user@ifs.alibaba-inc.com/#/canvas/' + id,
+    'http://ifs.alibaba-inc.com/#/canvas/' + id, 'https://ifs.alibaba-inc.com/other#/canvas/' + id])
+    assert.equal(normalize({canvas_url:bad}), '');
+  for (const bad of ['', '../bad', 'c_bad/other', 'c_bad?token=x', 'c_bad#fragment', null])
+    assert.equal(normalize({canvas_id:bad}), '');
+});
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 
 const card = (kind, model) => ({id:'if-card', type:kind === 'image' ? 'card_image' : 'card_video',
@@ -183,7 +197,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           body:kind === 'image' ? png : Buffer.from('fake-video')});
       }
       if (emitReferenceURLs && reuseFailure && /^\/runs\/bridge-\d+$/.test(url.pathname)) {
-        const result = {reference_urls:resultReferences(runs.at(-1)).slice(0, reuseFailure === 'partial' ? 1 : undefined)};
+        const result = {canvas_id:'c_OcBXJf2Bd0CxY-', reference_urls:resultReferences(runs.at(-1)).slice(0, reuseFailure === 'partial' ? 1 : undefined)};
         if (reuseFailure === 'expired') result.invalid_reference_indices = [1];
         return route.fulfill({status:200, headers, contentType:'application/json',
           body:JSON.stringify({state:'error', error:'模拟 IF 引用或生成失败', result})});
@@ -204,7 +218,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
             .map(display_name => ({display_name, type:'video'}))]}
         : url.pathname === '/runs' && request.method() === 'POST'
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
-          : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done',
+          : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done', canvas_id:'c_OcBXJf2Bd0CxY-',
             ...(emitReferenceURLs ? {reference_urls:resultReferences(runs.at(-1))} : {}),
             ...(runs.at(-1).references?.length > 1 ? {submitted_prompt:
               '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n使用模型：' + runs.at(-1).model + '\n\n生成需求：\n' + runs.at(-1).prompt} : {}),
@@ -386,6 +400,21 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /只生成了故事板图片，尚未生成视频，并要求确认下一步/);
     assert.match(await page.locator('#h3-errors').innerText(), /只生成了故事板图片，尚未生成视频/);
     assert.doesNotMatch(await page.locator('#toast').textContent(), /只生成了故事板图片/);
+    const canvasURL = 'https://ifs.alibaba-inc.com/#/canvas/c_OcBXJf2Bd0CxY-';
+    const canvasLink = page.locator('#world .if-canvas-link');
+    assert.equal(await canvasLink.getAttribute('href'), canvasURL);
+    assert.equal(await page.locator('#panel .if-canvas-link').getAttribute('href'), canvasURL);
+    assert.equal(await canvasLink.getAttribute('target'), '_blank');
+    assert.equal(await canvasLink.getAttribute('rel'), 'noopener noreferrer');
+    if (process.env.CHOUKA_TEST_SCREENSHOT) await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT});
+    // Exercise the actual new-tab link without sending fixture data to IF.
+    await page.context().route('https://ifs.alibaba-inc.com/**', route => route.fulfill({contentType:'text/html', body:'<title>IF canvas fixture</title>'}));
+    const popupPromise = page.waitForEvent('popup');
+    await canvasLink.click();
+    const popup = await popupPromise; await popup.waitForLoadState();
+    assert.equal(popup.url(), canvasURL);
+    assert.equal(await popup.evaluate(() => window.opener), null);
+    await popup.close();
     assert.equal(await page.evaluate(() => PROJ.cards[0].outputs.length), 0);
     assert.equal(runs.length, 3);
     assert.deepEqual(await page.evaluate(() => ({status:PROJ.cards[0].history[0].status,
@@ -403,6 +432,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     await page.evaluate(() => enqueueSave(PROJ.id));
     await page.reload();
     await page.waitForFunction(() => PROJ?.cards[0]?.history?.length === 3);
+    assert.equal(await page.locator('#world .if-canvas-link').getAttribute('href'), canvasURL);
     assert.equal(await page.evaluate(() => PROJ.cards[0].history[0].prompts[1].text), runs.at(-1).prompt);
     assert.deepEqual(await page.evaluate(() => ({
       textOnly: capOf({cap:'if_image', params:{if_model:'z-image-turbo'}}).inputs.filter(s => MEDIA.includes(s.type)).length,
@@ -446,6 +476,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     await page.locator('#panel .go').click();
     await page.waitForFunction(() => PROJ.cards[0].status === 'error');
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /模拟素材容量不足/);
+    assert.equal(await page.locator('.if-canvas-link').count(), 0, 'a new failed upload must not link to a previous canvas');
     assert.deepEqual(deletedAssets, ['/assets/' + 'b'.repeat(31) + uploadedReferences.length]);
     assert.equal(runs.length, 5, 'failed multi-reference upload must not submit a job');
     await page.evaluate(() => saveChain);
@@ -694,6 +725,15 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.deepEqual(counts(), beforeReuse, 'tab refresh retains successful reference URLs');
     reuseFailure = 'generation';
     await generate('error');
+    assert.equal(await page.locator('#world .if-canvas-link').getAttribute('href'), canvasURL);
+    assert.equal(await page.evaluate(() => {
+      const c = {...plain(PROJ.cards[0]), id:'canvas-link-recovery'};
+      rememberIFTask(c, PROJ.id, 'error');
+      const restored = {...c, if_canvas_url:undefined, status:'running'};
+      restoreIFTask(restored, PROJ.id);
+      sessionStorage.removeItem(ifTaskKey(c, PROJ.id));
+      return restored.if_canvas_url;
+    }), canvasURL);
     reuseFailure = null;
     await generate();
     assert.deepEqual(counts(), beforeReuse, 'generation failure must not discard successfully uploaded references');
