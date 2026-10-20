@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
-from if_studio_bridge import Bridge, LIMITS_FILE
+from if_studio_bridge import Bridge, LIMITS_FILE, SessionBusyError
 
 ORIGIN = 'http://127.0.0.1:8201'
 SECOND_ORIGIN = 'http://127.0.0.1:8199'
@@ -19,6 +19,10 @@ LOCALHOST_ORIGIN = 'http://localhost:8199'
 SECURE_ORIGIN = 'https://dinghaichouka.youku.com:8443'
 MODELS = [{'display_name': 'qwen-image-2.0', 'type': 'image'},
           {'display_name': 'Minimax H3', 'type': 'video'}]
+BUSY_ERROR = ('Error: 发送消息失败: /api/session/send 失败: '
+              'map[code:session_busy data:map[session_id:s1] '
+              'message:当前会话正在生成中，请等待本轮对话完成后再发送。 '
+              'status:session_busy success:false]')
 
 
 class BridgeTest(unittest.TestCase):
@@ -532,6 +536,107 @@ class BridgeTest(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'IFS refused the reference') as failure:
                 self.bridge.command('canvas', 'run')
         self.assertNotIn('secret-token', str(failure.exception))
+
+    def test_busy_references_and_final_send_retry_without_reupload_or_duplicate_acceptance(self):
+        for kind, model in (('image', 'qwen-image-2.0'), ('video', 'Minimax H3')):
+            with self.subTest(kind=kind):
+                job_id = 'busy-' + kind
+                paths = [Path(self.bridge.workspace.name) / f'{kind}-{n}.png' for n in range(2)]
+                for path in paths:
+                    path.write_bytes(b'fake-image')
+                accepted, attempts, uploads, polls = [], [], [], []
+                busy = False
+
+                def process(argv, **_):
+                    nonlocal busy
+                    args = tuple(argv[1:])
+                    result = {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+                    if args[0] == 'upload':
+                        uploads.append(args[1])
+                        result = {'url': f'https://example.com/{Path(args[1]).name}'}
+                    elif args[:2] == ('canvas', 'run'):
+                        attempts.append(args)
+                        if accepted:
+                            self.assertEqual(args[args.index('--canvas-id') + 1], 'c1')
+                            self.assertEqual(args[args.index('--session-id') + 1], 's1')
+                        if busy:
+                            return mock.Mock(returncode=1, stdout='', stderr=BUSY_ERROR)
+                        accepted.append(args)
+                        busy = True
+                    else:
+                        polls.append(args)
+                        self.assertEqual(len(accepted), 3, 'poll only after final demand is accepted')
+                        result = {'status': 'done', 'downloaded': []}
+                    return mock.Mock(returncode=0, stderr='', stdout=json.dumps(result))
+
+                def release_previous_round(seconds):
+                    nonlocal busy
+                    self.assertEqual(seconds, 15)
+                    _, _, state = self.request('GET', '/runs/' + job_id)
+                    self.assertEqual(state['state'], 'starting')
+                    self.assertIn('正在等待上一轮结束', state['step'])
+                    self.assertNotIn('progress', state)
+                    self.assertTrue(busy)
+                    busy = False
+
+                with mock.patch('if_studio_bridge.subprocess.run', side_effect=process), \
+                        mock.patch('if_studio_bridge.time.sleep', side_effect=release_previous_round) as pause:
+                    self.bridge.generate(job_id, {'type': kind, 'model': model, 'prompt': '最终需求'}, paths)
+                self.assertEqual(self.bridge.jobs[job_id]['state'], 'done')
+                self.assertEqual(uploads, list(map(str, paths)))
+                self.assertEqual(len(accepted), 3)
+                self.assertEqual(len(attempts), 5)
+                self.assertEqual(attempts[1], attempts[2], 'retry keeps second reference URL and prompt')
+                self.assertEqual(attempts[3], attempts[4], 'retry keeps final model and demand')
+                self.assertIn('图片1、图片2', accepted[-1][-1])
+                self.assertNotIn('--image', accepted[-1])
+                self.assertEqual(len(polls), 1)
+                self.assertEqual(pause.call_count, 2)
+                self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_busy_retry_is_bounded_and_never_polls_unaccepted_demand(self):
+        accepted = mock.Mock(returncode=0, stderr='', stdout=json.dumps(
+            {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}))
+        busy = mock.Mock(returncode=1, stdout='', stderr=BUSY_ERROR + ' token=hidden-secret')
+        with mock.patch('if_studio_bridge.subprocess.run', side_effect=[accepted] + [busy] * 21) as cli, \
+                mock.patch('if_studio_bridge.time.sleep') as pause:
+            self.bridge.generate('busy-limit', {'type': 'image', 'model': 'qwen-image-2.0',
+                'prompt': '最终需求', 'image': 'https://example.com/ref.png'})
+        self.assertEqual(pause.call_count, 20)
+        self.assertTrue(all(call.args == (15,) for call in pause.call_args_list))
+        self.assertEqual(cli.call_count, 22)
+        self.assertTrue(all(call.args[0][1:3] == ['canvas', 'run'] for call in cli.call_args_list))
+        job = self.bridge.jobs['busy-limit']
+        self.assertEqual(job['state'], 'error')
+        self.assertIn('已停止自动重试', job['error'])
+        self.assertIn('session_busy', job['error'])
+        self.assertNotIn('hidden-secret', job['error'])
+
+    def test_ambiguous_send_errors_are_not_retried(self):
+        for failure in (subprocess.TimeoutExpired('ifs', 60), OSError('network failed'),
+                        mock.Mock(returncode=1, stdout='', stderr='connection reset after sending'),
+                        mock.Mock(returncode=1, stdout='', stderr='prompt mentions session_busy'),
+                        mock.Mock(returncode=0, stderr='', stdout='invalid JSON')):
+            with self.subTest(failure=failure):
+                with mock.patch('if_studio_bridge.subprocess.run', side_effect=[failure]) as cli, \
+                        mock.patch('if_studio_bridge.time.sleep') as pause:
+                    self.bridge.generate('ambiguous', {'type': 'image', 'model': 'qwen-image-2.0',
+                        'prompt': '最终需求', 'canvas_id': 'c1', 'session_id': 's1'})
+                self.assertEqual(self.bridge.jobs['ambiguous']['state'], 'error')
+                self.assertEqual(cli.call_count, 1)
+                pause.assert_not_called()
+
+    def test_busy_error_only_retries_known_session_send(self):
+        with mock.patch('if_studio_bridge.subprocess.run', return_value=mock.Mock(
+                returncode=1, stdout='', stderr=BUSY_ERROR)) as cli, \
+                mock.patch('if_studio_bridge.time.sleep') as pause:
+            self.bridge.generate('unknown-session', {'model': 'qwen-image-2.0', 'prompt': '需求'})
+            self.assertEqual(self.bridge.jobs['unknown-session']['state'], 'error')
+            self.assertEqual(cli.call_count, 1)
+            pause.assert_not_called()
+            with self.assertRaises(RuntimeError) as failure:
+                self.bridge.command('canvas', 'poll', '--session-id', 's1')
+            self.assertNotIsInstance(failure.exception, SessionBusyError)
 
     def test_second_reference_cli_error_stops_chain_and_cleans_assets(self):
         image = b'\x89PNG\r\n\x1a\n' + b'0' * 32

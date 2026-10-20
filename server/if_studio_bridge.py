@@ -42,6 +42,10 @@ def redact_cli_error(detail):
                   r'\1[已隐藏]', detail)
 
 
+class SessionBusyError(RuntimeError):
+    pass
+
+
 class Bridge(ThreadingHTTPServer):
     allow_reuse_address = False
 
@@ -74,8 +78,13 @@ class Bridge(ThreadingHTTPServer):
             raise RuntimeError('IF CLI 不可用或请求超时，请检查本机终端') from exc
         if proc.returncode:
             detail = redact_cli_error((proc.stderr or proc.stdout).strip())
-            raise RuntimeError('IF CLI 请求失败：' + detail[-1500:] if detail else
-                               'IF CLI 请求失败，请检查本机登录状态和网络')
+            error = RuntimeError
+            # Only an explicit rejected send is safe to retry; a timeout may have been accepted.
+            if args[:2] == ('canvas', 'run') and re.search(
+                    r'/api/session/send 失败: map\[code:session_busy\b[^\r\n]*\bstatus:session_busy success:false\]', detail):
+                error = SessionBusyError
+            raise error('IF CLI 请求失败：' + detail[-1500:] if detail else
+                        'IF CLI 请求失败，请检查本机登录状态和网络')
         try:
             return json.loads(proc.stdout)
         except json.JSONDecodeError as exc:
@@ -134,7 +143,24 @@ class Bridge(ThreadingHTTPServer):
                         prompt = f'基于以上已登记的全部参考素材（{"、".join(names)}），执行以下总需求：\n\n{prompt}'
                     if request.get('skill'):
                         flags += ['--skill', request['skill']]
-                created = self.command(*flags, '--', prompt, timeout=60)
+                with self.lock:
+                    sending_step = self.jobs[job_id]['step']
+                for attempt in range(21):
+                    with self.lock:
+                        self.jobs[job_id] = {'state': 'starting', 'step': sending_step}
+                    try:
+                        created = self.command(*flags, '--', prompt, timeout=60)
+                        break
+                    except SessionBusyError as exc:
+                        if not (canvas_id and session_id):
+                            raise
+                        if attempt == 20:
+                            raise RuntimeError('IF 会话持续忙碌，已停止自动重试；本条消息未被接受，'
+                                               '请先在 IF 确认上一轮状态。' + str(exc)) from exc
+                        with self.lock:
+                            self.jobs[job_id] = {'state': 'starting',
+                                'step': f'IF 会话忙碌，正在等待上一轮结束；15 秒后重试（{attempt + 1}/20）'}
+                        time.sleep(15)
                 if created.get('status') != 'created':
                     raise RuntimeError('IF CLI 未创建画布：' + str(created.get('error') or
                                        created.get('message') or created.get('status'))[:500])
