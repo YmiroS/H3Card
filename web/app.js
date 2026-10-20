@@ -2671,7 +2671,8 @@ function paint(c) {
 
   const s = c.status;
   st.className = "st" + (s === "running" || s === "queued" ? " run" : s === "done" ? " done" : s === "error" ? " err" : "");
-  st.textContent = s === "queued" ? (!c.job ? "正在提交…" : c.queue_remaining > 1 ? `排队中 (${c.queue_remaining})` : "排队中")
+  st.textContent = s === "queued" ? (isIF(c) && c.step ? c.step
+      : !c.job ? "正在提交…" : c.queue_remaining > 1 ? `排队中 (${c.queue_remaining})` : "排队中")
     : s === "running" ? (isIF(c) && !(c.progress > 0) ? "生成中" : `生成中 ${Math.round((c.progress || 0) * 100)}%`)
                         + (c.step ? ` · ${c.step}` : "")
     : s === "done" ? (fmtEla(c.ms) ? `已完成 · ${fmtEla(c.ms)}` : "已完成")
@@ -5758,7 +5759,7 @@ function openPanel(id) {
   if (isIF(c)) {
     clipboardHint.textContent = ifModelsError
       ? `本机 IF 不可用：${ifModelsError}。请先安装并登录 IF CLI、启动本机桥接，点模型按钮可重试。`
-      : "IF 使用本机账号；支持按模型数量连接多份引用。多引用素材各上传一次，在同一画布按「图片1」「视频1」逐份登记且要求不生成，全部登记后再独立提交总需求。本机上传合计不超过 100 MB；音频暂不支持。";
+      : "IF 使用本机账号；支持按模型数量连接多份引用。多引用素材各上传一次，在同一画布按「图片1」「视频1」逐份登记且要求不生成，全部登记后再独立提交总需求。图片超过 20 MB 时优先转无损 WebP，仍超限再压缩；视频超过 50 MB 时自动转码。仅处理上传副本，原素材不变；本机上传合计不超过 100 MB，音频暂不支持。";
   }
   body.appendChild(clipboardHint);
   if (isIF(c)) {
@@ -8151,10 +8152,25 @@ async function runIF(c) {
         if (url.origin !== location.origin) throw new Error("IF 仅能上传当前画布内的本机素材");
         const response = await fetch(url, {credentials:"same-origin"});
         if (!response.ok) throw new Error("无法读取画布引用素材");
-        const blob = await response.blob();
+        let blob = await response.blob();
         const allowed = reference.kind === "image" ? ["image/png", "image/jpeg", "image/webp"] : ["video/mp4"];
-        if (!allowed.includes(blob.type) || blob.size > (reference.kind === "image" ? 20 : 50) * 1024 * 1024)
-          throw new Error("IF 画布引用只支持不超过 20 MB 的 PNG/JPEG/WebP 或不超过 50 MB 的 MP4");
+        const maximum = (reference.kind === "image" ? 20 : 50) * 1024 * 1024;
+        if (!allowed.includes(blob.type) || blob.size > maximum) {
+          c.status = "queued"; c.error = null;
+          c.step = `正在适配 IF ${KIND_ZH[reference.kind]}上传副本`;
+          paint(c);
+          const prepared = await fetch(`/api/if-reference?${new URLSearchParams({url:url.pathname + url.search, type:reference.kind})}`,
+            {credentials:"same-origin", cache:"no-store"});
+          if (!prepared.ok) throw new Error(`IF 素材自动适配失败：${(await prepared.text()).slice(0, 500)}`);
+          const originalSize = blob.size;
+          blob = await prepared.blob();
+          const conversion = prepared.headers.get("X-Chouka-IF-Conversion");
+          if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability || !canOperate())
+            throw new Error("画布已切换或权限已变化，已取消 IF 提交");
+          toast(`IF ${KIND_ZH[reference.kind]}上传副本已${conversion === "lossless-webp" ? "转换为无损 WebP" : "压缩"}（${(originalSize / 1048576).toFixed(1)} → ${(blob.size / 1048576).toFixed(1)} MB），原素材保持不变`);
+        }
+        if (!blob.size || !allowed.includes(blob.type) || blob.size > maximum)
+          throw new Error(`IF 上传副本仍不符合格式或 ${maximum / 1048576} MB 大小限制，原素材未修改`);
         const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
         assetIds.push(uploaded.asset_id);
         if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability)

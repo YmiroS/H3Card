@@ -355,6 +355,56 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(runs.at(-1).asset_ids.length, 3);
     assert.equal(uploadedReferences.length - beforeImageMulti, 3);
     assert.ok(uploadedReferences.slice(-3).every(item => item.type === 'image/png'));
+    const conversions = [];
+    let conversionFailure = false;
+    await page.route(origin + '/oversized.*', route => {
+      const kind = route.request().url().endsWith('.png') ? 'image' : 'video';
+      return route.fulfill({contentType:kind === 'image' ? 'image/png' : 'video/mp4',
+        body:Buffer.alloc((kind === 'image' ? 20 : 50) * 1024 * 1024 + 1)});
+    });
+    await page.route(origin + '/api/if-reference?*', async route => {
+      const url = new URL(route.request().url()), kind = url.searchParams.get('type');
+      assert.deepEqual(await page.evaluate(() => ({status:PROJ.cards[0].status,
+        step:PROJ.cards[0].step, visible:PROJ.cards[0]._el.textContent.includes(PROJ.cards[0].step)})),
+        {status:'queued', step:`正在适配 IF ${kind === 'image' ? '图片' : '视频'}上传副本`, visible:true});
+      conversions.push(Object.fromEntries(url.searchParams));
+      return route.fulfill(conversionFailure ? {status:422, body:'模拟转换失败，原素材未修改'} : {
+        contentType:kind === 'image' ? 'image/webp' : 'video/mp4', body:Buffer.from('adapted-' + kind),
+        headers:{'X-Chouka-IF-Conversion':kind === 'image' ? 'lossless-webp' : 'compressed-mp4'}});
+    });
+    for (const kind of ['image', 'video']) {
+      await page.evaluate(kind => {
+        const c = PROJ.cards[0];
+        c.cap = 'if_video'; c.params = {if_model:'Wan3.0视频', prompt:'测试上传副本'};
+        c.status = 'idle'; c.job = null; c.assets = {}; PROJ.edges = [];
+        c.assets[kind === 'image' ? 'images[0]' : 'video[0]'] = {
+          kind, url:kind === 'image' ? '/oversized.png' : '/oversized.mp4'};
+        openPanel(c.id);
+      }, kind);
+      const before = runs.length;
+      await page.locator('#panel .go').click();
+      await page.waitForFunction(before => PROJ.cards[0].status === 'done'
+        && PROJ.cards[0].job === 'bridge-' + (before + 1), before);
+      assert.equal(runs.length, before + 1);
+      assert.equal(uploadedReferences.at(-1).type, kind === 'image' ? 'image/webp' : 'video/mp4');
+      assert.deepEqual(uploadedReferences.at(-1).body, Buffer.from('adapted-' + kind));
+      assert.equal(await page.evaluate(kind => PROJ.cards[0].assets[kind === 'image' ? 'images[0]' : 'video[0]'].url, kind),
+        kind === 'image' ? '/oversized.png' : '/oversized.mp4', 'original canvas asset is not replaced');
+    }
+    assert.deepEqual(conversions, [{url:'/oversized.png', type:'image'}, {url:'/oversized.mp4', type:'video'}]);
+    conversionFailure = true;
+    await page.evaluate(() => {
+      const c = PROJ.cards[0];
+      c.assets = {'images[0]':{kind:'image', url:'/fixture.png'},
+        'video[0]':{kind:'video', url:'/oversized.mp4'}};
+      openPanel(c.id);
+    });
+    const beforeFailure = runs.length, deletedBefore = deletedAssets.length;
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /模拟转换失败/);
+    assert.equal(runs.length, beforeFailure, 'failed conversion must not submit a paid run');
+    assert.equal(deletedAssets.length, deletedBefore + 1, 'already uploaded references must be released');
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {

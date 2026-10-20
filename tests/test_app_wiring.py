@@ -101,6 +101,14 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.get('/permissions.html')).status, 404)
         self.assertEqual((await self.client.get('/app.js')).status, 200)
 
+    async def test_if_reference_route_is_wired_and_authenticated(self):
+        self.assertIsInstance(self.client.app['if_reference_copies'], controller_app.IFReferenceCopies)
+        response = await self.client.get('/api/if-reference')
+        self.assertEqual(response.status, 400)
+        self.client.session.cookie_jar.clear()
+        response = await self.client.get('/api/if-reference')
+        self.assertEqual(response.status, 401)
+
     async def test_local_admin_modules_remain_explicit_authenticated_routes(self):
         routes = {
             '/admin-shell.css': 'text/css',
