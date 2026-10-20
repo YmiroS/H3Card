@@ -210,6 +210,56 @@ function ifReferenceState(c, projectId) {
 function saveIFReferences(state) {
   try { sessionStorage.setItem(state.key, JSON.stringify({entries:state.entries, pending:state.pending, job:state.job})); } catch {}
 }
+function ifTaskKey(c, projectId) {
+  return 'chouka:if-task:v1:' + JSON.stringify([H3Auth.user?.id, projectId, c.id]);
+}
+function rememberIFTask(c, projectId, phase) {
+  const state = {phase, cap:c.cap, job:c.job, status:c.status, step:c.step, error:c.error,
+    if_started:c.if_started, if_job_cap:c.if_job_cap, ms:c.ms, outputs:c.outputs || [],
+    entry:c.job ? c.history?.find(item => item.job === c.job) : null};
+  try { sessionStorage.setItem(ifTaskKey(c, projectId), JSON.stringify(state)); } catch {}
+}
+function restoreIFTask(c, projectId) {
+  if (!isIF(c)) return false;
+  const key = ifTaskKey(c, projectId);
+  let state;
+  try { state = JSON.parse(sessionStorage.getItem(key)); } catch {}
+  if (!state || state.cap !== c.cap || !Number.isFinite(state.if_started)
+      || !['preparing', 'submitting', 'running', 'done', 'error'].includes(state.phase)) return false;
+  if ((c.if_started || 0) > state.if_started || (c.if_started === state.if_started
+      && c.job === state.job && ['done', 'error'].includes(c.status))) {
+    try { sessionStorage.removeItem(key); } catch {}
+    return false;
+  }
+  for (const field of ['job', 'status', 'step', 'error', 'if_started', 'if_job_cap', 'ms', 'outputs'])
+    c[field] = state[field];
+  c.progress = null;
+  if (state.entry && state.entry.job === c.job) {
+    c.history ||= [];
+    const index = c.history.findIndex(item => item.job === c.job);
+    if (index < 0) c.history.unshift(state.entry); else c.history[index] = state.entry;
+  }
+  if (state.phase === 'preparing' || state.phase === 'submitting') {
+    c.status = 'error'; c.step = '';
+    c.error = state.phase === 'preparing'
+      ? '上次素材准备因页面离开而中断，尚未提交 IF；请确认后重试'
+      : '上次 IF 提交结果尚未确认，请先在 IF 查看是否已创建任务，避免重复生成';
+    rememberIFTask(c, projectId, 'error');
+  }
+  return true;
+}
+async function saveIFTaskProject(c, projectId) {
+  const started = c.if_started, job = c.job, status = c.status, key = ifTaskKey(c, projectId);
+  const result = await enqueueSave(projectId);
+  if (result.ok && ['done', 'error'].includes(status)) {
+    try {
+      const state = JSON.parse(sessionStorage.getItem(key));
+      if (state?.if_started === started && state.job === job && state.phase === status)
+        sessionStorage.removeItem(key);
+    } catch {}
+  }
+  return result;
+}
 function reusableIFURL(value) {
   try {
     const url = new URL(value);
@@ -1645,6 +1695,7 @@ async function openProject(pid) {
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
   PROJ.groups = PROJ.groups || [];
+  const recoveredIFTasks = [];
   // 能力被合并/拆分过之后，老项目里存的 cap 可能已经不是模式入口了
   // （图生视频并进了首尾帧那条），统一归到模式入口，参数和素材的 key 是通的
   for (const c of PROJ.cards) {
@@ -1657,6 +1708,7 @@ async function openProject(pid) {
       const selected = Object.entries(md.modelSwitch).find(([, cid]) => cid === c.cap);
       if (selected) c._model = selected[0];
     }
+    if (restoreIFTask(c, PROJ.id)) recoveredIFTasks.push(c);
     if (!isTextCard(c) && !isAsset(c) && c.status === "queued" && !c.job) {
       c.status = "error";
       c.error = "上次提交未取得任务编号，请先检查任务列表，确认后再重试";
@@ -1696,6 +1748,9 @@ async function openProject(pid) {
   render();
   for (const card of PROJ.cards) {
     if (isIF(card) && card.job && card.status === "running") pollIF(card, PROJ.id);
+  }
+  if (recoveredIFTasks.length && canSave() && !PROJ.locked) {
+    for (const card of recoveredIFTasks) saveIFTaskProject(card, PROJ.id);
   }
   rememberProject(PROJ.id);
   connectPresence(PROJ.id);
@@ -8199,11 +8254,14 @@ function run(c) {
 async function runIF(c) {
   const project = PROJ, capability = c.cap;
   const assetIds = [];
-  let submitted = false;
+  let submitted = false, submissionAttempted = false;
   c.status = "queued"; c.error = null; c.progress = null; c.job = null; c.ms = null;
-  c.step = "正在连接本机 IF 并读取模型"; c.if_started = Date.now();
+  c.step = "正在连接本机 IF 并读取模型"; c.if_started = Date.now(); c.if_job_cap = capability;
+  rememberIFTask(c, project.id, 'preparing');
   paint(c); if (el.panel._id === c.id) openPanel(c.id);
   try {
+    const saved = await enqueueSave(project.id);
+    if (!saved.ok) throw new Error('任务准备状态保存失败，尚未提交 IF：' + (saved.error?.message || '请重试'));
     const models = await loadIFModels();
     await syncReferenceParameters(c);
     if (PROJ !== project || !canOperate() || !project.cards.includes(c) || c.cap !== capability)
@@ -8328,6 +8386,8 @@ async function runIF(c) {
     c.params.if_model = model.display_name;
     c.status = "queued"; c.error = null; c.progress = null; c.outputs = []; c.ms = null;
     c.step = "正在交由本机 IF 桥接处理"; c.job = null;
+    submissionAttempted = true;
+    rememberIFTask(c, project.id, 'submitting');
     paint(c); if (el.panel._id === c.id) openPanel(c.id);
     const job = await ifRequest("/runs", {method: "POST",
       headers: {"Content-Type": "application/json", "X-Chouka-IF": "generate"}, body: JSON.stringify(data)});
@@ -8338,15 +8398,20 @@ async function runIF(c) {
       {key:"if_original", label:"原始提示词", text:originalPrompt},
       {key:"if_submitted", label:"提交给 IF CLI 的提示词", text:data.prompt},
     ]});
+    rememberIFTask(c, project.id, 'running');
     if (el.hist._id === c.id) openHistory(c.id);
-    save(false);
+    const persisted = await saveIFTaskProject(c, project.id);
+    if (!persisted.ok) toast('IF 任务已提交，服务器状态保存失败；已保留本标签页恢复记录，请勿重复生成');
     pollIF(c, project.id);
   } catch (error) {
     if (!submitted && assetIds.length) await Promise.allSettled(assetIds.map(assetId =>
       ifRequest(`/assets/${encodeURIComponent(assetId)}`, {method:"DELETE", headers:{"X-Chouka-IF":"asset"}})));
     if (PROJ !== project || !project.cards.includes(c)) return;
     c.status = "error"; c.error = error.message; c.step = ""; c.job = null;
-    toast(error.message); save(false);
+    if (submissionAttempted && !submitted && (error instanceof TypeError || error instanceof SyntaxError))
+      c.error = 'IF 提交结果尚未确认，请先在 IF 查看是否已创建任务，避免重复生成：' + error.message;
+    rememberIFTask(c, project.id, 'error');
+    toast(c.error); await saveIFTaskProject(c, project.id);
   }
   if (PROJ === project && project.cards.includes(c)) {
     paint(c); if (el.panel._id === c.id) openPanel(c.id);
@@ -8400,8 +8465,8 @@ async function pollIF(c, projectId) {
     c.ms = Date.now() - (c.if_started || Date.now());
     pushHistory(c, {id: c.job, capability: c.if_job_cap || c.cap});
     if (el.hist._id === c.id) openHistory(c.id);
+    rememberIFTask(c, projectId, 'done');
     await propagateCardOutputs(c);
-    if (PROJ?.id === projectId && PROJ.cards.includes(c)) save(false);
   } catch (error) {
     if (PROJ?.id !== projectId || !PROJ.cards.includes(c)) return;
     if (error instanceof TypeError || /桥接请求失败|Failed to fetch/.test(error.message)) {
@@ -8412,13 +8477,15 @@ async function pollIF(c, projectId) {
       c.ms = Date.now() - (c.if_started || Date.now());
       if (c.job) pushHistory(c, {id:c.job, capability:c.if_job_cap || c.cap});
       if (el.hist._id === c.id) openHistory(c.id);
-      toast(error.message); save(false);
+      toast(error.message);
     }
   } finally {
     c._ifPolling = false;
     if (PROJ?.id === projectId && PROJ.cards.includes(c)) {
+      rememberIFTask(c, projectId, retry ? 'running' : c.status);
       paint(c); if (el.panel._id === c.id) openPanel(c.id);
       if (retry) setTimeout(() => pollIF(c, projectId), 2500);
+      else if (['done', 'error'].includes(c.status)) await saveIFTaskProject(c, projectId);
     }
   }
 }
