@@ -17,7 +17,7 @@ test('IF reference matrix covers every known model and never exceeds provider li
     assert.ok(['image', 'video'].includes(limit.type), name);
     for (const kind of ['image', 'video', 'audio']) {
       assert.ok(Number.isInteger(limit.bridge[kind]) && limit.bridge[kind] >= 0, `${name}: ${kind}`);
-      if (limit.type === 'image') assert.ok(limit.bridge[kind] <= 1, `${name}: ${kind}`);
+      if (limit.type === 'image' && kind !== 'image') assert.equal(limit.bridge[kind], 0, `${name}: ${kind}`);
       if (limit.api[kind] !== null) assert.ok(limit.bridge[kind] <= limit.api[kind], `${name}: ${kind}`);
     }
     assert.equal(limit.bridge.audio, 0, name);
@@ -166,7 +166,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         assert.doesNotMatch(summary, /官方 API 同名模型\/家族参考上限/);
       } else assert.match(summary, /官方 API 同名模型\/家族参考上限/);
       assert.equal(await page.evaluate(() => PROJ.edges[0].slot), kind === 'image' ? 'images[0]' : 'video[0]');
-      assert.match(await page.locator('#panel .refhead').innerText(), kind === 'image' ? /图片 1/ : /图片 10 · 视频 5/);
+      assert.match(await page.locator('#panel .refhead').innerText(), kind === 'image' ? /图片 3/ : /图片 10 · 视频 5/);
       await modelButton.click();
       await page.locator('#menu button').filter({hasText:unsupported}).click();
       assert.equal(await page.evaluate(() => PROJ.cards[0].params.if_model), unsupported);
@@ -225,7 +225,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       const videoDirective = `最终交付必须是由「${chosen}」生成的视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n`;
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen,
         prompt:`${kind === 'video' ? videoDirective : ''}蓝色圆形\n\n生成规格（作为内容要求）：分辨率 ${kind === 'image' ? '1440×1080' : '736×544，视频时长约 12 秒，随机种子参考 42'}。`,
-        ...(kind === 'video' ? {asset_ids:[referenceId], skill:'商品展示'} : {asset_id:referenceId})});
+        asset_ids:[referenceId], ...(kind === 'video' ? {skill:'商品展示'} : {})});
       assert.equal(uploadedReferences.length, kind === 'image' ? 1 : 2);
       assert.equal(uploadedReferences.at(-1).type, kind === 'image' ? 'image/png' : 'video/mp4');
       assert.deepEqual(uploadedReferences.at(-1).body, kind === 'image' ? png : Buffer.from('fake-video'));
@@ -319,6 +319,30 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /模拟素材容量不足/);
     assert.deepEqual(deletedAssets, ['/assets/' + 'b'.repeat(31) + uploadedReferences.length]);
     assert.equal(runs.length, 5, 'failed multi-reference upload must not submit a job');
+    project = {...project, cards:[card('image', 'qwen-image-3.0'),
+      {id:'image-src', type:'card_asset', cap:'asset', x:20, y:20, params:{}, assets:{},
+        outputs:[{kind:'image', url:'/fixture.png', ref:'image.png'}]}], edges:[]};
+    await page.goto(origin + '/?project=if-test');
+    await page.waitForFunction(() => PROJ?.cards[0]?._el
+      && projects.some(item => item.id === PROJ.id && item.permission === PROJ.permission));
+    await page.evaluate(async () => {
+      pick(PROJ.cards[0].id);
+      for (let n = 0; n < 3; n++) await linkTo(PROJ.cards[1], PROJ.cards[0]);
+    });
+    assert.deepEqual(await page.evaluate(() => PROJ.edges.map(edge => edge.slot)),
+      ['images[0]', 'images[1]', 'images[2]']);
+    assert.match(await page.locator('#panel .refhead').innerText(), /图片 3/);
+    assert.doesNotMatch(await page.locator('#panel .pbody').innerText(), /合计最多 1 项|不支持音频及多引用/);
+    await page.evaluate(async () => linkTo(PROJ.cards[1], PROJ.cards[0]));
+    assert.equal(await page.evaluate(() => PROJ.edges.length), 3, 'model limit must still apply');
+    const beforeImageMulti = uploadedReferences.length;
+    await page.locator('#panel .pblock textarea').first().fill('结合图片1、图片2、图片3生成');
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].job === 'bridge-6' && PROJ.cards[0].status === 'done');
+    assert.equal(runs.at(-1).type, 'image');
+    assert.equal(runs.at(-1).asset_ids.length, 3);
+    assert.equal(uploadedReferences.length - beforeImageMulti, 3);
+    assert.ok(uploadedReferences.slice(-3).every(item => item.type === 'image/png'));
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {
