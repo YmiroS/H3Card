@@ -510,15 +510,15 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
         await page.waitForFunction(()=>PROJ.cards[0].params._reference_video);
         assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'21:9',cap);
         const duration=videoRow(cap==='minimax_h3_character_transfer'?'单段时长(秒)':'时长(秒)');
-        assert.equal(await duration.locator('input[type=number]').inputValue(),cap==='minimax_h3_character_transfer'?'9':'4.1');
+        assert.equal(await duration.locator('input[type=number]').inputValue(),cap==='minimax_h3_character_transfer'?'9':'4');
         if(cap!=='minimax_h3_character_transfer') {
-          assert.equal(await duration.locator('input[type=range]').inputValue(),'4.1');
+          assert.equal(await duration.locator('input[type=range]').inputValue(),'4');
           assert.equal(await duration.locator('input[type=number]').evaluate(e=>e.validity.valid),true);
         } else assert.equal(await videoRow('仅测试前几秒').locator('input[type=number]').inputValue(),'0');
         if(process.env.CHOUKA_TEST_SCREENSHOT && cap==='minimax_h3_ref9') await page.screenshot({path:process.env.CHOUKA_TEST_SCREENSHOT});
         const payload=await page.evaluate(()=>payloadOf(PROJ.cards[0]));
         assert.equal('follow_reference_video' in payload.params,false);
-        assert.equal(payload.params.duration,cap==='minimax_h3_character_transfer'?9:4.1);
+        assert.equal(payload.params.duration,cap==='minimax_h3_character_transfer'?9:4);
         await page.locator('#respop button[title^="画面比例 16:9"]').click();
         await duration.locator('input[type=number]').fill('8');
         await page.evaluate(()=>openPanel(PROJ.cards[0].id));
@@ -532,7 +532,7 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
         assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),8,'removing reference keeps edited values');
       }
     });
-    await t.test('linked videos fill real parameters once and submit fractional duration without clamping',async()=>{
+    await t.test('linked videos fill parameters once and submit rounded integer duration without clamping',async()=>{
       await reset('minimax_h3_fusion_v2','card_video');
       const start=mediaRequests.length;
       await page.evaluate(async()=>{
@@ -543,12 +543,12 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       await paramsButton.click();
       assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'4:3','nearest existing workflow preset');
       const duration=videoRow('时长(秒)');
-      assert.equal(await duration.locator('input[type=number]').inputValue(),'19.125');
-      assert.equal(await duration.locator('input[type=range]').inputValue(),'19.125');
+      assert.equal(await duration.locator('input[type=number]').inputValue(),'19');
+      assert.equal(await duration.locator('input[type=range]').inputValue(),'19');
       assert.equal(await duration.locator('input[type=number]').evaluate(e=>e.validity.valid),true);
       assert.equal(mediaRequests.length-start,1,'link, panel and popup share one metadata request');
       await page.evaluate(()=>runCard(PROJ.cards[0]));
-      assert.equal(submissions.at(-1).params.duration,19.125);
+      assert.equal(submissions.at(-1).params.duration,19);
       assert.equal(submissions.at(-1).params.aspect_ratio,'4:3 (Standard)');
       assert.equal('follow_reference_video' in submissions.at(-1).params,false);
       assert.equal(submissions.at(-1).assets['video[0]'],'chouka/custom.mp4');
@@ -559,10 +559,10 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       const chooser=page.waitForEvent('filechooser');
       await page.evaluate(()=>pickFile(PROJ.cards[0],CAPS[PROJ.cards[0].cap].inputs.find(s=>s.type==='video')));
       await (await chooser).setFiles({name:'wide.mp4',mimeType:'video/mp4',buffer:Buffer.from('offline upload fixture')});
-      await page.waitForFunction(()=>PROJ.cards[0].params.duration===4.1);
+      await page.waitForFunction(()=>PROJ.cards[0].params.duration===4);
       await paramsButton.click();
       assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'21:9');
-      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'4.1');
+      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'4');
       assert.equal(await page.getByRole('switch',{name:'跟随参考视频比例和时长',exact:true}).count(),0);
       await page.locator('#respop button[title^="画面比例 16:9"]').click();
       await videoRow('时长(秒)').locator('input[type=number]').fill('8.5');
@@ -580,8 +580,8 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       delayedMedia();
       await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===7.375);
       assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'9:16');
-      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'7.375');
-      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),7.375);
+      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'7');
+      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.duration),7);
       await page.evaluate(()=>{const c=PROJ.cards[0];putAsset(c,{key:'video[0]'},{kind:'video',ref:'chouka/missing.mp4',url:'/missing.mp4'});openPanel(c.id);});
       await page.getByRole('button',{name:'重新读取',exact:true}).waitFor();
       assert.match(await page.locator('#respop [role=status]').innerText(),/无法读取参考视频/);
@@ -589,7 +589,7 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       await page.getByRole('button',{name:'重新读取',exact:true}).click();
       await page.waitForFunction(()=>PROJ.cards[0].assets['video[0]'].duration===6.5);
       assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'3:2');
-      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'6.5');
+      assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'7');
       assert.equal(await page.getByRole('button',{name:'重新读取',exact:true}).count(),0);
     });
     await t.test('manual edits made during metadata loading are not overwritten',async()=>{
@@ -622,7 +622,7 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
         await syncReferenceParameters(c);
       });
       assert.equal(await page.evaluate(()=>PROJ.cards[0].params.aspect_ratio),'9:16 (Portrait Widescreen)');
-      assert.equal(await page.evaluate(()=>PROJ.cards[0].params.duration),7.375);
+      assert.equal(await page.evaluate(()=>PROJ.cards[0].params.duration),7);
       await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
       assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'9:16');
     });
@@ -638,7 +638,7 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
         await page.reload();await page.waitForFunction(()=>PROJ?.cards[0]?._el);
         await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
         assert.equal(await page.locator('#respop .cgrid:not(.k) button.on span').innerText(),'21:9');
-        assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'4.1');
+        assert.equal(await videoRow('时长(秒)').locator('input[type=number]').inputValue(),'4');
         await page.locator('#respop button[title^="画面比例 16:9"]').click();
         await videoRow('时长(秒)').locator('input[type=number]').fill('11');
         await page.evaluate(()=>enqueueSave(PROJ.id));

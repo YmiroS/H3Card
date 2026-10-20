@@ -665,7 +665,7 @@ function syncReferenceParameters(c, cap = CAPS[runCap(c)] || capOf(c)) {
     // 人物迁移的 duration 是单段长度，不是成片总时长。
     const preview = cap.inputs.some(s => s.key === "preview_seconds");
     const key = preview ? "preview_seconds" : "duration";
-    if (unchanged([key])) params[key] = preview ? 0 : +source.duration;
+    if (unchanged([key])) params[key] = preview ? 0 : Math.max(1, Math.round(+source.duration));
     params._reference_video = identity;
     save();
   };
