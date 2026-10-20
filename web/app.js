@@ -5787,7 +5787,7 @@ function openPanel(id) {
   if (isIF(c)) {
     clipboardHint.textContent = ifModelsError
       ? `本机 IF 不可用：${ifModelsError}。请先安装并登录 IF CLI、启动本机桥接，点模型按钮可重试。`
-      : "IF 使用本机账号；支持按模型数量连接多份引用。多引用素材各上传一次，在同一画布按「图片1」「视频1」逐份登记且要求不生成，全部登记后再独立提交总需求。图片超过 10 MB 时优先转无损 WebP，仍超限再压缩；视频超过 50 MB 时自动转码。仅处理上传副本，原素材不变；本机上传合计不超过 100 MB，音频暂不支持。";
+      : "IF 使用本机账号；支持按模型数量连接多份引用。引用素材各上传一次，返回的 URL 按「图片1」「视频1」写入提示词，与生成需求一次提交；模型由 CLI 参数指定，随后轮询并保存产物。图片超过 10 MB 时优先转无损 WebP，仍超限再压缩；视频超过 50 MB 时自动转码。仅处理上传副本，原素材不变；本机上传合计不超过 100 MB，音频暂不支持。";
   }
   body.appendChild(clipboardHint);
   if (isIF(c)) {
@@ -5802,9 +5802,9 @@ function openPanel(id) {
     const videoCount = kind => limit.api[kind] == null
       ? `${ifModelLimits["Minimax H3"].api[kind]}（H3 估算）` : String(limit.api[kind]);
     summary.textContent = limit?.type === "video"
-      ? `${h3Estimate ? "H3 全能参考高质量估算（未核实该模型上限）" : "供应商 API 资料（并非 IF 引用上限）"}：图片 ${videoCount("image")} · 视频 ${videoCount("video")} · 音频 ${videoCount("audio")}。${limit.note} 本机 IF CLI 单次只接受一份图片或视频；桥接会按「图片1」「视频1」逐份命名登记，参考轮明确要求不生成，全部登记后再单独提交总提示词，最后仅调用一次 poll；音频暂不能提交。${h3Estimate ? `画布按 H3 估算开放${videoReference}槽位，模型能否接收仍待实测。` : `画布按各类型上限开放${videoReference}槽位；不同模式可能另有限制，以 IF 实际返回为准。`}画面比例、清晰度、时长等参数仅作为生成内容要求发送，模型不保证严格遵守。`
+      ? `${h3Estimate ? "H3 全能参考高质量估算（未核实该模型上限）" : "供应商 API 资料（并非 IF 引用上限）"}：图片 ${videoCount("image")} · 视频 ${videoCount("video")} · 音频 ${videoCount("audio")}。${limit.note} 桥接将全部引用上传后的 URL 按「图片1」「视频1」写入同一提示词，只提交一次生成需求，再轮询等待产物；IF 是否读取全部 URL 仍以实际结果为准，音频暂不能提交。${h3Estimate ? `画布按 H3 估算开放${videoReference}槽位，模型能否接收仍待实测。` : `画布按各类型上限开放${videoReference}槽位；不同模式可能另有限制，以 IF 实际返回为准。`}画面比例、清晰度、时长等参数仅作为生成内容要求发送，模型不保证严格遵守。`
       : limit
-        ? `官方 API 同名模型/家族参考上限：图片 ${format(limit.api.image)} · 视频 ${format(limit.api.video)} · 音频 ${format(limit.api.audio)}。${limit.note} IF 未公布内部模型版本和多素材转发规则；画布开放图片 ${limit.bridge.image}${limit.api.image == null ? "（估算，数量未核实）" : ""}／视频 ${limit.bridge.video}。多引用逐份命名登记后再独立提交总提示词；是否接受以 CLI 返回为准，失败直接显示错误；音频暂不可提交。画面比例、清晰度、时长等参数会作为生成内容发送，不是 IF API 参数，模型不保证严格遵守。`
+        ? `官方 API 同名模型/家族参考上限：图片 ${format(limit.api.image)} · 视频 ${format(limit.api.video)} · 音频 ${format(limit.api.audio)}。${limit.note} IF 未公布内部模型版本和多素材转发规则；画布开放图片 ${limit.bridge.image}${limit.api.image == null ? "（估算，数量未核实）" : ""}／视频 ${limit.bridge.video}。全部引用 URL 与生成需求在同一提示词中一次提交，再轮询产物；IF 是否读取全部 URL 仍以实际结果为准，失败直接显示错误；音频暂不可提交。画面比例、清晰度、时长等参数会作为生成内容发送，不是 IF API 参数，模型不保证严格遵守。`
         : "该 IF 模型尚无可核对的官方 API 上限，暂不开放新的画布引用。";
     if (Object.values(c.assets || {}).some(asset => asset && MEDIA.includes(asset.kind)
         && !limit?.bridge?.[asset.kind]))
@@ -8172,7 +8172,7 @@ async function runIF(c) {
       if (Number.isSafeInteger(seed) && seed >= 0) requirements.push(`随机种子参考 ${seed}`);
     }
     data.prompt += `\n\n生成规格（作为内容要求）：${requirements.join("，")}。`;
-    if (type === "video") data.prompt = `最终交付必须是由「${model.display_name}」生成的视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n${data.prompt}`;
+    if (type === "video") data.prompt = `最终交付必须是视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n${data.prompt}`;
     if (c.params.if_reference?.trim()) {
       if (!limit.bridge.image && !limit.bridge.video) throw new Error("该模型不支持已确认的媒体引用");
       data.image = c.params.if_reference.trim();

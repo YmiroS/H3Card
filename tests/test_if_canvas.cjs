@@ -129,7 +129,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       if (url.pathname === '/runs' && request.method() === 'POST') await checkBusy(/^正在提交至本机 IF$/);
       if (url.pathname === '/runs/bridge-1' && firstRunPolls < 3) {
         const states = [{state:'starting', step:'正在上传 IF 引用素材（1/1）'},
-          {state:'starting', step:'正在登记 IF 参考素材「图片1」（1/1）'},
+          {state:'starting', step:'正在向 IF 一次提交全部引用与图片生成需求'},
           {state:'running', step:'IF 正在生成图片，等待产物'}];
         return route.fulfill({status:200, headers, contentType:'application/json',
           body:JSON.stringify(states[firstRunPolls++])});
@@ -160,7 +160,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done',
             ...(runs.at(-1).asset_ids?.length > 1 ? {submitted_prompt:
-              '基于以上已登记的全部参考素材（图片1、图片2、视频1、视频2），执行以下总需求：\n\n' + runs.at(-1).prompt} : {}),
+              '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n生成需求：\n' + runs.at(-1).prompt} : {}),
             planning_text:returnVideoStoryboard || returnVideoPlanOnly ? '请确认这张故事板，再生成下一张图片' : '',
             downloaded:returnVideoPlanOnly ? [] : [{index:0, type:returnVideoStoryboard ? 'image' : runs.at(-1).type,
               name:runs.at(-1).type === 'image' || returnVideoStoryboard ? 'result.png' : 'result.mp4'}]}}
@@ -220,6 +220,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         assert.ok(Math.abs(note.left - note.linkLeft) < 1, 'descriptions align with the API link');
       }
       const summary = await page.locator('#panel .pbody').innerText();
+      assert.match(summary, /返回的 URL.+生成需求一次提交/);
+      assert.doesNotMatch(summary, /逐份登记|登记后/);
       if (kind === 'video') {
         assert.match(summary, /供应商 API 资料（并非 IF 引用上限）/);
         assert.match(summary, /画布按各类型上限开放图片 10／视频 5槽位/);
@@ -283,14 +285,14 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       await page.locator('#panel .go').click();
       if (kind === 'image') {
         for (const step of ['正在上传 IF 引用素材（1/1）',
-          '正在登记 IF 参考素材「图片1」（1/1）', 'IF 正在生成图片，等待产物']) {
+          '正在向 IF 一次提交全部引用与图片生成需求', 'IF 正在生成图片，等待产物']) {
           await page.waitForFunction(step => PROJ.cards[0].step === step, step);
           await checkBusy(new RegExp(step));
         }
       }
       await page.waitForFunction(() => PROJ.cards[0].status === 'done');
       assert.equal(await page.locator('.card .body .load').count(), 0);
-      const videoDirective = `最终交付必须是由「${chosen}」生成的视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n`;
+      const videoDirective = `最终交付必须是视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n`;
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen,
         prompt:`${kind === 'video' ? videoDirective : ''}蓝色圆形\n\n生成规格（作为内容要求）：分辨率 ${kind === 'image' ? '1440×1080' : '736×544，视频时长约 12 秒，随机种子参考 42'}。`,
         asset_ids:[referenceId], ...(kind === 'video' ? {skill:'商品展示'} : {})});
@@ -370,7 +372,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       ['image/png', 'image/png', 'video/mp4', 'video/mp4']);
     assert.equal(await page.evaluate(() => PROJ.cards[0].history.find(h => h.job === 'bridge-5')
       .prompts.find(p => p.key === 'if_submitted').text),
-      '基于以上已登记的全部参考素材（图片1、图片2、视频1、视频2），执行以下总需求：\n\n' + runs.at(-1).prompt);
+      '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n生成需求：\n' + runs.at(-1).prompt);
     let uploadAttempts = 0;
     const deletedAssets = [];
     await page.route('http://127.0.0.1:8278/**', route => {

@@ -92,6 +92,7 @@ class Bridge(ThreadingHTTPServer):
 
     def generate(self, job_id, request, asset_paths=None):
         asset_paths = asset_paths or []
+        submitted_prompt = None
         try:
             references = [str(path) for path in asset_paths]
             if request.get('image'):
@@ -110,61 +111,46 @@ class Bridge(ThreadingHTTPServer):
                     raise RuntimeError('IF CLI 上传失败：' + str(uploaded.get('error') or
                                        uploaded.get('message') or '未返回有效的素材 URL')[:500])
                 references[index] = url
-            steps = references + [None]
             counts = {'图片': 0, '视频': 0}
-            names = []
+            reference_lines = []
+            for index, reference in enumerate(references):
+                source = str(asset_paths[index]) if index < len(asset_paths) else request['image']
+                suffix = Path(urlparse(source).path).suffix.lower()
+                media = '视频' if suffix in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v') else '图片'
+                counts[media] += 1
+                reference_lines.append(f'{media}{counts[media]}：{reference}')
+            prompt = request['prompt']
+            if reference_lines:
+                prompt = '\n'.join(reference_lines) + '\n\n生成需求：\n' + prompt
+            submitted_prompt = prompt
             canvas_id, session_id = request.get('canvas_id'), request.get('session_id')
-            for index, reference in enumerate(steps):
-                flags = ['canvas', 'run', '--profile', 'buc', '--json', '--create-only']
-                if canvas_id and session_id:
-                    flags += ['--canvas-id', canvas_id, '--session-id', session_id]
-                if reference:
-                    flags += ['--image', reference]
-                prompt = request['prompt']
-                if reference:
-                    source = str(asset_paths[index]) if index < len(asset_paths) else request['image']
-                    suffix = Path(urlparse(source).path).suffix.lower()
-                    media = '视频' if suffix in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v') else '图片'
-                    counts[media] += 1
-                    name = f'{media}{counts[media]}'
-                    names.append(name)
-                    with self.lock:
-                        self.jobs[job_id] = {'state': 'starting',
-                            'step': f'正在登记 IF 参考素材「{name}」（{index + 1}/{len(references)}）'}
-                    prompt = (f'这是参考素材「{name}」，引用名为「{name}」。仅登记该素材及其内容、镜头信息，'
-                              '本轮不要生成任何内容，不要调用生图或生视频工具。'
-                              '等待全部参考素材登记完成后的总需求轮，再统一生成。')
-                else:
-                    with self.lock:
-                        self.jobs[job_id] = {'state': 'starting',
-                            'step': f'正在向 IF 提交{"视频" if video else "图片"}生成需求'}
-                    flags += ['--model', request['model']]
-                    if names:
-                        prompt = f'基于以上已登记的全部参考素材（{"、".join(names)}），执行以下总需求：\n\n{prompt}'
-                    if request.get('skill'):
-                        flags += ['--skill', request['skill']]
+            flags = ['canvas', 'run', '--profile', 'buc', '--json', '--create-only', '--model', request['model']]
+            if canvas_id and session_id:
+                flags += ['--canvas-id', canvas_id, '--session-id', session_id]
+            if request.get('skill'):
+                flags += ['--skill', request['skill']]
+            sending_step = f'正在向 IF 一次提交全部引用与{"视频" if video else "图片"}生成需求'
+            for attempt in range(21):
                 with self.lock:
-                    sending_step = self.jobs[job_id]['step']
-                for attempt in range(21):
+                    self.jobs[job_id] = {'state': 'starting', 'step': sending_step,
+                        'result': {'submitted_prompt': prompt}}
+                try:
+                    created = self.command(*flags, '--', prompt, timeout=60)
+                    break
+                except SessionBusyError as exc:
+                    if not (canvas_id and session_id):
+                        raise
+                    if attempt == 20:
+                        raise RuntimeError('IF 会话持续忙碌，已停止自动重试；本条消息未被接受，'
+                                           '请先在 IF 确认上一轮状态。' + str(exc)) from exc
                     with self.lock:
-                        self.jobs[job_id] = {'state': 'starting', 'step': sending_step}
-                    try:
-                        created = self.command(*flags, '--', prompt, timeout=60)
-                        break
-                    except SessionBusyError as exc:
-                        if not (canvas_id and session_id):
-                            raise
-                        if attempt == 20:
-                            raise RuntimeError('IF 会话持续忙碌，已停止自动重试；本条消息未被接受，'
-                                               '请先在 IF 确认上一轮状态。' + str(exc)) from exc
-                        with self.lock:
-                            self.jobs[job_id] = {'state': 'starting',
-                                'step': f'IF 会话忙碌，正在等待上一轮结束；15 秒后重试（{attempt + 1}/20）'}
-                        time.sleep(15)
-                if created.get('status') != 'created':
-                    raise RuntimeError('IF CLI 未创建画布：' + str(created.get('error') or
-                                       created.get('message') or created.get('status'))[:500])
-                canvas_id, session_id = created['canvas_id'], created['session_id']
+                        self.jobs[job_id] = {'state': 'starting',
+                            'step': f'IF 会话忙碌，正在等待上一轮结束；15 秒后重试（{attempt + 1}/20）',
+                            'result': {'submitted_prompt': prompt}}
+                    time.sleep(15)
+            if created.get('status') != 'created':
+                raise RuntimeError('IF CLI 未创建画布：' + str(created.get('error') or
+                                   created.get('message') or created.get('status'))[:500])
             created['submitted_prompt'] = prompt
             with self.lock:
                 self.jobs[job_id] = {'state': 'running', 'result': created,
@@ -174,7 +160,7 @@ class Bridge(ThreadingHTTPServer):
             poll_args = ('canvas', 'poll', '--profile', 'buc', '--canvas-id', created['canvas_id'],
                          '--session-id', created['session_id'], '--timeout', '600', '--save-dir', str(folder), '--json')
             result = self.command(*poll_args, timeout=630)
-            if not references and not video and result.get('status') == 'summary_feedback' and any(
+            if result.get('status') == 'summary_feedback' and any(
                     text in result.get('planning_text', '') for text in ('后台处理中', '已生成完毕')):
                 deadline = time.monotonic() + 900
                 while time.monotonic() < deadline:
@@ -183,6 +169,8 @@ class Bridge(ThreadingHTTPServer):
                     if result.get('status') != 'summary_feedback' or not any(
                             text in result.get('planning_text', '') for text in ('后台处理中', '已生成完毕')):
                         break
+                else:
+                    raise RuntimeError('IF 产物等待超时，未重新提交生成；请在 IF 查看原会话')
             if result.get('status') in ('error', 'failed'):
                 raise RuntimeError('IF CLI 生成失败：' + str(result.get('error') or
                                    result.get('message') or result.get('planning_text') or
@@ -200,7 +188,8 @@ class Bridge(ThreadingHTTPServer):
                 self.jobs[job_id] = {'state': 'done', 'result': result}
         except (RuntimeError, KeyError, TypeError, ValueError) as exc:
             with self.lock:
-                self.jobs[job_id] = {'state': 'error', 'error': redact_cli_error(exc)}
+                self.jobs[job_id] = {'state': 'error', 'error': redact_cli_error(exc),
+                    'result': {'submitted_prompt': submitted_prompt} if submitted_prompt is not None else {}}
         finally:
             for path in asset_paths:
                 path.unlink(missing_ok=True)
