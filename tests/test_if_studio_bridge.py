@@ -313,7 +313,7 @@ class BridgeTest(unittest.TestCase):
                 self.assertFalse(asset_path.exists())
                 if args[:2] == ('canvas', 'run'):
                     self.assertNotIn('--image', args)
-                    self.assertEqual(args[-1], '图片1：https://example.com/uploaded.png\n\n生成需求：\ngenerate')
+                    self.assertEqual(args[-1], '图片1：https://example.com/uploaded.png\n\n使用模型：qwen-image-2.0\n\n生成需求：\ngenerate')
                     self.assertEqual(args[args.index('--model') + 1], 'qwen-image-2.0')
                     self.assertEqual(job['result']['submitted_prompt'], args[-1])
                     return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
@@ -348,6 +348,17 @@ class BridgeTest(unittest.TestCase):
                 ('running', 'IF 正在生成图片，等待产物'),
             ])
 
+    def test_model_header_without_references_matches_cli_model(self):
+        for kind, model in [('image', 'qwen-image-2.0'), ('video', 'Seedance 2.5')]:
+            with self.subTest(kind=kind), mock.patch.object(self.bridge, 'command', side_effect=[
+                    {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}, {'status': 'done'}]) as cli:
+                self.bridge.generate('model-' + kind, {'type': kind, 'model': model, 'prompt': '直接生成文件'})
+                prompt = f'使用模型：{model}\n\n生成需求：\n直接生成文件'
+                self.assertEqual(cli.call_args_list[0].args[-1], prompt)
+                args = cli.call_args_list[0].args
+                self.assertEqual(args[args.index('--model') + 1], model)
+                self.assertEqual(self.bridge.jobs['model-' + kind]['result']['submitted_prompt'], prompt)
+
     def test_uploaded_and_direct_cdn_references_are_checked_and_encoded_before_single_run(self):
         path = Path(self.bridge.workspace.name) / 'reference.webp'
         path.write_bytes(b'RIFFxxxxWEBP')
@@ -363,7 +374,7 @@ class BridgeTest(unittest.TestCase):
                 'prompt': '使用全部引用', 'image': original}, [path])
         job = self.bridge.jobs['encoded-reference']
         self.assertEqual(job['state'], 'done')
-        expected = f'图片1：{corrected}\n图片2：{corrected}\n\n生成需求：\n使用全部引用'
+        expected = f'图片1：{corrected}\n图片2：{corrected}\n\n使用模型：Minimax H3\n\n生成需求：\n使用全部引用'
         self.assertEqual(job['result']['submitted_prompt'], expected)
         self.assertEqual(cli.call_args_list[1].args[-1], expected)
         self.assertEqual([call.args[:2] for call in cli.call_args_list], [
@@ -411,7 +422,7 @@ class BridgeTest(unittest.TestCase):
         job = self.bridge.jobs['reuse']
         self.assertEqual(job['state'], 'done')
         self.assertEqual(job['result']['submitted_prompt'],
-                         f'图片1：{cached}\n视频1：{fresh}\n图片2：{cached}\n\n生成需求：\ntest')
+                         f'图片1：{cached}\n视频1：{fresh}\n图片2：{cached}\n\n使用模型：Minimax H3\n\n生成需求：\ntest')
         self.assertEqual([call.args[0] for call in cli.call_args_list], ['upload', 'canvas', 'canvas'])
         self.assertEqual(len(job['result']['reference_urls']), 3)
         self.assertFalse(path.exists())
@@ -499,7 +510,7 @@ class BridgeTest(unittest.TestCase):
                 self.assertFalse(path.exists())
                 if args[:2] == ('canvas', 'run'):
                     self.assertNotIn('--image', args)
-                    self.assertEqual(args[-1], '视频1：https://example.com/uploaded.mp4\n\n生成需求：\ngenerate')
+                    self.assertEqual(args[-1], '视频1：https://example.com/uploaded.mp4\n\n使用模型：Minimax H3\n\n生成需求：\ngenerate')
                     self.assertEqual(args[args.index('--model') + 1], 'Minimax H3')
                     return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
                 return {'status': 'done', 'downloaded': []}
@@ -646,10 +657,10 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(runs[0][runs[0].index('--model') + 1], 'qwen-image-2.0')
         expected = (f'图片1：https://example.com/{paths[0].name}\n'
                     f'图片2：https://example.com/{paths[1].name}\n'
-                    '图片3：https://example.com/third.png\n\n生成需求：\ngenerate')
+                    '图片3：https://example.com/third.png\n\n使用模型：qwen-image-2.0\n\n生成需求：\ngenerate')
         self.assertEqual(runs[0][-1], expected)
         self.assertEqual(job['result']['submitted_prompt'], expected)
-        self.assertNotIn('qwen-image-2.0', expected)
+        self.assertEqual(expected.count('使用模型：qwen-image-2.0'), 1)
         self.assertNotIn('--canvas-id', runs[0])
         self.assertEqual(calls[-1][calls[-1].index('--canvas-id') + 1], 'image-c')
         self.assertEqual(calls[-1][calls[-1].index('--session-id') + 1], 'image-s')
@@ -704,12 +715,12 @@ class BridgeTest(unittest.TestCase):
         self.assertNotIn('--image', runs[0])
         self.assertNotIn('--canvas-id', runs[0])
         expected = ('视频1：https://example.com/uploaded.mp4\n图片1：https://example.com/a.png\n'
-                    '图片2：https://example.com/b.png\n视频2：https://example.com/clip.mp4\n\n生成需求：\n最终生成视频')
+                    '图片2：https://example.com/b.png\n视频2：https://example.com/clip.mp4\n\n使用模型：Minimax H3\n\n生成需求：\n最终生成视频')
         self.assertEqual(runs[0][-1], expected)
         self.assertEqual(job['result']['submitted_prompt'], expected)
         self.assertEqual(runs[0][runs[0].index('--skill') + 1], '商品展示')
         self.assertEqual(runs[0][runs[0].index('--model') + 1], 'Minimax H3')
-        self.assertNotIn('Minimax H3', expected)
+        self.assertEqual(expected.count('使用模型：Minimax H3'), 1)
         self.assertIn('--create-only', runs[0])
         self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
         self.assertEqual(len([call for call in calls if call[:2] == ('canvas', 'poll')]), 1)
@@ -902,7 +913,7 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(cli.call_count, 2)
         self.assertEqual(self.bridge.jobs['poll-timeout']['state'], 'error')
         self.assertIn('未重新提交生成', self.bridge.jobs['poll-timeout']['error'])
-        self.assertEqual(self.bridge.jobs['poll-timeout']['result']['submitted_prompt'], '生成视频')
+        self.assertEqual(self.bridge.jobs['poll-timeout']['result']['submitted_prompt'], '使用模型：Minimax H3\n\n生成需求：\n生成视频')
 
     def test_structured_cli_errors_redact_credentials(self):
         with mock.patch.object(self.bridge, 'command', return_value={
@@ -965,7 +976,7 @@ class BridgeTest(unittest.TestCase):
             calls.append(args)
             if args[:2] == ('canvas', 'run'):
                 self.assertNotIn('--image', args)
-                self.assertEqual(args[-1], f'图片1：{reference}\n\n生成需求：\ngenerate')
+                self.assertEqual(args[-1], f'图片1：{reference}\n\n使用模型：qwen-image-2.0\n\n生成需求：\ngenerate')
                 return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
             return {'status': 'done', 'downloaded': []}
 
@@ -979,7 +990,7 @@ class BridgeTest(unittest.TestCase):
                 time.sleep(.01)
             self.assertEqual(job['state'], 'done')
         self.assertEqual(sum(call[:2] == ('canvas', 'run') for call in calls), 1)
-        self.assertEqual(job['result']['submitted_prompt'], f'图片1：{reference}\n\n生成需求：\ngenerate')
+        self.assertEqual(job['result']['submitted_prompt'], f'图片1：{reference}\n\n使用模型：qwen-image-2.0\n\n生成需求：\ngenerate')
         self.assertFalse(any(call[0] == 'upload' for call in calls))
         self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
 

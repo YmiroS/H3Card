@@ -207,7 +207,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done',
             ...(emitReferenceURLs ? {reference_urls:resultReferences(runs.at(-1))} : {}),
             ...(runs.at(-1).references?.length > 1 ? {submitted_prompt:
-              '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n生成需求：\n' + runs.at(-1).prompt} : {}),
+              '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n使用模型：' + runs.at(-1).model + '\n\n生成需求：\n' + runs.at(-1).prompt} : {}),
             planning_text:returnVideoStoryboard || returnVideoPlanOnly ? '请确认这张故事板，再生成下一张图片' : '',
             downloaded:returnVideoPlanOnly ? [] : [{index:0, type:returnVideoStoryboard ? 'image' : runs.at(-1).type,
               name:runs.at(-1).type === 'image' || returnVideoStoryboard ? 'result.png' : 'result.mp4'}]}}
@@ -327,10 +327,12 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         assert.equal(await page.locator('#respop .image-advanced').count(), 0);
         await page.evaluate(() => { PROJ.cards[0].params.seed = 42; PROJ.cards[0].params.if_skill = '旧版技能'; });
       } else {
-        assert.equal(await rows.count(), 4);
+        assert.equal(await rows.count(), 1);
+        assert.doesNotMatch(await page.locator('#respop').innerText(), /种子|IF 技能|HTTPS/);
+        assert.deepEqual(capabilities.if_video.inputs.map(input => input.key), ['prompt', 'aspect_ratio', 'megapixels', 'duration']);
         await rows.filter({hasText:'时长'}).locator('input[type="number"]').fill('12');
-        await rows.filter({hasText:'种子'}).locator('input[type="number"]').fill('42');
-        await rows.filter({hasText:'IF 技能'}).locator('input').fill('商品展示');
+        await page.evaluate(() => Object.assign(PROJ.cards[0].params,
+          {seed:42, if_skill:'旧版技能', if_reference:'https://example.com/obsolete.mp4'}));
       }
       await page.locator('#respop .x').click();
       await page.locator('#panel .pblock textarea').first().fill('蓝色圆形');
@@ -344,10 +346,13 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       }
       await page.waitForFunction(() => PROJ.cards[0].status === 'done');
       assert.equal(await page.locator('.card .body .load').count(), 0);
-      const videoDirective = `最终交付必须是视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n`;
+      const directive = kind === 'video'
+        ? '最终交付必须是视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下参数要求为准。'
+        : '最终交付必须是图片文件，不是故事板或文字方案。用户已经确认生成需求，请直接生成图片；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为视频或文字方案。以本条图片目标和以下参数要求为准。';
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen,
-        prompt:`${kind === 'video' ? videoDirective : ''}蓝色圆形\n\n生成规格（作为内容要求）：分辨率 ${kind === 'image' ? '1440×1080' : '736×544，视频时长约 12 秒，随机种子参考 42'}。`,
-        references:[{kind, asset_id:referenceId}], ...(kind === 'video' ? {skill:'商品展示'} : {})});
+        prompt:`${directive}\n\n蓝色圆形\n\n分辨率：${kind === 'image' ? '1440×1080' : '736×544\n时长：12s\n画面比例：4 : 3'}`,
+        references:[{kind, asset_id:referenceId}]});
+      assert.doesNotMatch(runs.at(-1).prompt, /生成规格|随机种子/);
       assert.equal(uploadedReferences.length, kind === 'image' ? 1 : 2);
       assert.equal(uploadedReferences.at(-1).type, kind === 'image' ? 'image/png' : 'video/mp4');
       assert.deepEqual(uploadedReferences.at(-1).body, kind === 'image' ? png : Buffer.from('fake-video'));
@@ -424,7 +429,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       ['image/png', 'image/png', 'video/mp4', 'video/mp4']);
     assert.equal(await page.evaluate(() => PROJ.cards[0].history.find(h => h.job === 'bridge-5')
       .prompts.find(p => p.key === 'if_submitted').text),
-      '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n生成需求：\n' + runs.at(-1).prompt);
+      '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n使用模型：' + runs.at(-1).model + '\n\n生成需求：\n' + runs.at(-1).prompt);
     let uploadAttempts = 0;
     const deletedAssets = [];
     await page.route('http://127.0.0.1:8278/**', route => {
@@ -582,7 +587,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         await page.locator('#panel .go').click();
         await page.waitForFunction(count => PROJ.cards[0].status === 'done'
           && PROJ.cards[0].job === 'bridge-' + (count + 1), runCount);
-        assert.match(runs.at(-1).prompt, new RegExp(`视频时长约 ${seconds} 秒`));
+        assert.match(runs.at(-1).prompt, new RegExp(`时长：${seconds}s`));
         assert.equal(runs.at(-1).model, name);
       }
     }

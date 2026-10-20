@@ -177,9 +177,9 @@ class Bridge(ThreadingHTTPServer):
                     with self.lock:
                         self.jobs[job_id]['result'] = dict(reference_result)
                 reference_lines.append(f'{media}{counts[media]}：{reference}')
-            prompt = request['prompt']
+            prompt = f"使用模型：{request['model']}\n\n生成需求：\n{request['prompt']}"
             if reference_lines:
-                prompt = '\n'.join(reference_lines) + '\n\n生成需求：\n' + prompt
+                prompt = '\n'.join(reference_lines) + '\n\n' + prompt
             submitted_prompt = prompt
             canvas_id, session_id = request.get('canvas_id'), request.get('session_id')
             flags = ['canvas', 'run', '--profile', 'buc', '--json', '--create-only', '--model', request['model']]
