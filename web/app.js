@@ -248,7 +248,7 @@ function restoreIFTask(c, projectId) {
   if (!state || state.cap !== c.cap || !Number.isFinite(state.if_started)
       || !['preparing', 'submitting', 'running', 'done', 'error'].includes(state.phase)) return false;
   if ((c.if_started || 0) > state.if_started || (c.if_started === state.if_started
-      && c.job === state.job && ['done', 'error'].includes(c.status))) {
+      && ((c.job && c.job !== state.job) || (c.job === state.job && ['done', 'error'].includes(c.status))))) {
     try { sessionStorage.removeItem(key); } catch {}
     return false;
   }
@@ -2156,8 +2156,26 @@ function applyCollaborativeProject(project) {
     return;
   }
   const panelOpen = el.panel.style.display !== "none";
+  const recoveredIFTasks = [];
+  const activeIF = new Map(PROJ.cards.filter(card => isIF(card)
+    && ["queued", "running"].includes(card.status) && Number.isFinite(card.if_started))
+    .map(card => [card.id, card]));
   PROJ.name = project.name;
-  PROJ.cards = project.cards || [];
+  PROJ.cards = (project.cards || []).map(card => {
+    const active = activeIF.get(card.id);
+    const sameAttempt = active && card.if_started === active.if_started && card.job === active.job;
+    if (active && card.cap === active.cap && (card.if_started || 0) <= active.if_started
+        && !(card.if_started === active.if_started && card.job && active.job && card.job !== active.job)
+        && !(sameAttempt && ["done", "error"].includes(card.status))) {
+      // 上传与轮询闭包仍持有旧对象；协作快照只能更新布局，不能断开当前任务。
+      const runtime = Object.fromEntries(["params", "assets", "job", "status", "step", "error", "progress",
+        "if_started", "if_job_cap", "if_canvas_url", "ms", "outputs", "history", "_ifPolling"]
+        .map(key => [key, active[key]]));
+      return Object.assign(active, card, runtime);
+    }
+    if (restoreIFTask(card, project.id)) recoveredIFTasks.push(card);
+    return card;
+  });
   PROJ.edges = project.edges || [];
   PROJ.groups = project.groups || [];
   PROJ.rev = project.rev;
@@ -2170,6 +2188,13 @@ function applyCollaborativeProject(project) {
   selIds = new Set([...selIds].filter(id => PROJ.cards.some(card => card.id === id)));
   el.ptitle.textContent = PROJ.name;
   render();
+  for (const card of PROJ.cards) {
+    if (activeIF.get(card.id) !== card && isIF(card) && card.job && card.status === "running")
+      pollIF(card, PROJ.id);
+  }
+  if (recoveredIFTasks.length && canSave() && !PROJ.locked) {
+    for (const card of recoveredIFTasks) saveIFTaskProject(card, PROJ.id);
+  }
   if (!NODE_EDITOR) {
     if (panelOpen && selId) openPanel(selId);
     else if (!selId) closePanel();

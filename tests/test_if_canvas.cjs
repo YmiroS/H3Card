@@ -58,6 +58,88 @@ test('IF canvas links preserve full IDs and reject unsafe destinations', () => {
   for (const bad of ['', '../bad', 'c_bad/other', 'c_bad?token=x', 'c_bad#fragment', null])
     assert.equal(normalize({canvas_id:bad}), '');
 });
+test('IF collaboration preserves active attempts and respects terminal, newer and deleted cards', () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const journal = source.slice(source.indexOf('function ifTaskKey('), source.indexOf('async function saveIFTaskProject('));
+  const apply = source.slice(source.indexOf('function applyCollaborativeProject('), source.indexOf('function flushPendingProjectSync('));
+  const make = (status = 'running') => {
+    const active = {id:'c1', cap:'if_video', job:status === 'queued' ? null : 'job-1', status,
+      if_started:100, params:{prompt:'keep input'}, assets:{}, step:'正在生成', history:[], outputs:[]};
+    const storage = new Map(), polls = [];
+    const ctx = vm.createContext({PROJ:{id:'p1', rev:1, cards:[active]}, H3Auth:{user:{id:'u1'}},
+      sessionStorage:{getItem:key=>storage.get(key) ?? null, setItem:(key,value)=>storage.set(key,value), removeItem:key=>storage.delete(key)},
+      isIF:c=>c.cap === 'if_video', canSave:()=>false, NODE_EDITOR:false, saveTimer:null, contentSaving:false,
+      pendingContentSaves:0, pendingCardCreates:0, pendingDirectorRuns:0, pendingNodeWork:new Set(),
+      localFlushes:0, pendingProjectSync:null, el:{panel:{style:{display:'none'}}, ptitle:{}},
+      selId:null, selIds:new Set(), resetCanvasHistory(){}, seedHistory(){}, render(){}, closePanel(){},
+      pollIF:c=>{if (!c._ifPolling) polls.push(c.job);}});
+    vm.runInContext(journal + apply, ctx);
+    return {active, ctx, polls, apply:cards=>ctx.applyCollaborativeProject({id:'p1', rev:ctx.PROJ.rev+1, cards})};
+  };
+  for (const phase of ['preparing', 'submitting', 'running']) {
+    const t = make(phase === 'running' ? 'running' : 'queued');
+    t.ctx.rememberIFTask(t.active, 'p1', phase);
+    t.active._ifPolling = phase === 'running';
+    t.apply([{...t.active, params:{prompt:'remote old input'}, job:null, status:'idle', x:400, _ifPolling:undefined}]);
+    assert.equal(t.ctx.PROJ.cards[0], t.active, phase);
+    assert.equal(t.active.params.prompt, 'keep input', phase);
+    assert.equal(t.active.status, phase === 'running' ? 'running' : 'queued', phase);
+    assert.equal(t.active.x, 400);
+    assert.equal(t.active._ifPolling, phase === 'running');
+    assert.equal(t.polls.length, 0, 'an in-flight poll must not be duplicated');
+  }
+  const waitingPoll = make();
+  waitingPoll.active._ifPolling = false;
+  waitingPoll.apply([{...waitingPoll.active}]);
+  assert.equal(waitingPoll.ctx.PROJ.cards[0], waitingPoll.active);
+  assert.equal(waitingPoll.polls.length, 0, 'preserved cards retain their scheduled polling loop');
+  const finished = make();
+  finished.ctx.rememberIFTask(finished.active, 'p1', 'running');
+  finished.apply([{...finished.active, status:'done', outputs:[{url:'/finished.mp4'}]}]);
+  assert.equal(finished.ctx.PROJ.cards[0].status, 'done');
+  assert.equal(finished.polls.length, 0);
+  const newer = make();
+  newer.ctx.rememberIFTask(newer.active, 'p1', 'running');
+  newer.apply([{...newer.active, if_started:200, job:'job-2'}]);
+  assert.equal(newer.ctx.PROJ.cards[0].job, 'job-2');
+  assert.notEqual(newer.ctx.PROJ.cards[0], newer.active);
+  assert.deepEqual(newer.polls, ['job-2']);
+  for (const status of ['running', 'done']) {
+    const conflict = make();
+    conflict.ctx.rememberIFTask(conflict.active, 'p1', 'running');
+    conflict.apply([{...conflict.active, job:'job-2', status, outputs:[{url:'/remote.mp4'}]}]);
+    assert.equal(conflict.ctx.PROJ.cards[0].job, 'job-2');
+    assert.equal(conflict.ctx.PROJ.cards[0].status, status);
+    assert.equal(conflict.ctx.PROJ.cards[0].outputs[0].url, '/remote.mp4');
+    assert.deepEqual(conflict.polls, status === 'running' ? ['job-2'] : []);
+    assert.equal(conflict.ctx.sessionStorage.getItem(conflict.ctx.ifTaskKey(conflict.active, 'p1')), null);
+  }
+  const accepted = make('queued');
+  accepted.ctx.rememberIFTask(accepted.active, 'p1', 'submitting');
+  accepted.ctx.PROJ.cards = [];
+  accepted.apply([{...accepted.active, job:'accepted-job', status:'running'}]);
+  assert.equal(accepted.ctx.PROJ.cards[0].job, 'accepted-job', 'accepted server job beats a pre-acceptance journal');
+  assert.equal(accepted.ctx.PROJ.cards[0].status, 'running');
+  const deleted = make();
+  deleted.ctx.rememberIFTask(deleted.active, 'p1', 'running');
+  deleted.apply([]);
+  assert.equal(deleted.ctx.PROJ.cards.length, 0);
+  const changedMode = make();
+  changedMode.ctx.rememberIFTask(changedMode.active, 'p1', 'running');
+  changedMode.apply([{id:'c1', cap:'local_video', status:'idle'}]);
+  assert.equal(changedMode.ctx.PROJ.cards[0].cap, 'local_video');
+  assert.equal(changedMode.polls.length, 0);
+  for (const status of ['running', 'done']) {
+    const recovered = make(status);
+    recovered.active.outputs = [{url:'/recover.mp4'}];
+    recovered.ctx.rememberIFTask(recovered.active, 'p1', status);
+    recovered.ctx.PROJ.cards = [{id:'c1', cap:'if_video', status:'idle'}];
+    recovered.apply([{id:'c1', cap:'if_video', status:'idle'}]);
+    assert.equal(recovered.ctx.PROJ.cards[0].status, status);
+    assert.equal(recovered.ctx.PROJ.cards[0].outputs[0].url, '/recover.mp4');
+    assert.equal(recovered.polls.length, status === 'running' ? 1 : 0);
+  }
+});
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 
 const card = (kind, model) => ({id:'if-card', type:kind === 'image' ? 'card_image' : 'card_video',
@@ -844,6 +926,17 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.ok(ifPollCount > pollsBeforeRefresh, 'refresh must query the original bridge task');
     assert.equal(runs.length, beforeRecovery + 1, 'recovery must never resubmit generation');
     assert.match(await page.locator('.card .cf .st').first().innerText(), /正在上传 IF 引用素材/);
+    const afterCollaboration = await page.evaluate(async remote => {
+      await saveChain;
+      const active = PROJ.cards[0];
+      remote.rev = PROJ.rev + 1;
+      remote.name = '协作者修改了画布名称';
+      applyCollaborativeProject(remote);
+      return {job:PROJ.cards[0].job, status:PROJ.cards[0].status,
+        sameCard:PROJ.cards[0] === active, name:PROJ.name};
+    }, project);
+    assert.deepEqual(afterCollaboration, {job:recoveringJob, status:'running', sameCard:true,
+      name:'协作者修改了画布名称'}, 'collaboration reconnect must not replace the recovered IF task with a stale snapshot');
     heldIFStep = 'IF 正在生成视频，等待产物';
     await page.waitForFunction(() => PROJ.cards[0].step === 'IF 正在生成视频，等待产物');
     await page.reload();
