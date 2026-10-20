@@ -16,7 +16,8 @@ test('IF reference matrix covers every known model and never exceeds provider li
   for (const [name, limit] of Object.entries(ifModelLimits)) {
     assert.ok(['image', 'video'].includes(limit.type), name);
     for (const kind of ['image', 'video', 'audio']) {
-      assert.ok(limit.bridge[kind] === 0 || limit.bridge[kind] === 1, `${name}: ${kind}`);
+      assert.ok(Number.isInteger(limit.bridge[kind]) && limit.bridge[kind] >= 0, `${name}: ${kind}`);
+      if (limit.type === 'image') assert.ok(limit.bridge[kind] <= 1, `${name}: ${kind}`);
       if (limit.api[kind] !== null) assert.ok(limit.bridge[kind] <= limit.api[kind], `${name}: ${kind}`);
     }
     assert.equal(limit.bridge.audio, 0, name);
@@ -82,12 +83,16 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     page.on('pageerror', error => pageErrors.push(error.message));
     await page.route('http://127.0.0.1:8278/**', route => {
       const request = route.request(), url = new URL(request.url());
-      const headers = {'Access-Control-Allow-Origin':origin, 'Access-Control-Allow-Methods':'GET, POST, OPTIONS',
+      const headers = {'Access-Control-Allow-Origin':origin, 'Access-Control-Allow-Methods':'GET, POST, DELETE, OPTIONS',
         'Access-Control-Allow-Headers':'Content-Type, X-Chouka-IF', 'Access-Control-Allow-Private-Network':'true'};
       if (request.method() === 'OPTIONS') return route.fulfill({status:204, headers});
+      if (request.method() === 'DELETE' && url.pathname.startsWith('/assets/'))
+        return route.fulfill({status:200, headers, contentType:'application/json', body:'{"ok":true}'});
       if (url.pathname === '/assets') {
         uploadedReferences.push({type:request.headers()['content-type'], body:request.postDataBuffer()});
-        return route.fulfill({status:201, headers, contentType:'application/json', body:JSON.stringify({asset_id:referenceId})});
+        const asset_id = uploadedReferences.length <= 2 ? referenceId
+          : 'b'.repeat(31) + uploadedReferences.length;
+        return route.fulfill({status:201, headers, contentType:'application/json', body:JSON.stringify({asset_id})});
       }
       if (url.pathname.endsWith('/media/0')) {
         const kind = runs.at(-1).type;
@@ -106,6 +111,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         : url.pathname === '/runs' && request.method() === 'POST'
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done',
+            ...(runs.at(-1).asset_ids?.length > 1 ? {submitted_prompt:
+              '基于以上已登记的全部参考素材（图片1、图片2、视频1、视频2），执行以下总需求：\n\n' + runs.at(-1).prompt} : {}),
             planning_text:returnVideoStoryboard || returnVideoPlanOnly ? '请确认这张故事板，再生成下一张图片' : '',
             downloaded:returnVideoPlanOnly ? [] : [{index:0, type:returnVideoStoryboard ? 'image' : runs.at(-1).type,
               name:runs.at(-1).type === 'image' || returnVideoStoryboard ? 'result.png' : 'result.mp4'}]}}
@@ -155,11 +162,11 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       const summary = await page.locator('#panel .pbody').innerText();
       if (kind === 'video') {
         assert.match(summary, /供应商 API 资料（并非 IF 引用上限）/);
-        assert.match(summary, /当前画布可提交图片或视频共 1 项/);
+        assert.match(summary, /画布按各类型上限开放图片 10／视频 5槽位/);
         assert.doesNotMatch(summary, /官方 API 同名模型\/家族参考上限/);
       } else assert.match(summary, /官方 API 同名模型\/家族参考上限/);
       assert.equal(await page.evaluate(() => PROJ.edges[0].slot), kind === 'image' ? 'images[0]' : 'video[0]');
-      assert.match(await page.locator('#panel .refhead').innerText(), kind === 'image' ? /图片 1/ : /视频 1/);
+      assert.match(await page.locator('#panel .refhead').innerText(), kind === 'image' ? /图片 1/ : /图片 10 · 视频 5/);
       await modelButton.click();
       await page.locator('#menu button').filter({hasText:unsupported}).click();
       assert.equal(await page.evaluate(() => PROJ.cards[0].params.if_model), unsupported);
@@ -173,8 +180,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           }
           const estimate = await page.locator('#panel .pbody').innerText();
           assert.match(estimate, /H3 全能参考高质量估算（未核实该模型上限）：图片 9（H3 估算） · 视频 3（H3 估算） · 音频 3（H3 估算）/);
-          assert.match(estimate, /画布按 H3 估算开放图片或视频槽位，每次只能提交其中 1 项/);
-          assert.match((await page.locator('#panel .refhead').allTextContents()).join(' '), /视频 1/);
+          assert.match(estimate, /画布按 H3 估算开放图片 9／视频 3槽位，模型能否接收仍待实测/);
+          assert.match((await page.locator('#panel .refhead').allTextContents()).join(' '), /图片 9 · 视频 3/);
           assert.equal(await page.evaluate(() => PROJ.edges.length), 1);
         }
       } else {
@@ -218,7 +225,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       const videoDirective = `最终交付必须是由「${chosen}」生成的视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n`;
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen,
         prompt:`${kind === 'video' ? videoDirective : ''}蓝色圆形\n\n生成规格（作为内容要求）：分辨率 ${kind === 'image' ? '1440×1080' : '736×544，视频时长约 12 秒，随机种子参考 42'}。`,
-        asset_id:referenceId, ...(kind === 'video' ? {skill:'商品展示'} : {})});
+        ...(kind === 'video' ? {asset_ids:[referenceId], skill:'商品展示'} : {asset_id:referenceId})});
       assert.equal(uploadedReferences.length, kind === 'image' ? 1 : 2);
       assert.equal(uploadedReferences.at(-1).type, kind === 'image' ? 'image/png' : 'video/mp4');
       assert.deepEqual(uploadedReferences.at(-1).body, kind === 'image' ? png : Buffer.from('fake-video'));
@@ -274,7 +281,44 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       kling: capOf({cap:'if_video', params:{if_model:'可灵3.0 Omni'}}).inputs.filter(s => MEDIA.includes(s.type)).length,
       wanApi: ifModelLimits['Wan3.0视频'].api,
       wanBridge: ifModelLimits['Wan3.0视频'].bridge,
-    })), {textOnly:0, unknown:2, kling:2, wanApi:{image:10, video:5, audio:5}, wanBridge:{image:1, video:1, audio:0}});
+    })), {textOnly:0, unknown:12, kling:12, wanApi:{image:10, video:5, audio:5}, wanBridge:{image:10, video:5, audio:0}});
+    returnVideoStoryboard = false; returnVideoPlanOnly = false;
+    const beforeMulti = uploadedReferences.length;
+    await page.evaluate(async () => linkTo(PROJ.cards[1], PROJ.cards[0]));
+    assert.deepEqual(await page.evaluate(() => PROJ.edges.map(edge => edge.slot)), ['video[0]', 'video[1]']);
+    await page.evaluate(() => {
+      const c = PROJ.cards[0];
+      c.assets['images[0]'] = {kind:'image', url:'/fixture.png'};
+      c.assets['images[1]'] = {kind:'image', url:'/fixture.png'};
+      openPanel(c.id);
+    });
+    assert.match(await page.locator('#panel .refhead').innerText(), /图片 10 · 视频 5/);
+    await page.locator('#panel .pblock textarea').first().fill('结合全部素材生成视频');
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].job === 'bridge-5' && PROJ.cards[0].status === 'done');
+    assert.deepEqual(runs.at(-1).asset_ids,
+      [1, 2, 3, 4].map(n => 'b'.repeat(31) + (beforeMulti + n)));
+    assert.deepEqual(uploadedReferences.slice(-4).map(item => item.type),
+      ['image/png', 'image/png', 'video/mp4', 'video/mp4']);
+    assert.equal(await page.evaluate(() => PROJ.cards[0].history.find(h => h.job === 'bridge-5')
+      .prompts.find(p => p.key === 'if_submitted').text),
+      '基于以上已登记的全部参考素材（图片1、图片2、视频1、视频2），执行以下总需求：\n\n' + runs.at(-1).prompt);
+    let uploadAttempts = 0;
+    const deletedAssets = [];
+    await page.route('http://127.0.0.1:8278/**', route => {
+      const request = route.request(), pathname = new URL(request.url()).pathname;
+      if (request.method() === 'POST' && pathname === '/assets' && ++uploadAttempts === 2)
+        return route.fulfill({status:429, contentType:'application/json',
+          headers:{'Access-Control-Allow-Origin':origin}, body:'{"error":"模拟素材容量不足"}'});
+      if (request.method() === 'DELETE' && pathname.startsWith('/assets/'))
+        deletedAssets.push(pathname);
+      return route.fallback();
+    });
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /模拟素材容量不足/);
+    assert.deepEqual(deletedAssets, ['/assets/' + 'b'.repeat(31) + uploadedReferences.length]);
+    assert.equal(runs.length, 5, 'failed multi-reference upload must not submit a job');
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {
