@@ -49,6 +49,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
   let returnVideoStoryboard = false;
   let returnVideoPlanOnly = false;
   let emitReferenceURLs = false, reuseFailure = null;
+  let rejectProjectSaves = false, rejectSavesAfterSubmit = false, heldIFStep = null;
+  let ifPollCount = 0;
   const sourceVersions = new Map(), sourceReads = [], deniedSources = new Set();
   const sourceVersion = source => '"' + createHash('sha256').update(source + ':' + (sourceVersions.get(source) || 1)).digest('hex') + '"';
   const resultReferences = run => (run.references || []).map((item, index) => ({index, kind:item.kind,
@@ -69,6 +71,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     if (pathname === '/api/projects') return json(res, {projects:[{...project, cards:1}]});
     if (pathname === '/api/projects/if-test' && req.method === 'GET') return json(res, project);
     if (pathname === '/api/projects/if-test' && req.method === 'PUT') {
+      if (rejectProjectSaves) {req.resume(); res.statusCode = 503; return json(res, {error:'模拟项目保存失败'});}
       const chunks = [];
       req.on('data', chunk => chunks.push(chunk));
       req.on('end', () => {const next = JSON.parse(Buffer.concat(chunks));
@@ -150,8 +153,11 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           && await page.evaluate(() => PROJ?.cards[0]?.status === 'queued'))
         await checkBusy(/^正在连接本机 IF 并读取模型$/);
       if (url.pathname === '/runs' && request.method() === 'POST') await checkBusy(/^正在交由本机 IF 桥接处理$/);
-      if (url.pathname === '/runs/bridge-1' && firstRunPolls === 0)
+      if (url.pathname === '/runs/bridge-1' && firstRunPolls === 0) {
+        assert.equal(project.cards[0].job, 'bridge-1', 'persist the accepted task before polling starts');
+        assert.equal(project.cards[0].status, 'running');
         await checkBusy(/^本机 IF 正在准备生成任务$/);
+      }
       if (url.pathname === '/runs/bridge-1' && firstRunPolls < 3) {
         const states = [{state:'starting', step:'正在上传 IF 引用素材（1/1）'},
           {state:'starting', step:'正在向 IF 一次提交全部引用与图片生成需求'},
@@ -182,6 +188,13 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         return route.fulfill({status:200, headers, contentType:'application/json',
           body:JSON.stringify({state:'error', error:'模拟 IF 引用或生成失败', result})});
       }
+      if (url.pathname === '/runs' && request.method() === 'POST' && rejectSavesAfterSubmit)
+        rejectProjectSaves = true;
+      if (/^\/runs\/bridge-\d+$/.test(url.pathname)) {
+        ifPollCount++;
+        if (heldIFStep) return route.fulfill({status:200, headers, contentType:'application/json',
+          body:JSON.stringify({state:'running', step:heldIFStep, result:{reference_urls:resultReferences(runs.at(-1))}})});
+      }
       const result = url.pathname === '/status' ? {ready:true, reference_reuse:true}
         : url.pathname === '/models' ? {models:[{display_name:'qwen-image-3.0', type:'image'},
           {display_name:'qwen-image-2.0', type:'image'}, {display_name:'z-image-turbo', type:'image'},
@@ -204,6 +217,10 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
 
     for (const [kind, initial, chosen, modeTitle] of [
       ['image', 'qwen-image-2.0', 'qwen-image-3.0', '生图模式'], ['video', 'Minimax H3', 'Wan3.0视频', '生视频模式']]) {
+      if (kind === 'video') {
+        await page.waitForFunction(() => !PROJ.cards[0]._ifPolling);
+        await page.evaluate(() => saveChain);
+      }
       const original = card(kind, initial);
       original.cap = kind === 'image' ? 'zimage_t2i' : 'minimax_h3_character_transfer';
       const asset = {id:'asset-src', type:'card_asset', cap:'asset', x:20, y:20, params:{}, assets:{},
@@ -424,6 +441,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /模拟素材容量不足/);
     assert.deepEqual(deletedAssets, ['/assets/' + 'b'.repeat(31) + uploadedReferences.length]);
     assert.equal(runs.length, 5, 'failed multi-reference upload must not submit a job');
+    await page.evaluate(() => saveChain);
     project = {...project, cards:[card('image', 'qwen-image-3.0'),
       {id:'image-src', type:'card_asset', cap:'asset', x:20, y:20, params:{}, assets:{},
         outputs:[{kind:'image', url:'/fixture.png', ref:'image.png'}]}], edges:[]};
@@ -711,6 +729,127 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       return {cached:state.entries.length, isolated:[otherCard, otherProject, otherUser].map(s => s.entries.length),
         keys:new Set([state, otherCard, otherProject, otherUser].map(s => s.key)).size};
     }), {cached:2, isolated:[0, 0, 0], keys:4});
+    await page.evaluate(async () => {
+      await saveChain;
+      const c = PROJ.cards[0]; c.assets = {}; PROJ.edges = [];
+      c.params = {if_model:'Wan3.0视频', prompt:'刷新恢复原任务', duration:8};
+      openPanel(c.id);
+    });
+    heldIFStep = '正在上传 IF 引用素材（1/2）'; rejectSavesAfterSubmit = true;
+    const beforeRecovery = runs.length;
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].status === 'running'
+      && PROJ.cards[0].step === '正在上传 IF 引用素材（1/2）');
+    const recoveringJob = await page.evaluate(() => PROJ.cards[0].job);
+    assert.equal(runs.length, beforeRecovery + 1);
+    assert.equal(project.cards[0].job, null, 'server failed to save the accepted task ID');
+    assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem(ifTaskKey(PROJ.cards[0], PROJ.id))).job), recoveringJob);
+    let pollsBeforeRefresh = ifPollCount;
+    await page.reload();
+    await page.waitForFunction(job => PROJ?.cards[0]?.job === job && PROJ.cards[0].status === 'running'
+      && PROJ.cards[0].step === '正在上传 IF 引用素材（1/2）' && !PROJ.cards[0]._ifPolling, recoveringJob);
+    assert.ok(ifPollCount > pollsBeforeRefresh, 'refresh must query the original bridge task');
+    assert.equal(runs.length, beforeRecovery + 1, 'recovery must never resubmit generation');
+    assert.match(await page.locator('.card .cf .st').first().innerText(), /正在上传 IF 引用素材/);
+    heldIFStep = 'IF 正在生成视频，等待产物';
+    await page.waitForFunction(() => PROJ.cards[0].step === 'IF 正在生成视频，等待产物');
+    await page.reload();
+    await page.waitForFunction(job => PROJ?.cards[0]?.job === job && PROJ.cards[0].status === 'running'
+      && PROJ.cards[0].step === 'IF 正在生成视频，等待产物', recoveringJob);
+    assert.equal(runs.length, beforeRecovery + 1);
+    heldIFStep = null;
+    await page.waitForFunction(() => PROJ.cards[0].status === 'done' && !PROJ.cards[0]._ifPolling);
+    await page.evaluate(() => saveChain);
+    assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem(ifTaskKey(PROJ.cards[0], PROJ.id))).phase), 'done');
+    const completedOutputs = await page.evaluate(() => PROJ.cards[0].outputs);
+    pollsBeforeRefresh = ifPollCount;
+    await page.reload();
+    await page.waitForFunction(job => PROJ?.cards[0]?.job === job && PROJ.cards[0].status === 'done', recoveringJob);
+    assert.deepEqual(await page.evaluate(() => PROJ.cards[0].outputs), completedOutputs,
+      'completed media must survive refresh while server saves fail');
+    assert.equal(ifPollCount, pollsBeforeRefresh, 'restoring completion must not download outputs again');
+    assert.equal(runs.length, beforeRecovery + 1);
+    rejectProjectSaves = false; rejectSavesAfterSubmit = false;
+    assert.equal(await page.evaluate(async () => (await saveIFTaskProject(PROJ.cards[0], PROJ.id)).ok), true);
+    assert.equal(project.cards[0].job, recoveringJob);
+    assert.equal(project.cards[0].status, 'done');
+    assert.equal(await page.evaluate(() => sessionStorage.getItem(ifTaskKey(PROJ.cards[0], PROJ.id))), null,
+      'clear the recovery record only after the terminal state is saved');
+    for (const phase of ['preparing', 'submitting']) {
+      const before = runs.length;
+      await page.evaluate(phase => {
+        const original = ifRequest;
+        ifRequest = (path, options) => {
+          if (path !== (phase === 'preparing' ? '/models' : '/runs')) return original(path, options);
+          window.ifTestHeld = phase;
+          return new Promise(() => {});
+        };
+        openPanel(PROJ.cards[0].id);
+      }, phase);
+      await page.locator('#panel .go').click();
+      await page.waitForFunction(phase => {
+        const c = PROJ.cards[0], state = JSON.parse(sessionStorage.getItem(ifTaskKey(c, PROJ.id)));
+        return c.status === 'queued' && state?.phase === phase && window.ifTestHeld === phase;
+      }, phase);
+      await page.evaluate(() => saveChain);
+      await page.reload();
+      await page.waitForFunction(() => PROJ?.cards[0]?.status === 'error');
+      assert.match(await page.evaluate(() => PROJ.cards[0].error), phase === 'preparing'
+        ? /素材准备.*中断.*尚未提交 IF/ : /提交结果尚未确认.*避免重复生成/);
+      assert.equal(runs.length, before, 'interrupted preparation or unconfirmed submission must not auto-generate');
+      assert.equal(await page.evaluate(() => PROJ.cards[0].job), null);
+      await page.evaluate(() => saveChain);
+    }
+    rejectProjectSaves = true;
+    const beforeSaveFailure = runs.length;
+    await page.evaluate(() => openPanel(PROJ.cards[0].id));
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].status === 'error'
+      && PROJ.cards[0].error.startsWith('任务准备状态保存失败'));
+    assert.equal(runs.length, beforeSaveFailure, 'do not create a paid task when initial persistence fails');
+    rejectProjectSaves = false;
+    await page.evaluate(async () => {
+      await saveChain;
+      const original = ifRequest;
+      ifRequest = (path, options) => path === '/runs'
+        ? Promise.reject(new TypeError('Failed to fetch')) : original(path, options);
+      await runIF(PROJ.cards[0]);
+    });
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /提交结果尚未确认.*避免重复生成/);
+    assert.equal(runs.length, beforeSaveFailure);
+    assert.deepEqual(await page.evaluate(() => {
+      const c = PROJ.cards[0], base = {...plain(c), status:'running', job:'old-job', if_started:100, step:'旧进度'};
+      rememberIFTask(base, PROJ.id, 'running');
+      const newer = {...base, if_started:200, job:'new-job', status:'done', step:''};
+      const restored = restoreIFTask(newer, PROJ.id);
+      const otherProject = ifTaskKey(c, 'other-project');
+      const otherCard = ifTaskKey({...c, id:'other-card'}, PROJ.id);
+      const ownKey = ifTaskKey(c, PROJ.id);
+      const user = Object.getOwnPropertyDescriptor(H3Auth, 'user');
+      Object.defineProperty(H3Auth, 'user', {configurable:true, value:{id:'other-user'}});
+      const otherUser = ifTaskKey(c, PROJ.id);
+      Object.defineProperty(H3Auth, 'user', user);
+      return {restored, job:newer.job, status:newer.status, keys:new Set([ownKey, otherProject, otherCard, otherUser]).size};
+    }), {restored:false, job:'new-job', status:'done', keys:4});
+    assert.deepEqual(await page.evaluate(async () => {
+      const original = enqueueSave, results = [];
+      try {
+        for (const startStatus of ['done', 'running']) {
+          let release;
+          enqueueSave = () => new Promise(resolve => { release = resolve; });
+          const old = {id:'save-race', cap:'if_video', job:'old', status:startStatus, if_started:100, outputs:[]};
+          rememberIFTask(old, PROJ.id, startStatus);
+          const pending = saveIFTaskProject(old, PROJ.id);
+          const newer = {...old, job:startStatus === 'done' ? 'new' : 'old',
+            if_started:startStatus === 'done' ? 200 : 100, status:'done'};
+          rememberIFTask(newer, PROJ.id, 'done');
+          release({ok:true}); await pending;
+          results.push(JSON.parse(sessionStorage.getItem(ifTaskKey(old, PROJ.id)))?.job);
+          sessionStorage.removeItem(ifTaskKey(old, PROJ.id));
+        }
+      } finally { enqueueSave = original; }
+      return results;
+    }), ['new', 'old'], 'an older save acknowledgement cannot erase a newer task or an unsaved terminal result');
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {
