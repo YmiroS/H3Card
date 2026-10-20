@@ -356,11 +356,11 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(uploadedReferences.length - beforeImageMulti, 3);
     assert.ok(uploadedReferences.slice(-3).every(item => item.type === 'image/png'));
     const conversions = [];
-    let conversionFailure = false;
+    let conversionFailure = false, oversizedCopy = false;
     await page.route(origin + '/oversized.*', route => {
       const kind = route.request().url().endsWith('.png') ? 'image' : 'video';
       return route.fulfill({contentType:kind === 'image' ? 'image/png' : 'video/mp4',
-        body:Buffer.alloc((kind === 'image' ? 20 : 50) * 1024 * 1024 + 1)});
+        body:Buffer.alloc(kind === 'image' ? 12_500_000 : 50 * 1024 * 1024 + 1)});
     });
     await page.route(origin + '/api/if-reference?*', async route => {
       const url = new URL(route.request().url()), kind = url.searchParams.get('type');
@@ -369,7 +369,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         {status:'queued', step:`正在适配 IF ${kind === 'image' ? '图片' : '视频'}上传副本`, visible:true});
       conversions.push(Object.fromEntries(url.searchParams));
       return route.fulfill(conversionFailure ? {status:422, body:'模拟转换失败，原素材未修改'} : {
-        contentType:kind === 'image' ? 'image/webp' : 'video/mp4', body:Buffer.from('adapted-' + kind),
+        contentType:kind === 'image' ? 'image/webp' : 'video/mp4',
+        body:oversizedCopy ? Buffer.alloc(10_000_001) : Buffer.from('adapted-' + kind),
         headers:{'X-Chouka-IF-Conversion':kind === 'image' ? 'lossless-webp' : 'compressed-mp4'}});
     });
     for (const kind of ['image', 'video']) {
@@ -405,6 +406,20 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /模拟转换失败/);
     assert.equal(runs.length, beforeFailure, 'failed conversion must not submit a paid run');
     assert.equal(deletedAssets.length, deletedBefore + 1, 'already uploaded references must be released');
+    conversionFailure = false; oversizedCopy = true;
+    await page.evaluate(() => {
+      const c = PROJ.cards[0];
+      c.assets = {'images[0]':{kind:'image', url:'/oversized.png'}};
+      c.status = 'idle'; c.error = null;
+      openPanel(c.id);
+    });
+    const uploadsBeforeInvalidCopy = uploadedReferences.length;
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /10 MB/);
+    assert.equal(runs.length, beforeFailure);
+    assert.equal(uploadedReferences.length, uploadsBeforeInvalidCopy,
+      'even an adapted image one byte over 10,000,000 must not reach the bridge');
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {

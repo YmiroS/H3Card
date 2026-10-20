@@ -16,9 +16,9 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 
-MEDIA = {'image/png': ('image', '.png', 20 * 1024 * 1024),
-         'image/jpeg': ('image', '.jpg', 20 * 1024 * 1024),
-         'image/webp': ('image', '.webp', 20 * 1024 * 1024),
+MEDIA = {'image/png': ('image', '.png', 10_000_000),
+         'image/jpeg': ('image', '.jpg', 10_000_000),
+         'image/webp': ('image', '.webp', 10_000_000),
          'video/mp4': ('video', '.mp4', 50 * 1024 * 1024)}
 LIMITS_FILE = Path(__file__).resolve().parents[1] / 'manifests' / '_if_model_limits.json'
 

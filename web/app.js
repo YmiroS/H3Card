@@ -5787,7 +5787,7 @@ function openPanel(id) {
   if (isIF(c)) {
     clipboardHint.textContent = ifModelsError
       ? `本机 IF 不可用：${ifModelsError}。请先安装并登录 IF CLI、启动本机桥接，点模型按钮可重试。`
-      : "IF 使用本机账号；支持按模型数量连接多份引用。多引用素材各上传一次，在同一画布按「图片1」「视频1」逐份登记且要求不生成，全部登记后再独立提交总需求。图片超过 20 MB 时优先转无损 WebP，仍超限再压缩；视频超过 50 MB 时自动转码。仅处理上传副本，原素材不变；本机上传合计不超过 100 MB，音频暂不支持。";
+      : "IF 使用本机账号；支持按模型数量连接多份引用。多引用素材各上传一次，在同一画布按「图片1」「视频1」逐份登记且要求不生成，全部登记后再独立提交总需求。图片超过 10 MB 时优先转无损 WebP，仍超限再压缩；视频超过 50 MB 时自动转码。仅处理上传副本，原素材不变；本机上传合计不超过 100 MB，音频暂不支持。";
   }
   body.appendChild(clipboardHint);
   if (isIF(c)) {
@@ -8182,7 +8182,7 @@ async function runIF(c) {
         if (!response.ok) throw new Error("无法读取画布引用素材");
         let blob = await response.blob();
         const allowed = reference.kind === "image" ? ["image/png", "image/jpeg", "image/webp"] : ["video/mp4"];
-        const maximum = (reference.kind === "image" ? 20 : 50) * 1024 * 1024;
+        const maximum = reference.kind === "image" ? 10_000_000 : 50 * 1024 * 1024;
         if (!allowed.includes(blob.type) || blob.size > maximum) {
           c.status = "queued"; c.error = null;
           c.step = `正在适配 IF ${KIND_ZH[reference.kind]}上传副本`;
@@ -8198,7 +8198,7 @@ async function runIF(c) {
           toast(`IF ${KIND_ZH[reference.kind]}上传副本已${conversion === "lossless-webp" ? "转换为无损 WebP" : "压缩"}（${(originalSize / 1048576).toFixed(1)} → ${(blob.size / 1048576).toFixed(1)} MB），原素材保持不变`);
         }
         if (!blob.size || !allowed.includes(blob.type) || blob.size > maximum)
-          throw new Error(`IF 上传副本仍不符合格式或 ${maximum / 1048576} MB 大小限制，原素材未修改`);
+          throw new Error(`IF 上传副本仍不符合格式或 ${reference.kind === "image" ? 10 : 50} MB 大小限制，原素材未修改`);
         const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
         assetIds.push(uploaded.asset_id);
         if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability)

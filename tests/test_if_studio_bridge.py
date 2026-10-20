@@ -194,13 +194,23 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(self.upload(headers={'X-Chouka-IF': 'generate'})[0], 403)
         self.assertEqual(self.upload(origin='https://foreign.example')[0], 403)
         self.assertEqual(self.upload(headers={'Host': 'evil.example'})[0], 403)
-        for media_type, maximum in (('image/png', 20 * 1024 * 1024),
-                                    ('video/mp4', 50 * 1024 * 1024)):
+        for media_type, maximum in (('image/png', 10_000_000), ('image/jpeg', 10_000_000),
+                                    ('image/webp', 10_000_000), ('video/mp4', 50 * 1024 * 1024)):
             self.assertEqual(self.upload(b'', media_type, headers={
                 'Content-Length': str(maximum + 1)})[0], 400)
+        for media_type in ('image/png', 'image/jpeg', 'image/webp'):
+            self.assertEqual(self.upload(b'', media_type, headers={
+                'Content-Length': '12500000'})[0], 400, '12.5 MB must be rejected before the IF CLI')
         self.assertEqual(self.upload(b'', headers={'Content-Length': '-1'})[0], 400)
         self.assertFalse(self.bridge.assets)
         self.assertEqual(self.bridge.asset_bytes, 0)
+
+    def test_upload_accepts_image_at_exact_ten_mb(self):
+        data = b'\x89PNG\r\n\x1a\n' + bytes(10_000_000 - 8)
+        code, _, body = self.upload(data, 'image/png')
+        self.assertEqual(code, 201)
+        path = self.bridge.assets[body['asset_id']][0]
+        self.assertEqual(path.stat().st_size, 10_000_000)
 
     def test_image_asset_uploads_once_and_is_deleted_before_reference_round(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
