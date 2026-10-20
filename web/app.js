@@ -175,7 +175,7 @@ const MODEL_SWITCH_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen 
   qwen2512: "Qwen Image 2512（双阶段）", qwen21: "Qwen Image 2.1",
   da3: "Depth Anything 3", depthcrafter: "DepthCrafter" };
 const IF_BRIDGE = "http://127.0.0.1:8278";
-let ifModels = [], ifModelsPromise = null, ifModelsAttempted = false, ifModelsError = "";
+let ifModels = [], ifModelsPromise = null, ifModelsAttempted = false, ifModelsError = "", ifReferenceReuse = false;
 const isIF = c => capOf(c)?.execution === "if_studio";
 async function ifRequest(path, options = {}) {
   const response = await fetch(IF_BRIDGE + path, {...options, credentials: "omit"});
@@ -189,6 +189,7 @@ function loadIFModels() {
   ifModelsPromise = (async () => {
     const status = await ifRequest("/status");
     if (!status.ready) throw new Error("请先在本机登录 IF CLI");
+    ifReferenceReuse = status.reference_reuse === true;
     ifModels = (await ifRequest("/models")).models;
     ifModelsError = "";
     return ifModels;
@@ -196,6 +197,50 @@ function loadIFModels() {
     .finally(() => { ifModelsPromise = null; if (el.panel._id) openPanel(el.panel._id); });
   return ifModelsPromise;
 }
+function ifReferenceState(c, projectId) {
+  const key = 'chouka:if-references:v1:' + JSON.stringify([H3Auth.user?.id, projectId, c.id]);
+  if (c._ifReferences?.key === key) return c._ifReferences;
+  let stored;
+  try { stored = JSON.parse(sessionStorage.getItem(key)); } catch {}
+  const state = {key, entries:Array.isArray(stored?.entries) ? stored.entries.slice(0, 40) : [],
+    pending:Array.isArray(stored?.pending) ? stored.pending.slice(0, 40) : [], job:stored?.job || null};
+  c._ifReferences = state;
+  return state;
+}
+function saveIFReferences(state) {
+  try { sessionStorage.setItem(state.key, JSON.stringify({entries:state.entries, pending:state.pending, job:state.job})); } catch {}
+}
+function reusableIFURL(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === 'https:' && url.hostname === 'ant.alicdn.com' && !url.port
+      && !url.username && !url.password && url.pathname.startsWith('/bio/img/');
+  } catch { return false; }
+}
+function rememberIFReferences(c, result, projectId) {
+  const state = ifReferenceState(c, projectId);
+  if (state.job !== c.job) return;
+  for (const item of result?.reference_urls || []) {
+    const source = state.pending[item.index];
+    if (!Number.isInteger(item.index) || !source || source.kind !== item.kind || !reusableIFURL(item.url)) continue;
+    state.entries = state.entries.filter(entry => entry.source !== source.source);
+    state.entries.push({...source, url:item.url});
+  }
+  for (const index of result?.invalid_reference_indices || []) {
+    const source = state.pending[index];
+    if (source) state.entries = state.entries.filter(entry => entry.source !== source.source || entry.version !== source.version);
+  }
+  saveIFReferences(state);
+}
+async function ifReferenceVersion(url, kind) {
+  const response = await fetch(`/api/if-reference?${new URLSearchParams({url:url.pathname + url.search, type:kind})}`,
+    {method:'HEAD', credentials:'same-origin', cache:'no-store'});
+  if (!response.ok) throw new Error(`无法检查引用素材（${response.status}），请确认素材仍存在且有访问权限`);
+  const version = response.headers.get('ETag');
+  if (!version || !/^"[a-f0-9]{64}"$/.test(version)) throw new Error('抽卡服务尚不支持引用复用，请更新服务后重试');
+  return version;
+}
+
 /** 节点显示名。合并模式用模式名（"H3 图生视频"），不用张数最多那条能力的名字（"首尾帧"）。
     路由节点同理：叫「画质增强」，不能叫「SeedVR2 图片高清放大」—— 那会让人以为它不收视频。
     最后兜底用模式名而不是裸 id：风格节点在 CAPS 里根本没有条目（它不是能力）。 */
@@ -8220,13 +8265,34 @@ async function runIF(c) {
       data.image = c.params.if_reference.trim();
     }
     if (type === "video" && c.params.if_skill?.trim()) data.skill = c.params.if_skill.trim();
+    const referenceState = ifReferenceState(c, project.id);
+    referenceState.pending = []; referenceState.job = null;
+    const sourceKey = reference => JSON.stringify([reference.kind, new URL(reference.url, location.href).href, reference.ref || '']);
+    const activeSources = new Set(references.map(([, reference]) => sourceKey(reference)));
+    referenceState.entries = referenceState.entries.filter(entry => activeSources.has(entry.source));
+    saveIFReferences(referenceState);
     if (references.length) {
+      if (!ifReferenceReuse) throw new Error('请更新本机 IF 桥接器后重试；当前版本不支持引用复用');
+      data.references = [];
       for (const [index, [, reference]] of references.entries()) {
         const label = `${KIND_ZH[reference.kind]}引用（${index + 1}/${references.length}）`;
         const url = new URL(reference.url, location.href);
         if (url.origin !== location.origin) throw new Error("IF 仅能上传当前画布内的本机素材");
+        c.step = `正在检查 IF ${label}是否可复用`; paint(c);
+        const version = await ifReferenceVersion(url, reference.kind);
+        if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability || !canOperate())
+          throw new Error('画布已切换或权限已变化，已取消 IF 提交');
+        const identity = {source:sourceKey(reference), version, kind:reference.kind};
+        referenceState.pending.push(identity);
+        const cached = referenceState.entries.find(entry => entry.source === identity.source
+          && entry.version === version && entry.kind === reference.kind && reusableIFURL(entry.url));
+        if (cached) {
+          c.step = `正在复用已上传 IF 的${label}`; paint(c);
+          data.references.push({kind:reference.kind, url:cached.url});
+          continue;
+        }
         c.step = `正在读取 IF ${label}`; paint(c);
-        const response = await fetch(url, {credentials:"same-origin"});
+        const response = await fetch(url, {credentials:"same-origin", cache:"no-store"});
         if (!response.ok) throw new Error("无法读取画布引用素材");
         let blob = await response.blob();
         const allowed = reference.kind === "image" ? ["image/png", "image/jpeg", "image/webp"] : ["video/mp4"];
@@ -8235,7 +8301,7 @@ async function runIF(c) {
           c.step = `正在适配 IF ${KIND_ZH[reference.kind]}上传副本（${index + 1}/${references.length}）`;
           paint(c);
           const prepared = await fetch(`/api/if-reference?${new URLSearchParams({url:url.pathname + url.search, type:reference.kind})}`,
-            {credentials:"same-origin", cache:"no-store"});
+            {credentials:"same-origin", cache:"no-store", headers:{'If-Match':version}});
           if (!prepared.ok) throw new Error(`IF 素材自动适配失败：${(await prepared.text()).slice(0, 500)}`);
           const originalSize = blob.size;
           blob = await prepared.blob();
@@ -8248,14 +8314,17 @@ async function runIF(c) {
           throw new Error(`IF 上传副本仍不符合格式或 ${reference.kind === "image" ? 10 : 50} MB 大小限制，原素材未修改`);
         if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability || !canOperate())
           throw new Error("画布已切换或权限已变化，已取消 IF 提交");
+        if (await ifReferenceVersion(url, reference.kind) !== version)
+          throw new Error('准备期间引用素材已变化，请重试');
         c.step = `正在向本机桥接传送${label}`; paint(c);
         const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
         assetIds.push(uploaded.asset_id);
+        data.references.push({kind:reference.kind, asset_id:uploaded.asset_id});
         if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability)
           throw new Error("画布已切换，已取消 IF 提交");
       }
-      data.asset_ids = assetIds;
     }
+    saveIFReferences(referenceState);
     c.params.if_model = model.display_name;
     c.status = "queued"; c.error = null; c.progress = null; c.outputs = []; c.ms = null;
     c.step = "正在交由本机 IF 桥接处理"; c.job = null;
@@ -8264,6 +8333,7 @@ async function runIF(c) {
       headers: {"Content-Type": "application/json", "X-Chouka-IF": "generate"}, body: JSON.stringify(data)});
     submitted = true;
     c.job = job.id; c.if_job_cap = capability; c.status = "running"; c.step = "本机 IF 正在准备生成任务";
+    referenceState.job = job.id; saveIFReferences(referenceState);
     pushHistory(c, {id:job.id, capability, prompts:[
       {key:"if_original", label:"原始提示词", text:originalPrompt},
       {key:"if_submitted", label:"提交给 IF CLI 的提示词", text:data.prompt},
@@ -8291,6 +8361,7 @@ async function pollIF(c, projectId) {
   try {
     const job = await ifRequest(`/runs/${encodeURIComponent(c.job)}`);
     if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
+    rememberIFReferences(c, job.result, projectId);
     const submitted = c.history?.find(h => h.job === c.job)?.prompts?.find(p => p.key === "if_submitted");
     if (submitted && typeof job.result?.submitted_prompt === "string")
       submitted.text = job.result.submitted_prompt;
@@ -8299,7 +8370,8 @@ async function pollIF(c, projectId) {
       retry = true;
       return;
     }
-    if (job.state === "error") throw new Error(job.error || "IF 生成失败");
+    if (job.state === "error") throw new Error((job.error || "IF 生成失败")
+      + (job.result?.invalid_reference_indices?.length ? '；已清除失效引用缓存，重试时仅重新上传失效素材' : ''));
     const downloaded = job.result?.downloaded || [];
     const expected = capOf(c).outputType;
     const waiting = /请确认|确认后|回复["“]?确认/.test(job.result?.planning_text || "");

@@ -49,12 +49,17 @@ class NoReferenceRedirect(HTTPRedirectHandler):
         return None
 
 
+def is_if_upload_url(url):
+    parts = urlparse(url)
+    return (parts.scheme == 'https' and parts.hostname == 'ant.alicdn.com'
+            and parts.port in (None, 443) and parts.username is None and parts.password is None
+            and parts.path.startswith('/bio/img/'))
+
+
 def prepare_if_reference(url):
     parts = urlparse(url)
     # Only probe IF's public upload CDN, never arbitrary user-supplied hosts or redirects.
-    if (parts.scheme != 'https' or parts.hostname != 'ant.alicdn.com'
-            or parts.port not in (None, 443) or parts.username is not None or parts.password is not None
-            or not parts.path.startswith('/bio/img/')):
+    if not is_if_upload_url(url):
         return url
     directory, _, filename = parts.path.rpartition('/')
     # Raw underscores can be interpreted as CDN image-processing suffixes (not object-key bytes).
@@ -125,38 +130,52 @@ class Bridge(ThreadingHTTPServer):
     def generate(self, job_id, request, asset_paths=None):
         asset_paths = asset_paths or []
         submitted_prompt = None
+        reuse = request.get('references')
+        reference_result = {'reference_urls': []} if reuse is not None else {}
         try:
-            references = [str(path) for path in asset_paths]
+            paths = iter(asset_paths)
+            entries = ([(next(paths), item['kind'], None) if 'asset_id' in item
+                        else (None, item['kind'], item['url']) for item in reuse] if reuse is not None
+                       else [(path, 'video' if path.suffix.lower() in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v')
+                              else 'image', None) for path in asset_paths])
             if request.get('image'):
-                references.append(request['image'])
+                suffix = Path(urlparse(request['image']).path).suffix.lower()
+                entries.append((None, 'video' if suffix in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v')
+                                else 'image', request['image']))
             video = request.get('type') == 'video'
-            for index, path in enumerate(asset_paths):
-                with self.lock:
-                    self.jobs[job_id] = {'state': 'starting',
-                        'step': f'正在上传 IF 引用素材（{index + 1}/{len(asset_paths)}）'}
-                try:
-                    uploaded = self.command('upload', str(path), '--profile', 'buc', '--json', timeout=60)
-                finally:
-                    path.unlink(missing_ok=True)
-                url = uploaded.get('url')
-                if not isinstance(url, str) or urlparse(url).scheme not in ('http', 'https') or not urlparse(url).hostname:
-                    raise RuntimeError('IF CLI 上传失败：' + str(uploaded.get('error') or
-                                       uploaded.get('message') or '未返回有效的素材 URL')[:500])
-                references[index] = url
             counts = {'图片': 0, '视频': 0}
             reference_lines = []
-            for index, reference in enumerate(references):
-                source = str(asset_paths[index]) if index < len(asset_paths) else request['image']
-                suffix = Path(urlparse(source).path).suffix.lower()
-                media = '视频' if suffix in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v') else '图片'
+            uploaded_count = 0
+            for index, (path, kind, reference) in enumerate(entries):
+                media = '视频' if kind == 'video' else '图片'
                 counts[media] += 1
+                if path is not None:
+                    uploaded_count += 1
+                    with self.lock:
+                        self.jobs[job_id] = {'state': 'starting', 'result': dict(reference_result),
+                            'step': f'正在上传 IF 引用素材（{uploaded_count}/{len(asset_paths)}）'}
+                    try:
+                        uploaded = self.command('upload', str(path), '--profile', 'buc', '--json', timeout=60)
+                    finally:
+                        path.unlink(missing_ok=True)
+                    reference = uploaded.get('url')
+                    if not isinstance(reference, str) or urlparse(reference).scheme not in ('http', 'https') or not urlparse(reference).hostname:
+                        raise RuntimeError('IF CLI 上传失败：' + str(uploaded.get('error') or
+                                           uploaded.get('message') or '未返回有效的素材 URL')[:500])
                 with self.lock:
-                    self.jobs[job_id] = {'state': 'starting',
-                        'step': f'正在检查 IF {media}{counts[media]}引用地址（{index + 1}/{len(references)}）'}
+                    self.jobs[job_id] = {'state': 'starting', 'result': dict(reference_result),
+                        'step': f'正在检查 IF {media}{counts[media]}引用地址（{index + 1}/{len(entries)}）'}
                 try:
                     reference = prepare_if_reference(reference)
                 except RuntimeError as exc:
+                    if reuse is not None and index < len(reuse) and path is None:
+                        reference_result['invalid_reference_indices'] = [index]
                     raise RuntimeError(f'{media}{counts[media]}：{exc}') from exc
+                if reuse is not None and index < len(reuse):
+                    reference_result['reference_urls'] = reference_result['reference_urls'] + [
+                        {'index': index, 'kind': kind, 'url': reference}]
+                    with self.lock:
+                        self.jobs[job_id]['result'] = dict(reference_result)
                 reference_lines.append(f'{media}{counts[media]}：{reference}')
             prompt = request['prompt']
             if reference_lines:
@@ -172,7 +191,7 @@ class Bridge(ThreadingHTTPServer):
             for attempt in range(21):
                 with self.lock:
                     self.jobs[job_id] = {'state': 'starting', 'step': sending_step,
-                        'result': {'submitted_prompt': prompt}}
+                        'result': {**reference_result, 'submitted_prompt': prompt}}
                 try:
                     created = self.command(*flags, '--', prompt, timeout=60)
                     break
@@ -185,11 +204,12 @@ class Bridge(ThreadingHTTPServer):
                     with self.lock:
                         self.jobs[job_id] = {'state': 'starting',
                             'step': f'IF 会话忙碌，正在等待上一轮结束；15 秒后重试（{attempt + 1}/20）',
-                            'result': {'submitted_prompt': prompt}}
+                            'result': {**reference_result, 'submitted_prompt': prompt}}
                     time.sleep(15)
             if created.get('status') != 'created':
                 raise RuntimeError('IF CLI 未创建画布：' + str(created.get('error') or
                                    created.get('message') or created.get('status'))[:500])
+            created.update(reference_result)
             created['submitted_prompt'] = prompt
             with self.lock:
                 self.jobs[job_id] = {'state': 'running', 'result': created,
@@ -222,13 +242,14 @@ class Bridge(ThreadingHTTPServer):
                     downloads.append({'type': item.get('type'), 'name': path.name,
                                       'index': len(downloads), 'url': item.get('url')})
             result['downloaded'] = downloads
+            result.update(reference_result)
             result['submitted_prompt'] = prompt
             with self.lock:
                 self.jobs[job_id] = {'state': 'done', 'result': result}
         except (RuntimeError, KeyError, TypeError, ValueError) as exc:
             with self.lock:
                 self.jobs[job_id] = {'state': 'error', 'error': redact_cli_error(exc),
-                    'result': {'submitted_prompt': submitted_prompt} if submitted_prompt is not None else {}}
+                    'result': {**reference_result, **({'submitted_prompt': submitted_prompt} if submitted_prompt is not None else {})}}
         finally:
             for path in asset_paths:
                 path.unlink(missing_ok=True)
@@ -282,7 +303,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 status = self.server.command('auth', 'status', '--json', timeout=10)
                 profile = status.get('profiles', {}).get('buc', {})
                 self.reply(200, {'ready': bool(profile.get('has_ifs_token')) and
-                                 profile.get('registry') == 'ifs.alibaba-inc.com'})
+                                 profile.get('registry') == 'ifs.alibaba-inc.com', 'reference_reuse': True})
             except RuntimeError as exc:
                 self.reply(503, {'error': str(exc)})
         elif self.path == '/models':
@@ -432,7 +453,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             return
         lengths = self.headers.get_all('Content-Length', [])
         length = int(lengths[0]) if len(lengths) == 1 and re.fullmatch(r'[0-9]{1,9}', lengths[0]) else 0
-        if not 0 < length <= 12000:
+        if not 0 < length <= 128000:
             self.reply(400, {'error': '请求内容过长或为空'})
             return
         try:
@@ -450,7 +471,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 raise ValueError()
             if not isinstance(data, dict) or any(key not in (
                     'prompt', 'model', 'type', 'canvas_id', 'session_id', 'skill',
-                    'image', 'asset_id', 'asset_ids'
+                    'image', 'asset_id', 'asset_ids', 'references'
             ) for key in data):
                 raise ValueError()
             asset_id = data.get('asset_id')
@@ -467,6 +488,30 @@ class BridgeHandler(BaseHTTPRequestHandler):
             else:
                 asset_ids = [asset_id] if asset_id else []
                 if asset_id and 'image' in data:
+                    raise ValueError()
+            references = data.get('references')
+            if 'references' in data:
+                if ('asset_id' in data or 'asset_ids' in data or not isinstance(references, list)
+                        or not 1 <= len(references) <= 40):
+                    raise ValueError()
+                asset_ids = []
+                for item in references:
+                    if not isinstance(item, dict) or item.get('kind') not in ('image', 'video'):
+                        raise ValueError()
+                    if set(item) == {'kind', 'asset_id'}:
+                        if not isinstance(item['asset_id'], str) or not re.fullmatch(r'[A-Za-z0-9_-]{32}', item['asset_id']):
+                            raise ValueError()
+                        asset_ids.append(item['asset_id'])
+                    elif set(item) == {'kind', 'url'}:
+                        if not isinstance(item['url'], str) or len(item['url']) > 2048 or not is_if_upload_url(item['url']):
+                            raise ValueError()
+                        suffix = Path(urlparse(item['url']).path).suffix.lower()
+                        if suffix not in (('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v') if item['kind'] == 'video'
+                                          else ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp', '.avif')):
+                            raise ValueError()
+                    else:
+                        raise ValueError()
+                if len(set(asset_ids)) != len(asset_ids):
                     raise ValueError()
             image = data.get('image', '')
             if not isinstance(image, str) or len(image) > 2048:
@@ -486,7 +531,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             models = self.server.command('models', '--json', '--profile', 'buc', timeout=35)
             if not any(m.get('display_name') == model and m.get('type') == kind for m in models):
                 raise ValueError()
-            if asset_ids or image:
+            if asset_ids or references or image:
                 limits = json.loads(LIMITS_FILE.read_text(encoding='utf-8'))
                 rule = limits.get(model) if isinstance(limits, dict) else None
                 if not isinstance(rule, dict) or rule.get('type') != kind or \
@@ -497,8 +542,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     assets = [self.server.assets.get(item) for item in asset_ids]
                 if any(asset is None for asset in assets):
                     raise ValueError()
-                counts = {media: sum(asset[1] == media for asset in assets)
-                          for media in ('image', 'video')}
+                if references is not None:
+                    local = iter(assets)
+                    if any(next(local)[1] != item['kind'] for item in references if 'asset_id' in item):
+                        raise ValueError()
+                    counts = {media: sum(item['kind'] == media for item in references) for media in ('image', 'video')}
+                else:
+                    counts = {media: sum(asset[1] == media for asset in assets) for media in ('image', 'video')}
                 if image:
                     suffix = Path(url.path).suffix.lower()
                     url_kind = ('image' if suffix in ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.bmp',

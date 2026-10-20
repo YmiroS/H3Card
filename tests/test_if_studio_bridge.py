@@ -129,7 +129,7 @@ class BridgeTest(unittest.TestCase):
                 'registry': 'ifs.alibaba-inc.com', 'has_ifs_token': True}}}):
             for origin in (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN, SECURE_ORIGIN):
                 code, headers, body = self.request('GET', '/status', origin=origin)
-                self.assertEqual((code, body), (200, {'ready': True}))
+                self.assertEqual((code, body), (200, {'ready': True, 'reference_reuse': True}))
                 self.assertEqual(headers['Access-Control-Allow-Origin'], origin)
                 code, headers, _ = self.request('OPTIONS', '/runs', origin=origin,
                     headers={'Access-Control-Request-Method': 'POST'})
@@ -387,8 +387,95 @@ class BridgeTest(unittest.TestCase):
         self.assertIn('尚未提交生成', job['error'])
         self.assertNotIn('secret', job['error'])
         self.assertEqual(job['result'], {})
-        self.assertEqual([call.args[0] for call in cli.call_args_list], ['upload', 'upload'])
+        self.assertEqual([call.args[0] for call in cli.call_args_list], ['upload'])
         self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_reused_and_new_references_preserve_order_and_upload_only_new(self):
+        cached = 'https://ant.alicdn.com/bio/img/f_cached.png'
+        fresh = 'https://ant.alicdn.com/bio/img/f_new.mp4'
+        path = Path(self.bridge.workspace.name) / 'new.mp4'
+        path.write_bytes(b'video')
+        refs = [{'kind': 'image', 'url': cached}, {'kind': 'video', 'asset_id': 'a' * 32},
+                {'kind': 'image', 'url': cached}]
+        def command(*args, **kwargs):
+            if args[0] == 'upload':
+                self.assertEqual(self.bridge.jobs['reuse']['result']['reference_urls'],
+                                 [{'index': 0, 'kind': 'image', 'url': cached}])
+                return {'url': fresh}
+            if args[:2] == ('canvas', 'run'):
+                return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+            return {'status': 'done', 'downloaded': []}
+        with mock.patch.object(self.bridge, 'command', side_effect=command) as cli, \
+                mock.patch('if_studio_bridge.prepare_if_reference', side_effect=lambda value: value):
+            self.bridge.generate('reuse', {'model': 'Minimax H3', 'prompt': 'test', 'references': refs}, [path])
+        job = self.bridge.jobs['reuse']
+        self.assertEqual(job['state'], 'done')
+        self.assertEqual(job['result']['submitted_prompt'],
+                         f'图片1：{cached}\n视频1：{fresh}\n图片2：{cached}\n\n生成需求：\ntest')
+        self.assertEqual([call.args[0] for call in cli.call_args_list], ['upload', 'canvas', 'canvas'])
+        self.assertEqual(len(job['result']['reference_urls']), 3)
+        self.assertFalse(path.exists())
+        refs = [{'kind': item['kind'], 'url': item['url']} for item in job['result']['reference_urls']]
+        with mock.patch.object(self.bridge, 'command', side_effect=[
+                {'status': 'created', 'canvas_id': 'c2', 'session_id': 's2'}, {'status': 'done'}]) as cli, \
+                mock.patch('if_studio_bridge.prepare_if_reference', side_effect=lambda value: value):
+            self.bridge.generate('reuse-all', {'model': 'Minimax H3', 'prompt': 'new prompt', 'references': refs})
+        self.assertEqual(self.bridge.jobs['reuse-all']['state'], 'done')
+        self.assertEqual([call.args[:2] for call in cli.call_args_list], [('canvas', 'run'), ('canvas', 'poll')])
+
+    def test_partial_upload_success_survives_failure_and_invalid_reuse_never_generates(self):
+        url = 'https://ant.alicdn.com/bio/img/f_uploaded.png'
+        paths = [Path(self.bridge.workspace.name) / f'partial-{i}.png' for i in range(2)]
+        for path in paths:
+            path.write_bytes(b'image')
+        refs = [{'kind': 'image', 'asset_id': letter * 32} for letter in ('a', 'b')]
+        with mock.patch.object(self.bridge, 'command', side_effect=[{'url': url}, RuntimeError('upload failed')]) as cli, \
+                mock.patch('if_studio_bridge.prepare_if_reference', side_effect=lambda value: value):
+            self.bridge.generate('partial', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs}, paths)
+        result = self.bridge.jobs['partial']['result']
+        self.assertEqual(result['reference_urls'], [{'index': 0, 'kind': 'image', 'url': url}])
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertTrue(all(call.args[0] == 'upload' for call in cli.call_args_list))
+        refs = [{'kind': 'image', 'url': url}]
+        with mock.patch.object(self.bridge, 'command') as cli, \
+                mock.patch('if_studio_bridge.prepare_if_reference', side_effect=RuntimeError('HTTP 404，尚未提交生成')):
+            self.bridge.generate('expired', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs})
+        self.assertEqual(self.bridge.jobs['expired']['result']['invalid_reference_indices'], [0])
+        cli.assert_not_called()
+        with mock.patch.object(self.bridge, 'command', side_effect=RuntimeError('generation failed')), \
+                mock.patch('if_studio_bridge.prepare_if_reference', return_value=url):
+            self.bridge.generate('failed-after-upload', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs})
+        self.assertEqual(self.bridge.jobs['failed-after-upload']['result']['reference_urls'], result['reference_urls'])
+
+    def test_mixed_reference_api_enforces_limits_kinds_and_cdn_origin(self):
+        image_id = self.upload()[2]['asset_id']
+        url = 'https://ant.alicdn.com/bio/img/f_cached.png'
+        good = {'kind': 'image', 'url': url}
+        with mock.patch.object(self.bridge, 'command', return_value=MODELS):
+            for data in ({'references': [good] * 4}, {'references': [good], 'asset_ids': [image_id]},
+                         {'references': [{'kind': 'video', 'asset_id': image_id}]},
+                         {'references': [{'kind': 'image', 'asset_id': image_id}] * 2},
+                         {'references': [{'kind': 'video', 'url': url}]},
+                         {'references': [{'kind': 'image', 'url': 'https://127.0.0.1/private.png'}]},
+                         {'references': [{'kind': 'image', 'url': 'https://example.com/f.png'}]},
+                         {'references': [{'kind': 'image', 'url': url, 'asset_id': image_id}]},
+                         {'references': [good] * 3, 'image': 'https://example.com/extra.png'}):
+                self.assertEqual(self.run_request(**data)[0], 400, data)
+            self.assertIn(image_id, self.bridge.assets)
+            def finish(job_id, request, paths):
+                self.assertEqual(request['references'], [good, {'kind': 'image', 'asset_id': image_id}])
+                for path in paths:
+                    path.unlink()
+                self.bridge.jobs[job_id] = {'state': 'done', 'result': {}}
+            with mock.patch.object(self.bridge, 'generate', side_effect=finish):
+                code, _, body = self.run_request(references=[good, {'kind': 'image', 'asset_id': image_id}])
+                self.assertEqual(code, 202)
+                for _ in range(100):
+                    if self.bridge.jobs[body['id']]['state'] == 'done':
+                        break
+                    time.sleep(.01)
+                self.assertEqual(self.bridge.jobs[body['id']]['state'], 'done')
+            self.assertNotIn(image_id, self.bridge.assets)
 
     def test_video_asset_uploads_once_then_submits_url_in_prompt(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
