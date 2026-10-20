@@ -136,7 +136,9 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       if ((url.pathname === '/status' || url.pathname === '/models')
           && await page.evaluate(() => PROJ?.cards[0]?.status === 'queued'))
         await checkBusy(/^正在连接本机 IF 并读取模型$/);
-      if (url.pathname === '/runs' && request.method() === 'POST') await checkBusy(/^正在提交至本机 IF$/);
+      if (url.pathname === '/runs' && request.method() === 'POST') await checkBusy(/^正在交由本机 IF 桥接处理$/);
+      if (url.pathname === '/runs/bridge-1' && firstRunPolls === 0)
+        await checkBusy(/^本机 IF 正在准备生成任务$/);
       if (url.pathname === '/runs/bridge-1' && firstRunPolls < 3) {
         const states = [{state:'starting', step:'正在上传 IF 引用素材（1/1）'},
           {state:'starting', step:'正在向 IF 一次提交全部引用与图片生成需求'},
@@ -145,7 +147,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           body:JSON.stringify(states[firstRunPolls++])});
       }
       if (url.pathname === '/assets') {
-        await checkBusy(/^正在上传 IF .+引用（\d+\/\d+）至本机桥接$/);
+        await checkBusy(/^正在向本机桥接传送.+引用（\d+\/\d+）$/);
         uploadedReferences.push({type:request.headers()['content-type'], body:request.postDataBuffer()});
         const asset_id = uploadedReferences.length <= 2 ? referenceId
           : 'b'.repeat(31) + uploadedReferences.length;
@@ -490,8 +492,12 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(uploadedReferences.length, uploadsBeforeInvalidCopy,
       'even an adapted image one byte over 10,000,000 must not reach the bridge');
     assert.equal(await page.locator('.card .body .load').count(), 0, 'failure must stop loading');
-    for (const prefix of ['正在连接本机 IF', '正在读取 IF', '正在适配 IF', '正在上传 IF',
-      '正在提交至本机 IF', '正在取回 IF', '正在保存 IF'])
+    assert.ok(busySteps.indexOf('正在向本机桥接传送图片引用（1/1）')
+      < busySteps.indexOf('正在上传 IF 引用素材（1/1）'), 'local transfer must precede the only IF upload phase');
+    assert.ok(busySteps.indexOf('本机 IF 正在准备生成任务')
+      < busySteps.indexOf('正在上传 IF 引用素材（1/1）'), 'do not report generating before the IF upload');
+    for (const prefix of ['正在连接本机 IF', '正在读取 IF', '正在适配 IF', '正在向本机桥接传送', '正在上传 IF',
+      '正在交由本机 IF 桥接处理', '正在取回 IF', '正在保存 IF'])
       assert.ok(busySteps.some(step => step.startsWith(prefix)), prefix);
     // Exercise actual model menus and duration controls, not just manifest values.
     await page.evaluate(() => {

@@ -8248,7 +8248,7 @@ async function runIF(c) {
           throw new Error(`IF 上传副本仍不符合格式或 ${reference.kind === "image" ? 10 : 50} MB 大小限制，原素材未修改`);
         if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability || !canOperate())
           throw new Error("画布已切换或权限已变化，已取消 IF 提交");
-        c.step = `正在上传 IF ${label}至本机桥接`; paint(c);
+        c.step = `正在向本机桥接传送${label}`; paint(c);
         const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
         assetIds.push(uploaded.asset_id);
         if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability)
@@ -8258,12 +8258,12 @@ async function runIF(c) {
     }
     c.params.if_model = model.display_name;
     c.status = "queued"; c.error = null; c.progress = null; c.outputs = []; c.ms = null;
-    c.step = "正在提交至本机 IF"; c.job = null;
+    c.step = "正在交由本机 IF 桥接处理"; c.job = null;
     paint(c); if (el.panel._id === c.id) openPanel(c.id);
     const job = await ifRequest("/runs", {method: "POST",
       headers: {"Content-Type": "application/json", "X-Chouka-IF": "generate"}, body: JSON.stringify(data)});
     submitted = true;
-    c.job = job.id; c.if_job_cap = capability; c.status = "running"; c.step = "IF 正在生成";
+    c.job = job.id; c.if_job_cap = capability; c.status = "running"; c.step = "本机 IF 正在准备生成任务";
     pushHistory(c, {id:job.id, capability, prompts:[
       {key:"if_original", label:"原始提示词", text:originalPrompt},
       {key:"if_submitted", label:"提交给 IF CLI 的提示词", text:data.prompt},
