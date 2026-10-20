@@ -599,7 +599,7 @@ class BridgeTest(unittest.TestCase):
                                      ([image['asset_id']], {'asset_id': image['asset_id']})):
                 self.assertEqual(self.run_request(asset_ids=asset_ids, **extra)[0], 400)
             limits.read_text.return_value = json.dumps({
-                'Minimax H3': {'type': 'video', 'bridge': {'image': 1}}})
+                'qwen-image-2.0': {'type': 'video', 'bridge': {'image': 1}}})
             self.assertEqual(self.run_request(asset_id=image['asset_id'])[0], 400)
             limits.read_text.side_effect = FileNotFoundError()
             self.assertEqual(self.run_request(asset_id=image['asset_id'])[0], 400)
@@ -618,7 +618,6 @@ class BridgeTest(unittest.TestCase):
             for overrides in (
                     {'model': 'z-image-turbo', 'image': 'https://example.com/ref.png'},
                     {'model': 'z-image-turbo', 'image': 'https://example.com/opaque'},
-                    {'model': 'Unknown Model', 'image': 'https://example.com/ref.png'},
                     {'image': 'https://example.com/clip.mp4'},
                     {'image': 'https://example.com/clip.webm'},
                     {'image': 'https://example.com/voice.mp3'},
@@ -636,7 +635,7 @@ class BridgeTest(unittest.TestCase):
                                   {'type': 'video', 'model': 'Minimax H3',
                                    'image': 'https://example.com/clip.mp4'},
                                   {'model': 'z-image-turbo'},
-                                  {'model': 'Unknown Model'}):
+                                  {'model': 'Unknown Model', 'image': 'https://example.com/ref.png'}):
                     code, _, body = self.run_request(**overrides)
                     self.assertEqual(code, 202)
                     for _ in range(100):
@@ -948,18 +947,51 @@ class BridgeTest(unittest.TestCase):
         self.assertNotIn('json-secret', error)
         self.assertNotIn('url-secret', error)
 
-    def test_h3_estimate_rejects_video_references_above_each_kind_limit(self):
+    def test_fallback_rejects_video_references_above_each_kind_limit(self):
         models = MODELS + [{'display_name': '星辰图生视频', 'type': 'video'}]
         image = b'\x89PNG\r\n\x1a\n' + b'0' * 32
         video = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2'
-        images = [self.upload(image, 'image/png')[2]['asset_id'] for _ in range(10)]
-        videos = [self.upload(video, 'video/mp4')[2]['asset_id'] for _ in range(4)]
+        images = [self.upload(image, 'image/png')[2]['asset_id'] for _ in range(7)]
+        videos = [self.upload(video, 'video/mp4')[2]['asset_id'] for _ in range(2)]
         with mock.patch.object(self.bridge, 'command', return_value=models):
-            for asset_ids in (images, videos, images[:9] + videos):
+            for asset_ids in (images, videos, images[:6] + videos):
                 self.assertEqual(self.run_request(type='video', model='星辰图生视频',
                                                   asset_ids=asset_ids)[0], 400)
-        self.assertEqual(len(self.bridge.assets), 14)
+        self.assertEqual(len(self.bridge.assets), 9)
         self.assertFalse(self.bridge.jobs)
+
+    def test_fallback_reference_boundaries_for_known_and_new_models(self):
+        cases = [('z-image-turbo', 'image', 1), ('Nano Banana Pro', 'image', 3),
+                 ('万相2.7图像生成', 'image', 3), ('即梦5.0', 'image', 10),
+                 ('New IF Image', 'image', 3), ('星辰图生视频', 'video', 6),
+                 ('可灵3.0 Omni', 'video', 4), ('HappyHorse-1.1视频', 'video', 9),
+                 ('HappyHorse-1.0视频【内测】', 'video', 9), ('New IF Video', 'video', 6)]
+        models = MODELS + [{'display_name': name, 'type': kind} for name, kind, _ in cases]
+        images = [{'kind': 'image', 'url': f'https://ant.alicdn.com/bio/img/f_test_{i}.png'}
+                  for i in range(11)]
+        videos = [{'kind': 'video', 'url': f'https://ant.alicdn.com/bio/img/f_test_{i}.mp4'}
+                  for i in range(2)]
+        finished = threading.Event()
+
+        def finish(job_id, _request, _paths):
+            with self.bridge.lock:
+                self.bridge.jobs[job_id] = {'state': 'done', 'result': {}}
+            finished.set()
+
+        with mock.patch.object(self.bridge, 'command', return_value=models), \
+                mock.patch.object(self.bridge, 'generate', side_effect=finish) as generate:
+            for name, kind, maximum in cases:
+                with self.subTest(model=name):
+                    allowed = images[:maximum] + (videos[:1] if kind == 'video' else [])
+                    for refs in (images[:maximum + 1], images[:maximum] + videos[:2],
+                                 [{'kind': 'audio', 'url': 'https://ant.alicdn.com/bio/audio/f_test.mp3'}]):
+                        self.assertEqual(self.run_request(type=kind, model=name, references=refs)[0], 400)
+                    finished.clear()
+                    self.assertEqual(self.run_request(type=kind, model=name, references=allowed)[0], 202)
+                    self.assertTrue(finished.wait(2))
+                    self.assertEqual(generate.call_args.args[1]['references'], allowed)
+            self.assertEqual(generate.call_count, len(cases))
+            self.assertEqual(self.run_request(model='Not in CLI', references=images[:1])[0], 400)
 
     def test_unverified_video_models_allow_one_image_or_video_reference(self):
         models = MODELS + [{'display_name': name, 'type': 'video'}
