@@ -10,7 +10,7 @@ from pathlib import Path
 from aiohttp import web
 
 
-LIMITS = {"image": 20 * 1024 * 1024, "video": 50 * 1024 * 1024}
+LIMITS = {"image": 10_000_000, "video": 50 * 1024 * 1024}
 
 
 class IFReferenceCopies:
@@ -88,7 +88,7 @@ class IFReferenceCopies:
                 "-compression_level", "6", "-threads", "1", str(target))
             if target.is_file() and 0 < target.stat().st_size <= LIMITS["image"]:
                 return "lossless-webp" if lossless else "compressed-webp"
-        raise web.HTTPUnprocessableEntity(text="图片压缩后仍超过 IF 的 20 MB 上限，原素材未修改")
+        raise web.HTTPUnprocessableEntity(text="图片压缩后仍超过 IF 的 10 MB 上限，原素材未修改")
 
     async def video(self, executable, inputs, target, directory):
         metadata = await self.command(executable, *inputs, timeout=30, check=False)

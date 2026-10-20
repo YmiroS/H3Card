@@ -74,14 +74,16 @@ class IFReferenceEncodingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source.read_bytes(), original)
         self.assertFalse(target.parent.exists())
 
-    async def test_real_twenty_mb_image_limit_without_mocking(self):
-        original, _ = png_bytes(2400, 2400)
+    async def test_real_ten_mb_image_limit_without_mocking(self):
+        original, _ = png_bytes(1800, 1800, noise=True)
         source = self.root / 'large.png'
         source.write_bytes(original)
-        self.assertGreater(source.stat().st_size, LIMITS['image'])
+        self.assertEqual(LIMITS['image'], 10_000_000)
+        self.assertGreater(source.stat().st_size, 12_500_000)
+        self.assertLess(source.stat().st_size, 20_000_000)
         async with self.copies.prepare(source, 'image') as (target, method):
-            self.assertEqual(method, 'lossless-webp')
-            self.assertLessEqual(target.stat().st_size, LIMITS['image'])
+            self.assertEqual(method, 'compressed-webp')
+            self.assertLessEqual(target.stat().st_size, 10_000_000)
         self.assertEqual(source.read_bytes(), original)
         self.assertFalse(target.exists())
 
