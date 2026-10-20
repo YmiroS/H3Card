@@ -8299,7 +8299,7 @@ async function runIF(c) {
       const short = CLARITY_STEPS.find(s => s.id === clarity).val;
       const width = widthRatio >= heightRatio ? Math.round(short * widthRatio / heightRatio / 16) * 16 : short;
       const height = widthRatio >= heightRatio ? short : Math.round(short * heightRatio / widthRatio / 16) * 16;
-      requirements.push(`分辨率 ${width}×${height}`);
+      requirements.push(`分辨率：${width}×${height}`);
     } else {
       const ar = specs.find(s => s.key === "aspect_ratio");
       const mp = specs.find(s => s.key === "megapixels");
@@ -8312,17 +8312,18 @@ async function runIF(c) {
       if (!Number.isSafeInteger(seconds) || seconds < spec.min || (spec.max != null && seconds > spec.max))
         throw new Error(spec.max != null ? `当前 IF 模型时长须为 ${spec.min}–${spec.max} 秒的整数，请修改时长`
           : "当前 IF 模型时长范围未核实，请输入正整数秒");
-      requirements.push(`分辨率 ${resolution[0]}×${resolution[1]}`, `视频时长约 ${seconds} 秒`);
-      const seed = Number(c.params.seed ?? -1);
-      if (Number.isSafeInteger(seed) && seed >= 0) requirements.push(`随机种子参考 ${seed}`);
+      const [widthRatio, heightRatio] = RATIO_WH[ratioValue] || [1, 1];
+      requirements.push(`分辨率：${resolution[0]}×${resolution[1]}`, `时长：${seconds}s`, `画面比例：${widthRatio} : ${heightRatio}`);
     }
-    data.prompt += `\n\n生成规格（作为内容要求）：${requirements.join("，")}。`;
-    if (type === "video") data.prompt = `最终交付必须是视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n${data.prompt}`;
-    if (c.params.if_reference?.trim()) {
+    data.prompt += `\n\n${requirements.join("\n")}`;
+    const media = type === "video" ? "视频" : "图片";
+    const otherMedia = type === "video" ? "图片、" : "";
+    const fallback = type === "video" ? "不要改为生图" : "不要改为视频或文字方案";
+    data.prompt = `最终交付必须是${media}文件，不是${otherMedia}故事板或文字方案。用户已经确认生成需求，请直接生成${media}；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，${fallback}。以本条${media}目标和以下参数要求为准。\n\n${data.prompt}`;
+    if (type === "image" && c.params.if_reference?.trim()) {
       if (!limit.bridge.image && !limit.bridge.video) throw new Error("该模型不支持已确认的媒体引用");
       data.image = c.params.if_reference.trim();
     }
-    if (type === "video" && c.params.if_skill?.trim()) data.skill = c.params.if_skill.trim();
     const referenceState = ifReferenceState(c, project.id);
     referenceState.pending = []; referenceState.job = null;
     const sourceKey = reference => JSON.stringify([reference.kind, new URL(reference.url, location.href).href, reference.ref || '']);
