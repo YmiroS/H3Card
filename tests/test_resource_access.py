@@ -195,6 +195,27 @@ class ResourceAccessTests(unittest.TestCase):
         self.assertEqual((self.uploads / material['ref'][7:]).read_bytes(), b'original')
         self.assertEqual(card['assets']['images[0]'], media)
 
+    def test_copy_batch_reuses_resources_across_selected_cards(self):
+        self.store.set_grant(self.b, self.a, 'read')
+        media = {'kind': 'image', 'url': '/api/upload/source.png', 'ref': 'chouka/source.png'}
+        bundle = {'cards': [
+            {'id': 'material', 'outputs': [media]},
+            {'id': 'first', 'assets': {'image': media}},
+            {'id': 'second', 'assets': {'image': media}, 'references': {
+                'cards': [{'id': 'material', 'outputs': [media]}],
+                'edges': [{'from': 'material', 'to': 'second', 'slot': 'image'}],
+            }},
+        ]}
+        copied = self.access.copy_document(self.b, 'a', 'b', bundle)
+        material, first, second = copied['cards']
+        self.assertNotEqual(material['outputs'][0]['url'], media['url'])
+        self.assertEqual(material['outputs'][0], first['assets']['image'])
+        self.assertEqual(material['outputs'][0], second['assets']['image'])
+        self.assertEqual(material['outputs'][0], second['references']['cards'][0]['outputs'][0])
+        self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM resources').fetchone()[0], 2)
+        self.store.delete_grant(self.b, self.a)
+        self.assertTrue(self.access.validate_document(self.b, 'b', copied))
+
     def test_input_index_survives_job_display_pruning(self):
         self.store.register_job('job1', 'a', self.a)
         self.access.register_job_inputs('job1', {'image': 'chouka/source.png'})
