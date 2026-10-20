@@ -76,6 +76,11 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             self.assertIn(capability, [mode['id'] for mode in card['modes']])
             self.assertEqual(card_data['capabilities'][capability]['execution'], 'if_studio')
         self.assertEqual(len(card_data['if_model_limits']), 18)
+        for model, maximum in (('qwen-image-2.0', 3), ('qwen-image-3.0', 3),
+                               ('万相2.7图像生成', 9), ('即梦5.0 Pro', 10),
+                               ('Nano Banana Pro', 9), ('GPT-Image-2', 9)):
+            self.assertEqual(card_data['if_model_limits'][model]['bridge'],
+                             {'image': maximum, 'video': 0, 'audio': 0})
         self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['api'],
                          {'image': 10, 'video': 5, 'audio': 5})
         self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['bridge'],

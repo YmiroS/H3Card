@@ -202,7 +202,7 @@ class BridgeTest(unittest.TestCase):
         self.assertFalse(self.bridge.assets)
         self.assertEqual(self.bridge.asset_bytes, 0)
 
-    def test_asset_path_is_used_once_and_deleted_after_create(self):
+    def test_image_asset_uploads_once_and_is_deleted_before_reference_round(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
             limits.read_text.return_value = json.dumps({
                 'qwen-image-2.0': {'type': 'image', 'bridge': {'image': 1, 'video': 0}}})
@@ -218,14 +218,22 @@ class BridgeTest(unittest.TestCase):
                 if args[0] == 'models':
                     return MODELS
                 calls.append(args)
-                if args[:2] == ('canvas', 'run'):
-                    self.assertEqual(args.count('--image'), 1)
-                    self.assertEqual(args[args.index('--image') + 1], str(asset_path))
+                if args[0] == 'upload':
+                    self.assertEqual(args[1], str(asset_path))
                     self.assertTrue(asset_path.exists())
                     created.set()
                     self.assertTrue(release.wait(2))
-                    return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+                    return {'url': 'https://example.com/uploaded.png'}
                 self.assertFalse(asset_path.exists())
+                if args[:2] == ('canvas', 'run'):
+                    if '--image' in args:
+                        self.assertEqual(args[args.index('--image') + 1], 'https://example.com/uploaded.png')
+                        self.assertIn('图片1', args[-1])
+                        self.assertIn('本轮不要生成任何内容', args[-1])
+                    else:
+                        self.assertIn('总需求', args[-1])
+                        self.assertEqual(args[args.index('--model') + 1], 'qwen-image-2.0')
+                    return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
                 return {'status': 'done', 'downloaded': []}
 
             with mock.patch.object(self.bridge, 'command', side_effect=command):
@@ -244,7 +252,9 @@ class BridgeTest(unittest.TestCase):
                 self.assertEqual(job['state'], 'done')
                 self.assertEqual(self.run_request(asset_id=asset_id)[0], 400)
             self.assertFalse(asset_path.exists())
-            self.assertEqual(len([args for args in calls if args[:2] == ('canvas', 'run')]), 1)
+            self.assertEqual(len([args for args in calls if args[:2] == ('canvas', 'run')]), 2)
+            self.assertEqual(len([args for args in calls if args[0] == 'upload']), 1)
+            self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
 
     def test_video_asset_uploads_once_then_registers_before_final_prompt(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
@@ -333,8 +343,11 @@ class BridgeTest(unittest.TestCase):
                                               asset_ids=[video['asset_id'], video['asset_id']])[0], 400)
             self.assertEqual(self.run_request(type='video', model='Minimax H3',
                                               asset_ids=[image['asset_id']])[0], 400)
-            self.assertEqual(self.run_request(type='image', model='qwen-image-2.0',
-                                              asset_ids=[image['asset_id']])[0], 400)
+            for asset_ids, extra in (([image['asset_id'], image['asset_id']], {}),
+                                     ([video['asset_id']], {}),
+                                     ([image['asset_id']], {'image': 'https://example.com/opaque'}),
+                                     ([image['asset_id']], {'asset_id': image['asset_id']})):
+                self.assertEqual(self.run_request(asset_ids=asset_ids, **extra)[0], 400)
             limits.read_text.return_value = json.dumps({
                 'Minimax H3': {'type': 'video', 'bridge': {'image': 1}}})
             self.assertEqual(self.run_request(asset_id=image['asset_id'])[0], 400)
@@ -384,6 +397,56 @@ class BridgeTest(unittest.TestCase):
                         time.sleep(.01)
                     self.assertEqual(state, 'done')
                 self.assertEqual(generate.call_count, 5)
+
+    def test_image_multiple_references_register_then_generate_once(self):
+        ids = [self.upload()[2]['asset_id'] for _ in range(2)]
+        paths = [self.bridge.assets[item][0] for item in ids]
+        calls = []
+
+        def command(*args, **_):
+            if args[0] == 'models':
+                return MODELS
+            calls.append(args)
+            if args[0] == 'upload':
+                return {'url': f'https://example.com/{Path(args[1]).name}'}
+            if args[:2] == ('canvas', 'run'):
+                return {'status': 'created', 'canvas_id': 'image-c', 'session_id': 'image-s'}
+            return {'status': 'done', 'downloaded': []}
+
+        with mock.patch.object(self.bridge, 'command', side_effect=command):
+            code, _, response = self.run_request(asset_ids=ids, image='https://example.com/third.png')
+            self.assertEqual(code, 202)
+            for _ in range(100):
+                _, _, job = self.request('GET', '/runs/' + response['id'])
+                if job['state'] == 'done':
+                    break
+                time.sleep(.01)
+            self.assertEqual(job['state'], 'done')
+        self.assertEqual([call[0] for call in calls[:2]], ['upload', 'upload'])
+        runs = [call for call in calls if call[:2] == ('canvas', 'run')]
+        self.assertEqual(len(runs), 4)
+        for number, call in enumerate(runs[:-1], 1):
+            self.assertIn(f'引用名为「图片{number}」', call[-1])
+            self.assertIn('本轮不要生成任何内容', call[-1])
+            self.assertIn('--create-only', call)
+            self.assertNotIn('--model', call)
+        self.assertNotIn('--image', runs[-1])
+        self.assertEqual(runs[-1][runs[-1].index('--model') + 1], 'qwen-image-2.0')
+        self.assertIn('图片1、图片2、图片3', runs[-1][-1])
+        for call in runs[1:]:
+            self.assertEqual(call[call.index('--canvas-id') + 1], 'image-c')
+            self.assertEqual(call[call.index('--session-id') + 1], 'image-s')
+        self.assertEqual([call[:2] for call in calls].count(('canvas', 'poll')), 1)
+        self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
+        self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_image_limits_count_local_and_https_references_together(self):
+        ids = [self.upload()[2]['asset_id'] for _ in range(4)]
+        with mock.patch.object(self.bridge, 'command', return_value=MODELS):
+            for asset_ids, extra in ((ids, {}), (ids[:3], {'image': 'https://example.com/opaque'})):
+                self.assertEqual(self.run_request(asset_ids=asset_ids, **extra)[0], 400)
+        self.assertEqual(len(self.bridge.assets), 4)
+        self.assertFalse(self.bridge.jobs)
 
     def test_video_references_continue_one_canvas_and_return_cli_failure(self):
         png = b'\x89PNG\r\n\x1a\n' + b'0' * 32
@@ -570,13 +633,18 @@ class BridgeTest(unittest.TestCase):
 
     def test_allowed_https_reference_is_forwarded_once(self):
         reference = 'https://example.com/reference.png?token=1'
+        calls = []
 
         def command(*args, **_):
             if args[0] == 'models':
                 return MODELS
+            calls.append(args)
             if args[:2] == ('canvas', 'run'):
-                self.assertEqual(args.count('--image'), 1)
-                self.assertEqual(args[args.index('--image') + 1], reference)
+                if '--image' in args:
+                    self.assertEqual(args.count('--image'), 1)
+                    self.assertEqual(args[args.index('--image') + 1], reference)
+                else:
+                    self.assertIn('总需求', args[-1])
                 return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
             return {'status': 'done', 'downloaded': []}
 
@@ -589,7 +657,9 @@ class BridgeTest(unittest.TestCase):
                     break
                 time.sleep(.01)
             self.assertEqual(job['state'], 'done')
-
+        self.assertEqual(sum('--image' in call for call in calls), 1)
+        self.assertFalse(any(call[0] == 'upload' for call in calls))
+        self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
 
     def test_private_network_preflight(self):
         code, headers, _ = self.request('OPTIONS', '/runs', headers={

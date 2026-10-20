@@ -88,18 +88,17 @@ class Bridge(ThreadingHTTPServer):
             if request.get('image'):
                 references.append(request['image'])
             video = request.get('type') == 'video'
-            if video:
-                for index, path in enumerate(asset_paths):
-                    try:
-                        uploaded = self.command('upload', str(path), '--profile', 'buc', '--json', timeout=60)
-                    finally:
-                        path.unlink(missing_ok=True)
-                    url = uploaded.get('url')
-                    if not isinstance(url, str) or urlparse(url).scheme not in ('http', 'https') or not urlparse(url).hostname:
-                        raise RuntimeError('IF CLI 上传失败：' + str(uploaded.get('error') or
-                                           uploaded.get('message') or '未返回有效的素材 URL')[:500])
-                    references[index] = url
-            steps = references + [None] if video else (references or [None])
+            for index, path in enumerate(asset_paths):
+                try:
+                    uploaded = self.command('upload', str(path), '--profile', 'buc', '--json', timeout=60)
+                finally:
+                    path.unlink(missing_ok=True)
+                url = uploaded.get('url')
+                if not isinstance(url, str) or urlparse(url).scheme not in ('http', 'https') or not urlparse(url).hostname:
+                    raise RuntimeError('IF CLI 上传失败：' + str(uploaded.get('error') or
+                                       uploaded.get('message') or '未返回有效的素材 URL')[:500])
+                references[index] = url
+            steps = references + [None]
             counts = {'图片': 0, '视频': 0}
             names = []
             canvas_id, session_id = request.get('canvas_id'), request.get('session_id')
@@ -110,7 +109,7 @@ class Bridge(ThreadingHTTPServer):
                 if reference:
                     flags += ['--image', reference]
                 prompt = request['prompt']
-                if video and reference:
+                if reference:
                     source = str(asset_paths[index]) if index < len(asset_paths) else request['image']
                     suffix = Path(urlparse(source).path).suffix.lower()
                     media = '视频' if suffix in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v') else '图片'
@@ -122,15 +121,11 @@ class Bridge(ThreadingHTTPServer):
                               '等待全部参考素材登记完成后的总需求轮，再统一生成。')
                 else:
                     flags += ['--model', request['model']]
-                    if video and names:
+                    if names:
                         prompt = f'基于以上已登记的全部参考素材（{"、".join(names)}），执行以下总需求：\n\n{prompt}'
                     if request.get('skill'):
                         flags += ['--skill', request['skill']]
-                try:
-                    created = self.command(*flags, '--', prompt, timeout=60)
-                finally:
-                    if not video and index < len(asset_paths):
-                        asset_paths[index].unlink(missing_ok=True)
+                created = self.command(*flags, '--', prompt, timeout=60)
                 if created.get('status') != 'created':
                     raise RuntimeError('IF CLI 未创建画布：' + str(created.get('error') or
                                        created.get('message') or created.get('status'))[:500])
@@ -143,7 +138,7 @@ class Bridge(ThreadingHTTPServer):
             poll_args = ('canvas', 'poll', '--profile', 'buc', '--canvas-id', created['canvas_id'],
                          '--session-id', created['session_id'], '--timeout', '600', '--save-dir', str(folder), '--json')
             result = self.command(*poll_args, timeout=630)
-            if not video and result.get('status') == 'summary_feedback' and any(
+            if not references and not video and result.get('status') == 'summary_feedback' and any(
                     text in result.get('planning_text', '') for text in ('后台处理中', '已生成完毕')):
                 deadline = time.monotonic() + 900
                 while time.monotonic() < deadline:
@@ -400,7 +395,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 raise ValueError()
             asset_ids = data.get('asset_ids')
             if 'asset_ids' in data:
-                if kind != 'video' or 'asset_id' in data or not isinstance(asset_ids, list) or \
+                if 'asset_id' in data or not isinstance(asset_ids, list) or \
                         not 1 <= len(asset_ids) <= 40 or len(set(asset_ids)) != len(asset_ids) or \
                         any(not isinstance(item, str) or not re.fullmatch(r'[A-Za-z0-9_-]{32}', item)
                             for item in asset_ids):
@@ -449,8 +444,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                 else None)
                     if url_kind in counts:
                         counts[url_kind] += 1
-                    elif url_kind or kind == 'video' or not any(bridge_limits.get(m) for m in counts):
+                    elif url_kind or kind == 'video':
                         raise ValueError()
+                    else:
+                        counts['image'] += 1
                 for media, count in counts.items():
                     maximum = bridge_limits.get(media)
                     if count and (type(maximum) is not int or count > maximum):
