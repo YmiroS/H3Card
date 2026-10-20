@@ -215,12 +215,35 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(pause.call_count, 2)
 
     def test_cli_poll_failure_message_is_returned(self):
-        created = {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+        created = {'status': 'created', 'canvas_id': 'c_OcBXJf2Bd0CxY-', 'session_id': 's1',
+                   'canvas_url': 'https://ifs.alibaba-inc.com/#/canvas/c_OcBXJf2Bd0CxY-'}
         with mock.patch.object(self.bridge, 'command', side_effect=[
                 created, {'status': 'failed', 'message': 'IFS 不接受此引用组合'}]):
             self.bridge.generate('failed-video', {'model': 'Minimax H3', 'prompt': '生成视频'})
         self.assertEqual(self.bridge.jobs['failed-video']['state'], 'error')
         self.assertIn('IFS 不接受此引用组合', self.bridge.jobs['failed-video']['error'])
+        result = self.bridge.jobs['failed-video']['result']
+        self.assertEqual(result['canvas_id'], created['canvas_id'])
+        self.assertEqual(result['canvas_url'], created['canvas_url'])
+        self.assertEqual(result['session_id'], 's1')
+
+    def test_poll_exception_and_incomplete_completion_keep_created_canvas(self):
+        canvas_id = 'c_OcBXJf2Bd0CxY-'
+        for name, outcome, expected_state in [('exception', RuntimeError('网络断开'), 'error'),
+                                               ('no-media', {'status': 'done'}, 'done')]:
+            with self.subTest(name=name), mock.patch.object(self.bridge, 'command', side_effect=[
+                    {'status': 'created', 'canvas_id': canvas_id, 'session_id': 's1'}, outcome]):
+                self.bridge.generate(name, {'model': 'Minimax H3', 'prompt': '生成视频'})
+            job = self.bridge.jobs[name]
+            self.assertEqual(job['state'], expected_state)
+            self.assertEqual(job['result']['canvas_id'], canvas_id)
+
+    def test_failure_before_canvas_creation_has_no_canvas_link(self):
+        with mock.patch.object(self.bridge, 'command', side_effect=RuntimeError('尚未创建')):
+            self.bridge.generate('not-created', {'model': 'Minimax H3', 'prompt': '生成视频'})
+        self.assertEqual(self.bridge.jobs['not-created']['state'], 'error')
+        self.assertNotIn('canvas_id', self.bridge.jobs['not-created']['result'])
+        self.assertNotIn('canvas_url', self.bridge.jobs['not-created']['result'])
 
     def upload(self, body=b'\x89PNG\r\n\x1a\n' + b'0' * 32, content_type='image/png', **kwargs):
         return self.request('POST', '/assets', body, headers={

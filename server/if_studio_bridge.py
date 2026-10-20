@@ -130,6 +130,8 @@ class Bridge(ThreadingHTTPServer):
     def generate(self, job_id, request, asset_paths=None):
         asset_paths = asset_paths or []
         submitted_prompt = None
+        canvas_result = {key: request[key] for key in ('canvas_id', 'session_id')
+                         if isinstance(request.get(key), str) and request[key]}
         reuse = request.get('references')
         reference_result = {'reference_urls': []} if reuse is not None else {}
         try:
@@ -206,6 +208,8 @@ class Bridge(ThreadingHTTPServer):
                             'step': f'IF 会话忙碌，正在等待上一轮结束；15 秒后重试（{attempt + 1}/20）',
                             'result': {**reference_result, 'submitted_prompt': prompt}}
                     time.sleep(15)
+            canvas_result.update({key: created[key] for key in ('canvas_id', 'canvas_url', 'session_id')
+                                  if isinstance(created.get(key), str) and created[key]})
             if created.get('status') != 'created':
                 raise RuntimeError('IF CLI 未创建画布：' + str(created.get('error') or
                                    created.get('message') or created.get('status'))[:500])
@@ -242,6 +246,9 @@ class Bridge(ThreadingHTTPServer):
                     downloads.append({'type': item.get('type'), 'name': path.name,
                                       'index': len(downloads), 'url': item.get('url')})
             result['downloaded'] = downloads
+            for key, value in canvas_result.items():
+                if not result.get(key):
+                    result[key] = value
             result.update(reference_result)
             result['submitted_prompt'] = prompt
             with self.lock:
@@ -249,7 +256,8 @@ class Bridge(ThreadingHTTPServer):
         except (RuntimeError, KeyError, TypeError, ValueError) as exc:
             with self.lock:
                 self.jobs[job_id] = {'state': 'error', 'error': redact_cli_error(exc),
-                    'result': {**reference_result, **({'submitted_prompt': submitted_prompt} if submitted_prompt is not None else {})}}
+                    'result': {**canvas_result, **reference_result,
+                               **({'submitted_prompt': submitted_prompt} if submitted_prompt is not None else {})}}
         finally:
             for path in asset_paths:
                 path.unlink(missing_ok=True)

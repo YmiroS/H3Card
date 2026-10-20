@@ -209,12 +209,34 @@ function ifReferenceState(c, projectId) {
 function saveIFReferences(state) {
   try { sessionStorage.setItem(state.key, JSON.stringify({entries:state.entries, pending:state.pending, job:state.job})); } catch {}
 }
+function ifCanvasURL(result) {
+  try {
+    const url = new URL(result?.canvas_url);
+    if (url.origin === 'https://ifs.alibaba-inc.com' && !url.username && !url.password
+        && url.pathname === '/' && /^#\/canvas\/c_[A-Za-z0-9_-]+$/.test(url.hash)) return url.href;
+  } catch {}
+  const id = result?.canvas_id;
+  return typeof id === 'string' && /^c_[A-Za-z0-9_-]+$/.test(id)
+    ? `https://ifs.alibaba-inc.com/#/canvas/${id}` : '';
+}
+function ifCanvasLink(c) {
+  if (!isIF(c) || c.status !== 'error') return null;
+  const url = ifCanvasURL({canvas_url:c.if_canvas_url});
+  if (!url) return null;
+  const link = document.createElement('a');
+  link.className = 'if-canvas-link'; link.textContent = '打开 IF 画布';
+  link.href = url; link.target = '_blank'; link.rel = 'noopener noreferrer';
+  link.title = '在新标签页查看 IF 生成失败原因';
+  for (const event of ['pointerdown', 'mousedown', 'click', 'dblclick'])
+    link.addEventListener(event, e => e.stopPropagation());
+  return link;
+}
 function ifTaskKey(c, projectId) {
   return 'chouka:if-task:v1:' + JSON.stringify([H3Auth.user?.id, projectId, c.id]);
 }
 function rememberIFTask(c, projectId, phase) {
   const state = {phase, cap:c.cap, job:c.job, status:c.status, step:c.step, error:c.error,
-    if_started:c.if_started, if_job_cap:c.if_job_cap, ms:c.ms, outputs:c.outputs || [],
+    if_started:c.if_started, if_job_cap:c.if_job_cap, if_canvas_url:c.if_canvas_url, ms:c.ms, outputs:c.outputs || [],
     entry:c.job ? c.history?.find(item => item.job === c.job) : null};
   try { sessionStorage.setItem(ifTaskKey(c, projectId), JSON.stringify(state)); } catch {}
 }
@@ -230,7 +252,7 @@ function restoreIFTask(c, projectId) {
     try { sessionStorage.removeItem(key); } catch {}
     return false;
   }
-  for (const field of ['job', 'status', 'step', 'error', 'if_started', 'if_job_cap', 'ms', 'outputs'])
+  for (const field of ['job', 'status', 'step', 'error', 'if_started', 'if_job_cap', 'if_canvas_url', 'ms', 'outputs'])
     c[field] = state[field];
   c.progress = null;
   if (state.entry && state.entry.job === c.job) {
@@ -2805,6 +2827,8 @@ function paint(c) {
     : outs.length > 1 ? `${outs.length} 张`
     : out ? String(out.filename || out.origin || out.url || "").split(/[\\/]/).pop().slice(-22) : "";
   meta.title = c.error || "";
+  const canvasLink = ifCanvasLink(c);
+  if (canvasLink) meta.replaceChildren(canvasLink);
 }
 
 /** 文本节点的节点脚：状态字 / 输入段数 / 出口提示 / 进度条。在节点上打字时也要刷它
@@ -6015,6 +6039,8 @@ function openPanel(id) {
   body.appendChild(pwrap);
 
   if (c.error) body.appendChild(errBox(c.error));
+  const canvasLink = ifCanvasLink(c);
+  if (canvasLink) body.appendChild(canvasLink);
 
   // --- 底部 ---
   const foot = document.createElement("div"); foot.className = "foot";
@@ -8261,6 +8287,7 @@ async function runIF(c) {
   let submitted = false, submissionAttempted = false;
   c.status = "queued"; c.error = null; c.progress = null; c.job = null; c.ms = null;
   c.step = "正在连接本机 IF 并读取模型"; c.if_started = Date.now(); c.if_job_cap = capability;
+  delete c.if_canvas_url;
   rememberIFTask(c, project.id, 'preparing');
   paint(c); if (el.panel._id === c.id) openPanel(c.id);
   try {
@@ -8432,6 +8459,8 @@ async function pollIF(c, projectId) {
     const job = await ifRequest(`/runs/${encodeURIComponent(c.job)}`);
     if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
     rememberIFReferences(c, job.result, projectId);
+    const canvasURL = ifCanvasURL(job.result);
+    if (canvasURL) c.if_canvas_url = canvasURL;
     const submitted = c.history?.find(h => h.job === c.job)?.prompts?.find(p => p.key === "if_submitted");
     if (submitted && typeof job.result?.submitted_prompt === "string")
       submitted.text = job.result.submitted_prompt;

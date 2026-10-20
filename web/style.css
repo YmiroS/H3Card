@@ -1679,6 +1679,15 @@ body.node-editor #panel .director-supplement {
 body.node-editor #respop { width: min(380px, calc(100vw - 16px)); max-height: calc(100vh - 16px); }
 body.node-editor #toast { max-width: calc(100vw - 24px); }
 #toast a { color: var(--acc); text-decoration: underline; }
+.if-canvas-link {
+  display: inline-flex; align-items: center; justify-content: center; padding: 5px 9px;
+  border: 1px solid #fb7185; border-radius: 6px; background: #881337;
+  color: #fff1f2; font-size: 12px; line-height: 1.4; text-decoration: none; cursor: pointer;
+}
+.if-canvas-link:hover { background: #9f1239; }
+.if-canvas-link:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
+.card .meta:has(.if-canvas-link) { overflow: visible; flex-shrink: 0; }
+.card .if-canvas-link { padding: 2px 6px; font-size: 11px; }
 
 /* ================= 只读画布：允许看和平移缩放，改动入口全部收掉 ================= */
 body.project-readonly #dock, body.project-readonly #selbar .act,
