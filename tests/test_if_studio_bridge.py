@@ -216,7 +216,7 @@ class BridgeTest(unittest.TestCase):
         path = self.bridge.assets[body['asset_id']][0]
         self.assertEqual(path.stat().st_size, 10_000_000)
 
-    def test_image_asset_uploads_once_and_is_deleted_before_reference_round(self):
+    def test_image_asset_uploads_once_and_is_deleted_before_single_submission(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
             limits.read_text.return_value = json.dumps({
                 'qwen-image-2.0': {'type': 'image', 'bridge': {'image': 1, 'video': 0}}})
@@ -243,13 +243,10 @@ class BridgeTest(unittest.TestCase):
                     return {'url': 'https://example.com/uploaded.png'}
                 self.assertFalse(asset_path.exists())
                 if args[:2] == ('canvas', 'run'):
-                    if '--image' in args:
-                        self.assertEqual(args[args.index('--image') + 1], 'https://example.com/uploaded.png')
-                        self.assertIn('图片1', args[-1])
-                        self.assertIn('本轮不要生成任何内容', args[-1])
-                    else:
-                        self.assertIn('总需求', args[-1])
-                        self.assertEqual(args[args.index('--model') + 1], 'qwen-image-2.0')
+                    self.assertNotIn('--image', args)
+                    self.assertEqual(args[-1], '图片1：https://example.com/uploaded.png\n\n生成需求：\ngenerate')
+                    self.assertEqual(args[args.index('--model') + 1], 'qwen-image-2.0')
+                    self.assertEqual(job['result']['submitted_prompt'], args[-1])
                     return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
                 return {'status': 'done', 'downloaded': []}
 
@@ -273,17 +270,16 @@ class BridgeTest(unittest.TestCase):
                 self.assertEqual(job['state'], 'done')
                 self.assertEqual(self.run_request(asset_id=asset_id)[0], 400)
             self.assertFalse(asset_path.exists())
-            self.assertEqual(len([args for args in calls if args[:2] == ('canvas', 'run')]), 2)
+            self.assertEqual(len([args for args in calls if args[:2] == ('canvas', 'run')]), 1)
             self.assertEqual(len([args for args in calls if args[0] == 'upload']), 1)
             self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
             self.assertEqual(steps, [
                 ('starting', '正在上传 IF 引用素材（1/1）'),
-                ('starting', '正在登记 IF 参考素材「图片1」（1/1）'),
-                ('starting', '正在向 IF 提交图片生成需求'),
+                ('starting', '正在向 IF 一次提交全部引用与图片生成需求'),
                 ('running', 'IF 正在生成图片，等待产物'),
             ])
 
-    def test_video_asset_uploads_once_then_registers_before_final_prompt(self):
+    def test_video_asset_uploads_once_then_submits_url_in_prompt(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
             limits.read_text.return_value = json.dumps({
                 'Minimax H3': {'type': 'video', 'bridge': {'image': 0, 'video': 1}}})
@@ -304,14 +300,9 @@ class BridgeTest(unittest.TestCase):
                     return {'url': 'https://example.com/uploaded.mp4'}
                 self.assertFalse(path.exists())
                 if args[:2] == ('canvas', 'run'):
-                    if '--image' in args:
-                        self.assertEqual(args[args.index('--image') + 1], 'https://example.com/uploaded.mp4')
-                        self.assertIn('视频1', args[-1])
-                        self.assertIn('本轮不要生成任何内容', args[-1])
-                        self.assertNotIn('--model', args)
-                    else:
-                        self.assertIn('总需求', args[-1])
-                        self.assertEqual(args[args.index('--model') + 1], 'Minimax H3')
+                    self.assertNotIn('--image', args)
+                    self.assertEqual(args[-1], '视频1：https://example.com/uploaded.mp4\n\n生成需求：\ngenerate')
+                    self.assertEqual(args[args.index('--model') + 1], 'Minimax H3')
                     return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
                 return {'status': 'done', 'downloaded': []}
 
@@ -326,7 +317,7 @@ class BridgeTest(unittest.TestCase):
                 self.assertEqual(job['state'], 'done')
                 self.assertFalse(path.exists())
                 self.assertEqual([call[:2] for call in calls], [
-                    ('upload', str(path)), ('canvas', 'run'), ('canvas', 'run'), ('canvas', 'poll')])
+                    ('upload', str(path)), ('canvas', 'run'), ('canvas', 'poll')])
 
     def test_asset_failure_deletes_file_and_cannot_replay(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
@@ -425,7 +416,7 @@ class BridgeTest(unittest.TestCase):
                     self.assertEqual(state, 'done')
                 self.assertEqual(generate.call_count, 5)
 
-    def test_image_multiple_references_register_then_generate_once(self):
+    def test_image_multiple_references_generate_once_with_all_urls(self):
         ids = [self.upload()[2]['asset_id'] for _ in range(2)]
         paths = [self.bridge.assets[item][0] for item in ids]
         calls = []
@@ -451,18 +442,19 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(job['state'], 'done')
         self.assertEqual([call[0] for call in calls[:2]], ['upload', 'upload'])
         runs = [call for call in calls if call[:2] == ('canvas', 'run')]
-        self.assertEqual(len(runs), 4)
-        for number, call in enumerate(runs[:-1], 1):
-            self.assertIn(f'引用名为「图片{number}」', call[-1])
-            self.assertIn('本轮不要生成任何内容', call[-1])
-            self.assertIn('--create-only', call)
-            self.assertNotIn('--model', call)
-        self.assertNotIn('--image', runs[-1])
-        self.assertEqual(runs[-1][runs[-1].index('--model') + 1], 'qwen-image-2.0')
-        self.assertIn('图片1、图片2、图片3', runs[-1][-1])
-        for call in runs[1:]:
-            self.assertEqual(call[call.index('--canvas-id') + 1], 'image-c')
-            self.assertEqual(call[call.index('--session-id') + 1], 'image-s')
+        self.assertEqual(len(runs), 1)
+        self.assertIn('--create-only', runs[0])
+        self.assertNotIn('--image', runs[0])
+        self.assertEqual(runs[0][runs[0].index('--model') + 1], 'qwen-image-2.0')
+        expected = (f'图片1：https://example.com/{paths[0].name}\n'
+                    f'图片2：https://example.com/{paths[1].name}\n'
+                    '图片3：https://example.com/third.png\n\n生成需求：\ngenerate')
+        self.assertEqual(runs[0][-1], expected)
+        self.assertEqual(job['result']['submitted_prompt'], expected)
+        self.assertNotIn('qwen-image-2.0', expected)
+        self.assertNotIn('--canvas-id', runs[0])
+        self.assertEqual(calls[-1][calls[-1].index('--canvas-id') + 1], 'image-c')
+        self.assertEqual(calls[-1][calls[-1].index('--session-id') + 1], 'image-s')
         self.assertEqual([call[:2] for call in calls].count(('canvas', 'poll')), 1)
         self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
         self.assertTrue(all(not path.exists() for path in paths))
@@ -508,25 +500,19 @@ class BridgeTest(unittest.TestCase):
                 time.sleep(.01)
             self.assertEqual(job['state'], 'done')
         runs = [call for call in calls if call[:2] == ('canvas', 'run')]
-        self.assertEqual(len(runs), 5)
+        self.assertEqual(len(runs), 1)
         self.assertEqual([call[1] for call in calls if call[0] == 'upload'], paths)
         self.assertTrue(all(call[0] == 'upload' for call in calls[:3]))
-        self.assertEqual([call[call.index('--image') + 1] for call in runs[:-1]],
-                         urls + ['https://example.com/clip.mp4'])
-        self.assertNotIn('--image', runs[-1])
+        self.assertNotIn('--image', runs[0])
         self.assertNotIn('--canvas-id', runs[0])
-        for call in runs[1:]:
-            self.assertEqual(call[call.index('--canvas-id') + 1], 'c1')
-            self.assertEqual(call[call.index('--session-id') + 1], 's1')
-        self.assertEqual(runs[-1][-1], '基于以上已登记的全部参考素材（视频1、图片1、图片2、视频2），执行以下总需求：\n\n最终生成视频')
-        self.assertEqual(runs[-1][runs[-1].index('--skill') + 1], '商品展示')
-        for call, name in zip(runs[:-1], ('视频1', '图片1', '图片2', '视频2')):
-            self.assertIn(f'引用名为「{name}」', call[-1])
-            self.assertIn('本轮不要生成任何内容', call[-1])
-            self.assertIn('不要调用生图或生视频工具', call[-1])
-            self.assertNotIn('--model', call)
-            self.assertNotIn('--skill', call)
-            self.assertIn('--create-only', call)
+        expected = ('视频1：https://example.com/uploaded.mp4\n图片1：https://example.com/a.png\n'
+                    '图片2：https://example.com/b.png\n视频2：https://example.com/clip.mp4\n\n生成需求：\n最终生成视频')
+        self.assertEqual(runs[0][-1], expected)
+        self.assertEqual(job['result']['submitted_prompt'], expected)
+        self.assertEqual(runs[0][runs[0].index('--skill') + 1], '商品展示')
+        self.assertEqual(runs[0][runs[0].index('--model') + 1], 'Minimax H3')
+        self.assertNotIn('Minimax H3', expected)
+        self.assertIn('--create-only', runs[0])
         self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
         self.assertEqual(len([call for call in calls if call[:2] == ('canvas', 'poll')]), 1)
         self.assertTrue(all(not Path(path).exists() for path in paths))
@@ -537,7 +523,7 @@ class BridgeTest(unittest.TestCase):
                 self.bridge.command('canvas', 'run')
         self.assertNotIn('secret-token', str(failure.exception))
 
-    def test_busy_references_and_final_send_retry_without_reupload_or_duplicate_acceptance(self):
+    def test_busy_existing_session_retries_single_demand_without_reupload(self):
         for kind, model in (('image', 'qwen-image-2.0'), ('video', 'Minimax H3')):
             with self.subTest(kind=kind):
                 job_id = 'busy-' + kind
@@ -545,7 +531,7 @@ class BridgeTest(unittest.TestCase):
                 for path in paths:
                     path.write_bytes(b'fake-image')
                 accepted, attempts, uploads, polls = [], [], [], []
-                busy = False
+                busy = True
 
                 def process(argv, **_):
                     nonlocal busy
@@ -556,16 +542,15 @@ class BridgeTest(unittest.TestCase):
                         result = {'url': f'https://example.com/{Path(args[1]).name}'}
                     elif args[:2] == ('canvas', 'run'):
                         attempts.append(args)
-                        if accepted:
-                            self.assertEqual(args[args.index('--canvas-id') + 1], 'c1')
-                            self.assertEqual(args[args.index('--session-id') + 1], 's1')
+                        self.assertEqual(args[args.index('--canvas-id') + 1], 'c1')
+                        self.assertEqual(args[args.index('--session-id') + 1], 's1')
                         if busy:
                             return mock.Mock(returncode=1, stdout='', stderr=BUSY_ERROR)
                         accepted.append(args)
                         busy = True
                     else:
                         polls.append(args)
-                        self.assertEqual(len(accepted), 3, 'poll only after final demand is accepted')
+                        self.assertEqual(len(accepted), 1, 'poll only after the single demand is accepted')
                         result = {'status': 'done', 'downloaded': []}
                     return mock.Mock(returncode=0, stderr='', stdout=json.dumps(result))
 
@@ -581,30 +566,29 @@ class BridgeTest(unittest.TestCase):
 
                 with mock.patch('if_studio_bridge.subprocess.run', side_effect=process), \
                         mock.patch('if_studio_bridge.time.sleep', side_effect=release_previous_round) as pause:
-                    self.bridge.generate(job_id, {'type': kind, 'model': model, 'prompt': '最终需求'}, paths)
+                    self.bridge.generate(job_id, {'type': kind, 'model': model, 'prompt': '最终需求',
+                        'canvas_id': 'c1', 'session_id': 's1'}, paths)
                 self.assertEqual(self.bridge.jobs[job_id]['state'], 'done')
                 self.assertEqual(uploads, list(map(str, paths)))
-                self.assertEqual(len(accepted), 3)
-                self.assertEqual(len(attempts), 5)
-                self.assertEqual(attempts[1], attempts[2], 'retry keeps second reference URL and prompt')
-                self.assertEqual(attempts[3], attempts[4], 'retry keeps final model and demand')
-                self.assertIn('图片1、图片2', accepted[-1][-1])
-                self.assertNotIn('--image', accepted[-1])
+                self.assertEqual(len(accepted), 1)
+                self.assertEqual(len(attempts), 2)
+                self.assertEqual(attempts[0], attempts[1], 'retry keeps all URLs and the same demand')
+                for number, path in enumerate(paths, 1):
+                    self.assertIn(f'图片{number}：https://example.com/{path.name}', accepted[0][-1])
+                self.assertNotIn('--image', accepted[0])
                 self.assertEqual(len(polls), 1)
-                self.assertEqual(pause.call_count, 2)
+                self.assertEqual(pause.call_count, 1)
                 self.assertTrue(all(not path.exists() for path in paths))
 
     def test_busy_retry_is_bounded_and_never_polls_unaccepted_demand(self):
-        accepted = mock.Mock(returncode=0, stderr='', stdout=json.dumps(
-            {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}))
         busy = mock.Mock(returncode=1, stdout='', stderr=BUSY_ERROR + ' token=hidden-secret')
-        with mock.patch('if_studio_bridge.subprocess.run', side_effect=[accepted] + [busy] * 21) as cli, \
+        with mock.patch('if_studio_bridge.subprocess.run', side_effect=[busy] * 21) as cli, \
                 mock.patch('if_studio_bridge.time.sleep') as pause:
             self.bridge.generate('busy-limit', {'type': 'image', 'model': 'qwen-image-2.0',
-                'prompt': '最终需求', 'image': 'https://example.com/ref.png'})
+                'prompt': '最终需求', 'image': 'https://example.com/ref.png', 'canvas_id': 'c1', 'session_id': 's1'})
         self.assertEqual(pause.call_count, 20)
         self.assertTrue(all(call.args == (15,) for call in pause.call_args_list))
-        self.assertEqual(cli.call_count, 22)
+        self.assertEqual(cli.call_count, 21)
         self.assertTrue(all(call.args[0][1:3] == ['canvas', 'run'] for call in cli.call_args_list))
         job = self.bridge.jobs['busy-limit']
         self.assertEqual(job['state'], 'error')
@@ -638,7 +622,7 @@ class BridgeTest(unittest.TestCase):
                 self.bridge.command('canvas', 'poll', '--session-id', 's1')
             self.assertNotIsInstance(failure.exception, SessionBusyError)
 
-    def test_second_reference_cli_error_stops_chain_and_cleans_assets(self):
+    def test_single_submission_error_stops_and_cleans_assets(self):
         image = b'\x89PNG\r\n\x1a\n' + b'0' * 32
         ids = [self.upload(image, 'image/png')[2]['asset_id'] for _ in range(2)]
         paths = [self.bridge.assets[item][0] for item in ids]
@@ -650,9 +634,7 @@ class BridgeTest(unittest.TestCase):
             calls.append(args)
             if args[0] == 'upload':
                 return {'url': f'https://example.com/{Path(args[1]).name}'}
-            if len([call for call in calls if call[:2] == ('canvas', 'run')]) == 2:
-                raise RuntimeError('IFS 拒绝第二张引用图片')
-            return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+            raise RuntimeError('IFS 拒绝单轮生成需求')
 
         with mock.patch.object(self.bridge, 'command', side_effect=command):
             code, _, response = self.run_request(type='video', model='Minimax H3', asset_ids=ids)
@@ -662,10 +644,11 @@ class BridgeTest(unittest.TestCase):
                 if job['state'] == 'error':
                     break
                 time.sleep(.01)
-        self.assertEqual(job['error'], 'IFS 拒绝第二张引用图片')
-        self.assertEqual(len(calls), 4)
+        self.assertEqual(job['error'], 'IFS 拒绝单轮生成需求')
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(job['result']['submitted_prompt'], calls[-1][-1])
         self.assertFalse(any(call[:2] == ('canvas', 'poll') for call in calls))
-        self.assertTrue(all('--image' in call for call in calls if call[:2] == ('canvas', 'run')))
+        self.assertTrue(all('--image' not in call for call in calls if call[:2] == ('canvas', 'run')))
         self.assertTrue(all(not path.exists() for path in paths))
         self.assertEqual(self.bridge.asset_slots, 0)
 
@@ -685,28 +668,43 @@ class BridgeTest(unittest.TestCase):
                 self.assertTrue(all(not path.exists() for path in paths))
 
     def test_video_final_prompt_failure_does_not_poll(self):
-        created = {'status': 'created', 'canvas_id': 'existing-c', 'session_id': 'existing-s'}
-        with mock.patch.object(self.bridge, 'command', side_effect=[
-                created, {'status': 'failed', 'error': 'IFS 拒绝总需求'}]) as cli:
+        with mock.patch.object(self.bridge, 'command', return_value={
+                'status': 'failed', 'error': 'IFS 拒绝总需求'}) as cli:
             self.bridge.generate('final-error', {'type': 'video', 'model': 'Minimax H3',
                 'prompt': '生成视频', 'image': 'https://example.com/ref.png',
                 'canvas_id': 'existing-c', 'session_id': 'existing-s'})
         self.assertEqual(self.bridge.jobs['final-error']['state'], 'error')
         self.assertIn('IFS 拒绝总需求', self.bridge.jobs['final-error']['error'])
-        self.assertEqual(cli.call_count, 2)
+        self.assertEqual(cli.call_count, 1)
         for call in cli.call_args_list:
             self.assertEqual(call.args[:2], ('canvas', 'run'))
             self.assertEqual(call.args[call.args.index('--canvas-id') + 1], 'existing-c')
             self.assertEqual(call.args[call.args.index('--session-id') + 1], 'existing-s')
         self.assertNotIn('--image', cli.call_args.args)
 
-    def test_video_polls_once_even_if_cli_returns_background_summary(self):
+    def test_video_with_reference_polls_background_summary_without_resubmitting(self):
         created = {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
         background = {'status': 'summary_feedback', 'planning_text': '后台处理中'}
-        with mock.patch.object(self.bridge, 'command', side_effect=[created, background]) as cli:
-            self.bridge.generate('single-poll', {'type': 'video', 'model': 'Minimax H3', 'prompt': '生成视频'})
-        self.assertEqual([call.args[:2] for call in cli.call_args_list], [('canvas', 'run'), ('canvas', 'poll')])
-        self.assertEqual(self.bridge.jobs['single-poll']['result']['status'], 'summary_feedback')
+        finished = {'status': 'done', 'downloaded': []}
+        with mock.patch.object(self.bridge, 'command', side_effect=[created, background, finished]) as cli, \
+                mock.patch('if_studio_bridge.time.sleep') as pause:
+            self.bridge.generate('single-run', {'type': 'video', 'model': 'Minimax H3',
+                'prompt': '生成视频', 'image': 'https://example.com/ref.png'})
+        self.assertEqual([call.args[:2] for call in cli.call_args_list],
+                         [('canvas', 'run'), ('canvas', 'poll'), ('canvas', 'poll')])
+        self.assertEqual(self.bridge.jobs['single-run']['result']['status'], 'done')
+        pause.assert_called_once_with(10)
+
+    def test_background_poll_timeout_does_not_resubmit(self):
+        created = {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+        background = {'status': 'summary_feedback', 'planning_text': '后台处理中'}
+        with mock.patch.object(self.bridge, 'command', side_effect=[created, background]) as cli, \
+                mock.patch('if_studio_bridge.time.monotonic', side_effect=[0, 901]):
+            self.bridge.generate('poll-timeout', {'type': 'video', 'model': 'Minimax H3', 'prompt': '生成视频'})
+        self.assertEqual(cli.call_count, 2)
+        self.assertEqual(self.bridge.jobs['poll-timeout']['state'], 'error')
+        self.assertIn('未重新提交生成', self.bridge.jobs['poll-timeout']['error'])
+        self.assertEqual(self.bridge.jobs['poll-timeout']['result']['submitted_prompt'], '生成视频')
 
     def test_structured_cli_errors_redact_credentials(self):
         with mock.patch.object(self.bridge, 'command', return_value={
@@ -768,11 +766,8 @@ class BridgeTest(unittest.TestCase):
                 return MODELS
             calls.append(args)
             if args[:2] == ('canvas', 'run'):
-                if '--image' in args:
-                    self.assertEqual(args.count('--image'), 1)
-                    self.assertEqual(args[args.index('--image') + 1], reference)
-                else:
-                    self.assertIn('总需求', args[-1])
+                self.assertNotIn('--image', args)
+                self.assertEqual(args[-1], f'图片1：{reference}\n\n生成需求：\ngenerate')
                 return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
             return {'status': 'done', 'downloaded': []}
 
@@ -785,7 +780,8 @@ class BridgeTest(unittest.TestCase):
                     break
                 time.sleep(.01)
             self.assertEqual(job['state'], 'done')
-        self.assertEqual(sum('--image' in call for call in calls), 1)
+        self.assertEqual(sum(call[:2] == ('canvas', 'run') for call in calls), 1)
+        self.assertEqual(job['result']['submitted_prompt'], f'图片1：{reference}\n\n生成需求：\ngenerate')
         self.assertFalse(any(call[0] == 'upload' for call in calls))
         self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
 
