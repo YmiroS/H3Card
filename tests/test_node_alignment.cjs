@@ -749,7 +749,8 @@ function browserFixture(platform) {
     let PROJ = {id:'interaction',cards:[],edges:[],groups:[]};
     let selIds = new Set(), selId = null, selEdge = null, view = {x:0,y:0,k:1}, mouseW = null;
     let allowed = true, saved = 0, viewSaved = 0, linked = 0, spawned = 0, rendered = 0;
-    let panelClosed = 0, historyClosed = 0;
+    let panelClosed = 0, historyClosed = 0, uploadAttempts = 0;
+    const pickAsset = () => uploadAttempts++;
     const closeHistory = () => { historyClosed++; el.hist._id = null; };
     const paintKind = () => {};
     const canOperate = () => allowed, requireOperate = () => allowed;
@@ -796,7 +797,7 @@ function browserFixture(platform) {
     function reset() {
       closeMenu(); el.world.replaceChildren(); el.wires.replaceChildren(); el.groups.replaceChildren();
       allowed = true; NODE_EDITOR = false; selId = null; selIds = new Set(); selEdge = null;
-      rendered = 0; panelClosed = 0; historyClosed = 0; el.hist._id = null; el.view.style.display = 'none';
+      rendered = 0; panelClosed = 0; historyClosed = 0; uploadAttempts = 0; el.hist._id = null; el.view.style.display = 'none';
       document.querySelectorAll('[data-typing-fixture]').forEach(e => e.remove());
       if (document.activeElement instanceof HTMLElement) document.activeElement.blur();
       view = {x:0,y:0,k:1}; saved = 0; viewSaved = 0; linked = 0; spawned = 0; events.length = 0;
@@ -909,6 +910,25 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
             assert.deepEqual(await page.evaluate(() => PROJ.cards.map(c => [c.x,c.y])), before);
             assert.deepEqual(await page.evaluate(() => [saved,viewSaved]), [0,1]);
             assert.equal(await page.locator('#stage').evaluate(d => d.classList.contains('panning')), false);
+          }
+        });
+
+        await t.test('空素材节点 Shift 平移不弹文件选择，提前松开 Shift 也不误触且后续普通点击可用', async () => {
+          for (const releaseEarly of [false,true]) {
+            await reset();
+            await page.evaluate(() => { cardOf('a').outputs = []; choose(['b','c']); });
+            await page.keyboard.down('Shift');
+            try {
+              await page.mouse.move(180,200); await page.mouse.down();
+              await page.mouse.move(230,230,{steps:4});
+              if (releaseEarly) await page.keyboard.up('Shift');
+              await page.mouse.up();
+            } finally { await page.keyboard.up('Shift'); }
+            assert.equal(await page.evaluate(() => uploadAttempts), 0);
+            assert.deepEqual(await selection(), ['b','c']);
+            assert.deepEqual(await page.evaluate(() => view), {x:50,y:30,k:1});
+            await page.mouse.click(230,230);
+            assert.equal(await page.evaluate(() => uploadAttempts), 1, '后续普通点击仍可选择文件');
           }
         });
 
