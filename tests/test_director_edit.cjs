@@ -990,7 +990,8 @@ test('director fifth-step real Edge smoke', {timeout: 600000}, async t => {
       // A duration requiring 15× must be rejected, not silently trim or clamp.
       const before = structuredClone(data.clips[0]);
       await setField('最终时长（秒）', 0.2);
-      await expect(page.locator('#toast')).toContainText(/速度|0.25|4/);
+      await expect(page.locator('#h3-errors')).toContainText(/速度|0.25|4/);
+      await page.getByRole('button', {name:'关闭全部错误通知', exact:true}).click();
       await expect(field('最终时长（秒）')).toHaveValue('1');
       assert.deepEqual((await waitSaved()).clips[0], before);
     });

@@ -409,6 +409,11 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
       headers:{Origin:fixture.origin}, data:{username:'clipboard-test',password:'Clipboard-test-password-123'},
     });
     assert.equal(login.status(),200,await login.text());
+    const session = await login.json();
+    const phone = await context.request.post(fixture.origin + '/api/auth/phone', {
+      headers:{Origin:fixture.origin, 'X-CSRF-Token':session.csrf_token}, data:{phone:'13800138000'},
+    });
+    assert.equal(phone.status(),200,await phone.text());
     await context.addInitScript(() => {
       window.clipboardEvidence = [];
       document.addEventListener('paste', event => {
@@ -727,7 +732,8 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
           const saved = await api(`/api/projects/${project.id}`);
           assert.equal(saved.cards.length,1); assert.deepEqual(saved.edges,[]);
           await assertNoDropSuccess();
-          assert.ok((await state()).notice.includes('卡片添加失败'),'Show a failure instead of a success toast');
+          await expect(page.locator('#h3-errors')).toContainText('卡片添加失败');
+          await page.getByRole('button', {name:'关闭全部错误通知', exact:true}).click();
           (report.canvasDropCreateFailures ||= []).push({failure,...result});
         } finally { await page.unroute(pattern,handler); }
       });

@@ -41,14 +41,14 @@ async function refresh() {
     if (teamResult.status === 'rejected') throw teamResult.reason;
     teams = teamResult.value.teams; ready = true; candidatesReady = candidateResult.status === 'fulfilled';
     candidates = candidatesReady ? candidateResult.value.users : [];
-    if (!candidatesReady) $('error').textContent = '项目组已加载，但候选账号加载失败，暂不可添加组员。请刷新重试：' + candidateResult.reason.message;
+    if (!candidatesReady) { $('error').textContent = '项目组已加载，但候选账号加载失败，暂不可添加组员。请刷新重试：' + candidateResult.reason.message; H3Notify.error($('error').textContent); }
     render(); $('refresh-note').textContent = '更新于 ' + new Date().toLocaleTimeString('zh-CN', {hour12:false});
   } catch (error) { ready = false; $('refresh-note').textContent = '加载失败，请刷新重试'; throw error; }
   finally { loading = false; syncControls(); }
 }
 async function changed(message) {
   AdminUI.toast(message);
-  try { await refresh(); } catch (error) { $('error').textContent = '操作已成功，但项目组刷新失败，请点击刷新数据后继续：' + error.message; }
+  try { await refresh(); } catch (error) { $('error').textContent = '操作已成功，但项目组刷新失败，请点击刷新数据后继续：' + error.message; H3Notify.error($('error').textContent); }
 }
 function openOperation({title, body, submitLabel, action, message}) {
   if (mutationBusy || !ready) return;
@@ -96,7 +96,7 @@ function memberPicker(team) {
     event.preventDefault(); if (busy || mutationBusy || !ready) return;
     const userIds = inputs.filter(input => input.checked).map(input => input.value);
     if (!userIds.length) return;
-    if (userIds.length > 1000) { error.textContent = '每次最多添加 1000 名组员，请减少选择。'; return; }
+    if (userIds.length > 1000) { error.textContent = '每次最多添加 1000 名组员，请减少选择。'; H3Notify.error(error.textContent); return; }
     const selected = available.filter(user => userIds.includes(String(user.id)));
     openOperation({title:'确认添加 ' + selected.length + ' 名组员', body:`<p>项目组：<b>${h(team.name)}</b></p><ul class="dialog-member-list">${selected.map(user => '<li>' + h(label(user)) + '</li>').join('')}</ul><p class="notice-box">添加后这些账号可共同查看和编辑本组空间的全部画布、任务和素材。不会创建账号或发送邀请。</p>`, submitLabel:'确认添加组员', action:async () => {
       if (!team.can_manage) throw new Error('你无权管理该项目组。');
@@ -149,16 +149,16 @@ function render() {
 $('create-team').onsubmit = event => {
   event.preventDefault(); const source = event.currentTarget, name = source.elements.name.value.trim();
   $('create-error').textContent = '';
-  if (!name || Array.from(name).length > 64 || /[\u0000-\u001f]/u.test(name)) { $('create-error').textContent = '项目组名称须为 1 至 64 个字符，不能含控制字符。'; return; }
+  if (!name || Array.from(name).length > 64 || /[\u0000-\u001f]/u.test(name)) { $('create-error').textContent = '项目组名称须为 1 至 64 个字符，不能含控制字符。'; H3Notify.error($('create-error').textContent); return; }
   openOperation({title:'确认创建项目组', body:`<p>项目组：<b>${h(name)}</b></p><p>创建者：${h(label(currentUser))}</p><p class="notice-box">创建者自动成为组长和首位成员。本组全部画布由组员共同查看和编辑。</p>`, submitLabel:'确认创建项目组', action:async () => { await H3Auth.json('/api/teams', 'POST', {name}); source.reset(); }, message:'项目组已创建'});
 };
-$('refresh').onclick = async () => { $('error').textContent = ''; try { await refresh(); } catch (error) { $('error').textContent = error.message; } };
+$('refresh').onclick = async () => { $('error').textContent = ''; try { await refresh(); } catch (error) { $('error').textContent = error.message; H3Notify.error(error.message); } };
 H3Auth.requireUser().then(async user => {
   await AdminUI.mount({page:'teams', user});
   if (user.role !== 'admin' && !user.team_leader) throw new Error('仅管理员或组长可访问项目组管理。');
   currentUser = user; $('create-section').hidden = false;
   $('create-help').textContent = '创建者 ' + user.username + ' 自动成为组长和首位成员。项目组画布由组员共同编辑。';
   await refresh();
-}).catch(error => { $('error').textContent = error.message; });
+}).catch(error => { $('error').textContent = error.message; H3Notify.error(error.message); });
 })();
 </script></body></html>

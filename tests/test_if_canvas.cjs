@@ -384,6 +384,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     await page.locator('#panel .go').click();
     await page.waitForFunction(() => PROJ.cards[0].status === 'error');
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /只生成了故事板图片，尚未生成视频，并要求确认下一步/);
+    assert.match(await page.locator('#h3-errors').innerText(), /只生成了故事板图片，尚未生成视频/);
+    assert.doesNotMatch(await page.locator('#toast').textContent(), /只生成了故事板图片/);
     assert.equal(await page.evaluate(() => PROJ.cards[0].outputs.length), 0);
     assert.equal(runs.length, 3);
     assert.deepEqual(await page.evaluate(() => ({status:PROJ.cards[0].history[0].status,

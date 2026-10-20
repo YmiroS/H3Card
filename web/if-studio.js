@@ -19,6 +19,7 @@
   function message(text, error = false, href = '') {
     status.textContent = text;
     status.dataset.error = String(error);
+    if (error) H3Notify.error(text);
     if (href) {
       const link = document.createElement('a');
       link.href = href;
@@ -149,6 +150,7 @@
         generate.disabled = !model.options.length;
         if (job.state === 'error') {
           info.firstChild.textContent = `生成失败：${job.error}`;
+          H3Notify.error(info.firstChild.textContent);
           return;
         }
         const result = job.result;
@@ -193,6 +195,7 @@
           info.textContent = '本机桥接已重启，历史任务请到 IF Studio 画布查看。';
         } else {
           info.textContent = `本机桥接断开：${error.message}`;
+          H3Notify.error(info.textContent);
         }
       }
     }
@@ -217,6 +220,7 @@
         poll(job.id);
       } catch (error) {
         info.textContent = `提交失败：${error.message}`;
+        H3Notify.error(info.textContent);
         generate.disabled = !model.options.length;
       }
     });
@@ -237,6 +241,7 @@
         }
       } catch (error) {
         info.textContent = `无法连接 IF：${error.message}。请在本机启动桥接程序，并配置此 Chouka 页面的准确来源。`;
+        H3Notify.error(info.textContent);
       }
     })();
   }
