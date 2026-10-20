@@ -7,6 +7,7 @@ import os
 import re
 import secrets
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -37,9 +38,9 @@ def valid_media(content_type, prefix, size):
 class Bridge(ThreadingHTTPServer):
     allow_reuse_address = False
 
-    def __init__(self, address, origin, cli):
+    def __init__(self, address, origins, cli):
         super().__init__(address, BridgeHandler)
-        self.origin = origin
+        self.origins = tuple(origins)
         self.cli = cli
         self.jobs = {}
         self.assets = {}
@@ -47,6 +48,11 @@ class Bridge(ThreadingHTTPServer):
         self.asset_slots = 0
         self.lock = threading.Lock()
         self.workspace = tempfile.TemporaryDirectory(prefix='chouka-ifs-')
+        self.serving = threading.Event()
+
+    def service_actions(self):
+        self.serving.set()
+        super().service_actions()
 
     def close(self):
         self.server_close()
@@ -120,7 +126,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def authorized(self):
         host = self.headers.get('Host', '')
-        if host != f'127.0.0.1:{self.server.server_port}' or self.headers.get('Origin') != self.server.origin:
+        if host != f'127.0.0.1:{self.server.server_port}' or self.headers.get('Origin') not in self.server.origins:
             self.send_error(403)
             return False
         return True
@@ -130,7 +136,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header('Content-Type', 'application/json; charset=utf-8')
         self.send_header('Content-Length', str(len(body)))
-        self.send_header('Access-Control-Allow-Origin', self.server.origin)
+        self.send_header('Access-Control-Allow-Origin', self.headers['Origin'])
         self.send_header('Vary', 'Origin')
         self.send_header('Cache-Control', 'no-store')
         self.end_headers()
@@ -146,7 +152,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.send_error(404)
             return
         self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', self.server.origin)
+        self.send_header('Access-Control-Allow-Origin', self.headers['Origin'])
         self.send_header('Access-Control-Allow-Methods', method)
         self.send_header('Access-Control-Allow-Headers', 'Content-Type, X-Chouka-IF')
         self.send_header('Access-Control-Allow-Private-Network', 'true')
@@ -210,7 +216,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.send_header('Accept-Ranges', 'bytes')
                 if range_header:
                     self.send_header('Content-Range', f'bytes {start}-{end}/{size}')
-                self.send_header('Access-Control-Allow-Origin', self.server.origin)
+                self.send_header('Access-Control-Allow-Origin', self.headers['Origin'])
+                self.send_header('Vary', 'Origin')
                 self.send_header('Cache-Control', 'no-store')
                 self.end_headers()
                 with path.open('rb') as stream:
@@ -391,16 +398,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
 def main():
     parser = argparse.ArgumentParser(description='Chouka per-user IF Studio loopback bridge')
-    parser.add_argument('--origin', required=True, help='Exact Chouka page origin, e.g. http://127.0.0.1:8201')
+    parser.add_argument('--origin', required=True, action='append', help='Exact Chouka page origin; repeat for each local site')
     parser.add_argument('--port', type=int, default=8278)
+    parser.add_argument('--manager-stdin', action='store_true', help='Stop and clean up when the managing app closes stdin')
     parser.add_argument('--cli', default=str(Path(os.environ.get('LOCALAPPDATA', '')) / 'Programs' / 'ifs' / 'ifs.exe'))
     args = parser.parse_args()
-    origin = urlparse(args.origin)
-    if origin.scheme not in ('http', 'https') or not origin.netloc or origin.path not in ('', '/') or \
-            origin.query or origin.fragment or args.origin.rstrip('/') != f'{origin.scheme}://{origin.netloc}':
-        parser.error('--origin 必须是 Chouka 的完整、精确网页来源（不含路径）')
-    server = Bridge(('127.0.0.1', args.port), args.origin.rstrip('/'), args.cli)
-    print(f'IF Studio bridge: 127.0.0.1:{args.port} -> {server.origin}', flush=True)
+    for value in args.origin:
+        origin = urlparse(value)
+        if origin.scheme not in ('http', 'https') or not origin.netloc or origin.path not in ('', '/') or \
+                origin.query or origin.fragment or value.rstrip('/') != f'{origin.scheme}://{origin.netloc}':
+            parser.error('--origin 必须是 Chouka 的完整、精确网页来源（不含路径）')
+    server = Bridge(('127.0.0.1', args.port), [value.rstrip('/') for value in args.origin], args.cli)
+    print(f'IF Studio bridge: 127.0.0.1:{args.port} -> {", ".join(server.origins)}', flush=True)
+    if args.manager_stdin:
+        def stop_with_manager():
+            sys.stdin.buffer.read(1)
+            server.serving.wait()
+            server.shutdown()
+        threading.Thread(target=stop_with_manager, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
