@@ -185,6 +185,39 @@ class IFReferenceAPITests(unittest.IsolatedAsyncioTestCase, auth_support.AuthFix
         self.assertEqual((await response.read())[:4], b'RIFF')
         self.assertEqual(self.source.read_bytes(), self.original)
 
+    async def test_head_versions_source_without_conversion_and_if_match_rejects_changes(self):
+        params = {'url': '/api/upload/reference.png', 'type': 'image'}
+        with mock.patch.object(self.app['if_reference_copies'], 'prepare') as prepare:
+            first = await self.client.head('/api/if-reference', params=params)
+            self.assertEqual(first.status, 200)
+            self.assertEqual(await first.read(), b'')
+            version = first.headers['ETag']
+            self.assertRegex(version, r'^"[a-f0-9]{64}"$')
+            self.assertIn('no-store', first.headers['Cache-Control'])
+            second = await self.client.head('/api/if-reference', params=params)
+            self.assertEqual(second.headers['ETag'], version)
+            self.source.write_bytes(self.original + b'changed')
+            changed = await self.client.head('/api/if-reference', params=params)
+            self.assertNotEqual(changed.headers['ETag'], version)
+            stale = await self.client.get('/api/if-reference', params=params, headers={'If-Match': version})
+            self.assertEqual(stale.status, 412)
+            denied = await self.client.head('/api/if-reference', params={**params, 'url': '/api/upload/private.png'})
+            self.assertEqual(denied.status, 404)
+            prepare.assert_not_called()
+        async with TestClient(TestServer(self.build_app())) as anonymous:
+            denied = await anonymous.head('/api/if-reference', params=params)
+            self.assertEqual(denied.status, 401)
+
+    async def test_get_accepts_current_source_version_and_returns_same_etag(self):
+        if not controller_app.ffmpeg_bin():
+            self.skipTest('FFmpeg required')
+        params = {'url': '/api/upload/reference.png', 'type': 'image'}
+        first = await self.client.head('/api/if-reference', params=params)
+        response = await self.client.get('/api/if-reference', params=params, headers={'If-Match': first.headers['ETag']})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.headers['ETag'], first.headers['ETag'])
+        self.assertEqual((await response.read())[:4], b'RIFF')
+
     async def test_rejects_external_traversal_duplicate_and_wrong_type(self):
         for params in ({'url': 'https://example.org/test.png'}, {'url': '/api/upload/../outside.png'},
                        {'type': 'audio'}, {'type': 'video'}, {'extra': 'x'}):

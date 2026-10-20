@@ -14,6 +14,7 @@
 import asyncio
 import copy
 import hmac
+import hashlib
 import os
 import json
 import math
@@ -3116,6 +3117,13 @@ async def api_thumbnail(request):
     })
 
 
+def if_reference_version(source, kind):
+    stat = source.stat()
+    signature = (str(source.resolve()), stat.st_dev, stat.st_ino, stat.st_size,
+                 stat.st_mtime_ns, stat.st_ctime_ns, kind, 'if-copy-v1')
+    return '"' + hashlib.sha256(json.dumps(signature).encode()).hexdigest() + '"'
+
+
 async def api_if_reference(request):
     query = request.rel_url.query
     if (set(query) != {"url", "type"} or any(len(query.getall(key)) != 1 for key in query)
@@ -3131,7 +3139,11 @@ async def api_if_reference(request):
     extensions = IMG_EXT if query["type"] == "image" else VID_EXT
     if source.suffix.lower() not in extensions or not source.is_file():
         raise web.HTTPBadRequest(text="素材类型不符或原文件不存在")
-    before = (source.resolve(), source.stat().st_size, source.stat().st_mtime_ns)
+    before = if_reference_version(source, query['type'])
+    if request.headers.get('If-Match', before) not in (before, '*'):
+        raise web.HTTPPreconditionFailed(text="引用素材已变化，请重试")
+    if request.method == 'HEAD':
+        return web.Response(headers={'ETag': before, 'Cache-Control': 'private, no-store'})
     handler = asyncio.current_task()
 
     async def cancel_disconnected():
@@ -3145,12 +3157,12 @@ async def api_if_reference(request):
         async with request.app["if_reference_copies"].prepare(source, query["type"]) as (target, method):
             await require_resource(request, *ref)
             current = await resource_call(request.app, "local_path", *ref)
-            if not current.is_file() or before != (current.resolve(), current.stat().st_size, current.stat().st_mtime_ns):
+            if not current.is_file() or before != if_reference_version(current, query['type']):
                 raise web.HTTPConflict(text="压缩期间素材已变化，请重试")
             response = web.StreamResponse(headers={
                 "Content-Type": "image/webp" if query["type"] == "image" else "video/mp4",
                 "Content-Length": str(target.stat().st_size), "Cache-Control": "private, no-store",
-                "X-Content-Type-Options": "nosniff", "X-Chouka-IF-Conversion": method,
+                "X-Content-Type-Options": "nosniff", "X-Chouka-IF-Conversion": method, "ETag": before,
             })
             await response.prepare(request)
             with target.open("rb") as file:

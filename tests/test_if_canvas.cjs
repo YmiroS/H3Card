@@ -2,6 +2,7 @@ const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const {readFileSync, existsSync} = require('node:fs');
 const {createServer} = require('node:http');
+const {createHash} = require('node:crypto');
 const path = require('node:path');
 const {chromium} = require('playwright');
 
@@ -47,6 +48,11 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
   let failMediaOnce = true;
   let returnVideoStoryboard = false;
   let returnVideoPlanOnly = false;
+  let emitReferenceURLs = false, reuseFailure = null;
+  const sourceVersions = new Map(), sourceReads = [], deniedSources = new Set();
+  const sourceVersion = source => '"' + createHash('sha256').update(source + ':' + (sourceVersions.get(source) || 1)).digest('hex') + '"';
+  const resultReferences = run => (run.references || []).map((item, index) => ({index, kind:item.kind,
+    url:item.url || `https://ant.alicdn.com/bio/img/f_${item.asset_id}.${item.kind === 'image' ? 'webp' : 'mp4'}`}));
   const json = (res, data) => {res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(data));};
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -55,6 +61,10 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     if (pathname === '/api/auth/presence' || pathname.endsWith('/presence')) return json(res, {ok:true, users:[]});
     if (pathname === '/api/cards') return json(res, {cards, capabilities, if_model_limits:ifModelLimits, comfy_online:true});
     if (pathname === '/api/health') return json(res, {comfy_online:true});
+    if (pathname === '/api/if-reference' && req.method === 'HEAD') {
+      if (deniedSources.has(url.searchParams.get('url'))) {res.writeHead(403); return res.end();}
+      res.setHeader('ETag', sourceVersion(url.searchParams.get('url'))); return res.end();
+    }
     if (pathname === '/api/jobs') return json(res, {jobs:[]});
     if (pathname === '/api/projects') return json(res, {projects:[{...project, cards:1}]});
     if (pathname === '/api/projects/if-test' && req.method === 'GET') return json(res, project);
@@ -118,6 +128,9 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     });
     let checkedReferenceRead = false;
     await page.route(origin + '/fixture.*', async route => {
+      if (route.request().resourceType() === 'fetch'
+          && await page.evaluate(() => PROJ?.cards[0]?.step?.startsWith('正在读取 IF ')).catch(() => false))
+        sourceReads.push(new URL(route.request().url()).pathname);
       if (!checkedReferenceRead && route.request().resourceType() === 'fetch'
           && await page.evaluate(() => PROJ?.cards[0]?.step?.startsWith('正在读取 IF '))) {
         checkedReferenceRead = true;
@@ -163,7 +176,13 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         return route.fulfill({status:200, headers, contentType:kind === 'image' ? 'image/png' : 'video/mp4',
           body:kind === 'image' ? png : Buffer.from('fake-video')});
       }
-      const result = url.pathname === '/status' ? {ready:true}
+      if (emitReferenceURLs && reuseFailure && /^\/runs\/bridge-\d+$/.test(url.pathname)) {
+        const result = {reference_urls:resultReferences(runs.at(-1)).slice(0, reuseFailure === 'partial' ? 1 : undefined)};
+        if (reuseFailure === 'expired') result.invalid_reference_indices = [1];
+        return route.fulfill({status:200, headers, contentType:'application/json',
+          body:JSON.stringify({state:'error', error:'模拟 IF 引用或生成失败', result})});
+      }
+      const result = url.pathname === '/status' ? {ready:true, reference_reuse:true}
         : url.pathname === '/models' ? {models:[{display_name:'qwen-image-3.0', type:'image'},
           {display_name:'qwen-image-2.0', type:'image'}, {display_name:'z-image-turbo', type:'image'},
           {display_name:'Wan3.0视频', type:'video'}, {display_name:'Minimax H3', type:'video'},
@@ -173,7 +192,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         : url.pathname === '/runs' && request.method() === 'POST'
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done',
-            ...(runs.at(-1).asset_ids?.length > 1 ? {submitted_prompt:
+            ...(emitReferenceURLs ? {reference_urls:resultReferences(runs.at(-1))} : {}),
+            ...(runs.at(-1).references?.length > 1 ? {submitted_prompt:
               '图片1：https://example.com/ref1.png\n图片2：https://example.com/ref2.png\n视频1：https://example.com/ref1.mp4\n视频2：https://example.com/ref2.mp4\n\n生成需求：\n' + runs.at(-1).prompt} : {}),
             planning_text:returnVideoStoryboard || returnVideoPlanOnly ? '请确认这张故事板，再生成下一张图片' : '',
             downloaded:returnVideoPlanOnly ? [] : [{index:0, type:returnVideoStoryboard ? 'image' : runs.at(-1).type,
@@ -310,7 +330,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       const videoDirective = `最终交付必须是视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n`;
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen,
         prompt:`${kind === 'video' ? videoDirective : ''}蓝色圆形\n\n生成规格（作为内容要求）：分辨率 ${kind === 'image' ? '1440×1080' : '736×544，视频时长约 12 秒，随机种子参考 42'}。`,
-        asset_ids:[referenceId], ...(kind === 'video' ? {skill:'商品展示'} : {})});
+        references:[{kind, asset_id:referenceId}], ...(kind === 'video' ? {skill:'商品展示'} : {})});
       assert.equal(uploadedReferences.length, kind === 'image' ? 1 : 2);
       assert.equal(uploadedReferences.at(-1).type, kind === 'image' ? 'image/png' : 'video/mp4');
       assert.deepEqual(uploadedReferences.at(-1).body, kind === 'image' ? png : Buffer.from('fake-video'));
@@ -381,7 +401,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     await page.locator('#panel .pblock textarea').first().fill('结合全部素材生成视频');
     await page.locator('#panel .go').click();
     await page.waitForFunction(() => PROJ.cards[0].job === 'bridge-5' && PROJ.cards[0].status === 'done');
-    assert.deepEqual(runs.at(-1).asset_ids,
+    assert.deepEqual(runs.at(-1).references.map(item => item.asset_id),
       [1, 2, 3, 4].map(n => 'b'.repeat(31) + (beforeMulti + n)));
     assert.deepEqual(uploadedReferences.slice(-4).map(item => item.type),
       ['image/png', 'image/png', 'video/mp4', 'video/mp4']);
@@ -425,18 +445,23 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     await page.locator('#panel .go').click();
     await page.waitForFunction(() => PROJ.cards[0].job === 'bridge-6' && PROJ.cards[0].status === 'done');
     assert.equal(runs.at(-1).type, 'image');
-    assert.equal(runs.at(-1).asset_ids.length, 3);
+    assert.equal(runs.at(-1).references.map(item => item.asset_id).length, 3);
     assert.equal(uploadedReferences.length - beforeImageMulti, 3);
     assert.ok(uploadedReferences.slice(-3).every(item => item.type === 'image/png'));
     const conversions = [];
     let conversionFailure = false, oversizedCopy = false;
-    await page.route(origin + '/oversized.*', route => {
+    await page.route(origin + '/oversized.*', async route => {
+      if (route.request().resourceType() === 'fetch'
+          && await page.evaluate(() => PROJ?.cards[0]?.step?.startsWith('正在读取 IF ')).catch(() => false))
+        sourceReads.push(new URL(route.request().url()).pathname);
       const kind = route.request().url().endsWith('.png') ? 'image' : 'video';
       return route.fulfill({contentType:kind === 'image' ? 'image/png' : 'video/mp4',
         body:Buffer.alloc(kind === 'image' ? 12_500_000 : 50 * 1024 * 1024 + 1)});
     });
     await page.route(origin + '/api/if-reference?*', async route => {
+      if (route.request().method() === 'HEAD') return route.fallback();
       const url = new URL(route.request().url()), kind = url.searchParams.get('type');
+      assert.equal(route.request().headers()['if-match'], sourceVersion(url.searchParams.get('url')));
       await checkBusy(new RegExp(`^正在适配 IF ${kind === 'image' ? '图片' : '视频'}上传副本（\\d+/\\d+）$`));
       conversions.push(Object.fromEntries(url.searchParams));
       return route.fulfill(conversionFailure ? {status:422, body:'模拟转换失败，原素材未修改'} : {
@@ -598,6 +623,94 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         release(); await page.unroute(origin + '/api/media?*', metadata);
       }
     }
+    emitReferenceURLs = true; oversizedCopy = false;
+    await page.evaluate(() => {
+      const c = PROJ.cards[0]; c.cap = 'if_video'; c.type = 'card_video';
+      c.params = {if_model:'Wan3.0视频', prompt:'引用复用测试', duration:8};
+      c.assets = {'images[0]':{kind:'image', url:'/oversized.png'},
+        'video[0]':{kind:'video', url:'/fixture.mp4', width:1280, height:720, duration:8}};
+      c.status = 'idle'; PROJ.edges = []; openPanel(c.id);
+    });
+    const generate = async (status = 'done') => {
+      const before = runs.length;
+      await page.locator('#panel .go').click();
+      await page.waitForFunction(({status, before}) => PROJ.cards[0].status === status
+        && PROJ.cards[0].job === 'bridge-' + (before + 1), {status, before});
+      assert.equal(runs.length, before + 1);
+    };
+    const counts = () => ({uploads:uploadedReferences.length, reads:sourceReads.length, conversions:conversions.length});
+    let beforeReuse = counts();
+    await generate();
+    assert.equal(uploadedReferences.length, beforeReuse.uploads + 2);
+    assert.equal(sourceReads.length, beforeReuse.reads + 2);
+    assert.equal(conversions.length, beforeReuse.conversions + 1);
+    assert.ok(runs.at(-1).references.every(item => item.asset_id));
+    beforeReuse = counts();
+    await page.locator('#panel .pblock textarea').first().fill('仅修改提示词再生成');
+    await page.evaluate(() => { PROJ.cards[0].params.duration = 10; });
+    await generate();
+    assert.deepEqual(counts(), beforeReuse, 'unchanged references must skip source reads, conversion and bridge upload');
+    assert.ok(runs.at(-1).references.every(item => item.url && !item.asset_id));
+    assert.match(runs.at(-1).prompt, /仅修改提示词再生成/);
+    sourceVersions.set('/oversized.png', 2);
+    await generate();
+    assert.equal(uploadedReferences.length, beforeReuse.uploads + 1, 'same URL with new source version uploads only that reference');
+    assert.equal(conversions.length, beforeReuse.conversions + 1);
+    assert.ok(runs.at(-1).references[0].asset_id);
+    assert.ok(runs.at(-1).references[1].url);
+    await page.evaluate(() => enqueueSave(PROJ.id));
+    assert.equal(project.cards[0]._ifReferences, undefined, 'private IF URLs must not enter shared project state');
+    await page.reload();
+    await page.waitForFunction(() => PROJ?.cards[0]?._el
+      && projects.some(item => item.id === PROJ.id && item.permission === PROJ.permission));
+    await page.evaluate(() => openPanel(PROJ.cards[0].id));
+    beforeReuse = counts();
+    await generate();
+    assert.deepEqual(counts(), beforeReuse, 'tab refresh retains successful reference URLs');
+    reuseFailure = 'generation';
+    await generate('error');
+    reuseFailure = null;
+    await generate();
+    assert.deepEqual(counts(), beforeReuse, 'generation failure must not discard successfully uploaded references');
+    reuseFailure = 'expired';
+    await generate('error');
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /仅重新上传失效素材/);
+    reuseFailure = null;
+    await generate();
+    assert.equal(uploadedReferences.length, beforeReuse.uploads + 1);
+    assert.equal(conversions.length, beforeReuse.conversions);
+    assert.ok(runs.at(-1).references[0].url);
+    assert.ok(runs.at(-1).references[1].asset_id);
+    sourceVersions.set('/oversized.png', 3); sourceVersions.set('/fixture.mp4', 2);
+    reuseFailure = 'partial';
+    await generate('error');
+    beforeReuse = counts();
+    reuseFailure = null;
+    await generate();
+    assert.equal(uploadedReferences.length, beforeReuse.uploads + 1, 'partial upload failure retains the successful first reference');
+    assert.equal(conversions.length, beforeReuse.conversions);
+    assert.ok(runs.at(-1).references[0].url);
+    assert.ok(runs.at(-1).references[1].asset_id);
+    deniedSources.add('/oversized.png');
+    beforeReuse = counts();
+    const beforeDenied = runs.length;
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /403/);
+    assert.equal(runs.length, beforeDenied, 'cached URLs must not bypass source authorization');
+    assert.deepEqual(counts(), beforeReuse);
+    deniedSources.clear();
+    assert.deepEqual(await page.evaluate(() => {
+      const c = PROJ.cards[0], state = ifReferenceState(c, PROJ.id);
+      const otherCard = ifReferenceState({id:'other-card'}, PROJ.id);
+      const otherProject = ifReferenceState({id:c.id}, 'other-project');
+      const user = Object.getOwnPropertyDescriptor(H3Auth, 'user');
+      Object.defineProperty(H3Auth, 'user', {configurable:true, value:{id:'other-user'}});
+      const otherUser = ifReferenceState({id:c.id}, PROJ.id);
+      Object.defineProperty(H3Auth, 'user', user);
+      return {cached:state.entries.length, isolated:[otherCard, otherProject, otherUser].map(s => s.entries.length),
+        keys:new Set([state, otherCard, otherProject, otherUser].map(s => s.key)).size};
+    }), {cached:2, isolated:[0, 0, 0], keys:4});
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {
