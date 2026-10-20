@@ -3461,6 +3461,12 @@ function bindGlobal() {
       const up = () => {
         el.stage.classList.remove("panning");
         document.removeEventListener("mousemove", mv); document.removeEventListener("mouseup", up);
+        // 左键平移后的 click 不能触发节点操作（例如空素材节点选文件）。
+        if (moved && ev.button === 0) {
+          const swallowClick = e => { e.preventDefault(); e.stopImmediatePropagation(); };
+          document.addEventListener("click", swallowClick, { capture: true, once: true });
+          setTimeout(() => document.removeEventListener("click", swallowClick, true), 0);
+        }
         // 拖动画布结束后恢复面板显示，并重新定位到节点下方
         if (moved) { veilPanel(false); placePanel(); saveView(); }
       };
