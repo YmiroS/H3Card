@@ -16,13 +16,14 @@ from if_studio_bridge import Bridge, LIMITS_FILE
 ORIGIN = 'http://127.0.0.1:8201'
 SECOND_ORIGIN = 'http://127.0.0.1:8199'
 LOCALHOST_ORIGIN = 'http://localhost:8199'
+SECURE_ORIGIN = 'https://dinghaichouka.youku.com:8443'
 MODELS = [{'display_name': 'qwen-image-2.0', 'type': 'image'},
           {'display_name': 'Minimax H3', 'type': 'video'}]
 
 
 class BridgeTest(unittest.TestCase):
     def setUp(self):
-        self.bridge = Bridge(('127.0.0.1', 0), (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN), 'ifs.exe')
+        self.bridge = Bridge(('127.0.0.1', 0), (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN, SECURE_ORIGIN), 'ifs.exe')
         self.thread = threading.Thread(target=self.bridge.serve_forever, daemon=True)
         self.thread.start()
 
@@ -48,12 +49,12 @@ class BridgeTest(unittest.TestCase):
 
     def test_second_bridge_cannot_bind_same_port(self):
         with self.assertRaises(OSError):
-            Bridge(('127.0.0.1', self.bridge.server_port), (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN), 'ifs.exe')
+            Bridge(('127.0.0.1', self.bridge.server_port), (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN, SECURE_ORIGIN), 'ifs.exe')
 
     def test_only_configured_chouka_origins_are_allowed(self):
         with mock.patch.object(self.bridge, 'command', return_value={'profiles': {'buc': {
                 'registry': 'ifs.alibaba-inc.com', 'has_ifs_token': True}}}):
-            for origin in (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN):
+            for origin in (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN, SECURE_ORIGIN):
                 code, headers, body = self.request('GET', '/status', origin=origin)
                 self.assertEqual((code, body), (200, {'ready': True}))
                 self.assertEqual(headers['Access-Control-Allow-Origin'], origin)
@@ -117,7 +118,7 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertEqual(headers['Access-Control-Allow-Origin'], ORIGIN)
             self.assertEqual(payload, b'fake-image')
-            for origin in (SECOND_ORIGIN, LOCALHOST_ORIGIN):
+            for origin in (SECOND_ORIGIN, LOCALHOST_ORIGIN, SECURE_ORIGIN):
                 code, headers, payload = self.request('GET', f'/runs/{job_id}/media/0', origin=origin)
                 self.assertEqual((code, payload), (200, b'fake-image'))
                 self.assertEqual(headers['Access-Control-Allow-Origin'], origin)

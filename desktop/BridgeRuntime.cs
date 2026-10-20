@@ -24,6 +24,7 @@ internal sealed class BridgeRuntime
 {
     internal const int Port = 8278;
     internal const string Origin = "http://dinghaichouka.youku.com:8199";
+    internal const string SecureOrigin = "https://dinghaichouka.youku.com:8443";
     internal const string InstallerUrl = "https://ifs.alibaba-inc.com/openapi/v1/assets/install.ps1";
     internal const string InstallerSha256 = "aa9453e7ae6d0ba1a285ce0e604f2ddcc875bbec9a561e44abda6df3b76eb614";
     private const string StartupKey = @"Software\Microsoft\Windows\CurrentVersion\Run";
@@ -70,7 +71,7 @@ internal sealed class BridgeRuntime
             throw new FileNotFoundException("程序缺少桥接运行文件，请重新解压完整安装包");
         if (PortOccupied()) throw new InvalidOperationException("端口 8278 已被其他程序占用；不会覆盖或停止它");
         ProcessStartInfo info = new ProcessStartInfo(PythonPath,
-            "-B -u \"" + ScriptPath + "\" --origin " + Origin + " --port " + Port +
+            "-B -u \"" + ScriptPath + "\" --origin " + Origin + " --origin " + SecureOrigin + " --port " + Port +
             " --manager-stdin --cli \"" + CliPath + "\"");
         info.WorkingDirectory = root;
         info.UseShellExecute = false;
@@ -124,7 +125,7 @@ internal sealed class BridgeRuntime
         } catch (Exception error) {
             if (managed) result.Authorization = "连接异常：" + error.Message;
             else {
-                result.Service = "8278 已占用，非当前网页可用桥接；关闭占用程序后刷新";
+                result.Service = "8278 已占用，非受支持的 Chouka 桥接；关闭占用程序后刷新";
                 result.Authorization = "无法验证现有服务：" + error.Message;
             }
         }
@@ -136,11 +137,11 @@ internal sealed class BridgeRuntime
         HttpWebRequest request = (HttpWebRequest)WebRequest.Create("http://127.0.0.1:" + Port + path);
         request.Method = "GET";
         request.Timeout = 10000;
-        request.Headers["Origin"] = Origin;
+        request.Headers["Origin"] = SecureOrigin;
         request.Proxy = null;
         using (HttpWebResponse response = (HttpWebResponse)request.GetResponse())
         using (StreamReader reader = new StreamReader(response.GetResponseStream())) {
-            if (response.Headers["Access-Control-Allow-Origin"] != Origin)
+            if (response.Headers["Access-Control-Allow-Origin"] != SecureOrigin)
                 throw new InvalidOperationException("桥接未授权内网网页来源");
             return new JavaScriptSerializer().Deserialize<Dictionary<string, object>>(reader.ReadToEnd());
         }

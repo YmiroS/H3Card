@@ -25,8 +25,9 @@ internal static class ShutdownProbe {
             var args = new FormClosingEventArgs(CloseReason.WindowsShutDown, false);
             closing.Invoke(manager, new object[] {manager, args});
             if (args.Cancel) throw new Exception("Windows logout was cancelled");
-            if (BridgeRuntime.Port != 8278 || BridgeRuntime.Origin != "http://dinghaichouka.youku.com:8199")
-                throw new Exception("Unexpected bridge port or intranet origin");
+            if (BridgeRuntime.Port != 8278 || BridgeRuntime.Origin != "http://dinghaichouka.youku.com:8199" ||
+                BridgeRuntime.SecureOrigin != "https://dinghaichouka.youku.com:8443")
+                throw new Exception("Unexpected bridge port or Chouka origins");
             Console.WriteLine("shutdown-ok");
         }
     }
