@@ -50,6 +50,7 @@ from distributed import (
     can_run_capability, worker_capability_comparisons,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
+from if_reference import IFReferenceCopies
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.auth_store import AuthStore
 from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
@@ -3115,6 +3116,53 @@ async def api_thumbnail(request):
     })
 
 
+async def api_if_reference(request):
+    query = request.rel_url.query
+    if (set(query) != {"url", "type"} or any(len(query.getall(key)) != 1 for key in query)
+            or query["type"] not in ("image", "video")):
+        raise web.HTTPBadRequest(text="必须提供单个素材 URL 和图片或视频类型")
+    ref = await resource_call(request.app, "reference", query["url"])
+    if not ref:
+        raise web.HTTPBadRequest(text="IF 适配仅支持画布中的已登记素材")
+    await require_resource(request, *ref)
+    if ref[0] == "comfy":
+        await cache_comfy_outputs(request, {"outputs": [{"url": query["url"]}]})
+    source = await resource_call(request.app, "local_path", *ref)
+    extensions = IMG_EXT if query["type"] == "image" else VID_EXT
+    if source.suffix.lower() not in extensions or not source.is_file():
+        raise web.HTTPBadRequest(text="素材类型不符或原文件不存在")
+    before = (source.resolve(), source.stat().st_size, source.stat().st_mtime_ns)
+    handler = asyncio.current_task()
+
+    async def cancel_disconnected():
+        # 只取消这个只读转换接口，不改变其他写接口的断连事务行为。
+        while request.transport is not None and not request.transport.is_closing():
+            await asyncio.sleep(.25)
+        handler.cancel()
+
+    monitor = asyncio.create_task(cancel_disconnected())
+    try:
+        async with request.app["if_reference_copies"].prepare(source, query["type"]) as (target, method):
+            await require_resource(request, *ref)
+            current = await resource_call(request.app, "local_path", *ref)
+            if not current.is_file() or before != (current.resolve(), current.stat().st_size, current.stat().st_mtime_ns):
+                raise web.HTTPConflict(text="压缩期间素材已变化，请重试")
+            response = web.StreamResponse(headers={
+                "Content-Type": "image/webp" if query["type"] == "image" else "video/mp4",
+                "Content-Length": str(target.stat().st_size), "Cache-Control": "private, no-store",
+                "X-Content-Type-Options": "nosniff", "X-Chouka-IF-Conversion": method,
+            })
+            await response.prepare(request)
+            with target.open("rb") as file:
+                while chunk := await asyncio.to_thread(file.read, 256 * 1024):
+                    await response.write(chunk)
+            await response.write_eof()
+            return response
+    finally:
+        monitor.cancel()
+        await asyncio.gather(monitor, return_exceptions=True)
+
+
 async def api_preview_status(request):
     await require_resource(request, "upload", request.match_info["name"])
     return await preview_status(request)
@@ -3652,6 +3700,7 @@ def make_app(auth_path=None):
     app["media_thumbnails"] = MediaThumbnails(
         ROOT / "data" / "thumbnails", ffmpeg_bin, IMG_EXT | VID_EXT,
     )
+    app["if_reference_copies"] = IFReferenceCopies(ffmpeg_bin)
     if CONTROLLER_MODE:
         database_path = ROOT / "data" / "control.db"
         app["distributed"] = DistributedStore(database_path)
@@ -3672,6 +3721,7 @@ def make_app(auth_path=None):
     app.router.add_get("/api/preview/{name}/file", api_preview_file)
     app.router.add_get("/api/preview/{name}", api_preview_status)
     app.router.add_get("/api/thumbnail", api_thumbnail)
+    app.router.add_get("/api/if-reference", api_if_reference)
     app.router.add_get("/api/media", api_media)
     app.router.add_post("/api/generate", api_generate)
     app.router.add_post("/api/rewrite", api_rewrite)
