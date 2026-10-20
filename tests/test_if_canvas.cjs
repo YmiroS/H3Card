@@ -102,7 +102,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         : url.pathname === '/models' ? {models:[{display_name:'qwen-image-3.0', type:'image'},
           {display_name:'qwen-image-2.0', type:'image'}, {display_name:'z-image-turbo', type:'image'},
           {display_name:'Wan3.0视频', type:'video'}, {display_name:'Minimax H3', type:'video'},
-          {display_name:'星辰图生视频', type:'video'}]}
+          {display_name:'星辰图生视频', type:'video'}, {display_name:'可灵3.0 Omni', type:'video'}]}
         : url.pathname === '/runs' && request.method() === 'POST'
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done',
@@ -150,9 +150,14 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       await page.waitForFunction(() => document.querySelector('#menu')?.textContent.includes('（当前）'));
       const unsupported = kind === 'image' ? 'z-image-turbo' : '星辰图生视频';
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
-        [chosen, initial + '（当前）', unsupported]);
+        [chosen, initial + '（当前）', unsupported, ...(kind === 'video' ? ['可灵3.0 Omni'] : [])]);
       await page.locator('#menu button').filter({hasText:chosen}).click();
-      assert.match(await page.locator('#panel .pbody').innerText(), /官方 API 同名模型\/家族参考上限/);
+      const summary = await page.locator('#panel .pbody').innerText();
+      if (kind === 'video') {
+        assert.match(summary, /供应商 API 资料（并非 IF 引用上限）/);
+        assert.match(summary, /当前画布可提交图片或视频共 1 项/);
+        assert.doesNotMatch(summary, /官方 API 同名模型\/家族参考上限/);
+      } else assert.match(summary, /官方 API 同名模型\/家族参考上限/);
       assert.equal(await page.evaluate(() => PROJ.edges[0].slot), kind === 'image' ? 'images[0]' : 'video[0]');
       assert.match(await page.locator('#panel .refhead').innerText(), kind === 'image' ? /图片 1/ : /视频 1/);
       await modelButton.click();
@@ -160,13 +165,27 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       assert.equal(await page.evaluate(() => PROJ.cards[0].params.if_model), unsupported);
       assert.equal(await page.evaluate(() => PROJ.edges.length), 1);
       assert.equal(await page.locator('#panel .slot.filled').count(), 1);
-      assert.match(await page.locator('#panel .pbody').innerText(), /已连接的引用保持原样/);
-      await page.locator('#panel .pblock textarea').first().fill('不兼容引用不应提交');
-      await page.locator('#panel .go').click();
-      await page.waitForFunction(() => PROJ.cards[0].status === 'error');
-      assert.match(await page.evaluate(() => PROJ.cards[0].error), /不能通过本机 IF CLI 接收/);
-      assert.equal(runs.length, kind === 'image' ? 0 : 1, 'incompatible references must not submit a bridge job');
-      assert.equal(uploadedReferences.length, kind === 'image' ? 0 : 1, 'incompatible references must not upload');
+      if (kind === 'video') {
+        for (const name of ['星辰图生视频', '可灵3.0 Omni']) {
+          if (name !== unsupported) {
+            await modelButton.click();
+            await page.locator('#menu button').filter({hasText:name}).click();
+          }
+          const estimate = await page.locator('#panel .pbody').innerText();
+          assert.match(estimate, /H3 全能参考高质量估算（未核实该模型上限）：图片 9（H3 估算） · 视频 3（H3 估算） · 音频 3（H3 估算）/);
+          assert.match(estimate, /画布按 H3 估算开放图片或视频槽位，每次只能提交其中 1 项/);
+          assert.match((await page.locator('#panel .refhead').allTextContents()).join(' '), /视频 1/);
+          assert.equal(await page.evaluate(() => PROJ.edges.length), 1);
+        }
+      } else {
+        assert.match(await page.locator('#panel .pbody').innerText(), /已连接的引用保持原样/);
+        await page.locator('#panel .pblock textarea').first().fill('不兼容引用不应提交');
+        await page.locator('#panel .go').click();
+        await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+        assert.match(await page.evaluate(() => PROJ.cards[0].error), /当前画布尚未开放所选模型的/);
+        assert.equal(runs.length, 0, 'incompatible references must not submit a bridge job');
+        assert.equal(uploadedReferences.length, 0, 'incompatible references must not upload');
+      }
       assert.equal(await page.evaluate(() => PROJ.edges.length), 1);
       await modelButton.click();
       await page.locator('#menu button').filter({hasText:initial}).click();
@@ -252,9 +271,10 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.deepEqual(await page.evaluate(() => ({
       textOnly: capOf({cap:'if_image', params:{if_model:'z-image-turbo'}}).inputs.filter(s => MEDIA.includes(s.type)).length,
       unknown: capOf({cap:'if_video', params:{if_model:'星辰图生视频'}}).inputs.filter(s => MEDIA.includes(s.type)).length,
+      kling: capOf({cap:'if_video', params:{if_model:'可灵3.0 Omni'}}).inputs.filter(s => MEDIA.includes(s.type)).length,
       wanApi: ifModelLimits['Wan3.0视频'].api,
       wanBridge: ifModelLimits['Wan3.0视频'].bridge,
-    })), {textOnly:0, unknown:0, wanApi:{image:10, video:5, audio:5}, wanBridge:{image:1, video:1, audio:0}});
+    })), {textOnly:0, unknown:2, kling:2, wanApi:{image:10, video:5, audio:5}, wanBridge:{image:1, video:1, audio:0}});
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {

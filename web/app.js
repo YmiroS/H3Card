@@ -5761,9 +5761,15 @@ function openPanel(id) {
     const limit = ifModelLimits[name];
     const summary = document.createElement("div"); summary.className = "knobnote";
     const format = value => value == null ? "未核实" : String(value);
-    summary.textContent = limit
-      ? `官方 API 同名模型/家族参考上限：图片 ${format(limit.api.image)} · 视频 ${format(limit.api.video)} · 音频 ${format(limit.api.audio)}。${limit.note} IF 未公布内部模型版本和多素材转发规则；画布实际可提交图片 ${limit.bridge.image}／视频 ${limit.bridge.video}，且合计最多 1 项；音频暂不可提交。画面比例、清晰度、时长等参数会作为生成内容发送，不是 IF API 参数，模型不保证严格遵守。`
-      : "该 IF 模型尚无可核对的官方 API 上限，暂不开放新的画布引用。";
+    const videoReference = [limit?.bridge.image && "图片", limit?.bridge.video && "视频"].filter(Boolean).join("或");
+    const h3Estimate = limit?.type === "video" && Object.values(limit.api).some(value => value == null);
+    const videoCount = kind => limit.api[kind] == null
+      ? `${ifModelLimits["Minimax H3"].api[kind]}（H3 估算）` : String(limit.api[kind]);
+    summary.textContent = limit?.type === "video"
+      ? `${h3Estimate ? "H3 全能参考高质量估算（未核实该模型上限）" : "供应商 API 资料（并非 IF 引用上限）"}：图片 ${videoCount("image")} · 视频 ${videoCount("video")} · 音频 ${videoCount("audio")}。${limit.note} 本机 IF CLI 每次仅能传入一张图片或一段视频，不支持音频或多引用；IF 未公开此模型实际接受的引用类型和模式。${videoReference ? (h3Estimate ? `画布按 H3 估算开放${videoReference}槽位，每次只能提交其中 1 项；所选 IF 模型能否接收仍待实测。` : `当前画布可提交${videoReference}共 1 项。`) : "当前画布暂未开放该模型的媒体引用，不代表模型本身不支持。"}画面比例、清晰度、时长等参数仅作为生成内容要求发送，模型不保证严格遵守。`
+      : limit
+        ? `官方 API 同名模型/家族参考上限：图片 ${format(limit.api.image)} · 视频 ${format(limit.api.video)} · 音频 ${format(limit.api.audio)}。${limit.note} IF 未公布内部模型版本和多素材转发规则；画布实际可提交图片 ${limit.bridge.image}／视频 ${limit.bridge.video}，且合计最多 1 项；音频暂不可提交。画面比例、清晰度、时长等参数会作为生成内容发送，不是 IF API 参数，模型不保证严格遵守。`
+        : "该 IF 模型尚无可核对的官方 API 上限，暂不开放新的画布引用。";
     if (Object.values(c.assets || {}).some(asset => asset && MEDIA.includes(asset.kind)
         && !limit?.bridge?.[asset.kind]))
       summary.textContent += " 已连接的引用保持原样，但不适用于当前模型；可切回原模型或手动移除，运行时不会忽略它。";
@@ -8090,7 +8096,7 @@ async function runIF(c) {
     if (references.length > 1) throw new Error("本机 IF CLI 只能接收一项图片或视频引用，请先移除多余素材");
     const reference = references[0];
     if (reference && !limit.bridge[reference.kind])
-      throw new Error(`所选模型不能通过本机 IF CLI 接收${KIND_ZH[reference.kind] || reference.kind}引用`);
+      throw new Error(`当前画布尚未开放所选模型的${KIND_ZH[reference.kind] || reference.kind}引用，请更换模型或移除引用`);
     if (reference && c.params.if_reference?.trim())
       throw new Error("已连接画布素材，请清空参数中的 HTTPS 引用地址，不能同时提交两项引用");
     const data = {type, model: model.display_name, prompt: withStyle(resolveCardMentions(prompt, c), styleTexts(c))};
