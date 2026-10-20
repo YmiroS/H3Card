@@ -1,6 +1,9 @@
 import http.client
 import json
+import os
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -11,13 +14,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
 from if_studio_bridge import Bridge, LIMITS_FILE
 
 ORIGIN = 'http://127.0.0.1:8201'
+SECOND_ORIGIN = 'http://127.0.0.1:8199'
+LOCALHOST_ORIGIN = 'http://localhost:8199'
 MODELS = [{'display_name': 'qwen-image-2.0', 'type': 'image'},
           {'display_name': 'Minimax H3', 'type': 'video'}]
 
 
 class BridgeTest(unittest.TestCase):
     def setUp(self):
-        self.bridge = Bridge(('127.0.0.1', 0), ORIGIN, 'ifs.exe')
+        self.bridge = Bridge(('127.0.0.1', 0), (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN), 'ifs.exe')
         self.thread = threading.Thread(target=self.bridge.serve_forever, daemon=True)
         self.thread.start()
 
@@ -43,18 +48,22 @@ class BridgeTest(unittest.TestCase):
 
     def test_second_bridge_cannot_bind_same_port(self):
         with self.assertRaises(OSError):
-            Bridge(('127.0.0.1', self.bridge.server_port), ORIGIN, 'ifs.exe')
+            Bridge(('127.0.0.1', self.bridge.server_port), (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN), 'ifs.exe')
 
-    def test_only_exact_chouka_origin_is_allowed(self):
+    def test_only_configured_chouka_origins_are_allowed(self):
         with mock.patch.object(self.bridge, 'command', return_value={'profiles': {'buc': {
                 'registry': 'ifs.alibaba-inc.com', 'has_ifs_token': True}}}):
-            code, headers, body = self.request('GET', '/status')
-            self.assertEqual((code, body), (200, {'ready': True}))
-            self.assertEqual(headers['Access-Control-Allow-Origin'], ORIGIN)
-            code, _, _ = self.request('GET', '/status', origin='https://attacker.example')
-            self.assertEqual(code, 403)
-            code, _, _ = self.request('GET', '/status', origin='null')
-            self.assertEqual(code, 403)
+            for origin in (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN):
+                code, headers, body = self.request('GET', '/status', origin=origin)
+                self.assertEqual((code, body), (200, {'ready': True}))
+                self.assertEqual(headers['Access-Control-Allow-Origin'], origin)
+                code, headers, _ = self.request('OPTIONS', '/runs', origin=origin,
+                    headers={'Access-Control-Request-Method': 'POST'})
+                self.assertEqual(code, 204)
+                self.assertEqual(headers['Access-Control-Allow-Origin'], origin)
+            for origin in ('https://attacker.example', 'null', 'http://127.0.0.1:8202'):
+                code, _, _ = self.request('GET', '/status', origin=origin)
+                self.assertEqual(code, 403)
             code, _, _ = self.request('POST', '/runs', '{}', headers={'Content-Type': 'text/plain'})
             self.assertEqual(code, 403)
 
@@ -108,6 +117,10 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertEqual(headers['Access-Control-Allow-Origin'], ORIGIN)
             self.assertEqual(payload, b'fake-image')
+            for origin in (SECOND_ORIGIN, LOCALHOST_ORIGIN):
+                code, headers, payload = self.request('GET', f'/runs/{job_id}/media/0', origin=origin)
+                self.assertEqual((code, payload), (200, b'fake-image'))
+                self.assertEqual(headers['Access-Control-Allow-Origin'], origin)
             conn = http.client.HTTPConnection('127.0.0.1', self.bridge.server_port, timeout=3)
             conn.request('GET', f'/runs/{job_id}/media/0', headers={'Origin': ORIGIN, 'Range': 'bytes=5-9'})
             ranged = conn.getresponse()
@@ -352,6 +365,7 @@ class BridgeTest(unittest.TestCase):
                 time.sleep(.01)
             self.assertEqual(job['state'], 'done')
 
+
     def test_private_network_preflight(self):
         code, headers, _ = self.request('OPTIONS', '/runs', headers={
             'Access-Control-Request-Method': 'POST',
@@ -366,6 +380,19 @@ class BridgeTest(unittest.TestCase):
         })
         self.assertEqual(code, 204)
         self.assertEqual(headers['Access-Control-Allow-Methods'], 'GET')
+
+
+class ManagedBridgeTest(unittest.TestCase):
+    def test_closed_manager_pipe_cleans_temporary_workspace(self):
+        with tempfile.TemporaryDirectory(prefix='chouka-managed-test-') as directory:
+            env = os.environ.copy()
+            env.update({'TMPDIR': directory, 'TEMP': directory, 'TMP': directory})
+            bridge = Path(__file__).resolve().parents[1] / 'server' / 'if_studio_bridge.py'
+            result = subprocess.run([sys.executable, '-B', str(bridge), '--origin', ORIGIN,
+                                     '--port', '0', '--manager-stdin'], input=b'stop',
+                                    capture_output=True, timeout=8, env=env)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            self.assertEqual(list(Path(directory).iterdir()), [])
 
 
 if __name__ == '__main__':
