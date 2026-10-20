@@ -2589,7 +2589,7 @@ function paint(c) {
     body.innerHTML = phHTML(c);
   }
 
-  if (outs.length && body.dataset.url !== sig) {
+  if (!busy && outs.length && body.dataset.url !== sig) {
     body.dataset.url = sig;
     body.classList.toggle("grid", outs.length > 1);
     applySize(c);      // 宫格的画面区是自动高度，进出宫格都要重新决定 c.h 生不生效
@@ -8116,9 +8116,13 @@ async function runIF(c) {
   const project = PROJ, capability = c.cap;
   const assetIds = [];
   let submitted = false;
+  c.status = "queued"; c.error = null; c.progress = null; c.job = null; c.ms = null;
+  c.step = "正在连接本机 IF 并读取模型"; c.if_started = Date.now();
+  paint(c); if (el.panel._id === c.id) openPanel(c.id);
   try {
     const models = await loadIFModels();
-    if (PROJ !== project || !canOperate() || !project.cards.includes(c) || c.cap !== capability) return;
+    if (PROJ !== project || !canOperate() || !project.cards.includes(c) || c.cap !== capability)
+      throw new Error("画布已切换或权限已变化，已取消 IF 提交");
     const type = capOf(c).outputType;
     const model = models.filter(entry => entry.type === type)
       .find(entry => entry.display_name === c.params.if_model)
@@ -8175,17 +8179,18 @@ async function runIF(c) {
     }
     if (type === "video" && c.params.if_skill?.trim()) data.skill = c.params.if_skill.trim();
     if (references.length) {
-      for (const [, reference] of references) {
+      for (const [index, [, reference]] of references.entries()) {
+        const label = `${KIND_ZH[reference.kind]}引用（${index + 1}/${references.length}）`;
         const url = new URL(reference.url, location.href);
         if (url.origin !== location.origin) throw new Error("IF 仅能上传当前画布内的本机素材");
+        c.step = `正在读取 IF ${label}`; paint(c);
         const response = await fetch(url, {credentials:"same-origin"});
         if (!response.ok) throw new Error("无法读取画布引用素材");
         let blob = await response.blob();
         const allowed = reference.kind === "image" ? ["image/png", "image/jpeg", "image/webp"] : ["video/mp4"];
         const maximum = reference.kind === "image" ? 10_000_000 : 50 * 1024 * 1024;
         if (!allowed.includes(blob.type) || blob.size > maximum) {
-          c.status = "queued"; c.error = null;
-          c.step = `正在适配 IF ${KIND_ZH[reference.kind]}上传副本`;
+          c.step = `正在适配 IF ${KIND_ZH[reference.kind]}上传副本（${index + 1}/${references.length}）`;
           paint(c);
           const prepared = await fetch(`/api/if-reference?${new URLSearchParams({url:url.pathname + url.search, type:reference.kind})}`,
             {credentials:"same-origin", cache:"no-store"});
@@ -8199,6 +8204,9 @@ async function runIF(c) {
         }
         if (!blob.size || !allowed.includes(blob.type) || blob.size > maximum)
           throw new Error(`IF 上传副本仍不符合格式或 ${reference.kind === "image" ? 10 : 50} MB 大小限制，原素材未修改`);
+        if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability || !canOperate())
+          throw new Error("画布已切换或权限已变化，已取消 IF 提交");
+        c.step = `正在上传 IF ${label}至本机桥接`; paint(c);
         const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
         assetIds.push(uploaded.asset_id);
         if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability)
@@ -8208,7 +8216,7 @@ async function runIF(c) {
     }
     c.params.if_model = model.display_name;
     c.status = "queued"; c.error = null; c.progress = null; c.outputs = []; c.ms = null;
-    c.step = "正在提交至本机 IF"; c.job = null; c.if_started = Date.now();
+    c.step = "正在提交至本机 IF"; c.job = null;
     paint(c); if (el.panel._id === c.id) openPanel(c.id);
     const job = await ifRequest("/runs", {method: "POST",
       headers: {"Content-Type": "application/json", "X-Chouka-IF": "generate"}, body: JSON.stringify(data)});
@@ -8245,7 +8253,7 @@ async function pollIF(c, projectId) {
     if (submitted && typeof job.result?.submitted_prompt === "string")
       submitted.text = job.result.submitted_prompt;
     if (job.state === "starting" || job.state === "running") {
-      c.step = job.state === "starting" ? "IF 正在创建画布" : "IF 正在生成";
+      c.step = job.step || (job.state === "starting" ? "本机 IF 正在准备生成任务" : "IF 正在生成");
       retry = true;
       return;
     }
@@ -8257,8 +8265,9 @@ async function pollIF(c, projectId) {
       ? `IF 要求确认规划或故事板，未直接生成${KIND_ZH[expected]}；请在 IF 网站查看该会话。`
       : `IF 未返回${KIND_ZH[expected]}产物，请在 IF 网站查看该会话。`);
     const outputs = [];
-    for (const item of downloaded) {
+    for (const [index, item] of downloaded.entries()) {
       if (item.type !== capOf(c).outputType) continue;
+      c.step = `正在取回 IF ${KIND_ZH[item.type]}产物（${index + 1}/${downloaded.length}）`; paint(c);
       const response = await fetch(`${IF_BRIDGE}/runs/${encodeURIComponent(c.job)}/media/${item.index}`, {credentials: "omit"});
       if (!response.ok) {
         if (response.status >= 500 || response.status === 429) throw new TypeError("IF 产物暂不可读取");
@@ -8266,6 +8275,7 @@ async function pollIF(c, projectId) {
       }
       const file = new File([await response.blob()], item.name);
       if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
+      c.step = `正在保存 IF ${KIND_ZH[item.type]}产物（${index + 1}/${downloaded.length}）`; paint(c);
       const asset = await uploadAsset(file, item.type === "image");
       outputs.push({...asset, filename: item.name});
     }

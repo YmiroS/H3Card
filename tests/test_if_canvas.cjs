@@ -77,24 +77,72 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
   try {
     browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
     const page = await browser.newPage({viewport:{width:1600, height:1100}});
-    page.setDefaultTimeout(10000);
+    page.setDefaultTimeout(20000);
     const origin = `http://127.0.0.1:${server.address().port}`;
     const pageErrors = [];
     page.on('pageerror', error => pageErrors.push(error.message));
-    await page.route('http://127.0.0.1:8278/**', route => {
+    const busySteps = [];
+    const checkBusy = async pattern => {
+      const state = await page.evaluate(() => {
+        const c = PROJ.cards[0];
+        return {status:c.status, step:c.step, progress:c.progress,
+          loading:!!c._el.querySelector('.body .load'),
+          oldMedia:c._el.querySelectorAll('.body img, .body video').length,
+          foot:c._el.querySelector('.cf .st').textContent,
+          disabled:document.querySelector('#panel .go')?.disabled ?? null};
+      });
+      assert.ok(['queued', 'running'].includes(state.status));
+      assert.match(state.step, pattern);
+      assert.equal(state.loading, true, 'IF must show loading even while previous outputs are retained');
+      assert.equal(state.oldMedia, 0, 'old output must not overwrite the loading spinner');
+      if (state.disabled !== null)
+        assert.equal(state.disabled, true, 'generation stays disabled throughout preparation');
+      assert.equal(state.progress, null, 'unverified numeric IF progress must not be invented');
+      assert.ok(state.foot.includes(state.step), 'the actual stage must be visible in the card footer');
+      assert.doesNotMatch(state.foot, /\d+%/);
+      busySteps.push(state.step);
+    };
+    await page.route(origin + '/api/upload?*', async route => {
+      if (route.request().method() === 'POST') await checkBusy(/^正在保存 IF /);
+      return route.fallback();
+    });
+    let checkedReferenceRead = false;
+    await page.route(origin + '/fixture.*', async route => {
+      if (!checkedReferenceRead && route.request().resourceType() === 'fetch'
+          && await page.evaluate(() => PROJ?.cards[0]?.step?.startsWith('正在读取 IF '))) {
+        checkedReferenceRead = true;
+        await checkBusy(/^正在读取 IF /);
+      }
+      return route.fallback();
+    });
+    let firstRunPolls = 0;
+    await page.route('http://127.0.0.1:8278/**', async route => {
       const request = route.request(), url = new URL(request.url());
       const headers = {'Access-Control-Allow-Origin':origin, 'Access-Control-Allow-Methods':'GET, POST, DELETE, OPTIONS',
         'Access-Control-Allow-Headers':'Content-Type, X-Chouka-IF', 'Access-Control-Allow-Private-Network':'true'};
       if (request.method() === 'OPTIONS') return route.fulfill({status:204, headers});
       if (request.method() === 'DELETE' && url.pathname.startsWith('/assets/'))
         return route.fulfill({status:200, headers, contentType:'application/json', body:'{"ok":true}'});
+      if ((url.pathname === '/status' || url.pathname === '/models')
+          && await page.evaluate(() => PROJ?.cards[0]?.status === 'queued'))
+        await checkBusy(/^正在连接本机 IF 并读取模型$/);
+      if (url.pathname === '/runs' && request.method() === 'POST') await checkBusy(/^正在提交至本机 IF$/);
+      if (url.pathname === '/runs/bridge-1' && firstRunPolls < 3) {
+        const states = [{state:'starting', step:'正在上传 IF 引用素材（1/1）'},
+          {state:'starting', step:'正在登记 IF 参考素材「图片1」（1/1）'},
+          {state:'running', step:'IF 正在生成图片，等待产物'}];
+        return route.fulfill({status:200, headers, contentType:'application/json',
+          body:JSON.stringify(states[firstRunPolls++])});
+      }
       if (url.pathname === '/assets') {
+        await checkBusy(/^正在上传 IF .+引用（\d+\/\d+）至本机桥接$/);
         uploadedReferences.push({type:request.headers()['content-type'], body:request.postDataBuffer()});
         const asset_id = uploadedReferences.length <= 2 ? referenceId
           : 'b'.repeat(31) + uploadedReferences.length;
         return route.fulfill({status:201, headers, contentType:'application/json', body:JSON.stringify({asset_id})});
       }
       if (url.pathname.endsWith('/media/0')) {
+        await checkBusy(/^正在取回 IF .+产物（1\/1）$/);
         const kind = runs.at(-1).type;
         if (kind === 'image' && failMediaOnce) {
           failMediaOnce = false;
@@ -233,7 +281,15 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       await page.locator('#respop .x').click();
       await page.locator('#panel .pblock textarea').first().fill('蓝色圆形');
       await page.locator('#panel .go').click();
+      if (kind === 'image') {
+        for (const step of ['正在上传 IF 引用素材（1/1）',
+          '正在登记 IF 参考素材「图片1」（1/1）', 'IF 正在生成图片，等待产物']) {
+          await page.waitForFunction(step => PROJ.cards[0].step === step, step);
+          await checkBusy(new RegExp(step));
+        }
+      }
       await page.waitForFunction(() => PROJ.cards[0].status === 'done');
+      assert.equal(await page.locator('.card .body .load').count(), 0);
       const videoDirective = `最终交付必须是由「${chosen}」生成的视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下生成规格为准。\n\n`;
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen,
         prompt:`${kind === 'video' ? videoDirective : ''}蓝色圆形\n\n生成规格（作为内容要求）：分辨率 ${kind === 'image' ? '1440×1080' : '736×544，视频时长约 12 秒，随机种子参考 42'}。`,
@@ -364,9 +420,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     });
     await page.route(origin + '/api/if-reference?*', async route => {
       const url = new URL(route.request().url()), kind = url.searchParams.get('type');
-      assert.deepEqual(await page.evaluate(() => ({status:PROJ.cards[0].status,
-        step:PROJ.cards[0].step, visible:PROJ.cards[0]._el.textContent.includes(PROJ.cards[0].step)})),
-        {status:'queued', step:`正在适配 IF ${kind === 'image' ? '图片' : '视频'}上传副本`, visible:true});
+      await checkBusy(new RegExp(`^正在适配 IF ${kind === 'image' ? '图片' : '视频'}上传副本（\\d+/\\d+）$`));
       conversions.push(Object.fromEntries(url.searchParams));
       return route.fulfill(conversionFailure ? {status:422, body:'模拟转换失败，原素材未修改'} : {
         contentType:kind === 'image' ? 'image/webp' : 'video/mp4',
@@ -420,6 +474,10 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(runs.length, beforeFailure);
     assert.equal(uploadedReferences.length, uploadsBeforeInvalidCopy,
       'even an adapted image one byte over 10,000,000 must not reach the bridge');
+    assert.equal(await page.locator('.card .body .load').count(), 0, 'failure must stop loading');
+    for (const prefix of ['正在连接本机 IF', '正在读取 IF', '正在适配 IF', '正在上传 IF',
+      '正在提交至本机 IF', '正在取回 IF', '正在保存 IF'])
+      assert.ok(busySteps.some(step => step.startsWith(prefix)), prefix);
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {
