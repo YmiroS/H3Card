@@ -1,5 +1,6 @@
 """Per-user loopback bridge between the Chouka browser page and the user's IF CLI."""
 import argparse
+import hashlib
 import ipaddress
 import json
 import mimetypes
@@ -91,6 +92,7 @@ class Bridge(ThreadingHTTPServer):
         self.origins = tuple(origins)
         self.cli = cli
         self.jobs = {}
+        self.requests = {}
         self.assets = {}
         self.asset_bytes = 0
         self.asset_slots = 0
@@ -292,7 +294,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         if not ((method == 'POST' and self.path in ('/runs', '/assets')) or
                 (method == 'DELETE' and self.path.startswith('/assets/')) or
                 (method == 'GET' and (self.path in ('/status', '/models') or
-                                      self.path.startswith('/runs/')))):
+                                      self.path.startswith(('/runs/', '/requests/'))))):
             self.send_error(404)
             return
         self.send_response(204)
@@ -311,7 +313,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 status = self.server.command('auth', 'status', '--json', timeout=10)
                 profile = status.get('profiles', {}).get('buc', {})
                 self.reply(200, {'ready': bool(profile.get('has_ifs_token')) and
-                                 profile.get('registry') == 'ifs.alibaba-inc.com', 'reference_reuse': True})
+                                 profile.get('registry') == 'ifs.alibaba-inc.com', 'reference_reuse': True,
+                                 'request_recovery': True})
             except RuntimeError as exc:
                 self.reply(503, {'error': str(exc)})
         elif self.path == '/models':
@@ -321,6 +324,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
                                             for m in models if m.get('type') in ('image', 'video')]})
             except (RuntimeError, KeyError, TypeError) as exc:
                 self.reply(503, {'error': str(exc)})
+        elif self.path.startswith('/requests/'):
+            request_id = self.path.removeprefix('/requests/')
+            with self.server.lock:
+                entry = self.server.requests.get((self.headers['Origin'], request_id))
+            if entry is None:
+                self.reply(404, {'error': '尚未找到该请求，请勿重复提交'})
+            else:
+                self.reply(200, {'id': entry['id']})
         elif self.path.startswith('/runs/'):
             parts = self.path.split('/')
             with self.server.lock:
@@ -449,6 +460,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     self.server.asset_slots -= 1
                     self.server.asset_bytes -= length
 
+    def reply_existing_request(self, key, fingerprint):
+        previous = self.server.requests.get(key)
+        if not previous:
+            return False
+        matches = previous['fingerprint'] == fingerprint
+        self.reply(202 if matches else 409, {'id': previous['id']} if matches else
+                   {'error': '该请求编号已用于其他生成内容，请勿重复提交'})
+        return True
+
     def do_POST(self):
         if not self.authorized():
             return
@@ -479,9 +499,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 raise ValueError()
             if not isinstance(data, dict) or any(key not in (
                     'prompt', 'model', 'type', 'canvas_id', 'session_id', 'skill',
-                    'image', 'asset_id', 'asset_ids', 'references'
+                    'image', 'asset_id', 'asset_ids', 'references', 'request_id'
             ) for key in data):
                 raise ValueError()
+            request_id = data.get('request_id')
+            if request_id is not None and (not isinstance(request_id, str) or
+                                           not re.fullmatch(r'[a-f0-9]{32}', request_id)):
+                raise ValueError()
+            request_key = (self.headers['Origin'], request_id)
+            fingerprint = hashlib.sha256(json.dumps(data, sort_keys=True).encode()).hexdigest()
+            with self.server.lock:
+                if self.reply_existing_request(request_key, fingerprint):
+                    return
             asset_id = data.get('asset_id')
             if 'asset_id' in data and (not isinstance(asset_id, str) or
                                        not re.fullmatch(r'[A-Za-z0-9_-]{32}', asset_id)):
@@ -551,6 +580,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         raise ValueError()
                     bridge_limits = rule['bridge']
                 with self.server.lock:
+                    if self.reply_existing_request(request_key, fingerprint):
+                        return
                     assets = [self.server.assets.get(item) for item in asset_ids]
                 if any(asset is None for asset in assets):
                     raise ValueError()
@@ -585,6 +616,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             self.reply(503, {'error': str(exc)})
             return
         with self.server.lock:
+            if self.reply_existing_request(request_key, fingerprint):
+                return
             if any(job['state'] in ('starting', 'running') for job in self.server.jobs.values()):
                 self.reply(409, {'error': '已有 IF 生成任务正在进行'})
                 return
@@ -599,13 +632,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.server.asset_bytes -= asset[2]
             job_id = secrets.token_urlsafe(18)
             self.server.jobs[job_id] = {'state': 'starting', 'step': '本机 IF 正在准备生成任务'}
+            if request_id:
+                self.server.requests[request_key] = {'id': job_id, 'fingerprint': fingerprint}
         try:
             threading.Thread(target=self.server.generate, args=(job_id, data, asset_paths), daemon=True).start()
         except RuntimeError:
             for path in asset_paths:
                 path.unlink(missing_ok=True)
             with self.server.lock:
-                self.server.jobs.pop(job_id, None)
+                self.server.jobs[job_id] = {'state': 'error', 'error': '无法启动生成任务'}
             self.reply(503, {'error': '无法启动生成任务'})
             return
         self.reply(202, {'id': job_id})

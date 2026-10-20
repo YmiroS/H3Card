@@ -72,7 +72,7 @@ test('IF collaboration preserves active attempts and respects terminal, newer an
       pendingContentSaves:0, pendingCardCreates:0, pendingDirectorRuns:0, pendingNodeWork:new Set(),
       localFlushes:0, pendingProjectSync:null, el:{panel:{style:{display:'none'}}, ptitle:{}},
       selId:null, selIds:new Set(), resetCanvasHistory(){}, seedHistory(){}, render(){}, closePanel(){},
-      pollIF:c=>{if (!c._ifPolling) polls.push(c.job);}});
+      resumeIFTask:c=>{if (c.cap === 'if_video' && c.job && c.status === 'running' && !c._ifPolling) polls.push(c.job);}});
     vm.runInContext(journal + apply, ctx);
     return {active, ctx, polls, apply:cards=>ctx.applyCollaborativeProject({id:'p1', rev:ctx.PROJ.rev+1, cards})};
   };
@@ -120,6 +120,20 @@ test('IF collaboration preserves active attempts and respects terminal, newer an
   accepted.apply([{...accepted.active, job:'accepted-job', status:'running'}]);
   assert.equal(accepted.ctx.PROJ.cards[0].job, 'accepted-job', 'accepted server job beats a pre-acceptance journal');
   assert.equal(accepted.ctx.PROJ.cards[0].status, 'running');
+  const uncertain = make('queued');
+  uncertain.active.if_request_id = 'a'.repeat(32);
+  uncertain.ctx.rememberIFTask(uncertain.active, 'p1', 'submitting');
+  const timedOut = {...uncertain.active, status:'error'};
+  assert.equal(uncertain.ctx.restoreIFTask(timedOut, 'p1'), true);
+  assert.equal(timedOut.status, 'running', 'a lookup timeout is not a confirmed terminal job');
+  assert.ok(uncertain.ctx.sessionStorage.getItem(uncertain.ctx.ifTaskKey(timedOut, 'p1')));
+  const otherRequest = make('queued');
+  otherRequest.active.if_request_id = 'a'.repeat(32);
+  otherRequest.ctx.rememberIFTask(otherRequest.active, 'p1', 'preparing');
+  otherRequest.apply([{...otherRequest.active, if_request_id:'b'.repeat(32)}]);
+  assert.notEqual(otherRequest.ctx.PROJ.cards[0], otherRequest.active);
+  assert.equal(otherRequest.ctx.PROJ.cards[0].if_request_id, 'b'.repeat(32));
+  assert.equal(otherRequest.ctx.sessionStorage.getItem(otherRequest.ctx.ifTaskKey(otherRequest.active, 'p1')), null);
   const deleted = make();
   deleted.ctx.rememberIFTask(deleted.active, 'p1', 'running');
   deleted.apply([]);
@@ -156,7 +170,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
   let returnVideoPlanOnly = false;
   let emitReferenceURLs = false, reuseFailure = null;
   let rejectProjectSaves = false, rejectSavesAfterSubmit = false, heldIFStep = null;
-  let ifPollCount = 0;
+  let ifPollCount = 0, recoveryLookupStatus = 0, recoveryLookups = 0;
   const sourceVersions = new Map(), sourceReads = [], deniedSources = new Set();
   const sourceVersion = source => '"' + createHash('sha256').update(source + ':' + (sourceVersions.get(source) || 1)).digest('hex') + '"';
   const resultReferences = run => (run.references || []).map((item, index) => ({index, kind:item.kind,
@@ -301,7 +315,15 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         if (heldIFStep) return route.fulfill({status:200, headers, contentType:'application/json',
           body:JSON.stringify({state:'running', step:heldIFStep, result:{reference_urls:resultReferences(runs.at(-1))}})});
       }
-      const result = url.pathname === '/status' ? {ready:true, reference_reuse:true}
+      if (url.pathname.startsWith('/requests/')) {
+        recoveryLookups++;
+        if (recoveryLookupStatus) return route.fulfill({status:recoveryLookupStatus, headers,
+          contentType:'application/json', body:JSON.stringify({error:'模拟任务尚未登记或桥接暂不可用'})});
+        const index = runs.findIndex(run => run.request_id === url.pathname.split('/')[2]);
+        return route.fulfill({status:index < 0 ? 404 : 200, headers, contentType:'application/json',
+          body:JSON.stringify(index < 0 ? {error:'尚未找到该请求'} : {id:'bridge-' + (index + 1)})});
+      }
+      const result = url.pathname === '/status' ? {ready:true, reference_reuse:true, request_recovery:true}
         : url.pathname === '/models' ? {models:[{display_name:'qwen-image-3.0', type:'image'},
           {display_name:'qwen-image-2.0', type:'image'}, {display_name:'z-image-turbo', type:'image'},
           {display_name:'Wan3.0视频', type:'video'}, {display_name:'Minimax H3', type:'video'},
@@ -451,7 +473,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       const directive = kind === 'video'
         ? '最终交付必须是视频文件，不是图片、故事板或文字方案。用户已经确认生成需求，请直接生成视频；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为生图。以本条视频目标和以下参数要求为准。'
         : '最终交付必须是图片文件，不是故事板或文字方案。用户已经确认生成需求，请直接生成图片；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为视频或文字方案。以本条图片目标和以下参数要求为准。';
-      assert.deepEqual(runs.at(-1), {type:kind, model:chosen,
+      assert.match(runs.at(-1).request_id, /^[a-f0-9]{32}$/);
+      assert.deepEqual(runs.at(-1), {type:kind, model:chosen, request_id:runs.at(-1).request_id,
         prompt:`${directive}\n\n蓝色圆形\n\n分辨率：${kind === 'image' ? '1440×1080' : '736×544\n时长：12s\n画面比例：4 : 3'}`,
         references:[{kind, asset_id:referenceId}]});
       assert.doesNotMatch(runs.at(-1).prompt, /生成规格|随机种子/);
@@ -961,31 +984,81 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(project.cards[0].status, 'done');
     assert.equal(await page.evaluate(() => sessionStorage.getItem(ifTaskKey(PROJ.cards[0], PROJ.id))), null,
       'clear the recovery record only after the terminal state is saved');
-    for (const phase of ['preparing', 'submitting']) {
+    for (const stage of ['initial-save', 'preparing', 'upload', 'submitting']) {
       const before = runs.length;
-      await page.evaluate(phase => {
-        const original = ifRequest;
-        ifRequest = (path, options) => {
-          if (path !== (phase === 'preparing' ? '/models' : '/runs')) return original(path, options);
-          window.ifTestHeld = phase;
-          return new Promise(() => {});
-        };
+      await page.evaluate(stage => {
+        PROJ.cards[0].params.prompt = '立即刷新恢复：' + stage;
+        PROJ.cards[0].assets = stage === 'upload'
+          ? {'images[0]':{kind:'image', url:'/fixture.png', filename:'ref.png'}} : {};
+        if (stage === 'initial-save') {
+          enqueueSave = () => { window.ifTestHeld = stage; return new Promise(() => {}); };
+        } else {
+          const original = ifRequest;
+          ifRequest = async (path, options) => {
+            if (path !== (stage === 'preparing' ? '/models' : stage === 'upload' ? '/assets' : '/runs')) return original(path, options);
+            if (stage !== 'preparing') await original(path, options); // Bridge accepts; caller never gets the ID.
+            window.ifTestHeld = stage;
+            return new Promise(() => {});
+          };
+        }
         openPanel(PROJ.cards[0].id);
-      }, phase);
+      }, stage);
       await page.locator('#panel .go').click();
-      await page.waitForFunction(phase => {
+      await page.waitForFunction(stage => window.ifTestHeld === stage, stage);
+      const attempt = await page.evaluate(() => {
         const c = PROJ.cards[0], state = JSON.parse(sessionStorage.getItem(ifTaskKey(c, PROJ.id)));
-        return c.status === 'queued' && state?.phase === phase && window.ifTestHeld === phase;
-      }, phase);
-      await page.evaluate(() => saveChain);
+        return {id:state.if_request_id, started:state.if_started, phase:state.phase};
+      });
+      assert.equal(attempt.phase, stage === 'submitting' ? 'submitting' : 'preparing');
+      assert.equal(runs.length, before + (stage === 'submitting' ? 1 : 0));
+      if (stage === 'submitting') recoveryLookupStatus = 404;
       await page.reload();
-      await page.waitForFunction(() => PROJ?.cards[0]?.status === 'error');
-      assert.match(await page.evaluate(() => PROJ.cards[0].error), phase === 'preparing'
-        ? /素材准备.*中断.*尚未提交 IF/ : /提交结果尚未确认.*避免重复生成/);
-      assert.equal(runs.length, before, 'interrupted preparation or unconfirmed submission must not auto-generate');
-      assert.equal(await page.evaluate(() => PROJ.cards[0].job), null);
+      if (stage === 'submitting') {
+        for (const status of [404, 503]) {
+          if (status === 503) { recoveryLookupStatus = status; await page.reload(); }
+          await page.waitForFunction(() => PROJ?.cards[0]?.status === 'running' && !PROJ.cards[0].job
+            && !PROJ.cards[0]._ifRecovering && PROJ.cards[0].step.includes('请勿重复生成'));
+          assert.equal(runs.length, before + 1, 'repeat refresh with pending lookup must not POST again');
+          assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem(ifTaskKey(PROJ.cards[0], PROJ.id))).phase), 'submitting');
+        }
+        assert.ok(recoveryLookups >= 2);
+        recoveryLookupStatus = 0;
+      }
+      await page.waitForFunction(() => PROJ?.cards[0]?.status === 'done' && !PROJ.cards[0]._ifPolling);
       await page.evaluate(() => saveChain);
+      assert.equal(runs.length, before + 1, 'resume preparation once or query the accepted request, never resubmit it');
+      assert.equal(runs.at(-1).request_id, attempt.id);
+      assert.match(runs.at(-1).prompt, new RegExp('立即刷新恢复：' + stage));
+      assert.equal(await page.evaluate(() => PROJ.cards[0].if_started), attempt.started);
+      assert.equal(await page.evaluate(() => PROJ.cards[0].job), 'bridge-' + (before + 1));
+      assert.match(await page.evaluate(() => PROJ.cards[0].history[0].prompts.find(p => p.key === 'if_original').text),
+        new RegExp('立即刷新恢复：' + stage));
     }
+    for (const blockedPhase of ['preparing', 'submitting']) {
+      const before = runs.length;
+      await page.evaluate(async blockedPhase => {
+        await saveChain;
+        const original = Storage.prototype.setItem;
+        Storage.prototype.setItem = function(key, value) {
+          if (key.startsWith('chouka:if-task:') && JSON.parse(value).phase === blockedPhase)
+            throw new DOMException('Storage full', 'QuotaExceededError');
+          return original.call(this, key, value);
+        };
+        try { await runIF(PROJ.cards[0]); } finally { Storage.prototype.setItem = original; }
+      }, blockedPhase);
+      assert.match(await page.evaluate(() => PROJ.cards[0].error), /无法保存 IF.*恢复记录.*尚未提交生成/);
+      assert.equal(runs.length, before, 'journal write failure must prevent submission');
+    }
+    const beforeOldBridge = runs.length;
+    await page.evaluate(async () => {
+      await saveChain;
+      const original = ifRequest;
+      ifRequest = async (path, options) => path === '/status'
+        ? {ready:true, reference_reuse:true} : original(path, options);
+      try { await runIF(PROJ.cards[0]); } finally { ifRequest = original; }
+    });
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /请更新本机 IF 桥接器/);
+    assert.equal(runs.length, beforeOldBridge, 'old bridge must be rejected before generation');
     rejectProjectSaves = true;
     const beforeSaveFailure = runs.length;
     await page.evaluate(() => openPanel(PROJ.cards[0].id));
@@ -997,12 +1070,23 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     await page.evaluate(async () => {
       await saveChain;
       const original = ifRequest;
-      ifRequest = (path, options) => path === '/runs'
-        ? Promise.reject(new TypeError('Failed to fetch')) : original(path, options);
+      ifRequest = (path, options) => {
+        if (path !== '/runs') return original(path, options);
+        PROJ.cards[0].if_submitted_at = Date.now() - 120001;
+        return Promise.reject(new TypeError('Failed to fetch'));
+      };
       await runIF(PROJ.cards[0]);
     });
+    await page.waitForFunction(() => PROJ.cards[0].status === 'error');
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /提交结果尚未确认.*避免重复生成/);
     assert.equal(runs.length, beforeSaveFailure);
+    await page.evaluate(() => saveChain);
+    const lookupsBeforeTimedOutRefresh = recoveryLookups;
+    await page.reload();
+    await page.waitForFunction(() => PROJ?.cards[0]?.status === 'error' && !PROJ.cards[0]._ifRecovering);
+    assert.ok(recoveryLookups > lookupsBeforeTimedOutRefresh, 'timeout refresh must query the original request again');
+    assert.equal(runs.length, beforeSaveFailure, 'timeout refresh must never repeat POST');
+    assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem(ifTaskKey(PROJ.cards[0], PROJ.id))).phase), 'submitting');
     assert.deepEqual(await page.evaluate(() => {
       const c = PROJ.cards[0], base = {...plain(c), status:'running', job:'old-job', if_started:100, step:'旧进度'};
       rememberIFTask(base, PROJ.id, 'running');
