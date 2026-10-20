@@ -77,19 +77,21 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             self.assertEqual(card_data['capabilities'][capability]['execution'], 'if_studio')
         self.assertEqual(len(card_data['if_model_limits']), 18)
         for model, maximum in (('qwen-image-2.0', 3), ('qwen-image-3.0', 3),
-                               ('万相2.7图像生成', 9), ('即梦5.0 Pro', 10),
-                               ('Nano Banana Pro', 9), ('GPT-Image-2', 9)):
+                               ('万相2.7图像生成', 3), ('即梦5.0 Pro', 10), ('即梦5.0', 10),
+                               ('Nano Banana Pro', 3), ('GPT-Image-2', 3),
+                               ('z-image-turbo', 1)):
             self.assertEqual(card_data['if_model_limits'][model]['bridge'],
                              {'image': maximum, 'video': 0, 'audio': 0})
         self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['api'],
                          {'image': 10, 'video': 5, 'audio': 5})
         self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['bridge'],
                          {'image': 10, 'video': 5, 'audio': 0})
-        for model in ('星辰图生视频', '可灵3.0 Omni'):
-            self.assertEqual(card_data['if_model_limits'][model]['api'],
-                             {'image': None, 'video': None, 'audio': None})
+        for model, images in (('星辰图生视频', 6), ('可灵3.0 Omni', 4),
+                              ('HappyHorse-1.1视频', 9), ('HappyHorse-1.0视频【内测】', 9)):
             self.assertEqual(card_data['if_model_limits'][model]['bridge'],
-                             {'image': 9, 'video': 3, 'audio': 0})
+                             {'image': images, 'video': 1, 'audio': 0})
+        self.assertEqual(card_data['if_model_limits']['Minimax H3']['duration']['min'], 5)
+        self.assertEqual(card_data['if_model_limits']['可灵3.0 Omni']['duration'], {'min': 3, 'max': 15})
         self.assertEqual((await self.client.get('/if-studio.html')).status, 404)
         self.assertEqual((await self.client.get('/admin/permissions')).status, 200)
         self.assertEqual((await self.client.get('/teams')).status, 200)

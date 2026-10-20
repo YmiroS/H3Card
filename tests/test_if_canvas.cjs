@@ -12,22 +12,32 @@ const cards = JSON.parse(readFileSync(path.join(root, 'manifests', '_cards.json'
 const capabilities = Object.fromEntries(['if_image', 'if_video', 'zimage_t2i', 'zimage_i2i', 'minimax_h3_character_transfer']
   .map(id => [id, JSON.parse(readFileSync(path.join(root, 'manifests', id + '.json'), 'utf8'))]));
 const ifModelLimits = JSON.parse(readFileSync(path.join(root, 'manifests', '_if_model_limits.json'), 'utf8'));
-test('IF reference matrix covers every known model and never exceeds provider limits', () => {
-  assert.equal(Object.keys(ifModelLimits).length, 18);
+test('IF reference matrix follows user research and uses explicit fallback quantities', () => {
+  const expected = {
+    'qwen-image-2.0':[3,0], 'qwen-image-3.0':[3,0], '万相2.7图像生成':[3,0],
+    'z-image-turbo':[1,0], 'Nano Banana 2':[3,0], 'Nano Banana Pro':[3,0],
+    '即梦5.0':[10,0], '即梦5.0 Pro':[10,0], 'GPT-Image-2.5':[3,0], 'GPT-Image-2':[3,0],
+    'HappyHorse-1.1视频':[9,1], 'HappyHorse-1.0视频【内测】':[9,1], 'Wan3.0视频':[10,5],
+    'Seedance 2.0':[9,3], 'Seedance 2.5':[30,10], 'Minimax H3':[9,3],
+    '可灵3.0 Omni':[4,1], '星辰图生视频':[6,1],
+  };
+  assert.deepEqual(Object.keys(ifModelLimits).sort(), Object.keys(expected).sort());
   for (const [name, limit] of Object.entries(ifModelLimits)) {
     assert.ok(['image', 'video'].includes(limit.type), name);
     for (const kind of ['image', 'video', 'audio']) {
       assert.ok(Number.isInteger(limit.bridge[kind]) && limit.bridge[kind] >= 0, `${name}: ${kind}`);
       if (limit.type === 'image' && kind !== 'image') assert.equal(limit.bridge[kind], 0, `${name}: ${kind}`);
-      if (limit.api[kind] !== null) assert.ok(limit.bridge[kind] <= limit.api[kind], `${name}: ${kind}`);
     }
+    assert.deepEqual([limit.bridge.image, limit.bridge.video], expected[name], name);
+    if (limit.reference_fallback) assert.deepEqual(limit.bridge,
+      {image:limit.type === 'video' ? 6 : 3, video:limit.type === 'video' ? 1 : 0, audio:0}, name);
     assert.equal(limit.bridge.audio, 0, name);
   }
 });
 const durationRanges = {
   'Wan3.0视频':[2, 30], 'HappyHorse-1.1视频':[3, 15], 'HappyHorse-1.0视频【内测】':[3, 15],
-  'Seedance 2.0':[4, 15], 'Seedance 2.5':[4, 30], 'Minimax H3':[4, 15],
-  '星辰图生视频':[null, null], '可灵3.0 Omni':[null, null],
+  'Seedance 2.0':[4, 15], 'Seedance 2.5':[4, 30], 'Minimax H3':[5, 15],
+  '星辰图生视频':[null, null], '可灵3.0 Omni':[3, 15],
 };
 test('IF duration limits match the supplied model table, with unknown ranges preserved', () => {
   for (const [name, range] of Object.entries(durationRanges)) {
@@ -57,7 +67,7 @@ const card = (kind, model) => ({id:'if-card', type:kind === 'image' ? 'card_imag
 test('IF in canvas image and video panels uses local bridge and saves results', async () => {
   let project = {id:'if-test', rev:0, name:'IF 模型菜单', permission:'operate', locked:false,
     edges:[], groups:[], view:{x:100, y:70, k:1}, cards:[card('image', 'qwen-image-2.0')]};
-  const requests = [], runs = [], uploadedReferences = [];
+  const requests = [], runs = [], uploadedReferences = [], extraModels = [];
   const referenceId = 'a'.repeat(32);
   let failMediaOnce = true;
   let returnVideoStoryboard = false;
@@ -215,7 +225,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           {display_name:'Wan3.0视频', type:'video'}, {display_name:'Minimax H3', type:'video'},
           {display_name:'星辰图生视频', type:'video'}, {display_name:'可灵3.0 Omni', type:'video'},
           ...['HappyHorse-1.1视频', 'HappyHorse-1.0视频【内测】', 'Seedance 2.0', 'Seedance 2.5']
-            .map(display_name => ({display_name, type:'video'}))]}
+            .map(display_name => ({display_name, type:'video'})), ...extraModels]}
         : url.pathname === '/runs' && request.method() === 'POST'
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done', canvas_id:'c_OcBXJf2Bd0CxY-',
@@ -288,11 +298,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       const summary = await page.locator('#panel .pbody').innerText();
       assert.match(summary, /返回的 URL.+生成需求一次提交/);
       assert.doesNotMatch(summary, /逐份登记|登记后/);
-      if (kind === 'video') {
-        assert.match(summary, /供应商 API 资料（并非 IF 引用上限）/);
-        assert.match(summary, /画布按各类型上限开放图片 10／视频 5槽位/);
-        assert.doesNotMatch(summary, /官方 API 同名模型\/家族参考上限/);
-      } else assert.match(summary, /官方 API 同名模型\/家族参考上限/);
+      assert.match(summary, kind === 'video' ? /画布引用上限：图片 10 · 视频 5/ : /画布引用上限：图片 3 · 视频 0/);
+      assert.match(summary, /按用户调研的 IF 实际限制/);
       assert.equal(await page.evaluate(() => PROJ.edges[0].slot), kind === 'image' ? 'images[0]' : 'video[0]');
       assert.match(await page.locator('#panel .refhead').innerText(), kind === 'image' ? /图片 3/ : /图片 10 · 视频 5/);
       await modelButton.click();
@@ -307,19 +314,18 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
             await page.locator('#menu button').filter({hasText:name}).click();
           }
           const estimate = await page.locator('#panel .pbody').innerText();
-          assert.match(estimate, /H3 全能参考高质量估算（未核实该模型上限）：图片 9（H3 估算） · 视频 3（H3 估算） · 音频 3（H3 估算）/);
-          assert.match(estimate, /画布按 H3 估算开放图片 9／视频 3槽位，模型能否接收仍待实测/);
-          assert.match((await page.locator('#panel .refhead').allTextContents()).join(' '), /图片 9 · 视频 3/);
+          assert.match(estimate, name === '星辰图生视频'
+            ? /画布兜底引用上限（不代表官方支持）：图片 6 · 视频 1/
+            : /画布引用上限：图片 4 · 视频 1/);
+          assert.doesNotMatch(estimate, /H3 估算/);
+          assert.match((await page.locator('#panel .refhead').allTextContents()).join(' '),
+            name === '星辰图生视频' ? /图片 6 · 视频 1/ : /图片 4 · 视频 1/);
           assert.equal(await page.evaluate(() => PROJ.edges.length), 1);
         }
       } else {
-        assert.match(await page.locator('#panel .pbody').innerText(), /已连接的引用保持原样/);
-        await page.locator('#panel .pblock textarea').first().fill('不兼容引用不应提交');
-        await page.locator('#panel .go').click();
-        await page.waitForFunction(() => PROJ.cards[0].status === 'error');
-        assert.match(await page.evaluate(() => PROJ.cards[0].error), /当前画布尚未开放所选模型的/);
-        assert.equal(runs.length, 0, 'incompatible references must not submit a bridge job');
-        assert.equal(uploadedReferences.length, 0, 'incompatible references must not upload');
+        assert.match(await page.locator('#panel .pbody').innerText(), /画布引用上限：图片 1 · 视频 0/);
+        assert.match(await page.locator('#panel .refhead').innerText(), /图片 1/);
+        assert.doesNotMatch(await page.locator('#panel .pbody').innerText(), /已连接的引用保持原样/);
       }
       assert.equal(await page.evaluate(() => PROJ.edges.length), 1);
       await modelButton.click();
@@ -440,7 +446,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       kling: capOf({cap:'if_video', params:{if_model:'可灵3.0 Omni'}}).inputs.filter(s => MEDIA.includes(s.type)).length,
       wanApi: ifModelLimits['Wan3.0视频'].api,
       wanBridge: ifModelLimits['Wan3.0视频'].bridge,
-    })), {textOnly:0, unknown:12, kling:12, wanApi:{image:10, video:5, audio:5}, wanBridge:{image:10, video:5, audio:0}});
+    })), {textOnly:1, unknown:7, kling:5, wanApi:{image:10, video:5, audio:5}, wanBridge:{image:10, video:5, audio:0}});
     returnVideoStoryboard = false; returnVideoPlanOnly = false;
     const beforeMulti = uploadedReferences.length;
     await page.evaluate(async () => linkTo(PROJ.cards[1], PROJ.cards[0]));
@@ -776,9 +782,49 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       return {cached:state.entries.length, isolated:[otherCard, otherProject, otherUser].map(s => s.entries.length),
         keys:new Set([state, otherCard, otherProject, otherUser].map(s => s.key)).size};
     }), {cached:2, isolated:[0, 0, 0], keys:4});
+    extraModels.push({display_name:'New IF Image', type:'image'}, {display_name:'New IF Video', type:'video'},
+      {display_name:'Nano Banana Pro', type:'image'}, {display_name:'即梦5.0', type:'image'});
+    for (const [model, kind, maximum] of [
+      ['z-image-turbo', 'image', 1], ['Nano Banana Pro', 'image', 3], ['New IF Image', 'image', 3],
+      ['即梦5.0', 'image', 10], ['HappyHorse-1.1视频', 'video', 9], ['可灵3.0 Omni', 'video', 4],
+      ['星辰图生视频', 'video', 6], ['New IF Video', 'video', 6]]) {
+      await page.evaluate(async ({model, kind, maximum}) => {
+        await saveChain;
+        const c = PROJ.cards[0]; c.cap = 'if_' + kind; c.type = 'card_' + kind;
+        c.params = {if_model:model, prompt:'兜底引用测试', duration:5};
+        c.assets = Object.fromEntries(Array.from({length:maximum}, (_, i) =>
+          [`images[${i}]`, {kind:'image', url:'/fixture.png', filename:`ref-${i}.png`} ]));
+        if (kind === 'video') c.assets['video[0]'] = {kind:'video', url:'/fixture.mp4', filename:'ref.mp4'};
+        PROJ.edges = []; openPanel(c.id);
+      }, {model, kind, maximum});
+      assert.deepEqual(await page.evaluate(() => capOf(PROJ.cards[0]).slotLimits),
+        {image:{max:maximum}, video:{max:kind === 'video' ? 1 : 0}, audio:{max:0}}, model);
+      assert.match(await page.locator('#panel .pbody').innerText(),
+        model.startsWith('New IF') || ifModelLimits[model].reference_fallback ? /兜底/ : /按用户调研/);
+      if (process.env.CHOUKA_TEST_FALLBACK_SCREENSHOT && model === 'New IF Video')
+        await page.screenshot({path:process.env.CHOUKA_TEST_FALLBACK_SCREENSHOT});
+      const before = runs.length;
+      await generate();
+      assert.equal(runs.length, before + 1, model);
+      assert.equal(runs.at(-1).model, model);
+      assert.equal(runs.at(-1).references.filter(r => r.kind === 'image').length, maximum);
+      assert.equal(runs.at(-1).references.filter(r => r.kind === 'video').length, kind === 'video' ? 1 : 0);
+      const uploadsBefore = uploadedReferences.length;
+      await page.evaluate(maximum => {
+        const c = PROJ.cards[0]; c.assets[`images[${maximum}]`] = {...c.assets['images[0]']};
+        openPanel(c.id);
+      }, maximum);
+      await page.locator('#panel .go').click();
+      await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+      assert.equal(runs.length, before + 1, 'over-limit fallback must not submit');
+      assert.equal(uploadedReferences.length, uploadsBefore, 'validate before upload');
+      assert.equal(await page.evaluate(() => Object.keys(PROJ.cards[0].assets).length),
+        maximum + 1 + (kind === 'video' ? 1 : 0), 'over-limit references must not be silently discarded');
+    }
     await page.evaluate(async () => {
       await saveChain;
       const c = PROJ.cards[0]; c.assets = {}; PROJ.edges = [];
+      c.cap = 'if_video'; c.type = 'card_video';
       c.params = {if_model:'Wan3.0视频', prompt:'刷新恢复原任务', duration:8};
       openPanel(c.id);
     });

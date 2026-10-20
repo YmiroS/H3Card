@@ -476,14 +476,20 @@ function runCap(c) {
   const n = Math.max(filledImgs(c), steps[0]);      // 一张都没传时按最低档算
   return md.ladder[String(steps.filter(s => s <= n).pop())] || c.cap;
 }
+function ifModelLimit(name, type) {
+  const limit = ifModelLimits[name];
+  if (limit?.type === type) return limit;
+  return {type, api:{image:null, video:null, audio:null},
+    bridge:{image:type === "video" ? 6 : 3, video:type === "video" ? 1 : 0, audio:0},
+    reference_fallback:true, note:"该模型引用规格尚未核实，使用画布兜底数量。"};
+}
 const capOf = (c) => {
   const cap = CAPS[c.cap];
   if (!cap || cap.execution !== "if_studio") return cap || null;
   const available = ifModels.filter(entry => entry.type === cap.outputType);
-  const model = ifModelLimits[c.params?.if_model] ? c.params.if_model
-    : available[0]?.display_name || c.params?.if_model;
-  const limits = ifModelLimits[model];
-  const bridge = limits?.type === cap.outputType ? limits.bridge : null;
+  const model = c.params?.if_model || available[0]?.display_name;
+  const limits = ifModelLimit(model, cap.outputType);
+  const bridge = limits.bridge;
   const inputs = cap.inputs.filter(s => s.key !== "if_reference" || bridge?.image || bridge?.video)
     .map(s => s.key === "if_reference" ? {...s,
       label:`参考${bridge?.image ? "图片" : ""}${bridge?.image && bridge?.video ? "／" : ""}${bridge?.video ? "视频" : ""} HTTPS 地址（可选）`}
@@ -5935,20 +5941,10 @@ function openPanel(id) {
   body.appendChild(clipboardHint);
   if (isIF(c)) {
     const available = ifModels.filter(entry => entry.type === cap.outputType);
-    const name = ifModelLimits[c.params.if_model] ? c.params.if_model
-      : available[0]?.display_name || c.params.if_model;
-    const limit = ifModelLimits[name];
+    const name = c.params.if_model || available[0]?.display_name;
+    const limit = ifModelLimit(name, cap.outputType);
     const summary = document.createElement("div"); summary.className = "knobnote";
-    const format = value => value == null ? "未核实" : String(value);
-    const videoReference = `图片 ${limit?.bridge.image || 0}／视频 ${limit?.bridge.video || 0}`;
-    const h3Estimate = limit?.type === "video" && Object.values(limit.api).some(value => value == null);
-    const videoCount = kind => limit.api[kind] == null
-      ? `${ifModelLimits["Minimax H3"].api[kind]}（H3 估算）` : String(limit.api[kind]);
-    summary.textContent = limit?.type === "video"
-      ? `${h3Estimate ? "H3 全能参考高质量估算（未核实该模型上限）" : "供应商 API 资料（并非 IF 引用上限）"}：图片 ${videoCount("image")} · 视频 ${videoCount("video")} · 音频 ${videoCount("audio")}。${limit.note} 桥接将全部引用上传后的 URL 按「图片1」「视频1」写入同一提示词，只提交一次生成需求，再轮询等待产物；IF 是否读取全部 URL 仍以实际结果为准，音频暂不能提交。${h3Estimate ? `画布按 H3 估算开放${videoReference}槽位，模型能否接收仍待实测。` : `画布按各类型上限开放${videoReference}槽位；不同模式可能另有限制，以 IF 实际返回为准。`}画面比例、清晰度、时长等参数仅作为生成内容要求发送，模型不保证严格遵守。`
-      : limit
-        ? `官方 API 同名模型/家族参考上限：图片 ${format(limit.api.image)} · 视频 ${format(limit.api.video)} · 音频 ${format(limit.api.audio)}。${limit.note} IF 未公布内部模型版本和多素材转发规则；画布开放图片 ${limit.bridge.image}${limit.api.image == null ? "（估算，数量未核实）" : ""}／视频 ${limit.bridge.video}。全部引用 URL 与生成需求在同一提示词中一次提交，再轮询产物；IF 是否读取全部 URL 仍以实际结果为准，失败直接显示错误；音频暂不可提交。画面比例、清晰度、时长等参数会作为生成内容发送，不是 IF API 参数，模型不保证严格遵守。`
-        : "该 IF 模型尚无可核对的官方 API 上限，暂不开放新的画布引用。";
+    summary.textContent = `${limit.reference_fallback ? "画布兜底引用上限（不代表官方支持）" : "画布引用上限"}：图片 ${limit.bridge.image} · 视频 ${limit.bridge.video}。${limit.note} 全部引用上传后的 URL 按「图片1」「视频1」与生成需求一次提交，再轮询产物；是否采用全部引用以 IF 实际返回为准，音频暂不可提交。画面比例、清晰度、时长等参数作为生成内容要求发送，模型不保证严格遵守。`;
     if (Object.values(c.assets || {}).some(asset => asset && MEDIA.includes(asset.kind)
         && !limit?.bridge?.[asset.kind]))
       summary.textContent += " 已连接的引用保持原样，但不适用于当前模型；可切回原模型或手动移除，运行时不会忽略它。";
@@ -5956,7 +5952,7 @@ function openPanel(id) {
     if (limit?.source) {
       const source = document.createElement("a"); source.href = limit.source;
       source.target = "_blank"; source.rel = "noopener noreferrer";
-      source.textContent = "查看官方 API 文档"; body.appendChild(source);
+      source.textContent = "供应商 API 参考文档（不作为 IF 引用上限）"; body.appendChild(source);
     }
   }
   if (localComposite) {
@@ -8305,16 +8301,16 @@ async function runIF(c) {
     const originalPrompt = String(c.params.prompt || "");
     const prompt = originalPrompt.trim();
     if (!prompt) throw new Error("请先填写 IF 生成需求");
-    const limit = ifModelLimits[model.display_name];
-    if (!limit || limit.type !== type) throw new Error("该 IF 模型尚无可核对的输入规格");
+    const limit = ifModelLimit(model.display_name, type);
     const references = Object.entries(c.assets || {}).filter(([, asset]) => asset && MEDIA.includes(asset.kind))
       .sort(([a], [b]) => a.localeCompare(b, undefined, {numeric:true}));
     const counts = {image:0, video:0, audio:0};
     for (const [slot, asset] of references) {
       const index = slot.match(/^(?:images|video)\[(\d+)\]$/);
-      if (!index || (asset.kind === "image") !== slot.startsWith("images[")
-          || Number(index[1]) >= (limit.bridge[asset.kind] || 0))
-        throw new Error(`当前画布尚未开放所选模型的${KIND_ZH[asset.kind] || asset.kind}引用，请更换模型或移除引用`);
+      if (!index || (asset.kind === "image") !== slot.startsWith("images["))
+        throw new Error(`引用槽位与${KIND_ZH[asset.kind] || asset.kind}类型不匹配，请重新连接引用`);
+      if (Number(index[1]) >= (limit.bridge[asset.kind] || 0))
+        throw new Error(`所选模型最多引用图片 ${limit.bridge.image} 张、视频 ${limit.bridge.video} 个；当前引用槽位超出范围，请移除多余引用或更换模型`);
       counts[asset.kind]++;
     }
     if (Object.keys(counts).some(kind => counts[kind] > (limit.bridge[kind] || 0)))

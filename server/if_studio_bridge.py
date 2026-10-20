@@ -542,10 +542,14 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if asset_ids or references or image:
                 limits = json.loads(LIMITS_FILE.read_text(encoding='utf-8'))
                 rule = limits.get(model) if isinstance(limits, dict) else None
-                if not isinstance(rule, dict) or rule.get('type') != kind or \
-                        not isinstance(rule.get('bridge'), dict):
-                    raise ValueError()
-                bridge_limits = rule['bridge']
+                if rule is None:
+                    bridge_limits = {'image': 6 if kind == 'video' else 3,
+                                     'video': 1 if kind == 'video' else 0, 'audio': 0}
+                else:
+                    if not isinstance(rule, dict) or rule.get('type') != kind or \
+                            not isinstance(rule.get('bridge'), dict):
+                        raise ValueError()
+                    bridge_limits = rule['bridge']
                 with self.server.lock:
                     assets = [self.server.assets.get(item) for item in asset_ids]
                 if any(asset is None for asset in assets):
