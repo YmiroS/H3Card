@@ -1021,6 +1021,7 @@ body.collapsed #side { width: 0; flex-basis: 0; border-right: none; }
 /* 旋钮下面那行小字。不限定在 .adv 里：常规旋钮也有说不清的（"每格分辨率"） */
 #panel .knobnote { font-size: 12px; line-height: 1.5; color: var(--dim); opacity: .72;
   margin: -2px 0 8px 0; padding-left: 86px; }   /* 跟 .resline 一样缩进，对齐控件列 */
+#panel .pbody > .knobnote { padding-left: 0; }
 #panel .dice { padding: 4px 8px; border-radius: 2px; background: #0c121f; border: 1px solid var(--line); }
 #panel .dice:hover { color: var(--acc); border-color: var(--acc); }
 #panel .foot { display: flex; align-items: center; gap: 8px; margin-top: 12px; }

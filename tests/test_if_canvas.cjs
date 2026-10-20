@@ -159,6 +159,18 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
         [chosen, initial + '（当前）', unsupported, ...(kind === 'video' ? ['可灵3.0 Omni'] : [])]);
       await page.locator('#menu button').filter({hasText:chosen}).click();
+      const noteLayout = await page.locator('#panel .pbody').evaluate(body => {
+        const linkLeft = body.querySelector('a').getBoundingClientRect().left;
+        return [...body.querySelectorAll(':scope > .knobnote')].map(note => ({
+          paddingLeft:getComputedStyle(note).paddingLeft,
+          left:note.getBoundingClientRect().left, linkLeft,
+        }));
+      });
+      assert.equal(noteLayout.length, 2);
+      for (const note of noteLayout) {
+        assert.equal(note.paddingLeft, '0px', 'panel descriptions must not reserve a parameter-label column');
+        assert.ok(Math.abs(note.left - note.linkLeft) < 1, 'descriptions align with the API link');
+      }
       const summary = await page.locator('#panel .pbody').innerText();
       if (kind === 'video') {
         assert.match(summary, /供应商 API 资料（并非 IF 引用上限）/);

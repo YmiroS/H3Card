@@ -892,6 +892,26 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           }
         });
 
+        await t.test('Shift + 左键在空白与节点上平移，保留选择、缩放和节点位置', async () => {
+          for (const from of [[650,700],[180,200]]) {
+            await reset(); await page.evaluate(() => choose());
+            const before = await page.evaluate(() => PROJ.cards.map(c => [c.x,c.y]));
+            await page.keyboard.down('Shift');
+            try {
+              await page.mouse.move(...from); await page.mouse.down();
+              await page.mouse.move(from[0] + 50,from[1] + 30,{steps:4});
+              assert.equal(await page.locator('#stage').evaluate(d => d.classList.contains('panning')), true);
+              assert.equal(await page.evaluate(() => el.lasso.style.display), 'none');
+              await page.mouse.up();
+            } finally { await page.keyboard.up('Shift'); }
+            assert.deepEqual(await selection(), ['a','b']);
+            assert.deepEqual(await page.evaluate(() => view), {x:50,y:30,k:1});
+            assert.deepEqual(await page.evaluate(() => PROJ.cards.map(c => [c.x,c.y])), before);
+            assert.deepEqual(await page.evaluate(() => [saved,viewSaved]), [0,1]);
+            assert.equal(await page.locator('#stage').evaluate(d => d.classList.contains('panning')), false);
+          }
+        });
+
         await t.test('右键先触发 mousedown 再 contextmenu，节点和空白均保留多选并显示五项', async () => {
           for (const target of ['node','blank']) {
             await reset(); await page.evaluate(() => choose());

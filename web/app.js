@@ -2317,8 +2317,8 @@ function buildCard(c) {
   d.querySelector(".rz.br").onmousedown = (ev) => startResize(ev, c, d, 1);
   d.querySelector(".port").onmousedown = (ev) => startWire(ev, c);
   d.onmousedown = (ev) => {
-    // 中键留给画布：在节点上按住中键也是拖画布（不平移就会以为卡死了）
-    if (ev.button === 1) return;
+    // 中键和 Shift + 左键留给画布，保留当前节点选择。
+    if (ev.button === 1 || (ev.button === 0 && ev.shiftKey)) return;
     // 整个节点都是拖动把手。以前只有标题栏那一条 26px 能拖 —— 出了图之后节点九成面积
     // 是画面，按下去却纹丝不动，每次挪节点都得回去瞄那一条。反过来列例外更省事（NODRAG）
     if (ev.button === 0 && !ev.target.closest(NODRAG)) return startDrag(ev, c, d);
@@ -3447,8 +3447,8 @@ function bindGlobal() {
     // 按钮执行时手里就没节点了 —— 这就是打组点了没反应的原因
     // 参数面板也同理：点面板上的按钮不能关掉面板
     if (ev.target.closest("#selbar") || ev.target.closest("#panel")) return;
-    // 中键拖画布；所有平台的普通左键拖动统一用于框选。
-    if (ev.button === 1) {
+    // 中键或 Shift + 左键拖画布；普通左键拖动用于框选。
+    if (ev.button === 1 || (ev.button === 0 && ev.shiftKey)) {
       ev.preventDefault();          // 掐掉中键自动滚动
       const s = { mx: ev.clientX, my: ev.clientY, x: view.x, y: view.y };
       el.stage.classList.add("panning");
