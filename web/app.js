@@ -174,12 +174,12 @@ const MODEL_SWITCH_NAMES = { zimage: "Z-Image", krea2: "Krea2", qwen2511: "Qwen 
   qwen2512: "Qwen Image 2512（双阶段）", qwen21: "Qwen Image 2.1",
   da3: "Depth Anything 3", depthcrafter: "DepthCrafter" };
 const IF_BRIDGE = "http://127.0.0.1:8278";
-let ifModels = [], ifModelsPromise = null, ifModelsAttempted = false, ifModelsError = "", ifReferenceReuse = false;
+let ifModels = [], ifModelsPromise = null, ifModelsAttempted = false, ifModelsError = "", ifReferenceReuse = false, ifRequestRecovery = false;
 const isIF = c => capOf(c)?.execution === "if_studio";
 async function ifRequest(path, options = {}) {
   const response = await fetch(IF_BRIDGE + path, {...options, credentials: "omit"});
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `本机桥接返回 ${response.status}`);
+  if (!response.ok) throw Object.assign(new Error(data.error || `本机桥接返回 ${response.status}`), {status:response.status});
   return data;
 }
 function loadIFModels() {
@@ -189,6 +189,7 @@ function loadIFModels() {
     const status = await ifRequest("/status");
     if (!status.ready) throw new Error("请先在本机登录 IF CLI");
     ifReferenceReuse = status.reference_reuse === true;
+    ifRequestRecovery = status.request_recovery === true;
     ifModels = (await ifRequest("/models")).models;
     ifModelsError = "";
     return ifModels;
@@ -237,8 +238,11 @@ function ifTaskKey(c, projectId) {
 function rememberIFTask(c, projectId, phase) {
   const state = {phase, cap:c.cap, job:c.job, status:c.status, step:c.step, error:c.error,
     if_started:c.if_started, if_job_cap:c.if_job_cap, if_canvas_url:c.if_canvas_url, ms:c.ms, outputs:c.outputs || [],
+    if_request_id:c.if_request_id, if_submitted_at:c.if_submitted_at, if_pending_prompts:c.if_pending_prompts,
+    inputs:phase === 'preparing' ? {params:c.params, assets:c.assets} : null,
     entry:c.job ? c.history?.find(item => item.job === c.job) : null};
-  try { sessionStorage.setItem(ifTaskKey(c, projectId), JSON.stringify(state)); } catch {}
+  try { sessionStorage.setItem(ifTaskKey(c, projectId), JSON.stringify(state)); return true; }
+  catch { return false; }
 }
 function restoreIFTask(c, projectId) {
   if (!isIF(c)) return false;
@@ -247,12 +251,17 @@ function restoreIFTask(c, projectId) {
   try { state = JSON.parse(sessionStorage.getItem(key)); } catch {}
   if (!state || state.cap !== c.cap || !Number.isFinite(state.if_started)
       || !['preparing', 'submitting', 'running', 'done', 'error'].includes(state.phase)) return false;
+  const unconfirmed = state.phase === 'submitting' && state.if_request_id
+    && state.if_request_id === c.if_request_id && !state.job && !c.job && c.status === 'error';
   if ((c.if_started || 0) > state.if_started || (c.if_started === state.if_started
-      && ((c.job && c.job !== state.job) || (c.job === state.job && ['done', 'error'].includes(c.status))))) {
+      && ((c.job && c.job !== state.job)
+        || (c.if_request_id && state.if_request_id && c.if_request_id !== state.if_request_id)
+        || (!unconfirmed && c.job === state.job && ['done', 'error'].includes(c.status))))) {
     try { sessionStorage.removeItem(key); } catch {}
     return false;
   }
-  for (const field of ['job', 'status', 'step', 'error', 'if_started', 'if_job_cap', 'if_canvas_url', 'ms', 'outputs'])
+  for (const field of ['job', 'status', 'step', 'error', 'if_started', 'if_job_cap', 'if_canvas_url', 'ms', 'outputs',
+    'if_request_id', 'if_submitted_at', 'if_pending_prompts'])
     c[field] = state[field];
   c.progress = null;
   if (state.entry && state.entry.job === c.job) {
@@ -260,7 +269,13 @@ function restoreIFTask(c, projectId) {
     const index = c.history.findIndex(item => item.job === c.job);
     if (index < 0) c.history.unshift(state.entry); else c.history[index] = state.entry;
   }
-  if (state.phase === 'preparing' || state.phase === 'submitting') {
+  if (state.phase === 'preparing' && state.if_request_id && state.inputs) {
+    c.params = state.inputs.params; c.assets = state.inputs.assets;
+    c.status = 'queued'; c.error = null; c.step = '正在恢复 IF 素材准备';
+    c._ifResumePreparing = true;
+  } else if (state.phase === 'submitting' && state.if_request_id) {
+    c.status = 'running'; c.error = null; c.step = '正在向本机 IF 确认原请求';
+  } else if (state.phase === 'preparing' || state.phase === 'submitting') {
     c.status = 'error'; c.step = '';
     c.error = state.phase === 'preparing'
       ? '上次素材准备因页面离开而中断，尚未提交 IF；请确认后重试'
@@ -1740,7 +1755,7 @@ async function openProject(pid) {
       if (selected) c._model = selected[0];
     }
     if (restoreIFTask(c, PROJ.id)) recoveredIFTasks.push(c);
-    if (!isTextCard(c) && !isAsset(c) && c.status === "queued" && !c.job) {
+    if (!isTextCard(c) && !isAsset(c) && c.status === "queued" && !c.job && !c._ifResumePreparing) {
       c.status = "error";
       c.error = "上次提交未取得任务编号，请先检查任务列表，确认后再重试";
     }
@@ -1778,7 +1793,7 @@ async function openProject(pid) {
   // 断线重连后可能有节点状态是 running，交给轮询自己收尾
   render();
   for (const card of PROJ.cards) {
-    if (isIF(card) && card.job && card.status === "running") pollIF(card, PROJ.id);
+    resumeIFTask(card, PROJ.id);
   }
   if (recoveredIFTasks.length && canSave() && !PROJ.locked) {
     for (const card of recoveredIFTasks) saveIFTaskProject(card, PROJ.id);
@@ -2166,10 +2181,13 @@ function applyCollaborativeProject(project) {
     const sameAttempt = active && card.if_started === active.if_started && card.job === active.job;
     if (active && card.cap === active.cap && (card.if_started || 0) <= active.if_started
         && !(card.if_started === active.if_started && card.job && active.job && card.job !== active.job)
+        && !(card.if_started === active.if_started && card.if_request_id && active.if_request_id
+          && card.if_request_id !== active.if_request_id)
         && !(sameAttempt && ["done", "error"].includes(card.status))) {
       // 上传与轮询闭包仍持有旧对象；协作快照只能更新布局，不能断开当前任务。
       const runtime = Object.fromEntries(["params", "assets", "job", "status", "step", "error", "progress",
-        "if_started", "if_job_cap", "if_canvas_url", "ms", "outputs", "history", "_ifPolling"]
+        "if_started", "if_job_cap", "if_canvas_url", "if_request_id", "if_submitted_at", "if_pending_prompts",
+        "ms", "outputs", "history", "_ifPolling", "_ifRecovering", "_ifResumePreparing"]
         .map(key => [key, active[key]]));
       return Object.assign(active, card, runtime);
     }
@@ -2189,8 +2207,7 @@ function applyCollaborativeProject(project) {
   el.ptitle.textContent = PROJ.name;
   render();
   for (const card of PROJ.cards) {
-    if (activeIF.get(card.id) !== card && isIF(card) && card.job && card.status === "running")
-      pollIF(card, PROJ.id);
+    if (activeIF.get(card.id) !== card) resumeIFTask(card, PROJ.id);
   }
   if (recoveredIFTasks.length && canSave() && !PROJ.locked) {
     for (const card of recoveredIFTasks) saveIFTaskProject(card, PROJ.id);
@@ -8302,19 +8319,72 @@ function run(c) {
   c._runPromise = trackNodeWork(runCard(c).finally(() => { delete c._runPromise; }));
   return c._runPromise;
 }
-async function runIF(c) {
+function resumeIFTask(c, projectId) {
+  if (!isIF(c) || !canOperate()) return;
+  if (c._ifResumePreparing) {
+    delete c._ifResumePreparing;
+    c._runPromise = trackNodeWork(runIF(c, true).finally(() => { delete c._runPromise; }));
+  } else if (c.status === 'running') {
+    if (c.job) pollIF(c, projectId);
+    else if (c.if_request_id) recoverIFSubmission(c, projectId);
+  }
+}
+async function recoverIFSubmission(c, projectId) {
+  if (c._ifRecovering || PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c)
+      || !isIF(c) || c.job || c.status !== 'running' || !c.if_request_id) return;
+  c._ifRecovering = true;
+  let retry = false;
+  try {
+    const job = await ifRequest(`/requests/${encodeURIComponent(c.if_request_id)}`);
+    if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c)) return;
+    c.job = job.id; c.error = null; c.step = '本机 IF 已接收原请求，正在恢复进度';
+    const references = ifReferenceState(c, projectId);
+    references.job = job.id; saveIFReferences(references);
+    pushHistory(c, {id:job.id, capability:c.if_job_cap || c.cap, prompts:c.if_pending_prompts || []});
+    delete c.if_pending_prompts;
+    rememberIFTask(c, projectId, 'running');
+    await saveIFTaskProject(c, projectId);
+    pollIF(c, projectId);
+  } catch (error) {
+    if (PROJ?.id !== projectId || !PROJ.cards.includes(c)) return;
+    retry = error instanceof TypeError || error.status >= 500
+      || (error.status === 404 && Date.now() - (c.if_submitted_at || c.if_started) < 120000);
+    c.step = retry ? '正在向本机 IF 确认原请求，请勿重复生成' : '';
+    if (!retry) {
+      c.status = 'error';
+      c.error = 'IF 提交结果尚未确认，请先在 IF 查看是否已创建任务，避免重复生成：' + error.message;
+    }
+    // 未确认的请求始终保留查询凭据，刷新只查原请求，绝不自动重提。
+    rememberIFTask(c, projectId, 'submitting');
+    if (!retry) { showError(c.error); await saveIFTaskProject(c, projectId); }
+  } finally {
+    c._ifRecovering = false;
+    if (PROJ?.id === projectId && PROJ.cards.includes(c)) {
+      paint(c); if (el.panel._id === c.id) openPanel(c.id);
+      if (retry) setTimeout(() => recoverIFSubmission(c, projectId), 2500);
+    }
+  }
+}
+async function runIF(c, resume = false) {
   const project = PROJ, capability = c.cap;
   const assetIds = [];
   let submitted = false, submissionAttempted = false;
   c.status = "queued"; c.error = null; c.progress = null; c.job = null; c.ms = null;
-  c.step = "正在连接本机 IF 并读取模型"; c.if_started = Date.now(); c.if_job_cap = capability;
+  c.step = "正在连接本机 IF 并读取模型"; c.if_job_cap = capability;
+  if (!resume) {
+    c.if_started = Date.now();
+    c.if_request_id = Array.from(crypto.getRandomValues(new Uint8Array(16)), n => n.toString(16).padStart(2, '0')).join('');
+  }
+  delete c.if_submitted_at; delete c.if_pending_prompts;
   delete c.if_canvas_url;
-  rememberIFTask(c, project.id, 'preparing');
+  const recorded = rememberIFTask(c, project.id, 'preparing');
   paint(c); if (el.panel._id === c.id) openPanel(c.id);
   try {
+    if (!recorded) throw new Error('无法保存 IF 刷新恢复记录，尚未提交生成；请检查浏览器存储空间和权限');
     const saved = await enqueueSave(project.id);
     if (!saved.ok) throw new Error('任务准备状态保存失败，尚未提交 IF：' + (saved.error?.message || '请重试'));
     const models = await loadIFModels();
+    if (!ifRequestRecovery) throw new Error('请更新本机 IF 桥接器后重试；当前版本不支持提交期间刷新恢复');
     await syncReferenceParameters(c);
     if (PROJ !== project || !canOperate() || !project.cards.includes(c) || c.cap !== capability)
       throw new Error("画布已切换或权限已变化，已取消 IF 提交");
@@ -8340,7 +8410,8 @@ async function runIF(c) {
     }
     if (Object.keys(counts).some(kind => counts[kind] > (limit.bridge[kind] || 0)))
       throw new Error("引用数量超出所选 IF 模型的画布槽位");
-    const data = {type, model: model.display_name, prompt: withStyle(resolveCardMentions(prompt, c), styleTexts(c))};
+    const data = {type, model: model.display_name, request_id:c.if_request_id,
+      prompt: withStyle(resolveCardMentions(prompt, c), styleTexts(c))};
     const supplement = directorSupplement(c);
     if (supplement.length) data.prompt += "\n" + supplement.join("\n");
     const cap = capOf(c), specs = cap.inputs;
@@ -8440,31 +8511,41 @@ async function runIF(c) {
     c.status = "queued"; c.error = null; c.progress = null; c.outputs = []; c.ms = null;
     c.step = "正在交由本机 IF 桥接处理"; c.job = null;
     submissionAttempted = true;
-    rememberIFTask(c, project.id, 'submitting');
+    c.if_submitted_at = Date.now();
+    c.if_pending_prompts = [
+      {key:"if_original", label:"原始提示词", text:originalPrompt},
+      {key:"if_submitted", label:"提交给 IF CLI 的提示词", text:data.prompt},
+    ];
+    if (!rememberIFTask(c, project.id, 'submitting'))
+      throw new Error('无法保存 IF 提交恢复记录，尚未提交生成；请检查浏览器存储空间和权限');
     paint(c); if (el.panel._id === c.id) openPanel(c.id);
     const job = await ifRequest("/runs", {method: "POST",
       headers: {"Content-Type": "application/json", "X-Chouka-IF": "generate"}, body: JSON.stringify(data)});
     submitted = true;
     c.job = job.id; c.if_job_cap = capability; c.status = "running"; c.step = "本机 IF 正在准备生成任务";
     referenceState.job = job.id; saveIFReferences(referenceState);
-    pushHistory(c, {id:job.id, capability, prompts:[
-      {key:"if_original", label:"原始提示词", text:originalPrompt},
-      {key:"if_submitted", label:"提交给 IF CLI 的提示词", text:data.prompt},
-    ]});
+    pushHistory(c, {id:job.id, capability, prompts:c.if_pending_prompts});
+    delete c.if_pending_prompts;
     rememberIFTask(c, project.id, 'running');
     if (el.hist._id === c.id) openHistory(c.id);
     const persisted = await saveIFTaskProject(c, project.id);
     if (!persisted.ok) showError('IF 任务已提交，服务器状态保存失败；已保留本标签页恢复记录，请勿重复生成');
     pollIF(c, project.id);
   } catch (error) {
-    if (!submitted && assetIds.length) await Promise.allSettled(assetIds.map(assetId =>
+    const uncertain = submissionAttempted && !submitted
+      && (error instanceof TypeError || error instanceof SyntaxError || error.status >= 500);
+    if (!submitted && !uncertain && assetIds.length) await Promise.allSettled(assetIds.map(assetId =>
       ifRequest(`/assets/${encodeURIComponent(assetId)}`, {method:"DELETE", headers:{"X-Chouka-IF":"asset"}})));
     if (PROJ !== project || !project.cards.includes(c)) return;
-    c.status = "error"; c.error = error.message; c.step = ""; c.job = null;
-    if (submissionAttempted && !submitted && (error instanceof TypeError || error instanceof SyntaxError))
-      c.error = 'IF 提交结果尚未确认，请先在 IF 查看是否已创建任务，避免重复生成：' + error.message;
-    rememberIFTask(c, project.id, 'error');
-    showError(`「${titleOf(c)}」生成失败：${c.error}`); await saveIFTaskProject(c, project.id);
+    if (uncertain) {
+      c.status = 'running'; c.error = null; c.step = '正在向本机 IF 确认原请求';
+      rememberIFTask(c, project.id, 'submitting');
+      recoverIFSubmission(c, project.id);
+    } else {
+      c.status = "error"; c.error = error.message; c.step = ""; c.job = null;
+      rememberIFTask(c, project.id, 'error');
+      showError(`「${titleOf(c)}」生成失败：${c.error}`); await saveIFTaskProject(c, project.id);
+    }
   }
   if (PROJ === project && project.cards.includes(c)) {
     paint(c); if (el.panel._id === c.id) openPanel(c.id);

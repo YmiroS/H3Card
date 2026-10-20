@@ -129,7 +129,7 @@ class BridgeTest(unittest.TestCase):
                 'registry': 'ifs.alibaba-inc.com', 'has_ifs_token': True}}}):
             for origin in (ORIGIN, SECOND_ORIGIN, LOCALHOST_ORIGIN, SECURE_ORIGIN):
                 code, headers, body = self.request('GET', '/status', origin=origin)
-                self.assertEqual((code, body), (200, {'ready': True, 'reference_reuse': True}))
+                self.assertEqual((code, body), (200, {'ready': True, 'reference_reuse': True, 'request_recovery': True}))
                 self.assertEqual(headers['Access-Control-Allow-Origin'], origin)
                 code, headers, _ = self.request('OPTIONS', '/runs', origin=origin,
                     headers={'Access-Control-Request-Method': 'POST'})
@@ -253,6 +253,75 @@ class BridgeTest(unittest.TestCase):
         data = {'type': 'image', 'model': 'qwen-image-2.0', 'prompt': 'generate', **overrides}
         return self.request('POST', '/runs', json.dumps(data), headers={
             'Content-Type': 'application/json', 'X-Chouka-IF': 'generate'})
+
+    def test_request_lookup_and_duplicate_submission_keep_one_original_job(self):
+        request_id = 'a' * 32
+        self.assertEqual(self.request('GET', '/requests/' + request_id)[0], 404)
+        code, headers, _ = self.request('OPTIONS', '/requests/' + request_id, origin=SECURE_ORIGIN,
+                                       headers={'Access-Control-Request-Method': 'GET',
+                                                'Access-Control-Request-Private-Network': 'true'})
+        self.assertEqual((code, headers['Access-Control-Allow-Origin'],
+                          headers['Access-Control-Allow-Private-Network']), (204, SECURE_ORIGIN, 'true'))
+        self.assertEqual(self.request('OPTIONS', '/requests/' + request_id,
+                                     origin='https://untrusted.example',
+                                     headers={'Access-Control-Request-Method': 'GET'})[0], 403)
+        _, _, asset = self.upload()
+        with mock.patch.object(self.bridge, 'command', return_value=MODELS), \
+                mock.patch.object(self.bridge, 'generate') as generate:
+            code, _, first = self.run_request(request_id=request_id, asset_id=asset['asset_id'])
+            self.assertEqual(code, 202)
+            code, _, recovered = self.request('GET', '/requests/' + request_id)
+            self.assertEqual((code, recovered), (200, first))
+            self.assertEqual(self.request('GET', '/requests/' + request_id, origin=SECOND_ORIGIN)[0], 404)
+            # Assets are already consumed; retry must still return the original job without generation.
+            code, _, repeated = self.run_request(request_id=request_id, asset_id=asset['asset_id'])
+            self.assertEqual((code, repeated), (202, first))
+            self.assertEqual(self.run_request(request_id=request_id, prompt='different')[0], 409)
+            with self.bridge.lock:
+                self.bridge.jobs[first['id']] = {'state': 'done', 'result': {'downloaded': []}}
+            self.assertEqual(self.run_request(request_id=request_id, asset_id=asset['asset_id'])[2], first)
+            self.assertEqual(generate.call_count, 1)
+            self.assertEqual(len(self.bridge.jobs), 1)
+
+    def test_concurrent_same_request_is_accepted_only_once(self):
+        barrier = threading.Barrier(2)
+        accepted = threading.Event()
+        counter_lock = threading.Lock()
+        model_calls = 0
+        results = []
+        asset_id = self.upload()[2]['asset_id']
+        def models(*args, **kwargs):
+            nonlocal model_calls
+            with counter_lock:
+                model_calls += 1
+                index = model_calls
+            barrier.wait(timeout=3)
+            if index == 2:
+                self.assertTrue(accepted.wait(3))
+            return MODELS
+        def submit():
+            response = self.run_request(request_id='b' * 32, asset_id=asset_id)
+            results.append(response)
+            if response[0] == 202:
+                accepted.set()
+        with mock.patch.object(self.bridge, 'command', side_effect=models), \
+                mock.patch.object(self.bridge, 'generate') as generate:
+            threads = [threading.Thread(target=submit) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+            self.assertEqual(len(results), 2)
+            self.assertEqual([item[0] for item in results], [202, 202])
+            self.assertEqual(results[0][2], results[1][2])
+            self.assertEqual(generate.call_count, 1)
+
+    def test_request_id_validation_never_starts_generation(self):
+        with mock.patch.object(self.bridge, 'command', return_value=MODELS), \
+                mock.patch.object(self.bridge, 'generate') as generate:
+            for value in ('', '../bad', 'a' * 33, 123, []):
+                self.assertEqual(self.run_request(request_id=value)[0], 400)
+            generate.assert_not_called()
 
     def test_upload_and_strict_preflight(self):
         code, headers, _ = self.request('OPTIONS', '/assets', headers={
