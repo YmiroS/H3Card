@@ -47,7 +47,7 @@ internal sealed class BridgeManager : Form
         MaximumSize = new Size(840, 350);
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = true;
-        Icon = SystemIcons.Application;
+        Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
         Font = new Font("Microsoft YaHei UI", 9);
 
         TableLayoutPanel layout = new TableLayoutPanel();
@@ -78,7 +78,7 @@ internal sealed class BridgeManager : Form
         layout.Controls.Add(startup, 0, 5);
         Label hint = new Label();
         hint.AutoSize = true;
-        hint.Text = "授权网页：http://dinghaichouka.youku.com:8199/  ·  本机端口：127.0.0.1:8278";
+        hint.Text = "网页：HTTPS 8443（需信任证书）  ·  本机桥接：127.0.0.1:8278";
         layout.Controls.Add(hint, 0, 6);
 
         ContextMenuStrip menu = new ContextMenuStrip();

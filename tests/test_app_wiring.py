@@ -1,5 +1,9 @@
 """真实 make_app 装配冒烟：中间件、页面路由、静态兜底与基本权限闭环。"""
 import asyncio
+import shutil
+import socket
+import ssl
+import subprocess
 import sys
 import tempfile
 import threading
@@ -827,6 +831,57 @@ class CapacityProbeWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.Aut
             self.assertEqual(response.status, 503, await response.text())
             probe.assert_not_called()
         self.assertIsNone(self.store.capacity.output_recovery(self.pid))
+
+
+class DualProtocolListenerTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
+    @unittest.skipUnless(shutil.which('openssl'), 'OpenSSL required for TLS fixture')
+    async def test_http_and_https_keep_separate_secure_contexts(self):
+        with tempfile.TemporaryDirectory(prefix='chouka-tls-test-') as directory:
+            key, certificate = Path(directory) / 'server.key', Path(directory) / 'server.crt'
+            result = subprocess.run([
+                'openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+                '-keyout', str(key), '-out', str(certificate), '-subj', '/CN=localhost',
+                '-addext', 'subjectAltName=DNS:localhost'],
+                capture_output=True, timeout=15)
+            self.assertEqual(result.returncode, 0, result.stderr.decode(errors='replace'))
+            tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            tls.load_cert_chain(certificate, key)
+            ports = []
+            for _ in range(2):
+                with socket.socket() as listener:
+                    listener.bind(('127.0.0.1', 0))
+                    ports.append(listener.getsockname()[1])
+            self.auth_setup()
+            app = self.build_app()
+            app['bind_host'] = '127.0.0.1'
+            with mock.patch.object(controller_app, 'PORT', ports[0]):
+                task = asyncio.create_task(controller_app._serve_http_and_https(app, tls, ports[1]))
+                try:
+                    async with ClientSession() as client:
+                        for protocol, port, secure in [('http', ports[0], False),
+                                                       ('https', ports[1], True)]:
+                            for attempt in range(100):
+                                if task.done():
+                                    await task
+                                try:
+                                    response = await client.post(
+                                        f'{protocol}://localhost:{port}/api/auth/login',
+                                        json={'username': 'admin', 'password': PASSWORD},
+                                        headers={'Origin': f'{protocol}://localhost:{port}'}, ssl=False)
+                                    break
+                                except OSError:
+                                    await asyncio.sleep(.01)
+                            else:
+                                self.fail(f'{protocol} listener did not start')
+                            async with response:
+                                self.assertEqual(response.status, 200, await response.text())
+                                self.assertEqual('Secure' in response.headers['Set-Cookie'], secure)
+                finally:
+                    if not task.done():
+                        task.cancel()
+                        with self.assertRaises(asyncio.CancelledError):
+                            await task
+                    self.auth_teardown()
 
 
 if __name__ == '__main__':

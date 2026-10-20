@@ -22,6 +22,7 @@ import random
 import re
 import socket
 import shutil
+import ssl
 import subprocess
 import sys
 import time
@@ -3749,6 +3750,18 @@ def make_app(auth_path=None):
     return app
 
 
+async def _serve_http_and_https(application, tls, https_port):
+    runner = web.AppRunner(application, handle_signals=True)
+    await runner.setup()
+    try:
+        await web.TCPSite(runner, host=application["bind_host"], port=PORT).start()
+        await web.TCPSite(runner, host=application["bind_host"], port=https_port,
+                          ssl_context=tls).start()
+        await asyncio.Event().wait()
+    finally:
+        await runner.cleanup()
+
+
 if __name__ == "__main__":
     try:
         import sys
@@ -3761,5 +3774,23 @@ if __name__ == "__main__":
     import logging
     logging.getLogger('asyncio').setLevel(logging.ERROR)
 
+    certificate = os.environ.get('CHOUKA_TLS_CERT')
+    key = os.environ.get('CHOUKA_TLS_KEY')
+    if bool(certificate) != bool(key):
+        raise RuntimeError('CHOUKA_TLS_CERT 和 CHOUKA_TLS_KEY 必须同时设置')
+    if certificate:
+        https_port = int(os.environ.get('CHOUKA_HTTPS_PORT', '8443'))
+        if https_port == PORT:
+            raise RuntimeError('HTTPS 与 HTTP 不能监听同一端口')
+        tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        tls.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls.load_cert_chain(certificate, key)
+
     application = make_app()
-    web.run_app(application, host=application["bind_host"], port=PORT, print=None)
+    if certificate:
+        try:
+            asyncio.run(_serve_http_and_https(application, tls, https_port))
+        except web.GracefulExit:
+            pass
+    else:
+        web.run_app(application, host=application["bind_host"], port=PORT, print=None)
