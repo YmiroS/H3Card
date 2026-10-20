@@ -371,11 +371,13 @@ const capOf = (c) => {
   const inputs = cap.inputs.filter(s => s.key !== "if_reference" || bridge?.image || bridge?.video)
     .map(s => s.key === "if_reference" ? {...s,
       label:`参考${bridge?.image ? "图片" : ""}${bridge?.image && bridge?.video ? "／" : ""}${bridge?.video ? "视频" : ""} HTTPS 地址（可选）`} : s);
-  if (bridge?.image) inputs.push({key:"images[0]", label:"参考图片", type:"image"});
-  if (bridge?.video) inputs.push({key:"video[0]", label:"参考视频", type:"video"});
+  for (let i = 0; i < (bridge?.image || 0); i++)
+    inputs.push({key:`images[${i}]`, label:"参考图片", type:"image"});
+  for (let i = 0; i < (bridge?.video || 0); i++)
+    inputs.push({key:`video[${i}]`, label:"参考视频", type:"video"});
   for (const [key, asset] of Object.entries(c.assets || {})) {
-    if (asset && ((key === "images[0]" && asset.kind === "image")
-        || (key === "video[0]" && asset.kind === "video"))
+    if (asset && ((/^images\[\d+\]$/.test(key) && asset.kind === "image")
+        || (/^video\[\d+\]$/.test(key) && asset.kind === "video"))
         && !inputs.some(s => s.key === key))
       inputs.push({key, label:asset.kind === "image" ? "已保留的参考图片" : "已保留的参考视频", type:asset.kind});
   }
@@ -4696,8 +4698,9 @@ function mediaCount(c, kind) {
 function firstFreeSlot(c, kind) {
   const cap = capOf(c); if (!cap) return null;
   const reserved = new Set((PROJ?.edges || []).filter(e => e.to === c.id && !isTextEdge(e)).flatMap(edgeSlots));
-  if (isIF(c) && (!mediaLimit(cap, kind)
-      || cap.inputs.some(s => MEDIA.includes(s.type) && (c.assets?.[s.key] || reserved.has(s.key))))) return null;
+  if (isIF(c) && (!mediaLimit(cap, kind) || mediaCount(c, kind) >= mediaLimit(cap, kind)
+      || (cap.outputType === "image" && cap.inputs.some(s => MEDIA.includes(s.type)
+        && (c.assets?.[s.key] || reserved.has(s.key)))))) return null;
   return cap.inputs.find(s => s.type === kind && !c.assets?.[s.key] && !reserved.has(s.key)) || null;
 }
 
@@ -5751,7 +5754,9 @@ function openPanel(id) {
   if (isIF(c)) {
     clipboardHint.textContent = ifModelsError
       ? `本机 IF 不可用：${ifModelsError}。请先安装并登录 IF CLI、启动本机桥接，点模型按钮可重试。`
-      : "IF 使用本机账号生成；从素材卡连线或在下方添加引用。本机 IF CLI 目前只支持一张图片或一段视频，不支持音频及多引用。";
+      : c.cap === "if_video"
+        ? "IF 视频使用本机账号；素材各上传一次，在同一画布按「图片1」「视频1」逐份登记且要求不生成，全部登记后再独立提交总需求。本机上传合计不超过 100 MB；音频暂不支持。"
+        : "IF 使用本机账号生成；从素材卡连线或在下方添加引用。本机 IF CLI 目前只支持一张图片或一段视频，不支持音频及多引用。";
   }
   body.appendChild(clipboardHint);
   if (isIF(c)) {
@@ -5761,12 +5766,12 @@ function openPanel(id) {
     const limit = ifModelLimits[name];
     const summary = document.createElement("div"); summary.className = "knobnote";
     const format = value => value == null ? "未核实" : String(value);
-    const videoReference = [limit?.bridge.image && "图片", limit?.bridge.video && "视频"].filter(Boolean).join("或");
+    const videoReference = `图片 ${limit?.bridge.image || 0}／视频 ${limit?.bridge.video || 0}`;
     const h3Estimate = limit?.type === "video" && Object.values(limit.api).some(value => value == null);
     const videoCount = kind => limit.api[kind] == null
       ? `${ifModelLimits["Minimax H3"].api[kind]}（H3 估算）` : String(limit.api[kind]);
     summary.textContent = limit?.type === "video"
-      ? `${h3Estimate ? "H3 全能参考高质量估算（未核实该模型上限）" : "供应商 API 资料（并非 IF 引用上限）"}：图片 ${videoCount("image")} · 视频 ${videoCount("video")} · 音频 ${videoCount("audio")}。${limit.note} 本机 IF CLI 每次仅能传入一张图片或一段视频，不支持音频或多引用；IF 未公开此模型实际接受的引用类型和模式。${videoReference ? (h3Estimate ? `画布按 H3 估算开放${videoReference}槽位，每次只能提交其中 1 项；所选 IF 模型能否接收仍待实测。` : `当前画布可提交${videoReference}共 1 项。`) : "当前画布暂未开放该模型的媒体引用，不代表模型本身不支持。"}画面比例、清晰度、时长等参数仅作为生成内容要求发送，模型不保证严格遵守。`
+      ? `${h3Estimate ? "H3 全能参考高质量估算（未核实该模型上限）" : "供应商 API 资料（并非 IF 引用上限）"}：图片 ${videoCount("image")} · 视频 ${videoCount("video")} · 音频 ${videoCount("audio")}。${limit.note} 本机 IF CLI 单次只接受一份图片或视频；桥接会按「图片1」「视频1」逐份命名登记，参考轮明确要求不生成，全部登记后再单独提交总提示词，最后仅调用一次 poll；音频暂不能提交。${h3Estimate ? `画布按 H3 估算开放${videoReference}槽位，模型能否接收仍待实测。` : `画布按各类型上限开放${videoReference}槽位；不同模式可能另有限制，以 IF 实际返回为准。`}画面比例、清晰度、时长等参数仅作为生成内容要求发送，模型不保证严格遵守。`
       : limit
         ? `官方 API 同名模型/家族参考上限：图片 ${format(limit.api.image)} · 视频 ${format(limit.api.video)} · 音频 ${format(limit.api.audio)}。${limit.note} IF 未公布内部模型版本和多素材转发规则；画布实际可提交图片 ${limit.bridge.image}／视频 ${limit.bridge.video}，且合计最多 1 项；音频暂不可提交。画面比例、清晰度、时长等参数会作为生成内容发送，不是 IF API 参数，模型不保证严格遵守。`
         : "该 IF 模型尚无可核对的官方 API 上限，暂不开放新的画布引用。";
@@ -7508,7 +7513,7 @@ function referenceSlots(c, specs, md) {
       if (max) limits.push(`${KIND_ZH[kind] || kind} ${max}`);
     }
     head.textContent = limits.length ? `引用上限：${limits.join(" · ")}`
-      + (isIF(c) ? "（图片或视频合计 1 项）" : "") : "当前模型不支持画布素材引用";
+      + (isIF(c) && cap.outputType === "image" ? "（合计 1 项）" : "") : "当前模型不支持画布素材引用";
   }
   wrap.appendChild(head);
   const imageSpecs = filled.filter(s => s.type === "image");
@@ -7532,7 +7537,7 @@ function referenceSlots(c, specs, md) {
       const max = mediaLimit(cap, kind);
       const count = filled.filter(s => s.type === kind).length;
       const next = specs.find(s => s.type === kind && !(c.assets || {})[s.key]);
-      if (!max || count >= max || !next || (isIF(c) && filled.length)) continue;
+      if (!max || count >= max || !next || (isIF(c) && cap.outputType === "image" && filled.length)) continue;
       const b = document.createElement("button"); b.className = "refadd";
       b.textContent = `＋ 添加${KIND_ZH[kind] || kind}（${count}/${max}）`;
       b.title = `${KIND_ZH[kind] || kind}引用上限 ${max}`;
@@ -8079,6 +8084,8 @@ function run(c) {
 }
 async function runIF(c) {
   const project = PROJ, capability = c.cap;
+  const assetIds = [];
+  let submitted = false;
   try {
     const models = await loadIFModels();
     if (PROJ !== project || !canOperate() || !project.cards.includes(c) || c.cap !== capability) return;
@@ -8092,12 +8099,19 @@ async function runIF(c) {
     if (!prompt) throw new Error("请先填写 IF 生成需求");
     const limit = ifModelLimits[model.display_name];
     if (!limit || limit.type !== type) throw new Error("该 IF 模型尚无可核对的输入规格");
-    const references = Object.values(c.assets || {}).filter(asset => asset && MEDIA.includes(asset.kind));
-    if (references.length > 1) throw new Error("本机 IF CLI 只能接收一项图片或视频引用，请先移除多余素材");
-    const reference = references[0];
-    if (reference && !limit.bridge[reference.kind])
-      throw new Error(`当前画布尚未开放所选模型的${KIND_ZH[reference.kind] || reference.kind}引用，请更换模型或移除引用`);
-    if (reference && c.params.if_reference?.trim())
+    const references = Object.entries(c.assets || {}).filter(([, asset]) => asset && MEDIA.includes(asset.kind))
+      .sort(([a], [b]) => a.localeCompare(b, undefined, {numeric:true}));
+    const counts = {image:0, video:0, audio:0};
+    for (const [slot, asset] of references) {
+      const index = slot.match(/^(?:images|video)\[(\d+)\]$/);
+      if (!index || (asset.kind === "image") !== slot.startsWith("images[")
+          || Number(index[1]) >= (limit.bridge[asset.kind] || 0))
+        throw new Error(`当前画布尚未开放所选模型的${KIND_ZH[asset.kind] || asset.kind}引用，请更换模型或移除引用`);
+      counts[asset.kind]++;
+    }
+    if (Object.keys(counts).some(kind => counts[kind] > (limit.bridge[kind] || 0)))
+      throw new Error("引用数量超出所选 IF 模型的画布槽位");
+    if (type === "image" && references.length && c.params.if_reference?.trim())
       throw new Error("已连接画布素材，请清空参数中的 HTTPS 引用地址，不能同时提交两项引用");
     const data = {type, model: model.display_name, prompt: withStyle(resolveCardMentions(prompt, c), styleTexts(c))};
     const supplement = directorSupplement(c);
@@ -8132,18 +8146,23 @@ async function runIF(c) {
       data.image = c.params.if_reference.trim();
     }
     if (type === "video" && c.params.if_skill?.trim()) data.skill = c.params.if_skill.trim();
-    if (reference) {
-      const url = new URL(reference.url, location.href);
-      if (url.origin !== location.origin) throw new Error("IF 仅能上传当前画布内的本机素材");
-      const response = await fetch(url, {credentials:"same-origin"});
-      if (!response.ok) throw new Error("无法读取画布引用素材");
-      const blob = await response.blob();
-      const allowed = reference.kind === "image" ? ["image/png", "image/jpeg", "image/webp"] : ["video/mp4"];
-      if (!allowed.includes(blob.type) || blob.size > (reference.kind === "image" ? 20 : 50) * 1024 * 1024)
-        throw new Error("IF 画布引用只支持不超过 20 MB 的 PNG/JPEG/WebP 或不超过 50 MB 的 MP4");
-      const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
-      data.asset_id = uploaded.asset_id;
-      if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability) return;
+    if (references.length) {
+      for (const [, reference] of references) {
+        const url = new URL(reference.url, location.href);
+        if (url.origin !== location.origin) throw new Error("IF 仅能上传当前画布内的本机素材");
+        const response = await fetch(url, {credentials:"same-origin"});
+        if (!response.ok) throw new Error("无法读取画布引用素材");
+        const blob = await response.blob();
+        const allowed = reference.kind === "image" ? ["image/png", "image/jpeg", "image/webp"] : ["video/mp4"];
+        if (!allowed.includes(blob.type) || blob.size > (reference.kind === "image" ? 20 : 50) * 1024 * 1024)
+          throw new Error("IF 画布引用只支持不超过 20 MB 的 PNG/JPEG/WebP 或不超过 50 MB 的 MP4");
+        const uploaded = await ifRequest("/assets", {method:"POST", headers:{"X-Chouka-IF":"asset", "Content-Type":blob.type}, body:blob});
+        assetIds.push(uploaded.asset_id);
+        if (PROJ !== project || !project.cards.includes(c) || c.cap !== capability)
+          throw new Error("画布已切换，已取消 IF 提交");
+      }
+      if (type === "video") data.asset_ids = assetIds;
+      else data.asset_id = assetIds[0];
     }
     c.params.if_model = model.display_name;
     c.status = "queued"; c.error = null; c.progress = null; c.outputs = []; c.ms = null;
@@ -8151,6 +8170,7 @@ async function runIF(c) {
     paint(c); if (el.panel._id === c.id) openPanel(c.id);
     const job = await ifRequest("/runs", {method: "POST",
       headers: {"Content-Type": "application/json", "X-Chouka-IF": "generate"}, body: JSON.stringify(data)});
+    submitted = true;
     c.job = job.id; c.if_job_cap = capability; c.status = "running"; c.step = "IF 正在生成";
     pushHistory(c, {id:job.id, capability, prompts:[
       {key:"if_original", label:"原始提示词", text:originalPrompt},
@@ -8160,6 +8180,8 @@ async function runIF(c) {
     save(false);
     pollIF(c, project.id);
   } catch (error) {
+    if (!submitted && assetIds.length) await Promise.allSettled(assetIds.map(assetId =>
+      ifRequest(`/assets/${encodeURIComponent(assetId)}`, {method:"DELETE", headers:{"X-Chouka-IF":"asset"}})));
     if (PROJ !== project || !project.cards.includes(c)) return;
     c.status = "error"; c.error = error.message; c.step = ""; c.job = null;
     toast(error.message); save(false);
@@ -8177,6 +8199,9 @@ async function pollIF(c, projectId) {
   try {
     const job = await ifRequest(`/runs/${encodeURIComponent(c.job)}`);
     if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
+    const submitted = c.history?.find(h => h.job === c.job)?.prompts?.find(p => p.key === "if_submitted");
+    if (submitted && typeof job.result?.submitted_prompt === "string")
+      submitted.text = job.result.submitted_prompt;
     if (job.state === "starting" || job.state === "running") {
       c.step = job.state === "starting" ? "IF 正在创建画布" : "IF 正在生成";
       retry = true;

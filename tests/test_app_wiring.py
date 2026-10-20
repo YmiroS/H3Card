@@ -79,12 +79,12 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['api'],
                          {'image': 10, 'video': 5, 'audio': 5})
         self.assertEqual(card_data['if_model_limits']['Wan3.0视频']['bridge'],
-                         {'image': 1, 'video': 1, 'audio': 0})
+                         {'image': 10, 'video': 5, 'audio': 0})
         for model in ('星辰图生视频', '可灵3.0 Omni'):
             self.assertEqual(card_data['if_model_limits'][model]['api'],
                              {'image': None, 'video': None, 'audio': None})
             self.assertEqual(card_data['if_model_limits'][model]['bridge'],
-                             {'image': 1, 'video': 1, 'audio': 0})
+                             {'image': 9, 'video': 3, 'audio': 0})
         self.assertEqual((await self.client.get('/if-studio.html')).status, 404)
         self.assertEqual((await self.client.get('/admin/permissions')).status, 200)
         self.assertEqual((await self.client.get('/teams')).status, 200)

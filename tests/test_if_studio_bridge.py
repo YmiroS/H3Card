@@ -128,7 +128,7 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual((ranged.status, ranged.read()), (206, b'image'))
             conn.close()
 
-    def test_background_video_summary_is_rechecked_without_resubmitting(self):
+    def test_legacy_image_summary_is_rechecked_without_resubmitting(self):
         created = {'status': 'created', 'canvas_id': 'c2', 'session_id': 's2'}
         background = {'status': 'summary_feedback', 'planning_text': '视频生成任务已提交，正在后台处理中。'}
         finished_notice = {'status': 'summary_feedback', 'planning_text': '视频已生成完毕。'}
@@ -140,6 +140,14 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual([call.args[:2] for call in cli.call_args_list].count(('canvas', 'run')), 1)
         self.assertEqual([call.args[:2] for call in cli.call_args_list].count(('canvas', 'poll')), 3)
         self.assertEqual(pause.call_count, 2)
+
+    def test_cli_poll_failure_message_is_returned(self):
+        created = {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+        with mock.patch.object(self.bridge, 'command', side_effect=[
+                created, {'status': 'failed', 'message': 'IFS 不接受此引用组合'}]):
+            self.bridge.generate('failed-video', {'model': 'Minimax H3', 'prompt': '生成视频'})
+        self.assertEqual(self.bridge.jobs['failed-video']['state'], 'error')
+        self.assertIn('IFS 不接受此引用组合', self.bridge.jobs['failed-video']['error'])
 
     def upload(self, body=b'\x89PNG\r\n\x1a\n' + b'0' * 32, content_type='image/png', **kwargs):
         return self.request('POST', '/assets', body, headers={
@@ -165,6 +173,17 @@ class BridgeTest(unittest.TestCase):
         mp4 = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2'
         code, _, body = self.upload(mp4, 'video/mp4')
         self.assertEqual((code, body['kind']), (201, 'video'))
+        asset_id = body['asset_id']
+        path = self.bridge.assets[asset_id][0]
+        code, headers, _ = self.request('OPTIONS', '/assets/' + asset_id, headers={
+            'Access-Control-Request-Method': 'DELETE',
+            'Access-Control-Request-Headers': 'x-chouka-if',
+            'Access-Control-Request-Private-Network': 'true'})
+        self.assertEqual((code, headers['Access-Control-Allow-Methods']), (204, 'DELETE'))
+        self.assertEqual(self.request('DELETE', '/assets/' + asset_id, headers={'X-Chouka-IF': 'asset'})[0], 200)
+        self.assertFalse(path.exists())
+        self.assertEqual(self.bridge.asset_slots, 1)
+        self.assertEqual(self.request('DELETE', '/assets/' + asset_id, headers={'X-Chouka-IF': 'asset'})[0], 404)
 
     def test_upload_rejects_invalid_media_size_and_origin(self):
         for payload, content_type in ((b'not png', 'image/png'),
@@ -227,7 +246,7 @@ class BridgeTest(unittest.TestCase):
             self.assertFalse(asset_path.exists())
             self.assertEqual(len([args for args in calls if args[:2] == ('canvas', 'run')]), 1)
 
-    def test_video_asset_uses_file_path_for_video_model(self):
+    def test_video_asset_uploads_once_then_registers_before_final_prompt(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
             limits.read_text.return_value = json.dumps({
                 'Minimax H3': {'type': 'video', 'bridge': {'image': 0, 'video': 1}}})
@@ -235,14 +254,28 @@ class BridgeTest(unittest.TestCase):
             _, _, uploaded = self.upload(mp4, 'video/mp4')
             path = self.bridge.assets[uploaded['asset_id']][0]
 
+            calls = []
+
             def command(*args, **_):
                 if args[0] == 'models':
                     return MODELS
-                if args[:2] == ('canvas', 'run'):
-                    self.assertEqual(args[args.index('--image') + 1], str(path))
-                    self.assertEqual(args.count('--image'), 1)
-                    return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+                calls.append(args)
+                self.assertIn('--json', args)
+                if args[0] == 'upload':
+                    self.assertEqual(args[1], str(path))
+                    self.assertTrue(path.exists())
+                    return {'url': 'https://example.com/uploaded.mp4'}
                 self.assertFalse(path.exists())
+                if args[:2] == ('canvas', 'run'):
+                    if '--image' in args:
+                        self.assertEqual(args[args.index('--image') + 1], 'https://example.com/uploaded.mp4')
+                        self.assertIn('视频1', args[-1])
+                        self.assertIn('本轮不要生成任何内容', args[-1])
+                        self.assertNotIn('--model', args)
+                    else:
+                        self.assertIn('总需求', args[-1])
+                        self.assertEqual(args[args.index('--model') + 1], 'Minimax H3')
+                    return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
                 return {'status': 'done', 'downloaded': []}
 
             with mock.patch.object(self.bridge, 'command', side_effect=command):
@@ -255,6 +288,8 @@ class BridgeTest(unittest.TestCase):
                     time.sleep(.01)
                 self.assertEqual(job['state'], 'done')
                 self.assertFalse(path.exists())
+                self.assertEqual([call[:2] for call in calls], [
+                    ('upload', str(path)), ('canvas', 'run'), ('canvas', 'run'), ('canvas', 'poll')])
 
     def test_asset_failure_deletes_file_and_cannot_replay(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
@@ -294,6 +329,12 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(self.run_request(asset_id=[image['asset_id'], video['asset_id']])[0], 400)
             self.assertEqual(self.run_request(asset_id=image['asset_id'], audio='https://example.com/x')[0], 400)
             self.assertEqual(self.run_request(asset_id='unknown')[0], 400)
+            self.assertEqual(self.run_request(type='video', model='Minimax H3',
+                                              asset_ids=[video['asset_id'], video['asset_id']])[0], 400)
+            self.assertEqual(self.run_request(type='video', model='Minimax H3',
+                                              asset_ids=[image['asset_id']])[0], 400)
+            self.assertEqual(self.run_request(type='image', model='qwen-image-2.0',
+                                              asset_ids=[image['asset_id']])[0], 400)
             limits.read_text.return_value = json.dumps({
                 'Minimax H3': {'type': 'video', 'bridge': {'image': 1}}})
             self.assertEqual(self.run_request(asset_id=image['asset_id'])[0], 400)
@@ -344,12 +385,168 @@ class BridgeTest(unittest.TestCase):
                     self.assertEqual(state, 'done')
                 self.assertEqual(generate.call_count, 5)
 
+    def test_video_references_continue_one_canvas_and_return_cli_failure(self):
+        png = b'\x89PNG\r\n\x1a\n' + b'0' * 32
+        mp4 = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2'
+        uploaded = [self.upload(data, content_type)[2]['asset_id'] for data, content_type in (
+            (mp4, 'video/mp4'), (png, 'image/png'), (png, 'image/png'))]
+        paths = [str(self.bridge.assets[item][0]) for item in uploaded]
+        urls = ['https://example.com/uploaded.mp4', 'https://example.com/a.png', 'https://example.com/b.png']
+        calls = []
+
+        def command(*args, **_):
+            if args[0] == 'models':
+                return MODELS
+            calls.append(args)
+            self.assertIn('--json', args)
+            if args[0] == 'upload':
+                self.assertTrue(Path(args[1]).exists())
+                return {'url': urls[paths.index(args[1])]}
+            if args[:2] == ('canvas', 'run'):
+                self.assertTrue(all(not Path(path).exists() for path in paths))
+                return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+            return {'status': 'done', 'downloaded': []}
+
+        with mock.patch.object(self.bridge, 'command', side_effect=command):
+            code, _, response = self.run_request(type='video', model='Minimax H3',
+                asset_ids=uploaded, image='https://example.com/clip.mp4', prompt='最终生成视频', skill='商品展示')
+            self.assertEqual(code, 202)
+            for _ in range(100):
+                _, _, job = self.request('GET', '/runs/' + response['id'])
+                if job['state'] == 'done':
+                    break
+                time.sleep(.01)
+            self.assertEqual(job['state'], 'done')
+        runs = [call for call in calls if call[:2] == ('canvas', 'run')]
+        self.assertEqual(len(runs), 5)
+        self.assertEqual([call[1] for call in calls if call[0] == 'upload'], paths)
+        self.assertTrue(all(call[0] == 'upload' for call in calls[:3]))
+        self.assertEqual([call[call.index('--image') + 1] for call in runs[:-1]],
+                         urls + ['https://example.com/clip.mp4'])
+        self.assertNotIn('--image', runs[-1])
+        self.assertNotIn('--canvas-id', runs[0])
+        for call in runs[1:]:
+            self.assertEqual(call[call.index('--canvas-id') + 1], 'c1')
+            self.assertEqual(call[call.index('--session-id') + 1], 's1')
+        self.assertEqual(runs[-1][-1], '基于以上已登记的全部参考素材（视频1、图片1、图片2、视频2），执行以下总需求：\n\n最终生成视频')
+        self.assertEqual(runs[-1][runs[-1].index('--skill') + 1], '商品展示')
+        for call, name in zip(runs[:-1], ('视频1', '图片1', '图片2', '视频2')):
+            self.assertIn(f'引用名为「{name}」', call[-1])
+            self.assertIn('本轮不要生成任何内容', call[-1])
+            self.assertIn('不要调用生图或生视频工具', call[-1])
+            self.assertNotIn('--model', call)
+            self.assertNotIn('--skill', call)
+            self.assertIn('--create-only', call)
+        self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
+        self.assertEqual(len([call for call in calls if call[:2] == ('canvas', 'poll')]), 1)
+        self.assertTrue(all(not Path(path).exists() for path in paths))
+
+        with mock.patch('if_studio_bridge.subprocess.run', return_value=mock.Mock(
+                returncode=1, stderr='IFS refused the reference: Bearer secret-token', stdout='')):
+            with self.assertRaisesRegex(RuntimeError, 'IFS refused the reference') as failure:
+                self.bridge.command('canvas', 'run')
+        self.assertNotIn('secret-token', str(failure.exception))
+
+    def test_second_reference_cli_error_stops_chain_and_cleans_assets(self):
+        image = b'\x89PNG\r\n\x1a\n' + b'0' * 32
+        ids = [self.upload(image, 'image/png')[2]['asset_id'] for _ in range(2)]
+        paths = [self.bridge.assets[item][0] for item in ids]
+        calls = []
+
+        def command(*args, **_):
+            if args[0] == 'models':
+                return MODELS
+            calls.append(args)
+            if args[0] == 'upload':
+                return {'url': f'https://example.com/{Path(args[1]).name}'}
+            if len([call for call in calls if call[:2] == ('canvas', 'run')]) == 2:
+                raise RuntimeError('IFS 拒绝第二张引用图片')
+            return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+
+        with mock.patch.object(self.bridge, 'command', side_effect=command):
+            code, _, response = self.run_request(type='video', model='Minimax H3', asset_ids=ids)
+            self.assertEqual(code, 202)
+            for _ in range(100):
+                _, _, job = self.request('GET', '/runs/' + response['id'])
+                if job['state'] == 'error':
+                    break
+                time.sleep(.01)
+        self.assertEqual(job['error'], 'IFS 拒绝第二张引用图片')
+        self.assertEqual(len(calls), 4)
+        self.assertFalse(any(call[:2] == ('canvas', 'poll') for call in calls))
+        self.assertTrue(all('--image' in call for call in calls if call[:2] == ('canvas', 'run')))
+        self.assertTrue(all(not path.exists() for path in paths))
+        self.assertEqual(self.bridge.asset_slots, 0)
+
+    def test_video_upload_failure_never_sends_reference_or_generation(self):
+        for result in ({'error': 'IFS 上传素材被拒绝 token=upload-secret'}, {'url': 'file:///private/image.png'}):
+            with self.subTest(result=result):
+                paths = [Path(self.bridge.workspace.name) / f'upload-{n}.png' for n in range(2)]
+                for path in paths:
+                    path.write_bytes(b'fake-image')
+                with mock.patch.object(self.bridge, 'command', return_value=result) as cli:
+                    self.bridge.generate('upload-error', {'type': 'video', 'model': 'Minimax H3',
+                                                         'prompt': '生成视频'}, paths)
+                self.assertEqual(self.bridge.jobs['upload-error']['state'], 'error')
+                self.assertNotIn('upload-secret', self.bridge.jobs['upload-error']['error'])
+                self.assertEqual(cli.call_count, 1)
+                self.assertEqual(cli.call_args.args[0], 'upload')
+                self.assertTrue(all(not path.exists() for path in paths))
+
+    def test_video_final_prompt_failure_does_not_poll(self):
+        created = {'status': 'created', 'canvas_id': 'existing-c', 'session_id': 'existing-s'}
+        with mock.patch.object(self.bridge, 'command', side_effect=[
+                created, {'status': 'failed', 'error': 'IFS 拒绝总需求'}]) as cli:
+            self.bridge.generate('final-error', {'type': 'video', 'model': 'Minimax H3',
+                'prompt': '生成视频', 'image': 'https://example.com/ref.png',
+                'canvas_id': 'existing-c', 'session_id': 'existing-s'})
+        self.assertEqual(self.bridge.jobs['final-error']['state'], 'error')
+        self.assertIn('IFS 拒绝总需求', self.bridge.jobs['final-error']['error'])
+        self.assertEqual(cli.call_count, 2)
+        for call in cli.call_args_list:
+            self.assertEqual(call.args[:2], ('canvas', 'run'))
+            self.assertEqual(call.args[call.args.index('--canvas-id') + 1], 'existing-c')
+            self.assertEqual(call.args[call.args.index('--session-id') + 1], 'existing-s')
+        self.assertNotIn('--image', cli.call_args.args)
+
+    def test_video_polls_once_even_if_cli_returns_background_summary(self):
+        created = {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
+        background = {'status': 'summary_feedback', 'planning_text': '后台处理中'}
+        with mock.patch.object(self.bridge, 'command', side_effect=[created, background]) as cli:
+            self.bridge.generate('single-poll', {'type': 'video', 'model': 'Minimax H3', 'prompt': '生成视频'})
+        self.assertEqual([call.args[:2] for call in cli.call_args_list], [('canvas', 'run'), ('canvas', 'poll')])
+        self.assertEqual(self.bridge.jobs['single-poll']['result']['status'], 'summary_feedback')
+
+    def test_structured_cli_errors_redact_credentials(self):
+        with mock.patch.object(self.bridge, 'command', return_value={
+                'status': 'failed', 'error': '引用失败 {"token":"json-secret"} https://example.com/ref.png?key=url-secret'}):
+            self.bridge.generate('redaction', {'type': 'video', 'model': 'Minimax H3',
+                                             'prompt': '生成视频', 'image': 'https://example.com/ref.png'})
+        error = self.bridge.jobs['redaction']['error']
+        self.assertIn('引用失败', error)
+        self.assertNotIn('json-secret', error)
+        self.assertNotIn('url-secret', error)
+
+    def test_h3_estimate_rejects_video_references_above_each_kind_limit(self):
+        models = MODELS + [{'display_name': '星辰图生视频', 'type': 'video'}]
+        image = b'\x89PNG\r\n\x1a\n' + b'0' * 32
+        video = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2'
+        images = [self.upload(image, 'image/png')[2]['asset_id'] for _ in range(10)]
+        videos = [self.upload(video, 'video/mp4')[2]['asset_id'] for _ in range(4)]
+        with mock.patch.object(self.bridge, 'command', return_value=models):
+            for asset_ids in (images, videos, images[:9] + videos):
+                self.assertEqual(self.run_request(type='video', model='星辰图生视频',
+                                                  asset_ids=asset_ids)[0], 400)
+        self.assertEqual(len(self.bridge.assets), 14)
+        self.assertFalse(self.bridge.jobs)
+
     def test_unverified_video_models_allow_one_image_or_video_reference(self):
         models = MODELS + [{'display_name': name, 'type': 'video'}
                            for name in ('星辰图生视频', '可灵3.0 Omni')]
 
-        def finish(job_id, _request, asset_path):
-            asset_path.unlink()
+        def finish(job_id, _request, asset_paths):
+            for path in asset_paths:
+                path.unlink()
             with self.bridge.lock:
                 self.bridge.jobs[job_id] = {'state': 'done', 'result': {}}
 
