@@ -78,6 +78,27 @@ internal static class TrayProbe {
             Application.DoEvents();
             if (!IsWindowVisible(manager.Handle) || IsIconic(manager.Handle))
                 throw new Exception("Second launch did not restore hidden minimized window");
+            if (!manager.Visible || manager.WindowState != FormWindowState.Normal)
+                throw new Exception("Second launch left WinForms state hidden or minimized");
+            manager.Location = new Point(-10000, -10000);
+            manager.Close();
+            if (manager.Visible || manager.IsDisposed) throw new Exception("Close must only hide the manager");
+            if (!Program.ShowExistingWindow(manager.Text) || !manager.Visible)
+                throw new Exception("Restore after close failed");
+            bool onScreen = false;
+            foreach (Screen screen in Screen.AllScreens)
+                if (screen.WorkingArea.IntersectsWith(manager.Bounds)) onScreen = true;
+            if (!onScreen) throw new Exception("Restored window remained outside all monitors");
+            if (!tray.Visible || tray.Icon == null) throw new Exception("Restore did not re-register tray icon");
+            manager.Hide();
+            tray.ContextMenuStrip.Items[0].PerformClick();
+            if (!manager.Visible) throw new Exception("Tray menu could not reopen the window");
+            using (Form unresponsive = new Form()) {
+                unresponsive.Text = "Not a bridge " + Guid.NewGuid();
+                unresponsive.Show();
+                if (Program.ShowExistingWindow(unresponsive.Text))
+                    throw new Exception("Window that ignored the restore message was reported as restored");
+            }
             if (Program.ShowExistingWindow("not-a-chouka-window-" + Guid.NewGuid()))
                 throw new Exception("Unexpected window matched");
             manager.Dispose();
@@ -88,6 +109,63 @@ internal static class TrayProbe {
 }
 '''
         self.run_probe(source, 'TrayProbe', 'tray-and-activation-ok', embed_icon=True)
+
+    def test_separate_process_restores_managed_window_without_restarting_bridge(self):
+        source = r'''
+using System;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.Drawing;
+using System.Reflection;
+using System.Windows.Forms;
+internal static class ActivationProbe {
+    [STAThread]
+    private static void Main(string[] args) {
+        if (args.Length > 0) {
+            if (!Program.ShowExistingWindow(args[0])) throw new Exception("Restore request was not acknowledged");
+            return;
+        }
+        using (BridgeManager manager = new BridgeManager()) {
+            var flags = BindingFlags.Instance | BindingFlags.NonPublic;
+            var events = (EventHandlerList)typeof(Component).GetProperty("Events", flags).GetValue(manager, null);
+            var key = typeof(Form).GetField("EVENT_SHOWN", BindingFlags.Static | BindingFlags.NonPublic).GetValue(null);
+            events.RemoveHandler(key, events[key]);
+            ((Timer)typeof(BridgeManager).GetField("timer", flags).GetValue(manager)).Stop();
+            manager.Text = "Chouka activation test " + Guid.NewGuid();
+            var runtime = typeof(BridgeManager).GetField("runtime", flags).GetValue(manager);
+            Process sender = null;
+            int rounds = 0;
+            using (Timer check = new Timer()) {
+                check.Interval = 50;
+                Action launch = delegate {
+                    manager.WindowState = FormWindowState.Minimized;
+                    manager.Hide();
+                    sender = Process.Start(new ProcessStartInfo(Application.ExecutablePath,
+                        "\"" + manager.Text + "\"") {UseShellExecute = false, CreateNoWindow = true});
+                };
+                manager.Shown += delegate { launch(); check.Start(); };
+                check.Tick += delegate {
+                    if (sender == null || !sender.HasExited) return;
+                    if (sender.ExitCode != 0) throw new Exception("Second process could not restore manager");
+                    sender.Dispose(); sender = null;
+                    if (!manager.Visible || manager.WindowState != FormWindowState.Normal)
+                        throw new Exception("WinForms state was not restored across processes");
+                    if (typeof(BridgeRuntime).GetField("bridge", flags).GetValue(runtime) != null)
+                        throw new Exception("Activation unexpectedly started a bridge process");
+                    if (++rounds < 2) { launch(); return; }
+                    check.Stop();
+                    manager.Dispose();
+                    Application.ExitThread();
+                };
+                Application.Run(manager);
+            }
+            if (rounds != 2) throw new Exception("Did not verify both reactivation cycles");
+            Console.WriteLine("cross-process-activation-ok");
+        }
+    }
+}
+'''
+        self.run_probe(source, 'ActivationProbe', 'cross-process-activation-ok', embed_icon=True)
 
     def test_built_package_icon_renders_correctly_in_dotnet(self):
         source = r'''

@@ -11,18 +11,27 @@ internal static class Program
     internal const string WindowTitle = "本地抽卡_IF_Bridge";
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern IntPtr FindWindow(string className, string title);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern uint RegisterWindowMessage(string name);
     [DllImport("user32.dll")]
-    private static extern bool ShowWindowAsync(IntPtr window, int command);
+    private static extern uint GetWindowThreadProcessId(IntPtr window, out uint processId);
     [DllImport("user32.dll")]
-    private static extern bool SetForegroundWindow(IntPtr window);
+    private static extern bool AllowSetForegroundWindow(uint processId);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr SendMessageTimeout(IntPtr window, uint message, IntPtr wParam,
+        IntPtr lParam, uint flags, uint timeout, out IntPtr result);
+    internal static readonly uint RestoreWindowMessage = RegisterWindowMessage("ChoukaIFBridge.RestoreWindow");
 
     internal static bool ShowExistingWindow(string title)
     {
         IntPtr window = FindWindow(null, title);
         if (window == IntPtr.Zero) return false;
-        ShowWindowAsync(window, 9);
-        SetForegroundWindow(window);
-        return true;
+        uint processId;
+        GetWindowThreadProcessId(window, out processId);
+        AllowSetForegroundWindow(processId);
+        IntPtr result;
+        return SendMessageTimeout(window, RestoreWindowMessage, IntPtr.Zero, IntPtr.Zero,
+            2, 2000, out result) != IntPtr.Zero && result == new IntPtr(1);
     }
 
     [STAThread]
@@ -31,7 +40,7 @@ internal static class Program
         bool first;
         using (Mutex instance = new Mutex(true, @"Local\ChoukaIFBridgeManager", out first)) {
             if (!first) {
-                if (!ShowExistingWindow(WindowTitle)) MessageBox.Show("本地抽卡 IF Bridge 正在启动，请稍后重试。", WindowTitle);
+                if (!ShowExistingWindow(WindowTitle)) MessageBox.Show("本地抽卡 IF Bridge 已在运行，但窗口未响应打开请求。\n请检查是否有登录或确认对话框，并稍后重试；桥接任务未被停止。", WindowTitle);
                 return;
             }
             Application.EnableVisualStyles();
@@ -258,7 +267,33 @@ internal sealed class BridgeManager : Form
             });
         });
     }
-    private void ShowWindow() { Show(); WindowState = FormWindowState.Normal; BringToFront(); Activate(); }
+    protected override void WndProc(ref Message message)
+    {
+        if ((uint)message.Msg == Program.RestoreWindowMessage) {
+            ShowWindow();
+            message.Result = new IntPtr(1);
+            return;
+        }
+        base.WndProc(ref message);
+    }
+    private void ShowWindow()
+    {
+        Show();
+        WindowState = FormWindowState.Normal;
+        bool onScreen = false;
+        foreach (Screen screen in Screen.AllScreens)
+            if (screen.WorkingArea.IntersectsWith(Bounds)) { onScreen = true; break; }
+        if (!onScreen) {
+            Rectangle area = Screen.FromPoint(Cursor.Position).WorkingArea;
+            Location = new Point(area.Left + Math.Max(0, (area.Width - Width) / 2),
+                area.Top + Math.Max(0, (area.Height - Height) / 2));
+        }
+        tray.Visible = false;
+        tray.Icon = trayIcon;
+        tray.Visible = true;
+        BringToFront();
+        Activate();
+    }
     private void ExitProgram() { exiting = true; Close(); }
     private void OnClosing(object sender, FormClosingEventArgs args)
     {
