@@ -9,9 +9,10 @@ import time
 import unittest
 from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
-from if_studio_bridge import Bridge, LIMITS_FILE, SessionBusyError
+from if_studio_bridge import Bridge, LIMITS_FILE, NoReferenceRedirect, SessionBusyError, prepare_if_reference
 
 ORIGIN = 'http://127.0.0.1:8201'
 SECOND_ORIGIN = 'http://127.0.0.1:8199'
@@ -23,6 +24,74 @@ BUSY_ERROR = ('Error: 发送消息失败: /api/session/send 失败: '
               'map[code:session_busy data:map[session_id:s1] '
               'message:当前会话正在生成中，请等待本轮对话完成后再发送。 '
               'status:session_busy success:false]')
+
+
+class ReferenceURLTest(unittest.TestCase):
+    def response(self, status=206, content_type='application/octet-stream', body=b'RIFFxxxxWEBP'):
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.status = status
+        response.headers = {'Content-Type': content_type}
+        response.read.return_value = body
+        return response
+
+    def test_cdn_filename_encoding_is_idempotent_and_preserves_other_url_parts(self):
+        urls = [
+            ('f_test_.webp', 'f%5Ftest%5F.webp'),
+            ('f_a_b.png', 'f%5Fa%5Fb.png'),
+            ('f_a_.jpg', 'f%5Fa%5F.jpg'),
+            ('f_video_.mp4', 'f%5Fvideo%5F.mp4'),
+            ('f%5Ftest%5f.webp', 'f%5Ftest%5f.webp'),
+        ]
+        for original, encoded in urls:
+            with self.subTest(original=original), mock.patch('if_studio_bridge.build_opener') as build:
+                response = self.response()
+                build.return_value.open.return_value = response
+                suffix = '?token=keep_%2F&x=1#original_fragment'
+                expected = 'https://ant.alicdn.com/bio/img/' + encoded + suffix
+                actual = prepare_if_reference('https://ant.alicdn.com/bio/img/' + original + suffix)
+                self.assertEqual(actual, expected)
+                self.assertEqual(prepare_if_reference(actual), expected)
+                request = build.return_value.open.call_args.args[0]
+                self.assertEqual(request.full_url, expected)
+                self.assertEqual(request.get_method(), 'GET')
+                self.assertEqual(request.get_header('Range'), 'bytes=0-31')
+                self.assertEqual(build.return_value.open.call_args.kwargs, {'timeout': 15})
+                self.assertIsInstance(build.call_args.args[0], NoReferenceRedirect)
+                response.read.assert_called_with(32)
+                self.assertTrue(response.__exit__.called)
+
+    def test_unrelated_urls_are_not_rewritten_or_fetched(self):
+        with mock.patch('if_studio_bridge.build_opener') as build:
+            for url in ('https://example.com/f_test_.webp', 'https://127.0.0.1/bio/img/f_a.png',
+                        'https://ant.alicdn.com.evil.example/bio/img/f_a.png',
+                        'https://ant.alicdn.com:444/bio/img/f_a.png',
+                        'https://user:pass@ant.alicdn.com/bio/img/f_a.png',
+                        'https://ant.alicdn.com/other/f_a.png', 'http://ant.alicdn.com/bio/img/f_a.png'):
+                self.assertEqual(prepare_if_reference(url), url)
+            build.assert_not_called()
+
+    def test_cdn_failure_is_reported_before_generation(self):
+        url = 'https://ant.alicdn.com/bio/img/f_test_.webp?token=secret'
+        for error in (HTTPError(url, 404, 'NoSuchKey', {}, None),
+                      HTTPError(url, 302, 'Redirect', {'Location': 'http://127.0.0.1/private'}, None),
+                      URLError('network unreachable'), TimeoutError('timed out')):
+            with self.subTest(error=error), mock.patch('if_studio_bridge.build_opener') as build:
+                build.return_value.open.side_effect = error
+                with self.assertRaisesRegex(RuntimeError, '尚未提交生成') as failure:
+                    prepare_if_reference(url)
+                self.assertNotIn('secret', str(failure.exception))
+        self.assertIsNone(NoReferenceRedirect().redirect_request(None, None, 302, '', {}, 'http://127.0.0.1/'))
+
+    def test_empty_error_documents_and_unexpected_status_are_rejected(self):
+        for status, content_type, body in ((200, 'application/xml', b'<Error/>'),
+                                          (200, 'text/html', b'login'), (200, 'application/json', b'{}'),
+                                          (200, 'image/png', b''), (204, '', b'x')):
+            with self.subTest(status=status, content_type=content_type), \
+                    mock.patch('if_studio_bridge.build_opener') as build:
+                build.return_value.open.return_value = self.response(status, content_type, body)
+                with self.assertRaisesRegex(RuntimeError, '未返回有效媒体内容'):
+                    prepare_if_reference('https://ant.alicdn.com/bio/img/f_test.png')
 
 
 class BridgeTest(unittest.TestCase):
@@ -278,6 +347,48 @@ class BridgeTest(unittest.TestCase):
                 ('starting', '正在向 IF 一次提交全部引用与图片生成需求'),
                 ('running', 'IF 正在生成图片，等待产物'),
             ])
+
+    def test_uploaded_and_direct_cdn_references_are_checked_and_encoded_before_single_run(self):
+        path = Path(self.bridge.workspace.name) / 'reference.webp'
+        path.write_bytes(b'RIFFxxxxWEBP')
+        original = 'https://ant.alicdn.com/bio/img/f_reference_.webp'
+        corrected = 'https://ant.alicdn.com/bio/img/f%5Freference%5F.webp'
+        response = ReferenceURLTest().response()
+        with mock.patch('if_studio_bridge.build_opener') as build, \
+                mock.patch.object(self.bridge, 'command', side_effect=[
+                    {'url': original}, {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'},
+                    {'status': 'done', 'downloaded': []}]) as cli:
+            build.return_value.open.return_value = response
+            self.bridge.generate('encoded-reference', {'model': 'Minimax H3', 'type': 'video',
+                'prompt': '使用全部引用', 'image': original}, [path])
+        job = self.bridge.jobs['encoded-reference']
+        self.assertEqual(job['state'], 'done')
+        expected = f'图片1：{corrected}\n图片2：{corrected}\n\n生成需求：\n使用全部引用'
+        self.assertEqual(job['result']['submitted_prompt'], expected)
+        self.assertEqual(cli.call_args_list[1].args[-1], expected)
+        self.assertEqual([call.args[:2] for call in cli.call_args_list], [
+            ('upload', str(path)), ('canvas', 'run'), ('canvas', 'poll')])
+        self.assertEqual(build.return_value.open.call_count, 2)
+        self.assertFalse(path.exists())
+
+    def test_unreachable_uploaded_cdn_reference_never_submits_and_cleans_all_local_assets(self):
+        paths = [Path(self.bridge.workspace.name) / f'reference-{i}.png' for i in range(2)]
+        for path in paths:
+            path.write_bytes(b'png')
+        url = 'https://ant.alicdn.com/bio/img/f_missing_.png?token=secret'
+        with mock.patch.object(self.bridge, 'command', return_value={'url': url}) as cli, \
+                mock.patch('if_studio_bridge.build_opener') as build:
+            build.return_value.open.side_effect = HTTPError(url, 404, 'NoSuchKey', {}, None)
+            self.bridge.generate('missing-reference', {'model': 'Minimax H3', 'prompt': 'test'}, paths)
+        job = self.bridge.jobs['missing-reference']
+        self.assertEqual(job['state'], 'error')
+        self.assertIn('图片1', job['error'])
+        self.assertIn('HTTP 404', job['error'])
+        self.assertIn('尚未提交生成', job['error'])
+        self.assertNotIn('secret', job['error'])
+        self.assertEqual(job['result'], {})
+        self.assertEqual([call.args[0] for call in cli.call_args_list], ['upload', 'upload'])
+        self.assertTrue(all(not path.exists() for path in paths))
 
     def test_video_asset_uploads_once_then_submits_url_in_prompt(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:

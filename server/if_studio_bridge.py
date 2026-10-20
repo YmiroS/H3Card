@@ -13,7 +13,9 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
+from urllib.request import HTTPRedirectHandler, Request, build_opener
 
 
 MEDIA = {'image/png': ('image', '.png', 10_000_000),
@@ -40,6 +42,36 @@ def redact_cli_error(detail):
     detail = re.sub(r'(?i)(https?://[^\s?]+)\?[^\s]+', r'\1?[已隐藏]', detail)
     return re.sub(r'''(?i)(\b(?:access_token|refresh_token|ifs_token|token)["']?\s*[=:]\s*["']?)[^\s,}"']+''',
                   r'\1[已隐藏]', detail)
+
+
+class NoReferenceRedirect(HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def prepare_if_reference(url):
+    parts = urlparse(url)
+    # Only probe IF's public upload CDN, never arbitrary user-supplied hosts or redirects.
+    if (parts.scheme != 'https' or parts.hostname != 'ant.alicdn.com'
+            or parts.port not in (None, 443) or parts.username is not None or parts.password is not None
+            or not parts.path.startswith('/bio/img/')):
+        return url
+    directory, _, filename = parts.path.rpartition('/')
+    # Raw underscores can be interpreted as CDN image-processing suffixes (not object-key bytes).
+    url = parts._replace(path=directory + '/' + filename.replace('_', '%5F')).geturl()
+    request = Request(url, headers={'Range': 'bytes=0-31', 'Accept-Encoding': 'identity'})
+    try:
+        with build_opener(NoReferenceRedirect()).open(request, timeout=15) as response:
+            content_type = response.headers.get('Content-Type', '').lower()
+            if (response.status not in (200, 206) or not response.read(32)
+                    or content_type.startswith('text/') or 'xml' in content_type or 'json' in content_type):
+                raise RuntimeError('IF 引用地址未返回有效媒体内容，尚未提交生成，请重新上传素材')
+    except HTTPError as exc:
+        exc.close()
+        raise RuntimeError(f'IF 引用地址检查失败（HTTP {exc.code}），尚未提交生成，请重新上传素材') from exc
+    except (URLError, OSError) as exc:
+        raise RuntimeError('IF 引用地址检查超时或网络不可用，尚未提交生成，请检查网络后重试') from exc
+    return url
 
 
 class SessionBusyError(RuntimeError):
@@ -118,6 +150,13 @@ class Bridge(ThreadingHTTPServer):
                 suffix = Path(urlparse(source).path).suffix.lower()
                 media = '视频' if suffix in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.m4v') else '图片'
                 counts[media] += 1
+                with self.lock:
+                    self.jobs[job_id] = {'state': 'starting',
+                        'step': f'正在检查 IF {media}{counts[media]}引用地址（{index + 1}/{len(references)}）'}
+                try:
+                    reference = prepare_if_reference(reference)
+                except RuntimeError as exc:
+                    raise RuntimeError(f'{media}{counts[media]}：{exc}') from exc
                 reference_lines.append(f'{media}{counts[media]}：{reference}')
             prompt = request['prompt']
             if reference_lines:
