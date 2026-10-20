@@ -1,18 +1,37 @@
 using System;
 using System.Diagnostics;
 using System.Drawing;
+using System.IO;
+using System.Runtime.InteropServices;
 using System.Threading;
 using System.Windows.Forms;
 
 internal static class Program
 {
+    internal const string WindowTitle = "本地抽卡_IF_Bridge";
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr FindWindow(string className, string title);
+    [DllImport("user32.dll")]
+    private static extern bool ShowWindowAsync(IntPtr window, int command);
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(IntPtr window);
+
+    internal static bool ShowExistingWindow(string title)
+    {
+        IntPtr window = FindWindow(null, title);
+        if (window == IntPtr.Zero) return false;
+        ShowWindowAsync(window, 9);
+        SetForegroundWindow(window);
+        return true;
+    }
+
     [STAThread]
     private static void Main()
     {
         bool first;
         using (Mutex instance = new Mutex(true, @"Local\ChoukaIFBridgeManager", out first)) {
             if (!first) {
-                MessageBox.Show("本地抽卡 IF Bridge 已在运行。", "本地抽卡_IF_Bridge");
+                if (!ShowExistingWindow(WindowTitle)) MessageBox.Show("本地抽卡 IF Bridge 正在启动，请稍后重试。", WindowTitle);
                 return;
             }
             Application.EnableVisualStyles();
@@ -35,19 +54,24 @@ internal sealed class BridgeManager : Form
     private readonly Button login = new Button();
     private readonly CheckBox startup = new CheckBox();
     private readonly NotifyIcon tray = new NotifyIcon();
+    private readonly ContextMenuStrip trayMenu = new ContextMenuStrip();
+    private readonly Icon applicationIcon;
+    private readonly Icon trayIcon;
     private readonly System.Windows.Forms.Timer timer = new System.Windows.Forms.Timer();
     private bool exiting, installing, loginPrompted, loginRunning, changingStartup;
     private int refreshing;
 
     internal BridgeManager()
     {
-        Text = "本地抽卡_IF_Bridge";
+        Text = Program.WindowTitle;
         Size = new Size(590, 300);
         MinimumSize = new Size(590, 300);
         MaximumSize = new Size(840, 350);
         StartPosition = FormStartPosition.CenterScreen;
         ShowInTaskbar = true;
-        Icon = System.Drawing.Icon.ExtractAssociatedIcon(Application.ExecutablePath);
+        applicationIcon = LoadApplicationIcon();
+        Icon = applicationIcon;
+        trayIcon = new Icon(applicationIcon, SystemInformation.SmallIconSize);
         Font = new Font("Microsoft YaHei UI", 9);
 
         TableLayoutPanel layout = new TableLayoutPanel();
@@ -81,20 +105,43 @@ internal sealed class BridgeManager : Form
         hint.Text = "网页：HTTPS 8443（需信任证书）  ·  本机桥接：127.0.0.1:8278";
         layout.Controls.Add(hint, 0, 6);
 
-        ContextMenuStrip menu = new ContextMenuStrip();
-        menu.Items.Add("打开窗口", null, delegate { ShowWindow(); });
-        menu.Items.Add("退出程序", null, delegate { ExitProgram(); });
-        tray.Icon = Icon;
-        tray.Text = "本地抽卡 IF Bridge";
-        tray.ContextMenuStrip = menu;
+        trayMenu.Items.Add("打开窗口", null, delegate { ShowWindow(); });
+        trayMenu.Items.Add("退出程序", null, delegate { ExitProgram(); });
+        tray.Icon = trayIcon;
+        tray.Text = "本地抽卡 IF Bridge — 单击打开";
+        tray.ContextMenuStrip = trayMenu;
         tray.Visible = true;
+        tray.MouseClick += OnTrayMouseClick;
         tray.DoubleClick += delegate { ShowWindow(); };
         timer.Interval = 5000;
         timer.Tick += delegate { RefreshStatus(); };
         timer.Start();
         Shown += delegate { FirstStart(); };
         FormClosing += OnClosing;
-        FormClosed += delegate { timer.Stop(); tray.Visible = false; tray.Dispose(); };
+    }
+
+    private static Icon LoadApplicationIcon()
+    {
+        using (Stream stream = typeof(BridgeManager).Assembly.GetManifestResourceStream("ChoukaIFBridge.ico")) {
+            if (stream != null) using (Icon icon = new Icon(stream)) return (Icon)icon.Clone();
+        }
+        return (Icon)SystemIcons.Application.Clone();
+    }
+    private void OnTrayMouseClick(object sender, MouseEventArgs args)
+    {
+        if (args.Button == MouseButtons.Left) ShowWindow();
+    }
+    protected override void Dispose(bool disposing)
+    {
+        if (disposing) {
+            timer.Dispose();
+            tray.Visible = false;
+            tray.Dispose();
+            trayMenu.Dispose();
+            if (trayIcon != null) trayIcon.Dispose();
+            if (applicationIcon != null) applicationIcon.Dispose();
+        }
+        base.Dispose(disposing);
     }
 
     private void StartupChanged(object sender, EventArgs args)
@@ -211,7 +258,7 @@ internal sealed class BridgeManager : Form
             });
         });
     }
-    private void ShowWindow() { Show(); WindowState = FormWindowState.Normal; Activate(); }
+    private void ShowWindow() { Show(); WindowState = FormWindowState.Normal; BringToFront(); Activate(); }
     private void ExitProgram() { exiting = true; Close(); }
     private void OnClosing(object sender, FormClosingEventArgs args)
     {

@@ -30,8 +30,22 @@ try {
         try {
             $graphics.InterpolationMode = [Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
             $graphics.DrawImage($source, 0, 0, $size, $size)
-            $bitmap.Save($stream, [Drawing.Imaging.ImageFormat]::Png)
-            $images.Add($stream.ToArray())
+            $bitmap.Save($stream, [Drawing.Imaging.ImageFormat]::Bmp)
+            $bmp = $stream.ToArray()
+            $pixels = 4 * $size * $size
+            $maskStride = [int]([Math]::Ceiling($size / 32.0) * 4)
+            $dib = New-Object byte[] (40 + $pixels + $maskStride * $size)
+            [Array]::Copy($bmp, 14, $dib, 0, 40 + $pixels)
+            [Array]::Copy([BitConverter]::GetBytes([int](2 * $size)), 0, $dib, 8, 4)
+            for ($row = 0; $row -lt $size; $row++) {
+                for ($col = 0; $col -lt $size; $col++) {
+                    if ($dib[40 + 4 * ($row * $size + $col) + 3] -eq 0) {
+                        $index = 40 + $pixels + $row * $maskStride + [int][Math]::Floor($col / 8.0)
+                        $dib[$index] = $dib[$index] -bor (128 -shr ($col % 8))
+                    }
+                }
+            }
+            $images.Add($dib)
         } finally { $stream.Dispose(); $graphics.Dispose(); $bitmap.Dispose() }
     }
 } finally { $source.Dispose() }
@@ -55,7 +69,7 @@ Copy-Item (Join-Path $repo 'manifests\_if_model_limits.json') (Join-Path $releas
 Copy-Item (Join-Path $PSScriptRoot 'Install.ps1') $release
 Copy-Item (Join-Path $PSScriptRoot 'Chouka-IF-Test-CA.crt') $release
 Copy-Item (Join-Path $PSScriptRoot '*.txt') $release
-& $compiler '/nologo' '/target:winexe' '/optimize+' '/codepage:65001' '/r:System.Windows.Forms.dll' '/r:System.Drawing.dll' '/r:System.Web.Extensions.dll' "/win32icon:$iconPath" "/out:$(Join-Path $release 'ChoukaIFBridge.exe')" (Join-Path $PSScriptRoot 'BridgeRuntime.cs') (Join-Path $PSScriptRoot 'BridgeManager.cs')
+& $compiler '/nologo' '/target:winexe' '/optimize+' '/codepage:65001' '/r:System.Windows.Forms.dll' '/r:System.Drawing.dll' '/r:System.Web.Extensions.dll' "/win32icon:$iconPath" "/resource:$iconPath,ChoukaIFBridge.ico" "/out:$(Join-Path $release 'ChoukaIFBridge.exe')" (Join-Path $PSScriptRoot 'BridgeRuntime.cs') (Join-Path $PSScriptRoot 'BridgeManager.cs')
 if ($LASTEXITCODE -ne 0) { throw 'Bridge manager compilation failed.' }
 & (Join-Path $runtime 'python.exe') -B -c 'import http.server,ipaddress,subprocess,mimetypes'
 if ($LASTEXITCODE -ne 0) { throw 'Bundled Python runtime cannot import the bridge requirements.' }
