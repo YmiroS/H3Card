@@ -58,7 +58,7 @@
       const buttons=[...form.querySelectorAll('button')],states=buttons.map(b=>b.disabled);buttons.forEach(b=>b.disabled=true);
       const old=submit.textContent;submit.textContent='正在提交…';status.focus();
       try { await onSubmit(form);busy=false;nativeClose('success'); }
-      catch(error) { status.textContent=`${error.message||'提交失败'}；输入已保留，可重试。`;status.classList.add('danger');status.focus(); }
+      catch(error) { status.textContent=`${error.message||'提交失败'}；输入已保留，可重试。`;status.classList.add('danger');status.focus();H3Notify.error(status.textContent); }
       finally { busy=false;content.inert=wasInert;delete form.dataset.busy;form.removeAttribute('aria-busy');buttons.forEach((b,i)=>b.disabled=states[i]);submit.textContent=old; }
     });
     for(const type of ['click','keydown','input','change'])form.addEventListener(type,event=>{if(busy&&!event.target.closest('[data-operation-status]')){event.preventDefault();event.stopImmediatePropagation();}},true);

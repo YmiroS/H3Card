@@ -332,7 +332,7 @@ function hardwareSummary(h) {
 const unit = g => g.source === 'historical' ? '任务' : UNIT[g.unit] || text(g.unit);
 const estimateUnit = () => '任务';
 function el(tag, value, cls) { const node=document.createElement(tag); if(value != null) node.textContent=value; if(cls) node.className=cls; return node; }
-function message(id, value) { $(id).textContent=value; $(id).hidden=!value; }
+function message(id, value) { $(id).textContent=value; $(id).hidden=!value; if (value && ['error','estimate-error'].includes(id)) H3Notify.error(value); }
 function list(values, cls='warn') { const root=el('ul',null,cls); for(const value of values || []) root.append(el('li',text(value))); return root; }
 function groupWarnings(g) {
   const result=[...(g.warnings || [])];

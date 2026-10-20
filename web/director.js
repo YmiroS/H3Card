@@ -121,7 +121,7 @@
         $('save-status').classList.add('error');
         updateActions();
       }
-      toast(error.message); throw error;
+      H3Notify.error(error.message); throw error;
     }).finally(() => { saving = null; updateActions(); });
     return saving;
   }
@@ -166,7 +166,7 @@
       $('script').value = doc.script; $('style').value = doc.style;
       const url = new URL(location.href); url.searchParams.set('project', pid); history.replaceState(null, '', url);
       busy = false; render(); await poll();
-    } catch (error) { busy = false; $('projects').value = project?.id || ''; if (project) renderInspector(); updateActions(); toast(error.message); }
+    } catch (error) { busy = false; $('projects').value = project?.id || ''; if (project) renderInspector(); updateActions(); H3Notify.error(error.message); }
   }
   function makeShot(title = '', description = '') {
     // 局域网 HTTP 不提供 randomUUID，但允许 getRandomValues。
@@ -428,7 +428,7 @@
         });
         adopt.disabled = !writable() || busy || active; block.append(adopt); if (active) block.classList.add('selected-version');
       }
-      if (live(job)) { const cancel = button('取消任务',async () => { try { await auth.json(`/api/job/${entry.job}/cancel`,'POST',{}); await poll(); } catch (error) { toast(error.message); } }); cancel.disabled = !writable() || busy; block.append(cancel); }
+      if (live(job)) { const cancel = button('取消任务',async () => { try { await auth.json(`/api/job/${entry.job}/cancel`,'POST',{}); await poll(); } catch (error) { H3Notify.error(error.message); } }); cancel.disabled = !writable() || busy; block.append(cancel); }
       container.append(block);
     }
   }
@@ -470,7 +470,7 @@
       $('node-discard').hidden = true;
       $('node-frame').src = `/?project=${encodeURIComponent(project.id)}&card=${encodeURIComponent(cardId)}&editor=1`;
       $('node-dialog').showModal();
-    } catch (error) { toast(error.message); }
+    } catch (error) { H3Notify.error(error.message); }
     finally { editorOpening = false; busy = false; renderInspector(); updateActions(); }
   }
   async function closeNodeEditor() {
@@ -482,14 +482,14 @@
       await api.flush();
       $('node-dialog').close(); $('node-frame').src = 'about:blank';
       await refreshProject(); render(); await poll();
-    } catch (error) { toast(error.message); $('node-discard').hidden = false; }
+    } catch (error) { H3Notify.error(error.message); $('node-discard').hidden = false; }
     finally { editorClosing = false; $('node-close').disabled = false; }
   }
   async function discardNodeEditor() {
     if (editorClosing || !confirm('放弃尚未保存的节点编辑并关闭？画布节点与已提交的任务不会删除。')) return;
     $('node-dialog').close(); $('node-frame').src = 'about:blank';
     try { await refreshProject(); render(); }
-    catch (error) { toast(error.message); }
+    catch (error) { H3Notify.error(error.message); }
   }
   async function createStage(shot,type) {
     if (!writable() || busy || shot[type].card) return;
@@ -500,7 +500,7 @@
     try {
       shot[type] = {...config,capability,params:structuredClone(config.params || {})}; touch(); await flush();
       busy = false; render(); await openNodeEditor(shot,type);
-    } catch (error) { toast(error.message); }
+    } catch (error) { H3Notify.error(error.message); }
     finally { busy = false; renderInspector(); updateActions(); }
   }
   async function showImport(shot = null,type = null) {
@@ -518,7 +518,7 @@
       $('import-confirm').disabled = !cards.length;
       $('import-dialog').dataset.shot = shot?.id || '';
       $('import-dialog').showModal();
-    } catch (error) { toast(error.message); }
+    } catch (error) { H3Notify.error(error.message); }
     finally { busy = false; render(); }
   }
   async function importCards() {
@@ -533,7 +533,7 @@
       project = {...project,...result.project}; mergeDocument(result.director);
       selected = shot || doc.shots.find(s => ['image','video'].some(type => cards.includes(s[type].card)))?.id || selected;
       $('import-dialog').close(); toast('已关联原画布节点，没有复制节点');
-    } catch (error) { toast(error.message); if (error.status === 409) await refreshProject(); }
+    } catch (error) { H3Notify.error(error.message); if (error.status === 409) await refreshProject(); }
     finally { busy = false; $('import-confirm').disabled = false; render(); }
   }
   async function applyStoryboard(shot) {
@@ -558,7 +558,7 @@
       project = {...project,...result.project}; mergeDocument(result.director);
       $('save-status').textContent = '已保存';
       toast(`已连线并加入${slot.label || '图片参考槽'}，固定采用的分镜版本，其他素材均保留`);
-    } catch (error) { toast(error.message); if (error.status === 409) await refreshProject(); }
+    } catch (error) { H3Notify.error(error.message); if (error.status === 409) await refreshProject(); }
     finally { busy = false; render(); }
   }
   async function poll() {
@@ -584,6 +584,10 @@
           catch (error) { if ([403,404].includes(error.status)) next.set(id,{id,unavailable:true}); }
         }));
         if (project?.id !== pid) return;
+      }
+      for (const [id, job] of next) {
+        if (job.status === 'error' && jobs.has(id) && jobs.get(id).status !== 'error')
+          H3Notify.error(`「${job.cardName || job.name || '镜头任务'}」生成失败：${job.error || '未知错误'}`);
       }
       jobs = next;
       const signature = JSON.stringify(doc.shots.map(s => [s.id,s.history.map(h => next.get(h.job)),s.selected]));
@@ -651,13 +655,13 @@
     const name = $('create-name').value.trim(); if (!name) { $('create-error').textContent = '请填写项目名称'; return; }
     submit.disabled = true;
     try { await createProject(name); $('create-dialog').close(); }
-    catch (error) { $('create-error').textContent = error.message; }
+    catch (error) { $('create-error').textContent = error.message; H3Notify.error(error.message); }
     finally { submit.disabled = false; }
   };
   $('demo').onclick = async () => {
     $('demo').disabled = true;
     try { await createProject('雨后的来信 · 导演示例',true); }
-    catch (error) { toast(error.message); }
+    catch (error) { H3Notify.error(error.message); }
     finally { $('demo').disabled = false; }
   };
   $('save').onclick = () => flush().catch(() => {});
@@ -665,7 +669,7 @@
   $('export').onclick = async () => {
     if (!doc) return;
     // 冲突时仍允许下载本页导演草稿；剪辑草稿在第五步单独下载。
-    try { await flush(); } catch (error) { toast(`未能保存，仍将导出本页方案备份：${error.message}`); }
+    try { await flush(); } catch (error) { H3Notify.error(`未能保存，仍将导出本页方案备份：${error.message}`); }
     const blob = new Blob([JSON.stringify({name:project.name,director:doc},null,2)],{type:'application/json'});
     const link = el('a'); link.href = URL.createObjectURL(blob); link.download = `${project.name.replace(/[\\/:*?"<>|]/g,'_')}-导演方案.json`;
     link.click(); setTimeout(() => URL.revokeObjectURL(link.href),1000);
@@ -704,7 +708,7 @@
       if (pid) await openProject(pid);
       updateActions();
       auth.every(poll,1800);
-    } catch (error) { toast(error.message); $('connection').textContent = '连接失败，请刷新重试'; }
+    } catch (error) { H3Notify.error(error.message); $('connection').textContent = '连接失败，请刷新重试'; }
   }
   boot();
 })();

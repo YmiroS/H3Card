@@ -516,7 +516,9 @@ test('team leader page selects multiple members and submits one atomic batch saf
     assert.equal(await dialog.locator('img').count(), 0, '确认明细中的用户名仍为纯文本');
     await dialog.getByRole('button', {name:'确认添加组员', exact:true}).click();
     assert.equal((await response).status(), 409);
-    assert.match(await dialog.getByRole('alert').innerText(), /账号状态已变化/);
+    assert.match(await dialog.locator('[data-operation-status]').innerText(), /账号状态已变化/);
+    assert.match(await page.locator('#h3-errors').innerText(), /账号状态已变化/);
+    await page.getByRole('button', {name:'关闭全部错误通知', exact:true}).click();
     await dialog.getByRole('button', {name:'取消', exact:true}).click();
     await form.getByRole('alert').waitFor({state:'visible'});
     assert.equal(await form.getByRole('alert').textContent(), '账号状态已变化，请重试');

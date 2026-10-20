@@ -169,7 +169,7 @@ async function refreshRegistrations() {
     const backlog = data.outbox || {pending:0};
     $('outbox-status').textContent = backlog.pending > 0 ? '审批通知积压 ' + backlog.pending + ' 条（最早 ' + (backlog.oldest_at ? new Date(backlog.oldest_at * 1000).toLocaleString('zh-CN', {hour12:false}) : '时间未知') + '），系统会自动重试投递。' : '审批通知投递正常。';
   } catch (error) {
-    $('metric-pending').textContent = '—'; $('outbox-status').textContent = '注册申请信息加载失败：' + error.message;
+    $('metric-pending').textContent = '—'; $('outbox-status').textContent = '注册申请信息加载失败：' + error.message; H3Notify.error($('outbox-status').textContent);
     $('registrations').replaceChildren(); emptyRow($('registrations'), '暂时无法加载注册申请，请点击刷新数据重试。', 5);
   }
 }
@@ -187,7 +187,7 @@ async function refresh() {
 // 变更与刷新分开处理：后端已成功时不把刷新失败伪装成提交失败，避免重复变更。
 async function changed(message) {
   AdminUI.toast(message);
-  try { await refresh(); } catch (error) { $('error').textContent = '操作已成功，但列表刷新失败，请点击刷新数据后继续：' + error.message; }
+  try { await refresh(); } catch (error) { $('error').textContent = '操作已成功，但列表刷新失败，请点击刷新数据后继续：' + error.message; H3Notify.error($('error').textContent); }
 }
 function openOperation({title, body, submitLabel, action, message, afterSuccess}) {
   if (mutationBusy || !ready) return;
@@ -217,8 +217,8 @@ $('grant').onsubmit = event => {
   const form = event.currentTarget, viewer = form.elements.viewer_id.value, owner = form.elements.owner_id.value, permission = form.elements.permission.value;
   $('grant-error').textContent = '';
   const isAll = owner === '*'; // 仅供 UI 选择范围，绝不作为 owner_id 发送。
-  if (!userById(viewer) || (!isAll && !userById(owner))) { $('grant-error').textContent = '请选择有效账号和授权范围。'; return; }
-  if (!isAll && viewer === owner) { $('grant-error').textContent = '访问者和所有者不能是同一个账号。'; return; }
+  if (!userById(viewer) || (!isAll && !userById(owner))) { $('grant-error').textContent = '请选择有效账号和授权范围。'; H3Notify.error($('grant-error').textContent); return; }
+  if (!isAll && viewer === owner) { $('grant-error').textContent = '访问者和所有者不能是同一个账号。'; H3Notify.error($('grant-error').textContent); return; }
   const scopeLabel = isAll ? '所有画布（' + allCanvasScope + '）' : userLabel(owner);
   const scopeNotice = isAll ? '覆盖' + allCanvasScope + '，不受所有者或项目组成员关系限制。' : '覆盖所有者当前和以后创建的全部个人画布，不包含项目组画布。';
   openOperation({title:'确认画布授权', body:`<p>访问者 A：${h(userLabel(viewer))}</p><p>所有者 / 授权范围：${h(scopeLabel)}</p><p>权限：<b>${permission === 'operate' ? '可操作（含删除）' : '只读'}</b></p><p class="notice-box danger">${h(scopeNotice)}可操作包含删除；授权不传递，也不会成为管理员。已有同范围授权将被更新，其他独立授权保留；保存后即时重新校验权限。停用账号不会因此恢复登录。</p>`, submitLabel:'确认保存授权', action:() => isAll ? H3Auth.json(globalGrantPath(viewer), 'PUT', {permission}) : H3Auth.json('/api/admin/grants', 'PUT', {viewer_id:viewer, owner_id:owner, permission}), message:'画布授权已保存'});
@@ -232,7 +232,7 @@ $('assign').onsubmit = event => {
   const target = users.find(u => u.enabled && String(u.id) === $('assign').elements.owner_id.value);
   const chosen = filteredProjects().filter(p => !p.team_id && selectedProjects.has(p.id)).map(p => ({...p}));
   if (!target || !chosen.length) return;
-  if (chosen.length > 1000) { $('error').textContent = '每次最多分配 1000 个画布，请缩小筛选范围后再选择。'; return; }
+  if (chosen.length > 1000) { $('error').textContent = '每次最多分配 1000 个画布，请缩小筛选范围后再选择。'; H3Notify.error($('error').textContent); return; }
   const rows = chosen.map(project => `<tr><td>${h(project.name || '未命名画布')}</td><td>${h(project.id)}</td><td>${h(ownerLabel(project))}</td><td>${h(userLabel(target.id))}</td></tr>`).join('');
   openOperation({title:'确认分配 ' + chosen.length + ' 个画布', body:`<p>目标账号：<b>${h(userLabel(target.id))}</b></p><p class="notice-box danger">画布内容和历史费用不变。目标用户的授权访问者也会获得相应权限（可操作包含删除）；原所有者及其授权访问者可能失去访问权限。管理员仍可访问全部画布。项目组画布不参与分配。</p><div class="dialog-list" tabindex="0" role="region" aria-label="画布分配确认明细"><table><thead><tr><th>画布名称</th><th>画布 ID</th><th>旧归属</th><th>目标归属</th></tr></thead><tbody>${rows}</tbody></table></div>`, submitLabel:'确认分配所列画布', action:async () => {
     assigning = true; syncControls();
@@ -242,8 +242,8 @@ $('assign').onsubmit = event => {
     } finally { assigning = false; syncControls(); }
   }, message:'画布归属已分配'});
 };
-$('refresh').onclick = async () => { $('error').textContent = ''; try { await refresh(); } catch (error) { $('error').textContent = error.message; } };
-H3Auth.requireUser(true).then(async user => { await AdminUI.mount({page:'permissions', user}); await refresh(); }).catch(error => { $('error').textContent = error.message; });
+$('refresh').onclick = async () => { $('error').textContent = ''; try { await refresh(); } catch (error) { $('error').textContent = error.message; H3Notify.error(error.message); } };
+H3Auth.requireUser(true).then(async user => { await AdminUI.mount({page:'permissions', user}); await refresh(); }).catch(error => { $('error').textContent = error.message; H3Notify.error(error.message); });
 })();
 </script>
 </body></html>

@@ -39,6 +39,7 @@ function cardCopyContext() {
     drawWires() {}, paintStyles() {}, pick:id => { context.selected = id; context.selIds.clear(); },
     save() { context.saved++; },
     trackNodeWork:promise => promise, toast:text => context.notices.push(text),
+    showError:text => context.notices.push(text),
     jpost:async (_url,body) => ({card:JSON.parse(JSON.stringify(body.card))}),
   });
   vm.runInContext(source.slice(source.indexOf('function cloneCard('), source.indexOf('function mergeCollaborativeCard(')) +
@@ -244,7 +245,7 @@ test('history copying is independent of prompt expansion and supports HTTP clipb
   const html = `<!doctype html><meta charset="utf-8"><link rel="stylesheet" href="/style.css">
     <div id="fixture" style="width:290px"></div><script>
     const CAPS = {}, histTime = () => '12:00', fmtEla = () => '1秒', prepareVideos = () => {};
-    window.messages = []; const toast = text => messages.push(text);
+    window.messages = []; const toast = text => messages.push(text), showError = text => messages.push(text);
     window.record = {seed:12345, user_prompt:'正面提示词\\nsecond line', negative_prompt:'负面提示词', prompt:'完整提交提示词\\n中文 & <tags> "quoted"'};
     ${functions}
     document.getElementById('fixture').appendChild(histRun({}, record, true));

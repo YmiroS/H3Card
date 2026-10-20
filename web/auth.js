@@ -141,6 +141,30 @@
     }
     .maintenance-banner-message[aria-hidden="true"] { display: none; }
   }
+  #h3-errors {
+    box-sizing: border-box; position: fixed; inset: 16px 12px auto; margin: 0 auto;
+    width: min(720px, calc(100vw - 24px)); max-height: min(55dvh, 480px); overflow: auto;
+    padding: 0; color: #fff1f2; background: #38151c; border: 2px solid #fb7185;
+    border-radius: 12px; box-shadow: 0 12px 40px #0009; z-index: 2147483647;
+    font: 14px/1.6 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif;
+    text-align: left; white-space: normal; pointer-events: auto;
+  }
+  #h3-errors[hidden] { display: none; }
+  #h3-errors::backdrop { background: transparent; pointer-events: none; }
+  #h3-errors .h3-error-heading { display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; background: #9f1239; color: #fff; }
+  #h3-errors .h3-error-heading strong { flex: 1; font-size: 16px; }
+  #h3-errors .h3-error-icon { display: grid; place-items: center; width: 24px; height: 24px;
+    border: 2px solid currentColor; border-radius: 50%; font-weight: 800; }
+  #h3-errors .h3-error-item { display: flex; align-items: flex-start; gap: 12px;
+    padding: 14px; border-top: 1px solid #fb71854d; }
+  #h3-errors .h3-error-message { flex: 1; min-width: 0; margin: 0; color: #fff1f2;
+    font: inherit; white-space: pre-wrap; overflow-wrap: anywhere; user-select: text; }
+  #h3-errors button { flex: none; display: grid; place-items: center; min-width: 36px;
+    min-height: 36px; padding: 4px 8px; margin: 0; border: 1px solid #fda4af80;
+    border-radius: 6px; background: transparent; color: #fff; font: inherit; cursor: pointer; }
+  #h3-errors button:hover { background: #ffffff20; }
+  #h3-errors button:focus-visible { outline: 2px solid #fff; outline-offset: 2px; }
   .auth-dialog {
     /* 主样式表有 * { margin: 0 } 全局重置，会吃掉原生 dialog 的 margin:auto 居中，
        这里必须显式声明，否则弹窗会跑到角落 */
@@ -178,6 +202,59 @@
   @media (prefers-reduced-motion: reduce) { .btn { transition: none; } }
   `;
   document.head.append(style);
+})();
+
+(() => {
+  let panel;
+  const entries = new Map();
+  function position() {
+    if (!panel || !entries.size) return;
+    // Keep notifications inside the active modal's focus scope and above its top layer.
+    const host = [...document.querySelectorAll('dialog:modal')].at(-1) || document.body;
+    if (panel.parentElement !== host) {
+      if (panel.hidePopover && panel.matches(':popover-open')) panel.hidePopover();
+      host.append(panel);
+    }
+    panel.style.top = document.querySelector('#maintenance-banner:not([hidden])') ? '56px' : '16px';
+    if (panel.showPopover && !panel.matches(':popover-open')) panel.showPopover();
+  }
+  function dismiss(text) {
+    const focused = panel.contains(document.activeElement);
+    entries.get(text)?.remove(); entries.delete(text);
+    if (!entries.size) {
+      if (panel.hidePopover && panel.matches(':popover-open')) panel.hidePopover();
+      panel.hidden = true;
+    } else if (focused) panel.querySelector('button').focus({preventScroll:true});
+  }
+  function error(value) {
+    const text = String(value?.message || value || '操作失败，请重试');
+    // Same-origin embedded node editors report to the visible workspace, not a clipped iframe.
+    try {
+      if (window.parent !== window && window.parent.H3Notify) return window.parent.H3Notify.error(text);
+    } catch { /* Cross-origin pages retain their own notification. */ }
+    if (!panel) {
+      panel = document.createElement('section'); panel.id = 'h3-errors'; panel.hidden = true;
+      panel.setAttribute('aria-label', '错误通知');
+      if (typeof panel.showPopover === 'function') panel.setAttribute('popover', 'manual');
+      const heading = document.createElement('div'); heading.className = 'h3-error-heading';
+      heading.innerHTML = '<span class="h3-error-icon" aria-hidden="true">!</span><strong>操作失败</strong>';
+      const close = document.createElement('button'); close.type = 'button'; close.textContent = '全部关闭';
+      close.setAttribute('aria-label', '关闭全部错误通知');
+      close.onclick = () => { for (const message of [...entries.keys()]) dismiss(message); };
+      heading.append(close); panel.append(heading);
+      new MutationObserver(position).observe(document.body, {subtree:true, childList:true, attributes:true, attributeFilter:['open','hidden']});
+    }
+    if (!entries.has(text)) {
+      const row = document.createElement('div'); row.className = 'h3-error-item';
+      const message = document.createElement('p'); message.className = 'h3-error-message';
+      message.setAttribute('role', 'alert'); message.setAttribute('aria-atomic', 'true'); message.textContent = text;
+      const close = document.createElement('button'); close.type = 'button'; close.textContent = '×';
+      close.setAttribute('aria-label', '关闭此错误通知'); close.onclick = () => dismiss(text);
+      row.append(message, close); panel.append(row); entries.set(text, row);
+      panel.hidden = false; position(); row.scrollIntoView({block:'nearest'});
+    } else { panel.hidden = false; position(); }
+  }
+  window.H3Notify = {error};
 })();
 
 (() => {
@@ -373,7 +450,7 @@
           user = data.user;
           finish();
         } catch (error) {
-          if (dialog.isConnected) { alert.textContent = error.message; input.focus(); }
+          if (dialog.isConnected) { alert.textContent = error.message; input.focus(); H3Notify.error(error.message); }
         } finally {
           busy = false; submit.disabled = exit.disabled = false; input.readOnly = false;
           submit.textContent = '保存并继续';
@@ -502,6 +579,7 @@
         } catch (error) {
           const alert = dialog.isConnected && dialog.querySelector('[role=alert]');
           if (alert) alert.textContent = error.message;
+          H3Notify.error(error.message);
         }
       };
       document.body.append(dialog); dialog.showModal();

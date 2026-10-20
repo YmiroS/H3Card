@@ -145,6 +145,7 @@
         const message = '暂时无法检查登录状态，请尝试登录或稍后重试。';
         loginError.textContent = message;
         registerError.textContent = message;
+        H3Notify.error(message);
       }
     });
 
@@ -161,6 +162,7 @@
         location.replace('/');
       } catch (error) {
         loginError.textContent = error.status ? error.message : '网络连接异常，请检查网络后重试。';
+        H3Notify.error(loginError.textContent);
         setSubmitting(loginForm, false);
         loginError.focus({preventScroll: true});
       }
@@ -173,6 +175,7 @@
       const data = Object.fromEntries(new FormData(registerForm));
       if (data.password !== data.confirm_password) {
         registerError.textContent = '两次输入的密码不一致，请重新确认。';
+        H3Notify.error(registerError.textContent);
         registerForm.elements.confirm_password.setAttribute('aria-invalid', 'true');
         registerForm.elements.confirm_password.focus();
         return;
@@ -189,6 +192,7 @@
         done.focus({preventScroll: true});
       } catch (error) {
         registerError.textContent = error.status ? error.message : '网络连接异常，请检查网络后重试。';
+        H3Notify.error(registerError.textContent);
         setSubmitting(registerForm, false);
         registerError.focus({preventScroll: true});
       }

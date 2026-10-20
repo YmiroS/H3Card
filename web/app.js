@@ -130,14 +130,13 @@ window.addEventListener('h3auth:denied', async ({detail}) => {
 const jpost = (p, b) => api(p, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b || {}) });
 const jput = (p, b) => api(p, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(b) });
 
+const showError = message => H3Notify.error(message);
 let toastTimer = null;
 function toast(msg) {
   el.toast.textContent = msg;
   el.toast.style.display = "block";
   clearTimeout(toastTimer);
-  // 按字数给时间：2.6 秒够看「已保存」，但看不完一段 API 报错
-  // （「HTTP 401 —— key 不对或者没权限」后面还跟着人家返回的原文）。
-  // 那种一闪而过等于没提示，用户只能来问人
+  // 普通提示按字数延长；错误通知由顶部组件保留至手动关闭。
   toastTimer = setTimeout(() => (el.toast.style.display = "none"),
     Math.min(2600 + Math.max(0, String(msg).length - 20) * 70, 9000));
 }
@@ -1430,7 +1429,7 @@ const bootReady = (async function boot() {
     const d = await api("/api/cards", { cache: "no-store" });
     CARDS = d.cards; CAPS = d.capabilities; ifModelLimits = d.if_model_limits || {};
     el.dot.classList.toggle("on", !!d.comfy_online);
-  } catch (e) { toast("后端未就绪：" + e.message); if (!H3Auth.active) return; }
+  } catch (e) { showError("后端未就绪：" + e.message); if (!H3Auth.active) return; }
   await loadProjects();
   bindGlobal();
   // 显式链接优先，其次恢复本账号上次画布；首次进入仍打开示例。
@@ -1576,9 +1575,11 @@ async function loadProjects() {
       if (del) del.onclick = async (ev) => {
         ev.stopPropagation();
         if (!confirm(`删除项目「${p.name}」？（文件会保留为 .deleted）`)) return;
-        await api(`/api/projects/${p.id}`, { method: "DELETE" });
-        if (PROJ && PROJ.id === p.id) { PROJ = null; closePanel(); showEmpty(); }
-        loadProjects();
+        try {
+          await api(`/api/projects/${p.id}`, { method: "DELETE" });
+          if (PROJ && PROJ.id === p.id) { PROJ = null; closePanel(); showEmpty(); }
+          await loadProjects();
+        } catch (error) { showError("删除画布失败：" + error.message); }
       };
       container.appendChild(d);
     }
@@ -1588,7 +1589,7 @@ async function loadProjects() {
 async function openShareDialog(project) {
   let data;
   try { data = await api(`/api/projects/${encodeURIComponent(project.id)}/shares`); }
-  catch (error) { return toast('共享设置加载失败：' + error.message); }
+  catch (error) { return showError('共享设置加载失败：' + error.message); }
 
   const dialog = document.createElement('dialog');
   dialog.className = 'auth-dialog project-share-dialog';
@@ -1638,7 +1639,7 @@ async function openShareDialog(project) {
         ? `已分享给 ${body.user_ids.length + body.team_ids.length} 个个人或项目组`
         : '已取消全部分享');
     } catch (saveError) {
-      error.textContent = saveError.message; submit.disabled = false; submit.textContent = '确定分享';
+      error.textContent = saveError.message; showError(saveError.message); submit.disabled = false; submit.textContent = '确定分享';
     }
   };
   document.body.appendChild(dialog); dialog.showModal();
@@ -1650,9 +1651,11 @@ async function newProject() {
   const spaceName = teamId ? teams.find(team => team.id === teamId)?.name : '个人空间';
   const name = prompt(`在「${spaceName || '项目组'}」新建画布`, "新项目 " + new Date().toLocaleDateString("zh-CN"));
   if (name === null) return;
-  const p = await jpost("/api/projects", { name, team_id: teamId });
-  await loadProjects();
-  openProject(p.id);
+  try {
+    const p = await jpost("/api/projects", { name, team_id: teamId });
+    await loadProjects();
+    await openProject(p.id);
+  } catch (error) { showError("新建画布失败：" + error.message); }
 }
 
 async function renameProject(project) {
@@ -1675,7 +1678,7 @@ async function renameProject(project) {
     if (el.jobs.style.display !== "none") renderJobs();
     await loadProjects();
   } catch (error) {
-    toast("项目重命名失败：" + error.message);
+    showError("项目重命名失败：" + error.message);
   }
 }
 
@@ -1686,7 +1689,7 @@ async function openProject(pid) {
   disconnectPresence();
   const opening = ++openingProject;
   try { const project = await api(`/api/projects/${encodeURIComponent(pid)}`); if (opening !== openingProject || !H3Auth.active) return; PROJ = project; }
-  catch (e) { return toast(e.message); }
+  catch (e) { return showError(e.message); }
   const spaces = projectSpaces(PROJ);
   if (!spaces.includes(selectedSpace)) selectedSpace = spaces[0] || 'personal';
   syncSpaceOptions();
@@ -1860,7 +1863,7 @@ function saveView() {
       try {
         await jput(`/api/projects/${encodeURIComponent(expectedId)}/view`, snapshot);
       } catch (error) {
-        if (PROJ?.id === expectedId) toast("视图保存失败：" + error.message);
+        if (PROJ?.id === expectedId) showError("视图保存失败：" + error.message);
       }
     });
   }, 400);
@@ -1952,7 +1955,7 @@ async function doSave(expectedId = PROJ?.id) {
       toast("画布在别处被改过，已重新加载");
       await openProject(id);
     } else {
-      toast("保存失败：" + e.message);
+      showError("保存失败：" + e.message);
     }
     return { ok: false, error: e };
   } finally {
@@ -3714,13 +3717,13 @@ function bindGlobal() {
           try {
             const item = await uploadAsset(file);
             const assetCard = CARDS.find(d => d.kind === "asset");
-            if (!assetCard) return toast("找不到素材节点定义");
+            if (!assetCard) return showError("找不到素材节点定义");
             const c = addCard(assetCard.id, at.x, at.y, assetCard.modes[0].id);
             if (!c) return;
             await setAssetItem(c, item);
             toast("已上传：" + item.origin);
           } catch (err) {
-            toast("上传失败：" + err.message);
+            showError("上传失败：" + err.message);
           }
         };
         input.click();
@@ -3765,7 +3768,7 @@ function bindGlobal() {
         if (!card) return;
         toast(`已建素材节点：${item.origin || drag.output.filename || "历史产物"}`);
       } catch (error) {
-        if (PROJ === drag.project) toast("导入历史产物失败：" + error.message);
+        if (PROJ === drag.project) showError("导入历史产物失败：" + error.message);
       }
       return;
     }
@@ -3785,7 +3788,7 @@ function bindGlobal() {
         toast(`已建素材节点：${item.origin || f.name}`);
         at.x += 50; at.y += 50;   // 多个文件时错开位置
       } catch (e) {
-        if (PROJ === project) toast(`上传失败 ${f.name}：${e.message}`);
+        if (PROJ === project) showError(`上传失败 ${f.name}：${e.message}`);
       }
     }
   });
@@ -4221,7 +4224,7 @@ async function openDirectorCard(c) {
     const link = document.createElement("a");
     link.href = url; link.target = "_blank"; link.rel = "noopener"; link.textContent = "打开导演镜头";
     el.toast.append(" · ", link);
-  } catch (error) { toast("导演台操作失败：" + error.message); }
+  } catch (error) { showError("导演台操作失败：" + error.message); }
 }
 
 function cardMenu(cx, cy, c) {
@@ -4505,7 +4508,7 @@ function queueCardCreate(card, preserveLocal = false) {
       if (preserveLocal ? PROJ === project : PROJ?.id === projectId) {
         workFailure = error;
         rollbackFailedCard(card);
-        toast("卡片添加失败：" + error.message);
+        showError("卡片添加失败：" + error.message);
       }
     } finally {
       pendingCardCreates = Math.max(0, pendingCardCreates - 1);
@@ -4519,7 +4522,7 @@ function addCard(type, x, y, cap, select = true) {
   if (!requireOperate()) return null;
   const def = cardDef(type);
   if (!def || !def.modes || !def.modes.length) {
-    toast(`节点类型 ${type} 不可用：找不到定义或没有模式`);
+    showError(`节点类型 ${type} 不可用：找不到定义或没有模式`);
     return null;
   }
   const c = { id: uid(), type, cap: cap || modeCap(def.modes[0]), x: Math.round(x), y: Math.round(y), params: {}, assets: {}, status: null, progress: 0, outputs: [] };
@@ -4705,7 +4708,7 @@ function pasteCopiedCard(snapshot, at) {
         if (chain === saveChain) break;
       }
       return insertPastedCard(cards, at);
-    } catch (error) { toast(`粘贴失败：${error.message}`); }
+    } catch (error) { showError(`粘贴失败：${error.message}`); }
   })());
 }
 
@@ -4808,7 +4811,7 @@ async function pasteClipboardMedia(files, project, target) {
       toast(`已导入${KIND_ZH[kind]}素材并引用到「${titleOf(target)}」的${slotName(plan.slot,target)}`);
     }
   } catch (error) {
-    if (PROJ === project) toast('剪贴板导入失败：' + error.message);
+    if (PROJ === project) showError('剪贴板导入失败：' + error.message);
   }
 }
 function handleClipboardPaste(event) {
@@ -4986,7 +4989,7 @@ async function linkTo(from, to) {
       if (selId === to.id) openPanel(to.id);
     }
     save();
-    toast("引用失败：" + e.message);
+    showError("引用失败：" + e.message);
   }
 }
 
@@ -5518,7 +5521,7 @@ async function copyHistoryText(value, message) {
     }
     toast(message);
   } catch (_) {
-    toast("复制失败，请展开后手动选中文字复制");
+    showError("复制失败，请展开后手动选中文字复制");
   }
 }
 
@@ -5763,7 +5766,7 @@ async function openImageComposer(c) {
         toast("图片合成已保存，可从输出端口连接下游节点");
       },
     });
-  } catch (error) { toast("图片合成：" + error.message); }
+  } catch (error) { showError("图片合成：" + error.message); }
 }
 
 /* ================= 参数面板 ================= */
@@ -6074,7 +6077,7 @@ function openPanel(id) {
           },
         }))
         : [{text: ifModelsError ? "重试连接本机 IF" : "正在读取本机 IF 模型…",
-            run: () => loadIFModels().catch(error => toast(error.message))}]);
+            run: () => loadIFModels().catch(error => showError(error.message))}]);
       foot.appendChild(modelBtn);
     }
 
@@ -6442,7 +6445,7 @@ async function runText(c) {
     workFailure = e;
     paint(c);
     if (el.panel._id === c.id) openPanel(c.id);
-    toast(e.message);
+    showError(e.message);
   }
   save();
 }
@@ -7260,7 +7263,7 @@ async function translatePrompt(c, s) {
     c._rwErr = { key: s.key, msg: e.message };
     workFailure = e;
     repanel(c);
-    toast("翻译失败：" + e.message);
+    showError("翻译失败：" + e.message);
   }
 }
 
@@ -7426,6 +7429,7 @@ async function rewritePrompt(c, s, model) {
   } catch (e) {
     c._rwErr = { key: s.key, msg: e.message };
     workFailure = e;
+    showError("优化失败：" + e.message);
   }
   c._rwBusy = false;
   repanel(c);
@@ -7871,7 +7875,7 @@ function pickFile(c, s) {
     try {
       putAsset(c, s, await uploadAsset(f, capOf(c)?.execution === "browser"));
       openPanel(c.id); save();
-    } catch (e) { workFailure = e; toast("上传失败：" + e.message); }
+    } catch (e) { workFailure = e; showError("上传失败：" + e.message); }
   })());
   el.picker.click();
 }
@@ -7889,7 +7893,7 @@ function pickAsset(c, onItem) {
       const item = await uploadAsset(f);
       if (onItem) await onItem(item);
       else await setAssetItem(c, item);
-    } catch (e) { workFailure = e; toast("上传失败：" + e.message); }
+    } catch (e) { workFailure = e; showError("上传失败：" + e.message); }
   })());
   el.picker.click();
 }
@@ -8119,7 +8123,7 @@ async function augFrames(c, s, row) {
     Object.assign(a, await api("/api/media?ref=" + encodeURIComponent(a.ref)
       + "&project=" + encodeURIComponent(PROJ.id)));
     if (a.frames) save();
-  } catch (e) { toast(`读取媒体信息失败：${e.message}`); }
+  } catch (e) { showError(`读取媒体信息失败：${e.message}`); }
   miss = "总帧数读不出来（填 0 = 整段，一定没错）";
   draw();
 }
@@ -8402,7 +8406,7 @@ async function runIF(c) {
     rememberIFTask(c, project.id, 'running');
     if (el.hist._id === c.id) openHistory(c.id);
     const persisted = await saveIFTaskProject(c, project.id);
-    if (!persisted.ok) toast('IF 任务已提交，服务器状态保存失败；已保留本标签页恢复记录，请勿重复生成');
+    if (!persisted.ok) showError('IF 任务已提交，服务器状态保存失败；已保留本标签页恢复记录，请勿重复生成');
     pollIF(c, project.id);
   } catch (error) {
     if (!submitted && assetIds.length) await Promise.allSettled(assetIds.map(assetId =>
@@ -8412,7 +8416,7 @@ async function runIF(c) {
     if (submissionAttempted && !submitted && (error instanceof TypeError || error instanceof SyntaxError))
       c.error = 'IF 提交结果尚未确认，请先在 IF 查看是否已创建任务，避免重复生成：' + error.message;
     rememberIFTask(c, project.id, 'error');
-    toast(c.error); await saveIFTaskProject(c, project.id);
+    showError(`「${titleOf(c)}」生成失败：${c.error}`); await saveIFTaskProject(c, project.id);
   }
   if (PROJ === project && project.cards.includes(c)) {
     paint(c); if (el.panel._id === c.id) openPanel(c.id);
@@ -8478,7 +8482,7 @@ async function pollIF(c, projectId) {
       c.ms = Date.now() - (c.if_started || Date.now());
       if (c.job) pushHistory(c, {id:c.job, capability:c.if_job_cap || c.cap});
       if (el.hist._id === c.id) openHistory(c.id);
-      toast(error.message);
+      showError(`「${titleOf(c)}」生成失败：${error.message}`);
     }
   } finally {
     c._ifPolling = false;
@@ -8497,7 +8501,7 @@ async function runCard(c) {
   if (isText(c)) return runText(c);
   if (c.status === "queued" || c.status === "running") return;
   const cap = capOf(c);
-  if (!cap) return toast("能力不可用");
+  if (!cap) return showError("能力不可用");
   if (cap.id === "image_composite" && cap.execution === "browser") return openImageComposer(c);
   if (cap.execution === "if_studio") return runIF(c);
   if (c.director_shot) {
@@ -8521,7 +8525,7 @@ async function runCard(c) {
   } catch (e) {
     c.status = "error"; c.error = e.message; c.job = null;
     workFailure = e;
-    toast(e.message);
+    showError(`「${titleOf(c)}」提交失败：${e.message}`);
   }
   if (c.director_shot) pendingDirectorRuns = Math.max(0, pendingDirectorRuns - 1);
   paint(c); if (el.panel._id === c.id) openPanel(c.id);
@@ -8530,7 +8534,7 @@ async function runCard(c) {
 
 async function cancel(c) {
   if (!c.job) return;
-  try { await jpost(`/api/job/${c.job}/cancel`); } catch (e) { toast(e.message); }
+  try { await jpost(`/api/job/${c.job}/cancel`); } catch (e) { showError(e.message); }
 }
 
 async function propagateCardOutputs(c) {
@@ -8546,7 +8550,10 @@ async function propagateCardOutputs(c) {
       try {
         const imported = await importOutput(outputs[i], capOf(to)?.execution === "browser");
         if (PROJ === project && project.edges.includes(e) && cardOf(to.id)) to.assets[slots[i]] = imported;
-      } catch (error) { console.error("导入产物失败:", error); }
+      } catch (error) {
+        console.error("导入产物失败:", error);
+        if (PROJ === project) showError(`向「${titleOf(to)}」导入产物失败：${error.message}`);
+      }
     }
     if (PROJ !== project) return;
     refreshVideoParameters(to);
@@ -8596,7 +8603,7 @@ async function pollJobs() {
         if (el.hist._id === c.id) openHistory(c.id);
         await propagateCardOutputs(c);
       }
-      if (c.status === "error") toast(c.error || "生成失败");
+      if (c.status === "error") showError(`「${titleOf(c)}」生成失败：${c.error || "未知错误"}`);
     }
   }
   if (dirty) save(false);
@@ -8800,7 +8807,7 @@ function actBtn(text, run, danger) {
 
 async function stopTask(j) {
   if (!canTask(j)) return toast("此任务关联的画布为只读，不能停止");
-  try { await jpost(`/api/job/${j.id}/cancel`); } catch (e) { return toast(e.message); }
+  try { await jpost(`/api/job/${j.id}/cancel`); } catch (e) { return showError(e.message); }
   pollJobs();
 }
 
@@ -8808,12 +8815,12 @@ async function delTask(j) {
   if (!canTask(j)) return toast("此任务关联的画布为只读，不能删除");
   // 还在跑的删掉等于先停后删，这一步不可逆（跑到一半的算力就没了），所以问一句
   if (jobLive(j) && !confirm("这个任务还没跑完，删除会先把它停掉。继续？")) return;
-  try { await api(`/api/job/${j.id}`, { method: "DELETE" }); } catch (e) { return toast(e.message); }
+  try { await api(`/api/job/${j.id}`, { method: "DELETE" }); } catch (e) { return showError(e.message); }
   pollJobs();
 }
 
 async function clearDoneJobs() {
-  try { await jpost("/api/jobs/clear"); } catch (e) { return toast(e.message); }
+  try { await jpost("/api/jobs/clear"); } catch (e) { return showError(e.message); }
   pollJobs();
 }
 

@@ -57,7 +57,7 @@
     };
     return result;
   }
-  const notify = text => config?.toast?.(text);
+  const notify = text => H3Notify.error(text);
   function editableSnapshot() {
     const {ratio, resolution, fps, clips, audio, texts} = documentEdit;
     return clone({ratio, resolution, fps, clips, audio, texts});
