@@ -370,7 +370,12 @@ const capOf = (c) => {
   const bridge = limits?.type === cap.outputType ? limits.bridge : null;
   const inputs = cap.inputs.filter(s => s.key !== "if_reference" || bridge?.image || bridge?.video)
     .map(s => s.key === "if_reference" ? {...s,
-      label:`参考${bridge?.image ? "图片" : ""}${bridge?.image && bridge?.video ? "／" : ""}${bridge?.video ? "视频" : ""} HTTPS 地址（可选）`} : s);
+      label:`参考${bridge?.image ? "图片" : ""}${bridge?.image && bridge?.video ? "／" : ""}${bridge?.video ? "视频" : ""} HTTPS 地址（可选）`}
+      : s.key === "duration" ? {...s, min:limits?.duration?.min ?? 1, max:limits?.duration?.max ?? null,
+        type:limits?.duration?.max != null ? "slider" : "number", step:1,
+        default:limits?.duration?.default ?? s.default, showHint:true,
+        hint:limits?.duration?.max != null ? `当前模型时长：${limits.duration.min}–${limits.duration.max} 秒（整数）。`
+          : "当前模型时长范围未核实；请输入正整数秒，不套用其他模型上限。"} : s);
   for (let i = 0; i < (bridge?.image || 0); i++)
     inputs.push({key:`images[${i}]`, label:"参考图片", type:"image"});
   for (let i = 0; i < (bridge?.video || 0); i++)
@@ -384,6 +389,14 @@ const capOf = (c) => {
   return {...cap, inputs, slotLimits:{image:{max:bridge?.image || 0},
     video:{max:bridge?.video || 0}, audio:{max:0}}};
 };
+
+function normalizeIFDuration(c) {
+  const spec = capOf(c)?.inputs.find(s => s.key === "duration");
+  if (!spec) return;
+  const seconds = Number(c.params.duration ?? spec.default);
+  c.params.duration = Math.min(spec.max ?? Infinity,
+    Math.max(spec.min, Number.isFinite(seconds) ? Math.round(seconds) : spec.default));
+}
 
 /** 路由节点上放进这种素材该切到哪一路（已经在那一路上就返回 null）。
     和 ladder 不一样，这里两条工作流的参数完全不同，画不出一张"并集"面板，
@@ -595,9 +608,9 @@ function imageClarityPicker(c, cap, onchange) {
 const whClaritySteps = cap => cap.outputType === "video"
   ? H3_P.map(p => ({ id: `${p}p`, label: `${p}p`, val: p })) : CLARITY_STEPS;
 const supportsVideoReference = cap => cap?.kind === "gen" && cap.outputType === "video"
-  && cap.id.startsWith("minimax_h3_") && cap.inputs.some(s => s.type === "video");
+  && (cap.execution === "if_studio" || (cap.id.startsWith("minimax_h3_") && cap.inputs.some(s => s.type === "video")));
 const referenceVideo = (c, cap) => supportsVideoReference(cap)
-  ? cap.inputs.filter(s => s.type === "video").map(s => c.assets?.[s.key]).find(a => a?.ref) : null;
+  ? (isIF(c) ? capOf(c) : cap).inputs.filter(s => s.type === "video").map(s => c.assets?.[s.key]).find(a => a?.ref) : null;
 const videoMetadataReady = a => a && [a.width, a.height, a.duration].every(v => Number.isFinite(+v) && +v > 0);
 const referenceMetadata = new WeakMap();
 
@@ -619,7 +632,7 @@ async function ensureReferenceMetadata(c, cap = CAPS[runCap(c)] || capOf(c)) {
 }
 function refreshReferencePreview(c) {
   if (!PROJ?.cards.includes(c) || el.panel._id !== c.id) return;
-  const cap = CAPS[runCap(c)] || capOf(c);
+  const cap = isIF(c) ? capOf(c) : CAPS[runCap(c)] || capOf(c);
   const button = el.panel.querySelector('button[title^="点开弹窗"]');
   if (button) button.textContent = `⚙ ${paramsBrief(c, cap) || "参数"}`;
   if (el.respop._card === c && el.respop.style.display !== "none") {
@@ -640,7 +653,7 @@ function syncReferenceParameters(c, cap = CAPS[runCap(c)] || capOf(c)) {
   if (pending?.identity === identity && pending.source === source) return pending.promise;
   const project = PROJ, params = c.params;
   const before = {...params};
-  const state = {identity, source};
+  const state = {identity, source, before};
   c._referenceParameters = state;
   const apply = () => {
     if (PROJ !== project || !project.cards.includes(c) || c.params !== params
@@ -665,7 +678,10 @@ function syncReferenceParameters(c, cap = CAPS[runCap(c)] || capOf(c)) {
     // 人物迁移的 duration 是单段长度，不是成片总时长。
     const preview = cap.inputs.some(s => s.key === "preview_seconds");
     const key = preview ? "preview_seconds" : "duration";
-    if (unchanged([key])) params[key] = preview ? 0 : Math.max(1, Math.round(+source.duration));
+    if (unchanged([key])) {
+      params[key] = preview ? 0 : Math.max(1, Math.round(+source.duration));
+      if (isIF(c)) normalizeIFDuration(c);
+    }
     params._reference_video = identity;
     save();
   };
@@ -1166,7 +1182,7 @@ function capBrief(cap) {
   }
   if (!mediaKinds.length) need.push("不需要素材，纯提示词驱动");
   if (txts.length) need.push(txts.length > 1 ? `提示词 ×${txts.length}` : "提示词");
-  if (dur) opt.push(`时长 ${dur.min}–${dur.max} 秒`);
+  if (dur) opt.push(dur.max == null ? "时长范围未核实（正整数秒）" : `时长 ${dur.min}–${dur.max} 秒`);
   if (cap.imageControls) {
     opt.push(`清晰度 ${CLARITY_STEPS.map(s => s.label).join(" / ")}（短边）`);
     opt.push(cap.imageControls.mode === "i2i" ? "默认原图比例，也可另选画面比例" : "画面比例（13 档）");
@@ -5762,7 +5778,7 @@ function openPanel(id) {
   // 合并模式的槽位按图槽最多那条画（它是超集），但默认值得取「按当前张数真正会跑的
   // 那条」。不这么做的话，面板显示的是首尾帧那条的示例提示词，只传一张图跑的却是
   // 图生视频那条的示例提示词 —— 看到的和出片的不是一回事。
-  const rcap = CAPS[runCap(c)];
+  const rcap = isIF(c) ? cap : CAPS[runCap(c)];
   let specs = (rcap && rcap !== cap)
     ? cap.inputs.map((s) => {
       const o = rcap.inputs.find(x => x.key === s.key);
@@ -5948,7 +5964,13 @@ function openPanel(id) {
         ? available.map(entry => ({
           text: entry.display_name + (entry.display_name === chosen ? "（当前）" : ""),
           run: () => {
-            c.params.if_model = entry.display_name; openPanel(id); save();
+            closeResPop(); c.params.if_model = entry.display_name;
+            const pending = c._referenceParameters;
+            const untouched = pending && c.params.duration === pending.before.duration;
+            normalizeIFDuration(c);
+            // 切模型的自动限幅不是手动编辑，不能阻断尚未完成的参考视频回填。
+            if (untouched) pending.before.duration = c.params.duration;
+            openPanel(id); save();
           },
         }))
         : [{text: ifModelsError ? "重试连接本机 IF" : "正在读取本机 IF 模型…",
@@ -7849,7 +7871,24 @@ function rowEl(c, s) {
   const cur = c.params[s.key] != null ? c.params[s.key]
     : (s.type === "seed" ? -1 : s.default);
 
-  if (s.type === "slider") {
+  if (isIF(c) && s.key === "duration") {
+    const n = document.createElement("input"); n.type = "number";
+    n.min = s.min; if (s.max != null) n.max = s.max;
+    n.step = 1; n.required = true; n.value = cur; n.style.width = "72px";
+    const r = s.max != null ? document.createElement("input") : null;
+    if (r) {
+      r.type = "range"; r.min = s.min; r.max = s.max; r.step = 1; r.value = cur;
+      r.oninput = () => { n.value = r.value; c.params.duration = Number(r.value); save(); };
+      row.appendChild(r);
+    }
+    n.oninput = () => { c.params.duration = n.value === "" ? "" : Number(n.value); if (r) r.value = n.value; save(); };
+    n.onchange = () => {
+      normalizeIFDuration(c); n.value = c.params.duration;
+      if (r) r.value = n.value;
+      save();
+    };
+    row.appendChild(n);
+  } else if (s.type === "slider") {
     const r = document.createElement("input"); r.type = "range";
     r.min = s.min != null ? s.min : 1; r.max = s.max != null ? s.max : 30; r.step = s.step || 1;
     const cap = CAPS[runCap(c)] || capOf(c);
@@ -8121,6 +8160,7 @@ async function runIF(c) {
   paint(c); if (el.panel._id === c.id) openPanel(c.id);
   try {
     const models = await loadIFModels();
+    await syncReferenceParameters(c);
     if (PROJ !== project || !canOperate() || !project.cards.includes(c) || c.cap !== capability)
       throw new Error("画布已切换或权限已变化，已取消 IF 提交");
     const type = capOf(c).outputType;
@@ -8166,8 +8206,10 @@ async function runIF(c) {
         Number.isFinite(pixels) && pixels >= mp.min && pixels <= mp.max ? pixels : mp.default);
       const spec = specs.find(s => s.key === "duration");
       const seconds = Number(c.params.duration ?? spec.default);
-      requirements.push(`分辨率 ${resolution[0]}×${resolution[1]}`,
-        `视频时长约 ${Number.isFinite(seconds) && seconds >= spec.min && seconds <= spec.max ? seconds : spec.default} 秒`);
+      if (!Number.isSafeInteger(seconds) || seconds < spec.min || (spec.max != null && seconds > spec.max))
+        throw new Error(spec.max != null ? `当前 IF 模型时长须为 ${spec.min}–${spec.max} 秒的整数，请修改时长`
+          : "当前 IF 模型时长范围未核实，请输入正整数秒");
+      requirements.push(`分辨率 ${resolution[0]}×${resolution[1]}`, `视频时长约 ${seconds} 秒`);
       const seed = Number(c.params.seed ?? -1);
       if (Number.isSafeInteger(seed) && seed >= 0) requirements.push(`随机种子参考 ${seed}`);
     }
