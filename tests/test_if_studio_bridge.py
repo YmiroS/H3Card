@@ -222,12 +222,15 @@ class BridgeTest(unittest.TestCase):
             asset_path = self.bridge.assets[asset_id][0]
             created = threading.Event()
             release = threading.Event()
-            calls = []
+            calls, steps = [], []
 
             def command(*args, **_):
                 if args[0] == 'models':
                     return MODELS
                 calls.append(args)
+                with self.bridge.lock:
+                    job = next(iter(self.bridge.jobs.values()))
+                    steps.append((job['state'], job.get('step')))
                 if args[0] == 'upload':
                     self.assertEqual(args[1], str(asset_path))
                     self.assertTrue(asset_path.exists())
@@ -251,6 +254,10 @@ class BridgeTest(unittest.TestCase):
                 self.assertEqual(code, 202)
                 self.assertTrue(created.wait(2))
                 try:
+                    _, _, pending = self.request('GET', '/runs/' + body['id'])
+                    self.assertEqual(pending['state'], 'starting')
+                    self.assertEqual(pending['step'], '正在上传 IF 引用素材（1/1）')
+                    self.assertNotIn('progress', pending)
                     self.assertEqual(self.run_request(asset_id=asset_id)[0], 400)
                 finally:
                     release.set()
@@ -265,6 +272,12 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(len([args for args in calls if args[:2] == ('canvas', 'run')]), 2)
             self.assertEqual(len([args for args in calls if args[0] == 'upload']), 1)
             self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
+            self.assertEqual(steps, [
+                ('starting', '正在上传 IF 引用素材（1/1）'),
+                ('starting', '正在登记 IF 参考素材「图片1」（1/1）'),
+                ('starting', '正在向 IF 提交图片生成需求'),
+                ('running', 'IF 正在生成图片，等待产物'),
+            ])
 
     def test_video_asset_uploads_once_then_registers_before_final_prompt(self):
         with mock.patch('if_studio_bridge.LIMITS_FILE') as limits:

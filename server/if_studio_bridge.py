@@ -89,6 +89,9 @@ class Bridge(ThreadingHTTPServer):
                 references.append(request['image'])
             video = request.get('type') == 'video'
             for index, path in enumerate(asset_paths):
+                with self.lock:
+                    self.jobs[job_id] = {'state': 'starting',
+                        'step': f'正在上传 IF 引用素材（{index + 1}/{len(asset_paths)}）'}
                 try:
                     uploaded = self.command('upload', str(path), '--profile', 'buc', '--json', timeout=60)
                 finally:
@@ -116,10 +119,16 @@ class Bridge(ThreadingHTTPServer):
                     counts[media] += 1
                     name = f'{media}{counts[media]}'
                     names.append(name)
+                    with self.lock:
+                        self.jobs[job_id] = {'state': 'starting',
+                            'step': f'正在登记 IF 参考素材「{name}」（{index + 1}/{len(references)}）'}
                     prompt = (f'这是参考素材「{name}」，引用名为「{name}」。仅登记该素材及其内容、镜头信息，'
                               '本轮不要生成任何内容，不要调用生图或生视频工具。'
                               '等待全部参考素材登记完成后的总需求轮，再统一生成。')
                 else:
+                    with self.lock:
+                        self.jobs[job_id] = {'state': 'starting',
+                            'step': f'正在向 IF 提交{"视频" if video else "图片"}生成需求'}
                     flags += ['--model', request['model']]
                     if names:
                         prompt = f'基于以上已登记的全部参考素材（{"、".join(names)}），执行以下总需求：\n\n{prompt}'
@@ -132,7 +141,8 @@ class Bridge(ThreadingHTTPServer):
                 canvas_id, session_id = created['canvas_id'], created['session_id']
             created['submitted_prompt'] = prompt
             with self.lock:
-                self.jobs[job_id] = {'state': 'running', 'result': created}
+                self.jobs[job_id] = {'state': 'running', 'result': created,
+                    'step': f'IF 正在生成{"视频" if video else "图片"}，等待产物'}
             folder = Path(self.workspace.name) / job_id
             folder.mkdir()
             poll_args = ('canvas', 'poll', '--profile', 'buc', '--canvas-id', created['canvas_id'],
@@ -472,7 +482,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.server.asset_slots -= 1
                 self.server.asset_bytes -= asset[2]
             job_id = secrets.token_urlsafe(18)
-            self.server.jobs[job_id] = {'state': 'starting'}
+            self.server.jobs[job_id] = {'state': 'starting', 'step': '本机 IF 正在准备生成任务'}
         try:
             threading.Thread(target=self.server.generate, args=(job_id, data, asset_paths), daemon=True).start()
         except RuntimeError:
