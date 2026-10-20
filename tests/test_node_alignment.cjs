@@ -150,7 +150,7 @@ test('菜单：五项映射、布尔返回值以及回调重新校验权限和�
     assert.equal(s.selectionMenu(123,456), true);
     const menu = s.menus[0];
     assert.deepEqual([menu.x,menu.y,menu.title], [123,456,'选中节点']);
-    assert.deepEqual(Array.from(menu.items, item => item.text), ['对齐方式', '批量重命名（4 个节点）', '批量删除（4 个节点）']);
+    assert.deepEqual(Array.from(menu.items, item => item.text), ['对齐方式', '复制选中节点（4 个）', '批量重命名（4 个节点）', '批量删除（4 个节点）']);
     assert.deepEqual(Array.from(menu.items[0].children, item => item.text), labels);
     menu.items[0].children[index].run();
     assert.deepEqual(cards.slice(0,4).map(c => [c.x,c.y]), expected[mode]);
@@ -525,7 +525,7 @@ const deletion = [
   block('function mediaSlotsForOutputs(', '/** 用户手动换掉某一格'),
   block('function askDelMany(', '\nfunction pickEdge('),
   block('function delCard(', '/** 单节点删除统一确认'),
-  block('function askDelCard(', '/** Ctrl+C 存下的那个节点'),
+  block('function askDelCard(', '/** Ctrl+C 存下的节点快照'),
 ].join('\n');
 function deletionFixture() {
   const fixture = geometryFixture(), s = fixture.context, calls = fixture.calls;
@@ -722,7 +722,7 @@ test('批量菜单：危险项重新验证项目、权限及至少两个当前�
   for (const change of ['unchanged','permission','one','missing','deleted','project','closed']) {
     const {context:s,calls} = deletionFixture();
     s.selectionMenu(10,20);
-    const item = s.menus[0].items[2];
+    const item = s.menus[0].items.find(item => item.danger);
     assert.equal(item.text, '批量删除（2 个节点）');
     assert.equal(item.danger, true);
     if (change === 'permission') s.allowed = false;
@@ -767,7 +767,15 @@ function browserFixture(platform) {
     const linkTo = () => linked++, spawnDownstream = () => spawned++;
     const CARDS = [{id:'text',kind:'text',modes:[]},{id:'image',kind:'gen',name:'生图',modes:[]},
       {id:'video',kind:'gen',name:'生视频',modes:[]},{id:'tools',kind:'tool',modes:[{name:'放大'}]}];
-    const CLIP = {id:'copied'};
+    let saveChain = Promise.resolve(), copyWork = Promise.resolve(), copyId = 0;
+    const trackNodeWork = work => copyWork = work, clipboardPasteTarget = () => null;
+    const paintStyles = () => {}, paintPort = () => {};
+    function addCard(type,x,y,cap) {
+      const card = {id:'copy-' + ++copyId,type,x,y,cap,outputs:[]};
+      PROJ.cards.push(card); el.world.appendChild(buildCard(card)); return card;
+    }
+    ${block('let CLIP = null;', 'const CLIPBOARD_MEDIA_EXT').replace('let mouseW = null;', '')}
+    CLIP = [{id:'copied'}];
     ${geometry}
     ${block('function applyView(', '/* ================= 小地图')}
     ${block('const NODRAG =', '/* 全屏幕只许一个东西在响')}
@@ -780,7 +788,7 @@ function browserFixture(platform) {
     ${block('function showMenu(', '/** 面板底部工具条')}
     ${block('function cardMenu(', '/** 把一份产物下载到本地')}
     ${deletion}
-    ${block('function askDelCard(', '/** Ctrl+C 存下的那个节点')}
+    ${block('function askDelCard(', '/** Ctrl+C 存下的节点快照')}
     const drawWires = () => paintSel();
     const render = () => {
       rendered++; el.world.replaceChildren();
@@ -864,6 +872,45 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           }
         });
 
+        await t.test('框选后快捷键与右键菜单均批量复制粘贴，输入框保留原生快捷键', async () => {
+          for (const entry of ['keyboard','menu']) {
+            await reset();
+            await page.evaluate(() => {
+              for (const card of PROJ.cards) card.type = 'image';
+              PROJ.edges = [{from:'a',to:'b',slot:'image'}];
+            });
+            await drag([90,90],[650,400]);
+            assert.deepEqual(await selection(), ['a','b']);
+            const modifier = platform === 'MacIntel' ? 'Meta' : 'Control';
+            if (entry === 'keyboard') await page.keyboard.press(modifier + '+c');
+            else {
+              await rightClick('.card[data-id="a"] .body');
+              await page.getByRole('button',{name:'复制选中节点（2 个）',exact:false}).click();
+            }
+            assert.equal(await page.evaluate(() => CLIP.length),2);
+            await page.keyboard.press(modifier + '+v');
+            await page.evaluate(() => copyWork);
+            assert.equal(await page.evaluate(() => PROJ.cards.length),5);
+            const pasted = await selection();
+            assert.equal(pasted.length,2);
+            assert.ok(pasted.every(id => !['a','b','c'].includes(id)));
+            assert.deepEqual(await page.evaluate(() => {
+              const [a,b] = [...selIds].map(cardOf);
+              return [b.x - a.x,b.y - a.y,PROJ.edges.some(edge => edge.from === a.id && edge.to === b.id),saved];
+            }),[250,50,true,1]);
+            await page.keyboard.press(modifier + '+v');
+            await page.evaluate(() => copyWork);
+            assert.equal(await page.evaluate(() => PROJ.cards.length),7);
+            await page.evaluate(() => {
+              const input = document.createElement('textarea'); input.dataset.typingFixture = 'copy';
+              document.body.appendChild(input); input.focus();
+            });
+            await page.keyboard.press(modifier + '+c');
+            await page.keyboard.press(modifier + '+v');
+            assert.equal(await page.evaluate(() => PROJ.cards.length),7);
+          }
+        });
+
         await t.test('框选四像素阈值、单张降为普通选择、空白单击清空', async () => {
           await reset();
           await page.evaluate(() => choose());
@@ -938,7 +985,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
             if (target === 'node') await rightClick('.card[data-id="a"] .body');
             else await page.mouse.click(650,700,{button:'right'});
             assert.deepEqual(await selection(), ['a','b']);
-            assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
+            assert.deepEqual(await menuLabels(), ['对齐方式', '复制选中节点（2 个）', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
             assert.deepEqual(await page.evaluate(() => events), [
               {type:'mousedown',button:2,trusted:true},{type:'contextmenu',button:2,trusted:true},
             ]);
@@ -1007,7 +1054,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           const targetY = ['left','right','center'].includes(mode) ? [rowAY,rowAY,rowBY,rowBY,60]
             : mode === 'top' ? [60,60,60,60,60] : [a0,b0,c0,d0,e0].map(r => bottom-r.h);
           await rightClick('.card[data-id="a"] .body');
-          assert.deepEqual(await menuLabels(), ['对齐方式','批量重命名（5 个节点）','批量删除（5 个节点）']);
+          assert.deepEqual(await menuLabels(), ['对齐方式','复制选中节点（5 个）','批量重命名（5 个节点）','批量删除（5 个节点）']);
           await openAlignment();
           await page.getByRole('button',{name:labels[index],exact:false}).click();
           const after = await snapshot();
@@ -1066,7 +1113,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           await reset(); await page.evaluate(() => choose());
           await rightClick('.card[data-id="a"] .port');
           assert.deepEqual(await selection(), ['a','b']);
-          assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
+          assert.deepEqual(await menuLabels(), ['对齐方式', '复制选中节点（2 个）', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
           assert.deepEqual(await page.evaluate(() => [el.world.classList.contains('wiring'),el.wires.querySelectorAll('.tmp').length,linked,spawned]), [false,0,0,0]);
           await page.evaluate(() => closeMenu());
           const port = await page.locator('.card[data-id="a"] .port').boundingBox();
@@ -1087,7 +1134,7 @@ test('浏览器交互：真实鼠标顺序、框选、平移、节点多选及�
           assert.deepEqual(await page.evaluate(() => PROJ.cards.map(c => [c.x,c.y])), [[140,140],[390,190],[720,450]]);
           assert.equal(await page.evaluate(() => saved), 1);
           await rightClick('.card[data-id="a"] .body');
-          assert.deepEqual(await menuLabels(), ['对齐方式', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
+          assert.deepEqual(await menuLabels(), ['对齐方式', '复制选中节点（2 个）', '批量重命名（2 个节点）', '批量删除（2 个节点）']);
           await openAlignment();
           await page.getByRole('button',{name:'左对齐',exact:false}).click();
           assert.deepEqual(await selection(), ['b','a','missing']);

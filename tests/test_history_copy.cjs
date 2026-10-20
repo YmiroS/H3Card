@@ -24,7 +24,8 @@ function cardCopyContext() {
       {from:'generator',to:'unrelated',slot:'image'},
     ]},
     CARDS:[{id:'card_image'},{id:'card_asset'},{id:'card_style'}], CW:290,
-    saveChain:Promise.resolve(), allowed:true, notices:[], created:[],
+    saveChain:Promise.resolve(), allowed:true, notices:[], created:[], selIds:new Set(), selId:null,
+    saved:0, paintSel() {}, closePanel() {}, closeHistory() {},
     requireOperate:() => context.allowed, canOperate:() => context.allowed,
     cardOf:id => context.PROJ.cards.find(card => card.id === id),
     isTextEdge:edge => edge.slot.startsWith('@'),
@@ -35,7 +36,8 @@ function cardCopyContext() {
       context.created.push({card,select}); context.PROJ.cards.push(card); return card;
     },
     paintTitle() {}, applySize() {}, paint() {}, paintKind() {}, paintPort() {},
-    drawWires() {}, paintStyles() {}, pick:id => { context.selected = id; }, save() {},
+    drawWires() {}, paintStyles() {}, pick:id => { context.selected = id; context.selIds.clear(); },
+    save() { context.saved++; },
     trackNodeWork:promise => promise, toast:text => context.notices.push(text),
     jpost:async (_url,body) => ({card:JSON.parse(JSON.stringify(body.card))}),
   });
@@ -113,6 +115,84 @@ test('paste discards delayed cross-canvas response after the canvas changes', as
   reply(); await pending;
   assert.equal(context.PROJ.cards.length,0);
   assert.match(context.notices.at(-1),/画布已切换/);
+});
+
+test('batch paste preserves relative positions, remaps internal wires and keeps external inputs', async () => {
+  const context = cardCopyContext();
+  context.selIds = new Set(['material','generator','missing']);
+  context.copyCard();
+  context.PROJ.cards[2].params.prompt = '复制后修改';
+  const pasted = await context.pasteCard();
+  assert.equal(pasted.length,2);
+  const [material, generator] = pasted;
+  assert.deepEqual([generator.x - material.x,generator.y - material.y],[380,20]);
+  assert.deepEqual([material.x,material.y],[44,108]);
+  assert.equal(generator.params.prompt,'@素材1');
+  assert.equal(context.saved,1);
+  assert.deepEqual([...context.selIds],Array.from(pasted,card => card.id));
+  const edges = context.PROJ.edges.filter(edge => edge.to === generator.id);
+  assert.deepEqual(edges.map(edge => edge.from),[material.id,'style']);
+  assert.deepEqual(JSON.parse(JSON.stringify(edges[0].slots)),['images[0]','images[1]']);
+  assert.deepEqual(JSON.parse(JSON.stringify(edges[0].version)),{job:'fixed',index:1});
+  const again = await context.pasteCard();
+  assert.equal(again.length,2);
+  assert.ok(again.every(card => !pasted.some(previous => previous.id === card.id)));
+  assert.deepEqual([again[0].x,again[0].y],[68,136]);
+});
+
+test('cross-canvas batch paste copies shared references once without converting selected generators', async () => {
+  const context = cardCopyContext();
+  const original = context.PROJ.cards[2];
+  context.PROJ.cards.push({...original,id:'second',x:800,y:250,
+    assets:{'images[0]':{kind:'image',ref:'chouka/other.png',url:'/api/upload/other.png'}}});
+  context.PROJ.edges.push({from:'material',to:'second',slot:'images[0]'},
+    {from:'generator',to:'second',slot:'image'});
+  context.selIds = new Set(['generator','second']);
+  context.copyCard(original);
+  context.PROJ = {id:'target',cards:[],edges:[]};
+  const pasted = await context.pasteCard();
+  assert.equal(pasted.length,2);
+  assert.ok(pasted.every(card => card.type === 'card_image'));
+  assert.equal(context.PROJ.cards.length,4);
+  const material = context.PROJ.cards.find(card => card.type === 'card_asset');
+  assert.deepEqual(Array.from(material.outputs,output => output.ref),['chouka/source.png','chouka/other.png']);
+  assert.ok(context.PROJ.edges.some(edge => edge.from === pasted[0].id && edge.to === pasted[1].id));
+  assert.equal(context.PROJ.edges.filter(edge => edge.from === material.id).length,2);
+  assert.deepEqual([pasted[1].x - pasted[0].x,pasted[1].y - pasted[0].y],[400,150]);
+  assert.equal(context.saved,1);
+});
+
+test('batch paste is all-or-nothing on copy API failure, canvas changes or unavailable node types', async () => {
+  for (const failure of ['api','project','permission','type']) {
+    const context = cardCopyContext();
+    context.selIds = new Set(['material','generator']); context.copyCard();
+    context.PROJ = {id:'target',cards:[],edges:[]};
+    context.jpost = async (_url,body) => {
+      assert.equal(body.card.cards.length,2);
+      if (failure === 'api') throw new Error('复制失败');
+      if (failure === 'project') context.PROJ = {id:'other',cards:[],edges:[]};
+      if (failure === 'permission') context.allowed = false;
+      if (failure === 'type') body.card.cards[1].type = 'unavailable';
+      return {card:body.card};
+    };
+    await context.pasteCard();
+    assert.equal(context.created.length,0,failure);
+    assert.equal(context.saved,0,failure);
+    assert.match(context.notices.at(-1),/粘贴失败/,failure);
+  }
+});
+
+test('copying an unselected card stays single and readonly paste does not insert', async () => {
+  const context = cardCopyContext();
+  context.selIds = new Set(['material','style']);
+  context.copyCard(context.PROJ.cards[2]);
+  context.allowed = false;
+  await context.pasteCard();
+  assert.equal(context.created.length,0);
+  context.allowed = true;
+  const pasted = await context.pasteCard();
+  assert.equal(pasted.type,'card_image');
+  assert.equal(context.created.length,1);
 });
 
 test('history uses persisted job snapshots after reload and keeps each submission distinct', async () => {
