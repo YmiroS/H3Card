@@ -344,6 +344,33 @@ class BridgeTest(unittest.TestCase):
                     self.assertEqual(state, 'done')
                 self.assertEqual(generate.call_count, 5)
 
+    def test_unverified_video_models_allow_one_image_or_video_reference(self):
+        models = MODELS + [{'display_name': name, 'type': 'video'}
+                           for name in ('星辰图生视频', '可灵3.0 Omni')]
+
+        def finish(job_id, _request, asset_path):
+            asset_path.unlink()
+            with self.bridge.lock:
+                self.bridge.jobs[job_id] = {'state': 'done', 'result': {}}
+
+        with mock.patch.object(self.bridge, 'command', return_value=models), \
+                mock.patch.object(self.bridge, 'generate', side_effect=finish) as generate:
+            for name in ('星辰图生视频', '可灵3.0 Omni'):
+                for payload, content_type in (
+                        (b'\x89PNG\r\n\x1a\n' + b'0' * 32, 'image/png'),
+                        (b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2', 'video/mp4')):
+                    _, _, uploaded = self.upload(payload, content_type)
+                    code, _, body = self.run_request(type='video', model=name, asset_id=uploaded['asset_id'])
+                    self.assertEqual(code, 202, name)
+                    for _ in range(100):
+                        with self.bridge.lock:
+                            state = self.bridge.jobs[body['id']]['state']
+                        if state == 'done':
+                            break
+                        time.sleep(.01)
+                    self.assertEqual(state, 'done')
+            self.assertEqual(generate.call_count, 4)
+
     def test_allowed_https_reference_is_forwarded_once(self):
         reference = 'https://example.com/reference.png?token=1'
 

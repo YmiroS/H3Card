@@ -79,14 +79,14 @@
   },
   "星辰图生视频": {
     "type": "video", "api": {"image": null, "video": null, "audio": null},
-    "bridge": {"image": 0, "video": 0, "audio": 0},
-    "note": "未找到可核对的官方模型 API 型号和逐类型引用上限。",
+    "bridge": {"image": 1, "video": 1, "audio": 0},
+    "note": "IF 模型描述为图生视频，但未公开实际输入规则及逐类型引用上限；画布按 H3 估算开放图片或视频单项引用，实际可用性待验证。",
     "source": ""
   },
   "Seedance 2.0": {
     "type": "video", "api": {"image": 9, "video": 3, "audio": 3},
     "bridge": {"image": 1, "video": 1, "audio": 0},
-    "note": "官方多模态参考最多图片 9／视频 3／音频 3，合计最多 15 项；不同版本和子任务另有限制，IF 版本未公开。",
+    "note": "官方多模态参考分别最多图片 9／视频 3／音频 3；不同版本和子任务另有限制，不能将各类型上限相加当作独立的总量限制，IF 版本未公开。",
     "source": "https://ark.volcengine.com/region:cn-beijing/docs/seedance-2-0"
   },
   "Seedance 2.5": {
@@ -97,8 +97,8 @@
   },
   "可灵3.0 Omni": {
     "type": "video", "api": {"image": null, "video": null, "audio": null},
-    "bridge": {"image": 0, "video": 0, "audio": 0},
-    "note": "未找到可核对的官方 v3 Omni API 输入类型和逐类型引用上限。",
+    "bridge": {"image": 1, "video": 1, "audio": 0},
+    "note": "IF 模型描述提到多参考及视频编辑，但官方文档未核实到 v3 Omni 对应的输入类型和数量；画布按 H3 估算开放图片或视频单项引用，实际可用性待验证。",
     "source": "https://kling.ai/document-api"
   },
   "Minimax H3": {
