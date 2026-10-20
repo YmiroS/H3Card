@@ -60,48 +60,56 @@
     "source": "https://developers.openai.com/api/docs/models"
   },
   "HappyHorse-1.1视频": {
+    "duration": {"min": 3, "max": 15, "default": 5},
     "type": "video", "api": {"image": 1, "video": 0, "audio": 0},
     "bridge": {"image": 1, "video": 0, "audio": 0},
     "note": "图生视频接口仅首帧图片 1 张；文生视频接口不收图片，IF 未公开采用哪一种。",
     "source": "https://help.aliyun.com/zh/model-studio/happyhorse-image-to-video-api-reference"
   },
   "HappyHorse-1.0视频【内测】": {
+    "duration": {"min": 3, "max": 15, "default": 5},
     "type": "video", "api": {"image": 1, "video": 0, "audio": 0},
     "bridge": {"image": 1, "video": 0, "audio": 0},
     "note": "图生视频接口仅首帧图片 1 张；文生视频接口不收图片，IF 未公开采用哪一种。",
     "source": "https://help.aliyun.com/zh/model-studio/happyhorse-image-to-video-api-reference"
   },
   "Wan3.0视频": {
+    "duration": {"min": 2, "max": 30},
     "type": "video", "api": {"image": 10, "video": 5, "audio": 5},
     "bridge": {"image": 10, "video": 5, "audio": 0},
     "note": "参考模式图片≤10、视频≤5（合计≤15 秒）、音频≤5（合计≤15 秒）；首尾帧模式各≤1 张，不能与参考模式混用。IF 未公开具体版本与模式。",
     "source": "https://help.aliyun.com/zh/model-studio/wan3-video-generation-api-reference"
   },
   "星辰图生视频": {
+    "duration": {"min": null, "max": null},
     "type": "video", "api": {"image": null, "video": null, "audio": null},
     "bridge": {"image": 9, "video": 3, "audio": 0},
     "note": "IF 模型描述为图生视频，但未公开实际输入规则及逐类型引用上限；画布借用 H3 数量开放引用，实际可用性待验证。",
     "source": ""
   },
   "Seedance 2.0": {
+    "duration": {"min": 4, "max": 15},
     "type": "video", "api": {"image": 9, "video": 3, "audio": 3},
     "bridge": {"image": 9, "video": 3, "audio": 0},
     "note": "官方多模态参考分别最多图片 9／视频 3／音频 3；不同版本和子任务另有限制，不能将各类型上限相加当作独立的总量限制，IF 版本未公开。",
     "source": "https://ark.volcengine.com/region:cn-beijing/docs/seedance-2-0"
   },
   "Seedance 2.5": {
+    "duration": {"min": 4, "max": 30},
     "type": "video", "api": {"image": 30, "video": 10, "audio": 10},
     "bridge": {"image": 30, "video": 10, "audio": 0},
     "note": "官方多模态参考图片≤30／视频≤10／音频≤10，合计≤50 项；视频和音频总参考时长≤30 秒，具体任务还有模式限制。",
     "source": "https://ark.volcengine.com/region:cn-beijing/docs/seedance-2-5"
   },
   "可灵3.0 Omni": {
+    "duration": {"min": null, "max": null},
     "type": "video", "api": {"image": null, "video": null, "audio": null},
     "bridge": {"image": 9, "video": 3, "audio": 0},
     "note": "IF 模型描述提到多参考及视频编辑，但官方文档未核实到 v3 Omni 对应的输入类型和数量；画布借用 H3 数量开放引用，实际可用性待验证。",
     "source": "https://kling.ai/document-api"
   },
   "Minimax H3": {
+    "duration": {"min": 4, "max": 15},
     "type": "video", "api": {"image": 9, "video": 3, "audio": 3},
     "bridge": {"image": 9, "video": 3, "audio": 0},
     "note": "参考模式图片≤9／视频≤3／音频≤3；首尾帧模式图片各≤1，不能与参考模式混用。",

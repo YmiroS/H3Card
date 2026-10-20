@@ -23,6 +23,16 @@ test('IF reference matrix covers every known model and never exceeds provider li
     assert.equal(limit.bridge.audio, 0, name);
   }
 });
+const durationRanges = {
+  'Wan3.0视频':[2, 30], 'HappyHorse-1.1视频':[3, 15], 'HappyHorse-1.0视频【内测】':[3, 15],
+  'Seedance 2.0':[4, 15], 'Seedance 2.5':[4, 30], 'Minimax H3':[4, 15],
+  '星辰图生视频':[null, null], '可灵3.0 Omni':[null, null],
+};
+test('IF duration limits match the supplied model table, with unknown ranges preserved', () => {
+  for (const [name, range] of Object.entries(durationRanges)) {
+    assert.deepEqual([ifModelLimits[name].duration.min, ifModelLimits[name].duration.max], range, name);
+  }
+});
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 
 const card = (kind, model) => ({id:'if-card', type:kind === 'image' ? 'card_image' : 'card_video',
@@ -155,7 +165,9 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         : url.pathname === '/models' ? {models:[{display_name:'qwen-image-3.0', type:'image'},
           {display_name:'qwen-image-2.0', type:'image'}, {display_name:'z-image-turbo', type:'image'},
           {display_name:'Wan3.0视频', type:'video'}, {display_name:'Minimax H3', type:'video'},
-          {display_name:'星辰图生视频', type:'video'}, {display_name:'可灵3.0 Omni', type:'video'}]}
+          {display_name:'星辰图生视频', type:'video'}, {display_name:'可灵3.0 Omni', type:'video'},
+          ...['HappyHorse-1.1视频', 'HappyHorse-1.0视频【内测】', 'Seedance 2.0', 'Seedance 2.5']
+            .map(display_name => ({display_name, type:'video'}))]}
         : url.pathname === '/runs' && request.method() === 'POST'
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done',
@@ -205,7 +217,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       await page.waitForFunction(() => document.querySelector('#menu')?.textContent.includes('（当前）'));
       const unsupported = kind === 'image' ? 'z-image-turbo' : '星辰图生视频';
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
-        [chosen, initial + '（当前）', unsupported, ...(kind === 'video' ? ['可灵3.0 Omni'] : [])]);
+        [chosen, initial + '（当前）', unsupported, ...(kind === 'video'
+          ? ['可灵3.0 Omni', 'HappyHorse-1.1视频', 'HappyHorse-1.0视频【内测】', 'Seedance 2.0', 'Seedance 2.5'] : [])]);
       await page.locator('#menu button').filter({hasText:chosen}).click();
       const noteLayout = await page.locator('#panel .pbody').evaluate(body => {
         const linkLeft = body.querySelector('a').getBoundingClientRect().left;
@@ -480,6 +493,105 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     for (const prefix of ['正在连接本机 IF', '正在读取 IF', '正在适配 IF', '正在上传 IF',
       '正在提交至本机 IF', '正在取回 IF', '正在保存 IF'])
       assert.ok(busySteps.some(step => step.startsWith(prefix)), prefix);
+    // Exercise actual model menus and duration controls, not just manifest values.
+    await page.evaluate(() => {
+      const c = PROJ.cards[0]; c.cap = 'if_video'; c.assets = {}; PROJ.edges = [];
+      c.params = {if_model:'Wan3.0视频', prompt:'时长边界测试'};
+      c.status = 'idle'; openPanel(c.id);
+    });
+    for (const [name, [min, max]] of Object.entries(durationRanges)) {
+      await page.evaluate(() => { PROJ.cards[0].params.duration = 99; });
+      await page.locator('#panel button[title="IF 模型 —— 点击换"]').click();
+      await page.locator('#menu button').filter({hasText:name}).click();
+      assert.equal(await page.evaluate(() => PROJ.cards[0].params.duration), max ?? 99, name);
+      await page.locator('#panel button[title^="点开弹窗"]').click();
+      const row = page.locator('#respop .row').filter({hasText:'时长'});
+      const number = row.locator('input[type="number"]');
+      assert.equal(await number.getAttribute('min'), String(min ?? 1), name);
+      assert.equal(await number.getAttribute('max'), max == null ? null : String(max), name);
+      assert.equal(await number.getAttribute('step'), '1', name);
+      assert.equal(await row.locator('input[type="range"]').count(), max == null ? 0 : 1, name);
+      assert.match(await row.innerText(), max == null ? /时长范围未核实/ : new RegExp(`${min}–${max} 秒`));
+      for (const [input, expected] of [['0', min ?? 1], ['99', max ?? 99], ['7.6', 8]]) {
+        await number.fill(input); await number.press('Tab');
+        assert.equal(await number.inputValue(), String(expected), `${name}: ${input}`);
+        assert.equal(await page.evaluate(() => PROJ.cards[0].params.duration), expected);
+      }
+      await page.locator('#respop .x').click();
+      const before = runs.length, uploads = uploadedReferences.length;
+      for (const value of max == null ? [0, 1.5, ''] : [min - 1, max + 1, 7.5, '']) {
+        await page.evaluate(value => { PROJ.cards[0].params.duration = value; }, value);
+        await page.locator('#panel .go').click();
+        await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+        assert.match(await page.evaluate(() => PROJ.cards[0].error), /时长.*整数/);
+        assert.equal(runs.length, before, `${name}: invalid duration must not submit`);
+        assert.equal(uploadedReferences.length, uploads);
+      }
+      for (const seconds of max == null ? [1, 60] : [min, max]) {
+        await page.evaluate(seconds => { PROJ.cards[0].params.duration = seconds; }, seconds);
+        const runCount = runs.length;
+        await page.locator('#panel .go').click();
+        await page.waitForFunction(count => PROJ.cards[0].status === 'done'
+          && PROJ.cards[0].job === 'bridge-' + (count + 1), runCount);
+        assert.match(runs.at(-1).prompt, new RegExp(`视频时长约 ${seconds} 秒`));
+        assert.equal(runs.at(-1).model, name);
+      }
+    }
+    for (const [model, duration, expected] of [
+      ['Wan3.0视频', 40, 30], ['Wan3.0视频', 0.4, 2], ['Minimax H3', 22, 15],
+      ['Seedance 2.5', 29.7, 30], ['星辰图生视频', 40, 40],
+    ]) {
+      const result = await page.evaluate(async ({model, duration}) => {
+        const c = PROJ.cards[0]; c.params = {if_model:model};
+        c.assets = {'video[0]':{kind:'video', ref:`ref-${model}-${duration}.mp4`,
+          width:720, height:1280, duration, url:'/fixture.mp4'}};
+        await syncReferenceParameters(c);
+        const first = c.params.duration;
+        c.params.duration = 9; await syncReferenceParameters(c);
+        return {first, manual:c.params.duration, ratio:c.params.aspect_ratio,
+          spec:capOf(c).inputs.find(s => s.key === 'duration')};
+      }, {model, duration});
+      assert.equal(result.first, expected, `${model}: reference duration`);
+      assert.equal(result.manual, 9, 'manual duration must survive later reference refreshes');
+      assert.equal(result.ratio, '9:16 (Portrait Widescreen)');
+      assert.equal(result.spec.max, durationRanges[model][1], 'reference cannot expand model bounds');
+    }
+    for (const manual of [false, true]) {
+      let release, requested;
+      const pending = new Promise(resolve => { release = resolve; });
+      const started = new Promise(resolve => { requested = resolve; });
+      const metadata = async route => {
+        requested(); await pending;
+        await route.fulfill({contentType:'application/json',
+          body:JSON.stringify({width:720, height:1280, duration:29.7})});
+      };
+      await page.route(origin + '/api/media?*', metadata);
+      try {
+        await page.evaluate(manual => {
+          const c = PROJ.cards[0]; c.params = {if_model:'Wan3.0视频'};
+          c.assets = {'video[0]':{kind:'video', ref:`delayed-${manual}.mp4`, url:'/fixture.mp4'}};
+          openPanel(c.id);
+        }, manual);
+        await started;
+        if (manual) {
+          await page.locator('#panel button[title^="点开弹窗"]').click();
+          const number = page.locator('#respop .row').filter({hasText:'时长'}).locator('input[type="number"]');
+          await number.fill('9'); await number.press('Tab');
+          await page.locator('#respop .x').click();
+        }
+        for (const name of ['Minimax H3', 'Seedance 2.5', 'Minimax H3']) {
+          await page.locator('#panel button[title="IF 模型 —— 点击换"]').click();
+          await page.locator('#menu button').filter({hasText:name}).click();
+        }
+        release();
+        await page.waitForFunction(() => PROJ.cards[0].params._reference_video);
+        await page.evaluate(() => syncReferenceParameters(PROJ.cards[0]));
+        assert.equal(await page.evaluate(() => PROJ.cards[0].params.duration), manual ? 9 : 15,
+          'switching models during metadata loading must preserve auto-fill unless manually edited');
+      } finally {
+        release(); await page.unroute(origin + '/api/media?*', metadata);
+      }
+    }
     assert.deepEqual(pageErrors, []);
     assert.deepEqual(requests.filter(r => r === 'unexpected generation'), []);
   } finally {
