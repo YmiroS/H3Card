@@ -164,6 +164,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
   let project = {id:'if-test', rev:0, name:'IF 模型菜单', permission:'operate', locked:false,
     edges:[], groups:[], view:{x:100, y:70, k:1}, cards:[card('image', 'qwen-image-2.0')]};
   const requests = [], runs = [], uploadedReferences = [], extraModels = [];
+  const modelQuotas = new Map();
+  let failModelRefresh = false;
   const referenceId = 'a'.repeat(32);
   let failMediaOnce = true;
   let returnVideoStoryboard = false;
@@ -272,6 +274,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       if ((url.pathname === '/status' || url.pathname === '/models')
           && await page.evaluate(() => PROJ?.cards[0]?.status === 'queued'))
         await checkBusy(/^正在连接本机 IF 并读取模型$/);
+      if (url.pathname === '/models' && failModelRefresh)
+        return route.fulfill({status:503, headers, contentType:'application/json', body:JSON.stringify({error:'额度刷新失败'})});
       if (url.pathname === '/runs' && request.method() === 'POST') await checkBusy(/^正在交由本机 IF 桥接处理$/);
       if (url.pathname === '/runs/bridge-1' && firstRunPolls === 0) {
         assert.equal(project.cards[0].job, 'bridge-1', 'persist the accepted task before polling starts');
@@ -329,7 +333,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
           {display_name:'Wan3.0视频', type:'video'}, {display_name:'Minimax H3', type:'video'},
           {display_name:'星辰图生视频', type:'video'}, {display_name:'可灵3.0 Omni', type:'video'},
           ...['HappyHorse-1.1视频', 'HappyHorse-1.0视频【内测】', 'Seedance 2.0', 'Seedance 2.5']
-            .map(display_name => ({display_name, type:'video'})), ...extraModels]}
+            .map(display_name => ({display_name, type:'video'})), ...extraModels]
+              .map(model => ({...model, ...(modelQuotas.get(model.display_name) || {quota_status:'limited', remaining:30})}))}
         : url.pathname === '/runs' && request.method() === 'POST'
           ? (runs.push(request.postDataJSON()), {id:'bridge-' + runs.length})
           : /^\/runs\/bridge-\d+$/.test(url.pathname) ? {state:'done', result:{status:'done', canvas_id:'c_OcBXJf2Bd0CxY-',
@@ -381,11 +386,20 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       assert.match(await page.locator(`#panel button[title="${modeTitle} —— 点击换"]`).innerText(), /IFS/);
       const modelButton = page.locator('#panel button[title="IF 模型 —— 点击换"]');
       await modelButton.click();
-      await page.waitForFunction(() => document.querySelector('#menu')?.textContent.includes('（当前）'));
+      await page.waitForFunction(() => document.querySelector('#menu')?.style.display !== 'none'
+        && document.querySelector('#menu')?.textContent.includes('剩余 30 次免费'));
       const unsupported = kind === 'image' ? 'z-image-turbo' : '星辰图生视频';
       assert.deepEqual(await page.locator('#menu button span:last-child').allTextContents(),
         [chosen, initial + '（当前）', unsupported, ...(kind === 'video'
-          ? ['可灵3.0 Omni', 'HappyHorse-1.1视频', 'HappyHorse-1.0视频【内测】', 'Seedance 2.0', 'Seedance 2.5'] : [])]);
+          ? ['可灵3.0 Omni', 'HappyHorse-1.1视频', 'HappyHorse-1.0视频【内测】', 'Seedance 2.0', 'Seedance 2.5'] : [])]
+          .map(name => name + ' · 剩余 30 次免费'));
+      if (kind === 'image') {
+        await page.evaluate(() => closeMenu());
+        modelQuotas.set(chosen, {quota_status:'limited', remaining:29});
+        await modelButton.click();
+        await page.waitForFunction(() => document.querySelector('#menu')?.textContent.includes('剩余 29 次免费'));
+        modelQuotas.delete(chosen);
+      }
       await page.locator('#menu button').filter({hasText:chosen}).click();
       const noteLayout = await page.locator('#panel .pbody').evaluate(body => {
         const linkLeft = body.querySelector('a').getBoundingClientRect().left;
@@ -503,6 +517,40 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       }
     }
     assert.equal(runs.length, 2);
+    modelQuotas.set('Wan3.0视频', {quota_status:'exhausted', remaining:0});
+    modelQuotas.set('Minimax H3', {quota_status:'unavailable', remaining:0});
+    modelQuotas.set('星辰图生视频', {quota_status:'free', remaining:null});
+    modelQuotas.set('可灵3.0 Omni', {quota_status:'paid', remaining:null});
+    modelQuotas.set('Seedance 2.0', {quota_status:'unknown', remaining:null});
+    modelQuotas.set('Seedance 2.5', {});
+    const quotaButton = page.locator('#panel button[title="IF 模型 —— 点击换"]');
+    await quotaButton.click();
+    await page.waitForFunction(() => document.querySelector('#menu')?.textContent.includes('免费次数已用完'));
+    for (const [name, text, disabled] of [
+      ['Wan3.0视频', '剩余 0 次 · 免费次数已用完', true],
+      ['Minimax H3', '剩余 0 次 · 未开通', true],
+      ['星辰图生视频', '免费使用', false], ['可灵3.0 Omni', '已开通 · 按预算使用', false],
+      ['Seedance 2.0', '次数未知', false], ['Seedance 2.5', '次数未知 · 请更新桥接器', false]]) {
+      const item = page.locator('#menu button').filter({hasText:name});
+      assert.ok((await item.innerText()).includes(text));
+      assert.equal(await item.isDisabled(), disabled);
+    }
+    if (process.env.CHOUKA_TEST_QUOTA_SCREENSHOT)
+      await page.screenshot({path:process.env.CHOUKA_TEST_QUOTA_SCREENSHOT});
+    await page.evaluate(() => closeMenu());
+    const uploadsBeforeQuotaFailure = uploadedReferences.length;
+    await page.locator('#panel .go').click();
+    await page.waitForFunction(() => PROJ.cards[0].status === 'error');
+    assert.match(await page.evaluate(() => PROJ.cards[0].error), /免费次数已用完.*尚未提交生成/);
+    assert.equal(runs.length, 2, 'known unavailable models must not submit or silently switch');
+    assert.equal(uploadedReferences.length, uploadsBeforeQuotaFailure);
+    assert.equal(await page.evaluate(() => PROJ.cards[0].params.if_model), 'Wan3.0视频');
+    failModelRefresh = true;
+    await quotaButton.click();
+    await page.waitForFunction(() => document.querySelector('#h3-errors')?.textContent.includes('读取 IF 剩余次数失败'));
+    assert.equal(await page.locator('#menu').isVisible(), false, 'failed refresh must not show stale counts');
+    failModelRefresh = false;
+    modelQuotas.clear();
     await page.locator('#panel .pblock textarea').first().fill('后来修改的视频需求');
     assert.equal(await page.evaluate(() => PROJ.cards[0].history[0].prompts[0].text), '蓝色圆形');
     returnVideoStoryboard = true;
