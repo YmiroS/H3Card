@@ -208,9 +208,9 @@ test('IF collaboration preserves active attempts and respects terminal, newer an
     const storage = new Map(), polls = [];
     const ctx = vm.createContext({PROJ:{id:'p1', rev:1, cards:[active]}, H3Auth:{user:{id:'u1'}},
       sessionStorage:{getItem:key=>storage.get(key) ?? null, setItem:(key,value)=>storage.set(key,value), removeItem:key=>storage.delete(key)},
-      isIF:c=>c.cap === 'if_video', canSave:()=>false, NODE_EDITOR:false, saveTimer:null, contentSaving:false,
-      pendingContentSaves:0, pendingCardCreates:0, pendingDirectorRuns:0, pendingNodeWork:new Set(),
-      localFlushes:0, pendingProjectSync:null, el:{panel:{style:{display:'none'}}, ptitle:{}},
+      isIF:c=>c.cap === 'if_video', canSave:()=>false, NODE_EDITOR:false,
+      persistence:require('../web/features/project-persistence.js').create({}),
+      pendingDirectorRuns:0, pendingProjectSync:null, el:{panel:{style:{display:'none'}}, ptitle:{}},
       selId:null, selIds:new Set(), resetCanvasHistory(){}, seedHistory(){}, render(){}, closePanel(){},
       resumeIFTask:c=>{if (c.cap === 'if_video' && c.job && c.status === 'running' && !c._ifPolling) polls.push(c.job);}});
     vm.runInContext(journal + apply, ctx);
@@ -355,7 +355,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     if (pathname === '/api/generate') {requests.push('unexpected generation'); res.writeHead(400); return res.end();}
     const name = pathname === '/' ? 'index.html' : pathname.slice(1);
     const file = path.join(web, name);
-    if (name && !name.includes('/') && existsSync(file)) {
+    if (name && (!name.includes('/') || require('./helpers/frontend-static.cjs').canvasNames.includes(name)) && existsSync(file)) {
       res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript'
         : name.endsWith('.css') ? 'text/css' : name.endsWith('.png') ? 'image/png' : 'text/html');
       return res.end(readFileSync(file));
@@ -498,7 +498,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       ['image', 'qwen-image-2.0', 'qwen-image-3.0', '生图模式'], ['video', 'Minimax H3', 'Wan3.0视频', '生视频模式']]) {
       if (kind === 'video') {
         await page.waitForFunction(() => !PROJ.cards[0]._ifPolling);
-        await page.evaluate(() => saveChain);
+        await page.evaluate(() => persistence.pendingChain);
       }
       const original = card(kind, initial);
       original.cap = kind === 'image' ? 'zimage_t2i' : 'minimax_h3_character_transfer';
@@ -705,7 +705,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         await page.waitForFunction(() => PROJ?.cards[0]?.status === 'done');
         assert.equal(runs.length, 1, 'refresh must poll the original bridge job without resubmitting');
         await page.waitForFunction(() => !PROJ.cards[0]._ifPolling);
-        await page.evaluate(() => saveChain);
+        await page.evaluate(() => persistence.pendingChain);
         project.cards[0] = {...project.cards[0], status:'error', error:'协作者误标失败', outputs:[]};
         await page.reload();
         await page.waitForFunction(() => PROJ?.cards[0]?.status === 'error');
@@ -843,7 +843,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(await page.locator('.if-canvas-link').count(), 0, 'a new failed upload must not link to a previous canvas');
     assert.deepEqual(deletedAssets, ['/assets/' + 'b'.repeat(31) + uploadedReferences.length]);
     assert.equal(runs.length, 5, 'failed multi-reference upload must not submit a job');
-    await page.evaluate(() => saveChain);
+    await page.evaluate(() => persistence.pendingChain);
     project = {...project, cards:[card('image', 'qwen-image-3.0'),
       {id:'image-src', type:'card_asset', cap:'asset', x:20, y:20, params:{}, assets:{},
         outputs:[{kind:'image', url:'/fixture.png', ref:'image.png'}]}], edges:[]};
@@ -1150,7 +1150,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       ['即梦5.0', 'image', 10], ['HappyHorse-1.1视频', 'video', 9], ['可灵3.0 Omni', 'video', 4],
       ['星辰图生视频', 'video', 6], ['New IF Video', 'video', 6]]) {
       await page.evaluate(async ({model, kind, maximum}) => {
-        await saveChain;
+        await persistence.pendingChain;
         const c = PROJ.cards[0]; c.cap = 'if_' + kind; c.type = 'card_' + kind;
         c.params = {if_model:model, prompt:'兜底引用测试', duration:5};
         c.assets = Object.fromEntries(Array.from({length:maximum}, (_, i) =>
@@ -1183,7 +1183,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         maximum + 1 + (kind === 'video' ? 1 : 0), 'over-limit references must not be silently discarded');
     }
     await page.evaluate(async () => {
-      await saveChain;
+      await persistence.pendingChain;
       const c = PROJ.cards[0]; c.assets = {}; PROJ.edges = [];
       c.cap = 'if_video'; c.type = 'card_video';
       c.params = {if_model:'Wan3.0视频', prompt:'刷新恢复原任务', duration:8};
@@ -1206,7 +1206,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(runs.length, beforeRecovery + 1, 'recovery must never resubmit generation');
     assert.match(await page.locator('.card .cf .st').first().innerText(), /正在上传 IF 引用素材/);
     const afterCollaboration = await page.evaluate(async remote => {
-      await saveChain;
+      await persistence.pendingChain;
       const active = PROJ.cards[0];
       remote.rev = PROJ.rev + 1;
       remote.name = '协作者修改了画布名称';
@@ -1224,7 +1224,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(runs.length, beforeRecovery + 1);
     heldIFStep = null;
     await page.waitForFunction(() => PROJ.cards[0].status === 'done' && !PROJ.cards[0]._ifPolling);
-    await page.evaluate(() => saveChain);
+    await page.evaluate(() => persistence.pendingChain);
     assert.equal(await page.evaluate(() => JSON.parse(sessionStorage.getItem(ifTaskKey(PROJ.cards[0], PROJ.id))).phase), 'done');
     const completedOutputs = await page.evaluate(() => PROJ.cards[0].outputs);
     pollsBeforeRefresh = ifPollCount;
@@ -1247,7 +1247,14 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         PROJ.cards[0].assets = stage === 'upload'
           ? {'images[0]':{kind:'image', url:'/fixture.png', filename:'ref.png'}} : {};
         if (stage === 'initial-save') {
-          enqueueSave = () => { window.ifTestHeld = stage; return new Promise(() => {}); };
+          // Stall the injected HTTP boundary, not the production persistence queue.
+          const request = H3Auth.request;
+          H3Auth.request = (path, options = {}) => {
+            if (options.method === 'PUT' && path === '/api/projects/' + PROJ.id) {
+              window.ifTestHeld = stage; return new Promise(() => {});
+            }
+            return request(path, options);
+          };
         } else {
           const original = ifRequest;
           ifRequest = async (path, options) => {
@@ -1281,7 +1288,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         recoveryLookupStatus = 0;
       }
       await page.waitForFunction(() => PROJ?.cards[0]?.status === 'done' && !PROJ.cards[0]._ifPolling);
-      await page.evaluate(() => saveChain);
+      await page.evaluate(() => persistence.pendingChain);
       assert.equal(runs.length, before + 1, 'resume preparation once or query the accepted request, never resubmit it');
       assert.equal(runs.at(-1).request_id, attempt.id);
       assert.match(runs.at(-1).prompt, new RegExp('立即刷新恢复：' + stage));
@@ -1293,7 +1300,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     for (const blockedPhase of ['preparing', 'submitting']) {
       const before = runs.length;
       await page.evaluate(async blockedPhase => {
-        await saveChain;
+        await persistence.pendingChain;
         const original = Storage.prototype.setItem;
         Storage.prototype.setItem = function(key, value) {
           if (key.startsWith('chouka:if-task:') && JSON.parse(value).phase === blockedPhase)
@@ -1307,7 +1314,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     }
     const beforeOldBridge = runs.length;
     await page.evaluate(async () => {
-      await saveChain;
+      await persistence.pendingChain;
       const original = ifRequest;
       ifRequest = async (path, options) => path === '/status'
         ? {ready:true, reference_reuse:true} : original(path, options);
@@ -1324,7 +1331,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(runs.length, beforeSaveFailure, 'do not create a paid task when initial persistence fails');
     rejectProjectSaves = false;
     await page.evaluate(async () => {
-      await saveChain;
+      await persistence.pendingChain;
       const original = ifRequest;
       ifRequest = (path, options) => {
         if (path !== '/runs') return original(path, options);
@@ -1336,7 +1343,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     await page.waitForFunction(() => PROJ.cards[0].status === 'error');
     assert.match(await page.evaluate(() => PROJ.cards[0].error), /提交结果尚未确认.*避免重复生成/);
     assert.equal(runs.length, beforeSaveFailure);
-    await page.evaluate(() => saveChain);
+    await page.evaluate(() => persistence.pendingChain);
     const lookupsBeforeTimedOutRefresh = recoveryLookups;
     await page.reload();
     await page.waitForFunction(() => PROJ?.cards[0]?.status === 'error' && !PROJ.cards[0]._ifRecovering);
@@ -1358,22 +1365,28 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       return {restored, job:newer.job, status:newer.status, keys:new Set([ownKey, otherProject, otherCard, otherUser]).size};
     }), {restored:false, job:'new-job', status:'done', keys:4});
     assert.deepEqual(await page.evaluate(async () => {
-      const original = enqueueSave, results = [];
+      const original = H3Auth.request, results = [];
       try {
         for (const startStatus of ['done', 'running']) {
-          let release;
-          enqueueSave = () => new Promise(resolve => { release = resolve; });
+          let release, reportHeld;
+          const held = new Promise(resolve => { reportHeld = resolve; });
+          H3Auth.request = (path, options = {}) => {
+            if (options.method === 'PUT' && path === '/api/projects/' + PROJ.id)
+              return new Promise(resolve => { release = resolve; reportHeld(); });
+            return original(path, options);
+          };
           const old = {id:'save-race', cap:'if_video', job:'old', status:startStatus, if_started:100, outputs:[]};
           rememberIFTask(old, PROJ.id, startStatus);
           const pending = saveIFTaskProject(old, PROJ.id);
+          await held;
           const newer = {...old, job:startStatus === 'done' ? 'new' : 'old',
             if_started:startStatus === 'done' ? 200 : 100, status:'done'};
           rememberIFTask(newer, PROJ.id, 'done');
-          release({ok:true}); await pending;
+          release({rev:PROJ.rev}); await pending;
           results.push(JSON.parse(sessionStorage.getItem(ifTaskKey(old, PROJ.id)))?.job);
           sessionStorage.removeItem(ifTaskKey(old, PROJ.id));
         }
-      } finally { enqueueSave = original; }
+      } finally { H3Auth.request = original; }
       return results;
     }), ['new', 'old'], 'an older save acknowledgement cannot erase a newer task or an unsaved terminal result');
     assert.deepEqual(pageErrors, []);

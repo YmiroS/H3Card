@@ -6,6 +6,7 @@ import math
 import os
 import re
 import shutil
+import time
 import uuid
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from aiohttp import web
 from aiohttp.http_exceptions import BadHttpMessage
 
 from .edit_export import EditExports, ExportBusyError, total_duration
+from .project_repository import InvalidProjectId
 
 
 MEDIA_FORMATS = ("mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,avi,asf,mpeg,mpegts,"
@@ -87,28 +89,45 @@ def validate_edit(edit, current):
 
 
 class EditApi:
-    def __init__(self, app, host):
-        self.app, self.host = app, host
-        self.exports = EditExports(host.ROOT, host.ffmpeg_bin, self.resolve_asset,
+    def __init__(self, app, *, repository, root, ffmpeg_bin, comfy_http,
+                 call_store, resource_call, require_project, require_user,
+                 require_resource, broadcast_collaboration, sync_card,
+                 kind_of, duration_pattern, audio_pattern):
+        self.app = app
+        self.repository, self.root = repository, root
+        self.ffmpeg_bin, self.comfy_http = ffmpeg_bin, comfy_http
+        self.call_store, self.resource_call = call_store, resource_call
+        self.require_project, self.require_user = require_project, require_user
+        self.require_resource = require_resource
+        self.broadcast_collaboration, self.sync_card = broadcast_collaboration, sync_card
+        self.kind_of = kind_of
+        self.duration_pattern, self.audio_pattern = duration_pattern, audio_pattern
+        self.exports = EditExports(root, ffmpeg_bin, self.resolve_asset,
                                    self.authorize, self.publish)
 
+    def project_path(self, pid):
+        try:
+            return self.repository.path(pid)
+        except InvalidProjectId as exc:
+            raise web.HTTPBadRequest(reason="非法项目 id") from exc
+
     async def authorize(self, pid, user_id):
-        details = await self.host.call_store(self.app, "get_project_for_user", user_id, pid)
+        details = await self.call_store(self.app, "get_project_for_user", user_id, pid)
         if not details or details.get("permission") != "operate":
             return False
-        path = self.host.proj_path(pid)
-        return path.is_file() and not json.loads(path.read_text(encoding="utf-8")).get("locked")
+        path = self.project_path(pid)
+        return path.is_file() and not self.repository.read(pid).get("locked")
 
     async def project(self, request, operate=False):
         pid = request.match_info["pid"]
-        await self.host.require_project(request, pid, operate=operate)
-        path = self.host.proj_path(pid)
+        await self.require_project(request, pid, operate=operate)
+        path = self.project_path(pid)
         if not path.is_file():
             raise web.HTTPNotFound(text="项目不存在")
-        project = json.loads(path.read_text(encoding="utf-8"))
+        project = self.repository.read(path.stem)
         if operate and project.get("locked"):
             raise web.HTTPForbidden(text="只读项目不能保存或导出剪辑")
-        return pid, path, project, self.host.require_user(request)["id"]
+        return pid, path, project, self.require_user(request)["id"]
 
     async def body(self, request):
         try:
@@ -127,13 +146,15 @@ class EditApi:
 
     async def persist(self, request, path, project, edit, asset=None):
         pid = project["id"]
-        await self.host.require_project(request, pid, operate=True)
-        await self.host.resource_call(self.app, "validate_document", self.host.require_user(request)["id"], pid, edit)
+        await self.require_project(request, pid, operate=True)
+        await self.resource_call(self.app, "validate_document", self.require_user(request)["id"], pid, edit)
+        # Validation runs off-thread; access may be revoked while awaiting it.
+        await self.require_project(request, pid, operate=True)
         edit["rev"] += 1
         project["edit"] = edit
-        project["updated"] = self.host.time.time()
-        self.host.write_project(path, project)
-        await self.host.broadcast_collaboration(self.app, pid, {"type": "edit-changed", "rev": edit["rev"]}, authorize=True)
+        project["updated"] = time.time()
+        self.repository.write(pid, project)
+        await self.broadcast_collaboration(self.app, pid, {"type": "edit-changed", "rev": edit["rev"]}, authorize=True)
         result = {"edit": edit}
         if asset is not None:
             result["asset"] = asset
@@ -152,11 +173,11 @@ class EditApi:
         return await self.persist(request, path, project, body)
 
     async def resolve_asset(self, pid, user_id, asset):
-        resource = await self.host.resource_call(self.app, "reference", asset["url"])
-        if not resource or not await self.host.resource_call(self.app, "authorize", user_id, *resource, project_id=pid):
+        resource = await self.resource_call(self.app, "reference", asset["url"])
+        if not resource or not await self.resource_call(self.app, "authorize", user_id, *resource, project_id=pid):
             raise web.HTTPNotFound(text="剪辑素材不存在或已失去访问权限")
         kind, locator = resource
-        path = await self.host.resource_call(self.app, "local_path", kind, locator)
+        path = await self.resource_call(self.app, "local_path", kind, locator)
         if path.is_file():
             return path
         if kind != "comfy":
@@ -167,7 +188,7 @@ class EditApi:
         temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".part")
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
-            async with self.app["session"].get(self.host.COMFY_HTTP + "/view", params=json.loads(locator)) as response:
+            async with self.app["session"].get(self.comfy_http + "/view", params=json.loads(locator)) as response:
                 if response.status != 200:
                     raise web.HTTPNotFound(text="原始生成产物已不可用")
                 with temporary.open("wb") as stream:
@@ -181,7 +202,7 @@ class EditApi:
         return path
 
     async def metadata(self, path, kind):
-        executable = await asyncio.to_thread(self.host.ffmpeg_bin)
+        executable = await asyncio.to_thread(self.ffmpeg_bin)
         if not executable:
             raise web.HTTPServiceUnavailable(text="服务器未找到 FFmpeg，无法读取剪辑素材")
         process = await asyncio.create_subprocess_exec(str(executable), "-nostdin", "-hide_banner",
@@ -196,7 +217,7 @@ class EditApi:
                 process.kill()
                 await process.communicate()
         text = error.decode("utf-8", errors="replace")
-        duration = self.host.DUR_RE.search(text)
+        duration = self.duration_pattern.search(text)
         dimensions = re.search(r"Video:.*?\b(\d{2,5})x(\d{2,5})\b", text)
         seconds = 0
         if duration:
@@ -207,12 +228,12 @@ class EditApi:
             seconds = max(1 / 30, seconds)
         if ((kind != "image" and not number(seconds, 1 / 30, 3600))
                 or kind != "audio" and not dimensions
-                or kind == "audio" and not self.host.AUDIO_STREAM_RE.search(text)):
+                or kind == "audio" and not self.audio_pattern.search(text)):
             raise web.HTTPBadRequest(text="无法读取此素材，视频和音频须有有效时长（最多 60 分钟）")
         return {"duration": seconds if kind != "image" else 5,
                 "width": int(dimensions[1]) if dimensions else 0,
                 "height": int(dimensions[2]) if dimensions else 0,
-                "has_audio": bool(self.host.AUDIO_STREAM_RE.search(text))}
+                "has_audio": bool(self.audio_pattern.search(text))}
 
     def asset_capacity(self, edit):
         if len(edit["assets"]) >= 200:
@@ -222,7 +243,7 @@ class EditApi:
         self.asset_capacity(edit)
         metadata = await self.metadata(file, kind)
         locator = file.name
-        await self.host.resource_call(self.app, "register", project["id"], "upload", locator,
+        await self.resource_call(self.app, "register", project["id"], "upload", locator,
                                       parent_id=parent_id, external=True)
         aid = "asset_" + uuid.uuid4().hex
         asset = {"kind": kind, "url": "/api/upload/" + locator, "ref": "chouka/" + locator,
@@ -234,7 +255,7 @@ class EditApi:
 
     def remove_uncommitted_asset(self, path, file):
         if path.is_file():
-            project = json.loads(path.read_text(encoding="utf-8"))
+            project = self.repository.read(path.stem)
             assets = (project.get("edit") or {}).get("assets", {})
             if any(asset.get("url") == "/api/upload/" + file.name for asset in assets.values()):
                 return
@@ -260,19 +281,19 @@ class EditApi:
             card = next((c for c in project.get("cards", []) if c["id"] == source["card"]), None)
             if not card or card.get("director_shot") != source["shot"]:
                 raise web.HTTPBadRequest(text="产物不是此导演镜头的节点")
-            if source["job"] not in await self.host.call_store(self.app, "list_project_jobs", pid):
+            if source["job"] not in await self.call_store(self.app, "list_project_jobs", pid):
                 raise web.HTTPBadRequest(text="产物任务不属于当前项目")
-            self.host.sync_card_job(card, self.host.JOBS, self.host.CAPS, pid)
+            self.sync_card(card, pid)
             history = next((h for h in card.get("history", []) if h.get("job") == source["job"]), None)
             outputs = (history or {}).get("outputs") or []
             if source["index"] >= len(outputs) or any(outputs[source["index"]].get(k) != output.get(k) for k in ("url", "kind")):
                 raise web.HTTPBadRequest(text="产物不是此节点的已知历史版本")
         original = await self.resolve_asset(pid, user_id, output)
-        if self.host.kind_of(original.name) != output["kind"]:
+        if self.kind_of(original.name) != output["kind"]:
             raise web.HTTPBadRequest(text="素材类型与文件不一致")
-        resource = await self.host.resource_call(self.app, "reference", output["url"])
-        parent = await self.host.resource_call(self.app, "lookup", *resource)
-        folder = self.host.ROOT / "data" / "uploads"
+        resource = await self.resource_call(self.app, "reference", output["url"])
+        parent = await self.resource_call(self.app, "lookup", *resource)
+        folder = self.root / "data" / "uploads"
         folder.mkdir(parents=True, exist_ok=True)
         frozen = folder / ("edit_" + uuid.uuid4().hex + original.suffix.lower())
         try:
@@ -288,7 +309,7 @@ class EditApi:
         _, path, project, _ = await self.project(request, True)
         edit = copy.deepcopy(project.get("edit") or empty_edit())
         self.asset_capacity(edit)
-        folder = self.host.ROOT / "data" / "uploads"
+        folder = self.root / "data" / "uploads"
         folder.mkdir(parents=True, exist_ok=True)
         file = None
         revision = None
@@ -308,7 +329,7 @@ class EditApi:
                 elif part.name == "file" and file is None:
                     name = part.filename or ""
                     suffix = Path(name).suffix.lower()
-                    kind = self.host.kind_of(name)
+                    kind = self.kind_of(name)
                     if kind not in ("image", "video", "audio"):
                         raise web.HTTPBadRequest(text="只支持图片、视频、音频文件")
                     file = folder / ("edit_" + uuid.uuid4().hex + suffix)
@@ -343,7 +364,7 @@ class EditApi:
         if not await self.authorize(pid, user_id):
             raise web.HTTPForbidden(text="项目已失去导出权限")
         locator = export_id + "/" + path.name
-        await self.host.resource_call(self.app, "register", pid, "artifact", locator)
+        await self.resource_call(self.app, "register", pid, "artifact", locator)
         return "/api/artifact/" + locator
 
     async def start_export(self, request):
@@ -356,7 +377,8 @@ class EditApi:
         validate_edit(edit, edit)
         if not edit["clips"]:
             raise web.HTTPBadRequest(text="请先加入画面片段")
-        await self.host.resource_call(self.app, "validate_document", user_id, pid, edit)
+        await self.resource_call(self.app, "validate_document", user_id, pid, edit)
+        await self.require_project(request, pid, operate=True)
         return web.json_response({"export": self.exports.start(pid, user_id, edit)}, status=202)
 
     async def list_exports(self, request):
@@ -381,17 +403,25 @@ class EditApi:
             raise web.HTTPNotFound(text="导出任务不存在")
         if item["status"] != "done" or not item.get("url"):
             raise web.HTTPConflict(text="成片尚未导出完成")
-        resource = await self.host.resource_call(self.app, "reference", item["url"])
-        await self.host.require_resource(request, *resource, project_id=pid)
-        path = await self.host.resource_call(self.app, "local_path", *resource)
+        resource = await self.resource_call(self.app, "reference", item["url"])
+        await self.require_resource(request, *resource, project_id=pid)
+        path = await self.resource_call(self.app, "local_path", *resource)
         if not path.is_file():
             raise web.HTTPNotFound(text="导出文件不存在")
         return web.FileResponse(path, headers={"Content-Type": "video/mp4",
             "Content-Disposition": 'attachment; filename="film.mp4"', "X-Content-Type-Options": "nosniff"})
 
 
-def register_edit_routes(app, host):
-    api = EditApi(app, host)
+def register_edit_routes(app, *, repository, root, ffmpeg_bin, comfy_http,
+                         call_store, resource_call, require_project, require_user,
+                         require_resource, broadcast_collaboration, sync_card,
+                         kind_of, duration_pattern, audio_pattern):
+    api = EditApi(app, repository=repository, root=root, ffmpeg_bin=ffmpeg_bin,
+                  comfy_http=comfy_http, call_store=call_store, resource_call=resource_call,
+                  require_project=require_project, require_user=require_user,
+                  require_resource=require_resource, broadcast_collaboration=broadcast_collaboration,
+                  sync_card=sync_card, kind_of=kind_of,
+                  duration_pattern=duration_pattern, audio_pattern=audio_pattern)
     app["edit_exports"] = api.exports
     prefix = "/api/projects/{pid}/edit"
     app.router.add_get(prefix, api.get)

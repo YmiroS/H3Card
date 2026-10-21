@@ -38,22 +38,21 @@ function fixture() {
     #world{position:absolute;transform-origin:0 0}#hist{position:absolute;left:850px;top:30px;width:290px;height:670px;overflow:auto;display:block}
     #hist .rg [data-i]{height:90px;min-height:90px}#menu{z-index:1000}
     </style><div id="stage"><div id="world"></div></div><div id="hist"></div>
-    <div id="panel" style="display:none"></div><div id="menu" style="display:none"></div><script>
+    <div id="panel" style="display:none"></div><div id="menu" style="display:none"></div><script src="/features/project-persistence.js"></script><script>
     const el = Object.fromEntries(['stage','world','hist','panel','menu'].map(id => [id,document.getElementById(id)]));
     const NODE_EDITOR = false;
-    let workFailure = null;
     let PROJ = ${JSON.stringify(initialProject())}, view = {x:73,y:-41,k:0.65};
     const projects = [], CAPS = {generate:{name:'生成'}}, CARDS = [{id:'card_asset',kind:'asset',name:'素材节点',modes:[{id:'asset',name:'素材'}]}];
     const H3Auth = {active:true,request:async (url, options) => {
       const response = await fetch(url, options); if (!response.ok) throw Error('HTTP ' + response.status); return response.json();
     }};
     window.messages = []; window.viewers = []; window.nativeEvents = []; window.dropPromises = []; window.dropsDone = 0;
-    const toast = message => messages.push(message), save = () => {}, tipHide = () => {};
+    const toast = message => messages.push(message), showError = message => messages.push(message), save = () => {}, tipHide = () => {};
     ${block('const canOperate =', 'function clearProject(')}
     ${block('const jpost =', 'const jput =')}
     ${block('const uid =', '// 以实际能力反查模型')}
     ${block('const plain =', '/** 保存串行化')}
-    let saveChain = Promise.resolve(), pendingCardCreates = 0, pendingProjectSync = null, selId = null;
+    let pendingProjectSync = null, selId = null;
     const selIds = new Set(), flushPendingProjectSync = () => {};
     const isTextCard = () => false, capOf = () => CAPS.generate, isTextEdge = e => String(e.slot || '').startsWith('@');
     const pick = id => { selId = id; selIds.add(id); }, drawWires = () => {}, openPanel = () => {}, closePanel = () => {};
@@ -65,11 +64,16 @@ function fixture() {
     function render() { el.world.replaceChildren(...PROJ.cards.map(buildCard)); }
     const openViewer = (c, index, outputs, seed) => viewers.push({id:c.id,index,outputs:JSON.parse(JSON.stringify(outputs)),seed});
     ${block('function toWorld(', '/* ================= 小地图')}
-    ${block('const pendingNodeWork =', 'const el =')}
+    const persistence = ChoukaProjectPersistence.create({
+      getProject:() => PROJ, getView:() => view, isAuthenticated:() => H3Auth.active, canSave,
+      nodeEditor:false, editorCard:() => null, plain, api, jpost, recordCanvasEdit:() => {},
+      flushPendingProjectSync, showError:message => messages.push(message), flushFocusedControl:() => {},
+    });
+    const {trackNodeWork} = persistence;
     ${block('function mergeCollaborativeCard(', 'function delCard(')}
     ${block('async function importOutput(', '/** 素材格里的图')}
     ${block('const HIST_MAX', '/* ================= 参数面板')}
-    ${block('function showMenu(', '/** 面板底部工具条')}
+    ${block('let menuRevision =', '/** 面板底部工具条')}
     ${block('function downloadOut(', 'function resetSize(')}
     ${block('async function setAssetItem(', '/** 底部工具条「上传」')}
     // 记录真实异步 drop 的完成时机，不复制处理流程，也不靠固定等待时间判断拒绝。
@@ -115,6 +119,7 @@ test('历史产物拖回画布：真实处理器与 HTTP 下载上传回归', as
   const html = fixture();
   const server = createServer((req, res) => {
     if (req.url === '/') { res.setHeader('Content-Type','text/html; charset=utf-8'); return res.end(html); }
+    if (req.url === '/features/project-persistence.js') { res.setHeader('Content-Type','text/javascript'); return res.end(readFileSync(path.join(web,'features/project-persistence.js'))); }
     if (req.url === '/style.css') { res.setHeader('Content-Type','text/css'); return res.end(readFileSync(path.join(web,'style.css'))); }
     if (req.url.startsWith('/output/') || req.url.startsWith('/asset/')) {
       const index = extensions.findIndex(ext => req.url.split('?')[0].endsWith('.' + ext));
@@ -171,7 +176,7 @@ test('历史产物拖回画布：真实处理器与 HTTP 下载上传回归', as
     const url = 'http://127.0.0.1:' + server.address().port;
     const thumb = (round, index) => page.locator('#hist .hrun').nth(round).locator(`[data-i="${index}"]`);
     async function reset() { resetState(); await page.goto(url); }
-    async function settle() { await page.evaluate(async () => { await Promise.all(dropPromises); await saveChain; }); }
+    async function settle() { await page.evaluate(async () => { await Promise.all(dropPromises); await persistence.pendingChain; }); }
     async function unchanged() {
       assert.equal(await page.evaluate(() => JSON.stringify({cards:PROJ.cards.slice(0,2).map(plain),edges:PROJ.edges}) === original), true);
     }
