@@ -38,9 +38,8 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         for patch in patches:
             patch.start()
             self.addCleanup(patch.stop)
-        application = controller_app.make_app(auth_path=self.root / "data" / "auth.db")
-        self.old_project_dir = controller_app.PROJ_DIR
-        controller_app.PROJ_DIR = self.root / "data" / "projects"
+        application = controller_app.make_app(auth_path=self.root / "data" / "auth.db",
+                                              project_repository=self.projects)
         self.client = TestClient(TestServer(application))
         await self.client.start_server()
         self.origin = str(self.client.make_url('/')).rstrip('/')
@@ -48,7 +47,6 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
 
     async def asyncTearDown(self):
         await self.client.close()
-        controller_app.PROJ_DIR = self.old_project_dir
         self.auth_teardown()
 
     async def test_pages_and_static_fallback(self):

@@ -147,12 +147,12 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
   async function state() {
     return page.evaluate(() => ({project:PROJ && {id:PROJ.id, cards:PROJ.cards.map(plain), edges:PROJ.edges},
       selected:selId, selection:[...selIds], panel:el.panel._id, panelDisplay:getComputedStyle(el.panel).display,
-      notice:el.toast.textContent, pending:pendingNodeWork.size, creates:pendingCardCreates}));
+      notice:el.toast.textContent, pending:persistence.status.pendingNodeWork, creates:persistence.status.pendingCardCreates}));
   }
   async function settle() {
-    await expect.poll(() => page.evaluate(() => pendingNodeWork.size + pendingCardCreates + pendingContentSaves +
-      Number(contentSaving) + Number(saveTimer !== null)), {timeout:15000}).toBe(0);
-    await page.evaluate(async () => { await saveChain; });
+    await expect.poll(() => page.evaluate(() => persistence.status.pendingNodeWork + persistence.status.pendingCardCreates + persistence.status.pendingContentSaves +
+      Number(persistence.status.contentSaving) + Number(persistence.status.saveScheduled)), {timeout:15000}).toBe(0);
+    await page.evaluate(async () => { await persistence.pendingChain; });
   }
   async function reset({type='card_image', cap='zimage_t2i', fill=0, edgeOnly=false, editor=false} = {}) {
     if (page) await page.close();
@@ -473,7 +473,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
         firstStarted = true;
         try {
           // Commit the first PUT on the real server but withhold its response, so
-          // the textarea's second doSave remains queued on the production saveChain.
+          // the textarea's second doSave remains queued on the production persistence.pendingChain.
           const response = await route.fetch();
           assert.equal(response.status(),200,await response.text());
           firstHeld = true;
@@ -491,7 +491,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
         const input = page.locator('#panel textarea').first();
         await expect(input).toHaveValue('first');
         await input.fill('LATEST UNSAVED EDIT');
-        await expect.poll(() => page.evaluate(() => ({pending:pendingContentSaves,timer:saveTimer === null})),
+        await expect.poll(() => page.evaluate(() => ({pending:persistence.status.pendingContentSaves,timer:!persistence.status.saveScheduled})),
           {timeout:10000}).toEqual({pending:2,timer:true});
         const uploaded = page.waitForResponse(response => new URL(response.url()).pathname === '/api/upload' &&
           response.request().method() === 'POST',{timeout:10000});
@@ -509,7 +509,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
         assert.deepEqual(blocked.project.edges,[]);
         assert.equal(blocked.project.cards[0].params.prompt,'LATEST UNSAVED EDIT');
         assert.equal(await page.locator('#world .card').count(),1);
-        assert.equal(await page.evaluate(() => pendingContentSaves),2);
+        assert.equal(await page.evaluate(() => persistence.status.pendingContentSaves),2);
       } finally {
         release(); if (firstStarted) await handled;
         await page.unroute(pattern,handler);
@@ -531,7 +531,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
     });
     await check('canvas VIDEO DROP with valid MIME and no pending save persists real MP4',async () => {
       await reset(); await settle();
-      assert.equal(await page.evaluate(() => pendingContentSaves),0);
+      assert.equal(await page.evaluate(() => persistence.status.pendingContentSaves),0);
       const endpoint = `/api/projects/${project.id}`, conflicts = [];
       const observeResponse = response => {
         if (new URL(response.url()).pathname === endpoint && response.status() === 409) conflicts.push(409);
@@ -603,7 +603,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
         const input = page.locator('#panel textarea').first();
         await expect(input).toHaveValue('first');
         await input.fill('LATEST UNSAVED VIDEO DROP EDIT');
-        await expect.poll(() => page.evaluate(() => ({pending:pendingContentSaves,timer:saveTimer === null})),
+        await expect.poll(() => page.evaluate(() => ({pending:persistence.status.pendingContentSaves,timer:!persistence.status.saveScheduled})),
           {timeout:10000}).toEqual({pending:2,timer:true});
         const uploaded = page.waitForResponse(response => new URL(response.url()).pathname === '/api/upload' &&
           response.request().method() === 'POST',{timeout:10000});
@@ -722,7 +722,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
           await canvasVideoDrop();
           await expect.poll(() => result || routeError,{timeout:10000}).toBeTruthy();
           if (routeError) throw routeError;
-          await expect.poll(() => page.evaluate(() => workFailure?.message || ''),{timeout:10000}).not.toBe('');
+          await expect.poll(() => page.evaluate(() => persistence.status.workFailure?.message || ''),{timeout:10000}).not.toBe('');
           await settle();
           if (failure === 'backend-rejection') {
             assert.equal(result.status,400); assert.match(result.body,/卡片 ID 不正确/);
@@ -753,7 +753,7 @@ test('parameter panel clipboard media: real Edge, native PNG Ctrl+V, synthetic f
           assert.equal(committed.cards.find(c => c.id === 'target').params.prompt,'原文字');
           await page.evaluate(() => pick('target'));
           await page.locator('#panel textarea').first().fill('LATEST EDIT DURING DROP CREATE');
-          await expect.poll(() => page.evaluate(() => ({pending:pendingContentSaves,timer:saveTimer === null})),
+          await expect.poll(() => page.evaluate(() => ({pending:persistence.status.pendingContentSaves,timer:!persistence.status.saveScheduled})),
             {timeout:10000}).toEqual({pending:1,timer:true});
           assert.equal((await state()).project.cards.find(c => c.id === 'target').params.prompt,'LATEST EDIT DURING DROP CREATE');
         },() => canvasVideoDrop());
@@ -949,9 +949,9 @@ test('card clipboard incoming references: same-canvas duplication and cross-canv
       ? H3Auth.request(url) : H3Auth.json(url, method, data), {url, method, data});
   }
   async function settle() {
-    await expect.poll(() => page.evaluate(() => pendingNodeWork.size + pendingCardCreates + pendingContentSaves +
-      Number(contentSaving) + Number(saveTimer !== null)), {timeout:15000}).toBe(0);
-    await page.evaluate(async () => { await saveChain; });
+    await expect.poll(() => page.evaluate(() => persistence.status.pendingNodeWork + persistence.status.pendingCardCreates + persistence.status.pendingContentSaves +
+      Number(persistence.status.contentSaving) + Number(persistence.status.saveScheduled)), {timeout:15000}).toBe(0);
+    await page.evaluate(async () => { await persistence.pendingChain; });
   }
   async function state() {
     return page.evaluate(() => ({id:PROJ.id, cards:PROJ.cards.map(plain), edges:structuredClone(PROJ.edges)}));

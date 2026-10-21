@@ -169,9 +169,9 @@ async function api(page, url, method = 'GET', data) {
     ? H3Auth.request(url) : H3Auth.json(url,method,data), {url,method,data});
 }
 async function settle(page) {
-  await expect.poll(() => page.evaluate(() => pendingNodeWork.size + pendingCardCreates + pendingContentSaves +
-    Number(contentSaving) + Number(saveTimer !== null)), {timeout:15000}).toBe(0);
-  await page.evaluate(async () => { await saveChain; });
+  await expect.poll(() => page.evaluate(() => persistence.status.pendingNodeWork + persistence.status.pendingCardCreates + persistence.status.pendingContentSaves +
+    Number(persistence.status.contentSaving) + Number(persistence.status.saveScheduled)), {timeout:15000}).toBe(0);
+  await page.evaluate(async () => { await persistence.pendingChain; });
 }
 async function openProject(page, id) {
   await page.evaluate(async id => { await loadProjects(); await openProject(id); pick('composite'); }, id);

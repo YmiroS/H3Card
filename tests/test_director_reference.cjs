@@ -23,7 +23,7 @@ function canvas() {
     api:async () => ({jobs:[{id:'new-job',status:'done',outputs:[{kind:'image',url:'new-image'}]}]}),
     canOperate:() => true, canTask:() => true, isTextEdge:e => String(e.slot || '').startsWith('@'),
     paint:() => {}, paintKind:() => {}, paintJobsBtn:() => {}, drawWires:() => {},
-    openPanel:() => {}, openHistory:() => {}, renderJobs:() => {}, toast:() => {},
+    openPanel:() => {}, openHistory:() => {}, renderJobs:() => {}, toast:() => {}, refreshVideoParameters:() => {},
     pushHistory:() => {}, save:() => saved.push(true),
     titleOf:c => c.id, capOf:() => ({inputs:[]}),
     importOutput:async output => { imported.push(output); return {ref:output.url}; },
@@ -32,7 +32,8 @@ function canvas() {
     + block('function paintCompositeInputs(', 'function paint(c)')
     + block('function mediaSlotsForOutputs(', 'function cardBox(')
     + block('function edgeWord(', 'function drawWires(')
-    + block('async function pollJobs(', '/* ================= 任务浮窗'), context);
+    + block('async function propagateCardOutputs(', '/** 一次把所有任务'), context);
+  context.pollJobs = require('./helpers/task-updater.cjs').taskUpdater(context);
   return {context,target,pinned,liveTarget,imported,saved};
 }
 
