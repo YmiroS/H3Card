@@ -39,6 +39,24 @@ const durationRanges = {
   'Seedance 2.0':[4, 15], 'Seedance 2.5':[4, 30], 'Minimax H3':[5, 15],
   '星辰图生视频':[null, null], '可灵3.0 Omni':[3, 15],
 };
+test('IF video HD presets use exact dimensions and never affect local workflows', () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const helper = source.slice(source.indexOf('const IF_VIDEO_RESOLUTIONS ='), source.indexOf('const H3_LONG ='));
+  const resolve = vm.runInNewContext(helper + '; ifVideoResolution', {RATIO_WH:{
+    '16:9 (Widescreen)':[16,9], '9:16 (Portrait Widescreen)':[9,16], '1:1 (Square)':[1,1]}});
+  for (const [id, width, height] of [['1080p',1920,1080], ['2K',2560,1440], ['4K',3840,2160]]) {
+    const c = {params:{if_video_resolution:id}};
+    assert.deepEqual(JSON.parse(JSON.stringify(resolve(c, capabilities.if_video))), {label:id, width, height});
+    c.params.aspect_ratio = '9:16 (Portrait Widescreen)';
+    const portrait = resolve(c, capabilities.if_video);
+    assert.equal(portrait.width, height); assert.equal(portrait.height, width);
+    c.params.aspect_ratio = '1:1 (Square)';
+    assert.equal(resolve(c, capabilities.if_video).width, height);
+    assert.equal(resolve(c, capabilities.minimax_h3_character_transfer), null);
+    assert.equal(resolve(c, capabilities.if_image), null);
+  }
+  assert.equal(resolve({params:{}}, capabilities.if_video), null, 'legacy MP settings remain in effect');
+});
 test('IF duration limits match the supplied model table, with unknown ranges preserved', () => {
   for (const [name, range] of Object.entries(durationRanges)) {
     assert.deepEqual([ifModelLimits[name].duration.min, ifModelLimits[name].duration.max], range, name);
@@ -616,6 +634,18 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         assert.equal(await page.locator('#respop .image-advanced').count(), 0);
         await page.evaluate(() => { PROJ.cards[0].params.seed = 42; PROJ.cards[0].params.if_skill = '旧版技能'; });
       } else {
+        for (const preset of ['1080p', '2K', '4K']) {
+          await page.locator('#respop .cgrid.k button').filter({hasText:preset}).click();
+          assert.deepEqual(await page.locator('#respop .cgrid.k button.on').allTextContents(), [preset]);
+          assert.match(await page.evaluate(() => paramsBrief(PROJ.cards[0], capOf(PROJ.cards[0]))), new RegExp(preset));
+        }
+        await page.locator('#respop .cgrid.k button').filter({hasText:'544p'}).click();
+        assert.equal(await page.evaluate(() => PROJ.cards[0].params.if_video_resolution), undefined);
+        await page.locator('#respop .cgrid.k button').filter({hasText:'4K'}).click();
+        await page.locator('#respop .cgrid button').filter({hasText:'9:16'}).click();
+        assert.equal(await page.locator('#respop .cgrid.k button.on').getAttribute('title'), '2160×3840');
+        await ratio.click();
+        assert.equal(await page.locator('#respop .cgrid.k button.on').getAttribute('title'), '2880×2160');
         assert.equal(await rows.count(), 1);
         assert.doesNotMatch(await page.locator('#respop').innerText(), /种子|IF 技能|HTTPS/);
         assert.deepEqual(capabilities.if_video.inputs.map(input => input.key), ['prompt', 'aspect_ratio', 'megapixels', 'duration']);
@@ -640,7 +670,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         : '最终交付必须是图片文件，不是故事板或文字方案。用户已经确认生成需求，请直接生成图片；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为视频或文字方案。以本条图片目标和以下参数要求为准。';
       assert.match(runs.at(-1).request_id, /^[a-f0-9]{32}$/);
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen, request_id:runs.at(-1).request_id,
-        prompt:`${directive}\n\n蓝色圆形\n\n分辨率：${kind === 'image' ? '1440×1080' : '736×544\n时长：12s\n画面比例：4 : 3'}`,
+        prompt:`${directive}\n\n蓝色圆形\n\n分辨率：${kind === 'image' ? '1440×1080' : '2880×2160\n时长：12s\n画面比例：4 : 3'}`,
         references:[{kind, asset_id:referenceId}]});
       assert.doesNotMatch(runs.at(-1).prompt, /生成规格|随机种子/);
       assert.equal(uploadedReferences.length, kind === 'image' ? 1 : 2);
@@ -922,6 +952,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       c.status = 'idle'; openPanel(c.id);
     });
     for (const [name, [min, max]] of Object.entries(durationRanges)) {
+      const dismissErrors = page.getByRole('button', {name:'关闭全部错误通知'});
+      if (await dismissErrors.isVisible()) await dismissErrors.click();
       await page.evaluate(() => { PROJ.cards[0].params.duration = 99; });
       await page.locator('#panel button[title="IF 模型 —— 点击换"]').click();
       await page.locator('#menu button').filter({hasText:name}).click();
