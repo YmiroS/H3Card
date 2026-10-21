@@ -488,7 +488,6 @@
     const icons = {
       canvas: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
       director: '<rect x="3" y="8" width="18" height="13" rx="2"/><path d="m3 8 16-5 2 5M7 7l3-4m4 2 3-3M10 12l5 3-5 3z"/>',
-      ifstudio: '<rect x="3" y="5" width="18" height="14" rx="2"/><path d="m10 9 5 3-5 3z"/>',
       teams: '<circle cx="9" cy="8" r="3"/><path d="M3 21v-3a6 6 0 0 1 12 0v3m1-16a3 3 0 0 1 0 6m3 10v-3a6 6 0 0 0-2-4"/>',
       controller: '<path d="M3 17V7m6 14V3m6 14V7m6 14V3"/><path d="M1 10h4m2 5h4m2-5h4m2 5h4"/>',
       permissions: '<path d="m12 3 8 3v6c0 5-8 9-8 9s-8-4-8-9V6z"/><path d="m8 12 3 3 5-6"/>',
@@ -513,7 +512,6 @@
       link.querySelector('span').textContent = label; group.append(link);
     };
     add('canvas', '画布', '/'); add('director', '导演工作台', '/director');
-    add('ifstudio', 'IF Studio', '/if-studio');
     if (user.role === 'admin' || user.team_leader) {
       group = addGroup('管理');
       add('teams', '项目组', '/teams');

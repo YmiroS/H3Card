@@ -200,7 +200,8 @@ class Bridge(ThreadingHTTPServer):
                 prompt = '\n'.join(reference_lines) + '\n\n' + prompt
             submitted_prompt = prompt
             canvas_id, session_id = request.get('canvas_id'), request.get('session_id')
-            flags = ['canvas', 'run', '--profile', 'buc', '--json', '--create-only', '--model', request['model']]
+            flags = ['canvas', 'run', '--profile', 'buc', '--json', '--create-only',
+                     '--tool-list', json.dumps([request['_model_tool']], ensure_ascii=False)]
             if canvas_id and session_id:
                 flags += ['--canvas-id', canvas_id, '--session-id', session_id]
             if request.get('skill'):
@@ -581,9 +582,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 if (address is not None and not address.is_global) or host.replace('.', '').isdigit():
                     raise ValueError()
             models = self.server.command('models', '--refresh', '--json', '--profile', 'buc', timeout=35)
-            selected = next((m for m in models if m.get('display_name') == model and m.get('type') == kind), None)
-            if selected is None:
+            matches = [m for m in models if m.get('display_name') == model and m.get('type') == kind]
+            if len(matches) != 1:
                 raise ValueError()
+            selected = matches[0]
+            if any(not isinstance(selected.get(key), str) or not selected[key].strip()
+                   for key in ('id', 'provider')):
+                raise RuntimeError('IF 模型清单缺少工具标识，尚未提交生成，请更新 IF CLI 后重试')
             quota = model_quota(selected)
             if quota['quota_status'] in ('exhausted', 'unavailable'):
                 with self.server.lock:
@@ -659,7 +664,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
             if request_id:
                 self.server.requests[request_key] = {'id': job_id, 'fingerprint': fingerprint}
         try:
-            threading.Thread(target=self.server.generate, args=(job_id, data, asset_paths), daemon=True).start()
+            generation_request = {**data, '_model_tool': selected}
+            threading.Thread(target=self.server.generate, args=(job_id, generation_request, asset_paths), daemon=True).start()
         except RuntimeError:
             for path in asset_paths:
                 path.unlink(missing_ok=True)
