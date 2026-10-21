@@ -80,6 +80,20 @@ def prepare_if_reference(url):
     return url
 
 
+def model_quota(model):
+    if model.get('is_free') is True:
+        return {'quota_status': 'free', 'remaining': None}
+    if model.get('is_paid') is True:
+        return {'quota_status': 'paid', 'remaining': None}
+    total, used = model.get('total_count'), model.get('usage_count')
+    if (model.get('is_free') is not False or model.get('is_paid') is not False or
+            any(value is not None and (type(value) is not int or value < 0) for value in (total, used))):
+        return {'quota_status': 'unknown', 'remaining': None}
+    remaining = max(0, (total or 0) - (used or 0))
+    status = 'limited' if remaining else 'exhausted' if total else 'unavailable'
+    return {'quota_status': status, 'remaining': remaining}
+
+
 class SessionBusyError(RuntimeError):
     pass
 
@@ -319,9 +333,10 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 self.reply(503, {'error': str(exc)})
         elif self.path == '/models':
             try:
-                models = self.server.command('models', '--json', '--profile', 'buc', timeout=35)
-                self.reply(200, {'models': [{'display_name': m['display_name'], 'type': m['type']}
-                                            for m in models if m.get('type') in ('image', 'video')]})
+                models = self.server.command('models', '--refresh', '--json', '--profile', 'buc', timeout=35)
+                self.reply(200, {'models': [{'display_name': m['display_name'], 'type': m['type'],
+                                            **model_quota(m)}
+                                           for m in models if m.get('type') in ('image', 'video')]})
             except (RuntimeError, KeyError, TypeError) as exc:
                 self.reply(503, {'error': str(exc)})
         elif self.path.startswith('/requests/'):
@@ -565,9 +580,18 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     address = None
                 if (address is not None and not address.is_global) or host.replace('.', '').isdigit():
                     raise ValueError()
-            models = self.server.command('models', '--json', '--profile', 'buc', timeout=35)
-            if not any(m.get('display_name') == model and m.get('type') == kind for m in models):
+            models = self.server.command('models', '--refresh', '--json', '--profile', 'buc', timeout=35)
+            selected = next((m for m in models if m.get('display_name') == model and m.get('type') == kind), None)
+            if selected is None:
                 raise ValueError()
+            quota = model_quota(selected)
+            if quota['quota_status'] in ('exhausted', 'unavailable'):
+                with self.server.lock:
+                    if self.reply_existing_request(request_key, fingerprint):
+                        return
+                reason = '免费次数已用完' if quota['quota_status'] == 'exhausted' else '未开通且无免费次数'
+                self.reply(400, {'error': f'{model}：{reason}，尚未提交生成，请选择其他模型'})
+                return
             if asset_ids or references or image:
                 limits = json.loads(LIMITS_FILE.read_text(encoding='utf-8'))
                 rule = limits.get(model) if isinstance(limits, dict) else None

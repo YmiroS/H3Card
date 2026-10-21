@@ -182,7 +182,17 @@ async function ifRequest(path, options = {}) {
   if (!response.ok) throw Object.assign(new Error(data.error || `本机桥接返回 ${response.status}`), {status:response.status});
   return data;
 }
-function loadIFModels() {
+function ifModelQuotaText(model) {
+  switch (model.quota_status) {
+    case 'limited': return `剩余 ${model.remaining} 次免费`;
+    case 'exhausted': return '剩余 0 次 · 免费次数已用完';
+    case 'unavailable': return '剩余 0 次 · 未开通';
+    case 'free': return '免费使用';
+    case 'paid': return '已开通 · 按预算使用';
+    default: return model.quota_status ? '次数未知' : '次数未知 · 请更新桥接器';
+  }
+}
+function loadIFModels(refreshPanel = true) {
   if (ifModelsPromise) return ifModelsPromise;
   ifModelsAttempted = true;
   ifModelsPromise = (async () => {
@@ -194,7 +204,7 @@ function loadIFModels() {
     ifModelsError = "";
     return ifModels;
   })().catch(error => { ifModelsError = error.message; throw error; })
-    .finally(() => { ifModelsPromise = null; if (el.panel._id) openPanel(el.panel._id); });
+    .finally(() => { ifModelsPromise = null; if (refreshPanel && el.panel._id) openPanel(el.panel._id); });
   return ifModelsPromise;
 }
 function ifReferenceState(c, projectId) {
@@ -4002,6 +4012,8 @@ function showMenu(cx, cy, title, items) {
       continue;
     }
     const b = document.createElement("button");
+    b.disabled = !!it.disabled;
+    if (it.disabled) b.style.opacity = "0.45";
     if (it.danger) b.className = "danger";
     const i = document.createElement("span"); i.textContent = it.icon || "▸";
     const t = document.createElement("span"); t.textContent = it.text;
@@ -6127,9 +6139,10 @@ function openPanel(id) {
     } else if (isIF(c)) {
       const available = ifModels.filter(entry => entry.type === cap.outputType);
       const chosen = available.find(entry => entry.display_name === c.params.if_model)?.display_name || available[0]?.display_name;
-      const modelBtn = capBtn(chosen || "选择 IF 模型", "IF 模型", () => available.length
-        ? available.map(entry => ({
-          text: entry.display_name + (entry.display_name === chosen ? "（当前）" : ""),
+      const modelBtn = capBtn(chosen || "选择 IF 模型", "IF 模型", () => ifModels.some(entry => entry.type === cap.outputType)
+        ? ifModels.filter(entry => entry.type === cap.outputType).map(entry => ({
+          text: entry.display_name + (entry.display_name === chosen ? "（当前）" : "") + ' · ' + ifModelQuotaText(entry),
+          disabled: ['exhausted', 'unavailable'].includes(entry.quota_status),
           run: () => {
             closeResPop(); c.params.if_model = entry.display_name;
             const pending = c._referenceParameters;
@@ -6142,6 +6155,24 @@ function openPanel(id) {
         }))
         : [{text: ifModelsError ? "重试连接本机 IF" : "正在读取本机 IF 模型…",
             run: () => loadIFModels().catch(error => showError(error.message))}]);
+      modelBtn._openIFModels = modelBtn.onclick;
+      modelBtn.onclick = async ev => {
+        ev.stopPropagation(); closeMenu();
+        modelBtn.disabled = true;
+        modelBtn.firstChild.textContent = '读取剩余次数…';
+        try {
+          await loadIFModels(false);
+          if (el.panel._id === id && PROJ?.cards.includes(c)) {
+            const current = el.panel.querySelector('button[title="IF 模型 —— 点击换"]');
+            current?._openIFModels(ev);
+          }
+        } catch (error) {
+          showError('读取 IF 剩余次数失败：' + error.message);
+        } finally {
+          modelBtn.disabled = false;
+          modelBtn.firstChild.textContent = chosen || '选择 IF 模型';
+        }
+      };
       foot.appendChild(modelBtn);
     }
 
@@ -8393,6 +8424,8 @@ async function runIF(c, resume = false) {
       .find(entry => entry.display_name === c.params.if_model)
       || (!c.params.if_model && models.find(entry => entry.type === type));
     if (!model) throw new Error("当前 IF 模型不可用，请重新选择模型");
+    if (['exhausted', 'unavailable'].includes(model.quota_status))
+      throw new Error(`${model.display_name}：${ifModelQuotaText(model)}，尚未提交生成，请选择其他模型`);
     const originalPrompt = String(c.params.prompt || "");
     const prompt = originalPrompt.trim();
     if (!prompt) throw new Error("请先填写 IF 生成需求");

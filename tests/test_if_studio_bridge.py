@@ -12,7 +12,7 @@ from unittest import mock
 from urllib.error import HTTPError, URLError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'server'))
-from if_studio_bridge import Bridge, LIMITS_FILE, NoReferenceRedirect, SessionBusyError, prepare_if_reference
+from if_studio_bridge import Bridge, LIMITS_FILE, NoReferenceRedirect, SessionBusyError, prepare_if_reference, model_quota
 
 ORIGIN = 'http://127.0.0.1:8201'
 SECOND_ORIGIN = 'http://127.0.0.1:8199'
@@ -24,6 +24,28 @@ BUSY_ERROR = ('Error: 发送消息失败: /api/session/send 失败: '
               'map[code:session_busy data:map[session_id:s1] '
               'message:当前会话正在生成中，请等待本轮对话完成后再发送。 '
               'status:session_busy success:false]')
+
+
+class ModelQuotaTest(unittest.TestCase):
+    def test_quota_matches_if_account_permissions_without_inventing_counts(self):
+        base = {'is_free': False, 'is_paid': False}
+        for fields, status, remaining in (
+                ({'total_count': 100, 'usage_count': 1}, 'limited', 99),
+                ({'total_count': 30}, 'limited', 30),
+                ({'total_count': 30, 'usage_count': 30}, 'exhausted', 0),
+                ({'total_count': 30, 'usage_count': 35}, 'exhausted', 0),
+                ({}, 'unavailable', 0),
+                ({'total_count': None, 'usage_count': None}, 'unavailable', 0),
+                ({'total_count': 0}, 'unavailable', 0),
+                ({'is_free': True}, 'free', None),
+                ({'is_paid': True, 'total_count': 30, 'usage_count': 30}, 'paid', None),
+                ({'total_count': '30'}, 'unknown', None),
+                ({'usage_count': -1}, 'unknown', None),
+                ({'total_count': True}, 'unknown', None)):
+            with self.subTest(fields=fields):
+                self.assertEqual(model_quota({**base, **fields}),
+                                 {'quota_status': status, 'remaining': remaining})
+        self.assertEqual(model_quota({}), {'quota_status': 'unknown', 'remaining': None})
 
 
 class ReferenceURLTest(unittest.TestCase):
@@ -144,7 +166,8 @@ class BridgeTest(unittest.TestCase):
     def test_models_and_request_validation(self):
         with mock.patch.object(self.bridge, 'command', return_value=MODELS):
             code, _, body = self.request('GET', '/models')
-            self.assertEqual((code, body['models']), (200, MODELS))
+            self.assertEqual((code, body['models']), (200, [
+                {**m, 'quota_status': 'unknown', 'remaining': None} for m in MODELS]))
             for data in ({'type': 'video', 'model': 'qwen-image-2.0', 'prompt': 'hello'},
                          {'type': 'image', 'model': 'qwen-image-2.0', 'prompt': 'hello',
                           'image': 'file:///private/secret'},
@@ -157,6 +180,37 @@ class BridgeTest(unittest.TestCase):
                                           headers={'Content-Type': 'application/json', 'X-Chouka-IF': 'generate'})
                 self.assertEqual(code, 400)
             self.assertFalse(self.bridge.jobs)
+
+    def test_models_refresh_and_expose_only_public_quota_fields(self):
+        models = [{**MODELS[0], 'is_free': False, 'is_paid': False,
+                   'total_count': 100, 'usage_count': 1, 'internal_field': 'private'},
+                  {**MODELS[1], 'is_free': False, 'is_paid': False},
+                  {'display_name': 'planner', 'type': 'text'}]
+        with mock.patch.object(self.bridge, 'command', return_value=models) as command:
+            code, headers, body = self.request('GET', '/models')
+            command.assert_called_once_with('models', '--refresh', '--json', '--profile', 'buc', timeout=35)
+            self.assertEqual(code, 200)
+            self.assertEqual(headers['Cache-Control'], 'no-store')
+            self.assertEqual(body['models'], [
+                {**MODELS[0], 'quota_status': 'limited', 'remaining': 99},
+                {**MODELS[1], 'quota_status': 'unavailable', 'remaining': 0}])
+
+    def test_unavailable_or_exhausted_model_is_rejected_before_generation(self):
+        for quota, message in (({}, '未开通'), ({'total_count': 30, 'usage_count': 30}, '免费次数已用完')):
+            with self.subTest(quota=quota), mock.patch.object(self.bridge, 'command', return_value=[
+                    {**MODELS[0], 'is_free': False, 'is_paid': False, **quota}]) as command, \
+                    mock.patch.object(self.bridge, 'generate') as generate:
+                code, _, body = self.request('POST', '/runs', json.dumps({
+                    'type': 'image', 'model': MODELS[0]['display_name'], 'prompt': 'hello',
+                    'request_id': 'a' * 32}),
+                    headers={'Content-Type': 'application/json', 'X-Chouka-IF': 'generate'})
+                self.assertEqual(code, 400)
+                self.assertIn(message, body['error'])
+                self.assertIn('尚未提交生成', body['error'])
+                command.assert_called_once_with('models', '--refresh', '--json', '--profile', 'buc', timeout=35)
+                generate.assert_not_called()
+                self.assertFalse(self.bridge.jobs)
+                self.assertFalse(self.bridge.requests)
 
     def test_create_poll_and_media(self):
         def command(*args, **_):
