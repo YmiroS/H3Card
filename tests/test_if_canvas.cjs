@@ -39,6 +39,24 @@ const durationRanges = {
   'Seedance 2.0':[4, 15], 'Seedance 2.5':[4, 30], 'Minimax H3':[5, 15],
   '星辰图生视频':[null, null], '可灵3.0 Omni':[3, 15],
 };
+test('IF video HD presets use exact dimensions and never affect local workflows', () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const helper = source.slice(source.indexOf('const IF_VIDEO_RESOLUTIONS ='), source.indexOf('const H3_LONG ='));
+  const resolve = vm.runInNewContext(helper + '; ifVideoResolution', {RATIO_WH:{
+    '16:9 (Widescreen)':[16,9], '9:16 (Portrait Widescreen)':[9,16], '1:1 (Square)':[1,1]}});
+  for (const [id, width, height] of [['1080p',1920,1080], ['2K',2560,1440], ['4K',3840,2160]]) {
+    const c = {params:{if_video_resolution:id}};
+    assert.deepEqual(JSON.parse(JSON.stringify(resolve(c, capabilities.if_video))), {label:id, width, height});
+    c.params.aspect_ratio = '9:16 (Portrait Widescreen)';
+    const portrait = resolve(c, capabilities.if_video);
+    assert.equal(portrait.width, height); assert.equal(portrait.height, width);
+    c.params.aspect_ratio = '1:1 (Square)';
+    assert.equal(resolve(c, capabilities.if_video).width, height);
+    assert.equal(resolve(c, capabilities.minimax_h3_character_transfer), null);
+    assert.equal(resolve(c, capabilities.if_image), null);
+  }
+  assert.equal(resolve({params:{}}, capabilities.if_video), null, 'legacy MP settings remain in effect');
+});
 test('IF duration limits match the supplied model table, with unknown ranges preserved', () => {
   for (const [name, range] of Object.entries(durationRanges)) {
     assert.deepEqual([ifModelLimits[name].duration.min, ifModelLimits[name].duration.max], range, name);
@@ -57,6 +75,85 @@ test('IF canvas links preserve full IDs and reject unsafe destinations', () => {
     assert.equal(normalize({canvas_url:bad}), '');
   for (const bad of ['', '../bad', 'c_bad/other', 'c_bad?token=x', 'c_bad#fragment', null])
     assert.equal(normalize({canvas_id:bad}), '');
+});
+test('IF manual recovery queries existing jobs only and leaves missing or stale tasks unchanged', async () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const helper = source.slice(source.indexOf('async function restoreIFOutputs('), source.indexOf('function ifTaskKey('));
+  const make = (options = {}) => {
+    const card = {id:'c1', cap:'if_video', job:'j1', if_request_id:'r1', if_started:100,
+      status:'error', error:'协作误标失败', outputs:[]};
+    const calls = [], errors = [], project = {id:'p1', cards:[card]};
+    const ctx = vm.createContext({PROJ:project, canOperate:()=>options.allowed !== false, isIF:()=>true,
+      confirm:()=>options.confirm !== false, el:{panel:{}}, openPanel(){}, paint(){},
+      showError:message=>errors.push(message),
+      ifRequest:async (url, init) => {
+        assert.equal(init, undefined, 'recovery must use GET, not create a run');
+        calls.push(url);
+        if (options.query) return options.query(url, card, ctx);
+        return url.startsWith('/requests/') ? {id:'j1'} : {state:options.state || 'done'};
+      },
+      rememberIFTask:(c,p,phase)=>{calls.push('journal'); assert.equal(phase, 'running'); return true;},
+      saveIFTaskProject:async()=>calls.push('save'),
+      pollIF:async(c,p,job)=>{calls.push('poll:' + job.state); assert.equal(c.status, 'running');},
+    });
+    vm.runInContext(helper, ctx);
+    return {card, calls, errors, ctx, run:()=>ctx.restoreIFOutputs(card)};
+  };
+  for (const state of ['done', 'running', 'starting']) {
+    const t = make({state}); await t.run();
+    assert.deepEqual(t.calls, ['/runs/j1', 'journal', 'save', 'poll:' + state]);
+    assert.equal(t.card.job, 'j1'); assert.equal(t.card.error, null);
+  }
+  const byRequest = make(); byRequest.card.job = null; await byRequest.run();
+  assert.deepEqual(byRequest.calls.slice(0, 2), ['/requests/r1', '/runs/j1']);
+  assert.equal(byRequest.card.job, 'j1');
+  for (const options of [{confirm:false}, {allowed:false}]) {
+    const t = make(options); await t.run(); assert.deepEqual(t.calls, []);
+  }
+  for (const query of [async()=>{throw Object.assign(new Error('任务不存在'), {status:404});},
+    async()=>({state:'error', error:'原任务失败'}), async()=>{throw new TypeError('Failed to fetch');}]) {
+    const t = make({query}); await t.run();
+    assert.deepEqual(t.calls, ['/runs/j1']);
+    assert.equal(t.card.status, 'error'); assert.equal(t.card.error, '协作误标失败');
+    assert.equal(t.errors.length, 1); assert.match(t.errors[0], /未重新提交生成/);
+  }
+  const stale = make({query:async(url, c)=>{c.job = 'new-job'; return {state:'done'};}});
+  await stale.run(); assert.deepEqual(stale.calls, ['/runs/j1']); assert.equal(stale.card.job, 'new-job');
+  let release;
+  const duplicate = make({query:()=>new Promise(resolve=>{release = resolve;})});
+  const pending = duplicate.run(); await duplicate.run();
+  assert.deepEqual(duplicate.calls, ['/runs/j1']);
+  release({state:'done'}); await pending;
+  assert.equal(duplicate.card._ifRestoring, false);
+});
+test('IF recovered outputs survive failed project saves and uploads cannot write into a switched project', async () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const journal = source.slice(source.indexOf('function ifTaskKey('), source.indexOf('function reusableIFURL('));
+  const storage = new Map();
+  const card = {id:'c1', cap:'if_video', job:'j1', if_request_id:'r1', if_started:100,
+    status:'done', outputs:[{url:'/restored.mp4'}]};
+  const ctx = vm.createContext({H3Auth:{user:{id:'u1'}}, isIF:()=>true,
+    sessionStorage:{getItem:k=>storage.get(k) ?? null, setItem:(k,v)=>storage.set(k,v), removeItem:k=>storage.delete(k)},
+    enqueueSave:async()=>({ok:false})});
+  vm.runInContext(journal, ctx);
+  ctx.rememberIFTask(card, 'p1', 'done');
+  await ctx.saveIFTaskProject(card, 'p1');
+  const stale = {...card, status:'error', outputs:[]};
+  assert.equal(ctx.restoreIFTask(stale, 'p1'), true);
+  assert.equal(stale.status, 'done'); assert.equal(stale.outputs[0].url, '/restored.mp4');
+  assert.equal(ctx.restoreIFTask({...card, status:'error', if_started:101}, 'p1'), false);
+  card.status = 'running'; card.outputs = [];
+  ctx.PROJ = {id:'p1', cards:[card]}; ctx.canOperate = ()=>true; ctx.ownsIFTask = ()=>true;
+  ctx.capOf = ()=>({outputType:'video'}); ctx.KIND_ZH = {video:'视频'};
+  ctx.rememberIFReferences = ()=>{}; ctx.ifCanvasURL = ()=>''; ctx.paint = ()=>{};
+  ctx.IF_BRIDGE = 'http://127.0.0.1:19781'; ctx.File = class {};
+  ctx.fetch = async()=>({ok:true, blob:async()=>({})});
+  ctx.uploadAsset = async()=>{ctx.PROJ = {id:'other', cards:[]}; return {url:'/wrong-project.mp4'};};
+  ctx.propagateCardOutputs = ()=>{throw new Error('stale upload must not propagate');};
+  const poll = source.slice(source.indexOf('async function pollIF('), source.indexOf('async function runCard('));
+  vm.runInContext(poll, ctx);
+  await ctx.pollIF(card, 'p1', {state:'done', result:{downloaded:[{type:'video', name:'out.mp4', index:0}]}});
+  assert.equal(card.status, 'running'); assert.deepEqual(card.outputs, []);
 });
 test('IF refresh only resumes tasks recorded by the initiating browser session', async () => {
   const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
@@ -537,6 +634,18 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         assert.equal(await page.locator('#respop .image-advanced').count(), 0);
         await page.evaluate(() => { PROJ.cards[0].params.seed = 42; PROJ.cards[0].params.if_skill = '旧版技能'; });
       } else {
+        for (const preset of ['1080p', '2K', '4K']) {
+          await page.locator('#respop .cgrid.k button').filter({hasText:preset}).click();
+          assert.deepEqual(await page.locator('#respop .cgrid.k button.on').allTextContents(), [preset]);
+          assert.match(await page.evaluate(() => paramsBrief(PROJ.cards[0], capOf(PROJ.cards[0]))), new RegExp(preset));
+        }
+        await page.locator('#respop .cgrid.k button').filter({hasText:'544p'}).click();
+        assert.equal(await page.evaluate(() => PROJ.cards[0].params.if_video_resolution), undefined);
+        await page.locator('#respop .cgrid.k button').filter({hasText:'4K'}).click();
+        await page.locator('#respop .cgrid button').filter({hasText:'9:16'}).click();
+        assert.equal(await page.locator('#respop .cgrid.k button.on').getAttribute('title'), '2160×3840');
+        await ratio.click();
+        assert.equal(await page.locator('#respop .cgrid.k button.on').getAttribute('title'), '2880×2160');
         assert.equal(await rows.count(), 1);
         assert.doesNotMatch(await page.locator('#respop').innerText(), /种子|IF 技能|HTTPS/);
         assert.deepEqual(capabilities.if_video.inputs.map(input => input.key), ['prompt', 'aspect_ratio', 'megapixels', 'duration']);
@@ -561,7 +670,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         : '最终交付必须是图片文件，不是故事板或文字方案。用户已经确认生成需求，请直接生成图片；不要等待用户确认规划、分镜或中间图片，也不要把中间图片当作最终结果。如无法直接完成，请说明原因，不要改为视频或文字方案。以本条图片目标和以下参数要求为准。';
       assert.match(runs.at(-1).request_id, /^[a-f0-9]{32}$/);
       assert.deepEqual(runs.at(-1), {type:kind, model:chosen, request_id:runs.at(-1).request_id,
-        prompt:`${directive}\n\n蓝色圆形\n\n分辨率：${kind === 'image' ? '1440×1080' : '736×544\n时长：12s\n画面比例：4 : 3'}`,
+        prompt:`${directive}\n\n蓝色圆形\n\n分辨率：${kind === 'image' ? '1440×1080' : '2880×2160\n时长：12s\n画面比例：4 : 3'}`,
         references:[{kind, asset_id:referenceId}]});
       assert.doesNotMatch(runs.at(-1).prompt, /生成规格|随机种子/);
       assert.equal(uploadedReferences.length, kind === 'image' ? 1 : 2);
@@ -595,6 +704,21 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         await page.reload();
         await page.waitForFunction(() => PROJ?.cards[0]?.status === 'done');
         assert.equal(runs.length, 1, 'refresh must poll the original bridge job without resubmitting');
+        await page.waitForFunction(() => !PROJ.cards[0]._ifPolling);
+        await page.evaluate(() => persistence.pendingChain);
+        project.cards[0] = {...project.cards[0], status:'error', error:'协作者误标失败', outputs:[]};
+        await page.reload();
+        await page.waitForFunction(() => PROJ?.cards[0]?.status === 'error');
+        await page.evaluate(() => pick(PROJ.cards[0].id));
+        assert.equal(await page.evaluate(() => ownsIFTask(PROJ.cards[0], PROJ.id)), false);
+        page.once('dialog', dialog => {
+          assert.match(dialog.message(), /不会重新生成/);
+          dialog.accept();
+        });
+        await page.locator('#panel .if-recover-button').click();
+        await page.waitForFunction(() => PROJ.cards[0].status === 'done' && PROJ.cards[0].outputs.length > 0);
+        assert.equal(runs.length, 1, 'manual recovery must not submit another paid run');
+        assert.equal(await page.locator('#panel .if-recover-button').count(), 0);
       }
     }
     assert.equal(runs.length, 2);
@@ -828,6 +952,8 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       c.status = 'idle'; openPanel(c.id);
     });
     for (const [name, [min, max]] of Object.entries(durationRanges)) {
+      const dismissErrors = page.getByRole('button', {name:'关闭全部错误通知'});
+      if (await dismissErrors.isVisible()) await dismissErrors.click();
       await page.evaluate(() => { PROJ.cards[0].params.duration = 99; });
       await page.locator('#panel button[title="IF 模型 —— 点击换"]').click();
       await page.locator('#menu button').filter({hasText:name}).click();

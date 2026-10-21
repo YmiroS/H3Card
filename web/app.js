@@ -256,6 +256,54 @@ function ifCanvasLink(c) {
     link.addEventListener(event, e => e.stopPropagation());
   return link;
 }
+function ifRecoveryButton(c) {
+  if (!isIF(c) || c.status !== 'error' || !(c.job || c.if_request_id) || !canOperate()) return null;
+  const button = document.createElement('button');
+  button.type = 'button'; button.className = 'if-recover-button';
+  button.textContent = c._ifRestoring ? '正在查询原产物…' : '查询原产物';
+  button.disabled = !!c._ifRestoring;
+  button.title = '由发起人在原电脑查询原任务，不会重新提交生成';
+  for (const event of ['pointerdown', 'mousedown', 'dblclick'])
+    button.addEventListener(event, e => e.stopPropagation());
+  button.onclick = e => { e.stopPropagation(); restoreIFOutputs(c); };
+  return button;
+}
+async function restoreIFOutputs(c) {
+  const project = PROJ;
+  if (!project || !project.cards.includes(c) || !canOperate() || !isIF(c)
+      || c.status !== 'error' || !(c.job || c.if_request_id) || c._ifRestoring || c._ifPolling) return;
+  if (!confirm('请由任务发起人在原电脑操作。\n只查询本机桥接器中的原任务并取回产物，不会重新生成。\n若桥接器已重启，原记录可能无法恢复。继续查询？')) return;
+  const original = {cap:c.cap, job:c.job, request:c.if_request_id, started:c.if_started};
+  const unchanged = () => PROJ === project && project.cards.includes(c) && canOperate()
+    && c.status === 'error' && c.cap === original.cap && c.job === original.job
+    && c.if_request_id === original.request && c.if_started === original.started;
+  c._ifRestoring = true;
+  if (el.panel._id === c.id) openPanel(c.id);
+  try {
+    const id = original.job || (await ifRequest(`/requests/${encodeURIComponent(original.request)}`)).id;
+    if (!unchanged()) return;
+    if (!id) throw new Error('本机桥接器未返回原任务编号');
+    const job = await ifRequest(`/runs/${encodeURIComponent(id)}`);
+    if (!unchanged()) return;
+    if (job.state === 'error') throw new Error('原任务在 IF 中仍为失败：' + (job.error || '请打开 IF 画布查看原因'));
+    if (!['starting', 'running', 'done'].includes(job.state)) throw new Error('原任务状态无法识别，请在 IF 查看');
+    const resumed = {...c, job:id, status:'running', error:null, progress:null,
+      if_started:Number.isFinite(c.if_started) ? c.if_started : Date.now(), step:'正在查询原任务并恢复产物'};
+    if (!rememberIFTask(resumed, project.id, 'running')) throw new Error('无法保存恢复记录，请检查浏览器存储权限');
+    Object.assign(c, {job:resumed.job, status:resumed.status, error:null, progress:null,
+      if_started:resumed.if_started, step:resumed.step});
+    paint(c); if (el.panel._id === c.id) openPanel(c.id);
+    await saveIFTaskProject(c, project.id);
+    await pollIF(c, project.id, job);
+  } catch (error) {
+    showError(error.status === 404
+      ? '本机未找到原任务，请由发起人在原电脑查询；若桥接器已重启，请到 IF 下载原产物。未重新提交生成。'
+      : '查询原产物未完成：' + error.message + '；未重新提交生成。');
+  } finally {
+    c._ifRestoring = false;
+    if (PROJ === project && project.cards.includes(c) && el.panel._id === c.id) openPanel(c.id);
+  }
+}
 function ifTaskKey(c, projectId) {
   return 'chouka:if-task:v1:' + JSON.stringify([H3Auth.user?.id, projectId, c.id]);
 }
@@ -285,10 +333,12 @@ function restoreIFTask(c, projectId) {
       || !['preparing', 'submitting', 'running', 'done', 'error'].includes(state.phase)) return false;
   const unconfirmed = state.phase === 'submitting' && state.if_request_id
     && state.if_request_id === c.if_request_id && !state.job && !c.job && c.status === 'error';
+  const recoveredOutputs = state.phase === 'done' && state.status === 'done' && state.job
+    && state.job === c.job && c.status === 'error' && state.outputs?.length;
   if ((c.if_started || 0) > state.if_started || (c.if_started === state.if_started
       && ((c.job && c.job !== state.job)
         || (c.if_request_id && state.if_request_id && c.if_request_id !== state.if_request_id)
-        || (!unconfirmed && c.job === state.job && ['done', 'error'].includes(c.status))))) {
+        || (!unconfirmed && !recoveredOutputs && c.job === state.job && ['done', 'error'].includes(c.status))))) {
     try { sessionStorage.removeItem(key); } catch {}
     return false;
   }
@@ -642,6 +692,17 @@ const RATIO_WH = {
   "21:9 (Ultrawide)": [21, 9],
 };
 const H3_P = [480, 544, 640, 768];
+const IF_VIDEO_RESOLUTIONS = [{id:'1080p', short:1080}, {id:'2K', short:1440}, {id:'4K', short:2160}];
+function ifVideoResolution(c, cap) {
+  if (cap.execution !== 'if_studio' || cap.outputType !== 'video') return null;
+  const preset = IF_VIDEO_RESOLUTIONS.find(item => item.id === c.params.if_video_resolution);
+  if (!preset) return null;
+  const ratio = c.params.aspect_ratio ?? cap.inputs.find(item => item.key === 'aspect_ratio').default;
+  const [w, h] = RATIO_WH[ratio] || [1, 1];
+  return {label:preset.id,
+    width:w >= h ? Math.round(preset.short * w / h / 2) * 2 : preset.short,
+    height:w >= h ? preset.short : Math.round(preset.short * h / w / 2) * 2};
+}
 // scale_to_side=longest 那条链路给的是长边；这几个长边在 16:9 素材上正好落到上面的短边
 const H3_LONG = { 480: 832, 544: 960, 640: 1152, 768: 1344 };
 const MULT = 32;
@@ -991,6 +1052,7 @@ function clarityPicker(c, cap, onchange) {
     const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "清晰度";
     const g = document.createElement("div"); g.className = "cgrid k";
     const curStep = whStep(cap, c);
+    const ifResolution = ifVideoResolution(c, cap);
     for (const s of steps) {
       const b = document.createElement("button");
       const curVal = mpSpec
@@ -999,7 +1061,7 @@ function clarityPicker(c, cap, onchange) {
       // mp 那套按换算出的短边像素对档（0.4MP 默认正好就是 480p），
       // 别按 megapixels 原值等值比 —— 换算有 32 像素取整，原值永远差一点
       const on = mpSpec
-        ? (isFinite(curVal) && Math.min(...resFromMP(mpRatio, curVal)) === s.p)
+        ? (!ifResolution && isFinite(curVal) && Math.min(...resFromMP(mpRatio, curVal)) === s.p)
         : (curVal != null && Math.abs(curVal - s.val) < 40);
       b.className = on ? "on" : "";
       b.textContent = s.label;
@@ -1013,7 +1075,7 @@ function clarityPicker(c, cap, onchange) {
           : `${s.val} × ${Math.round(s.val * r[2] / r[1] / multiple) * multiple}`;
       }
       b.onclick = () => {
-        if (mpSpec) { c.params.megapixels = s.val; }
+        if (mpSpec) { c.params.megapixels = s.val; delete c.params.if_video_resolution; }
         else {
           c.params._clarity = s.id;
           // 从当前宽高反推比例，没有记录过就按现有宽高推算
@@ -1040,6 +1102,17 @@ function clarityPicker(c, cap, onchange) {
         save(); onchange && onchange();
       };
       g.appendChild(b);
+    }
+    if (cap.execution === 'if_studio' && cap.outputType === 'video') {
+      for (const preset of IF_VIDEO_RESOLUTIONS) {
+        const button = document.createElement('button');
+        const resolution = ifVideoResolution({...c, params:{...c.params, if_video_resolution:preset.id}}, cap);
+        button.textContent = preset.id;
+        button.className = ifResolution?.label === preset.id ? 'on' : '';
+        button.title = `${resolution.width}×${resolution.height}`;
+        button.onclick = () => { c.params.if_video_resolution = preset.id; save(); onchange && onchange(); };
+        g.appendChild(button);
+      }
     }
     wrap.append(t, g);
   }
@@ -1108,7 +1181,7 @@ function paramsBrief(c, cap) {
     const ratio = c.params.aspect_ratio != null ? c.params.aspect_ratio
       : (ar || {}).default || "16:9 (Widescreen)";
     const p = isFinite(v) ? Math.min(...resFromMP(ratio, v)) : null;
-    parts.push(p ? `${p}p` : "?");
+    parts.push(ifVideoResolution(c, cap)?.label || (p ? `${p}p` : "?"));
   } else if (w) {
     const s = whStep(cap, c);
     if (s) parts.push(s.label);
@@ -5794,6 +5867,8 @@ function openPanel(id) {
   if (c.error) body.appendChild(errBox(c.error));
   const canvasLink = ifCanvasLink(c);
   if (canvasLink) body.appendChild(canvasLink);
+  const recoveryButton = ifRecoveryButton(c);
+  if (recoveryButton) body.appendChild(recoveryButton);
 
   // --- 底部 ---
   const foot = document.createElement("div"); foot.className = "foot";
@@ -8040,6 +8115,7 @@ function payloadOf(c) {
 }
 
 function run(c) {
+  if (c._ifRestoring) { toast('正在查询原产物，请勿重复生成'); return Promise.resolve(); }
   if (c._runPromise) return c._runPromise;
   c._runPromise = trackNodeWork(runCard(c).finally(() => { delete c._runPromise; }));
   return c._runPromise;
@@ -8156,7 +8232,8 @@ async function runIF(c, resume = false) {
       const mp = specs.find(s => s.key === "megapixels");
       const ratioValue = c.params.aspect_ratio ?? ar.default;
       const pixels = Number(c.params.megapixels ?? mp.default);
-      const resolution = resFromMP(ratioValue,
+      const highResolution = ifVideoResolution(c, cap);
+      const resolution = highResolution ? [highResolution.width, highResolution.height] : resFromMP(ratioValue,
         Number.isFinite(pixels) && pixels >= mp.min && pixels <= mp.max ? pixels : mp.default);
       const spec = specs.find(s => s.key === "duration");
       const seconds = Number(c.params.duration ?? spec.default);
@@ -8280,14 +8357,18 @@ async function runIF(c, resume = false) {
   }
 }
 
-async function pollIF(c, projectId) {
+async function pollIF(c, projectId, recoveredJob = null) {
   if (c._ifPolling || PROJ?.id !== projectId || !canOperate() || !isIF(c)
       || !PROJ.cards.includes(c) || !ownsIFTask(c, projectId) || !c.job || c.status !== "running") return;
   c._ifPolling = true;
+  const attempt = {job:c.job, request:c.if_request_id, started:c.if_started, cap:c.cap};
+  const current = () => PROJ?.id === projectId && canOperate() && PROJ.cards.includes(c)
+    && c.job === attempt.job && c.if_request_id === attempt.request
+    && c.if_started === attempt.started && c.cap === attempt.cap;
   let retry = false;
   try {
-    const job = await ifRequest(`/runs/${encodeURIComponent(c.job)}`);
-    if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
+    const job = recoveredJob || await ifRequest(`/runs/${encodeURIComponent(c.job)}`);
+    if (!current()) return;
     rememberIFReferences(c, job.result, projectId);
     const canvasURL = ifCanvasURL(job.result);
     if (canvasURL) c.if_canvas_url = canvasURL;
@@ -8317,9 +8398,10 @@ async function pollIF(c, projectId) {
         throw new Error("无法读取 IF 产物");
       }
       const file = new File([await response.blob()], item.name);
-      if (PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c) || !isIF(c)) return;
+      if (!current()) return;
       c.step = `正在保存 IF ${KIND_ZH[item.type]}产物（${index + 1}/${downloaded.length}）`; paint(c);
       const asset = await uploadAsset(file, item.type === "image");
+      if (!current()) return;
       outputs.push({...asset, filename: item.name});
     }
     if (!outputs.length) throw new Error(expected === "video" && downloaded.some(item => item.type === "image")
@@ -8332,7 +8414,7 @@ async function pollIF(c, projectId) {
     rememberIFTask(c, projectId, 'done');
     await propagateCardOutputs(c);
   } catch (error) {
-    if (PROJ?.id !== projectId || !PROJ.cards.includes(c)) return;
+    if (!current()) return;
     if (error instanceof TypeError || /桥接请求失败|Failed to fetch/.test(error.message)) {
       c.step = "IF 连接或产物读取中断，正在重试";
       retry = true;
@@ -8345,7 +8427,7 @@ async function pollIF(c, projectId) {
     }
   } finally {
     c._ifPolling = false;
-    if (PROJ?.id === projectId && PROJ.cards.includes(c)) {
+    if (current()) {
       rememberIFTask(c, projectId, retry ? 'running' : c.status);
       paint(c); if (el.panel._id === c.id) openPanel(c.id);
       if (retry) setTimeout(() => pollIF(c, projectId), 2500);
