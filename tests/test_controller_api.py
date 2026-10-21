@@ -98,7 +98,7 @@ class TranslationFallbackTest(unittest.IsolatedAsyncioTestCase, auth_support.Aut
                         "subject_definitions:\n<Subject 1> is a gray cat."}],
         })
         request.app = {"session": object(), "auth_store": self.auth,
-                       "resource_access": self.access}
+                       "resource_access": self.access, "project_repository": self.projects}
 
         async def chat(_session, _system, user, _max_tokens, _temperature):
             self.assertIn("__CK_KEEP_", user)

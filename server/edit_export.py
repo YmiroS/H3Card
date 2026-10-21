@@ -387,6 +387,9 @@ class EditExports:
                     url = await self.publish(record["project"], record["user_id"], record["id"], final)
                     if not isinstance(url, str) or not url:
                         raise _ExportError("Export resource registration did not return a URL")
+                    # Publishing awaits resource registration; do not commit a
+                    # successful export if access was revoked during that await.
+                    await self._check_acl(record)
                     self._update(record, status="done", progress=1.0, url=url)
         except asyncio.CancelledError:
             if record["status"] != "canceled":

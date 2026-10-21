@@ -69,10 +69,11 @@ test('AlphaGen toolbox mode, editable parameters and isolated submissions in com
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.end(JSON.stringify(value));
   };
-  const files = {'/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js',
+  const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js',
     '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost').pathname;
+    if (url === '/api/auth/presence' && req.method === 'POST') { req.resume(); return json(res, {online_users:1}); }
     if (req.method === 'GET') {
       if (url === '/api/auth/me') return json(res, {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'fixture-csrf'});
       if (url === '/api/cards') return json(res, {cards, capabilities, comfy_online:true});

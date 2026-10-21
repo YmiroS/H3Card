@@ -882,11 +882,11 @@ class FollowReferenceGenerateTest(unittest.IsolatedAsyncioTestCase):
                      "params": {"aspect_ratio": "21:9 (Ultrawide)", "duration": 4.1, "seed": 42},
                      "assets": {"video[0]": self.ref}, "video_metadata": {"duration": 1}}
         self.store = mock.Mock()
-        self.request = mock.Mock(app={"distributed": self.store})
+        self.request = mock.Mock(app={"distributed": self.store,
+                                      "project_repository": mock.Mock(read=mock.Mock(return_value={"cards": []}))})
         replacements = {
             "authorized_body": mock.AsyncMock(return_value=self.body),
             "generation_assets": mock.AsyncMock(return_value=self.body["assets"]),
-            "proj_path": mock.Mock(return_value=mock.Mock(read_text=mock.Mock(return_value='{"cards": []}'))),
             "probe_video": mock.Mock(side_effect=lambda ref: dict(self.info)),
             "require_project": mock.AsyncMock(), "require_user": mock.Mock(return_value={"id": "u"}),
             "call_store": mock.AsyncMock(), "resource_call": mock.AsyncMock(), "save_jobs": mock.Mock(),
