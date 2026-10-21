@@ -259,6 +259,14 @@ function ifCanvasLink(c) {
 function ifTaskKey(c, projectId) {
   return 'chouka:if-task:v1:' + JSON.stringify([H3Auth.user?.id, projectId, c.id]);
 }
+function ownsIFTask(c, projectId) {
+  let state;
+  try { state = JSON.parse(sessionStorage.getItem(ifTaskKey(c, projectId))); } catch {}
+  return !!(state && state.cap === c.cap && Number.isFinite(c.if_started)
+    && state.if_started === c.if_started
+    && (c.if_request_id ? state.if_request_id === c.if_request_id : c.job && state.job === c.job)
+    && (!c.job || !state.job || c.job === state.job));
+}
 function rememberIFTask(c, projectId, phase) {
   const state = {phase, cap:c.cap, job:c.job, status:c.status, step:c.step, error:c.error,
     if_started:c.if_started, if_job_cap:c.if_job_cap, if_canvas_url:c.if_canvas_url, ms:c.ms, outputs:c.outputs || [],
@@ -1609,7 +1617,7 @@ async function openProject(pid) {
       if (selected) c._model = selected[0];
     }
     if (restoreIFTask(c, PROJ.id)) recoveredIFTasks.push(c);
-    if (!isTextCard(c) && !isAsset(c) && c.status === "queued" && !c.job && !c._ifResumePreparing) {
+    if (!isIF(c) && !isTextCard(c) && !isAsset(c) && c.status === "queued" && !c.job && !c._ifResumePreparing) {
       c.status = "error";
       c.error = "上次提交未取得任务编号，请先检查任务列表，确认后再重试";
     }
@@ -1880,7 +1888,7 @@ function applyCollaborativeProject(project) {
   }
   const panelOpen = el.panel.style.display !== "none";
   const recoveredIFTasks = [];
-  const activeIF = new Map(PROJ.cards.filter(card => isIF(card)
+  const activeIF = new Map(PROJ.cards.filter(card => isIF(card) && ownsIFTask(card, PROJ.id)
     && ["queued", "running"].includes(card.status) && Number.isFinite(card.if_started))
     .map(card => [card.id, card]));
   PROJ.name = project.name;
@@ -8037,7 +8045,8 @@ function run(c) {
   return c._runPromise;
 }
 function resumeIFTask(c, projectId) {
-  if (!isIF(c) || !canOperate()) return;
+  // 协作者只能同步状态，不能拿他人的任务编号查询自己的本机桥接器。
+  if (!isIF(c) || !canOperate() || !ownsIFTask(c, projectId)) return;
   if (c._ifResumePreparing) {
     delete c._ifResumePreparing;
     c._runPromise = trackNodeWork(runIF(c, true).finally(() => { delete c._runPromise; }));
@@ -8048,7 +8057,7 @@ function resumeIFTask(c, projectId) {
 }
 async function recoverIFSubmission(c, projectId) {
   if (c._ifRecovering || PROJ?.id !== projectId || !canOperate() || !PROJ.cards.includes(c)
-      || !isIF(c) || c.job || c.status !== 'running' || !c.if_request_id) return;
+      || !isIF(c) || !ownsIFTask(c, projectId) || c.job || c.status !== 'running' || !c.if_request_id) return;
   c._ifRecovering = true;
   let retry = false;
   try {
@@ -8273,7 +8282,7 @@ async function runIF(c, resume = false) {
 
 async function pollIF(c, projectId) {
   if (c._ifPolling || PROJ?.id !== projectId || !canOperate() || !isIF(c)
-      || !PROJ.cards.includes(c) || !c.job || c.status !== "running") return;
+      || !PROJ.cards.includes(c) || !ownsIFTask(c, projectId) || !c.job || c.status !== "running") return;
   c._ifPolling = true;
   let retry = false;
   try {
