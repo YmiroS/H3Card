@@ -489,7 +489,11 @@ async def assign_projects(request):
 
 
 def register_auth_routes(app, web_root):
-    redirect_origin = '' if app.get('local_test') else os.environ.get('CHOUKA_HTTPS_REDIRECT_ORIGIN', '')
+    redirect_origin = os.environ.get('CHOUKA_HTTPS_REDIRECT_ORIGIN', '')
+    if not redirect_origin and os.environ.get('CHOUKA_TLS_CERT') and os.environ.get('CHOUKA_TLS_KEY'):
+        redirect_origin = f"https://dinghaichouka.youku.com:{os.environ.get('CHOUKA_HTTPS_PORT', '8443')}"
+    if app.get('local_test') or app.get('admin_sandbox'):
+        redirect_origin = ''
     if redirect_origin:
         try:
             target = urlsplit(redirect_origin)
