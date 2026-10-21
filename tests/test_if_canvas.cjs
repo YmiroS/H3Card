@@ -58,13 +58,56 @@ test('IF canvas links preserve full IDs and reject unsafe destinations', () => {
   for (const bad of ['', '../bad', 'c_bad/other', 'c_bad?token=x', 'c_bad#fragment', null])
     assert.equal(normalize({canvas_id:bad}), '');
 });
+test('IF refresh only resumes tasks recorded by the initiating browser session', async () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const journal = source.slice(source.indexOf('function ifTaskKey('), source.indexOf('async function saveIFTaskProject('));
+  const resume = source.slice(source.indexOf('function resumeIFTask('), source.indexOf('async function recoverIFSubmission('));
+  const storage = new Map(), calls = [];
+  const ctx = vm.createContext({H3Auth:{user:{id:'u1'}},
+    sessionStorage:{getItem:k=>storage.get(k) ?? null, setItem:(k,v)=>storage.set(k,v)},
+    isIF:()=>true, canOperate:()=>true, pollIF:()=>calls.push('poll'),
+    recoverIFSubmission:()=>calls.push('recover')});
+  vm.runInContext(journal + resume, ctx);
+  const card = {id:'c1', cap:'if_video', status:'running', job:'j1', if_request_id:'r1', if_started:100};
+  ctx.resumeIFTask(card, 'p1');
+  assert.deepEqual(calls, [], 'collaborator must not query their own bridge');
+  ctx.rememberIFTask(card, 'p1', 'running');
+  ctx.resumeIFTask(card, 'p1');
+  assert.deepEqual(calls, ['poll'], 'initiator can resume after refresh');
+  ctx.resumeIFTask({...card, if_request_id:'r2'}, 'p1');
+  ctx.resumeIFTask({...card, job:'j2'}, 'p1');
+  ctx.resumeIFTask({...card, if_started:101}, 'p1');
+  ctx.resumeIFTask(card, 'other-project');
+  ctx.H3Auth.user.id = 'u2';
+  ctx.resumeIFTask(card, 'p1');
+  assert.deepEqual(calls, ['poll'], 'other attempts, projects and users cannot take over');
+  ctx.H3Auth.user.id = 'u1';
+  const submitting = {...card, job:null};
+  ctx.rememberIFTask(submitting, 'p1', 'submitting');
+  ctx.resumeIFTask(submitting, 'p1');
+  assert.deepEqual(calls, ['poll', 'recover']);
+  storage.clear();
+  ctx.resumeIFTask(submitting, 'p1');
+  assert.deepEqual(calls, ['poll', 'recover'], 'observer cannot recover an unconfirmed submission');
+  const polling = source.slice(source.indexOf('async function pollIF('), source.indexOf('async function runCard('));
+  const recovering = source.slice(source.indexOf('async function recoverIFSubmission('), source.indexOf('async function runIF('));
+  ctx.PROJ = {id:'p1', cards:[card]};
+  ctx.ifRequest = () => { throw new Error('observer contacted bridge'); };
+  vm.runInContext(polling + recovering, ctx);
+  await ctx.pollIF(card, 'p1');
+  card.job = null;
+  await ctx.recoverIFSubmission(card, 'p1');
+  assert.equal(card.status, 'running');
+  assert.equal(card._ifPolling, undefined);
+  assert.equal(card._ifRecovering, undefined);
+});
 test('IF collaboration preserves active attempts and respects terminal, newer and deleted cards', () => {
   const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
   const journal = source.slice(source.indexOf('function ifTaskKey('), source.indexOf('async function saveIFTaskProject('));
   const apply = source.slice(source.indexOf('function applyCollaborativeProject('), source.indexOf('function flushPendingProjectSync('));
   const make = (status = 'running') => {
     const active = {id:'c1', cap:'if_video', job:status === 'queued' ? null : 'job-1', status,
-      if_started:100, params:{prompt:'keep input'}, assets:{}, step:'正在生成', history:[], outputs:[]};
+      if_started:100, if_request_id:'request-1', params:{prompt:'keep input'}, assets:{}, step:'正在生成', history:[], outputs:[]};
     const storage = new Map(), polls = [];
     const ctx = vm.createContext({PROJ:{id:'p1', rev:1, cards:[active]}, H3Auth:{user:{id:'u1'}},
       sessionStorage:{getItem:key=>storage.get(key) ?? null, setItem:(key,value)=>storage.set(key,value), removeItem:key=>storage.delete(key)},
@@ -88,7 +131,12 @@ test('IF collaboration preserves active attempts and respects terminal, newer an
     assert.equal(t.active._ifPolling, phase === 'running');
     assert.equal(t.polls.length, 0, 'an in-flight poll must not be duplicated');
   }
+  const observer = make();
+  observer.apply([{...observer.active, step:'对方正在保存产物', job:'job-2'}]);
+  assert.equal(observer.ctx.PROJ.cards[0].step, '对方正在保存产物');
+  assert.equal(observer.ctx.PROJ.cards[0].job, 'job-2', 'observer must accept remote task updates');
   const waitingPoll = make();
+  waitingPoll.ctx.rememberIFTask(waitingPoll.active, 'p1', 'running');
   waitingPoll.active._ifPolling = false;
   waitingPoll.apply([{...waitingPoll.active}]);
   assert.equal(waitingPoll.ctx.PROJ.cards[0], waitingPoll.active);
@@ -536,6 +584,15 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       if (kind === 'image') {
         project.cards[0] = {...project.cards[0], status:'running', outputs:[]};
         await page.reload();
+        await page.waitForFunction(() => PROJ?.cards[0]?.status === 'running');
+        assert.equal(await page.evaluate(() => ownsIFTask(PROJ.cards[0], PROJ.id)), false);
+        await page.evaluate(async () => {
+          const card = PROJ.cards[0];
+          await pollIF(card, PROJ.id);
+          if (card.status !== 'running') throw new Error('observer changed shared task status');
+          rememberIFTask(card, PROJ.id, 'running');
+        });
+        await page.reload();
         await page.waitForFunction(() => PROJ?.cards[0]?.status === 'done');
         assert.equal(runs.length, 1, 'refresh must poll the original bridge job without resubmitting');
       }
@@ -755,6 +812,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     assert.equal(runs.length, beforeFailure);
     assert.equal(uploadedReferences.length, uploadsBeforeInvalidCopy,
       'even an adapted image one byte over 10,000,000 must not reach the bridge');
+    await page.waitForFunction(() => !document.querySelector('.card .body .load'));
     assert.equal(await page.locator('.card .body .load').count(), 0, 'failure must stop loading');
     assert.ok(busySteps.indexOf('正在向本机桥接传送图片引用（1/1）')
       < busySteps.indexOf('正在上传 IF 引用素材（1/1）'), 'local transfer must precede the only IF upload phase');
