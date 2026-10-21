@@ -1018,9 +1018,33 @@ class HTTPSRedirectConfigTests(unittest.TestCase):
             with self.subTest(local_test=local_test, origin=origin):
                 app = web.Application()
                 app['local_test'] = local_test
-                with patch.dict(os.environ, {'CHOUKA_HTTPS_REDIRECT_ORIGIN': origin}):
+                with patch.dict(os.environ, {'CHOUKA_HTTPS_REDIRECT_ORIGIN': origin}, clear=True):
                     register_auth_routes(app, '.')
                 self.assertEqual(app['https_redirect_origin'], expected)
+
+    def test_direct_tls_defaults_to_intranet_https_without_redirect_setting(self):
+        tls = {'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key'}
+        for settings, expected in (
+                ({'CHOUKA_TLS_CERT': 'server.crt'}, ''),
+                (tls, 'https://dinghaichouka.youku.com:8443'),
+                (tls | {'CHOUKA_HTTPS_REDIRECT_ORIGIN': ''}, 'https://dinghaichouka.youku.com:8443'),
+                (tls | {'CHOUKA_HTTPS_PORT': '9443'}, 'https://dinghaichouka.youku.com:9443'),
+                (tls | {'CHOUKA_HTTPS_REDIRECT_ORIGIN': 'https://example.test/'}, 'https://example.test')):
+            with self.subTest(settings=settings), patch.dict(os.environ, settings, clear=True):
+                app = web.Application()
+                register_auth_routes(app, '.')
+                self.assertEqual(app['https_redirect_origin'], expected)
+
+    def test_local_and_admin_sandboxes_ignore_tls_redirect(self):
+        for mode in ('local_test', 'admin_sandbox'):
+            with self.subTest(mode=mode), patch.dict(os.environ, {
+                    'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key',
+                    'CHOUKA_HTTPS_REDIRECT_ORIGIN': 'https://example.test',
+            }, clear=True):
+                app = web.Application()
+                app[mode] = True
+                register_auth_routes(app, '.')
+                self.assertEqual(app['https_redirect_origin'], '')
 
 
 class HTTPSRedirectTests(unittest.IsolatedAsyncioTestCase):
@@ -1032,7 +1056,10 @@ class HTTPSRedirectTests(unittest.IsolatedAsyncioTestCase):
         self.target = 'https://dinghaichouka.youku.com:8443'
         app = web.Application(middlewares=[auth_middleware])
         app['auth_store'] = self.store
-        with patch.dict(os.environ, {'CHOUKA_HTTPS_REDIRECT_ORIGIN': self.target}):
+        with patch.dict(os.environ, {
+                'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key',
+                'CHOUKA_HTTPS_PORT': '8443',
+        }, clear=True):
             register_auth_routes(app, Path(__file__).resolve().parents[1] / 'web')
 
         async def ok(request):
