@@ -678,6 +678,17 @@ const RATIO_WH = {
   "21:9 (Ultrawide)": [21, 9],
 };
 const H3_P = [480, 544, 640, 768];
+const IF_VIDEO_RESOLUTIONS = [{id:'1080p', short:1080}, {id:'2K', short:1440}, {id:'4K', short:2160}];
+function ifVideoResolution(c, cap) {
+  if (cap.execution !== 'if_studio' || cap.outputType !== 'video') return null;
+  const preset = IF_VIDEO_RESOLUTIONS.find(item => item.id === c.params.if_video_resolution);
+  if (!preset) return null;
+  const ratio = c.params.aspect_ratio ?? cap.inputs.find(item => item.key === 'aspect_ratio').default;
+  const [w, h] = RATIO_WH[ratio] || [1, 1];
+  return {label:preset.id,
+    width:w >= h ? Math.round(preset.short * w / h / 2) * 2 : preset.short,
+    height:w >= h ? preset.short : Math.round(preset.short * h / w / 2) * 2};
+}
 // scale_to_side=longest 那条链路给的是长边；这几个长边在 16:9 素材上正好落到上面的短边
 const H3_LONG = { 480: 832, 544: 960, 640: 1152, 768: 1344 };
 const MULT = 32;
@@ -1193,6 +1204,7 @@ function clarityPicker(c, cap, onchange) {
     const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "清晰度";
     const g = document.createElement("div"); g.className = "cgrid k";
     const curStep = whStep(cap, c);
+    const ifResolution = ifVideoResolution(c, cap);
     for (const s of steps) {
       const b = document.createElement("button");
       const curVal = mpSpec
@@ -1201,7 +1213,7 @@ function clarityPicker(c, cap, onchange) {
       // mp 那套按换算出的短边像素对档（0.4MP 默认正好就是 480p），
       // 别按 megapixels 原值等值比 —— 换算有 32 像素取整，原值永远差一点
       const on = mpSpec
-        ? (isFinite(curVal) && Math.min(...resFromMP(mpRatio, curVal)) === s.p)
+        ? (!ifResolution && isFinite(curVal) && Math.min(...resFromMP(mpRatio, curVal)) === s.p)
         : (curVal != null && Math.abs(curVal - s.val) < 40);
       b.className = on ? "on" : "";
       b.textContent = s.label;
@@ -1215,7 +1227,7 @@ function clarityPicker(c, cap, onchange) {
           : `${s.val} × ${Math.round(s.val * r[2] / r[1] / multiple) * multiple}`;
       }
       b.onclick = () => {
-        if (mpSpec) { c.params.megapixels = s.val; }
+        if (mpSpec) { c.params.megapixels = s.val; delete c.params.if_video_resolution; }
         else {
           c.params._clarity = s.id;
           // 从当前宽高反推比例，没有记录过就按现有宽高推算
@@ -1242,6 +1254,17 @@ function clarityPicker(c, cap, onchange) {
         save(); onchange && onchange();
       };
       g.appendChild(b);
+    }
+    if (cap.execution === 'if_studio' && cap.outputType === 'video') {
+      for (const preset of IF_VIDEO_RESOLUTIONS) {
+        const button = document.createElement('button');
+        const resolution = ifVideoResolution({...c, params:{...c.params, if_video_resolution:preset.id}}, cap);
+        button.textContent = preset.id;
+        button.className = ifResolution?.label === preset.id ? 'on' : '';
+        button.title = `${resolution.width}×${resolution.height}`;
+        button.onclick = () => { c.params.if_video_resolution = preset.id; save(); onchange && onchange(); };
+        g.appendChild(button);
+      }
     }
     wrap.append(t, g);
   }
@@ -1310,7 +1333,7 @@ function paramsBrief(c, cap) {
     const ratio = c.params.aspect_ratio != null ? c.params.aspect_ratio
       : (ar || {}).default || "16:9 (Widescreen)";
     const p = isFinite(v) ? Math.min(...resFromMP(ratio, v)) : null;
-    parts.push(p ? `${p}p` : "?");
+    parts.push(ifVideoResolution(c, cap)?.label || (p ? `${p}p` : "?"));
   } else if (w) {
     const s = whStep(cap, c);
     if (s) parts.push(s.label);
@@ -8526,7 +8549,8 @@ async function runIF(c, resume = false) {
       const mp = specs.find(s => s.key === "megapixels");
       const ratioValue = c.params.aspect_ratio ?? ar.default;
       const pixels = Number(c.params.megapixels ?? mp.default);
-      const resolution = resFromMP(ratioValue,
+      const highResolution = ifVideoResolution(c, cap);
+      const resolution = highResolution ? [highResolution.width, highResolution.height] : resFromMP(ratioValue,
         Number.isFinite(pixels) && pixels >= mp.min && pixels <= mp.max ? pixels : mp.default);
       const spec = specs.find(s => s.key === "duration");
       const seconds = Number(c.params.duration ?? spec.default);
