@@ -165,7 +165,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
     edges:[], groups:[], view:{x:100, y:70, k:1}, cards:[card('image', 'qwen-image-2.0')]};
   const requests = [], runs = [], uploadedReferences = [], extraModels = [];
   const modelQuotas = new Map();
-  let failModelRefresh = false;
+  let failModelRefresh = false, holdModels = null;
   const referenceId = 'a'.repeat(32);
   let failMediaOnce = true;
   let returnVideoStoryboard = false;
@@ -274,6 +274,7 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       if ((url.pathname === '/status' || url.pathname === '/models')
           && await page.evaluate(() => PROJ?.cards[0]?.status === 'queued'))
         await checkBusy(/^正在连接本机 IF 并读取模型$/);
+      if (url.pathname === '/models' && holdModels) await holdModels;
       if (url.pathname === '/models' && failModelRefresh)
         return route.fulfill({status:503, headers, contentType:'application/json', body:JSON.stringify({error:'额度刷新失败'})});
       if (url.pathname === '/runs' && request.method() === 'POST') await checkBusy(/^正在交由本机 IF 桥接处理$/);
@@ -393,6 +394,24 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         [chosen, initial + '（当前）', unsupported, ...(kind === 'video'
           ? ['可灵3.0 Omni', 'HappyHorse-1.1视频', 'HappyHorse-1.0视频【内测】', 'Seedance 2.0', 'Seedance 2.5'] : [])]
           .map(name => name + ' · 剩余 30 次免费'));
+      for (const newerAction of ['mode', 'dismiss']) {
+        let releaseModels;
+        holdModels = new Promise(resolve => { releaseModels = resolve; });
+        await modelButton.click();
+        if (newerAction === 'mode')
+          await page.locator(`#panel button[title="${modeTitle} —— 点击换"]`).click();
+        else await page.keyboard.press('Escape');
+        releaseModels();
+        holdModels = null;
+        await page.waitForFunction(() => !document.querySelector('#panel button[title="IF 模型 —— 点击换"]').disabled);
+        if (newerAction === 'mode')
+          assert.equal(await page.locator('#menu .hd').innerText(), modeTitle, 'late quota refresh must preserve the newer menu');
+        else assert.equal(await page.locator('#menu').isVisible(), false, 'late quota refresh must not reopen a dismissed menu');
+      }
+      await page.evaluate(() => pick(PROJ.cards[0].id));
+      await modelButton.click();
+      await page.waitForFunction(() => document.querySelector('#menu')?.style.display !== 'none'
+        && document.querySelector('#menu .hd')?.textContent === 'IF 模型');
       if (kind === 'image') {
         await page.evaluate(() => closeMenu());
         modelQuotas.set(chosen, {quota_status:'limited', remaining:29});

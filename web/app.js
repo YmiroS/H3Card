@@ -4001,7 +4001,9 @@ function bindGlobal() {
 
 /* ================= 右键菜单 ================= */
 /** items: [{icon, text, danger, run, children}]，children 为二级菜单，{group:"…"} 为分类小标题。 */
+let menuRevision = 0;
 function showMenu(cx, cy, title, items) {
+  menuRevision++;
   el.menu.innerHTML = "";
   const hd = document.createElement("div"); hd.className = "hd";
   hd.textContent = title; el.menu.appendChild(hd);
@@ -4065,7 +4067,7 @@ function showMenu(cx, cy, title, items) {
   el.menu.style.left = Math.min(cx, innerWidth - el.menu.offsetWidth - 8) + "px";
   el.menu.style.top = Math.min(cy, innerHeight - el.menu.offsetHeight - 8) + "px";
 }
-const closeMenu = () => (el.menu.style.display = "none");
+const closeMenu = () => { menuRevision++; el.menu.style.display = "none"; };
 
 /** 面板底部工具条的胶囊按钮（文本节点的模型/加工方式、生图节点的模式都是它）：
     名字+▾，点开一个小菜单换。菜单往**上方**弹 —— 按钮都在面板最底一排，
@@ -6158,11 +6160,12 @@ function openPanel(id) {
       modelBtn._openIFModels = modelBtn.onclick;
       modelBtn.onclick = async ev => {
         ev.stopPropagation(); closeMenu();
+        const revision = menuRevision;
         modelBtn.disabled = true;
         modelBtn.firstChild.textContent = '读取剩余次数…';
         try {
           await loadIFModels(false);
-          if (el.panel._id === id && PROJ?.cards.includes(c)) {
+          if (menuRevision === revision && el.panel._id === id && PROJ?.cards.includes(c)) {
             const current = el.panel.querySelector('button[title="IF 模型 —— 点击换"]');
             current?._openIFModels(ev);
           }
