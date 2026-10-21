@@ -36,7 +36,7 @@ test('recent jobs show their recorded mode separately from card names', async ()
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.end(JSON.stringify({online_users:1}));
     }
-    const files = {'/':'index.html', '/auth.js':'auth.js', '/admin-shell.js':'admin-shell.js',
+    const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html', '/auth.js':'auth.js', '/admin-shell.js':'admin-shell.js',
       '/controller-page.js':'controller-page.js', '/admin-shell.css':'admin-shell.css',
       '/app.js':'app.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png',
       '/image-composer.css':'image-composer.css', '/vendor/fabric.min.js':'vendor/fabric.min.js',
@@ -255,7 +255,7 @@ test('H3 stable switch persists across reloads and supports keyboard with real p
     res.setHeader('Content-Type', 'application/json; charset=utf-8');
     res.end(JSON.stringify(value));
   };
-  const files = {'/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js',
+  const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js',
     '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png',
     '/image-composer.css':'image-composer.css', '/vendor/fabric.min.js':'vendor/fabric.min.js',
     '/image-composer.js':'image-composer.js'};

@@ -60,10 +60,13 @@ from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_
                          setup_local_test_auth)
 from server.resource_access import ResourceAccess
 from server.edit_api import register_edit_routes
-from server.edit_export import ExportBusyError
 from server.image_controls import image_controls, patch_image_controls
 from server.director_bridge import import_director, link_director, project_director, reference_storyboard, sync_card_job
 from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
+from server.project_repository import ProjectRepository, InvalidProjectId
+from server.project_service import ProjectService, ProjectError
+from server.routes import (register_page_routes, register_project_routes, register_media_routes,
+                           register_generation_routes, register_controller_routes, register_worker_routes)
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
 PACK = ROOT.parent                                     # 整合包根目录
@@ -180,13 +183,21 @@ async def require_resource(request, kind, locator, project_id=None):
         raise web.HTTPNotFound(text="资源不存在或无权访问")
 
 
-def write_project(path, document):
-    temporary = path.with_name(path.name + "." + uuid.uuid4().hex + ".tmp")
-    try:
-        temporary.write_text(json.dumps(document, ensure_ascii=False), encoding="utf-8")
-        os.replace(temporary, path)
-    finally:
-        temporary.unlink(missing_ok=True)
+def project_errors(handler):
+    """Translate persistence/application errors at the HTTP boundary."""
+    from functools import wraps
+
+    @wraps(handler)
+    async def wrapped(request):
+        try:
+            return await handler(request)
+        except InvalidProjectId as exc:
+            raise web.HTTPBadRequest(reason="非法项目 id") from exc
+        except ProjectError as exc:
+            error = {400: web.HTTPBadRequest, 403: web.HTTPForbidden,
+                     404: web.HTTPNotFound, 409: web.HTTPConflict}[exc.status]
+            raise error(reason=exc.reason, text=exc.text) from exc
+    return wrapped
 
 
 async def cache_comfy_outputs(request, card):
@@ -215,10 +226,10 @@ async def authorized_body(request):
     if not isinstance(body, dict) or not isinstance(body.get("project"), str):
         raise web.HTTPBadRequest(text="必须提供画布 ID")
     await require_project(request, body["project"], operate=True)
-    path = proj_path(body["project"])
+    path = project_path(request.app, body["project"])
     if not path.is_file():
         raise web.HTTPNotFound(text="画布不存在")
-    project = json.loads(path.read_text(encoding="utf-8"))
+    project = request.app["project_repository"].read(body["project"])
     body["projectName"] = project.get("name", "未命名")
     await resource_call(request.app, "validate_assets", require_user(request)["id"],
                         body["project"], body.get("assets") or {})
@@ -1255,8 +1266,7 @@ async def generation_assets(request, assets, project_id=None):
 
 async def api_generate(request):
     body = await authorized_body(request)
-    project_path = proj_path(body["project"])
-    project = json.loads(project_path.read_text(encoding="utf-8"))
+    project = request.app["project_repository"].read(body["project"])
     linked_card = next((card for card in project.get("cards", [])
                         if card.get("id") == body.get("card") and card.get("director_shot")), None)
     if linked_card:
@@ -1385,7 +1395,7 @@ async def api_generate(request):
         sync_card_job(linked_card, JOBS, CAPS, body["project"])
         project["rev"] = project.get("rev", 0) + 1
         project["updated"] = time.time()
-        write_project(project_path, project)
+        request.app["project_repository"].write(body["project"], project)
         await broadcast_collaboration(request.app, body["project"], {
             "type": "project-changed", "project": collaboration_project(project),
         }, authorize=True)
@@ -2313,10 +2323,21 @@ async def api_jobs_clear(request):
 PROJ_DIR = ROOT / "data" / "projects"
 
 
-def proj_path(pid):
-    if not pid.replace("-", "").isalnum():
-        raise web.HTTPBadRequest(reason="非法项目 id")
-    return PROJ_DIR / f"{pid}.json"
+def project_path(app, pid):
+    try:
+        return app["project_repository"].path(pid)
+    except InvalidProjectId as exc:
+        raise web.HTTPBadRequest(reason="非法项目 id") from exc
+
+
+async def publish_project(app, pid, project):
+    await broadcast_collaboration(app, pid, {
+        "type": "project-changed", "project": collaboration_project(project),
+    }, authorize=True)
+
+
+def sync_edit_card(card, pid):
+    sync_card_job(card, JOBS, CAPS, pid)
 
 
 def sync_project_name(app, project_id, project_name):
@@ -2337,11 +2358,11 @@ async def api_projects(request):
     accessible = await call_store(request.app, "list_projects", user["id"])
     out = []
     for acl in accessible:
-        path = proj_path(acl["project_id"])
+        path = project_path(request.app, acl["project_id"])
         if not path.is_file():
             continue
         try:
-            d = json.loads(path.read_text(encoding="utf-8"))
+            d = request.app["project_repository"].read(acl["project_id"])
         except (OSError, ValueError):
             continue
         out.append({"id": acl["project_id"], "name": d.get("name", "未命名"),
@@ -2360,6 +2381,7 @@ async def api_projects(request):
     return web.json_response({"projects": out, "teams": teams})
 
 
+@project_errors
 async def api_project_create(request):
     user = require_user(request)
     body = await request.json()
@@ -2367,18 +2389,10 @@ async def api_project_create(request):
             or not isinstance(body.get("name", ""), str)
             or (body.get("team_id") is not None and not isinstance(body.get("team_id"), str))):
         raise web.HTTPBadRequest(text="画布名称或项目组不正确")
-    team_id = body.get("team_id") or None
-    PROJ_DIR.mkdir(parents=True, exist_ok=True)
-    pid = uuid.uuid4().hex[:12]
-    d = {"id": pid, "name": (body.get("name") or "新项目").strip()[:40],
-         "cards": [], "edges": [], "view": {"x": 0, "y": 0, "k": 1},
-         "created": time.time(), "updated": time.time(), "rev": 0}
-    acl = await call_store(request.app, "create_project", pid, user["id"],
-                           state="pending", team_id=team_id)
-    write_project(proj_path(pid), d)
-    await call_store(request.app, "set_project_state", pid, "active")
+    d, acl = await request.app["project_service"].create(
+        user, body, store=partial(call_store, request.app))
     return web.json_response(d | {"owner_id": user["id"], "owner_username": user["username"],
-                                  "team_id": team_id, "team_name": acl.get("team_name"),
+                                  "team_id": body.get("team_id") or None, "team_name": acl.get("team_name"),
                                   "share_count": 0, "shared_team_ids": [],
                                   "shared_personally": False, "permission": "operate"})
 
@@ -2386,14 +2400,14 @@ async def api_project_create(request):
 async def api_project_get(request):
     pid = request.match_info["pid"]
     await require_project(request, pid)
-    p = proj_path(pid)
+    p = project_path(request.app, pid)
     if not p.exists():
         raise web.HTTPNotFound(reason="项目不存在")
     user = require_user(request)
     details = await call_store(request.app, "get_project_for_user", user["id"], pid)
     if details is None:
         raise web.HTTPNotFound(reason="项目不存在或不可访问")
-    d = json.loads(p.read_text(encoding="utf-8"))
+    d = request.app["project_repository"].read(pid)
     for card in d.get("cards", []):
         sync_card_job(card, JOBS, CAPS, pid)
     if "director" in d:
@@ -2484,10 +2498,10 @@ def validate_director(document):
 async def api_director_save(request):
     pid = request.match_info["pid"]
     await require_project(request, pid, operate=True)
-    path = proj_path(pid)
+    path = project_path(request.app, pid)
     if not path.is_file():
         raise web.HTTPNotFound(text="项目不存在")
-    project = json.loads(path.read_text(encoding="utf-8"))
+    project = request.app["project_repository"].read(pid)
     if project.get("locked"):
         raise web.HTTPForbidden(text="示例项目只读，请新建导演项目")
     try:
@@ -2527,7 +2541,7 @@ async def api_director_save(request):
     body["rev"] = rev + 1
     project["director"] = body
     project["updated"] = time.time()
-    write_project(path, project)
+    request.app["project_repository"].write(pid, project)
     result = {"ok": True, "rev": body["rev"], "updated": project["updated"]}
     if linked:
         await broadcast_collaboration(request.app, pid, {
@@ -2541,10 +2555,10 @@ async def api_director_import(request):
     """Import explicit canvas members under project_write_lock and browser auth/CSRF."""
     pid = request.match_info["pid"]
     await require_project(request, pid, operate=True)
-    path = proj_path(pid)
+    path = project_path(request.app, pid)
     if not path.is_file():
         raise web.HTTPNotFound(text="项目不存在")
-    project = json.loads(path.read_text(encoding="utf-8"))
+    project = request.app["project_repository"].read(pid)
     if project.get("locked"):
         raise web.HTTPForbidden(text="示例项目只读，请新建导演项目")
     try:
@@ -2582,7 +2596,7 @@ async def api_director_import(request):
     work["rev"] = project.get("rev", 0) + 1
     work["director"]["rev"] = rev + 1
     work["updated"] = time.time()
-    write_project(path, work)
+    request.app["project_repository"].write(pid, work)
     snapshot = collaboration_project(work)
     await broadcast_collaboration(request.app, pid, {
         "type": "project-changed", "project": snapshot,
@@ -2594,10 +2608,10 @@ async def api_director_import(request):
 async def api_director_reference(request):
     pid = request.match_info["pid"]
     await require_project(request, pid, operate=True)
-    path = proj_path(pid)
+    path = project_path(request.app, pid)
     if not path.is_file():
         raise web.HTTPNotFound(text="项目不存在")
-    project = json.loads(path.read_text(encoding="utf-8"))
+    project = request.app["project_repository"].read(pid)
     if project.get("locked"):
         raise web.HTTPForbidden(text="示例项目只读，请新建导演项目")
     try:
@@ -2629,7 +2643,7 @@ async def api_director_reference(request):
     work["rev"] = project.get("rev", 0) + 1
     work["director"]["rev"] = rev + 1
     work["updated"] = time.time()
-    write_project(path, work)
+    request.app["project_repository"].write(pid, work)
     snapshot = collaboration_project(work)
     await broadcast_collaboration(request.app, pid, {
         "type": "project-changed", "project": snapshot,
@@ -2668,10 +2682,10 @@ def collaboration_project(project):
 async def api_project_card_create(request):
     pid = request.match_info["pid"]
     await require_project(request, pid, operate=True)
-    path = proj_path(pid)
+    path = project_path(request.app, pid)
     if not path.is_file():
         raise web.HTTPNotFound(text="画布不存在")
-    project = json.loads(path.read_text(encoding="utf-8"))
+    project = request.app["project_repository"].read(pid)
     if project.get("locked"):
         raise web.HTTPForbidden(reason="locked project")
     try:
@@ -2706,7 +2720,7 @@ async def api_project_card_create(request):
     project.setdefault("cards", []).append(card)
     project["rev"] = project.get("rev", 0) + 1
     project["updated"] = time.time()
-    write_project(path, project)
+    request.app["project_repository"].write(pid, project)
     payload = {"type": "card-added", "card": card, "rev": project["rev"],
                "updated": project["updated"]}
     await broadcast_collaboration(request.app, pid, payload, authorize=True)
@@ -2914,116 +2928,53 @@ async def api_project_shares(request):
     return web.json_response(data)
 
 
+@project_errors
 async def api_project_save(request):
     pid = request.match_info["pid"]
     await require_project(request, pid, operate=True)
-    p = proj_path(pid)
-    if not p.exists():
-        raise web.HTTPNotFound(reason="项目不存在")
-    old = json.loads(p.read_text(encoding="utf-8"))
-    # locked 的项目（示例）是只读的：用户在上面随便改参数、随便重跑都行，但一个字都不落盘 ——
-    # 刷新就回到这份固定的示例。前端 save() 也会直接跳过，这里是最后一道闸
-    # （另一个标签页、或者写歪的脚本照样拦住）。要改示例本身就直接改那份 json 文件，
-    # 记得把 rev 加一，不然开着旧快照的页面下一次写入会撞上 409。
-    if old.get("locked"):
-        raise web.HTTPForbidden(reason="locked project")
+    service = request.app["project_service"]
+    old = service.editable(pid)
     body = await request.json()
-    # 前端每次都整份 PUT，没有版本号就是「后写的赢」：一个开着旧快照的标签页随便点一下，
-    # 就能把别处刚写进去的产物抹掉。带上打开时拿到的 rev，对不上就让它先重新加载。
-    # rev 是必填的：不带版本号的写入一律拒，否则一个没刷新过的老页面又能悄悄盖掉数据
-    rev = old.get("rev", 0)
-    if body.get("rev") != rev:
-        # reason 走 HTTP 头，只能是 ASCII，中文提示由前端自己出
-        raise web.HTTPConflict(reason="stale rev")
-    if "name" in body:
-        body["name"] = str(body.get("name") or "").strip()[:40]
-        if not body["name"]:
-            raise web.HTTPBadRequest(reason="项目名不能为空")
-    if "cards" in body:
-        if not isinstance(body["cards"], list) or any(not isinstance(card, dict) for card in body["cards"]):
-            raise web.HTTPBadRequest(text="卡片数据不正确")
-        card_ids = [card.get("id") for card in body["cards"]]
-        if any(not isinstance(card_id, str) or not card_id for card_id in card_ids) or len(card_ids) != len(set(card_ids)):
-            raise web.HTTPBadRequest(text="卡片 ID 不正确或重复")
-        old_cards = {card.get("id"): card for card in old.get("cards", [])}
-        if any(card_id not in old_cards for card_id in card_ids):
-            raise web.HTTPConflict(reason="cards must be created separately")
-        for card in body["cards"]:
-            previous = old_cards[card["id"]]
-            for key in ("created_by", "created_by_name", "created_at"):
-                if key in previous:
-                    card[key] = previous[key]
-                else:
-                    card.pop(key, None)
-    await resource_call(request.app, "validate_document", require_user(request)["id"], pid, body)
-    await require_project(request, pid, operate=True)
-    previous_name = old.get("name")
-    for k in ("name", "cards", "edges", "groups"):
-        if k in body:
-            old[k] = body[k]
-    old["rev"] = rev + 1
-    old["updated"] = time.time()
-    write_project(p, old)
-    if old.get("name") != previous_name:
-        sync_project_name(request.app, pid, old.get("name") or "未命名")
-    await broadcast_collaboration(request.app, pid, {
-        "type": "project-changed", "project": collaboration_project(old),
-    }, authorize=True)
+    old = await service.save(
+        pid, old, body,
+        validate=partial(resource_call, request.app, "validate_document", require_user(request)["id"], pid),
+        authorize=partial(require_project, request, pid, operate=True),
+        sync_name=partial(sync_project_name, request.app),
+        publish=partial(publish_project, request.app, pid))
     return web.json_response({"ok": True, "updated": old["updated"], "rev": old["rev"]})
 
 
+@project_errors
 async def api_project_rename(request):
     pid = request.match_info["pid"]
     await require_project(request, pid, operate=True)
-    p = proj_path(pid)
-    if not p.exists():
-        raise web.HTTPNotFound(reason="项目不存在")
-    project = json.loads(p.read_text(encoding="utf-8"))
-    if project.get("locked"):
-        raise web.HTTPForbidden(reason="locked project")
+    service = request.app["project_service"]
+    project = service.editable(pid)
     body = await request.json()
-    name = str(body.get("name") or "").strip()[:40]
-    if not name:
-        raise web.HTTPBadRequest(reason="项目名不能为空")
-    if project.get("name") != name:
-        project["name"] = name
-        project["rev"] = project.get("rev", 0) + 1
-        project["updated"] = time.time()
-        await require_project(request, pid, operate=True)
-        write_project(p, project)
-        sync_project_name(request.app, pid, name)
-        await broadcast_collaboration(request.app, pid, {
-            "type": "project-changed", "project": collaboration_project(project),
-        }, authorize=True)
+    project = await service.rename(
+        pid, project, body,
+        authorize=partial(require_project, request, pid, operate=True),
+        sync_name=partial(sync_project_name, request.app),
+        publish=partial(publish_project, request.app, pid))
     return web.json_response({
         "ok": True, "name": project["name"], "updated": project.get("updated", 0),
         "rev": project.get("rev", 0),
     })
 
 
+@project_errors
 async def api_project_delete(request):
     pid = request.match_info["pid"]
     await require_project(request, pid, operate=True)
-    p = proj_path(pid)
-    if p.exists() and json.loads(p.read_text(encoding="utf-8")).get("locked"):
-        raise web.HTTPForbidden(reason="locked project")
-    await broadcast_collaboration(request.app, pid, {"type": "project-deleted"}, authorize=True)
-    # 先封闭访问，再取消任务、移动文件；失败重试也不重新开放。
-    await call_store(request.app, "set_project_state", pid, "deleted")
-    await close_presence_room(request.app, pid, code=1000, message=b"canvas deleted")
-    try:
-        await request.app["edit_exports"].cancel_project(pid)
-    except ExportBusyError:
-        # Other instances cannot publish after project access has been revoked above.
-        pass
-    jobs = await call_store(request.app, "list_project_jobs", pid)
-    for jid in jobs:
-        if CONTROLLER_MODE:
-            await stop_job(request.app, jid)
-        elif JOBS.get(jid, {}).get("status") == "queued":
-            await stop_job(request.app, jid)
-    if p.exists():
-        p.rename(p.with_suffix(".json.deleted"))
+    await request.app["project_service"].delete(
+        pid,
+        publish_deleted=partial(broadcast_collaboration, request.app, pid,
+                                {"type": "project-deleted"}, authorize=True),
+        store=partial(call_store, request.app),
+        close_presence=partial(close_presence_room, request.app, pid, code=1000, message=b"canvas deleted"),
+        cancel_exports=request.app["edit_exports"].cancel_project,
+        cancel_job=partial(stop_job, request.app),
+        should_cancel=lambda jid: CONTROLLER_MODE or JOBS.get(jid, {}).get("status") == "queued")
     return web.json_response({"ok": True})
 
 
@@ -3671,7 +3622,7 @@ async def no_cache(request, response):
         response.headers.setdefault("Cache-Control", "no-cache")
 
 
-def make_app(auth_path=None):
+def make_app(auth_path=None, *, project_repository=None):
     local_test = os.environ.get("CHOUKA_LOCAL_TEST") == "1"
     admin_sandbox = os.environ.get("CHOUKA_ADMIN_SANDBOX") == "1"
     if local_test and (CONTROLLER_MODE or EXECUTION_MODE != "local"):
@@ -3705,7 +3656,14 @@ def make_app(auth_path=None):
     app["online_presence_window"] = 90
     app["presence_access_changed"] = partial(handle_presence_access_changed, app)
     register_auth_routes(app, ROOT / "web")
-    register_edit_routes(app, sys.modules[__name__])
+    app["project_repository"] = project_repository or ProjectRepository(PROJ_DIR)
+    app["project_service"] = ProjectService(app["project_repository"])
+    register_edit_routes(
+        app, repository=app["project_repository"], root=ROOT, ffmpeg_bin=ffmpeg_bin,
+        comfy_http=COMFY_HTTP, call_store=call_store, resource_call=resource_call,
+        require_project=require_project, require_user=require_user, require_resource=require_resource,
+        broadcast_collaboration=broadcast_collaboration, sync_card=sync_edit_card,
+        kind_of=kind_of, duration_pattern=DUR_RE, audio_pattern=AUDIO_STREAM_RE)
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
     )
@@ -3719,80 +3677,46 @@ def make_app(auth_path=None):
         app["costs"] = CostLedger(database_path, ROOT / "pricing.json")
         app["costs"].backfill(JOBS.values())
     app.on_response_prepare.append(no_cache)
-    app.router.add_get("/", index)
-    app.router.add_get("/director", director_index)
-    app.router.add_get("/if-studio", if_studio_index)
-    app.router.add_get("/controller", controller_index)
-    app.router.add_get("/controller/costs", controller_costs)
-    app.router.add_get("/controller/capacity", controller_capacity)
-    app.router.add_get("/api/health", api_health)
-    app.router.add_get("/api/status", api_status)
-    app.router.add_get("/api/cards", api_cards)
-    app.router.add_post("/api/reload", api_reload)
-    app.router.add_post("/api/upload", api_upload)
-    app.router.add_get("/api/preview/{name}/file", api_preview_file)
-    app.router.add_get("/api/preview/{name}", api_preview_status)
-    app.router.add_get("/api/thumbnail", api_thumbnail)
-    app.router.add_get("/api/if-reference", api_if_reference)
-    app.router.add_get("/api/media", api_media)
-    app.router.add_post("/api/generate", api_generate)
-    app.router.add_post("/api/rewrite", api_rewrite)
-    app.router.add_post("/api/text", api_text)
-    app.router.add_get("/api/jobs", api_jobs)
-    app.router.add_post("/api/jobs/clear", api_jobs_clear)
-    app.router.add_get("/api/job/{pid}", api_job)
-    app.router.add_post("/api/job/{pid}/cancel", api_cancel)
-    app.router.add_delete("/api/job/{pid}", api_job_delete)
-    app.router.add_get("/api/projects", api_projects)
-    app.router.add_post("/api/projects", api_project_create)
-    app.router.add_get("/api/projects/{pid}", api_project_get)
-    app.router.add_put("/api/projects/{pid}/director", api_director_save)
-    app.router.add_post("/api/projects/{pid}/director/import", api_director_import)
-    app.router.add_post("/api/projects/{pid}/director/reference", api_director_reference)
-    app.router.add_put("/api/projects/{pid}/view", api_project_view)
-    app.router.add_post("/api/projects/{pid}/cards", api_project_card_create)
-    app.router.add_get("/api/projects/{pid}/presence", api_project_presence)
-    app.router.add_get("/api/projects/{pid}/shares", api_project_shares)
-    app.router.add_put("/api/projects/{pid}/shares", api_project_shares)
-    app.router.add_put("/api/projects/{pid}", api_project_save)
-    app.router.add_post("/api/projects/{pid}/rename", api_project_rename)
-    app.router.add_post("/api/projects/{pid}/copy", api_project_copy)
-    app.router.add_delete("/api/projects/{pid}", api_project_delete)
-    app.router.add_get("/api/file", api_file)
-    app.router.add_get("/api/artifact/{pid}/{name}", api_artifact)
+    register_page_routes(
+        app, index=index, director_index=director_index, if_studio_index=if_studio_index,
+        controller_index=controller_index, controller_costs=controller_costs,
+        controller_capacity=controller_capacity, permissions_page=permissions_page,
+        teams_page=teams_page, static_asset=static_asset)
+    register_generation_routes(
+        app, api_health=api_health, api_status=api_status, api_cards=api_cards,
+        api_reload=api_reload, api_generate=api_generate, api_rewrite=api_rewrite,
+        api_text=api_text, api_jobs=api_jobs, api_jobs_clear=api_jobs_clear,
+        api_job=api_job, api_cancel=api_cancel, api_job_delete=api_job_delete)
+    register_media_routes(
+        app, api_upload=api_upload, api_preview_file=api_preview_file,
+        api_preview_status=api_preview_status, api_thumbnail=api_thumbnail,
+        api_if_reference=api_if_reference, api_media=api_media, api_file=api_file,
+        api_artifact=api_artifact, api_upload_file=api_upload_file)
+    register_project_routes(
+        app, api_projects=api_projects, api_project_create=api_project_create,
+        api_project_get=api_project_get, api_director_save=api_director_save,
+        api_director_import=api_director_import, api_director_reference=api_director_reference,
+        api_project_view=api_project_view, api_project_card_create=api_project_card_create,
+        api_project_presence=api_project_presence, api_project_shares=api_project_shares,
+        api_project_save=api_project_save, api_project_rename=api_project_rename,
+        api_project_copy=api_project_copy, api_project_delete=api_project_delete)
     if CONTROLLER_MODE:
-        app.router.add_get("/api/workers", api_workers)
-        app.router.add_get("/api/workers/{worker_id}/temperature", api_worker_temperature)
-        app.router.add_get("/api/costs", api_costs)
-        app.router.add_get("/api/capacity", api_capacity)
-        app.router.add_get("/api/capacity/export", api_capacity_export)
-        app.router.add_post("/api/capacity/estimate", api_capacity_estimate)
-        app.router.add_post("/api/capacity/jobs/{pid}/review", api_capacity_review)
-        app.router.add_post("/api/capacity/jobs/{pid}/probe-outputs", api_capacity_probe_outputs)
-        app.router.add_post("/api/capacity/workers/{worker_id}", api_capacity_worker)
-        app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
-        app.router.add_delete("/api/workers/{worker_id}", api_worker_delete)
-        app.router.add_post("/api/admin/workers/sync-all", api_workers_sync_all)
+        register_controller_routes(
+            app, api_workers=api_workers, api_worker_temperature=api_worker_temperature,
+            api_costs=api_costs, api_capacity=api_capacity, api_capacity_export=api_capacity_export,
+            api_capacity_estimate=api_capacity_estimate, api_capacity_review=api_capacity_review,
+            api_capacity_probe_outputs=api_capacity_probe_outputs, api_capacity_worker=api_capacity_worker,
+            api_worker_enabled=api_worker_enabled, api_worker_delete=api_worker_delete,
+            api_workers_sync_all=api_workers_sync_all)
         if not admin_sandbox:
-            app.router.add_post("/agent/v1/register", api_agent_register)
-            app.router.add_post("/agent/v1/heartbeat", api_agent_heartbeat)
-            app.router.add_post("/agent/v1/jobs/acquire", api_agent_acquire)
-            app.router.add_post("/agent/v1/jobs/{pid}/start", api_agent_start)
-            app.router.add_get("/agent/v1/jobs/{pid}/inputs/{name}", api_agent_input)
-            app.router.add_post("/agent/v1/jobs/{pid}/event", api_agent_event)
-            app.router.add_post("/agent/v1/jobs/{pid}/artifact", api_agent_artifact)
-            app.router.add_post("/agent/v1/jobs/{pid}/complete", api_agent_complete)
-            app.router.add_post("/agent/v1/jobs/{pid}/failed", api_agent_failed)
+            register_worker_routes(
+                app, api_agent_register=api_agent_register, api_agent_heartbeat=api_agent_heartbeat,
+                api_agent_acquire=api_agent_acquire, api_agent_start=api_agent_start,
+                api_agent_input=api_agent_input, api_agent_event=api_agent_event,
+                api_agent_artifact=api_agent_artifact, api_agent_complete=api_agent_complete,
+                api_agent_failed=api_agent_failed)
     up = ROOT / "data" / "uploads"
     up.mkdir(parents=True, exist_ok=True)
-    app.router.add_get("/api/upload/{name}", api_upload_file)
-    app.router.add_get("/admin/permissions", permissions_page)
-    app.router.add_get("/teams", teams_page)
-    # 不使用 web 根目录兜底，防止直接访问管理 HTML 或备份文件绕过页面授权。
-    for name in ("app.js", "style.css", "director.js", "director.css", "director_edit.js",
-                 "if-studio.js", "admin-shell.css", "admin-shell.js", "controller-page.js", "costs-page.js",
-                 "image-composer.js", "image-composer.css", "vendor/fabric.min.js"):
-        app.router.add_get("/" + name, partial(static_asset, name=name))
     app.on_startup.append(on_start)
     app.on_shutdown.append(close_presence_connections)
     app.on_cleanup.append(on_stop)

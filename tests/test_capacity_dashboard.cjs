@@ -383,7 +383,7 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(url.origin,'http://capacity.test','测试不允许连接外部服务');
       const json=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(data)});
       if(['/icon.png','/favicon.png'].includes(url.pathname))return route.fulfill({contentType:'image/png',body:readFileSync(path.join(web,url.pathname.slice(1)))});
-      if(['/auth.js','/admin-shell.js','/admin-shell.css','/controller-page.js'].includes(url.pathname))return route.fulfill({contentType:url.pathname.endsWith('.css')?'text/css':'text/javascript',body:readFileSync(path.join(web,url.pathname.slice(1)),'utf8')});
+      if(['/capacity-page.js','/auth.js','/admin-shell.js','/admin-shell.css','/controller-page.js'].includes(url.pathname))return route.fulfill({contentType:url.pathname.endsWith('.css')?'text/css':'text/javascript',body:readFileSync(path.join(web,url.pathname.slice(1)),'utf8')});
       if(url.pathname==='/api/auth/presence') {
         assert.equal(request.method(),'POST');assert.equal(request.headers()['x-csrf-token'],'synthetic-csrf');
         state.presence.push(request.postDataJSON());return json({online_users:7});

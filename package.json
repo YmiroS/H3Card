@@ -1,0 +1,20 @@
+{
+  "name": "chouka-web",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Development checks for the Chouka web application; production does not require Node.js.",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "check": "node tools/check-web.cjs",
+    "test": "npm run check && npm run test:tooling && node tools/run-tests.cjs all",
+    "test:python": "node tools/run-tests.cjs python",
+    "test:web": "node tools/run-tests.cjs web",
+    "test:tooling": "node --test tools/tooling.test.cjs",
+    "test:install-browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "playwright": "1.64.1"
+  }
+}

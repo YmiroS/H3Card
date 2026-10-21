@@ -24,7 +24,7 @@ function cardCopyContext() {
       {from:'generator',to:'unrelated',slot:'image'},
     ]},
     CARDS:[{id:'card_image'},{id:'card_asset'},{id:'card_style'}], CW:290,
-    saveChain:Promise.resolve(), allowed:true, notices:[], created:[], selIds:new Set(), selId:null,
+    persistence:require('../web/features/project-persistence.js').create({}), allowed:true, notices:[], created:[], selIds:new Set(), selId:null,
     saved:0, paintSel() {}, closePanel() {}, closeHistory() {},
     requireOperate:() => context.allowed, canOperate:() => context.allowed,
     cardOf:id => context.PROJ.cards.find(card => card.id === id),
@@ -213,10 +213,10 @@ test('history uses persisted job snapshots after reload and keeps each submissio
   });
   vm.runInContext(
     source.slice(source.indexOf('const HIST_MAX'), source.indexOf('async function copyHistoryText(')) +
-    source.slice(source.indexOf('const plain ='), source.indexOf('/** 保存串行化')) +
-    source.slice(source.indexOf('async function pollJobs()'), source.indexOf('/* ================= 任务浮窗')),
+    source.slice(source.indexOf('const plain ='), source.indexOf('/** 保存串行化')),
     context,
   );
+  context.pollJobs = require('./helpers/task-updater.cjs').taskUpdater(context);
   await context.pollJobs();
   const current = context.PROJ.cards[0];
   assert.equal(current.history[0].cap, 'zimage_i2i');

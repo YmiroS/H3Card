@@ -97,6 +97,8 @@ class EditApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
         self.application["costs"] = self.ledger
         self.application["distributed"] = self.dispatch
         self.manager = self.application["edit_exports"]
+        self.edit_api = next(route.handler.__self__ for route in self.application.router.routes()
+                             if isinstance(getattr(route.handler, "__self__", None), EditApi))
         self.addAsyncCleanup(self.manager.close)
         self.own_project("p")
         self.project_path = self.root / "data" / "projects" / "p.json"
@@ -276,6 +278,76 @@ class EditApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
         self.assertEqual({k: v for k, v in after.items() if k not in ("edit", "updated")},
                          {k: v for k, v in before.items() if k != "updated"})
         self.assertEqual(await self.get_edit(), after["edit"])
+
+    async def test_save_reauthorizes_when_grant_is_revoked_during_validation(self):
+        edit = self.seed_edit()
+        editor = self.auth.create_user("editor", auth_support.PASSWORD)
+        self.auth.set_grant(editor["id"], self.admin["id"], "operate")
+        await self.switch_user("editor")
+        before = self.project_path.read_bytes()
+        validate = self.access.validate_document
+
+        def validate_then_revoke(*args, **kwargs):
+            result = validate(*args, **kwargs)
+            self.auth.delete_grant(editor["id"], self.admin["id"])
+            return result
+
+        with mock.patch.object(self.access, "validate_document", side_effect=validate_then_revoke) as checked:
+            await self.save({**edit, "ratio": "9:16"}, 404)
+        checked.assert_called_once()
+        self.assertEqual(self.project_path.read_bytes(), before)
+        self.assertEqual(self.read_project()["edit"], edit)
+        self.assertEqual(self.read_project()["edit"]["rev"], 0)
+        self.assertFalse(self.application["project_locks"]["p"].locked())
+
+    async def test_export_does_not_enqueue_after_validation_revokes_grant(self):
+        self.seed_edit()
+        editor = self.auth.create_user("editor", auth_support.PASSWORD)
+        self.auth.set_grant(editor["id"], self.admin["id"], "operate")
+        await self.switch_user("editor")
+        before = self.project_path.read_bytes()
+        validate = self.access.validate_document
+
+        def validate_then_revoke(*args, **kwargs):
+            result = validate(*args, **kwargs)
+            self.auth.delete_grant(editor["id"], self.admin["id"])
+            return result
+
+        with mock.patch.object(self.access, "validate_document", side_effect=validate_then_revoke) as checked:
+            await self.start_export(expected=404)
+        checked.assert_called_once()
+        self.assertEqual(self.project_path.read_bytes(), before)
+        self.assertEqual(self.manager.list("p"), [])
+        self.assertEqual(list(self.manager.metadata.glob("*.json")), [])
+        self.assertEqual(self.manager.tasks, {})
+
+    async def test_export_registration_revocation_cannot_commit_done_or_keep_artifact(self):
+        self.seed_edit()
+        self.render()
+        editor = self.auth.create_user("editor", auth_support.PASSWORD)
+        self.auth.set_grant(editor["id"], self.admin["id"], "operate")
+        await self.switch_user("editor")
+        before = self.project_path.read_bytes()
+        register = self.access.register
+
+        def register_then_revoke(pid, kind, locator, **kwargs):
+            result = register(pid, kind, locator, **kwargs)
+            if kind == "artifact":
+                self.auth.delete_grant(editor["id"], self.admin["id"])
+            return result
+
+        with mock.patch.object(self.access, "register", side_effect=register_then_revoke) as registered:
+            item = await self.start_export()
+            finished = await self.finish(item["id"])
+        registered.assert_called_once()
+        self.assertEqual(finished["status"], "error")
+        self.assertFalse(finished.get("url"))
+        self.assertEqual(self.project_path.read_bytes(), before)
+        self.assertFalse((self.manager.artifacts / item["id"]).exists())
+        saved = json.loads((self.manager.metadata / (item["id"] + ".json")).read_text(encoding="utf-8"))
+        self.assertEqual(saved["status"], "error")
+        self.assertFalse(saved.get("url"))
+        self.assertEqual((await self.client.get(self.url + f'/exports/{item["id"]}/download')).status, 404)
 
     async def test_canvas_and_director_saves_cannot_overwrite_edit(self):
         self.seed_project(rev=8, cards=[{"id": "card-1", "title": "旧标题"}],
@@ -544,7 +616,7 @@ class EditApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
         generation = self.generation_state()
         # Keep the actual metadata subprocess and HTTP upload implementation;
         # only point the executable resolver at the fixture's CPU FFmpeg.
-        with mock.patch.object(controller_app, "ffmpeg_bin", return_value=FFMPEG):
+        with mock.patch.object(self.edit_api, "ffmpeg_bin", return_value=FFMPEG):
             payload = await (await self.upload(filename=fixture.name, content=fixture.read_bytes())).json()
         asset = payload["asset"]
         self.assertEqual((asset["kind"], asset["width"], asset["height"], asset["has_audio"]),
@@ -579,7 +651,7 @@ class EditApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
             with self.subTest(filename=filename):
                 process = mock.Mock(returncode=1)
                 process.communicate = mock.AsyncMock(return_value=(b"", stderr.encode()))
-                with mock.patch.object(controller_app, "ffmpeg_bin", return_value=sys.executable), \
+                with mock.patch.object(self.edit_api, "ffmpeg_bin", return_value=sys.executable), \
                         mock.patch("server.edit_api.asyncio.create_subprocess_exec",
                                    new_callable=mock.AsyncMock, return_value=process) as spawn:
                     response = await self.upload(rev=(await self.get_edit())["rev"], filename=filename)
@@ -607,7 +679,7 @@ class EditApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
             with self.subTest(filename=filename, stderr=stderr):
                 process = mock.Mock(returncode=1)
                 process.communicate = mock.AsyncMock(return_value=(b"", stderr.encode()))
-                with mock.patch.object(controller_app, "ffmpeg_bin", return_value=sys.executable), \
+                with mock.patch.object(self.edit_api, "ffmpeg_bin", return_value=sys.executable), \
                         mock.patch("server.edit_api.asyncio.create_subprocess_exec",
                                    new_callable=mock.AsyncMock, return_value=process):
                     await self.upload(filename=filename, expected=400)
@@ -618,7 +690,7 @@ class EditApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
         process = mock.Mock(returncode=None)
         process.communicate = mock.AsyncMock(side_effect=[asyncio.TimeoutError(), (b"", b"")])
         before = self.project_path.read_bytes()
-        with mock.patch.object(controller_app, "ffmpeg_bin", return_value=sys.executable), \
+        with mock.patch.object(self.edit_api, "ffmpeg_bin", return_value=sys.executable), \
                 mock.patch("server.edit_api.asyncio.create_subprocess_exec",
                            new_callable=mock.AsyncMock, return_value=process):
             response = await self.upload(expected=400)
@@ -720,10 +792,11 @@ class EditApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
         output, source, original = self.seed_output()
         before = self.project_path.read_bytes()
         generation = self.generation_state()
-        target = "broadcast_collaboration" if after_write else "write_project"
+        target = "broadcast_collaboration" if after_write else "write"
+        dependency = self.edit_api if after_write else self.application["project_repository"]
         exception = RuntimeError("notification failed") if after_write else OSError("atomic write failed")
         replacement = mock.AsyncMock(side_effect=exception) if after_write else mock.Mock(side_effect=exception)
-        with mock.patch.object(controller_app, target, replacement):
+        with mock.patch.object(dependency, target, replacement):
             if route == "upload":
                 response = await self.client.post(self.url + "/upload", data=self.multipart([
                     ("rev", "0", None), ("file", b"isolated uploaded bytes", "camera.mp4"),

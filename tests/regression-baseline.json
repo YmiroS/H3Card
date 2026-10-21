@@ -1,0 +1,62 @@
+{
+  "purpose": "Observed pre-refactor baseline for comparison, not an allowlist. The test runner must still return nonzero for every failing test.",
+  "captured_on": "2026-10-21",
+  "commit": "5216aa28d24a33a6948d46d5548a0597f0a13b1d",
+  "execution": {
+    "source": "git archive HEAD; no runtime data or credentials copied",
+    "python": "3.12.10",
+    "aiohttp": "3.13.3",
+    "node": "24.19.0",
+    "playwright": "1.61.1",
+    "browser": "Microsoft Edge 155.0.4283.62",
+    "node_test_concurrency": 1,
+    "limitations": [
+      "Windows symlink creation privilege was unavailable.",
+      "Installed ComfyUI source, live worker configuration and sibling embedded Python were not copied.",
+      "The baseline used loopback-only network guards. The repository runner isolates source, data and user directories but is not an OS network sandbox.",
+      "Post-refactor verification uses locked Playwright 1.64.1 with the same Edge version; account for this tooling difference when comparing browser outcomes.",
+      "Browser tests use local test interfaces; this is not real GPU generation or deployed-service validation."
+    ]
+  },
+  "python": {
+    "files": 28,
+    "tests": 941,
+    "passed": 925,
+    "failed": 5,
+    "errors": 9,
+    "skipped": 2,
+    "known_failure_categories": {
+      "windows_symlink_privilege": 7,
+      "workflow_fingerprint_missing_audios": 2,
+      "if_image_missing_from_old_image_controls_expectation": 1,
+      "seedvr_fp8_graph_vs_old_fp16_expectation": 1,
+      "sqlite_handle_cleanup_on_windows": 1,
+      "desktop_packaging_requires_sibling_embedded_python": 1,
+      "worker_test_requires_untracked_config": 1
+    }
+  },
+  "web": {
+    "files": 23,
+    "tests": 584,
+    "passed": 473,
+    "failed": 111,
+    "skipped": 0,
+    "cancelled": 0,
+    "aggregate_parent_failures": 3,
+    "note": "Counts include aggregate parents and do not equal the number of independent production defects. Some timeout root causes remain uninvestigated.",
+    "failures_by_file": {
+      "test_alphagen.cjs": 1,
+      "test_asset_slots.cjs": 4,
+      "test_capacity_dashboard.cjs": 3,
+      "test_card_rename.cjs": 3,
+      "test_clipboard_media.cjs": 3,
+      "test_controller_modes.cjs": 1,
+      "test_director_reference.cjs": 2,
+      "test_history_drag.cjs": 16,
+      "test_image_composer.cjs": 5,
+      "test_image_model_switch.cjs": 9,
+      "test_node_alignment.cjs": 63,
+      "test_prompt_highlight.cjs": 1
+    }
+  }
+}

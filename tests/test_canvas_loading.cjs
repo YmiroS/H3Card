@@ -147,7 +147,7 @@ function installProbe(options) {
 }
 
 async function fixtureServer(videoBytes, audioBytes, highRes) {
-  const staticFiles = Object.fromEntries(['index.html','style.css','app.js','auth.js'].map(name => [name,readFileSync(path.join(web,name))]));
+  const staticFiles = Object.fromEntries([...require('./helpers/frontend-static.cjs').canvasNames,'index.html','style.css','app.js','auth.js'].map(name => [name,readFileSync(path.join(web,name))]));
   const state = {projects:[],requests:[],writes:[],held:[],events:new EventEmitter(),thumbnailDelay:65,holdThumbnails:false,holdPreviews:false,previewModes:{},heldPaths:new Set(),failThumbnail:null};
   const json = (res, data, status = 200) => { res.writeHead(status, {'Content-Type':'application/json'}); res.end(JSON.stringify(data)); };
   const server = createServer((req,res) => {

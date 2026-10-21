@@ -38,6 +38,8 @@ test('image model menus, parameters and media limits in the complete UI', async 
   const server = createServer((req, res) => {
     const url = new URL(req.url, 'http://localhost').pathname;
     if (url === '/api/auth/me') return json(res, {user:{id:'admin', username:'admin', role:'admin'}, csrf_token:'test-csrf'});
+    if (url === '/api/auth/presence') return json(res, {online_users:1});
+    if (url === '/api/projects/model-test/presence') return json(res, {members:[]});
     if (url === '/api/cards') return json(res, {cards, capabilities, comfy_online:true});
     if (url === '/api/reload') return json(res, {ok:true});
     if (url === '/api/health') return json(res, {comfy_online:true});
@@ -67,7 +69,7 @@ test('image model menus, parameters and media limits in the complete UI', async 
       return;
     }
     if (url === '/fixture.png') { res.setHeader('Content-Type', 'image/png'); return res.end(png); }
-    const files = {'/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+    const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html', '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
     if (Object.hasOwn(files, url)) {
       const name = files[url];
       res.setHeader('Content-Type', name.endsWith('.js') ? 'text/javascript; charset=utf-8'

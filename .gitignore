@@ -17,3 +17,8 @@ __pycache__/
 # 软删除的项目文件
 *.deleted
 .venv/
+
+# Frontend development dependencies and browser test output
+node_modules/
+playwright-report/
+test-results/

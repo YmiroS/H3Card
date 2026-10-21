@@ -8,6 +8,8 @@ from aiohttp.test_utils import TestClient, TestServer
 from server.auth import auth_middleware, register_auth_routes
 from server.auth_store import AuthStore
 from server.resource_access import ResourceAccess
+from server.project_repository import ProjectRepository
+from server.project_service import ProjectService
 
 ROOT = Path(__file__).resolve().parents[1]
 PASSWORD = 'Test-password-123'
@@ -21,6 +23,7 @@ class AuthFixture:
         self.root = Path(self.temp.name)
         self.auth = AuthStore(self.root / 'data' / 'auth.db')
         self.access = ResourceAccess(self.auth, self.root)
+        self.projects = ProjectRepository(self.root / 'data' / 'projects')
         self.admin = self.auth.create_user('admin', PASSWORD, role='admin')
         self.auth.set_ready()
 
@@ -32,6 +35,8 @@ class AuthFixture:
         app = web.Application(middlewares=[auth_middleware])
         app['auth_store'] = self.auth
         app['resource_access'] = self.access
+        app['project_repository'] = self.projects
+        app['project_service'] = ProjectService(self.projects)
         app['project_locks'] = __import__('collections').defaultdict(
             __import__('asyncio').Lock)
         app['presence_rooms'] = __import__('collections').defaultdict(dict)

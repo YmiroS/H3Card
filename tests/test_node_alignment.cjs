@@ -242,7 +242,7 @@ test('画布撤销恢复节点、连线、分组和参数，但不回滚生成�
   assert.equal(project.cards.length, 1, '远端同步后不能重放旧的本地历史');
 });
 
-const saveCode = block('/** 保存串行化', '/** 等待本地提交');
+const {create: createPersistence} = require('../web/features/project-persistence.js');
 function saveFixture(remote) {
   const calls = {puts:[],posts:[],toasts:[],opened:0,flushed:0};
   const restored = {id:'a',type:'card_tools',name:'恢复节点',x:10,y:20,params:{prompt:'保留'},assets:{},outputs:[]};
@@ -266,7 +266,16 @@ function saveFixture(remote) {
     openProject:async () => { calls.opened++; },
     flushPendingProjectSync:() => { calls.flushed++; },
   });
-  vm.runInContext(saveCode,context,{filename:'app.js:画布保存真实函数'});
+  const persistence = createPersistence({
+    getProject:() => context.PROJ, getView:() => ({}), isAuthenticated:() => true,
+    canSave:() => context.canSave(), nodeEditor:false, editorCard:() => null,
+    plain:card => context.plain(card), api:(...args) => context.api(...args),
+    jpost:(...args) => context.jpost(...args), jput:(...args) => context.jput(...args),
+    recordCanvasEdit() {}, flushPendingProjectSync:() => context.flushPendingProjectSync(),
+    openProject:(...args) => context.openProject(...args), toast:message => context.toast(message),
+    showError:message => { throw new Error(message); }, flushFocusedControl() {},
+  });
+  context.doSave = persistence.enqueueSave;
   return {context,calls,restored};
 }
 
@@ -287,7 +296,7 @@ test('撤销已落盘的节点删除时经建卡接口恢复，不误报远端�
   assert.equal(s.PROJ.cards[0],restored,'恢复后保留正在显示的节点对象');
   assert.equal(restored.created_by,'user');
   assert.equal(s.PROJ.rev,4);
-  assert.equal(calls.flushed,1);
+  assert.equal(calls.flushed,2, '保存完成和串行队列出队均通知协作同步');
 });
 
 test('真正的远端版本冲突仍重新加载，不把本地整图盲目覆盖远端', async () => {
@@ -767,7 +776,8 @@ function browserFixture(platform) {
     const linkTo = () => linked++, spawnDownstream = () => spawned++;
     const CARDS = [{id:'text',kind:'text',modes:[]},{id:'image',kind:'gen',name:'生图',modes:[]},
       {id:'video',kind:'gen',name:'生视频',modes:[]},{id:'tools',kind:'tool',modes:[{name:'放大'}]}];
-    let saveChain = Promise.resolve(), copyWork = Promise.resolve(), copyId = 0;
+    const persistence = {pendingChain:Promise.resolve()};
+    let copyWork = Promise.resolve(), copyId = 0;
     const trackNodeWork = work => copyWork = work, clipboardPasteTarget = () => null;
     const paintStyles = () => {}, paintPort = () => {};
     function addCard(type,x,y,cap) {

@@ -201,8 +201,7 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(max(abs(value) for value in silence), 100)
         resolved = [event for event in self.events if event[0] == "resolve"]
         self.assertEqual(len(resolved), 2)  # same source reused, approved only once
-        self.assertEqual(self.events[-2][0], "acl")
-        self.assertEqual(self.events[-1][0], "publish")
+        self.assertEqual([event[0] for event in self.events[-3:]], ["acl", "publish", "acl"])
         self.assertFalse((self.manager.work / state["id"]).exists())
         public = self.manager.list("p")[0]
         self.assertNotIn("snapshot", public)

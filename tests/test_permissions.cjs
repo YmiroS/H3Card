@@ -213,7 +213,7 @@ test('canvas separates personal, shared and team spaces when creating projects',
       '/api/jobs': {jobs:[]},
     };
     if (Object.hasOwn(payloads, req.url)) { res.setHeader('Content-Type','application/json; charset=utf-8'); return res.end(JSON.stringify(payloads[req.url])); }
-    const files = {'/':'index.html','/app.js':'app.js','/auth.js':'auth.js','/style.css':'style.css','/icon.png':'icon.png', '/favicon.png':'favicon.png'};
+    const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html','/app.js':'app.js','/auth.js':'auth.js','/style.css':'style.css','/icon.png':'icon.png', '/favicon.png':'favicon.png'};
     const file = files[new URL(req.url, 'http://localhost').pathname]; if (!file) { res.writeHead(404); return res.end(); }
     res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
     res.end(readFileSync(path.join(web, file)));
@@ -804,7 +804,7 @@ test('permissions dialogs preserve failed inputs, clear passwords and confirm re
 test('新版工作区跨页面保留唯一导航和底部真实账号，键盘、触摸、角色及改密退出契约不变', async () => {
   let user = {id:'admin-1', username:'admin-account', display_name:'张三', phone:'13800138000', role:'admin'}, localTest = false;
   const mutations = [], unexpected = [], external = [], errors = [];
-  const files = {'/':'index.html', '/director':'director.html', '/teams':'teams.html', '/controller':'controller.html',
+  const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html', '/director':'director.html', '/teams':'teams.html', '/controller':'controller.html',
     '/admin/permissions':'permissions.html', '/controller/costs':'costs.html', '/controller/capacity':'capacity.html',
     '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/director.js':'director.js', '/director.css':'director.css',
     '/director_edit.js':'director_edit.js', '/icon.png':'icon.png', '/favicon.png':'favicon.png',

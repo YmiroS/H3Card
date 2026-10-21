@@ -68,7 +68,7 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       });
       return;
     }
-    const files = {'/':'index.html','/app.js':'app.js','/auth.js':'auth.js','/style.css':'style.css','/icon.png':'icon.png','/favicon.png':'favicon.png'};
+    const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html','/app.js':'app.js','/auth.js':'auth.js','/style.css':'style.css','/icon.png':'icon.png','/favicon.png':'favicon.png'};
     if (files[pathname]) {
       const name=files[pathname];
       res.setHeader('Content-Type',name.endsWith('.js')?'text/javascript; charset=utf-8':name.endsWith('.css')?'text/css':name.endsWith('.png')?'image/png':'text/html; charset=utf-8');
