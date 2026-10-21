@@ -11,6 +11,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from aiohttp import web
+from yarl import URL
 
 from .auth_store import AuthError
 
@@ -200,6 +201,12 @@ async def _local_test_request(request, handler):
 @web.middleware
 async def auth_middleware(request, handler):
     try:
+        redirect_origin = request.app.get('https_redirect_origin')
+        if (redirect_origin and not request.secure
+                and request.method in ('GET', 'HEAD')
+                and not request.path.startswith(('/api/', '/agent/'))
+                and request.headers.get('Upgrade', '').lower() != 'websocket'):
+            raise web.HTTPPermanentRedirect(URL(redirect_origin + request.rel_url.raw_path_qs, encoded=True))
         if request.app.get('auth_store') is None:
             raise web.HTTPServiceUnavailable(text='认证服务尚未配置')
         if request.app.get('local_test'):
@@ -482,6 +489,18 @@ async def assign_projects(request):
 
 
 def register_auth_routes(app, web_root):
+    redirect_origin = '' if app.get('local_test') else os.environ.get('CHOUKA_HTTPS_REDIRECT_ORIGIN', '')
+    if redirect_origin:
+        try:
+            target = urlsplit(redirect_origin)
+            if (target.scheme != 'https' or not target.hostname
+                    or target.username is not None or target.password is not None
+                    or target.path not in ('', '/') or target.query or target.fragment
+                    or target.port == 0 or any(char.isspace() for char in redirect_origin)):
+                raise ValueError('invalid HTTPS origin')
+        except ValueError as exc:
+            raise RuntimeError('CHOUKA_HTTPS_REDIRECT_ORIGIN 必须是完整 HTTPS 来源，不能带路径、凭据、查询或片段') from exc
+    app['https_redirect_origin'] = redirect_origin.rstrip('/')
     app['_auth_login_limits'] = OrderedDict()
     app['_auth_register_limits'] = OrderedDict()
     app['_auth_hash_slots'] = asyncio.Semaphore(2)
