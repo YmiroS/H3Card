@@ -23,12 +23,9 @@ let PROJ = null;           // 当前项目
 let projects = [];
 let teams = [];
 let selectedSpace = 'personal';
-let TASKS = [];            // 服务端所有任务（不限本项目），右上角计数和任务浮窗都看它
 let view = { x: 60, y: 70, k: 1 };
 let selId = null;
 let selIds = new Set();    // 框选出来的多个节点（左键空白处拖一个框；Delete 全删、拖动整体移动）
-let saveTimer = null;
-let viewTimer = null;
 let presenceSocket = null;
 let presenceProject = null;
 let presenceSelf = null;
@@ -37,22 +34,9 @@ let presenceMembers = new Map();
 let presenceVersion = -1;
 let pendingCursor = null;
 let cursorTimer = null;
-let contentSaving = false;
-let pendingCardCreates = 0;
 let pendingDirectorRuns = 0;
 let pendingProjectSync = null;
-let pendingContentSaves = 0;
-let localFlushes = 0;
-let saveFailure = null;
-let workFailure = null;
 let editorMissing = false;
-const pendingNodeWork = new Set();
-function trackNodeWork(work) {
-  pendingNodeWork.add(work);
-  const done = () => { pendingNodeWork.delete(work); flushPendingProjectSync(); };
-  work.then(done, error => { workFailure = error; done(); });
-  return work;
-}
 
 const el = {
   side: $("#side"), plist: $("#plist"), dot: $("#dot"),
@@ -69,6 +53,36 @@ const el = {
   minimap: $("#minimap"), minimapCanvas: $("#minimap-canvas"), minimapViewport: $("#minimap-viewport"),
   zoomPercent: $("#zoom-percent"),
 };
+
+const persistence = ChoukaProjectPersistence.create({
+  getProject: () => PROJ, getView: () => view, isAuthenticated: () => H3Auth.active,
+  canSave: () => canSave(), nodeEditor: NODE_EDITOR, editorCard: () => editorCard(), plain: card => plain(card),
+  api: (...args) => api(...args), jpost: (...args) => jpost(...args), jput: (...args) => jput(...args),
+  recordCanvasEdit: () => recordCanvasEdit(), flushPendingProjectSync: () => flushPendingProjectSync(),
+  openProject: id => openProject(id), toast: message => toast(message), showError: message => showError(message),
+  flushFocusedControl: () => {
+    if (document.activeElement?.closest?.("#panel, #respop")) document.activeElement.blur();
+  },
+});
+const { saveView, save, enqueueSave, flushLocalChanges, trackNodeWork } = persistence;
+
+const applyCanvasJobs = ChoukaTaskPanel.createCanvasUpdater({
+  getProject: () => PROJ, canOperate: () => canOperate(), isIF: card => isIF(card), canTask: job => canTask(job),
+  paint: card => paint(card), refreshPanel: card => { if (el.panel._id === card.id) openPanel(card.id); },
+  pushHistory: (card, job) => pushHistory(card, job),
+  refreshHistory: card => { if (el.hist._id === card.id) openHistory(card.id); },
+  propagateCardOutputs: card => propagateCardOutputs(card), titleOf: card => titleOf(card),
+  showError: message => showError(message), save: userEdit => save(userEdit),
+});
+const taskPanel = ChoukaTaskPanel.create({
+  document, panel: el.jobs, button: el.jobsbtn, getViewport: () => ({width: innerWidth, height: innerHeight}),
+  getUser: () => H3Auth.user, canTask: job => canTask(job), api: (...args) => api(...args),
+  jpost: (...args) => jpost(...args), jobProjName: job => jobProjName(job),
+  fmtEla: ms => fmtEla(ms), histTime: time => histTime(time),
+  toast: message => toast(message), showError: message => showError(message), confirm: message => confirm(message),
+  onFocusTask: job => focusTask(job), onJobsChanged: jobs => applyCanvasJobs(jobs),
+});
+const { pollJobs, paintJobsBtn, toggleJobs, closeJobs, placeJobs, renderJobs } = taskPanel;
 
 /* ================= 工具 ================= */
 const canOperate = (project = PROJ) => H3Auth.active && project?.permission === 'operate';
@@ -105,7 +119,7 @@ async function api(path, opt = {}) {
   return H3Auth.request(path, opt);
 }
 function clearProject() {
-  clearTimeout(saveTimer); clearTimeout(viewTimer); saveTimer = null; viewTimer = null; disconnectPresence();
+  persistence.cancelTimers(); disconnectPresence();
   PROJ = null; selId = null; selIds.clear(); pendingProjectSync = null; resetCanvasHistory();
   closePanel(); closeHistory(); closeViewer(); closeMenu(); closeJobs(); closeResPop();
   el.groups.replaceChildren(); el.selbar.style.display = 'none'; showEmpty();
@@ -113,11 +127,11 @@ function clearProject() {
 }
 function syncPermissionUI() {
   document.body.classList.toggle('project-readonly', !!PROJ && !canOperate());
-  if (!canOperate()) { clearTimeout(saveTimer); saveTimer = null; closeMenu(); closeResPop(); }
+  if (!canOperate()) { persistence.cancelContentSave(); closeMenu(); closeResPop(); }
   el.dock.style.display = canOperate() ? '' : 'none';
   if (PROJ) { el.ptitle.textContent = PROJ.name; const badge = document.createElement('span'); badge.className = 'ro'; badge.textContent = !canOperate() ? '只读' : PROJ.locked ? '试玩画布 · 刷新还原' : ''; el.ptitle.append(badge); }
 }
-window.addEventListener('h3auth:expired', () => { CLIP = null; TASKS = []; projects = []; clearProject(); el.plist.replaceChildren(); });
+window.addEventListener('h3auth:expired', () => { CLIP = null; taskPanel.reset(); projects = []; clearProject(); el.plist.replaceChildren(); });
 let refreshingAccess = false;
 window.addEventListener('h3auth:denied', async ({detail}) => {
   if (refreshingAccess || !H3Auth.active || !/^\/api\/(projects|job|upload|generate|text|rewrite|media|thumbnail)/.test(detail.path)) return;
@@ -650,19 +664,16 @@ const shortOf16x9 = (L) => Math.round(L * 9 / 16 / MULT) * MULT;
      select，清晰度档从 megapixels 的 min/max 里能选到的档位算
    · width + height（Z-Image 文生图）—— 任意 16 步进，清晰度按像素面积折 1K/2K */
 /** 清晰度档：按标准分辨率档位（短边像素）定义 */
-const CLARITY_STEPS = [
-  { id: "480P", label: "480P", val: 480 },
-  { id: "720P", label: "720P", val: 720 },
-  { id: "1080P", label: "1080P", val: 1080 },
-  { id: "1440P", label: "1440P", val: 1440 },
-  { id: "2K", label: "2K", val: 2048 },
-];
-/** 比例网格（照参考图内置的 13 种；映射到工作流那 8 档 select 里的最优近似） */
-const RATIO_GRID = [
-  ["1:1", 1, 1], ["1:2", 1, 2], ["2:1", 2, 1], ["9:16", 9, 16], ["16:9", 16, 9],
-  ["3:4", 3, 4], ["4:3", 4, 3], ["3:2", 3, 2], ["2:3", 2, 3], ["5:4", 5, 4],
-  ["4:5", 4, 5], ["21:9", 21, 9], ["9:21", 9, 21],
-];
+const { CLARITY_STEPS, RATIO_GRID, resolutionPresets, resolutionPreset, imageSettings, applyInputPresets } = ChoukaNodeParameters;
+const nodeParameters = ChoukaNodeParameters.create({
+  document, getCapability: card => capOf(card), getCapabilityById: id => CAPS[id],
+  getRunCapability: card => CAPS[runCap(card)] || capOf(card), getProject: () => PROJ,
+  isIF: card => isIF(card), normalizeIFDuration: card => normalizeIFDuration(card),
+  api: (...args) => api(...args), save: () => save(), onReferenceChange: card => refreshReferencePreview(card),
+  ratioWH: RATIO_WH, multiple: MULT,
+});
+const { switchImageCapability, imageClarityPicker, supportsVideoReference, referenceVideo, videoMetadataReady,
+  ensureReferenceMetadata, syncReferenceParameters, refreshVideoParameters, videoReferenceStatus } = nodeParameters;
 /** 13 种比例 → 工作流 select 那 8 档（挑宽高比最接近的；5:4/4:5/1:2/2:1/9:21 没有
     完全对应的，折到最近的档） */
 function ratioToOpt(r) {
@@ -678,105 +689,8 @@ const optToRatio = (opt) => {
   const wh = RATIO_WH[opt];
   return wh ? RATIO_GRID.find(r => r[1] === wh[0] && r[2] === wh[1]) : null;
 };
-/** TT 分辨率节点把宽、高和比例塞在同一个下拉值里，例如 1280x720 (16:9)。 */
-function resolutionPresets(spec) {
-  return (spec && spec.options || []).map(value => {
-    const m = /^(\d+)x(\d+)\s+\(([^)]+)\)$/.exec(String(value));
-    if (!m) return null;
-    const width = parseInt(m[1], 10), height = parseInt(m[2], 10);
-    return { value, width, height, ratio: m[3], short: Math.min(width, height) };
-  }).filter(Boolean);
-}
-function resolutionPreset(spec, value) {
-  return resolutionPresets(spec).find(x => x.value === value) || null;
-}
-function imageSettings(c, cap) {
-  const controls = cap.imageControls;
-  const ratio = c.params.image_ratio;
-  const clarity = c.params.image_clarity;
-  return {
-    ratio: RATIO_GRID.some(r => r[0] === ratio) || (controls.mode === "i2i" && ratio === "original")
-      ? ratio : controls.defaultRatio,
-    clarity: CLARITY_STEPS.some(s => s.id === clarity) ? clarity : controls.defaultClarity,
-  };
-}
-
-function switchImageCapability(c, capability) {
-  const old = capOf(c), next = CAPS[capability];
-  if (old && next && old.id !== next.id && (old.imageControls || next.imageControls)) {
-    const modelKeys = cap => [...new Set(cap.inputs.filter(s =>
-      !MEDIA.includes(s.type) && s.type !== "textarea" && s.type !== "seed").map(s => s.key))];
-    const saved = c.params._imageModelParams ||= {};
-    saved[old.id] = Object.fromEntries(modelKeys(old).filter(k => c.params[k] != null).map(k => [k, c.params[k]]));
-    const ratios = c.params._imageRatios ||= {};
-    if (old.imageControls) ratios[old.imageControls.mode] = imageSettings(c, old).ratio;
-    for (const key of new Set([...modelKeys(old), ...modelKeys(next)])) delete c.params[key];
-    Object.assign(c.params, saved[next.id] || {});
-    if (next.imageControls && old.imageControls?.mode !== next.imageControls.mode) {
-      c.params.image_ratio = ratios[next.imageControls.mode] || next.imageControls.defaultRatio;
-    }
-  }
-  c.cap = capability;
-}
-
-function imageClarityPicker(c, cap, onchange) {
-  const current = imageSettings(c, cap);
-  const wrap = document.createElement("div"); wrap.className = "cpick image-size-controls";
-  const title = document.createElement("div"); title.className = "ctitle"; title.textContent = "画面比例";
-  const ratios = document.createElement("div"); ratios.className = "cgrid";
-  const choices = cap.imageControls.mode === "i2i" ? [["original", 1, 1], ...RATIO_GRID] : RATIO_GRID;
-  for (const [ratio, width, height] of choices) {
-    const button = document.createElement("button");
-    const label = ratio === "original" ? "原图" : ratio;
-    button.className = ratio === current.ratio ? "on" : "";
-    button.innerHTML = `<i style="--ratio:${width / height}"></i><span>${label}</span>`;
-    button.title = `画面比例 ${label}`;
-    button.onclick = () => { c.params.image_ratio = ratio; save(); onchange(); };
-    ratios.appendChild(button);
-  }
-  const clarityTitle = document.createElement("div"); clarityTitle.className = "ctitle"; clarityTitle.textContent = "清晰度";
-  const sizes = document.createElement("div"); sizes.className = "cgrid k";
-  for (const step of CLARITY_STEPS) {
-    const button = document.createElement("button");
-    button.className = step.id === current.clarity ? "on" : "";
-    button.textContent = step.label;
-    button.title = `目标短边 ${step.val}px，实际尺寸按模型要求对齐`;
-    button.onclick = () => { c.params.image_clarity = step.id; save(); onchange(); };
-    sizes.appendChild(button);
-  }
-  const hint = document.createElement("div"); hint.className = "image-size-hint";
-  hint.textContent = cap.imageControls.mode === "i2i"
-    ? "清晰度按短边计算；默认保持原图比例。指定比例时，模型可能裁切主图以适配画布。"
-    : "清晰度按短边计算；实际尺寸按模型要求对齐。高分辨率会增加显存占用。";
-  wrap.append(title, ratios, clarityTitle, sizes, hint);
-  return wrap;
-}
-
 const whClaritySteps = cap => cap.outputType === "video"
   ? H3_P.map(p => ({ id: `${p}p`, label: `${p}p`, val: p })) : CLARITY_STEPS;
-const supportsVideoReference = cap => cap?.kind === "gen" && cap.outputType === "video"
-  && (cap.execution === "if_studio" || (cap.id.startsWith("minimax_h3_") && cap.inputs.some(s => s.type === "video")));
-const referenceVideo = (c, cap) => supportsVideoReference(cap)
-  ? (isIF(c) ? capOf(c) : cap).inputs.filter(s => s.type === "video").map(s => c.assets?.[s.key]).find(a => a?.ref) : null;
-const videoMetadataReady = a => a && [a.width, a.height, a.duration].every(v => Number.isFinite(+v) && +v > 0);
-const referenceMetadata = new WeakMap();
-
-async function ensureReferenceMetadata(c, cap = CAPS[runCap(c)] || capOf(c)) {
-  const source = referenceVideo(c, cap);
-  if (!source || videoMetadataReady(source)) return;
-  if (referenceMetadata.has(source)) return referenceMetadata.get(source).promise;
-  const project = PROJ;
-  const state = {};
-  referenceMetadata.set(source, state);
-  state.promise = api("/api/media?ref=" + encodeURIComponent(source.ref) + "&project=" + encodeURIComponent(project.id))
-    .then(info => {
-      if (!videoMetadataReady(info)) throw new Error("无法读取参考视频的比例和时长，请重新导入视频");
-      if (PROJ !== project || !project.cards.includes(c) || referenceVideo(c, cap) !== source) return;
-      Object.assign(source, info);
-      save();
-    }).catch(error => { state.error = error.message; throw error; });
-  return state.promise;
-}
 function refreshReferencePreview(c) {
   if (!PROJ?.cards.includes(c) || el.panel._id !== c.id) return;
   const cap = isIF(c) ? capOf(c) : CAPS[runCap(c)] || capOf(c);
@@ -786,72 +700,6 @@ function refreshReferencePreview(c) {
     if (el.respop._cap !== cap.id) closeResPop();
     else el.respop._refill();
   }
-}
-function syncReferenceParameters(c, cap = CAPS[runCap(c)] || capOf(c)) {
-  const source = referenceVideo(c, cap);
-  if (!source) {
-    delete c._referenceParameters;
-    delete c.params._reference_video;
-    return Promise.resolve();
-  }
-  const identity = JSON.stringify([cap.id, source.ref]);
-  if (c.params._reference_video === identity) return Promise.resolve();
-  const pending = c._referenceParameters;
-  if (pending?.identity === identity && pending.source === source) return pending.promise;
-  const project = PROJ, params = c.params;
-  const before = {...params};
-  const state = {identity, source, before};
-  c._referenceParameters = state;
-  const apply = () => {
-    if (PROJ !== project || !project.cards.includes(c) || c.params !== params
-      || c._referenceParameters !== state || (CAPS[runCap(c)] || capOf(c)) !== cap
-      || referenceVideo(c, cap) !== source || !videoMetadataReady(source)) return;
-    const unchanged = keys => keys.every(key => params[key] === before[key]);
-    const ar = cap.inputs.find(s => s.key === "aspect_ratio");
-    const ratio = +source.width / +source.height;
-    if (ar && unchanged(["aspect_ratio"])) {
-      params.aspect_ratio = ar.options.reduce((best, option) =>
-        Math.abs(RATIO_WH[option][0] / RATIO_WH[option][1] - ratio)
-          < Math.abs(RATIO_WH[best][0] / RATIO_WH[best][1] - ratio) ? option : best);
-    } else if (!ar && unchanged(["width", "height", "_ratio"])) {
-      const r = RATIO_GRID.reduce((best, item) => Math.abs(item[1] / item[2] - ratio)
-        < Math.abs(best[1] / best[2] - ratio) ? item : best);
-      const value = key => params[key] ?? cap.inputs.find(s => s.key === key)?.default;
-      const short = Math.min(+value("width"), +value("height"));
-      params._ratio = r[0];
-      params.width = r[1] >= r[2] ? Math.round(short * r[1] / r[2] / MULT) * MULT : short;
-      params.height = r[1] >= r[2] ? short : Math.round(short * r[2] / r[1] / MULT) * MULT;
-    }
-    // 人物迁移的 duration 是单段长度，不是成片总时长。
-    const preview = cap.inputs.some(s => s.key === "preview_seconds");
-    const key = preview ? "preview_seconds" : "duration";
-    if (unchanged([key])) {
-      params[key] = preview ? 0 : Math.max(1, Math.round(+source.duration));
-      if (isIF(c)) normalizeIFDuration(c);
-    }
-    params._reference_video = identity;
-    save();
-  };
-  state.promise = videoMetadataReady(source) ? Promise.resolve(apply()) : ensureReferenceMetadata(c, cap).then(apply);
-  return state.promise;
-}
-function refreshVideoParameters(c) {
-  syncReferenceParameters(c).catch(() => {}).finally(() => refreshReferencePreview(c));
-}
-function videoReferenceStatus(c, cap) {
-  const source = referenceVideo(c, cap);
-  if (!source || videoMetadataReady(source)) return null;
-  const note = document.createElement("div"); note.className = "knobnote"; note.setAttribute("role", "status");
-  note.textContent = referenceMetadata.get(source)?.error || "正在读取参考视频的比例和时长…";
-  if (referenceMetadata.get(source)?.error) {
-    const retry = document.createElement("button"); retry.type = "button"; retry.textContent = "重新读取";
-    retry.onclick = () => {
-      referenceMetadata.delete(source); delete c._referenceParameters;
-      refreshVideoParameters(c); refreshReferencePreview(c);
-    };
-    note.appendChild(retry);
-  }
-  return note;
 }
 const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length"]);
 const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
@@ -1561,7 +1409,7 @@ async function loadProjects() {
   try { const data = await api("/api/projects"); projects = data.projects; teams = data.teams || []; } catch (e) { return; }
   if (PROJ) {
     const latest = projects.find(p => p.id === PROJ.id);
-    if (!latest) { clearProject(); TASKS = TASKS.filter(j => projects.some(p => p.id === j.project)); }
+    if (!latest) { clearProject(); taskPanel.retainProjects(projects.map(project => project.id)); }
     else {
       const changed = PROJ.permission !== latest.permission;
       Object.assign(PROJ, {permission:latest.permission, owner_id:latest.owner_id,
@@ -1725,10 +1573,7 @@ async function renameProject(project) {
       PROJ.rev = result.rev;
       el.ptitle.textContent = result.name;
     }
-    for (const job of TASKS) {
-      if (job.project === project.id) job.projectName = result.name;
-    }
-    if (el.jobs.style.display !== "none") renderJobs();
+    taskPanel.renameProject(project.id, result.name);
     await loadProjects();
   } catch (error) {
     showError("项目重命名失败：" + error.message);
@@ -1737,8 +1582,7 @@ async function renameProject(project) {
 
 let openingProject = 0;
 async function openProject(pid) {
-  clearTimeout(saveTimer); saveTimer = null;
-  clearTimeout(viewTimer); viewTimer = null;
+  persistence.cancelTimers();
   disconnectPresence();
   const opening = ++openingProject;
   try { const project = await api(`/api/projects/${encodeURIComponent(pid)}`); if (opening !== openingProject || !H3Auth.active) return; PROJ = project; }
@@ -1747,7 +1591,7 @@ async function openProject(pid) {
   if (!spaces.includes(selectedSpace)) selectedSpace = spaces[0] || 'personal';
   syncSpaceOptions();
   pendingProjectSync = null;
-  saveFailure = null; workFailure = null; editorMissing = false;
+  persistence.resetFailures(); editorMissing = false;
   PROJ.cards = PROJ.cards || [];
   PROJ.edges = PROJ.edges || [];
   PROJ.groups = PROJ.groups || [];
@@ -1901,153 +1745,7 @@ for (const event of ["pointerdown", "keydown", "beforeinput", "paste", "drop", "
   }, true);
 }
 
-/** 保存串行化：两次 PUT 撞在一起会带同一个 rev，后一次要被服务端顶掉 */
-let saveChain = Promise.resolve();
-let viewSaveChain = Promise.resolve();
-
-function saveView() {
-  if (NODE_EDITOR || !H3Auth.active || !PROJ) return;
-  clearTimeout(viewTimer);
-  const expectedId = PROJ.id;
-  viewTimer = setTimeout(() => {
-    const snapshot = { x: view.x, y: view.y, k: view.k };
-    viewSaveChain = viewSaveChain.then(async () => {
-      if (!H3Auth.active) return;
-      try {
-        await jput(`/api/projects/${encodeURIComponent(expectedId)}/view`, snapshot);
-      } catch (error) {
-        if (PROJ?.id === expectedId) showError("视图保存失败：" + error.message);
-      }
-    });
-  }, 400);
-}
-
-function save(userEdit = true) {
-  if (userEdit) recordCanvasEdit();
-  if (!canSave()) return;
-  // 示例是只读的：拖节点、改参数、重跑都随便，但只活在这一次打开里，刷新就回到那份固定的示例。
-  // 这里直接不发请求（服务端也会回 403），否则每动一下就弹一次「保存失败」
-  if (PROJ.locked) return;
-  clearTimeout(saveTimer);
-  const expectedId = PROJ.id;
-  saveTimer = setTimeout(() => {
-    saveTimer = null;
-    enqueueSave(expectedId);
-  }, 700);
-}
-
-function enqueueSave(expectedId = PROJ?.id) {
-  pendingContentSaves++;
-  saveChain = saveChain.then(() => doSave(expectedId)).finally(() => {
-    pendingContentSaves--;
-    flushPendingProjectSync();
-  });
-  return saveChain;
-}
-
-async function restoreDeletedCardsAndRetry(id, payload) {
-  const remote = await api(`/api/projects/${encodeURIComponent(id)}`);
-  if (!PROJ || PROJ.id !== id || (remote.rev || 0) !== payload.rev) return null;
-  const remoteIds = new Set((remote.cards || []).map(card => card.id));
-  const missing = payload.cards.filter(card => !remoteIds.has(card.id));
-  if (!missing.length) return null;
-
-  let latest = remote;
-  for (const card of missing) {
-    const result = await jpost(`/api/projects/${encodeURIComponent(id)}/cards`, {
-      card, rev: latest.rev || 0,
-    });
-    if (!PROJ || PROJ.id !== id) throw new Error("恢复节点期间画布已切换");
-    latest = result.project;
-    const saved = result.card || (latest.cards || []).find(item => item.id === card.id);
-    const live = PROJ.cards.find(item => item.id === card.id);
-    if (saved && live) for (const key of ["created_by", "created_by_name", "created_at"])
-      if (saved[key] !== undefined) live[key] = card[key] = saved[key];
-  }
-  payload.rev = latest.rev || 0;
-  PROJ.rev = Math.max(PROJ.rev || 0, payload.rev);
-  return jput(`/api/projects/${id}`, payload);
-}
-
-async function doSave(expectedId = PROJ?.id) {
-  if (!canSave() || PROJ.id !== expectedId) {
-    return { ok: false, error: new Error("画布不可保存或已切换") };
-  }
-  if (NODE_EDITOR && !editorCard()) return { ok: false, error: new Error("此节点已删除或不可访问") };
-  if (NODE_EDITOR && saveFailure?.status === 409) return { ok: false, error: saveFailure };
-  const id = PROJ.id;
-  const payload = {
-    rev: PROJ.rev || 0, name: PROJ.name,
-    cards: PROJ.cards.map(plain), edges: PROJ.edges, groups: PROJ.groups || [],
-  };
-  contentSaving = true;
-  try {
-    const r = await jput(`/api/projects/${id}`, payload);
-    if (!PROJ || PROJ.id !== id) return { ok: false, error: new Error("保存期间画布已切换") };
-    PROJ.rev = Math.max(PROJ.rev || 0, r.rev || 0);
-    saveFailure = null;
-    return { ok: true };
-  } catch (caught) {
-    let e = caught;
-    if (e.status === 409 && PROJ && PROJ.id === id && !NODE_EDITOR && !localFlushes) {
-      try {
-        const r = await restoreDeletedCardsAndRetry(id, payload);
-        if (r) {
-          if (!PROJ || PROJ.id !== id) return { ok: false, error: new Error("保存期间画布已切换") };
-          PROJ.rev = Math.max(PROJ.rev || 0, r.rev || 0);
-          saveFailure = null;
-          return { ok: true };
-        }
-      } catch (retryError) {
-        e = retryError;
-      }
-    }
-    if (PROJ?.id === id) saveFailure = e;
-    // 普通画布的真正版本冲突仍重新加载；撤销恢复已落盘删除的节点会先走建卡接口重建。
-    if (e.status === 409 && PROJ && PROJ.id === id && !NODE_EDITOR && !localFlushes) {
-      toast("画布在别处被改过，已重新加载");
-      await openProject(id);
-    } else {
-      showError("保存失败：" + e.message);
-    }
-    return { ok: false, error: e };
-  } finally {
-    contentSaving = false;
-    flushPendingProjectSync();
-  }
-}
-
-/** 等待本地提交（不是等待 GPU 任务结束），并确认最后一次 PUT 真正成功。 */
-async function flushLocalChanges(expectedId = PROJ?.id) {
-  localFlushes++;
-  try {
-    // change/blur 才落值的控件也要先提交，父页关闭按钮不会自动让 iframe 内控件失焦。
-    if (document.activeElement?.closest?.("#panel, #respop")) document.activeElement.blur();
-    for (;;) {
-      const chain = saveChain;
-      await chain;
-      await Promise.all([...pendingNodeWork]);
-      if (!PROJ || PROJ.id !== expectedId) throw new Error("画布已关闭或切换");
-      if (workFailure) throw workFailure;
-      if (saveFailure && [403, 404, 409].includes(saveFailure.status)) throw saveFailure;
-      if (chain !== saveChain || pendingNodeWork.size || pendingCardCreates) continue;
-      if (!canSave()) throw new Error("此画布只读或已锁定，不能保存");
-      if (NODE_EDITOR && !editorCard()) throw new Error("此节点已删除，不能保存或重新创建");
-      clearTimeout(saveTimer); saveTimer = null;
-      const saved = await enqueueSave(expectedId);
-      if (!saved?.ok) throw saved?.error || new Error("保存未完成");
-      if (workFailure) throw workFailure;
-      if (!pendingNodeWork.size && !pendingCardCreates && !pendingContentSaves && saveTimer === null) return;
-    }
-  } catch (error) {
-    if (error === workFailure) workFailure = null;
-    throw error;
-  } finally {
-    localFlushes--;
-    flushPendingProjectSync();
-  }
-}
-
+/** 保存串行化由 project-persistence 持有；画布只装配依赖。 */
 function editorCard() {
   return !editorMissing && PROJ?.id === EDITOR_PROJECT ? PROJ.cards.find(card => card.id === EDITOR_CARD) : null;
 }
@@ -2173,10 +1871,10 @@ function applyCollaborativeProject(project) {
   if (!PROJ || project.id !== PROJ.id || (project.rev || 0) <= (PROJ.rev || 0)) return;
   if (NODE_EDITOR && !(project.cards || []).some(card => card.id === EDITOR_CARD)) {
     editorMissing = true;
-    clearTimeout(saveTimer); saveTimer = null;
+    persistence.cancelContentSave();
     restoreNodeEditor();
   }
-  if (saveTimer !== null || contentSaving || pendingContentSaves || pendingCardCreates || pendingDirectorRuns || pendingNodeWork.size || localFlushes || (NODE_EDITOR && saveFailure)) {
+  if (persistence.busy || pendingDirectorRuns) {
     if (!pendingProjectSync || (project.rev || 0) > (pendingProjectSync.rev || 0)) pendingProjectSync = project;
     return;
   }
@@ -2229,7 +1927,7 @@ function applyCollaborativeProject(project) {
 }
 
 function flushPendingProjectSync() {
-  if (!pendingProjectSync || saveTimer !== null || contentSaving || pendingContentSaves || pendingCardCreates || pendingDirectorRuns || pendingNodeWork.size || localFlushes || (NODE_EDITOR && saveFailure)) return;
+  if (!pendingProjectSync || persistence.busy || pendingDirectorRuns) return;
   const project = pendingProjectSync;
   pendingProjectSync = null;
   applyCollaborativeProject(project);
@@ -4513,10 +4211,10 @@ function createDroppedAsset(project, item, x, y) {
     if (!valid()) return null;
     // 旧 PUT 读取执行时的 cards，必须在新素材进入画布之前排空，避免 409 重载。
     for (;;) {
-      const chain = saveChain;
+      const chain = persistence.pendingChain;
       await chain;
       if (!valid()) return null;
-      if (chain === saveChain) break;
+      if (chain === persistence.pendingChain) break;
     }
     // 只合并建卡元数据，不能让建卡响应覆盖当前画布尚未保存的参数。
     const card = addCard("card_asset", x, y, null, false);
@@ -4567,8 +4265,7 @@ function rollbackFailedCard(card) {
 
 function queueCardCreate(card, preserveLocal = false) {
   const project = PROJ, projectId = project.id;
-  pendingCardCreates += 1;
-  saveChain = saveChain.then(async () => {
+  return persistence.enqueueCardCreate(async () => {
     try {
       const result = await jpost(`/api/projects/${encodeURIComponent(projectId)}/cards`, { card: plain(card) });
       if (preserveLocal) {
@@ -4592,16 +4289,12 @@ function queueCardCreate(card, preserveLocal = false) {
       return true;
     } catch (error) {
       if (preserveLocal ? PROJ === project : PROJ?.id === projectId) {
-        workFailure = error;
+        persistence.markWorkFailure(error);
         rollbackFailedCard(card);
         showError("卡片添加失败：" + error.message);
       }
-    } finally {
-      pendingCardCreates = Math.max(0, pendingCardCreates - 1);
-      flushPendingProjectSync();
     }
   });
-  return saveChain;
 }
 
 function addCard(type, x, y, cap, select = true) {
@@ -4788,10 +4481,10 @@ function pasteCopiedCard(snapshot, at) {
       }
       // 先排空旧保存，再把整批新 ID 放进画布，避免旧 PUT 抢在建卡请求前提交。
       for (;;) {
-        const chain = saveChain;
+        const chain = persistence.pendingChain;
         await chain;
         if (!canOperate() || PROJ !== project) throw new Error('画布已切换或权限已变化，未粘贴');
-        if (chain === saveChain) break;
+        if (chain === persistence.pendingChain) break;
       }
       return insertPastedCard(cards, at);
     } catch (error) { showError(`粘贴失败：${error.message}`); }
@@ -4867,10 +4560,10 @@ async function pasteClipboardMedia(files, project, target) {
       if (item.kind !== kind) throw new Error('上传素材类型不匹配，未创建节点或引用');
       // 旧的排队 PUT 会读取届时的 cards；先排空，避免把尚未建卡的素材 ID 提前提交。
       for (;;) {
-        const chain = saveChain;
+        const chain = persistence.pendingChain;
         await chain;
         if (!valid()) return;
-        if (chain === saveChain) break;
+        if (chain === persistence.pendingChain) break;
       }
       clipboardReferencePlan(target,kind);
       const at = blankSpot();
@@ -5787,7 +5480,7 @@ async function openImageComposer(c) {
   const check = () => { if (!valid()) throw new Error("画布、节点或权限已变化，请关闭编辑器后重新打开"); };
   const store = async (state, output) => {
     check();
-    localFlushes++;
+    persistence.beginFlush();
     try {
       beginCanvasEdit();
       c.params.composition = JSON.parse(JSON.stringify(state));
@@ -5809,7 +5502,7 @@ async function openImageComposer(c) {
         }
       }
       recordCanvasEdit();
-      clearTimeout(saveTimer); saveTimer = null;
+      persistence.cancelContentSave();
       const saved = await enqueueSave(project.id);
       if (!saved.ok) throw saved.error || new Error("合成保存失败，请重试");
       check();
@@ -5817,7 +5510,7 @@ async function openImageComposer(c) {
       if (el.panel._id === c.id) openPanel(c.id);
       if (output && el.hist._id === c.id) openHistory(c.id);
     } finally {
-      localFlushes--; flushPendingProjectSync();
+      persistence.endFlush();
     }
   };
   try {
@@ -6540,7 +6233,7 @@ async function runText(c) {
     toast(textRunToast(r) + (downs ? `\n已连给 ${downs} 个节点，它们下次运行会用这份新文本` : ""));
   } catch (e) {
     c.status = "error"; c.error = e.message;
-    workFailure = e;
+    persistence.markWorkFailure(e);
     paint(c);
     if (el.panel._id === c.id) openPanel(c.id);
     showError(e.message);
@@ -7359,7 +7052,7 @@ async function translatePrompt(c, s) {
   } catch (e) {
     c._rwBusy = false;
     c._rwErr = { key: s.key, msg: e.message };
-    workFailure = e;
+    persistence.markWorkFailure(e);
     repanel(c);
     showError("翻译失败：" + e.message);
   }
@@ -7526,7 +7219,7 @@ async function rewritePrompt(c, s, model) {
     toast(rwToast(r));
   } catch (e) {
     c._rwErr = { key: s.key, msg: e.message };
-    workFailure = e;
+    persistence.markWorkFailure(e);
     showError("优化失败：" + e.message);
   }
   c._rwBusy = false;
@@ -7973,7 +7666,7 @@ function pickFile(c, s) {
     try {
       putAsset(c, s, await uploadAsset(f, capOf(c)?.execution === "browser"));
       openPanel(c.id); save();
-    } catch (e) { workFailure = e; showError("上传失败：" + e.message); }
+    } catch (e) { persistence.markWorkFailure(e); showError("上传失败：" + e.message); }
   })());
   el.picker.click();
 }
@@ -7991,7 +7684,7 @@ function pickAsset(c, onItem) {
       const item = await uploadAsset(f);
       if (onItem) await onItem(item);
       else await setAssetItem(c, item);
-    } catch (e) { workFailure = e; showError("上传失败：" + e.message); }
+    } catch (e) { persistence.markWorkFailure(e); showError("上传失败：" + e.message); }
   })());
   el.picker.click();
 }
@@ -8278,16 +7971,6 @@ function augRes(c, s, row) {
 }
 
 /* ================= 运行 / 轮询 ================= */
-function applyInputPresets(cap, params) {
-  for (const spec of (cap.inputs || []).filter(s => s.presets)) {
-    const selected = params[spec.key] != null ? params[spec.key] : spec.default;
-    const preset = spec.presets[selected];
-    if (!preset) throw new Error(`${spec.label}无效：${selected}`);
-    params[spec.key] = selected;
-    Object.assign(params, preset);
-  }
-}
-
 /** 所见即所得：面板里显示的值就是提交的值。
     以前没动过的输入框不会进 params，ComfyUI 于是用了模板里作者的演示值 —
     图生视频出鼠标广告就是这么来的。 */
@@ -8672,8 +8355,8 @@ async function runCard(c) {
   if (cap.id === "image_composite" && cap.execution === "browser") return openImageComposer(c);
   if (cap.execution === "if_studio") return runIF(c);
   if (c.director_shot) {
-    clearTimeout(saveTimer); saveTimer = null;
-    await saveChain;
+    persistence.cancelContentSave();
+    await persistence.pendingChain;
     const saved = await enqueueSave(PROJ.id);
     if (!saved.ok) return;
     if (!PROJ.cards.includes(c)) return;
@@ -8691,7 +8374,7 @@ async function runCard(c) {
     if (job.project_rev != null && PROJ?.id === pl.project) PROJ.rev = Math.max(PROJ.rev || 0, job.project_rev);
   } catch (e) {
     c.status = "error"; c.error = e.message; c.job = null;
-    workFailure = e;
+    persistence.markWorkFailure(e);
     showError(`「${titleOf(c)}」提交失败：${e.message}`);
   }
   if (c.director_shot) pendingDirectorRuns = Math.max(0, pendingDirectorRuns - 1);
@@ -8731,264 +8414,12 @@ async function propagateCardOutputs(c) {
 
 /** 一次把所有任务捞回来：右上角的计数要算上别的项目/别处提交的活儿，
     所以不能只按当前项目的节点一张张问。 */
-async function pollJobs() {
-  if (!pollJobs._request) {
-    pollJobs._request = api("/api/jobs").finally(() => { pollJobs._request = null; });
-  }
-  try { TASKS = (await pollJobs._request).jobs || []; } catch (e) { return; }
-  paintJobsBtn();
-  if (el.jobs.style.display !== "none") renderJobs();
-  if (!PROJ || !canOperate()) return;
-  const projectId = PROJ.id;
-  const live = PROJ.cards.filter(c => c.job && !isIF(c) && ["queued", "running"].includes(c.status));
-  if (!live.length) return;
-  let dirty = false;
-  for (const c of live) {
-    const j = TASKS.find(x => x.id === c.job);
-    // 任务被从列表里删掉了（在浮窗里删的）。服务端删之前已经把活儿停了，
-    // 这里必须跟着落地，不然节点会一直转圈等一个不存在的任务
-    if (!j) {
-      c.status = "canceled"; c.step = ""; c.job = null; paint(c); dirty = true;
-      if (el.panel._id === c.id) openPanel(c.id);
-      continue;
-    }
-    // 任务列表随授权变化；只读任务可查看状态，但不能自动回写画布。
-    if (!canTask(j) || !PROJ || PROJ.id !== projectId || !canOperate()) continue;
-    const was = c.status;
-    c.status = j.status; c.progress = j.progress; c.error = j.error;
-    c.queue_remaining = j.queue_remaining; c.step = j.step || "";
-    if (j.seed != null) c.seed = j.seed;
-    // 耗时按服务端的起止时间算，别用浏览器这边的轮询间隔（差一整个轮询周期）
-    if (j.started && j.ended) c.ms = Math.round((j.ended - j.started) * 1000);
-    if (j.outputs && j.outputs.length) c.outputs = j.outputs;
-    paint(c);
-    if (was !== c.status) {
-      dirty = true;
-      if (el.panel._id === c.id) openPanel(c.id);
-      if (c.status === "done") {
-        pushHistory(c, j);
-        if (el.hist._id === c.id) openHistory(c.id);
-        await propagateCardOutputs(c);
-      }
-      if (c.status === "error") showError(`「${titleOf(c)}」生成失败：${c.error || "未知错误"}`);
-    }
-  }
-  if (dirty) save(false);
-}
-
-/* ================= 任务浮窗 ================= */
-const JOB_ZH = { queued: "等待中", running: "运行中", done: "已完成",
-                 error: "失败", canceled: "已取消" };
-const jobLive = (j) => j.status === "queued" || j.status === "running";
-const jobCls = (j) => j.status === "running" ? "run" : j.status === "queued" ? "wait"
-  : j.status === "done" ? "done" : j.status === "error" ? "bad" : "gone";
-
-/** 右上角那颗按钮。数字 = 还没跑完的任务数；后面那截字说明它们是在跑还是在等，
-    颜色同一件事再说一遍（青=在跑、橙=在等、灰=闲着），不点开也知道现在什么状况。 */
-function paintJobsBtn() {
-  const live = TASKS.filter(jobLive);
-  const run = live.find(j => j.status === "running");
-  const b = el.jobsbtn;
-  const sig = `${live.length}|${run ? Math.round((run.progress || 0) * 100) : -1}`;
-  if (b._sig === sig) return;        // 700ms 一次的轮询，没变就别重画
-  b._sig = sig;
-  b.classList.toggle("run", !!run);
-  b.classList.toggle("wait", !run && live.length > 0);
-  b.innerHTML = `任务<span class="n">(${live.length})</span>`;
-  const s = run ? `运行中 ${Math.round((run.progress || 0) * 100)}%`
-    : live.length ? "等待中" : "";
-  if (s) {
-    const t = document.createElement("span"); t.className = "s"; t.textContent = s;
-    b.appendChild(t);
-  }
-  b.title = live.length ? `${live.length} 个任务没跑完，点开可以看详情、停止或删除`
-    : "现在没有任务在跑，点开看历史";
-}
-
-function toggleJobs() {
-  if (el.jobs.style.display === "none") {
-    el.jobs.style.display = "";
-    el.jobsbtn.classList.add("open");
-    renderJobs(); placeJobs();
-    pollJobs();          // 刚打开别先给人看上一轮 700ms 前的旧状态
-  } else closeJobs();
-}
-
-function closeJobs() {
-  el.jobs.style.display = "none";
-  el.jobs.innerHTML = "";
-  el.jobs._sig = null;
-  el.jobsbtn.classList.remove("open");
-}
-
-/** 挂在按钮下面，右边缘对齐。宽度够不着就往左躲，别飘到窗外 */
-function placeJobs() {
-  if (el.jobs.style.display === "none") return;
-  const GAP = 8, r = el.jobsbtn.getBoundingClientRect();
-  el.jobs.style.maxHeight = (innerHeight - r.bottom - GAP * 2) + "px";
-  const w = el.jobs.offsetWidth;
-  el.jobs.style.top = (r.bottom + GAP) + "px";
-  el.jobs.style.left = Math.max(GAP, Math.min(r.right - w, innerWidth - w - GAP)) + "px";
-}
-
-/** 列表骨架的签名：有哪些任务、各自什么状态。只有它变了才重建 DOM ——
-    每 700ms 整块重画会让按钮在 mousedown 和 mouseup 之间被换掉，那一下点击就丢了。
-    进度、步骤、耗时这些一直在变的东西交给 fillJobRow 原地刷。 */
-const jobsSig = () => JSON.stringify(TASKS.map(j => [j.id, j.status, !!j.error,
-  jobProjName(j), j.cardName, j.name, j.submitter_display_name, j.submitter_username]));
-
-function renderJobs() {
-  const sig = jobsSig();
-  if (el.jobs._sig === sig) {
-    for (const d of el.jobs.querySelectorAll(".jrow")) {
-      const j = TASKS.find(x => x.id === d._id);
-      if (j) fillJobRow(d, j);
-    }
-    return;
-  }
-  el.jobs._sig = sig;
-  // 骨架重建时要留住滚动位置，不然新任务一进来列表就被弹回顶部
-  const old = el.jobs.querySelector(".jlist");
-  const scrolled = old ? old.scrollTop : 0;
-
-  el.jobs.innerHTML = "";
-  const hd = document.createElement("div"); hd.className = "jhd";
-  const ttl = document.createElement("b");
-  const n = TASKS.filter(jobLive).length;
-  ttl.textContent = n ? `任务 · ${n} 个没跑完` : "任务";
-  hd.appendChild(ttl);
-  if (TASKS.some(j => !jobLive(j))) {
-    const clr = document.createElement("button");
-    clr.className = "lnk"; clr.textContent = "清空已结束";
-    clr.title = "只清列表里的记录，已经出好的产物还在节点上";
-    clr.onclick = clearDoneJobs;
-    hd.appendChild(clr);
-  }
-  const x = document.createElement("button");
-  x.className = "x"; x.textContent = "✕"; x.title = "关闭"; x.onclick = closeJobs;
-  hd.appendChild(x);
-
-  const list = document.createElement("div"); list.className = "jlist";
-  if (!TASKS.length) {
-    const e = document.createElement("div"); e.className = "jempty";
-    e.textContent = "还没有任务。在节点上点「生成」，任务就会出现在这里。";
-    list.appendChild(e);
-  }
-  for (const j of TASKS) list.appendChild(jobRow(j));
-
-  el.jobs.append(hd, list);
-  list.scrollTop = scrolled;
-}
-
+/* ================= 任务浮窗：由 task-panel 持有列表和交互 ================= */
 /** 项目名以当前项目列表为准，任务提交时的名称只给已删除项目兜底。 */
 function jobProjName(j) {
   if (!j.project) return j.projectName || "";
   if (PROJ && j.project === PROJ.id) return PROJ.name;
   return (projects.find(p => p.id === j.project) || {}).name || j.projectName || "";
-}
-
-function jobRow(j) {
-  const d = document.createElement("div");
-  d.className = "jrow " + jobCls(j);
-  d._id = j.id;
-
-  const submitter = H3Auth.user?.role === 'admin'
-    ? j.submitter_display_name?.trim() || j.submitter_username || '未记录提交人' : '';
-  if (submitter) {
-    const person = document.createElement('div'); person.className = 'jowner';
-    person.textContent = submitter; d.append(person);
-  }
-  const r1 = document.createElement("div"); r1.className = "r1";
-  const nm = document.createElement("span"); nm.className = "nm";
-  // 节点名才是用户认得出的那个（"角色图放大"），能力名（"SeedVR2 图片高清放大"）退到第二行。
-  // 前面再挂上项目名：几个项目里都有一张叫"主角图"的节点，光看节点名分不出是哪个在跑
-  const card = j.cardName || j.name;
-  const pj = jobProjName(j);
-  if (pj) {
-    const p = document.createElement("i"); p.className = "pj";
-    p.textContent = pj + " - ";
-    nm.appendChild(p);
-  }
-  const cn = document.createElement("span"); cn.className = "cn";
-  cn.textContent = card;
-  nm.appendChild(cn);
-  nm.title = (submitter ? `${submitter} - ` : '') + (pj ? `${pj} - ` : "") + (card !== j.name ? `${card}（${j.name}）` : j.name);
-  d._st = document.createElement("span"); d._st.className = "st";
-  r1.append(nm, d._st);
-
-  const r2 = document.createElement("div"); r2.className = "r2";
-  d._sp = document.createElement("span"); d._sp.className = "sp";
-  d._tm = document.createElement("span");
-  r2.append(d._sp, d._tm);
-  const r3 = document.createElement("div"); r3.className = "r3";
-  d._node = document.createElement("span"); d._node.className = "node";
-  d._step = document.createElement("span"); d._step.className = "step";
-  r3.append(d._node, d._step);
-  d.append(r1, r2, r3);
-
-  if (jobLive(j)) {
-    const bar = document.createElement("div"); bar.className = "bar";
-    d._bar = document.createElement("i");
-    bar.appendChild(d._bar); d.appendChild(bar);
-  }
-  if (j.error) {
-    const m = document.createElement("div"); m.className = "msg";
-    m.textContent = j.error; d.appendChild(m);
-  }
-
-  const acts = document.createElement("div"); acts.className = "acts";
-  if (jobLive(j)) acts.appendChild(actBtn("停止", () => stopTask(j)));
-  acts.appendChild(actBtn("删除", () => delTask(j), true));
-  if (j.project && j.card) acts.appendChild(actBtn("看节点", () => focusTask(j)));
-  d.appendChild(acts);
-
-  fillJobRow(d, j);
-  return d;
-}
-
-/** 只刷每次轮询都在变的那几处：状态百分比、当前步骤、执行节点、耗时、进度条 */
-function fillJobRow(d, j) {
-  const pct = Math.round((j.progress || 0) * 100);
-  // 排队的不报"前面还有几个"：ComfyUI 的 queue_remaining 是整条队列的长度，
-  // 不是这一条自己的位次，拿它当位次就是编数字。队列长度改在浮窗标题上说一次
-  d._st.textContent = j.status === "running" ? `运行中 ${pct}%`
-    : JOB_ZH[j.status] || j.status;
-  const modelText = `${j.name} · ${j.modelName || j.capability}`;
-  if (d._sp.textContent !== modelText) d._sp.textContent = d._sp.title = modelText;
-  const nodeText = `执行节点：${j.nodeName || "等待分配"}`;
-  if (d._node.textContent !== nodeText) d._node.textContent = d._node.title = nodeText;
-  const stepText = j.step ? `当前：${j.step}` : "";
-  if (d._step.textContent !== stepText) d._step.textContent = d._step.title = stepText;
-  const ela = j.started ? fmtEla(((j.ended || Date.now() / 1000) - j.started) * 1000) : "";
-  d._tm.textContent = histTime(j.created * 1000) + (ela ? ` · ${ela}` : "");
-  if (d._bar) d._bar.style.width = pct + "%";
-}
-
-function actBtn(text, run, danger) {
-  const b = document.createElement("button");
-  if (danger) b.className = "danger";
-  b.textContent = text;
-  b.onclick = run;
-  return b;
-}
-
-async function stopTask(j) {
-  if (!canTask(j)) return toast("此任务关联的画布为只读，不能停止");
-  try { await jpost(`/api/job/${j.id}/cancel`); } catch (e) { return showError(e.message); }
-  pollJobs();
-}
-
-async function delTask(j) {
-  if (!canTask(j)) return toast("此任务关联的画布为只读，不能删除");
-  // 还在跑的删掉等于先停后删，这一步不可逆（跑到一半的算力就没了），所以问一句
-  if (jobLive(j) && !confirm("这个任务还没跑完，删除会先把它停掉。继续？")) return;
-  try { await api(`/api/job/${j.id}`, { method: "DELETE" }); } catch (e) { return showError(e.message); }
-  pollJobs();
-}
-
-async function clearDoneJobs() {
-  try { await jpost("/api/jobs/clear"); } catch (e) { return showError(e.message); }
-  pollJobs();
 }
 
 /** 从任务跳回它对应的那个节点：不在当前画布就先把那张画布打开 */
