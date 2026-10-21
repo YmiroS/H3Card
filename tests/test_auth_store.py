@@ -1,5 +1,6 @@
 import asyncio
 import hashlib
+import os
 import sqlite3
 import tempfile
 import threading
@@ -11,7 +12,8 @@ from pathlib import Path
 from unittest.mock import ANY, patch
 
 from aiohttp import web
-from aiohttp.test_utils import TestClient, TestServer
+from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
+from yarl import URL
 
 from server.auth import COOKIE, auth_middleware, register_auth_routes, require_project
 from server.auth_store import AuthError, AuthStore
@@ -997,6 +999,107 @@ class RegistrationStoreTests(unittest.TestCase):
         self.assertNotIn('password', ' '.join(rows[0].keys()))
         self.assertNotIn('phone', rows[0])
         self.assertNotIn('13800138000', str(rows))
+
+
+class HTTPSRedirectConfigTests(unittest.TestCase):
+    def test_reject_invalid_redirect_origins(self):
+        for origin in ('http://example.test', 'https://', 'https://user:pass@example.test',
+                       'https://example.test/path', 'https://example.test?next=elsewhere',
+                       'https://example.test#fragment', 'https://example.test:0',
+                       'https://example.test:99999', 'https://example.test\n'):
+            with self.subTest(origin=origin), patch.dict(os.environ, {'CHOUKA_HTTPS_REDIRECT_ORIGIN': origin}):
+                with self.assertRaisesRegex(RuntimeError, 'CHOUKA_HTTPS_REDIRECT_ORIGIN'):
+                    register_auth_routes(web.Application(), '.')
+
+    def test_optional_redirect_and_local_test_bypass(self):
+        for local_test, origin, expected in (
+                (False, '', ''), (False, 'https://example.test:8443/', 'https://example.test:8443'),
+                (True, 'https://example.test:8443', '')):
+            with self.subTest(local_test=local_test, origin=origin):
+                app = web.Application()
+                app['local_test'] = local_test
+                with patch.dict(os.environ, {'CHOUKA_HTTPS_REDIRECT_ORIGIN': origin}):
+                    register_auth_routes(app, '.')
+                self.assertEqual(app['https_redirect_origin'], expected)
+
+
+class HTTPSRedirectTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = AuthStore(Path(self.tmp.name) / 'auth.sqlite')
+        self.store.create_user('admin', PASSWORD, 'admin')
+        self.store.set_ready()
+        self.target = 'https://dinghaichouka.youku.com:8443'
+        app = web.Application(middlewares=[auth_middleware])
+        app['auth_store'] = self.store
+        with patch.dict(os.environ, {'CHOUKA_HTTPS_REDIRECT_ORIGIN': self.target}):
+            register_auth_routes(app, Path(__file__).resolve().parents[1] / 'web')
+
+        async def ok(request):
+            return web.json_response({'ok': True})
+
+        async def websocket(request):
+            ws = web.WebSocketResponse()
+            await ws.prepare(request)
+            await ws.send_str('connected')
+            await ws.close()
+            return ws
+
+        app.router.add_get('/api/business', ok)
+        app.router.add_get('/agent/v1/input', ok)
+        app.router.add_post('/agent/v1/test', ok)
+        app.router.add_get('/socket', websocket)
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.store.close()
+        self.tmp.cleanup()
+
+    async def test_http_pages_redirect_before_login_preserving_path_and_query(self):
+        for path in ('/', '/login', '/director?project=a%2Fb&x=1&x=2',
+                     '/if-studio', '/controller/costs', '/auth.js'):
+            for method in ('GET', 'HEAD'):
+                with self.subTest(path=path, method=method):
+                    response = await self.client.request(method, URL(path, encoded=True), allow_redirects=False)
+                    self.assertEqual(response.status, 308)
+                    self.assertEqual(response.headers['Location'], self.target + path)
+                    self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+
+    async def test_redirect_target_does_not_trust_host_or_forwarded_headers(self):
+        response = await self.client.get('/login', headers={
+            'Host': 'evil.test', 'X-Forwarded-Proto': 'https',
+        }, allow_redirects=False)
+        self.assertEqual(response.status, 308)
+        self.assertEqual(response.headers['Location'], self.target + '/login')
+
+    async def test_api_posts_worker_and_websocket_keep_existing_behavior(self):
+        response = await self.client.get('/api/business', headers={'Accept': 'text/html'}, allow_redirects=False)
+        self.assertEqual(response.status, 401)
+        self.assertNotIn('Location', response.headers)
+        self.assertEqual((await self.client.get('/agent/v1/input', allow_redirects=False)).status, 200)
+        self.assertEqual((await self.client.post('/agent/v1/test', allow_redirects=False)).status, 200)
+        response = await self.client.post('/api/auth/login', json={
+            'username': 'admin', 'password': PASSWORD,
+        }, headers={'Origin': str(self.client.make_url('/')).rstrip('/')}, allow_redirects=False)
+        self.assertEqual(response.status, 200)
+        self.assertEqual((await self.client.get('/api/business', allow_redirects=False)).status, 200)
+        async with self.client.ws_connect('/socket') as ws:
+            self.assertEqual((await ws.receive()).data, 'connected')
+        response = await self.client.post('/login', allow_redirects=False)
+        self.assertNotIn(response.status, (301, 302, 303, 307, 308))
+
+    async def test_https_request_does_not_loop(self):
+        request = make_mocked_request('GET', '/login', app=self.client.server.app).clone(scheme='https')
+
+        async def ok(request):
+            return web.Response(text='HTTPS page')
+
+        response = await auth_middleware(request, ok)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.text, 'HTTPS page')
+        self.assertNotIn('Location', response.headers)
 
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):
