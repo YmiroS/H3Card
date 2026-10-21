@@ -58,6 +58,85 @@ test('IF canvas links preserve full IDs and reject unsafe destinations', () => {
   for (const bad of ['', '../bad', 'c_bad/other', 'c_bad?token=x', 'c_bad#fragment', null])
     assert.equal(normalize({canvas_id:bad}), '');
 });
+test('IF manual recovery queries existing jobs only and leaves missing or stale tasks unchanged', async () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const helper = source.slice(source.indexOf('async function restoreIFOutputs('), source.indexOf('function ifTaskKey('));
+  const make = (options = {}) => {
+    const card = {id:'c1', cap:'if_video', job:'j1', if_request_id:'r1', if_started:100,
+      status:'error', error:'协作误标失败', outputs:[]};
+    const calls = [], errors = [], project = {id:'p1', cards:[card]};
+    const ctx = vm.createContext({PROJ:project, canOperate:()=>options.allowed !== false, isIF:()=>true,
+      confirm:()=>options.confirm !== false, el:{panel:{}}, openPanel(){}, paint(){},
+      showError:message=>errors.push(message),
+      ifRequest:async (url, init) => {
+        assert.equal(init, undefined, 'recovery must use GET, not create a run');
+        calls.push(url);
+        if (options.query) return options.query(url, card, ctx);
+        return url.startsWith('/requests/') ? {id:'j1'} : {state:options.state || 'done'};
+      },
+      rememberIFTask:(c,p,phase)=>{calls.push('journal'); assert.equal(phase, 'running'); return true;},
+      saveIFTaskProject:async()=>calls.push('save'),
+      pollIF:async(c,p,job)=>{calls.push('poll:' + job.state); assert.equal(c.status, 'running');},
+    });
+    vm.runInContext(helper, ctx);
+    return {card, calls, errors, ctx, run:()=>ctx.restoreIFOutputs(card)};
+  };
+  for (const state of ['done', 'running', 'starting']) {
+    const t = make({state}); await t.run();
+    assert.deepEqual(t.calls, ['/runs/j1', 'journal', 'save', 'poll:' + state]);
+    assert.equal(t.card.job, 'j1'); assert.equal(t.card.error, null);
+  }
+  const byRequest = make(); byRequest.card.job = null; await byRequest.run();
+  assert.deepEqual(byRequest.calls.slice(0, 2), ['/requests/r1', '/runs/j1']);
+  assert.equal(byRequest.card.job, 'j1');
+  for (const options of [{confirm:false}, {allowed:false}]) {
+    const t = make(options); await t.run(); assert.deepEqual(t.calls, []);
+  }
+  for (const query of [async()=>{throw Object.assign(new Error('任务不存在'), {status:404});},
+    async()=>({state:'error', error:'原任务失败'}), async()=>{throw new TypeError('Failed to fetch');}]) {
+    const t = make({query}); await t.run();
+    assert.deepEqual(t.calls, ['/runs/j1']);
+    assert.equal(t.card.status, 'error'); assert.equal(t.card.error, '协作误标失败');
+    assert.equal(t.errors.length, 1); assert.match(t.errors[0], /未重新提交生成/);
+  }
+  const stale = make({query:async(url, c)=>{c.job = 'new-job'; return {state:'done'};}});
+  await stale.run(); assert.deepEqual(stale.calls, ['/runs/j1']); assert.equal(stale.card.job, 'new-job');
+  let release;
+  const duplicate = make({query:()=>new Promise(resolve=>{release = resolve;})});
+  const pending = duplicate.run(); await duplicate.run();
+  assert.deepEqual(duplicate.calls, ['/runs/j1']);
+  release({state:'done'}); await pending;
+  assert.equal(duplicate.card._ifRestoring, false);
+});
+test('IF recovered outputs survive failed project saves and uploads cannot write into a switched project', async () => {
+  const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
+  const journal = source.slice(source.indexOf('function ifTaskKey('), source.indexOf('function reusableIFURL('));
+  const storage = new Map();
+  const card = {id:'c1', cap:'if_video', job:'j1', if_request_id:'r1', if_started:100,
+    status:'done', outputs:[{url:'/restored.mp4'}]};
+  const ctx = vm.createContext({H3Auth:{user:{id:'u1'}}, isIF:()=>true,
+    sessionStorage:{getItem:k=>storage.get(k) ?? null, setItem:(k,v)=>storage.set(k,v), removeItem:k=>storage.delete(k)},
+    enqueueSave:async()=>({ok:false})});
+  vm.runInContext(journal, ctx);
+  ctx.rememberIFTask(card, 'p1', 'done');
+  await ctx.saveIFTaskProject(card, 'p1');
+  const stale = {...card, status:'error', outputs:[]};
+  assert.equal(ctx.restoreIFTask(stale, 'p1'), true);
+  assert.equal(stale.status, 'done'); assert.equal(stale.outputs[0].url, '/restored.mp4');
+  assert.equal(ctx.restoreIFTask({...card, status:'error', if_started:101}, 'p1'), false);
+  card.status = 'running'; card.outputs = [];
+  ctx.PROJ = {id:'p1', cards:[card]}; ctx.canOperate = ()=>true; ctx.ownsIFTask = ()=>true;
+  ctx.capOf = ()=>({outputType:'video'}); ctx.KIND_ZH = {video:'视频'};
+  ctx.rememberIFReferences = ()=>{}; ctx.ifCanvasURL = ()=>''; ctx.paint = ()=>{};
+  ctx.IF_BRIDGE = 'http://127.0.0.1:19781'; ctx.File = class {};
+  ctx.fetch = async()=>({ok:true, blob:async()=>({})});
+  ctx.uploadAsset = async()=>{ctx.PROJ = {id:'other', cards:[]}; return {url:'/wrong-project.mp4'};};
+  ctx.propagateCardOutputs = ()=>{throw new Error('stale upload must not propagate');};
+  const poll = source.slice(source.indexOf('async function pollIF('), source.indexOf('async function runCard('));
+  vm.runInContext(poll, ctx);
+  await ctx.pollIF(card, 'p1', {state:'done', result:{downloaded:[{type:'video', name:'out.mp4', index:0}]}});
+  assert.equal(card.status, 'running'); assert.deepEqual(card.outputs, []);
+});
 test('IF refresh only resumes tasks recorded by the initiating browser session', async () => {
   const vm = require('node:vm'), source = readFileSync(path.join(web, 'app.js'), 'utf8');
   const journal = source.slice(source.indexOf('function ifTaskKey('), source.indexOf('async function saveIFTaskProject('));
@@ -595,6 +674,21 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
         await page.reload();
         await page.waitForFunction(() => PROJ?.cards[0]?.status === 'done');
         assert.equal(runs.length, 1, 'refresh must poll the original bridge job without resubmitting');
+        await page.waitForFunction(() => !PROJ.cards[0]._ifPolling);
+        await page.evaluate(() => saveChain);
+        project.cards[0] = {...project.cards[0], status:'error', error:'协作者误标失败', outputs:[]};
+        await page.reload();
+        await page.waitForFunction(() => PROJ?.cards[0]?.status === 'error');
+        await page.evaluate(() => pick(PROJ.cards[0].id));
+        assert.equal(await page.evaluate(() => ownsIFTask(PROJ.cards[0], PROJ.id)), false);
+        page.once('dialog', dialog => {
+          assert.match(dialog.message(), /不会重新生成/);
+          dialog.accept();
+        });
+        await page.locator('#panel .if-recover-button').click();
+        await page.waitForFunction(() => PROJ.cards[0].status === 'done' && PROJ.cards[0].outputs.length > 0);
+        assert.equal(runs.length, 1, 'manual recovery must not submit another paid run');
+        assert.equal(await page.locator('#panel .if-recover-button').count(), 0);
       }
     }
     assert.equal(runs.length, 2);
