@@ -365,6 +365,11 @@ test('IF in canvas image and video panels uses local bridge and saves results', 
       await page.goto(origin + '/?project=if-test');
       await page.waitForFunction(() => PROJ?.cards[0]?._el
         && projects.some(item => item.id === PROJ.id && item.permission === PROJ.permission));
+      await page.waitForSelector('#workspace-nav .workspace-links');
+      assert.equal(await page.locator('#workspace-nav a[href="/if-studio"]').count(), 0);
+      assert.equal(await page.locator('#workspace-nav a[aria-label="IF Studio"]').count(), 0);
+      assert.equal(await page.locator('#workspace-nav .workspace-links a[href="/"]').count(), 1);
+      assert.equal(await page.locator('#workspace-nav .workspace-links a[aria-label="导演工作台"]').count(), 1);
       await page.evaluate(() => pick(PROJ.cards[0].id));
       await page.evaluate(async () => linkTo(PROJ.cards[1], PROJ.cards[0]));
       assert.equal(await page.evaluate(() => PROJ.edges.length), 1);

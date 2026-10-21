@@ -18,8 +18,13 @@ ORIGIN = 'http://127.0.0.1:8201'
 SECOND_ORIGIN = 'http://127.0.0.1:8199'
 LOCALHOST_ORIGIN = 'http://localhost:8199'
 SECURE_ORIGIN = 'https://dinghaichouka.youku.com:8443'
-MODELS = [{'display_name': 'qwen-image-2.0', 'type': 'image'},
-          {'display_name': 'Minimax H3', 'type': 'video'}]
+MODELS = [{'display_name': 'qwen-image-2.0', 'type': 'image',
+           'id': 'generate_image_by_qwen_image', 'provider': 'starlink', 'provider_display_name': '星链'},
+          {'display_name': 'Minimax H3', 'type': 'video',
+           'id': 'generate_video_by_minimax_h3', 'provider': 'starlink', 'provider_display_name': '星链'}]
+DIRECT_TOOLS = {m['display_name']: m for m in MODELS}
+DIRECT_TOOLS['Seedance 2.5'] = {'display_name': 'Seedance 2.5', 'type': 'video',
+                               'id': 'generate_video_by_seedance25', 'provider': 'starlink'}
 BUSY_ERROR = ('Error: 发送消息失败: /api/session/send 失败: '
               'map[code:session_busy data:map[session_id:s1] '
               'message:当前会话正在生成中，请等待本轮对话完成后再发送。 '
@@ -122,6 +127,9 @@ class BridgeTest(unittest.TestCase):
         self.thread = threading.Thread(target=self.bridge.serve_forever, daemon=True)
         self.thread.start()
 
+    def generate(self, job_id, request, asset_paths=None):
+        self.bridge.generate(job_id, {**request, '_model_tool': DIRECT_TOOLS[request['model']]}, asset_paths)
+
     def tearDown(self):
         self.bridge.shutdown()
         self.thread.join(timeout=3)
@@ -167,7 +175,8 @@ class BridgeTest(unittest.TestCase):
         with mock.patch.object(self.bridge, 'command', return_value=MODELS):
             code, _, body = self.request('GET', '/models')
             self.assertEqual((code, body['models']), (200, [
-                {**m, 'quota_status': 'unknown', 'remaining': None} for m in MODELS]))
+                {'display_name': m['display_name'], 'type': m['type'],
+                 'quota_status': 'unknown', 'remaining': None} for m in MODELS]))
             for data in ({'type': 'video', 'model': 'qwen-image-2.0', 'prompt': 'hello'},
                          {'type': 'image', 'model': 'qwen-image-2.0', 'prompt': 'hello',
                           'image': 'file:///private/secret'},
@@ -192,8 +201,8 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(code, 200)
             self.assertEqual(headers['Cache-Control'], 'no-store')
             self.assertEqual(body['models'], [
-                {**MODELS[0], 'quota_status': 'limited', 'remaining': 99},
-                {**MODELS[1], 'quota_status': 'unavailable', 'remaining': 0}])
+                {'display_name': MODELS[0]['display_name'], 'type': 'image', 'quota_status': 'limited', 'remaining': 99},
+                {'display_name': MODELS[1]['display_name'], 'type': 'video', 'quota_status': 'unavailable', 'remaining': 0}])
 
     def test_unavailable_or_exhausted_model_is_rejected_before_generation(self):
         for quota, message in (({}, '未开通'), ({'total_count': 30, 'usage_count': 30}, '免费次数已用完')):
@@ -211,6 +220,48 @@ class BridgeTest(unittest.TestCase):
                 generate.assert_not_called()
                 self.assertFalse(self.bridge.jobs)
                 self.assertFalse(self.bridge.requests)
+
+    def test_exact_tool_list_uses_live_catalog_not_browser_metadata(self):
+        for original in MODELS:
+            tool = {**original, 'id': 'live_' + original['type'], 'provider': 'live_provider',
+                    'description': '完整模型对象', 'is_free': True, 'extra': {'version': 2}}
+            calls = []
+
+            def command(*args, **_):
+                calls.append(args)
+                if args[0] == 'models':
+                    return [{**tool, 'display_name': tool['display_name'] + ' Pro'}, tool]
+                if args[:2] == ('canvas', 'run'):
+                    return {'status': 'created', 'canvas_id': 'c_exact', 'session_id': 's_exact'}
+                return {'status': 'done', 'downloaded': []}
+
+            with self.subTest(kind=tool['type']), mock.patch.object(self.bridge, 'command', side_effect=command):
+                code, _, body = self.run_request(type=tool['type'], model=tool['display_name'],
+                                                 _model_tool={'id': 'browser_override', 'provider': 'wrong'})
+                self.assertEqual(code, 400)
+                self.assertEqual(calls, [])
+                code, _, body = self.run_request(type=tool['type'], model=tool['display_name'])
+                self.assertEqual(code, 202)
+                for _ in range(100):
+                    _, _, job = self.request('GET', '/runs/' + body['id'])
+                    if job['state'] in ('done', 'error'):
+                        break
+                    time.sleep(.01)
+                self.assertEqual(job['state'], 'done')
+                runs = [args for args in calls if args[:2] == ('canvas', 'run')]
+                self.assertEqual(len(runs), 1)
+                self.assertNotIn('--model', runs[0])
+                self.assertEqual(json.loads(runs[0][runs[0].index('--tool-list') + 1]), [tool])
+                self.assertEqual(sum(args[0] == 'models' for args in calls), 1)
+
+    def test_missing_or_ambiguous_tool_identity_does_not_generate(self):
+        for tools in ([{**MODELS[0], 'id': None}], [{**MODELS[0], 'provider': ''}], [MODELS[0], MODELS[0]]):
+            with self.subTest(tools=tools), mock.patch.object(self.bridge, 'command', return_value=tools), \
+                    mock.patch.object(self.bridge, 'generate') as generate:
+                code, _, _ = self.run_request()
+                self.assertIn(code, (400, 503))
+                generate.assert_not_called()
+                self.assertFalse(self.bridge.jobs)
 
     def test_create_poll_and_media(self):
         def command(*args, **_):
@@ -262,7 +313,7 @@ class BridgeTest(unittest.TestCase):
         completed = {'status': 'done', 'media': [{'type': 'video', 'url': 'https://media.example/video.mp4'}]}
         with mock.patch.object(self.bridge, 'command', side_effect=[created, background, finished_notice, completed]) as cli, \
                 mock.patch('if_studio_bridge.time.sleep') as pause:
-            self.bridge.generate('video-test', {'model': 'Minimax H3', 'prompt': '蓝色圆形'})
+            self.generate('video-test', {'model': 'Minimax H3', 'prompt': '蓝色圆形'})
         self.assertEqual(self.bridge.jobs['video-test']['result']['status'], 'done')
         self.assertEqual([call.args[:2] for call in cli.call_args_list].count(('canvas', 'run')), 1)
         self.assertEqual([call.args[:2] for call in cli.call_args_list].count(('canvas', 'poll')), 3)
@@ -273,7 +324,7 @@ class BridgeTest(unittest.TestCase):
                    'canvas_url': 'https://ifs.alibaba-inc.com/#/canvas/c_OcBXJf2Bd0CxY-'}
         with mock.patch.object(self.bridge, 'command', side_effect=[
                 created, {'status': 'failed', 'message': 'IFS 不接受此引用组合'}]):
-            self.bridge.generate('failed-video', {'model': 'Minimax H3', 'prompt': '生成视频'})
+            self.generate('failed-video', {'model': 'Minimax H3', 'prompt': '生成视频'})
         self.assertEqual(self.bridge.jobs['failed-video']['state'], 'error')
         self.assertIn('IFS 不接受此引用组合', self.bridge.jobs['failed-video']['error'])
         result = self.bridge.jobs['failed-video']['result']
@@ -287,14 +338,14 @@ class BridgeTest(unittest.TestCase):
                                                ('no-media', {'status': 'done'}, 'done')]:
             with self.subTest(name=name), mock.patch.object(self.bridge, 'command', side_effect=[
                     {'status': 'created', 'canvas_id': canvas_id, 'session_id': 's1'}, outcome]):
-                self.bridge.generate(name, {'model': 'Minimax H3', 'prompt': '生成视频'})
+                self.generate(name, {'model': 'Minimax H3', 'prompt': '生成视频'})
             job = self.bridge.jobs[name]
             self.assertEqual(job['state'], expected_state)
             self.assertEqual(job['result']['canvas_id'], canvas_id)
 
     def test_failure_before_canvas_creation_has_no_canvas_link(self):
         with mock.patch.object(self.bridge, 'command', side_effect=RuntimeError('尚未创建')):
-            self.bridge.generate('not-created', {'model': 'Minimax H3', 'prompt': '生成视频'})
+            self.generate('not-created', {'model': 'Minimax H3', 'prompt': '生成视频'})
         self.assertEqual(self.bridge.jobs['not-created']['state'], 'error')
         self.assertNotIn('canvas_id', self.bridge.jobs['not-created']['result'])
         self.assertNotIn('canvas_url', self.bridge.jobs['not-created']['result'])
@@ -460,7 +511,8 @@ class BridgeTest(unittest.TestCase):
                 if args[:2] == ('canvas', 'run'):
                     self.assertNotIn('--image', args)
                     self.assertEqual(args[-1], '图片1：https://example.com/uploaded.png\n\n使用模型：qwen-image-2.0\n\n生成需求：\ngenerate')
-                    self.assertEqual(args[args.index('--model') + 1], 'qwen-image-2.0')
+                    self.assertNotIn('--model', args)
+                    self.assertEqual(json.loads(args[args.index('--tool-list') + 1]), [MODELS[0]])
                     self.assertEqual(job['result']['submitted_prompt'], args[-1])
                     return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
                 return {'status': 'done', 'downloaded': []}
@@ -498,11 +550,12 @@ class BridgeTest(unittest.TestCase):
         for kind, model in [('image', 'qwen-image-2.0'), ('video', 'Seedance 2.5')]:
             with self.subTest(kind=kind), mock.patch.object(self.bridge, 'command', side_effect=[
                     {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}, {'status': 'done'}]) as cli:
-                self.bridge.generate('model-' + kind, {'type': kind, 'model': model, 'prompt': '直接生成文件'})
+                self.generate('model-' + kind, {'type': kind, 'model': model, 'prompt': '直接生成文件'})
                 prompt = f'使用模型：{model}\n\n生成需求：\n直接生成文件'
                 self.assertEqual(cli.call_args_list[0].args[-1], prompt)
                 args = cli.call_args_list[0].args
-                self.assertEqual(args[args.index('--model') + 1], model)
+                self.assertNotIn('--model', args)
+                self.assertEqual(json.loads(args[args.index('--tool-list') + 1]), [DIRECT_TOOLS[model]])
                 self.assertEqual(self.bridge.jobs['model-' + kind]['result']['submitted_prompt'], prompt)
 
     def test_uploaded_and_direct_cdn_references_are_checked_and_encoded_before_single_run(self):
@@ -516,7 +569,7 @@ class BridgeTest(unittest.TestCase):
                     {'url': original}, {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'},
                     {'status': 'done', 'downloaded': []}]) as cli:
             build.return_value.open.return_value = response
-            self.bridge.generate('encoded-reference', {'model': 'Minimax H3', 'type': 'video',
+            self.generate('encoded-reference', {'model': 'Minimax H3', 'type': 'video',
                 'prompt': '使用全部引用', 'image': original}, [path])
         job = self.bridge.jobs['encoded-reference']
         self.assertEqual(job['state'], 'done')
@@ -536,7 +589,7 @@ class BridgeTest(unittest.TestCase):
         with mock.patch.object(self.bridge, 'command', return_value={'url': url}) as cli, \
                 mock.patch('if_studio_bridge.build_opener') as build:
             build.return_value.open.side_effect = HTTPError(url, 404, 'NoSuchKey', {}, None)
-            self.bridge.generate('missing-reference', {'model': 'Minimax H3', 'prompt': 'test'}, paths)
+            self.generate('missing-reference', {'model': 'Minimax H3', 'prompt': 'test'}, paths)
         job = self.bridge.jobs['missing-reference']
         self.assertEqual(job['state'], 'error')
         self.assertIn('图片1', job['error'])
@@ -564,7 +617,7 @@ class BridgeTest(unittest.TestCase):
             return {'status': 'done', 'downloaded': []}
         with mock.patch.object(self.bridge, 'command', side_effect=command) as cli, \
                 mock.patch('if_studio_bridge.prepare_if_reference', side_effect=lambda value: value):
-            self.bridge.generate('reuse', {'model': 'Minimax H3', 'prompt': 'test', 'references': refs}, [path])
+            self.generate('reuse', {'model': 'Minimax H3', 'prompt': 'test', 'references': refs}, [path])
         job = self.bridge.jobs['reuse']
         self.assertEqual(job['state'], 'done')
         self.assertEqual(job['result']['submitted_prompt'],
@@ -576,7 +629,7 @@ class BridgeTest(unittest.TestCase):
         with mock.patch.object(self.bridge, 'command', side_effect=[
                 {'status': 'created', 'canvas_id': 'c2', 'session_id': 's2'}, {'status': 'done'}]) as cli, \
                 mock.patch('if_studio_bridge.prepare_if_reference', side_effect=lambda value: value):
-            self.bridge.generate('reuse-all', {'model': 'Minimax H3', 'prompt': 'new prompt', 'references': refs})
+            self.generate('reuse-all', {'model': 'Minimax H3', 'prompt': 'new prompt', 'references': refs})
         self.assertEqual(self.bridge.jobs['reuse-all']['state'], 'done')
         self.assertEqual([call.args[:2] for call in cli.call_args_list], [('canvas', 'run'), ('canvas', 'poll')])
 
@@ -588,7 +641,7 @@ class BridgeTest(unittest.TestCase):
         refs = [{'kind': 'image', 'asset_id': letter * 32} for letter in ('a', 'b')]
         with mock.patch.object(self.bridge, 'command', side_effect=[{'url': url}, RuntimeError('upload failed')]) as cli, \
                 mock.patch('if_studio_bridge.prepare_if_reference', side_effect=lambda value: value):
-            self.bridge.generate('partial', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs}, paths)
+            self.generate('partial', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs}, paths)
         result = self.bridge.jobs['partial']['result']
         self.assertEqual(result['reference_urls'], [{'index': 0, 'kind': 'image', 'url': url}])
         self.assertTrue(all(not path.exists() for path in paths))
@@ -596,12 +649,12 @@ class BridgeTest(unittest.TestCase):
         refs = [{'kind': 'image', 'url': url}]
         with mock.patch.object(self.bridge, 'command') as cli, \
                 mock.patch('if_studio_bridge.prepare_if_reference', side_effect=RuntimeError('HTTP 404，尚未提交生成')):
-            self.bridge.generate('expired', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs})
+            self.generate('expired', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs})
         self.assertEqual(self.bridge.jobs['expired']['result']['invalid_reference_indices'], [0])
         cli.assert_not_called()
         with mock.patch.object(self.bridge, 'command', side_effect=RuntimeError('generation failed')), \
                 mock.patch('if_studio_bridge.prepare_if_reference', return_value=url):
-            self.bridge.generate('failed-after-upload', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs})
+            self.generate('failed-after-upload', {'model': 'qwen-image-2.0', 'prompt': 'test', 'references': refs})
         self.assertEqual(self.bridge.jobs['failed-after-upload']['result']['reference_urls'], result['reference_urls'])
 
     def test_mixed_reference_api_enforces_limits_kinds_and_cdn_origin(self):
@@ -657,7 +710,8 @@ class BridgeTest(unittest.TestCase):
                 if args[:2] == ('canvas', 'run'):
                     self.assertNotIn('--image', args)
                     self.assertEqual(args[-1], '视频1：https://example.com/uploaded.mp4\n\n使用模型：Minimax H3\n\n生成需求：\ngenerate')
-                    self.assertEqual(args[args.index('--model') + 1], 'Minimax H3')
+                    self.assertNotIn('--model', args)
+                    self.assertEqual(json.loads(args[args.index('--tool-list') + 1]), [MODELS[1]])
                     return {'status': 'created', 'canvas_id': 'c1', 'session_id': 's1'}
                 return {'status': 'done', 'downloaded': []}
 
@@ -730,8 +784,8 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(self.run_request(image='https://example.com/ref.png')[0], 400)
 
     def test_https_reference_obeys_shared_model_limits(self):
-        models = MODELS + [{'display_name': 'z-image-turbo', 'type': 'image'},
-                           {'display_name': 'Unknown Model', 'type': 'image'}]
+        models = MODELS + [{'display_name': name, 'type': 'image', 'id': 'test_image_' + str(i), 'provider': 'test'}
+                           for i, name in enumerate(('z-image-turbo', 'Unknown Model'))]
         with mock.patch.object(self.bridge, 'command', return_value=models), \
                 mock.patch('if_studio_bridge.LIMITS_FILE') as limits:
             limits.read_text.return_value = json.dumps({
@@ -799,7 +853,8 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(len(runs), 1)
         self.assertIn('--create-only', runs[0])
         self.assertNotIn('--image', runs[0])
-        self.assertEqual(runs[0][runs[0].index('--model') + 1], 'qwen-image-2.0')
+        self.assertNotIn('--model', runs[0])
+        self.assertEqual(json.loads(runs[0][runs[0].index('--tool-list') + 1]), [MODELS[0]])
         expected = (f'图片1：https://example.com/{paths[0].name}\n'
                     f'图片2：https://example.com/{paths[1].name}\n'
                     '图片3：https://example.com/third.png\n\n使用模型：qwen-image-2.0\n\n生成需求：\ngenerate')
@@ -864,7 +919,8 @@ class BridgeTest(unittest.TestCase):
         self.assertEqual(runs[0][-1], expected)
         self.assertEqual(job['result']['submitted_prompt'], expected)
         self.assertEqual(runs[0][runs[0].index('--skill') + 1], '商品展示')
-        self.assertEqual(runs[0][runs[0].index('--model') + 1], 'Minimax H3')
+        self.assertNotIn('--model', runs[0])
+        self.assertEqual(json.loads(runs[0][runs[0].index('--tool-list') + 1]), [MODELS[1]])
         self.assertEqual(expected.count('使用模型：Minimax H3'), 1)
         self.assertIn('--create-only', runs[0])
         self.assertEqual(calls[-1][:2], ('canvas', 'poll'))
@@ -920,7 +976,7 @@ class BridgeTest(unittest.TestCase):
 
                 with mock.patch('if_studio_bridge.subprocess.run', side_effect=process), \
                         mock.patch('if_studio_bridge.time.sleep', side_effect=release_previous_round) as pause:
-                    self.bridge.generate(job_id, {'type': kind, 'model': model, 'prompt': '最终需求',
+                    self.generate(job_id, {'type': kind, 'model': model, 'prompt': '最终需求',
                         'canvas_id': 'c1', 'session_id': 's1'}, paths)
                 self.assertEqual(self.bridge.jobs[job_id]['state'], 'done')
                 self.assertEqual(uploads, list(map(str, paths)))
@@ -938,7 +994,7 @@ class BridgeTest(unittest.TestCase):
         busy = mock.Mock(returncode=1, stdout='', stderr=BUSY_ERROR + ' token=hidden-secret')
         with mock.patch('if_studio_bridge.subprocess.run', side_effect=[busy] * 21) as cli, \
                 mock.patch('if_studio_bridge.time.sleep') as pause:
-            self.bridge.generate('busy-limit', {'type': 'image', 'model': 'qwen-image-2.0',
+            self.generate('busy-limit', {'type': 'image', 'model': 'qwen-image-2.0',
                 'prompt': '最终需求', 'image': 'https://example.com/ref.png', 'canvas_id': 'c1', 'session_id': 's1'})
         self.assertEqual(pause.call_count, 20)
         self.assertTrue(all(call.args == (15,) for call in pause.call_args_list))
@@ -958,7 +1014,7 @@ class BridgeTest(unittest.TestCase):
             with self.subTest(failure=failure):
                 with mock.patch('if_studio_bridge.subprocess.run', side_effect=[failure]) as cli, \
                         mock.patch('if_studio_bridge.time.sleep') as pause:
-                    self.bridge.generate('ambiguous', {'type': 'image', 'model': 'qwen-image-2.0',
+                    self.generate('ambiguous', {'type': 'image', 'model': 'qwen-image-2.0',
                         'prompt': '最终需求', 'canvas_id': 'c1', 'session_id': 's1'})
                 self.assertEqual(self.bridge.jobs['ambiguous']['state'], 'error')
                 self.assertEqual(cli.call_count, 1)
@@ -968,7 +1024,7 @@ class BridgeTest(unittest.TestCase):
         with mock.patch('if_studio_bridge.subprocess.run', return_value=mock.Mock(
                 returncode=1, stdout='', stderr=BUSY_ERROR)) as cli, \
                 mock.patch('if_studio_bridge.time.sleep') as pause:
-            self.bridge.generate('unknown-session', {'model': 'qwen-image-2.0', 'prompt': '需求'})
+            self.generate('unknown-session', {'model': 'qwen-image-2.0', 'prompt': '需求'})
             self.assertEqual(self.bridge.jobs['unknown-session']['state'], 'error')
             self.assertEqual(cli.call_count, 1)
             pause.assert_not_called()
@@ -1013,7 +1069,7 @@ class BridgeTest(unittest.TestCase):
                 for path in paths:
                     path.write_bytes(b'fake-image')
                 with mock.patch.object(self.bridge, 'command', return_value=result) as cli:
-                    self.bridge.generate('upload-error', {'type': 'video', 'model': 'Minimax H3',
+                    self.generate('upload-error', {'type': 'video', 'model': 'Minimax H3',
                                                          'prompt': '生成视频'}, paths)
                 self.assertEqual(self.bridge.jobs['upload-error']['state'], 'error')
                 self.assertNotIn('upload-secret', self.bridge.jobs['upload-error']['error'])
@@ -1024,7 +1080,7 @@ class BridgeTest(unittest.TestCase):
     def test_video_final_prompt_failure_does_not_poll(self):
         with mock.patch.object(self.bridge, 'command', return_value={
                 'status': 'failed', 'error': 'IFS 拒绝总需求'}) as cli:
-            self.bridge.generate('final-error', {'type': 'video', 'model': 'Minimax H3',
+            self.generate('final-error', {'type': 'video', 'model': 'Minimax H3',
                 'prompt': '生成视频', 'image': 'https://example.com/ref.png',
                 'canvas_id': 'existing-c', 'session_id': 'existing-s'})
         self.assertEqual(self.bridge.jobs['final-error']['state'], 'error')
@@ -1042,7 +1098,7 @@ class BridgeTest(unittest.TestCase):
         finished = {'status': 'done', 'downloaded': []}
         with mock.patch.object(self.bridge, 'command', side_effect=[created, background, finished]) as cli, \
                 mock.patch('if_studio_bridge.time.sleep') as pause:
-            self.bridge.generate('single-run', {'type': 'video', 'model': 'Minimax H3',
+            self.generate('single-run', {'type': 'video', 'model': 'Minimax H3',
                 'prompt': '生成视频', 'image': 'https://example.com/ref.png'})
         self.assertEqual([call.args[:2] for call in cli.call_args_list],
                          [('canvas', 'run'), ('canvas', 'poll'), ('canvas', 'poll')])
@@ -1054,7 +1110,7 @@ class BridgeTest(unittest.TestCase):
         background = {'status': 'summary_feedback', 'planning_text': '后台处理中'}
         with mock.patch.object(self.bridge, 'command', side_effect=[created, background]) as cli, \
                 mock.patch('if_studio_bridge.time.monotonic', side_effect=[0, 901]):
-            self.bridge.generate('poll-timeout', {'type': 'video', 'model': 'Minimax H3', 'prompt': '生成视频'})
+            self.generate('poll-timeout', {'type': 'video', 'model': 'Minimax H3', 'prompt': '生成视频'})
         self.assertEqual(cli.call_count, 2)
         self.assertEqual(self.bridge.jobs['poll-timeout']['state'], 'error')
         self.assertIn('未重新提交生成', self.bridge.jobs['poll-timeout']['error'])
@@ -1063,7 +1119,7 @@ class BridgeTest(unittest.TestCase):
     def test_structured_cli_errors_redact_credentials(self):
         with mock.patch.object(self.bridge, 'command', return_value={
                 'status': 'failed', 'error': '引用失败 {"token":"json-secret"} https://example.com/ref.png?key=url-secret'}):
-            self.bridge.generate('redaction', {'type': 'video', 'model': 'Minimax H3',
+            self.generate('redaction', {'type': 'video', 'model': 'Minimax H3',
                                              'prompt': '生成视频', 'image': 'https://example.com/ref.png'})
         error = self.bridge.jobs['redaction']['error']
         self.assertIn('引用失败', error)
@@ -1071,7 +1127,8 @@ class BridgeTest(unittest.TestCase):
         self.assertNotIn('url-secret', error)
 
     def test_fallback_rejects_video_references_above_each_kind_limit(self):
-        models = MODELS + [{'display_name': '星辰图生视频', 'type': 'video'}]
+        models = MODELS + [{'display_name': '星辰图生视频', 'type': 'video',
+                            'id': 'generate_video_by_star', 'provider': 'starlink'}]
         image = b'\x89PNG\r\n\x1a\n' + b'0' * 32
         video = b'\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isomiso2'
         images = [self.upload(image, 'image/png')[2]['asset_id'] for _ in range(7)]
@@ -1089,7 +1146,8 @@ class BridgeTest(unittest.TestCase):
                  ('New IF Image', 'image', 3), ('星辰图生视频', 'video', 6),
                  ('可灵3.0 Omni', 'video', 4), ('HappyHorse-1.1视频', 'video', 9),
                  ('HappyHorse-1.0视频【内测】', 'video', 9), ('New IF Video', 'video', 6)]
-        models = MODELS + [{'display_name': name, 'type': kind} for name, kind, _ in cases]
+        models = MODELS + [{'display_name': name, 'type': kind, 'id': 'test_tool_' + str(i), 'provider': 'test'}
+                           for i, (name, kind, _) in enumerate(cases)]
         images = [{'kind': 'image', 'url': f'https://ant.alicdn.com/bio/img/f_test_{i}.png'}
                   for i in range(11)]
         videos = [{'kind': 'video', 'url': f'https://ant.alicdn.com/bio/img/f_test_{i}.mp4'}
@@ -1117,8 +1175,8 @@ class BridgeTest(unittest.TestCase):
             self.assertEqual(self.run_request(model='Not in CLI', references=images[:1])[0], 400)
 
     def test_unverified_video_models_allow_one_image_or_video_reference(self):
-        models = MODELS + [{'display_name': name, 'type': 'video'}
-                           for name in ('星辰图生视频', '可灵3.0 Omni')]
+        models = MODELS + [{'display_name': name, 'type': 'video', 'id': 'test_video_' + str(i), 'provider': 'test'}
+                           for i, name in enumerate(('星辰图生视频', '可灵3.0 Omni'))]
 
         def finish(job_id, _request, asset_paths):
             for path in asset_paths:
