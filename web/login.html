@@ -136,7 +136,7 @@
       registerError.textContent = '';
     });
 
-    H3Auth.me().then(() => location.replace('/')).catch(error => {
+    H3Auth.me().then(user => location.replace(user.role === 'monitor' ? '/monitor' : '/')).catch(error => {
       ready = true;
       loginButton.disabled = false;
       registerButton.disabled = false;
@@ -157,9 +157,9 @@
       loginError.textContent = '';
       setSubmitting(loginForm, true);
       try {
-        await H3Auth.login(username, password);
+        const user = await H3Auth.login(username, password);
         loginForm.reset();
-        location.replace('/');
+        location.replace(user.role === 'monitor' ? '/monitor' : '/');
       } catch (error) {
         loginError.textContent = error.status ? error.message : '网络连接异常，请检查网络后重试。';
         H3Notify.error(loginError.textContent);

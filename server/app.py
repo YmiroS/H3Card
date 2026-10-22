@@ -63,6 +63,7 @@ from server.edit_api import register_edit_routes
 from server.image_controls import image_controls, patch_image_controls
 from server.director_bridge import import_director, link_director, project_director, reference_storyboard, sync_card_job
 from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
+from server.monitor import register_monitor_routes
 from server.project_repository import ProjectRepository, InvalidProjectId
 from server.project_service import ProjectService, ProjectError
 from server.routes import (register_page_routes, register_project_routes, register_media_routes,
@@ -3492,6 +3493,23 @@ async def api_costs(request):
     return web.json_response(ledger.report(start, end, limit))
 
 
+def monitor_jobs_snapshot():
+    # 在事件循环内复制任务顶层，避免后台投影遍历正在变化的 JOBS。
+    return tuple(dict(job) for job in JOBS.values())
+
+
+def monitor_health_snapshot(app, workers):
+    # 由监控模块在线程池调用；不重复扫描 Worker，服务配置由投影层筛选。
+    return {
+        "ok": True, "mode": EXECUTION_MODE,
+        "server_time": time.time(), "started_at": STARTED_AT,
+        "sandbox": app.get("admin_sandbox", False),
+        "capabilities": len(CAPS), "jobs": len(JOBS),
+        "comfy_online": controller_comfy_online(app, workers),
+        "llm": llm.where(),
+    }
+
+
 async def api_health(request):
     user = require_user(request)
     workers = distributed_store(request.app).list_workers() if CONTROLLER_MODE else []
@@ -3677,6 +3695,9 @@ def make_app(auth_path=None, *, project_repository=None):
         app["costs"] = CostLedger(database_path, ROOT / "pricing.json")
         app["costs"].backfill(JOBS.values())
     app.on_response_prepare.append(no_cache)
+    register_monitor_routes(
+        app, web_root=ROOT / "web", get_jobs=monitor_jobs_snapshot,
+        get_health=monitor_health_snapshot)
     register_page_routes(
         app, index=index, director_index=director_index, if_studio_index=if_studio_index,
         controller_index=controller_index, controller_costs=controller_costs,

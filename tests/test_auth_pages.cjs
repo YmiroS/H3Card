@@ -10,6 +10,11 @@ const web = path.join(__dirname, '..', 'web');
 const browserOptions = process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {};
 const staticFiles = new Map([
   ['/login', ['login.html', 'text/html; charset=utf-8']],
+  ['/login.html', ['login.html', 'text/html; charset=utf-8']],
+  ['/admin/permissions', ['permissions.html', 'text/html; charset=utf-8']],
+  ['/admin-shell.js', ['admin-shell.js', 'text/javascript; charset=utf-8']],
+  ['/admin-shell.css', ['admin-shell.css', 'text/css; charset=utf-8']],
+  ['/icon.png', ['icon.png', 'image/png']],
   ['/auth.js', ['auth.js', 'text/javascript; charset=utf-8']],
   ['/auth-page.css', ['auth-page.css', 'text/css; charset=utf-8']],
   ['/auth-art.webp', ['auth-art.webp', 'image/webp']],
@@ -20,6 +25,9 @@ const apiMethods = new Map([
   ['/api/auth/me', 'GET'], ['/api/auth/login', 'POST'], ['/api/auth/register', 'POST'],
   ['/api/auth/presence', 'POST'], ['/api/health', 'GET'],
   ['/api/auth/phone', 'POST'], ['/api/auth/logout', 'POST'],
+  ['/api/monitor/summary', 'GET'],
+  ['/api/admin/users', 'GET,POST'], ['/api/admin/users/fixture-user', 'PATCH'],
+  ['/api/admin/grants', 'GET'], ['/api/admin/registrations', 'GET'], ['/api/projects', 'GET'],
 ]);
 const session = {user:{id:'fixture-user', username:'fixture-account', role:'user'}, csrf_token:'fixture-csrf'};
 const registration = {username:'fixture-account', display_name:'测试花名', phone:'13800138000', password:'月光落在山间2026'};
@@ -65,7 +73,7 @@ async function withFixture(options, run) {
     pendingResponses.add(res);
     res.on('close', () => pendingResponses.delete(res));
     void (async () => {
-      if (apiMethods.has(req.url) && apiMethods.get(req.url) === req.method) {
+      if (apiMethods.has(req.url) && apiMethods.get(req.url).split(',').includes(req.method)) {
         const chunks = [];
         for await (const chunk of req) chunks.push(chunk);
         const raw = Buffer.concat(chunks).toString();
@@ -98,6 +106,12 @@ async function withFixture(options, run) {
         const [file, type] = staticFiles.get(req.url);
         res.writeHead(200, {'Content-Type':type, 'Cache-Control':'no-store'});
         res.end(readFileSync(path.join(web, file)));
+        return;
+      }
+      if (req.method === 'GET' && req.url === '/monitor') {
+        res.writeHead(200, {'Content-Type':'text/html; charset=utf-8'});
+        // 只装配共享认证组件，不代替正式监控页。
+        res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="/auth-logo.png"><div id="account"></div><script src="/auth.js"></script><script>H3Auth.requireUser(false).then(user => { if (user.role !== "monitor") throw new Error("角色不符"); H3Auth.mountAccount(document.getElementById("account")); document.body.dataset.ready = "true"; }).catch(() => {});</script>');
         return;
       }
       if (req.method === 'GET' && req.url === '/') {
@@ -140,7 +154,7 @@ async function withFixture(options, run) {
     });
     page.on('dialog', async dialog => { dialogs.push(dialog.message()); await dialog.dismiss(); });
     const fixture = {page, origin, requests, handlers};
-    await page.goto(`${origin}/login`);
+    await page.goto(origin + (options.startPath || '/login'));
     await run(fixture);
     assert.deepEqual(pageErrors, [], '页面不得产生未捕获异常');
     assert.deepEqual(dialogs, [], '页面不得触发脚本弹窗');
@@ -207,6 +221,124 @@ async function expectEnabled(page) {
 async function settleUI(page) {
   await page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 }
+
+const monitorSession = {...session, user:{...session.user, role:'monitor', phone:'', enabled:true}};
+
+async function expectMonitor(fixture) {
+  const {page, origin, requests} = fixture;
+  await page.waitForURL(origin + '/monitor');
+  await page.waitForFunction(() => document.body.dataset.ready === 'true');
+  assert.match(await page.locator('#account').textContent(), /监控展示员/);
+  assert.equal(await page.locator('#phone-dialog, #workspace-nav a, #account a').count(), 0);
+  assert.deepEqual(await page.locator('#account button').allTextContents(), ['退出登录']);
+  await page.evaluate(async () => { document.dispatchEvent(new Event('visibilitychange')); await H3Auth.me(); });
+  await settleUI(page);
+  assert.deepEqual(requests.filter(r => !['/api/auth/me', '/api/auth/login'].includes(r.url)), [], '监控认证不能请求 presence、health、phone 等业务接口');
+}
+
+test('monitor 使用真实登录脚本落到监控，不补手机号、不调用业务轮询，退出携带 CSRF', async () => {
+  let loggedIn = false;
+  await withFixture({handlers:{
+    '/api/auth/me': () => loggedIn ? {body:monitorSession} : unauthorized,
+    '/api/auth/login': () => { loggedIn = true; return {body:monitorSession}; },
+    '/api/auth/logout': request => {
+      assert.equal(request.headers['x-csrf-token'], monitorSession.csrf_token);
+      loggedIn = false; return {body:{ok:true}};
+    },
+  }}, async fixture => {
+    const {page} = fixture;
+    await ready(page);
+    await page.locator(field('login', 'username')).fill('screen');
+    await page.locator(field('login', 'password')).fill(registration.password);
+    await page.locator(loginSubmit).click();
+    await expectMonitor(fixture);
+    await page.getByRole('button', {name:'退出登录', exact:true}).click();
+    await page.waitForURL(fixture.origin + '/login');
+    await ready(page);
+  });
+});
+
+for (const startPath of ['/login', '/login.html']) {
+  test(`已登录 monitor 访问 ${startPath} 直接进入监控`, async () => {
+    await withFixture({startPath, handlers:{'/api/auth/me': () => ({body:monitorSession})}}, expectMonitor);
+  });
+}
+
+test('monitor 请求403仍抛状态并通知页面，401清理全局会话后回登录', async () => {
+  let expired = false;
+  await withFixture({handlers:{
+    '/api/auth/me': () => expired ? unauthorized : {body:monitorSession},
+    '/api/monitor/summary': () => expired ? unauthorized : {status:403, body:{error:'监控权限已变化'}},
+  }}, async fixture => {
+    const {page} = fixture;
+    await expectMonitor(fixture);
+    const denied = await page.evaluate(async () => {
+      let detail;
+      window.addEventListener('h3auth:denied', event => { detail = event.detail; }, {once:true});
+      try { await H3Auth.request('/api/monitor/summary'); }
+      catch (error) { return {status:error.status, message:error.message, path:detail.path}; }
+    });
+    assert.deepEqual(denied, {status:403, message:'监控权限已变化', path:'/api/monitor/summary'});
+    expired = true;
+    await page.evaluate(() => {
+      window.addEventListener('h3auth:expired', () => {
+        sessionStorage.setItem('test-expired', String(H3Auth.user === null && !H3Auth.active));
+      }, {once:true});
+      H3Auth.request('/api/monitor/summary').catch(() => {});
+    });
+    await page.waitForURL(fixture.origin + '/login');
+    await ready(page);
+    assert.equal(await page.evaluate(() => sessionStorage.getItem('test-expired')), 'true');
+  });
+});
+
+test('管理员账号页能创建和修改监控角色，中文展示且不提供组长与画布授权入口', async () => {
+  const users = [{...monitorSession.user, role:'user', approval_status:'approved', team_leader:true}];
+  const mutations = [];
+  await withFixture({startPath:'/admin/permissions', handlers:{
+    '/api/auth/me': () => ({body:{...session, user:{...session.user, id:'admin', role:'admin', phone:'13800138000'}}}),
+    '/api/admin/users': request => {
+      if (request.method === 'GET') return {body:{users}};
+      mutations.push(request);
+      users.push({...request.body, id:'new-monitor', enabled:true, approval_status:'approved'});
+      return {status:201, body:{user:users.at(-1)}};
+    },
+    '/api/admin/users/fixture-user': request => {
+      mutations.push(request); Object.assign(users[0], request.body, {team_leader:false});
+      return {body:{user:users[0]}};
+    },
+    '/api/admin/grants': () => ({body:{grants:[]}}),
+    '/api/admin/registrations': () => ({body:{requests:[], outbox:{pending:0}}}),
+    '/api/projects': () => ({body:{projects:[]}}),
+  }}, async ({page}) => {
+    await page.waitForFunction(() => !document.getElementById('create-user').disabled);
+    await page.getByRole('button', {name:'新建账号', exact:true}).click();
+    await page.locator('#create input[name=username]').fill('screen');
+    await page.locator('#create input[name=password]').fill(registration.password);
+    await page.locator('#create input[name=team_leader]').check();
+    await page.locator('#create select[name=role]').selectOption('monitor');
+    assert.equal(await page.locator('#create input[name=team_leader]').isChecked(), false);
+    assert.equal(await page.locator('#create input[name=team_leader]').isDisabled(), true);
+    await page.getByRole('button', {name:'创建账号', exact:true}).click();
+    await page.waitForFunction(() => document.querySelectorAll('#users tr').length === 2 && !document.getElementById('create-user').disabled);
+    assert.equal(mutations[0].body.role, 'monitor');
+    assert.equal(mutations[0].body.team_leader, false);
+    assert.equal(mutations[0].headers['x-csrf-token'], session.csrf_token);
+    const row = page.locator('#users tr').filter({hasText:'new-monitor'});
+    assert.match(await row.textContent(), /监控展示员/);
+    assert.equal(await row.getByRole('button', {name:'设为组长', exact:true}).count(), 0);
+    assert.equal(await page.locator('#grant select[name=viewer_id] option[value="new-monitor"]').count(), 0);
+    assert.equal(await page.locator('#assign select[name=owner_id] option[value="new-monitor"]').count(), 0);
+    await page.locator('#users tr').filter({hasText:'fixture-user'}).getByRole('button', {name:'修改角色', exact:true}).click();
+    await page.locator('dialog select[name=role]').selectOption('monitor');
+    await page.getByRole('button', {name:'确认修改角色', exact:true}).click();
+    await page.waitForFunction(() => !document.getElementById('create-user').disabled && [...document.querySelectorAll('#users tr')].every(row => row.textContent.includes('监控展示员')));
+    assert.deepEqual(mutations[1].body, {role:'monitor'});
+    assert.equal(mutations[1].headers['x-csrf-token'], session.csrf_token);
+    await page.locator('#users tr').filter({hasText:'fixture-user'}).getByRole('button', {name:'修改角色', exact:true}).click();
+    assert.equal(await page.locator('dialog select[name=role]').inputValue(), 'monitor');
+  });
+});
 
 test('缺手机号登录后必须补录，失败保留输入、禁止重复提交，保存后刷新不再弹出', async () => {
   let current = {...session.user, phone:''}, attempts = 0, loggedIn = false;

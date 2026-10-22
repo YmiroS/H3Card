@@ -2,6 +2,7 @@
 import asyncio
 import json
 import os
+import re
 import secrets
 import sqlite3
 import time
@@ -27,6 +28,10 @@ PUBLIC = {'/login', '/login.html', '/auth.js', '/style.css', *AUTH_ASSETS}
 ADMIN_PAGES = {'/controller', '/controller.html', '/controller/costs', '/costs.html',
                '/controller/capacity', '/capacity.html',
                '/admin/permissions', '/permissions.html'}
+MONITOR_ASSETS = {'/monitor', '/monitor.css', '/monitor-page.js', '/monitor-alerts.js'}
+MONITOR_PUBLIC = {'/login', '/login.html', '/auth.js', *AUTH_ASSETS}
+MONITOR_READ = MONITOR_ASSETS | MONITOR_PUBLIC | {'/api/monitor/summary', '/api/auth/me'}
+MONITOR_WORKER = re.compile(r'/api/monitor/workers/[^/\\\x00-\x20%?#]+(?:/temperature)?')
 TEAM_PAGES = {'/teams', '/teams.html'}
 ADMIN_APIS = ('/api/admin', '/api/workers', '/api/costs', '/api/capacity', '/api/reload', '/api/status')
 
@@ -76,9 +81,16 @@ def require_admin(request):
     return user
 
 
+def require_monitor(request):
+    user = require_user(request)
+    if user['role'] not in ('admin', 'monitor'):
+        raise web.HTTPForbidden(text='需要监控展示员或管理员权限')
+    return user
+
+
 def require_team_leader(request):
     user = require_user(request)
-    if user['role'] != 'admin' and not user.get('team_leader'):
+    if user['role'] == 'monitor' or (user['role'] != 'admin' and not user.get('team_leader')):
         raise web.HTTPForbidden(text='需要组长权限')
     return user
 
@@ -107,6 +119,24 @@ async def require_job(request, jid, operate=False):
 
 def _admin_path(path):
     return path in ADMIN_PAGES or any(path == p or path.startswith(p + '/') for p in ADMIN_APIS)
+
+
+def _monitor_path(path):
+    return path in MONITOR_ASSETS or path == '/api/monitor' or path.startswith('/api/monitor/')
+
+
+def _monitor_allowed(request):
+    if request.method == 'POST':
+        return request.path == request.rel_url.raw_path == '/api/auth/logout'
+    if request.method not in ('GET', 'HEAD'):
+        return False
+    # 同时核对解码路径和原始路径，拒绝编码斜杠、双重编码及路径伪装。
+    path = request.path
+    raw_path = request.rel_url.raw_path
+    return (path in MONITOR_READ and raw_path == path) or (
+        MONITOR_WORKER.fullmatch(path) is not None
+        and MONITOR_WORKER.fullmatch(raw_path) is not None
+        and all(part not in ('.', '..') for part in path.split('/')))
 
 
 def _check_source(request):
@@ -191,6 +221,8 @@ async def _local_test_request(request, handler):
         require_admin(request)
     if path in TEAM_PAGES:
         require_team_leader(request)
+    if _monitor_path(path):
+        require_monitor(request)
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         _check_source(request)
         if not secrets.compare_digest(request.headers.get('X-CSRF-Token', ''), session['csrf_token']):
@@ -234,6 +266,11 @@ async def auth_middleware(request, handler):
 
 async def _browser_request(request, handler):
     path = request.path
+    token = request.cookies.get(COOKIE, '')
+    session = await call_store(request.app, 'get_session', token) if token else None
+    # 必须在公开资源、登录/注册的提前返回之前执行，监控角色默认无业务访问权。
+    if session is not None and session['user']['role'] == 'monitor' and not _monitor_allowed(request):
+        raise web.HTTPForbidden(text='监控展示员仅可访问只读监控页面')
     if path in PUBLIC and request.method in ('GET', 'HEAD'):
         return await handler(request)
     if not await call_store(request.app, 'has_admin'):
@@ -247,7 +284,6 @@ async def _browser_request(request, handler):
             raise web.HTTPServiceUnavailable(text='注册审批服务未配置，请联系管理员')
         _check_source(request)
         return await handler(request)
-    session = await call_store(request.app, 'get_session', request.cookies.get(COOKIE, ''))
     if session is None:
         if path.startswith('/api/') or request.method not in ('GET', 'HEAD'):
             raise web.HTTPUnauthorized(text='请先登录')
@@ -258,6 +294,8 @@ async def _browser_request(request, handler):
         require_admin(request)
     if path in TEAM_PAGES:
         require_team_leader(request)
+    if _monitor_path(path):
+        require_monitor(request)
     if request.method not in ('GET', 'HEAD', 'OPTIONS'):
         _check_source(request)
         supplied = request.headers.get('X-CSRF-Token', '')

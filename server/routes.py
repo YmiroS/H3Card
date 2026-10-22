@@ -11,7 +11,7 @@ STATIC_ASSETS = (
     "if-studio.js", "admin-shell.css", "admin-shell.js", "controller-page.js", "costs-page.js",
     "image-composer.js", "image-composer.css", "vendor/fabric.min.js",
     "features/node-parameters.js", "features/project-persistence.js", "features/task-panel.js",
-    "capacity-page.js",
+    "capacity-page.js", "monitor.css", "monitor-page.js", "monitor-alerts.js",
 )
 
 
