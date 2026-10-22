@@ -165,7 +165,11 @@ test('四类事件聚合、恢复不关闭、Esc保留未读、知晓不改变�
   state.data.workers[0].state='offline';state.data.workers[1].comfy_online=false;state.data.workers[1].sync_status='error';
   state.data.workers[1].sync_request_id='sync-1';await refresh(f);
   // 引擎负责阈值；使用多个真实摘要观察周期，不伪造引擎返回。
-  for(let i=0;i<5;i++)await page.clock.runFor(5000);
+  for(let i=0;i<5;i++) {
+    const response=page.waitForResponse(r=>r.url()===f.origin+'/api/monitor/summary');
+    await page.clock.runFor(5100);await response;
+    await page.waitForFunction(()=>!document.querySelector('#refresh').disabled);
+  }
   await page.locator('#alert-dialog[open]').waitFor();assert.equal(await page.locator('#alert-events [data-event-select]').count(),4);
   assert.equal(await page.locator('dialog[open]').count(),1);assert.match(await page.locator('#event-detail').textContent(),/故障状态.*提醒知晓/s);
   for(const button of await page.locator('#alert-events [data-event-select]').all()){await button.click();assert.equal(await page.locator('#event-detail img, #event-detail script').count(),0);}

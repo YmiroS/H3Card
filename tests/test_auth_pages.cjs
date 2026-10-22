@@ -342,7 +342,7 @@ test('管理员账号页能创建和修改监控角色，中文展示且不提�
 
 test('缺手机号登录后必须补录，失败保留输入、禁止重复提交，保存后刷新不再弹出', async () => {
   let current = {...session.user, phone:''}, attempts = 0, loggedIn = false;
-  const gate = deferred();
+  const gate = deferred(), secondRequest = deferred();
   await withFixture({authHome:true, handlers:{
     '/api/auth/me': () => loggedIn ? ({body:{...session, user:current}}) : unauthorized,
     '/api/auth/login': () => { loggedIn = true; return {body:{...session, user:current}}; },
@@ -351,6 +351,7 @@ test('缺手机号登录后必须补录，失败保留输入、禁止重复提�
       attempts++;
       if (attempts === 1) return {status:503, body:{error:'暂时无法保存，请重试'}};
       current = {...current, phone:request.body.phone};
+      secondRequest.resolve();
       return {body:{user:current}, wait:gate.promise};
     },
   }}, async fixture => {
@@ -376,6 +377,7 @@ test('缺手机号登录后必须补录，失败保留输入、禁止重复提�
     assert.equal(await page.locator('#phone-dialog input').inputValue(), '13800138000');
     await page.locator('#phone-dialog [type=submit]').click();
     await page.waitForFunction(() => document.querySelector('#phone-dialog [type=submit]').disabled);
+    await secondRequest.promise;
     await page.locator('#phone-dialog form').evaluate(form => form.dispatchEvent(new Event('submit', {cancelable:true})));
     assert.equal(attempts, 2);
     gate.resolve();
