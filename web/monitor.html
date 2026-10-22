@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>运行监控 · Chouka</title>
+  <link rel="icon" href="/favicon.png">
+  <link rel="stylesheet" href="/monitor.css">
+  <script defer src="/auth.js"></script>
+  <script defer src="/monitor-alerts.js"></script>
+  <script defer src="/monitor-page.js"></script>
+</head>
+<body>
+<svg class="icon-definitions" aria-hidden="true"><defs>
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3m-4 5v2"/></symbol>
+  <symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 7-3 9h18c0-2-3-2-3-9M10 21h4"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 24 24"><path d="m10.3 4-8 14a2 2 0 0 0 1.7 3h16a2 2 0 0 0 1.7-3l-8-14a2 2 0 0 0-3.4 0ZM12 9v4m0 4h.01"/></symbol>
+  <symbol id="i-close" viewBox="0 0 24 24"><path d="m6 6 12 12M18 6 6 18"/></symbol>
+  <symbol id="i-expand" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 7v5h-5M4 17v-5h5m10-5a8 8 0 0 0-14 1m0 9a8 8 0 0 0 14-1"/></symbol>
+  <symbol id="i-chart" viewBox="0 0 24 24"><path d="M4 4v16h17M7 14l4-5 4 3 5-6"/></symbol>
+</defs></svg>
+<main id="main" tabindex="-1">
+  <header class="header">
+    <div class="brand"><img src="/icon.png" alt="Chouka"><div><div class="heading-copy"><h1>运行监控</h1><span class="readonly"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg>只读展示</span></div><p class="subtitle">机器状态、任务进度与异常提醒，集中查看。</p></div></div>
+    <div class="header-tools"><div class="clock"><b id="clock">--:--:--</b><span id="date">本地时间</span></div><span id="monitor-account" class="account-name">正在验证账号…</span><button id="alerts-open" disabled><svg class="icon" aria-hidden="true"><use href="#i-bell"/></svg><span id="alert-label">异常记录</span></button><button id="fullscreen"><svg class="icon" aria-hidden="true"><use href="#i-expand"/></svg><span>全屏展示</span></button><button id="logout" disabled>退出登录</button></div>
+  </header>
+  <section id="access-denied" class="access-denied" role="alert" hidden><h2>监控已锁定</h2><p id="access-message"></p><a href="/login">返回登录</a></section>
+  <section class="connection-bar" id="connection" aria-label="数据连接状态"><div class="connection-main"><b id="connection-label">正在验证会话…</b><span id="refresh-stamp">尚未获取快照</span><span class="muted" id="freshness">每 5 秒读取，页面隐藏时暂停</span></div><button class="quiet" id="refresh" disabled><svg class="icon" aria-hidden="true"><use href="#i-refresh"/></svg>刷新显示</button></section>
+  <section id="unread-banner" class="notice-banner" hidden><div><strong class="red" id="unread-title"></strong><p>请通知管理员处理。已知晓不会重试任务，也不会将故障标记为恢复。</p></div><button class="alert-button" id="unread-open">查看异常提醒</button></section>
+  <div id="snapshot-content" class="snapshot-content">
+    <section class="metrics" aria-label="运行概览">
+      <article class="metric"><div class="metric-label">中间层服务</div><div class="metric-value text" id="service-value">未获取</div><p class="metric-note" id="service-note">等待服务响应</p></article>
+      <article class="metric"><div class="metric-label">在线执行端</div><div class="metric-value" id="online-value">未获取</div><p class="metric-note" id="online-note">按执行端状态统计</p></article>
+      <article class="metric"><div class="metric-label">正在运行</div><div class="metric-value" id="running-value">未获取</div><p class="metric-note">中间层当前运行任务数</p></article>
+      <article class="metric"><div class="metric-label">等待调度</div><div class="metric-value" id="queued-value">未获取</div><p class="metric-note">由中间层自动分配执行端</p></article>
+      <article class="metric"><div class="metric-label">ComfyUI</div><div class="metric-value text" id="comfy-value">未获取</div><p class="metric-note" id="comfy-note">服务可用性以接口为准</p></article>
+      <article class="metric metric-alert"><div class="metric-label">待关注异常</div><div class="metric-value" id="incident-value">未获取</div><p class="metric-note" id="ack-summary">故障状态与提醒知晓分别记录</p></article>
+    </section>
+    <div class="overview">
+      <section class="panel worker-panel" aria-labelledby="worker-title"><div class="panel-heading"><div><h2 id="worker-title">Windows 执行端</h2><p>单卡显存独立展示 · 离线与过期遥测不冒充当前读数</p></div><span class="small muted" id="worker-count">未获取</span></div><div class="table-wrap" id="worker-scroll" tabindex="0" aria-label="执行端列表，可横向滚动"><table class="workers"><thead><tr><th>执行端 / 主机</th><th>运行与接收状态</th><th>GPU / 显存</th><th>温度</th><th>系统内存</th><th>当前任务</th><th>同步 / 心跳</th><th>只读查看</th></tr></thead><tbody id="worker-rows"><tr><td colspan="8" class="empty">正在读取执行端…</td></tr></tbody></table></div><div class="table-foot"><span>遥测新鲜度 ≤ 60 秒；旧读数只在详情中标注为最后上报。</span><span>查看详情不会控制设备</span></div></section>
+      <aside class="side"><section class="panel attention"><div class="panel-heading"><h2 class="inline-title"><svg class="icon red" aria-hidden="true"><use href="#i-alert"/></svg>需要关注 <span id="attention-count" class="count-pill">—</span></h2><button class="link" id="attention-open" disabled>全部异常</button></div><div class="attention-list" id="attention-list">正在读取异常状态…</div><div class="attention-footer">提醒已知晓 ≠ 故障已恢复</div></section><section class="panel config"><div class="panel-heading"><h2>服务配置摘要</h2></div><dl class="definition" id="config-rows"><dt>服务信息</dt><dd>等待真实数据</dd></dl></section></aside>
+    </div>
+    <section class="panel jobs-panel" aria-labelledby="jobs-title"><div class="panel-heading"><div><h2 id="jobs-title">最近任务</h2><p>保留提交人、项目、卡片、进度与安全错误信息。</p></div><div class="task-toolbar"><span id="job-total">未获取</span><label>任务状态 <select id="job-filter"><option value="all">全部状态</option><option value="running">运行中</option><option value="queued">排队中</option><option value="assigned">已分配</option><option value="error">失败</option><option value="done">已完成</option><option value="canceled">已取消</option></select></label></div></div><div class="table-wrap job-scroll" id="job-scroll" tabindex="0" aria-label="任务列表，可横向滚动"><table class="jobs"><thead><tr><th>状态</th><th>姓名 / 项目 / 卡片</th><th>业务模式</th><th>过程进度 / 步骤</th><th>执行端</th><th>创建 / 开始时间</th><th>耗时 / 错误</th><th>提醒</th></tr></thead><tbody id="job-rows"><tr><td colspan="8" class="empty">正在读取任务…</td></tr></tbody></table></div><div class="table-foot"><span id="job-note">等待真实任务记录</span><span>无取消、重试、删除或修改入口</span></div></section>
+  </div>
+  <footer class="footer"><span>只读监控 · 会话有效期 24 小时，轮询不续期</span><span id="persistence-note" role="status">本屏提醒不是审计日志 · 最多保留 200 条</span></footer>
+</main>
+<dialog id="alert-dialog" class="alert-modal" aria-labelledby="alert-title" aria-describedby="alert-description"><header class="dialog-head"><div class="alert-title"><div class="alert-mark"><svg class="icon" aria-hidden="true"><use href="#i-alert"/></svg></div><div><h2 id="alert-title">运行异常提醒</h2><p id="alert-description">任务与执行端异常统一提醒</p><p>不会自动关闭 · 恢复不会自动知晓</p></div></div><button class="close" data-close aria-label="暂时收起异常弹窗"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></header><div class="alert-content"><nav class="alert-events" id="alert-events" aria-label="任务与设备异常列表"></nav><div class="event-detail" id="event-detail"></div></div><footer class="dialog-foot"><p>已知晓仅确认当前显示的本屏提醒，不修复设备、不重试任务；本屏提醒不是审计日志。</p><div class="actions"><button data-close>暂时收起</button><button class="primary" id="ack-alerts">已知晓本批提醒</button></div></footer></dialog>
+<dialog id="detail-dialog" aria-labelledby="detail-title"><header class="dialog-head"><div><h2 id="detail-title">只读详情</h2><p>60 秒无操作后收起；异常提醒不受此限制。</p></div><button class="close" data-close aria-label="关闭详情"><svg class="icon" aria-hidden="true"><use href="#i-close"/></svg></button></header><div class="dialog-body" id="detail-body"></div><footer class="dialog-foot"><p>只读安全快照，不提供原始秘密配置或管理操作。</p><button data-close>返回监控</button></footer></dialog>
+<div id="toast" class="toast" role="status" hidden></div>
+</body>
+</html>

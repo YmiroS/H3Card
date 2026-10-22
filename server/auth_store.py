@@ -1,6 +1,7 @@
 """SQLite 账号、会话及归属存储；所有公开方法均可在线程池调用。"""
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
 import threading
@@ -60,7 +61,10 @@ class AuthStore:
             if version == 6:
                 self.db.executescript(migrations.joinpath('007_user_phone.sql').read_text(encoding='utf-8'))
                 version = 7
-            elif version != 7:
+            if version == 7:
+                self._migrate_monitor_role(migrations / '008_monitor_role.sql')
+                version = 8
+            if version != 8:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
                 'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader,phone',
@@ -83,6 +87,44 @@ class AuthStore:
         except Exception:
             self.db.close()
             raise
+
+    def _migrate_monitor_role(self, script):
+        """原位扩展角色约束，保留旧列、索引、触发器及所有子表引用。"""
+        # SQLite 在事务内切换 foreign_keys 无效；先关闭，提交/回滚后再恢复。
+        self.db.execute('PRAGMA foreign_keys=OFF')
+        try:
+            with self._tx():
+                schema = self.db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'").fetchone()[0]
+                schema, count = re.subn(
+                    r"CHECK\s*\(\s*role\s+IN\s*\(\s*'admin'\s*,\s*'user'\s*\)\s*\)",
+                    "CHECK(role IN ('admin','user','monitor'))", schema, flags=re.IGNORECASE)
+                if count != 1:
+                    raise AuthError('users 角色约束不符合 v7，拒绝迁移')
+                schema, count = re.subn(
+                    r'^CREATE\s+TABLE\s+(?:users|"users"|`users`|\[users\])(?=\s*\()',
+                    'CREATE TABLE users_monitor_v8', schema, count=1, flags=re.IGNORECASE)
+                if count != 1:
+                    raise AuthError('users 表结构不符合 v7，拒绝迁移')
+                objects = self.db.execute(
+                    "SELECT sql FROM sqlite_master WHERE tbl_name='users' "
+                    "AND type IN ('index','trigger') AND sql IS NOT NULL ORDER BY type,name").fetchall()
+                self.db.execute(schema)
+                # 不用 executescript：它会先隐式提交，破坏重建失败时的原子回滚。
+                statement = ''
+                for line in script.read_text(encoding='utf-8').splitlines(keepends=True):
+                    statement += line
+                    if sqlite3.complete_statement(statement):
+                        self.db.execute(statement)
+                        statement = ''
+                if statement.strip():
+                    raise AuthError('008 迁移脚本不完整')
+                for obj in objects:
+                    self.db.execute(obj['sql'])
+                if self.db.execute('PRAGMA foreign_key_check').fetchone() is not None:
+                    raise AuthError('认证数据库外键校验失败，已取消迁移')
+        finally:
+            self.db.execute('PRAGMA foreign_keys=ON')
 
     @contextmanager
     def _tx(self):
@@ -166,7 +208,7 @@ class AuthStore:
 
     @staticmethod
     def _role(role):
-        if role not in ('admin', 'user'):
+        if role not in ('admin', 'user', 'monitor'):
             raise AuthError('无效角色')
 
     def _check_actor(self, actor_id=None, session_token=None):
@@ -203,6 +245,9 @@ class AuthStore:
         self._role(role)
         if not isinstance(team_leader, bool):
             raise AuthError('team_leader 必须为布尔值')
+        # 监控账号不携带组长能力；创建和角色切换使用同一归零规则。
+        if role == 'monitor':
+            team_leader = False
         self._password(password)
         username, username_key = self._username(username)
         hashed = self.hasher.hash(password)
@@ -240,6 +285,8 @@ class AuthStore:
             role = old['role'] if role is None else role
             enabled = bool(old['enabled']) if enabled is None else enabled
             team_leader = bool(old['team_leader']) if team_leader is None else team_leader
+            if role == 'monitor':
+                team_leader = False
             if old['role'] == 'admin' and old['enabled'] and (role != 'admin' or not enabled):
                 if self.db.execute("SELECT COUNT(*) FROM users WHERE enabled=1 AND role='admin'").fetchone()[0] <= 1:
                     raise AuthError('不能停用或降级最后一个管理员', 409)
@@ -495,7 +542,7 @@ class AuthStore:
                 raise AuthError('会话已失效，请重新登录', 401)
         if not actor['enabled'] or actor['approval_status'] != 'approved':
             raise AuthError('账号不可用', 403)
-        if actor['role'] != 'admin' and not actor['team_leader']:
+        if actor['role'] == 'monitor' or (actor['role'] != 'admin' and not actor['team_leader']):
             raise AuthError('需要组长权限', 403)
         if team_id is not None:
             self._identifier(team_id, '项目组 ID')
@@ -794,7 +841,7 @@ class AuthStore:
             user = self.get_user(user_id)
             project = self.get_project(project_id)
             if (not user or not user['enabled'] or user['approval_status'] != 'approved'
-                    or not project or project['state'] != 'active'):
+                    or user['role'] == 'monitor' or not project or project['state'] != 'active'):
                 return None
             if user['role'] == 'admin':
                 return 'operate'

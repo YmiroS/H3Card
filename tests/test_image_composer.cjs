@@ -611,9 +611,9 @@ test('image composer references: internal picks create real wires, retain exact 
     assert.deepEqual(snapshot.edges.map(e => e.from),['source-1','source-2']);
     assert.equal('images[2]' in composite(snapshot).assets,false,'Removing the final matching layer releases only its editor-managed input slot');
     await assertCompositeReferences(page,refs.slice(0,2)); await expect(page.locator('#wires path.hit')).toHaveCount(2);
-    await page.locator('#stage').click({position:{x:1000,y:600}}); await page.keyboard.press('Control+z'); await settle(page);
+    await page.locator('#stage').click({position:{x:1000,y:600}}); await page.keyboard.press('ControlOrMeta+z'); await settle(page);
     assert.equal((await saved()).edges.length,3,'Canvas undo restores composition changes and real input edges together');
-    await page.keyboard.press('Control+y'); await settle(page);
+    await page.keyboard.press('ControlOrMeta+y'); await settle(page);
     assert.equal((await saved()).edges.length,2,'Canvas redo removes the managed input again');
     await open(2); await remove('reference-1.png'); await persist();
     assert.deepEqual((await saved()).edges.find(e => e.from === 'source-1'),manual,'Layer deletion never removes a pre-existing manual wire');

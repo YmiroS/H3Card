@@ -268,7 +268,7 @@
     clearMaintenanceHideTimer(); maintenanceMode = 'clear'; setMaintenanceBanner(false);
     controllers.forEach(c => c.abort()); timers.forEach(clearInterval); timers.clear();
     window.dispatchEvent(new Event('h3auth:expired'));
-    if (redirect && location.pathname !== '/login') location.replace('/login');
+    if (redirect && !['/login', '/login.html'].includes(location.pathname)) location.replace('/login');
   }
   async function request(path, options = {}) {
     const url = new URL(path, location.href);
@@ -292,7 +292,7 @@
       if (!response.ok) {
         const message = typeof data === 'string' ? data : data.error?.message || data.error || data.message;
         const error = Object.assign(new Error(String(message || `请求失败（${response.status}）`).slice(0, 500)), {status:response.status, data});
-        if (response.status === 401 && !anonymous) invalidate(url.pathname !== '/api/auth/me' || location.pathname !== '/login');
+        if (response.status === 401 && !anonymous) invalidate(url.pathname !== '/api/auth/me' || !['/login', '/login.html'].includes(location.pathname));
         if ([403,404].includes(response.status)) window.dispatchEvent(new CustomEvent('h3auth:denied', {detail:{path:url.pathname, method, error}}));
         throw error;
       }
@@ -305,7 +305,7 @@
   }
   const json = (path, method, body) => request(path, {method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(body || {})});
   async function refreshPresence() {
-    if (stopped || document.hidden) return;
+    if (stopped || user?.role === 'monitor' || document.hidden) return;
     if (!presencePending) presencePending = json('/api/auth/presence', 'POST').then(data => {
       const count = document.querySelector('#workspace-nav .workspace-presence b');
       if (count) count.textContent = String(data.online_users);
@@ -376,7 +376,7 @@
     }
   }
   async function refreshMaintenance() {
-    if (stopped || document.hidden) return;
+    if (stopped || user?.role === 'monitor' || document.hidden) return;
     if (!maintenancePending) {
       const timeoutController = new AbortController();
       const timeout = setTimeout(() => timeoutController.abort(), 4000);
@@ -403,14 +403,14 @@
   async function me() {
     if (!pendingMe) pendingMe = request('/api/auth/me', {cache:'no-store'}).then(data => {
       user = data.user; csrf = data.csrf_token; localTest = data.local_test === true;
-      startPresence(); startMaintenance();
+      if (user.role !== 'monitor') { startPresence(); startMaintenance(); }
       return user;
     }).finally(() => { pendingMe = null; });
     return pendingMe;
   }
   let pendingPhone = null;
   function requirePhone() {
-    if (localTest || user.phone !== '') return Promise.resolve();
+    if (localTest || user.role === 'monitor' || user.phone !== '') return Promise.resolve();
     if (pendingPhone) return pendingPhone;
     pendingPhone = new Promise((resolve, reject) => {
       const dialog = document.createElement('dialog'); dialog.className = 'auth-dialog phone-dialog';
@@ -462,7 +462,7 @@
   }
   async function requireUser(admin = false) {
     const current = await me();
-    if (admin && current.role !== 'admin') { location.replace('/'); throw new Error('仅管理员可访问'); }
+    if (admin && current.role !== 'admin') { location.replace(current.role === 'monitor' ? '/monitor' : '/'); throw new Error('仅管理员可访问'); }
     await requirePhone();
     return user;
   }
@@ -484,7 +484,7 @@
   }
   function mountWorkspace() {
     const rail = document.getElementById('workspace-nav');
-    if (!rail || rail.querySelector('.workspace-links')) return;
+    if (!rail || user.role === 'monitor' || rail.querySelector('.workspace-links')) return;
     const icons = {
       canvas: '<rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/>',
       director: '<rect x="3" y="8" width="18" height="13" rx="2"/><path d="m3 8 16-5 2 5M7 7l3-4m4 2 3-3M10 12l5 3-5 3z"/>',
@@ -540,7 +540,7 @@
     who.textContent = workspace ? displayName : user.username;
     const role = document.createElement('span'); role.className = 'chip' + (user.role === 'admin' ? ' admin' : '');
     const dot = document.createElement('i'); dot.className = 'd';
-    const roleText = user.role === 'admin' ? '管理员' : user.team_leader ? '组长' : '普通用户';
+    const roleText = user.role === 'admin' ? '管理员' : user.role === 'monitor' ? '监控展示员' : user.team_leader ? '组长' : '普通用户';
     role.append(dot, document.createTextNode(roleText));
     const teams = document.createElement('a'); teams.className = 'btn sm'; teams.href = '/teams'; teams.textContent = '项目组';
     const password = document.createElement('button'); password.className = 'btn sm'; password.textContent = '修改密码';
@@ -584,6 +584,10 @@
     };
     const exit = document.createElement('button'); exit.className = 'btn sm'; exit.textContent = '退出登录';
     exit.onclick = () => { closeMenu(); logout().catch(() => {}); };
+    if (user.role === 'monitor') {
+      container.append(who, role, exit);
+      return;
+    }
     if (!workspace) {
       container.append(who, role);
       if (user.role === 'admin' || user.team_leader) container.append(teams);
