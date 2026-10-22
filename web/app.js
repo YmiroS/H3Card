@@ -2879,7 +2879,7 @@ function edgeWord(e) {
   const nm = (c) => c ? titleOf(c) : "?";
   return isTextEdge(e)
     ? (e.slot === TEXT_SLOT ? `文本：${nm(a)} → ${nm(b)}` : `风格：${nm(a)} → ${nm(b)}`)
-    : `${nm(a)} → ${nm(b)}${e.version ? `（固定分镜版本 · ${e.version.job} · 第 ${e.version.index + 1} 张）` : ''}`;
+    : `${nm(a)} → ${nm(b)}${e.composite ? '（固定合成引用）' : e.version ? `（固定分镜版本 · ${e.version.job} · 第 ${e.version.index + 1} 张）` : ''}`;
 }
 
 function paintWireFlow() {
@@ -5559,11 +5559,54 @@ async function openImageComposer(c) {
   const project = PROJ;
   const valid = () => PROJ === project && canSave() && cardOf(c.id) === c && c.cap === "image_composite";
   const check = () => { if (!valid()) throw new Error("画布、节点或权限已变化，请关闭编辑器后重新打开"); };
+  const sourceOrigins = [];
+  const sameImage = (a, b) => a?.kind === 'image' && b?.kind === 'image'
+    && (a.ref && b.ref ? a.ref === b.ref : a.url && b.url && new URL(a.url, location.href).href === new URL(b.url, location.href).href);
+  function referencePlan(state) {
+    const wanted = [];
+    for (const layer of state.layers) {
+      const origin = sourceOrigins.find(source => sameImage(source.asset, layer.asset));
+      if (!origin || wanted.some(source => sameImage(source.asset, layer.asset))) continue;
+      if (!project.cards.some(card => card.id === origin.from)) throw new Error('引用图片的来源节点已删除，请关闭编辑器后重新添加素材。');
+      wanted.push({from:origin.from,asset:layer.asset});
+    }
+    const assets = {...c.assets}, removed = [];
+    const edges = project.edges.filter(edge => {
+      if (edge.to !== c.id || !edge.composite) return true;
+      const keep = wanted.some(source => source.from === edge.from && edgeSlots(edge).some(slot => sameImage(assets[slot], source.asset)));
+      if (!keep) removed.push(edge);
+      return keep;
+    });
+    const reserved = new Set(edges.filter(edge => edge.to === c.id && !isTextEdge(edge)).flatMap(edgeSlots));
+    for (const edge of removed) for (const slot of edgeSlots(edge)) if (!reserved.has(slot)) delete assets[slot];
+    const slots = (capOf(c)?.inputs || []).filter(slot => slot.type === 'image');
+    for (const source of wanted) {
+      if (edges.some(edge => edge.to === c.id && !isTextEdge(edge) && edgeSlots(edge).some(slot => sameImage(assets[slot], source.asset)))) continue;
+      const spec = slots.find(slot => !reserved.has(slot.key) && sameImage(assets[slot.key], source.asset))
+        || slots.find(slot => !reserved.has(slot.key) && !assets[slot.key]);
+      if (!spec) throw new Error(`合成引用图片已达上限 ${slots.length}，请减少不同的画布引用图片后重试。`);
+      const pending = [c.id], seen = new Set();
+      while (pending.length) {
+        const id = pending.pop();
+        if (id === source.from) throw new Error('不能引用当前合成节点的下游图片，以免形成循环连线。');
+        if (seen.has(id)) continue;
+        seen.add(id);
+        for (const edge of edges) if (edge.from === id) pending.push(edge.to);
+      }
+      // The editor picked this exact image (possibly a historical output), not the source's next output.
+      edges.push({from:source.from,to:c.id,slot:spec.key,slots:[spec.key],composite:true});
+      assets[spec.key] = {...source.asset}; reserved.add(spec.key);
+    }
+    return {assets,edges};
+  }
   const store = async (state, output) => {
     check();
+    const references = referencePlan(state);
     persistence.beginFlush();
     try {
       beginCanvasEdit();
+      project.edges = references.edges;
+      c.assets = references.assets;
       c.params.composition = JSON.parse(JSON.stringify(state));
       for (const key of Object.keys(c.assets)) if (key.startsWith("composite:")) delete c.assets[key];
       for (const layer of state.layers) c.assets[`composite:${layer.id}`] = { ...layer.asset };
@@ -5571,7 +5614,7 @@ async function openImageComposer(c) {
         c.outputs = [output]; c.status = "done"; c.progress = 1;
         c.job = null; c.seed = null; c.ms = null; c.error = null; c.step = "";
         pushHistory(c, { id: `local:${uid()}`, capability: c.cap });
-        for (const edge of project.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version)) {
+        for (const edge of project.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version && !e.composite)) {
           const target = cardOf(edge.to);
           if (!target) continue;
           const slots = edgeSlots(edge); edge.slots = slots;
@@ -5599,18 +5642,23 @@ async function openImageComposer(c) {
     check();
     if (!window.ChoukaImageComposer) throw new Error("图片合成组件未加载，请强制刷新页面");
     const sources = new Map();
-    const addSource = (asset, name) => {
-      if (asset?.kind !== "image" || !asset.url || sources.has(asset.url)) return;
-      sources.set(asset.url, { ...asset, name: name || asset.origin || asset.filename || "图片" });
+    const addSource = (asset, name, from) => {
+      if (asset?.kind !== "image" || !asset.url) return;
+      if (from && !sourceOrigins.some(source => sameImage(source.asset, asset))) sourceOrigins.push({asset:{...asset},from});
+      if (!sources.has(asset.url)) sources.set(asset.url, { ...asset, name: name || asset.origin || asset.filename || "图片" });
     };
     for (const asset of Object.values(c.assets || {})) addSource(asset, asset?.origin);
-    for (const card of project.cards) {
-      if (card === c) continue;
-      for (const asset of Object.values(card.assets || {})) addSource(asset, `${titleOf(card)} · ${asset?.origin || "素材"}`);
-      for (const output of card.outputs || []) addSource(output, `${titleOf(card)} · 产物`);
-      for (const history of card.history || []) for (const output of history.outputs || [])
-        addSource(output, `${titleOf(card)} · 历史产物`);
+    const sourceCards = project.cards.filter(card => card !== c);
+    for (const edge of project.edges.filter(edge => edge.to === c.id && edge.composite)) {
+      if (!sourceCards.some(card => card.id === edge.from)) continue;
+      for (const slot of edgeSlots(edge)) addSource(c.assets[slot], c.assets[slot]?.origin, edge.from);
     }
+    // Prefer the image's output owner over a downstream card that merely holds a copy as input.
+    for (const card of sourceCards) for (const output of card.outputs || []) addSource(output, `${titleOf(card)} · 产物`, card.id);
+    for (const card of sourceCards) for (const history of card.history || []) for (const output of history.outputs || [])
+      addSource(output, `${titleOf(card)} · 历史产物`, card.id);
+    for (const card of sourceCards) for (const asset of Object.values(card.assets || {}))
+      addSource(asset, `${titleOf(card)} · ${asset?.origin || "素材"}`, card.id);
     const linkedSources = (capOf(c)?.inputs || []).filter(s => s.type === 'image')
       .map(s => c.assets[s.key]).filter(asset => asset?.kind === 'image' && asset.url);
     await window.ChoukaImageComposer.open({
@@ -5619,7 +5667,7 @@ async function openImageComposer(c) {
       upload: async file => { check(); const asset = await uploadAsset(file, true); check(); return asset; },
       onSave: state => store(state),
       onExport: async (blob, state) => {
-        check();
+        check(); referencePlan(state);
         const asset = await uploadAsset(new File([blob], `composition_${Date.now()}.png`, { type: "image/png" }), true);
         check();
         await store(state, { ...asset, filename: asset.origin });
@@ -6106,7 +6154,7 @@ function assetPanel(c) {
   clr.onclick = () => {
     c.outputs = [];
     // 连线保留，方便之后重新选文件；但下游不能继续拿已经清空的旧素材运行。
-    for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e))) clearEdgeAssets(e);
+    for (const e of PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.composite)) clearEdgeAssets(e);
     paint(c); paintKind(c); openPanel(c.id); save();
   };
   ops.appendChild(clr);
@@ -7786,7 +7834,7 @@ async function setAssetItem(c, item, showPanel = true) {
 
   // 同步更新所有引用这个素材节点的下游节点。上游曾清空过时下游格也会是空的，
   // 不能拿“当前有值”当条件，否则重新选择文件后连线还在、引用却恢复不了。
-  const edges = PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e));
+  const edges = PROJ.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.composite);
   for (const e of edges) {
     const to = PROJ.cards.find(x => x.id === e.to);
     if (!to || !to.assets) continue;
@@ -8481,7 +8529,7 @@ async function cancel(c) {
 async function propagateCardOutputs(c) {
   const project = PROJ;
   drawWires();
-  for (const e of project.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version)) {
+  for (const e of project.edges.filter(e => e.from === c.id && !isTextEdge(e) && !e.version && !e.composite)) {
     const to = project.cards.find(x => x.id === e.to);
     if (!to) continue;
     const outputs = c.outputs || [], slots = edgeSlots(e);

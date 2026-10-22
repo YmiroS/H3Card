@@ -533,6 +533,169 @@ async function referenceFixture(t, prefix, run) {
   }
 }
 
+test('image composer references: internal picks create real wires, retain exact history, deduplicate and remove only managed links', {timeout:150000}, async t => {
+  await referenceFixture(t,'chouka-image-composer-internal-wires-',async ({page,folder,report}) => {
+    const {project,sources} = await referenceProject(page,4);
+    const saved = () => api(page,`/api/projects/${project.id}`);
+    const composite = document => document.cards.find(c => c.id === 'composite');
+    await page.evaluate(async replacement => {
+      const source = cardOf('source-3');
+      source.history = [{job:'exact-old-image',outputs:structuredClone(source.outputs)}];
+      source.outputs = [replacement];
+      await enqueueSave(PROJ.id);
+      await linkTo(cardOf('source-1'),cardOf('composite'));
+    },sources[3].card.outputs[0]);
+    await settle(page);
+    const manual = (await saved()).edges[0];
+    const dialog = page.locator('dialog[data-image-composer]'), save = dialog.getByRole('button',{name:'保存编辑稿',exact:true});
+    async function open(count) {
+      await page.evaluate(() => pick('composite'));
+      await page.locator('#panel').getByRole('button',{name:'编辑合成',exact:true}).click();
+      await expect(save).toBeEnabled(); await expect(dialog.locator('.ic-layer')).toHaveCount(count);
+    }
+    async function add(index) {
+      await dialog.locator('.ic-sources button').filter({hasText:`reference-${index}.png`}).click();
+      await expect(save).toBeEnabled();
+    }
+    async function close() { await dialog.getByRole('button',{name:'关闭',exact:true}).click(); await expect(dialog).toHaveCount(0); }
+    async function persist() { await save.click(); await expect(save).toBeEnabled(); await settle(page); await close(); }
+    async function remove(filename) {
+      await dialog.locator('.ic-layer-name').filter({hasText:filename}).first().click();
+      await dialog.getByRole('button',{name:'删除',exact:true}).click();
+    }
+    await open(1); await add(2); await close();
+    assert.deepEqual((await saved()).edges,[manual],'Abandoning the editor does not create external wires');
+    await open(1); await add(2);
+    for (const [label,value] of [['X / px','17'],['Y / px','11'],['角度 / °','23']]) {
+      const input = dialog.getByLabel(label,{exact:true}); await input.fill(value); await input.press('Tab');
+    }
+    await add(3); await dialog.getByRole('button',{name:'复制',exact:true}).click();
+    await expect(dialog.locator('.ic-layer')).toHaveCount(4);
+    await dialog.getByRole('button',{name:'合成 PNG',exact:true}).click();
+    await expect.poll(async () => composite(await saved()).outputs.length).toBe(1);
+    await expect(save).toBeEnabled(); await settle(page); await close();
+    let snapshot = await saved();
+    assert.equal(snapshot.cards.length,5,'Reuse real source cards rather than creating duplicates');
+    assert.deepEqual(snapshot.edges.find(e => e.from === 'source-1'),manual,'Existing manual connection stays unchanged');
+    assert.deepEqual(snapshot.edges.filter(e => e.composite),[
+      {from:'source-2',to:'composite',slot:'images[1]',slots:['images[1]'],composite:true},
+      {from:'source-3',to:'composite',slot:'images[2]',slots:['images[2]'],composite:true},
+    ]);
+    const composition = composite(snapshot).params.composition, stableEdges = snapshot.edges;
+    const edited = composition.layers.find(l => l.asset.ref === sources[1].card.outputs[0].ref);
+    assert.deepEqual({x:edited.x,y:edited.y,angle:edited.angle},{x:17,y:11,angle:23});
+    const refs = [0,1,2].map(i => ({slot:`images[${i}]`,asset:sources[i].card.outputs[0],rgb:sources[i].rgb}));
+    await assertCompositeReferences(page,refs); await expect(page.locator('#wires path.hit')).toHaveCount(3);
+    await page.screenshot({path:path.join(folder,'internal-picks-external-wires.png'),fullPage:true});
+    await open(4); await persist();
+    assert.deepEqual((await saved()).edges,stableEdges,'Repeated save adds no duplicate source edges or occupied slots');
+    assert.deepEqual(composite(await saved()).params.composition.layers,composition.layers,'Layer positions and duplicates remain intact');
+    await page.evaluate(async replacement => {
+      await propagateCardOutputs(cardOf('source-3'));
+      await setAssetItem(cardOf('source-2'),replacement,false);
+      cardOf('source-3').history = [];
+      await enqueueSave(PROJ.id);
+    },sources[3].card.outputs[0]);
+    await settle(page);
+    assert.equal(composite(await saved()).assets['images[1]'].ref,sources[1].card.outputs[0].ref,'Changing an asset source does not replace the image selected inside the editor');
+    assert.equal(composite(await saved()).assets['images[2]'].ref,sources[2].card.outputs[0].ref,'Generated output propagation does not replace the selected historical version');
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id); await assertCompositeReferences(page,refs);
+    await expect(page.locator('#wires path.hit')).toHaveCount(3);
+    await open(4); await persist();
+    assert.deepEqual((await saved()).edges,stableEdges,'Pinned source ownership survives source replacement, history eviction and reload');
+    await open(4); await remove('reference-3.png'); await persist();
+    assert.equal((await saved()).edges.length,3,'Removing one duplicate retains the one source wire');
+    await open(3); await remove('reference-3.png'); await persist();
+    snapshot = await saved();
+    assert.deepEqual(snapshot.edges.map(e => e.from),['source-1','source-2']);
+    assert.equal('images[2]' in composite(snapshot).assets,false,'Removing the final matching layer releases only its editor-managed input slot');
+    await assertCompositeReferences(page,refs.slice(0,2)); await expect(page.locator('#wires path.hit')).toHaveCount(2);
+    await page.locator('#stage').click({position:{x:1000,y:600}}); await page.keyboard.press('Control+z'); await settle(page);
+    assert.equal((await saved()).edges.length,3,'Canvas undo restores composition changes and real input edges together');
+    await page.keyboard.press('Control+y'); await settle(page);
+    assert.equal((await saved()).edges.length,2,'Canvas redo removes the managed input again');
+    await open(2); await remove('reference-1.png'); await persist();
+    assert.deepEqual((await saved()).edges.find(e => e.from === 'source-1'),manual,'Layer deletion never removes a pre-existing manual wire');
+    const audit = await api(page,'/__fixture/audit');
+    assert.equal(audit.writes.filter(w => w.path === '/api/upload').length,5,'Four original sources and one PNG export: internal references require no extra uploads');
+    report.edges = (await saved()).edges;
+  });
+});
+
+test('image composer references: repair legacy internal layers, enforce eight inputs atomically and reuse a removed managed slot', {timeout:150000}, async t => {
+  await referenceFixture(t,'chouka-image-composer-reference-limit-',async ({page,report}) => {
+    const {project,sources} = await referenceProject(page,9);
+    const saved = () => api(page,`/api/projects/${project.id}`);
+    await page.evaluate(async image => {
+      for (let i = 1; i <= 7; i++) await linkTo(cardOf('source-' + i),cardOf('composite'));
+      const c = cardOf('composite');
+      c.params.composition = {version:1,width:64,height:48,background:'transparent',layers:[{
+        id:'legacy-internal-image',name:'旧版内部引用',asset:image,x:11,y:7,width:12,height:8,angle:23,opacity:.65,
+        visible:true,locked:false,crop:{x:2,y:1,width:4,height:4},
+      }]};
+      c.assets['composite:legacy-internal-image'] = image;
+      await enqueueSave(PROJ.id);
+    },sources[7].card.outputs[0]);
+    await settle(page);
+    const manual = (await saved()).edges;
+    const dialog = page.locator('dialog[data-image-composer]'), save = dialog.getByRole('button',{name:'保存编辑稿',exact:true});
+    async function open() {
+      await page.evaluate(() => pick('composite'));
+      await page.locator('#panel').getByRole('button',{name:'编辑合成',exact:true}).click(); await expect(save).toBeEnabled();
+    }
+    async function persist() { await save.click(); await expect(save).toBeEnabled(); await settle(page); }
+    async function close() { await dialog.getByRole('button',{name:'关闭',exact:true}).click(); }
+    await open(); await expect(dialog.locator('.ic-layer')).toHaveCount(8); await persist(); await close();
+    const repaired = await saved(), repairedCard = repaired.cards.find(c => c.id === 'composite');
+    assert.deepEqual(repaired.edges.slice(0,7),manual);
+    assert.deepEqual(repaired.edges[7],{from:'source-8',to:'composite',slot:'images[7]',slots:['images[7]'],composite:true});
+    const legacy = repairedCard.params.composition.layers.find(l => l.id === 'legacy-internal-image');
+    assert.deepEqual({x:legacy.x,y:legacy.y,width:legacy.width,height:legacy.height,angle:legacy.angle,opacity:legacy.opacity,crop:legacy.crop},
+      {x:11,y:7,width:12,height:8,angle:23,opacity:.65,crop:{x:2,y:1,width:4,height:4}});
+    await expect(page.locator('#wires path.hit')).toHaveCount(8);
+    await open(); await dialog.locator('.ic-sources button').filter({hasText:'reference-9.png'}).click();
+    await expect(save).toBeEnabled(); await expect(dialog.locator('.ic-layer')).toHaveCount(9);
+    await persist(); await expect(dialog.locator('[role=alert]')).toContainText('上限 8');
+    assert.deepEqual((await saved()).edges,repaired.edges,'A rejected ninth reference does not partially change any input edge');
+    assert.deepEqual((await saved()).cards.find(c => c.id === 'composite'),repairedCard,'Rejected save leaves the persisted draft and all assets intact');
+    await dialog.getByRole('button',{name:'合成 PNG',exact:true}).click(); await expect(save).toBeEnabled();
+    await expect(dialog.locator('[role=alert]')).toContainText('上限 8');
+    assert.equal((await api(page,'/__fixture/audit')).writes.filter(w => w.path === '/api/upload').length,9,'Rejected export does not upload an orphan PNG');
+    await dialog.locator('.ic-layer-name').filter({hasText:'reference-8.png'}).click();
+    await dialog.getByRole('button',{name:'删除',exact:true}).click(); await persist(); await close();
+    const replaced = await saved();
+    assert.deepEqual(replaced.edges.slice(0,7),manual);
+    assert.deepEqual(replaced.edges[7],{from:'source-9',to:'composite',slot:'images[7]',slots:['images[7]'],composite:true});
+    assert.equal(replaced.cards.find(c => c.id === 'composite').assets['images[7]'].ref,sources[8].card.outputs[0].ref);
+    await expect(page.locator('#wires path.hit')).toHaveCount(8);
+    report.edges = replaced.edges;
+  });
+});
+
+test('image composer references: reject a downstream reference cycle without changing saved data', {timeout:90000}, async t => {
+  await referenceFixture(t,'chouka-image-composer-reference-cycle-',async ({page}) => {
+    const {project,sources} = await referenceProject(page,1,true);
+    await page.evaluate(async image => {
+      const source = cardOf('source-1'); source.cap = 'zimage_i2i'; source.assets.image = image;
+      cardOf('composite').outputs = [image];
+      PROJ.edges.push({from:'composite',to:source.id,slot:'image',slots:['image']});
+      await enqueueSave(PROJ.id);
+    },sources[0].card.outputs[0]);
+    const saved = () => api(page,`/api/projects/${project.id}`), before = await saved();
+    await page.evaluate(() => pick('composite'));
+    await page.locator('#panel').getByRole('button',{name:'编辑合成',exact:true}).click();
+    const dialog = page.locator('dialog[data-image-composer]'), save = dialog.getByRole('button',{name:'保存编辑稿',exact:true});
+    await expect(save).toBeEnabled();
+    await dialog.locator('.ic-sources button').filter({hasText:'reference-1.png'}).click(); await expect(save).toBeEnabled();
+    await save.click(); await expect(save).toBeEnabled();
+    await expect(dialog.locator('[role=alert]')).toContainText('循环连线');
+    assert.deepEqual((await saved()).edges,before.edges);
+    assert.deepEqual((await saved()).cards,before.cards);
+    await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+  });
+});
+
 test('image composer crop: real pointer editing, cancel, transforms, history, source preservation, reload and PNG pixels', {timeout:180000}, async t => {
   await referenceFixture(t,'chouka-image-composer-crop-',async ({page,folder,report}) => {
     const project = await api(page,'/api/projects','POST',{name:'单图裁剪隔离验收'});
