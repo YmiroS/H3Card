@@ -57,9 +57,15 @@
     s.layers = s.layers.map(l => {
       if (!l || typeof l.id !== 'string' || !l.id || ids.has(l.id)) throw new Error('图层 ID 无效或重复。');
       ids.add(l.id);
-      assertSize(l.width, l.height);
+      if (![l.width,l.height].every(value => Number.isFinite(value) && value > 0) || l.width > MAX_SIDE || l.height > MAX_SIDE || l.width * l.height > MAX_PIXELS) throw new Error('图层尺寸必须大于 0，单边不超过 8192 像素，总像素不超过 3200 万。');
       if (![l.x,l.y,l.angle,l.opacity].every(Number.isFinite) || Math.abs(l.x) > 100000 || Math.abs(l.y) > 100000 || Math.abs(l.angle) > 36000 || l.opacity < 0 || l.opacity > 1) throw new Error('图层位置、角度或透明度无效。');
-      return {id:l.id, name:String(l.name || '图片').slice(0,200), asset:assetJSON(l.asset), x:l.x, y:l.y, width:l.width, height:l.height, angle:l.angle, opacity:l.opacity, visible:l.visible !== false, locked:!!l.locked};
+      let crop;
+      if (l.crop !== undefined) {
+        const c = l.crop;
+        if (!c || ![c.x,c.y,c.width,c.height].every(Number.isInteger) || c.x < 0 || c.y < 0 || c.width < 1 || c.height < 1 || c.x + c.width > MAX_SIDE || c.y + c.height > MAX_SIDE) throw new Error('图片裁剪范围无效，需使用原图范围内的整数像素。');
+        crop = {x:c.x,y:c.y,width:c.width,height:c.height};
+      }
+      return {id:l.id, name:String(l.name || '图片').slice(0,200), asset:assetJSON(l.asset), x:l.x, y:l.y, width:l.width, height:l.height, angle:l.angle, opacity:l.opacity, visible:l.visible !== false, locked:!!l.locked, ...(crop ? {crop} : {})};
     });
     const normalized = {version:1, width:s.width, height:s.height, background:s.background, layers:s.layers};
     if (s.linkedSources !== undefined) {
@@ -165,7 +171,7 @@
     body.append(left, center, right); footer.append(footerNote); dialog.append(head, status, errorBox, body, footer); document.body.append(dialog);
     const previousFocus = document.activeElement;
     let model, canvas, selected = null, busy = false, dead = false, ready = false, dirtyBase = '', history = [], historyIndex = -1;
-    let observer, permissionTimer, totalPixels = 0, viewScale = 1, fitMode = true, dragId = null, refreshing = false;
+    let observer, permissionTimer, totalPixels = 0, viewScale = 1, fitMode = true, dragId = null, refreshing = false, cropSession = null;
     const abort = new AbortController(), images = new Map(), objectMap = new Map();
     const f = () => window.fabric;
     const allowed = () => { try { return canEdit() === true; } catch (error) { showError(error); return false; } };
@@ -191,7 +197,8 @@
       if (dead) return;
       const permitted = allowed(), disabled = busy || !ready || !permitted;
       for (const control of dialog.querySelectorAll('button,input')) {
-        if (control !== closeButton && control !== retryButton) control.disabled = disabled || control.dataset.inactive === '1';
+        if (control.dataset.composerAction === 'cancel-crop') control.disabled = busy;
+        else if (control !== closeButton && control !== retryButton) control.disabled = disabled || control.dataset.inactive === '1';
       }
       closeButton.disabled = busy;
       retryButton.disabled = busy || !permitted;
@@ -228,22 +235,29 @@
       if (dead) { bitmap.close(); throw new Error('合成器已关闭。'); }
       totalPixels += bitmap.width * bitmap.height; images.set(url, bitmap); return bitmap;
     }
-    function makeObject(layer) {
+    function imageCrop(layer) {
       const bitmap = images.get(mediaURL(layer.asset.url));
       if (!bitmap) throw new Error('图片尚未载入。');
-      const object = new (f().FabricImage)(bitmap, {originX:'left', originY:'top', left:layer.x, top:layer.y, angle:layer.angle, scaleX:layer.width / bitmap.width, scaleY:layer.height / bitmap.height, opacity:layer.opacity, visible:layer.visible, selectable:!layer.locked, evented:!layer.locked, lockScalingFlip:true, objectCaching:false, cornerColor:'#a0e7cb', borderColor:'#a0e7cb', transparentCorners:false, cornerSize:12, padding:0});
+      const crop = layer.crop || {x:0,y:0,width:bitmap.width,height:bitmap.height};
+      if (crop.x + crop.width > bitmap.width || crop.y + crop.height > bitmap.height) throw new Error('裁剪范围超出原图尺寸。');
+      return crop;
+    }
+    function makeObject(layer) {
+      const bitmap = images.get(mediaURL(layer.asset.url)), crop = imageCrop(layer);
+      const object = new (f().FabricImage)(bitmap, {originX:'left', originY:'top', left:layer.x, top:layer.y, angle:layer.angle, cropX:crop.x, cropY:crop.y, width:crop.width, height:crop.height, scaleX:layer.width / crop.width, scaleY:layer.height / crop.height, opacity:layer.opacity, visible:layer.visible, selectable:!layer.locked, evented:!layer.locked, lockScalingFlip:true, objectCaching:false, cornerColor:'#a0e7cb', borderColor:'#a0e7cb', transparentCorners:false, cornerSize:12, padding:0});
       object.composerId = layer.id;
       object.setControlsVisibility({ml:!ratio.checked,mr:!ratio.checked,mt:!ratio.checked,mb:!ratio.checked});
       return object;
     }
-    function thumbnail(asset) {
+    function thumbnail(asset, crop) {
       const url = mediaURL(asset.url), frame = el('span', 'ic-thumbnail'), bitmap = images.get(url);
       frame.setAttribute('aria-hidden', 'true'); frame.draggable = false;
       if (bitmap) {
         // Reuse decoded pixels: rebuilding the layer list must not fetch the image again.
-        const preview = el('canvas'), scale = Math.min(1, 220 / bitmap.width, 120 / bitmap.height); preview.draggable = false;
-        preview.width = Math.max(1, Math.round(bitmap.width * scale)); preview.height = Math.max(1, Math.round(bitmap.height * scale));
-        preview.getContext('2d').drawImage(bitmap, 0, 0, preview.width, preview.height); frame.append(preview);
+        const region = crop || {x:0,y:0,width:bitmap.width,height:bitmap.height};
+        const preview = el('canvas'), scale = Math.min(1, 220 / region.width, 120 / region.height); preview.draggable = false;
+        preview.width = Math.max(1, Math.round(region.width * scale)); preview.height = Math.max(1, Math.round(region.height * scale));
+        preview.getContext('2d').drawImage(bitmap, region.x, region.y, region.width, region.height, 0, 0, preview.width, preview.height); frame.append(preview);
       } else {
         const preview = el('img'); preview.alt = ''; preview.loading = 'lazy'; preview.decoding = 'async'; preview.draggable = false;
         const original = new URL(url);
@@ -276,7 +290,7 @@
     function change(mutator) {
       if (!editable() || !model) return;
       const before = copy(model);
-      try { mutator(); model = normalize(model); rebuild(); checkpoint(); clearError(); }
+      try { mutator(); model = normalize(model); rebuild(); checkpoint(); clearError(); return true; }
       catch (error) { model = before; rebuild(); showError(error); }
     }
     function travel(delta) {
@@ -339,8 +353,8 @@
     const nameInput = field(right, '名称', 'text', {maxLength:200});
     const geometry = el('div', 'ic-field-grid'); right.append(geometry);
     const fields = {};
-    for (const [key,label,min,max] of [['x','X / px',-100000,100000],['y','Y / px',-100000,100000],['width','宽度 / px',1,MAX_SIDE],['height','高度 / px',1,MAX_SIDE],['angle','角度 / °',-36000,36000],['opacity','透明度 / %',0,100]]) {
-      const input = field(geometry,label,'number',{min,max,step:key === 'opacity' ? 1 : .1}); fields[key] = input; input.dataset.composerField = key;
+    for (const [key,label,min,max] of [['x','X / px',-100000,100000],['y','Y / px',-100000,100000],['width','宽度 / px',0,MAX_SIDE],['height','高度 / px',0,MAX_SIDE],['angle','角度 / °',-36000,36000],['opacity','透明度 / %',0,100]]) {
+      const input = field(geometry,label,'number',{min,max,step:key === 'opacity' ? 1 : key === 'width' || key === 'height' ? 'any' : .1}); fields[key] = input; input.dataset.composerField = key;
       input.addEventListener('change', () => change(() => {
         const layer = selectedLayer(); if (!layer || layer.locked) return;
         const number = Number(input.value);
@@ -358,6 +372,145 @@
       for (const object of objectMap.values()) object.setControlsVisibility({ml:!ratio.checked,mr:!ratio.checked,mt:!ratio.checked,mb:!ratio.checked});
       canvas.requestRenderAll();
     });
+    const cropButton = button(right, '裁剪图片', beginCrop);
+    cropButton.dataset.composerAction = 'crop';
+    right.append(el('p', 'ic-hint', '裁剪只影响所选图片，保留原图，可重新裁剪或恢复原图。'));
+    const cropDialog = el('dialog', 'ic-crop-dialog');
+    cropDialog.setAttribute('data-image-crop', '');
+    const cropTitle = el('h2', '', '裁剪所选图片'); cropTitle.id = `crop-${uid()}`;
+    cropDialog.setAttribute('aria-labelledby', cropTitle.id);
+    const cropHint = el('p', 'ic-hint', '拖动边框调整范围，框内拖动移动，框外拖动重新框选；也可输入原图像素。');
+    const cropStage = el('div', 'ic-crop-stage'), cropPreview = el('canvas');
+    cropPreview.setAttribute('aria-label', '单张图片裁剪预览，可使用下方数值调整裁剪范围');
+    cropStage.append(cropPreview);
+    const cropFields = el('div', 'ic-field-grid ic-crop-fields'), cropInputs = {};
+    const clamp = (value, min, max) => Math.max(min, Math.min(max, value));
+    for (const [key,label] of [['x','裁剪 X / px'],['y','裁剪 Y / px'],['width','裁剪宽度 / px'],['height','裁剪高度 / px']]) {
+      const input = field(cropFields, label, 'number', {min:key === 'x' || key === 'y' ? 0 : 1,step:1});
+      cropInputs[key] = input;
+      input.addEventListener('change', () => {
+        if (!editable() || !cropSession) return;
+        const {bitmap,rect} = cropSession, value = Number(input.value);
+        if (input.value.trim() && Number.isFinite(value)) {
+          rect[key] = clamp(Math.round(value), Number(input.min), Number(input.max));
+          rect.width = Math.min(rect.width, bitmap.width - rect.x);
+          rect.height = Math.min(rect.height, bitmap.height - rect.y);
+        }
+        paintCrop();
+      });
+    }
+    const cropNote = el('p', 'ic-hint'); cropNote.setAttribute('role', 'status');
+    const cropActions = el('div', 'ic-crop-actions');
+    button(cropActions, '恢复原图', () => {
+      if (!cropSession) return;
+      const {bitmap} = cropSession;
+      cropSession.rect = {x:0,y:0,width:bitmap.width,height:bitmap.height}; paintCrop();
+    });
+    const cropCancel = el('button', 'ic-button', '取消裁剪'); cropCancel.type = 'button'; cropCancel.dataset.composerAction = 'cancel-crop';
+    cropCancel.addEventListener('click', cancelCrop); cropActions.append(cropCancel);
+    button(cropActions, '应用裁剪', applyCrop, 'ic-primary');
+    cropDialog.append(cropTitle, cropHint, cropStage, cropFields, cropNote, cropActions); dialog.append(cropDialog);
+    cropDialog.addEventListener('cancel', event => { event.preventDefault(); event.stopPropagation(); cancelCrop(); });
+    cropDialog.addEventListener('keydown', event => event.stopPropagation());
+    function cancelCrop() {
+      cropSession = null; cropDialog.close(); cropPreview.width = cropPreview.height = 0;
+      cropButton.focus({preventScroll:true});
+    }
+    function beginCrop() {
+      const layer = selectedLayer();
+      if (!layer || layer.locked) return;
+      const bitmap = images.get(mediaURL(layer.asset.url));
+      cropSession = {id:layer.id,bitmap,rect:{...imageCrop(layer)},drag:null};
+      const scale = Math.min(720 / bitmap.width, 420 / bitmap.height);
+      cropPreview.width = Math.max(1, Math.round(bitmap.width * scale));
+      cropPreview.height = Math.max(1, Math.round(bitmap.height * scale));
+      paintCrop(); cropDialog.showModal(); cropCancel.focus();
+    }
+    function cropHandles(rect) {
+      return [[-1,-1],[0,-1],[1,-1],[-1,0],[1,0],[-1,1],[0,1],[1,1]].map(([fx,fy]) =>
+        ({fx,fy,x:rect.x + (fx + 1) * rect.width / 2,y:rect.y + (fy + 1) * rect.height / 2}));
+    }
+    function paintCrop() {
+      if (!cropSession) return;
+      const {bitmap,rect} = cropSession, ctx = cropPreview.getContext('2d');
+      const sx = cropPreview.width / bitmap.width, sy = cropPreview.height / bitmap.height;
+      const x = rect.x * sx, y = rect.y * sy, w = rect.width * sx, h = rect.height * sy;
+      ctx.clearRect(0,0,cropPreview.width,cropPreview.height);
+      ctx.drawImage(bitmap,0,0,cropPreview.width,cropPreview.height);
+      ctx.fillStyle = '#000a'; ctx.beginPath(); ctx.rect(0,0,cropPreview.width,cropPreview.height); ctx.rect(x,y,w,h); ctx.fill('evenodd');
+      ctx.strokeStyle = '#ffffff'; ctx.lineWidth = 2; ctx.strokeRect(x,y,w,h);
+      ctx.strokeStyle = '#ffffff88'; ctx.lineWidth = 1; ctx.beginPath();
+      for (const part of [1/3,2/3]) { ctx.moveTo(x + w * part,y); ctx.lineTo(x + w * part,y + h); ctx.moveTo(x,y + h * part); ctx.lineTo(x + w,y + h * part); }
+      ctx.stroke(); ctx.fillStyle = '#ffffff';
+      for (const handle of cropHandles(rect)) ctx.fillRect(handle.x * sx - 4,handle.y * sy - 4,8,8);
+      for (const [key,input] of Object.entries(cropInputs)) {
+        input.max = key === 'x' ? bitmap.width - 1 : key === 'y' ? bitmap.height - 1 : key === 'width' ? bitmap.width - rect.x : bitmap.height - rect.y;
+        input.value = rect[key];
+      }
+      cropNote.textContent = `原图 ${bitmap.width} × ${bitmap.height} px · 保留 ${rect.width} × ${rect.height} px`;
+    }
+    function cropPoint(event) {
+      const bounds = cropPreview.getBoundingClientRect(), {bitmap} = cropSession;
+      return {x:clamp(Math.round((event.clientX - bounds.left) * bitmap.width / bounds.width),0,bitmap.width),
+        y:clamp(Math.round((event.clientY - bounds.top) * bitmap.height / bounds.height),0,bitmap.height)};
+    }
+    function cropHit(point) {
+      const {rect,bitmap} = cropSession, bounds = cropPreview.getBoundingClientRect();
+      const handles = cropHandles(rect).map(handle => ({...handle,distance:Math.hypot((point.x - handle.x) * bounds.width / bitmap.width,(point.y - handle.y) * bounds.height / bitmap.height)}));
+      const nearest = handles.sort((a,b) => a.distance - b.distance)[0];
+      if (nearest.distance <= 14) return nearest;
+      return point.x > rect.x && point.x < rect.x + rect.width && point.y > rect.y && point.y < rect.y + rect.height ? 'move' : 'new';
+    }
+    cropPreview.addEventListener('pointerdown', event => {
+      if (event.button !== 0 || !editable() || !cropSession || cropSession.drag) return;
+      event.preventDefault();
+      const point = cropPoint(event), mode = cropHit(point), {bitmap} = cropSession;
+      if (mode === 'new') { point.x = Math.min(point.x,bitmap.width - 1); point.y = Math.min(point.y,bitmap.height - 1); }
+      cropSession.drag = {pointerId:event.pointerId,point,mode,before:{...cropSession.rect}};
+      cropPreview.setPointerCapture(event.pointerId);
+    });
+    cropPreview.addEventListener('pointermove', event => {
+      if (!cropSession || !editable()) return;
+      const point = cropPoint(event), {drag,bitmap} = cropSession;
+      if (!drag) {
+        const hit = cropHit(point);
+        cropPreview.style.cursor = typeof hit === 'string' ? hit === 'move' ? 'move' : 'crosshair' : hit.fx === 0 ? 'ns-resize' : hit.fy === 0 ? 'ew-resize' : hit.fx === hit.fy ? 'nwse-resize' : 'nesw-resize';
+        return;
+      }
+      if (drag.pointerId !== event.pointerId) return;
+      event.preventDefault();
+      const {before,mode} = drag, dx = point.x - drag.point.x, dy = point.y - drag.point.y;
+      if (mode === 'move') cropSession.rect = {...before,x:clamp(before.x + dx,0,bitmap.width - before.width),y:clamp(before.y + dy,0,bitmap.height - before.height)};
+      else if (mode === 'new') cropSession.rect = {x:Math.min(point.x,drag.point.x),y:Math.min(point.y,drag.point.y),width:Math.max(1,Math.abs(dx)),height:Math.max(1,Math.abs(dy))};
+      else {
+        let x = before.x, y = before.y, right = x + before.width, bottom = y + before.height;
+        if (mode.fx < 0) x = clamp(x + dx,0,right - 1);
+        if (mode.fx > 0) right = clamp(right + dx,x + 1,bitmap.width);
+        if (mode.fy < 0) y = clamp(y + dy,0,bottom - 1);
+        if (mode.fy > 0) bottom = clamp(bottom + dy,y + 1,bitmap.height);
+        cropSession.rect = {x,y,width:right - x,height:bottom - y};
+      }
+      paintCrop();
+    });
+    cropPreview.addEventListener('lostpointercapture', () => { if (cropSession) cropSession.drag = null; });
+    function applyCrop() {
+      if (!cropSession) return;
+      const {id,bitmap,rect} = cropSession;
+      const applied = change(() => {
+        const layer = selectedLayer();
+        if (!layer || layer.id !== id || layer.locked) throw new Error('所选图层已变化，请重新打开裁剪。');
+        const previous = imageCrop(layer), sx = layer.width / previous.width, sy = layer.height / previous.height;
+        const dx = (rect.x - previous.x) * sx, dy = (rect.y - previous.y) * sy, angle = layer.angle * Math.PI / 180;
+        // Preserve each retained source pixel's canvas position, including rotated/non-uniformly scaled layers.
+        layer.x += dx * Math.cos(angle) - dy * Math.sin(angle);
+        layer.y += dx * Math.sin(angle) + dy * Math.cos(angle);
+        layer.width = rect.width * sx; layer.height = rect.height * sy;
+        if (rect.x === 0 && rect.y === 0 && rect.width === bitmap.width && rect.height === bitmap.height) delete layer.crop;
+        else layer.crop = {...rect};
+      });
+      if (applied) cancelCrop();
+      else cropNote.textContent = errorBox.textContent;
+    }
     nameInput.addEventListener('change', () => change(() => { const layer = selectedLayer(); if (layer && !layer.locked) layer.name = nameInput.value || '图片'; }));
     right.append(el('p', 'ic-hint', 'X / Y 是图片未旋转时的左上角原点。锁定图层后，需先解锁才能修改属性或在画布移动。'));
     const saveButton = button(footer, '保存编辑稿', save, 'ic-primary');
@@ -370,6 +523,7 @@
       if (!transparent.checked) background.value = model.background;
       nameInput.value = layer?.name || '';
       nameInput.dataset.inactive = !layer || layer.locked ? '1' : '0';
+      cropButton.dataset.inactive = !layer || layer.locked ? '1' : '0';
       for (const [key,input] of Object.entries(fields)) {
         input.value = layer ? String(Math.round(layer[key] * (key === 'opacity' ? 100 : 1) * 1000) / 1000) : '';
         input.dataset.inactive = !layer || layer.locked ? '1' : '0';
@@ -389,7 +543,7 @@
         row.draggable = !busy && allowed(); row.dataset.layerId = item.id;
         const filename = assetName(item.asset);
         const select = el('button', 'ic-layer-name'); select.type = 'button'; select.title = filename; select.dataset.layerAction = 'select';
-        select.append(thumbnail(item.asset), el('span', 'ic-asset-name', filename));
+        select.append(thumbnail(item.asset, item.crop), el('span', 'ic-asset-name', filename));
         select.setAttribute('aria-pressed', String(selected === item.id)); select.disabled = busy || !allowed();
         select.addEventListener('click', () => {
           if (!editable()) return;

@@ -147,7 +147,7 @@ async function bootFixture(folder) {
 }
 
 // Encode lossless 8x8 RGBA fixtures without external tools or on-disk input files.
-function solidPNG(r, g, b) {
+function solidPNG(r, g, b, pixel = () => [r,g,b,255]) {
   function chunk(type, data) {
     const bytes = Buffer.concat([Buffer.from(type), data]);
     let crc = 0xffffffff;
@@ -161,7 +161,7 @@ function solidPNG(r, g, b) {
   }
   const header = Buffer.alloc(13); header.writeUInt32BE(8,0); header.writeUInt32BE(8,4); header[8] = 8; header[9] = 6;
   const rows = Buffer.alloc(8 * 33);
-  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) rows.set([r,g,b,255], y * 33 + 1 + x * 4);
+  for (let y = 0; y < 8; y++) for (let x = 0; x < 8; x++) rows.set(pixel(x,y), y * 33 + 1 + x * 4);
   return Buffer.concat([Buffer.from([137,80,78,71,13,10,26,10]), chunk('IHDR',header), chunk('IDAT',zlib.deflateSync(rows)), chunk('IEND',Buffer.alloc(0))]);
 }
 async function api(page, url, method = 'GET', data) {
@@ -174,7 +174,10 @@ async function settle(page) {
   await page.evaluate(async () => { await persistence.pendingChain; });
 }
 async function openProject(page, id) {
-  await page.evaluate(async id => { await loadProjects(); await openProject(id); pick('composite'); }, id);
+  await page.evaluate(async () => { await bootReady; });
+  await page.waitForFunction(() => !presenceSocket || presenceSocket.readyState !== WebSocket.CONNECTING);
+  await page.evaluate(async id => { await loadProjects(); if (PROJ?.id !== id) await openProject(id); pick('composite'); }, id);
+  await page.waitForFunction(() => presenceSocket?.readyState === WebSocket.OPEN);
   await settle(page);
 }
 async function launch(fixture, report) {
@@ -193,10 +196,8 @@ async function guardNetwork(context, origin, report) {
     report.browserOutbound.push(url.href); return route.abort('blockedbyclient');
   });
   // Newer Playwright supports interception of WebSockets as well as HTTP.
-  if (context.routeWebSocket) await context.routeWebSocket(/.*/, socket => {
-    const url = new URL(socket.url());
-    if (url.host === new URL(origin).host) socket.connectToServer();
-    else { report.browserOutbound.push(url.href); socket.close(); }
+  if (context.routeWebSocket) await context.routeWebSocket(url => url.host !== new URL(origin).host, socket => {
+    report.browserOutbound.push(socket.url()); socket.close();
   });
 }
 async function login(context, origin, username) {
@@ -204,13 +205,27 @@ async function login(context, origin, username) {
     headers:{Origin:origin}, data:{username,password:PASSWORD},
   });
   assert.equal(response.status(),200,await response.text());
+  const session = await response.json();
+  if (!session.user.phone) {
+    const phone = await context.request.post(origin + '/api/auth/phone', {
+      headers:{Origin:origin,'X-CSRF-Token':session.csrf_token},data:{phone:'13800138000'},
+    });
+    assert.equal(phone.status(),200,await phone.text());
+  }
 }
 async function loadPage(context, fixture, report) {
   const page = await context.newPage();
   page.on('pageerror', error => report.pageErrors.push(error.stack));
+  page.on('console', message => { if (message.type() === 'error') (report.consoleErrors ||= []).push(message.text()); });
+  page.on('response', response => { if (response.status() >= 400) (report.failedResponses ||= []).push({url:response.url(),status:response.status()}); });
   page.on('dialog', dialog => dialog.accept());
   await page.goto(fixture.origin);
-  await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+  try { await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active); }
+  catch (error) {
+    report.bootState = await page.evaluate(() => ({url:location.href,text:document.body.innerText,
+      cards:typeof CARDS === 'undefined' ? null : CARDS,auth:window.H3Auth?.active}));
+    throw error;
+  }
   return page;
 }
 function compositeCard(composition) {
@@ -517,6 +532,139 @@ async function referenceFixture(t, prefix, run) {
     try { if (browser) await browser.close(); } finally { if (fixture) await fixture.stop(); }
   }
 }
+
+test('image composer crop: real pointer editing, cancel, transforms, history, source preservation, reload and PNG pixels', {timeout:180000}, async t => {
+  await referenceFixture(t,'chouka-image-composer-crop-',async ({page,folder,report}) => {
+    const project = await api(page,'/api/projects','POST',{name:'单图裁剪隔离验收'});
+    await api(page,`/api/projects/${project.id}/cards`,'POST',{card:compositeCard()});
+    await openProject(page,project.id);
+    const dialog = page.locator('dialog[data-image-composer]'), crop = dialog.locator('dialog[data-image-crop]');
+    const save = dialog.getByRole('button',{name:'保存编辑稿',exact:true});
+    const saved = async () => (await api(page,`/api/projects/${project.id}`)).cards.find(c => c.id === 'composite');
+    async function open() {
+      await page.locator('#panel').getByRole('button',{name:'编辑合成',exact:true}).click(); await expect(save).toBeEnabled();
+    }
+    async function field(label,value,scope = dialog) {
+      const input = scope.getByLabel(label,{exact:true}); await input.fill(String(value)); await input.press('Tab');
+    }
+    async function choose(filename) { await dialog.locator('.ic-layer-name').filter({hasText:filename}).click(); }
+    async function persist() { await save.click(); await expect(save).toBeEnabled(); await settle(page); return (await saved()).params.composition; }
+    async function startCrop() { await dialog.getByRole('button',{name:'裁剪图片',exact:true}).click(); await expect(crop).toBeVisible(); }
+    async function setCrop() {
+      for (const [label,value] of [['裁剪 X / px',4],['裁剪 Y / px',0],['裁剪宽度 / px',4],['裁剪高度 / px',4]]) await field(label,value,crop);
+    }
+    async function apply() { await crop.getByRole('button',{name:'应用裁剪',exact:true}).click(); await expect(crop).not.toBeVisible(); }
+    const patterned = solidPNG(0,0,0,(x,y) => y < 4 ? (x < 4 ? [255,0,0,255] : [0,255,0,255]) : (x < 4 ? [0,0,255,255] : [255,255,0,255]));
+    await open(); await expect(dialog.getByRole('button',{name:'裁剪图片',exact:true})).toBeDisabled();
+    await field('画布宽度 / px',64); await field('画布高度 / px',64);
+    await dialog.locator('input[type=file]').setInputFiles([
+      {name:'quadrants.png',mimeType:'image/png',buffer:patterned},
+      {name:'unaffected.png',mimeType:'image/png',buffer:solidPNG(0,0,255)},
+    ]);
+    await expect(dialog.locator('.ic-layer')).toHaveCount(2); await expect(save).toBeEnabled();
+    await choose('unaffected.png'); await field('X / px',48); await field('Y / px',48);
+    await choose('quadrants.png');
+    await dialog.getByLabel('锁定宽高比',{exact:true}).uncheck();
+    for (const [label,value] of [['X / px',8],['Y / px',8],['宽度 / px',32],['高度 / px',24],['角度 / °',90]]) await field(label,value);
+    const initial = await persist(), original = initial.layers.find(l => l.asset.origin === 'quadrants.png');
+    const other = initial.layers.find(l => l.id !== original.id);
+    assert.ok(original); assert.ok(other);
+    await dialog.getByRole('button',{name:`锁定 ${original.name}`,exact:true}).click();
+    await expect(dialog.getByRole('button',{name:'裁剪图片',exact:true})).toBeDisabled();
+    await dialog.getByRole('button',{name:`解锁 ${original.name}`,exact:true}).click();
+    await startCrop(); await setCrop();
+    // Nested-modal keys must not delete or undo the underlying layer/card.
+    await crop.getByRole('button',{name:'恢复原图',exact:true}).focus();
+    await page.keyboard.press('Delete'); await page.keyboard.press('Control+z'); await page.keyboard.press('Escape');
+    await expect(crop).not.toBeVisible(); assert.deepEqual((await persist()).layers,initial.layers);
+    await startCrop();
+    const preview = crop.locator('canvas');
+    async function drag(from,to) {
+      const box = await preview.boundingBox();
+      const point = ([x,y]) => ({x:box.x + x * box.width / 8,y:box.y + y * box.height / 8});
+      const a = point(from), b = point(to);
+      await page.mouse.move(a.x,a.y); await page.mouse.down(); await page.mouse.move(b.x,b.y,{steps:8}); await page.mouse.up();
+    }
+    await drag([7.95,7.95],[4,4]);
+    await expect(crop.getByLabel('裁剪宽度 / px',{exact:true})).toHaveValue('4');
+    await expect(crop.getByLabel('裁剪高度 / px',{exact:true})).toHaveValue('4');
+    await drag([2,2],[4,2]); await expect(crop.getByLabel('裁剪 X / px',{exact:true})).toHaveValue('2');
+    await drag([6,5],[8,8]);
+    await expect(crop.getByLabel('裁剪 X / px',{exact:true})).toHaveValue('6');
+    await expect(crop.getByLabel('裁剪 Y / px',{exact:true})).toHaveValue('5');
+    await expect(crop.getByLabel('裁剪宽度 / px',{exact:true})).toHaveValue('2');
+    await field('裁剪 X / px',999,crop); await expect(crop.getByLabel('裁剪 X / px',{exact:true})).toHaveValue('7');
+    await field('裁剪宽度 / px',0,crop); await expect(crop.getByLabel('裁剪宽度 / px',{exact:true})).toHaveValue('1');
+    await crop.getByRole('button',{name:'恢复原图',exact:true}).click(); await setCrop();
+    await page.screenshot({path:path.join(folder,'crop-desktop.png'),fullPage:true});
+    await apply();
+    const rotated = (await persist()).layers.find(l => l.id === original.id);
+    assert.deepEqual(rotated.crop,{x:4,y:0,width:4,height:4});
+    assert.ok(Math.abs(rotated.x - 8) < 1e-8); assert.equal(rotated.y,24);
+    assert.equal(rotated.width,16); assert.equal(rotated.height,12); assert.equal(rotated.angle,90);
+    await dialog.getByRole('button',{name:'撤销',exact:true}).click();
+    assert.deepEqual((await persist()).layers,initial.layers);
+    await dialog.getByRole('button',{name:'重做',exact:true}).click();
+    assert.deepEqual((await persist()).layers.find(l => l.id === original.id),rotated);
+    // Restore the source non-destructively, then crop at zero rotation for exact PNG pixels.
+    await startCrop(); await crop.getByRole('button',{name:'恢复原图',exact:true}).click(); await apply();
+    const restored = (await persist()).layers.find(l => l.id === original.id);
+    assert.equal(restored.crop,undefined); assert.equal(restored.width,32); assert.equal(restored.height,24);
+    assert.ok(Math.abs(restored.x - 8) < 1e-8); assert.equal(restored.y,8);
+    // A one-source-pixel crop can occupy less than one canvas pixel. Never round its scale up.
+    await field('宽度 / px',4); await field('高度 / px',4); await startCrop();
+    for (const [label,value] of [['裁剪 X / px',2],['裁剪 Y / px',2],['裁剪宽度 / px',1],['裁剪高度 / px',1]]) await field(label,value,crop);
+    await apply();
+    const tiny = (await persist()).layers.find(l => l.id === original.id);
+    assert.equal(tiny.width,.5); assert.equal(tiny.height,.5);
+    await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id); await open(); await choose('quadrants.png');
+    await startCrop(); await crop.getByRole('button',{name:'恢复原图',exact:true}).click(); await apply();
+    const tinyRestored = (await persist()).layers.find(l => l.id === original.id);
+    assert.equal(tinyRestored.crop,undefined); assert.equal(tinyRestored.width,4); assert.equal(tinyRestored.height,4);
+    assert.ok(Math.abs(tinyRestored.x - 8) < 1e-8); assert.ok(Math.abs(tinyRestored.y - 8) < 1e-8);
+    await dialog.getByLabel('锁定宽高比',{exact:true}).uncheck();
+    await field('宽度 / px',32); await field('高度 / px',24);
+    await field('角度 / °',0); await field('X / px',8); await field('Y / px',8); await startCrop(); await setCrop(); await apply();
+    const composition = await persist(), clipped = composition.layers.find(l => l.id === original.id);
+    assert.deepEqual({x:clipped.x,y:clipped.y,width:clipped.width,height:clipped.height,crop:clipped.crop},
+      {x:24,y:8,width:16,height:12,crop:{x:4,y:0,width:4,height:4}});
+    assert.deepEqual(composition.layers.find(l => l.id === other.id),other,'Only the selected image changes');
+    assert.deepEqual(clipped.asset,original.asset,'Cropping retains the original resource identity');
+    const source = await page.request.get(new URL(clipped.asset.url,page.url()).href);
+    assert.deepEqual(await source.body(),patterned,'Original file bytes are never overwritten');
+    await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+    await page.reload(); await page.waitForFunction(() => typeof CARDS !== 'undefined' && CARDS.length && H3Auth.active);
+    await openProject(page,project.id); await open(); await choose('quadrants.png');
+    assert.deepEqual((await saved()).params.composition,composition,'Server reload preserves source crop and layer transforms');
+    await startCrop(); await expect(crop.getByLabel('裁剪 X / px',{exact:true})).toHaveValue('4');
+    await page.setViewportSize({width:720,height:900});
+    await page.screenshot({path:path.join(folder,'crop-narrow.png'),fullPage:true});
+    const overflow = await crop.evaluate(node => node.scrollWidth > node.clientWidth + 1); assert.equal(overflow,false,'Narrow crop modal has no horizontal overflow');
+    await crop.getByRole('button',{name:'取消裁剪',exact:true}).click();
+    await page.setViewportSize({width:1600,height:1100});
+    await dialog.getByRole('button',{name:'合成 PNG',exact:true}).click();
+    await expect.poll(async () => (await saved()).outputs.length).toBe(1); await expect(save).toBeEnabled();
+    const output = (await saved()).outputs[0];
+    const pixels = await page.evaluate(async url => {
+      const bitmap = await createImageBitmap(await (await fetch(url)).blob());
+      const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
+      const ctx = canvas.getContext('2d'); ctx.drawImage(bitmap,0,0); bitmap.close();
+      return [[10,10],[26,10],[38,18],[26,24],[50,50]].map(([x,y]) => [...ctx.getImageData(x,y,1,1).data]);
+    },output.url);
+    assert.deepEqual(pixels,[[0,0,0,0],[0,255,0,255],[0,255,0,255],[0,0,0,0],[0,0,255,255]],'PNG uses only the retained source pixels, without stretching the crop back to the original layer size');
+    await dialog.locator('.upper-canvas').click({position:{x:60,y:10}});
+    const live = await dialog.locator('.lower-canvas').evaluate(canvas => {
+      const ctx = canvas.getContext('2d'); return [...ctx.getImageData(32,14,1,1).data];
+    });
+    assert.deepEqual(live,[0,255,0,255],'Interactive canvas and exported PNG show the same cropped image');
+    const audit = await api(page,'/__fixture/audit');
+    assert.equal(audit.writes.filter(w => w.path === '/api/upload').length,3,'Cropping uses no extra uploads: two original sources and one final PNG');
+    report.composition = composition; report.pixels = pixels; report.rotated = rotated;
+    await dialog.getByRole('button',{name:'关闭',exact:true}).click();
+  });
+});
 
 test('image composer inputs: sequential real sources, visible references, output, reload, disconnect and eight-slot limit', {timeout:180000}, async t => {
   await referenceFixture(t,'chouka-image-composer-inputs-',async ({page,folder,report}) => {
