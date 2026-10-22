@@ -69,6 +69,18 @@ dialog.chouka-composer[open] { display:flex; flex-direction:column; }
 .chouka-composer .ic-switch input[type=checkbox]:checked::after { transform:translateX(16px); }
 .chouka-composer .ic-footer { flex:none; display:flex; align-items:center; justify-content:flex-end; gap:10px; padding:12px 20px; border-top:1px solid var(--ic-line); background:var(--ic-panel); }
 .chouka-composer .ic-footer>.ic-hint { flex:1; margin:0; }
+.chouka-composer .ic-crop-dialog { width:min(820px,94vw); max-width:94vw; max-height:90dvh; padding:20px; margin:auto; overflow:auto; overscroll-behavior:contain; color:var(--ic-text); background:var(--ic-panel); border:1px solid var(--ic-line); border-radius:12px; box-shadow:0 24px 80px #000a; }
+.chouka-composer .ic-crop-dialog[open] { display:flex; flex-direction:column; gap:12px; }
+.chouka-composer .ic-crop-dialog::backdrop { background:#050a0cbf; }
+.chouka-composer .ic-crop-dialog h2 { margin:0; font-size:18px; }
+.chouka-composer .ic-crop-dialog .ic-hint { margin:0; }
+.chouka-composer .ic-crop-stage { display:flex; flex:none; justify-content:center; align-items:center; padding:8px; min-height:80px; background-color:#27352f; background-image:conic-gradient(#35463c 25%,transparent 0 50%,#35463c 0 75%,transparent 0); background-size:16px 16px; border:1px solid var(--ic-line); border-radius:6px; }
+.chouka-composer .ic-crop-stage canvas { display:block; max-width:100%; height:auto; max-height:48dvh; object-fit:contain; touch-action:none; cursor:crosshair; }
+.chouka-composer .ic-crop-fields { grid-template-columns:repeat(4,minmax(0,1fr)); }
+.chouka-composer .ic-crop-fields .ic-field { margin:0; }
+.chouka-composer .ic-crop-actions { display:flex; flex-wrap:wrap; justify-content:flex-end; gap:10px; }
+.chouka-composer .ic-crop-actions .ic-button { min-height:44px; }
+@media (max-width:760px) { .chouka-composer .ic-crop-dialog { padding:14px; } .chouka-composer .ic-crop-dialog .ic-crop-fields { grid-template-columns:repeat(2,minmax(0,1fr)); } }
 @media (min-width:1700px) { .chouka-composer .ic-body { grid-template-columns:280px minmax(0,1fr) 280px; } }
 @media (max-width:1100px) { .chouka-composer .ic-body { grid-template-columns:205px minmax(0,1fr) 215px; } .chouka-composer .ic-left,.chouka-composer .ic-right { padding:10px; } .chouka-composer .ic-center { padding:8px; } .chouka-composer .ic-toolbar .ic-button { padding:6px; } }
 @media (max-width:760px) {
