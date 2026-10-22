@@ -359,6 +359,138 @@ test('节点详情完整显示并滚动承载长模型缺失清单', async () =>
   });
 });
 
+test('大节点完整配置按需分页，展开与轮询不挂载全量文本', async () => {
+  await withFixture({}, async fixture => {
+    const {page, handlers, at} = fixture;
+    const items = workers(at);
+    const caps = items[0].capabilities;
+    caps.node_classes = Array.from({length:5283}, (_, i) => `SyntheticNode_${i}`);
+    const models = Array.from({length:534}, (_, i) => `models/合成测试目录/version-${i}/model-${'x'.repeat(60)}.safetensors`);
+    caps.input_choices = Object.fromEntries(Array.from({length:300}, (_, i) => [`Loader_${i}`, {model:models}]));
+    caps.last_value = '<img src=x onerror="window.configInjected=1">配置结束';
+    handlers['/api/workers'] = () => ({body:{comparison_baseline:{status:'ready', worker_id:'worker-idle', agent_version:5}, workers:items}});
+    await page.addInitScript(() => {
+      const stringify = JSON.stringify;
+      window.configSerializations = 0;
+      JSON.stringify = function(value, ...args) {
+        if (value?.node_classes?.length === 5283) window.configSerializations++;
+        return stringify.call(this, value, ...args);
+      };
+    });
+    await dashboard(fixture);
+    await page.locator('[data-worker="worker-a"]').click();
+    assert.equal(await page.evaluate(() => configSerializations), 0, '首次展开前不序列化配置');
+    const before = await page.locator('dialog details pre').allTextContents();
+    const elapsed = await page.locator('dialog details').evaluate(async node => {
+      const start = performance.now(); node.open = true;
+      await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+      return performance.now() - start;
+    });
+    console.log(`合成配置 ${JSON.stringify(caps).length} 字符，展开至两帧 ${Math.round(elapsed)}ms`);
+    assert.equal(before.join('').length, 0, '折叠时不序列化或挂载全量配置');
+    const pre = page.locator('dialog details pre');
+    await page.waitForFunction(() => document.querySelector('dialog details pre')?.textContent.length > 0);
+    assert.ok((await pre.textContent()).length <= 16384, '每页文本有固定上限，不能仅用CSS裁剪全量内容');
+    assert.match(await pre.textContent(), /agent_version/);
+    const firstPage = await pre.textContent();
+    const previous = page.locator('[data-config-prev]'), next = page.locator('[data-config-next]');
+    assert.equal(await previous.isDisabled(), true);
+    await next.click();
+    assert.notEqual(await pre.textContent(), firstPage);
+    const secondPage = await pre.textContent();
+    assert.ok(secondPage.length <= 16384);
+    assert.match(await page.locator('[data-config-page]').textContent(), /第 2 \/ \d+ 页/);
+    caps.telemetry.hostname = '刷新后的主机名';
+    caps.agent_version = 6;
+    await tick(fixture, 5000, '/api/status');
+    assert.equal(await pre.textContent(), secondPage, '轮询不替换已打开的快照或重置页码');
+    assert.equal(await next.evaluate(node => node === document.activeElement), true, '轮询不抢分页按钮焦点');
+    await page.locator('dialog summary').click();
+    await settle(page);
+    await page.locator('dialog summary').click();
+    await settle(page);
+    assert.equal(await pre.textContent(), secondPage, '收起再展开保留当前页');
+    assert.equal(await page.evaluate(() => configSerializations), 1, '分页和反复展开不重复序列化大配置');
+    await previous.click();
+    assert.equal(await pre.textContent(), firstPage);
+    const downloadPromise = page.waitForEvent('download');
+    await page.locator('[data-config-download]').click();
+    const download = await downloadPromise;
+    const chunks = []; for await (const chunk of await download.createReadStream()) chunks.push(chunk);
+    const downloaded = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+    assert.equal(download.suggestedFilename(), 'worker-capabilities.json');
+    assert.deepEqual(downloaded, {...caps, agent_version:5, telemetry:{...caps.telemetry, hostname:'WIN-A'}}, '下载保留打开时的完整快照，不截断也不混入后续轮询');
+    assert.equal(await page.evaluate(() => window.configInjected), undefined);
+    await page.setViewportSize({width:390, height:844});
+    assert.equal(await page.locator('dialog').evaluate(node => node.scrollWidth <= node.clientWidth), true, '移动端配置在文本框内横向滚动');
+    await closeDialog(page);
+    assert.equal(await page.evaluate(() => document.activeElement.dataset.focusKey), 'worker-details:worker-a');
+    await page.locator('[data-worker="worker-a"]').click();
+    await page.locator('dialog summary').click();
+    await page.waitForFunction(() => document.querySelector('dialog details pre')?.textContent.includes('"agent_version": 6'));
+    assert.match(await page.locator('dialog .f-definition').textContent(), /刷新后的主机名/);
+    assert.equal(await page.evaluate(() => configSerializations), 2, '重新打开详情读取新的快照');
+    await closeDialog(page);
+  });
+});
+
+test('完整配置分页逐字保留长字符串、特殊字符和代理对，末页可返回', async () => {
+  await withFixture({}, async fixture => {
+    const {page, handlers, at} = fixture;
+    const items = workers(at);
+    // 将非 BMP 字符精确放到第一页边界，不能拆成两个损坏字符。
+    const caps = {long:'x'.repeat(15986) + String.fromCodePoint(0x20000) + 'y'.repeat(17000), last_value:'<img src=x onerror="window.configInjected=1">'};
+    items[0].capabilities = caps;
+    handlers['/api/workers'] = () => ({body:{workers:items}});
+    await dashboard(fixture);
+    await page.locator('[data-worker="worker-a"]').click();
+    await page.locator('dialog summary').click();
+    const pre = page.locator('dialog details pre'), next = page.locator('[data-config-next]');
+    await pre.waitFor();
+    let full = '';
+    for (let index = 0; index < 3; index++) {
+      const text = await pre.textContent();
+      assert.ok(text.length <= 16001);
+      assert.equal(text.isWellFormed(), true, '每页不能包含被拆开的代理对');
+      full += text;
+      if (index < 2) { await next.focus(); await page.keyboard.press('Enter'); }
+    }
+    assert.equal(await pre.evaluate(node => node === document.activeElement), true, '末页按钮禁用时焦点转到配置文本');
+    assert.equal(full, JSON.stringify(caps, null, 2), '所有分页拼接必须与原始配置逐字一致');
+    assert.equal(await next.isDisabled(), true);
+    assert.match(await page.locator('[data-config-page]').textContent(), /第 3 \/ 3 页/);
+    assert.equal(await page.locator('dialog img, dialog script').count(), 0);
+    assert.equal(await page.evaluate(() => window.configInjected), undefined);
+    await page.locator('[data-config-prev]').click();
+    assert.match(await page.locator('[data-config-page]').textContent(), /第 2 \/ 3 页/);
+    await page.locator('[data-config-prev]').focus();
+    await page.keyboard.press('Enter');
+    assert.match(await page.locator('[data-config-page]').textContent(), /第 1 \/ 3 页/);
+    assert.equal(await pre.evaluate(node => node === document.activeElement), true, '首页按钮禁用时焦点仍保留在配置区');
+    await page.keyboard.press('Shift+Tab');
+    assert.equal(await page.locator('[data-config-download]').evaluate(node => node === document.activeElement), true, '后续键盘导航不跳回弹窗顶部');
+    await closeDialog(page);
+  });
+});
+
+test('空配置仍可展开，单页分页按钮禁用且正常关闭', async () => {
+  await withFixture({}, async fixture => {
+    const {page, handlers, at} = fixture;
+    const items = workers(at); delete items[0].capabilities;
+    handlers['/api/workers'] = () => ({body:{workers:items}});
+    await dashboard(fixture);
+    await page.locator('[data-worker="worker-a"]').click();
+    await page.locator('dialog summary').click();
+    await page.locator('dialog details pre').waitFor();
+    assert.equal(await page.locator('dialog details pre').textContent(), '{}');
+    assert.equal(await page.locator('[data-config-prev]').isDisabled(), true);
+    assert.equal(await page.locator('[data-config-next]').isDisabled(), true);
+    await page.locator('dialog [data-cancel]').first().click();
+    await page.waitForFunction(() => !document.querySelector('dialog'));
+    assert.equal(await page.evaluate(() => document.body.classList.contains('modal-open')), false);
+  });
+});
+
 test('轮询保留节点及错误入口的焦点，跨刷新关闭弹窗回到原操作且不抢弹窗焦点', async () => {
   await withFixture({}, async fixture => {
     const {page} = fixture; await dashboard(fixture);
