@@ -1,5 +1,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
+const {readFileSync} = require('node:fs');
+const vm = require('node:vm');
 const parameters = require('../web/features/node-parameters.js');
 const {create: createPersistence} = require('../web/features/project-persistence.js');
 const {create: createTasks, createCanvasUpdater} = require('../web/features/task-panel.js');
@@ -166,6 +168,182 @@ test('task cancellation uses task permission, including revocation after opening
   const g=taskFixture(); await g.feature.stopTask(stale); await tick();
   assert.ok(g.calls.includes('/api/job/j/cancel'));
 });
+function canvasTaskFixture(extra={}) {
+  let project={id:'p',permission:'operate',cards:[{id:'c',job:'j',status:'running',step:'执行中',progress:0.4}]};
+  const calls={paint:[],panel:[],history:[],refreshHistory:[],propagate:[],save:[],errors:[]};
+  const update=createCanvasUpdater({getProject:() => project,canOperate:() => project?.permission==='operate',
+    isIF:card => !!card.ifTask,canTask:job => job.permission==='operate',
+    paint:card => calls.paint.push(card.id),refreshPanel:card => calls.panel.push(card.id),
+    pushHistory:(card,job) => calls.history.push(job.id),refreshHistory:card => calls.refreshHistory.push(card.id),
+    propagateCardOutputs:async card => calls.propagate.push(card.id),titleOf:card => card.id,
+    showError:message => calls.errors.push(message),save:edit => calls.save.push(edit),...extra});
+  return {update,calls,get project(){return project;},set project(value){project=value;},
+    get card(){return project.cards[0];}};
+}
+const canvasJob = (extra={}) => ({id:'j',project:'p',card:'c',permission:'operate',status:'running',progress:0.6,...extra});
+
+test('a poll started before production runCard submits cannot cancel its new job absent from the old list', async () => {
+  const pending=deferred(), reference=deferred(), generation=deferred(), f=canvasTaskFixture();
+  const tasks=taskFixture({api:() => pending.promise,onJobsChanged:f.update});
+  const polling=tasks.feature.pollJobs();
+  f.card.status='canceled';
+  const submissions=[];
+  const context=vm.createContext({PROJ:f.project,card:f.card,requireOperate:() => true,
+    isStyle:() => false,isText:() => false,capOf:() => ({id:'video'}),
+    syncReferenceParameters:() => reference.promise,payloadOf:() => ({project:'p',card:'c'}),
+    jpost:(url,body) => {submissions.push({url,body});return generation.promise;},
+    paint:card => f.calls.paint.push(card.id),openPanel() {},el:{panel:{}},
+    save:edit => f.calls.save.push(edit),flushPendingProjectSync() {},
+    persistence:{markWorkFailure:error => assert.fail(error.message)},showError:message => assert.fail(message)});
+  const source=readFileSync(require.resolve('../web/app.js'),'utf8');
+  vm.runInContext(source.slice(source.indexOf('async function runCard('),source.indexOf('async function cancel(c)')),context);
+  const generating=context.runCard(f.card);
+  assert.equal(f.card.job,null); assert.equal(f.card.status,'queued'); assert.equal(submissions.length,0);
+  reference.resolve(); await tick();
+  assert.equal(submissions.length,1); assert.equal(submissions[0].url,'/api/generate');
+  assert.equal(f.card.job,null);
+  generation.resolve({id:'new-job',status:'queued',seed:42}); await generating;
+  const generated=structuredClone(f.card), painted=f.calls.paint.length, saved=f.calls.save.length;
+  pending.resolve({jobs:[canvasJob({status:'canceled'})]}); await polling;
+  assert.deepEqual(structuredClone(f.card),generated); assert.equal(f.calls.paint.length,painted); assert.equal(f.calls.save.length,saved);
+  await f.update([]); assert.deepEqual(structuredClone(f.card),generated);
+  await f.update([canvasJob({id:'new-job',status:'running'})]);
+  assert.equal(f.card.job,'new-job'); assert.equal(f.card.status,'running');
+});
+
+test('missing jobs preserve every card field; explicit canceled retains association and can recover running/done', async () => {
+  const f=canvasTaskFixture(), before=structuredClone(f.card);
+  await f.update([]);
+  assert.deepEqual(f.card,before); assert.ok(Object.values(f.calls).every(calls => !calls.length));
+  await f.update([canvasJob({status:'canceled',step:''})]);
+  assert.equal(f.card.status,'canceled'); assert.equal(f.card.job,'j'); assert.equal(f.card.step,'');
+  await f.update([]); assert.equal(f.card.status,'canceled'); assert.equal(f.card.job,'j');
+  await f.update([canvasJob({status:'running',step:'继续执行'})]);
+  assert.equal(f.card.status,'running'); assert.equal(f.card.step,'继续执行');
+  await f.update([canvasJob({status:'canceled'})]);
+  const done=canvasJob({status:'done',outputs:[{url:'/result.png'}],seed:42,started:10,ended:13});
+  await f.update([done]); await f.update([done]);
+  assert.equal(f.card.status,'done'); assert.equal(f.card.job,'j'); assert.equal(f.card.ms,3000);
+  assert.equal(f.card.seed,42); assert.deepEqual(f.card.outputs,done.outputs);
+  assert.deepEqual(f.calls.history,['j']); assert.deepEqual(f.calls.propagate,['c']);
+});
+
+test('canvas synchronization and confirmed deletion respect task/project permissions, identity and IF isolation', async () => {
+  for (const mode of ['task-read','project-read','wrong-project','wrong-card','if']) {
+    for (const deleted of [false,true]) {
+      const f=canvasTaskFixture(), job=canvasJob({status:'canceled'});
+      if(mode==='task-read') job.permission='read';
+      if(mode==='project-read') f.project.permission='read';
+      if(mode==='wrong-project') job.project='other';
+      if(mode==='wrong-card') job.card='other';
+      if(mode==='if') f.card.ifTask=true;
+      const before=structuredClone(f.card);
+      await f.update([job],{deleted});
+      assert.deepEqual(f.card,before,`${mode}, deleted=${deleted}`);
+      assert.ok(Object.values(f.calls).every(calls => !calls.length));
+    }
+  }
+});
+
+test('old canvas poll skips regenerated or replaced cards after awaiting output propagation', async () => {
+  for (const change of ['new-job','submitting','replacement','permission']) {
+    const hold=deferred(), f=canvasTaskFixture({propagateCardOutputs:() => hold.promise});
+    const second={id:'d',job:'k',status:'running'}; f.project.cards.push(second);
+    const polling=f.update([canvasJob({status:'done'}),canvasJob({id:'k',card:'d',status:'done'})]);
+    if(change==='new-job') Object.assign(second,{job:'new-k',status:'queued'});
+    if(change==='submitting') Object.assign(second,{job:null,status:'queued'});
+    if(change==='replacement') f.project.cards[1]={id:'d',job:'k',status:'queued'};
+    if(change==='permission') f.project.permission='read';
+    const before=structuredClone(f.project.cards[1]);
+    hold.resolve(); await polling;
+    assert.deepEqual(f.project.cards[1],before,change);
+    assert.deepEqual(f.calls.paint,['c']); assert.deepEqual(f.calls.history,['j']);
+    if(change==='permission') assert.deepEqual(f.calls.save,[]);
+  }
+});
+
+test('confirmed DELETE explicitly cancels linked cards and invalidates an older running poll', async () => {
+  const oldPoll=deferred(), f=canvasTaskFixture(), events=[];
+  const tasks=taskFixture({api:async (url,opt) => opt?.method==='DELETE' ? {ok:true} : oldPoll.promise,
+    onJobsChanged:f.update,onTaskDeleted:async job => {events.push(job.id);await f.update([job],{deleted:true});}});
+  const polling=tasks.feature.pollJobs();
+  await tasks.feature.delTask(canvasJob());
+  assert.deepEqual(events,['j']); assert.equal(f.card.status,'canceled'); assert.equal(f.card.job,null);
+  assert.equal(f.card.step,''); assert.deepEqual(f.calls.save,[false]);
+  oldPoll.resolve({jobs:[canvasJob()]}); await polling;
+  assert.equal(f.card.status,'canceled'); assert.equal(f.card.job,null);
+  assert.deepEqual(tasks.feature.getJobs(),[]);
+});
+
+test('concurrent confirmed deletions both update their own card without invalidating each other', async () => {
+  const pending=[deferred(),deferred()], f=canvasTaskFixture();
+  f.project.cards.push({id:'d',job:'k',status:'running'});
+  const tasks=taskFixture({api:async (url,opt) => opt?.method==='DELETE'
+    ? pending[url.endsWith('/j') ? 0 : 1].promise : {jobs:[]},
+    onJobsChanged:f.update,onTaskDeleted:job => f.update([job],{deleted:true})});
+  const a=tasks.feature.delTask(canvasJob()), b=tasks.feature.delTask(canvasJob({id:'k',card:'d'}));
+  pending[0].resolve({ok:true}); await a;
+  pending[1].resolve({ok:true}); await b;
+  assert.deepEqual(f.project.cards.map(card => [card.status,card.job]),[['canceled',null],['canceled',null]]);
+});
+
+test('pending, unsuccessful, forbidden, missing and timed-out DELETE never imply cancellation', async () => {
+  const outcomes=[{ok:true,pending:true},{ok:false},{},
+    Object.assign(Error('forbidden'),{status:403}),Object.assign(Error('not visible'),{status:404}),
+    Object.assign(Error('timeout'),{name:'TimeoutError'}),Object.assign(Error('offline'),{status:503})];
+  for(const outcome of outcomes) {
+    const f=canvasTaskFixture(), before=structuredClone(f.card); let callbacks=0;
+    const tasks=taskFixture({api:async (url,opt) => {
+      if(opt?.method!=='DELETE') return {jobs:[]};
+      if(outcome instanceof Error) throw outcome;
+      return outcome;
+    },onJobsChanged:f.update,onTaskDeleted:async job => {callbacks++;await f.update([job],{deleted:true});}});
+    await tasks.feature.delTask(canvasJob()); await tick();
+    assert.equal(callbacks,0); assert.deepEqual(f.card,before); assert.deepEqual(f.calls.save,[]);
+    assert.equal(tasks.messages.length,outcome instanceof Error ? 1 : 0);
+    if(outcome.pending) {
+      await f.update([canvasJob({status:'canceled'})]);
+      assert.equal(f.card.status,'canceled'); assert.equal(f.card.job,'j');
+    }
+  }
+});
+
+test('declining delete sends no request and successful deletion never changes already completed cards', async () => {
+  const tasks=taskFixture({confirm:() => false,onTaskDeleted:() => assert.fail('unexpected deletion')});
+  await tasks.feature.delTask(canvasJob()); assert.deepEqual(tasks.calls,[]);
+  const f=canvasTaskFixture(); f.card.status='done'; f.card.outputs=[{url:'/kept.png'}];
+  const before=structuredClone(f.card);
+  await f.update([canvasJob({status:'done'})],{deleted:true});
+  assert.deepEqual(f.card,before); assert.deepEqual(f.calls.save,[]);
+});
+
+test('DELETE responses cannot mutate another project, a new card attempt, or revoked sessions/permissions', async () => {
+  for(const change of ['project','new-job','card','project-read','reset','retain']) {
+    const pending=deferred(), f=canvasTaskFixture(); let callbacks=0;
+    const tasks=taskFixture({api:async (url,opt) => opt?.method==='DELETE' ? pending.promise : {jobs:[]},
+      onJobsChanged:f.update,onTaskDeleted:async job => {callbacks++;await f.update([job],{deleted:true});}});
+    const deleting=tasks.feature.delTask(canvasJob());
+    if(change==='project') f.project={id:'other',permission:'operate',cards:[{id:'c',job:'j',status:'running'}]};
+    if(change==='new-job') f.card.job='new-job';
+    if(change==='card') f.project.cards=[{id:'other-card',job:'j',status:'running'}];
+    if(change==='project-read') f.project.permission='read';
+    if(change==='reset') tasks.feature.reset();
+    if(change==='retain') tasks.feature.retainProjects([]);
+    const before=structuredClone(f.card);
+    pending.resolve({ok:true}); await deleting; await tick();
+    assert.deepEqual(f.card,before,change); assert.deepEqual(f.calls.save,[]);
+    if(['reset','retain'].includes(change)) assert.equal(callbacks,0);
+  }
+});
+
+test('permission revocation while DELETE waits prevents its canvas callback', async () => {
+  const pending=deferred(); let callbacks=0;
+  const tasks=taskFixture({api:async (url,opt) => opt?.method==='DELETE' ? pending.promise
+    : {jobs:[canvasJob({permission:'read'})]},onTaskDeleted:() => callbacks++});
+  const deleting=tasks.feature.delTask(canvasJob()); await tasks.feature.pollJobs();
+  pending.resolve({ok:true}); await deleting; assert.equal(callbacks,0);
+});
+
 test('canvas updater leaves readonly tasks untouched and stops across project switches', async () => {
   const hold=deferred(), saved=[], painted=[];
   let project={id:'a',cards:[{id:'c',job:'j',status:'running'},{id:'d',job:'k',status:'running'}]};

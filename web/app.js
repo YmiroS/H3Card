@@ -81,6 +81,7 @@ const taskPanel = ChoukaTaskPanel.create({
   fmtEla: ms => fmtEla(ms), histTime: time => histTime(time),
   toast: message => toast(message), showError: message => showError(message), confirm: message => confirm(message),
   onFocusTask: job => focusTask(job), onJobsChanged: jobs => applyCanvasJobs(jobs),
+  onTaskDeleted: job => applyCanvasJobs([job], {deleted:true}),
 });
 const { pollJobs, paintJobsBtn, toggleJobs, closeJobs, placeJobs, renderJobs } = taskPanel;
 

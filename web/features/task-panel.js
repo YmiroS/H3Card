@@ -6,16 +6,17 @@
 })(globalThis, function () {
 "use strict";
 function create({ document, panel, button, getViewport, getUser, canTask, api, jpost,
-  jobProjName, fmtEla, histTime, toast, showError, confirm, onFocusTask, onJobsChanged }) {
-  let tasks = [], request = null, epoch = 0;
+  jobProjName, fmtEla, histTime, toast, showError, confirm, onFocusTask, onJobsChanged,
+  onTaskDeleted = () => {} }) {
+  let tasks = [], request = null, epoch = 0, pollRevision = 0;
   function setJobs(jobs) { tasks = jobs; paintJobsBtn(); if (panel.style.display !== "none") renderJobs(); }
   function pollJobs() {
     if (request) return request;
-    const expected = epoch;
+    const expected = epoch, revision = pollRevision;
     request = (async () => {
       let jobs;
       try { jobs = (await api("/api/jobs")).jobs || []; } catch (_) { return; }
-      if (epoch !== expected) return;
+      if (epoch !== expected || pollRevision !== revision) return;
       setJobs(jobs);
       await onJobsChanged(jobs);
     })().finally(() => { request = null; });
@@ -222,7 +223,15 @@ async function delTask(j) {
   if (!canTask(j)) return toast("此任务关联的画布为只读，不能删除");
   // 还在跑的删掉等于先停后删，这一步不可逆（跑到一半的算力就没了），所以问一句
   if (jobLive(j) && !confirm("这个任务还没跑完，删除会先把它停掉。继续？")) return;
-  try { await api(`/api/job/${j.id}`, { method: "DELETE" }); } catch (e) { return showError(e.message); }
+  const expected = epoch;
+  let result;
+  try { result = await api(`/api/job/${j.id}`, { method: "DELETE" }); } catch (e) { return showError(e.message); }
+  if (epoch !== expected) return;
+  // pending 只表示已请求停止；仅明确删除完成才能取消关联卡片。
+  // 作废删除前发出的轮询，避免旧 running 快照覆盖删除结果。
+  pollRevision++;
+  if (result?.ok === true && !result.pending && canTask(tasks.find(task => task.id === j.id) || j))
+    await onTaskDeleted(j);
   pollJobs();
 }
 
@@ -243,24 +252,27 @@ async function clearDoneJobs() {
 }
 function createCanvasUpdater({getProject, canOperate, isIF, canTask, paint, refreshPanel,
   pushHistory, refreshHistory, propagateCardOutputs, titleOf, showError, save}) {
-return async function applyCanvasJobs(tasks) {
+return async function applyCanvasJobs(tasks, {deleted = false} = {}) {
   if (!getProject() || !canOperate()) return;
-  const project = getProject(), projectId = project.id;
-  const live = getProject().cards.filter(c => c.job && !isIF(c) && ["queued", "running"].includes(c.status));
+  const project = getProject();
+  const live = project.cards.filter(c => c.job && !isIF(c) && ["queued", "running", "canceled"].includes(c.status))
+    .map(card => ({card, job:card.job, status:card.status}));
   if (!live.length) return;
   let dirty = false;
-  for (const c of live) {
-    if (getProject() !== project || !project.cards.includes(c) || !canOperate()) return;
-    const j = tasks.find(x => x.id === c.job);
-    // 任务被从列表里删掉了（在浮窗里删的）。服务端删之前已经把活儿停了，
-    // 这里必须跟着落地，不然节点会一直转圈等一个不存在的任务
-    if (!j) {
+  for (const {card:c, job, status} of live) {
+    if (getProject() !== project || !canOperate()) return;
+    // 前一张卡片的产物传播可能 await；不能把旧快照写入新任务或已替换的卡片。
+    if (!project.cards.includes(c) || c.job !== job || c.status !== status) continue;
+    const j = tasks.find(x => x.id === job);
+    // 列表受条数、权限和请求时序影响；缺席不是取消证据，保留状态和关联。
+    if (!j) continue;
+    // 任务列表随授权变化；只读任务可查看状态，但不能自动回写画布。
+    if (!canTask(j) || (j.project && j.project !== project.id) || (j.card && j.card !== c.id)) continue;
+    if (deleted) {
       c.status = "canceled"; c.step = ""; c.job = null; paint(c); dirty = true;
       refreshPanel(c);
       continue;
     }
-    // 任务列表随授权变化；只读任务可查看状态，但不能自动回写画布。
-    if (!canTask(j) || !getProject() || getProject().id !== projectId || !canOperate()) continue;
     const was = c.status;
     c.status = j.status; c.progress = j.progress; c.error = j.error;
     c.queue_remaining = j.queue_remaining; c.step = j.step || "";

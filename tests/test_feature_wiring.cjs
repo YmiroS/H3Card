@@ -14,7 +14,7 @@ test('production index wires feature factories, save isolation and task permissi
   const projects=Object.fromEntries(['a','b'].map(id => [id,{id,name:'模块画布 '+id,permission:'operate',rev:0,
     cards:[{id:'card-'+id,type:'card_image',cap:'zimage_t2i',x:100,y:20,params:{},assets:{},outputs:[]}],
     edges:[],groups:[],view:{x:60,y:70,k:1}}]));
-  const requests=[], puts=[], cancels=[], unexpected=[];
+  const requests=[], puts=[], cancels=[], deletions=[], unexpected=[];
   let holdSave=false, releaseSave=null, failSave=false, reportHeld;
   const saveHeld=new Promise(resolve => {reportHeld=resolve;});
   let jobs=[{id:'readonly-job',project:'a',projectName:'模块画布 a',card:'card-a',cardName:'只读任务',name:'文生图',
@@ -32,6 +32,7 @@ test('production index wires feature factories, save isolation and task permissi
     if(pathname==='/api/jobs')return json(res,{jobs});
     if(pathname==='/api/projects')return json(res,{projects:Object.values(projects).map(project => ({...project,cards:1}))});
     if(pathname==='/api/job/readonly-job/cancel') {cancels.push(pathname);jobs=jobs.map(job => ({...job,status:'canceled'}));return json(res,{ok:true});}
+    if(pathname==='/api/job/readonly-job' && req.method==='DELETE') {deletions.push(pathname);jobs=[];return json(res,{ok:true});}
     if(/^\/api\/projects\/[ab]\/presence$/.test(pathname))return json(res,{members:[]});
     if(/^\/api\/projects\/[ab]\/view$/.test(pathname))return json(res,{ok:true});
     const match=/^\/api\/projects\/([ab])$/.exec(pathname);
@@ -105,6 +106,27 @@ test('production index wires feature factories, save isolation and task permissi
       await page.locator('#jobs .jrow').getByRole('button',{name:'停止',exact:true}).click();
       await page.waitForFunction(() => taskPanel.getJobs()[0]?.status==='canceled');
       assert.equal(cancels.length,1);
+    });
+    await t.test('canvas retains missing jobs, recovers explicit states and cancels only after the actual delete control succeeds',async () => {
+      await page.evaluate(async () => {
+        await openProject('a');
+        Object.assign(PROJ.cards[0],{job:'readonly-job',status:'running'});paint(PROJ.cards[0]);
+      });
+      const job={...jobs[0]}; jobs=[];
+      await page.evaluate(() => pollJobs());
+      assert.deepEqual(await page.evaluate(() => [PROJ.cards[0].status,PROJ.cards[0].job]),['running','readonly-job']);
+      jobs=[{...job,status:'canceled'}]; await page.evaluate(() => pollJobs());
+      assert.deepEqual(await page.evaluate(() => [PROJ.cards[0].status,PROJ.cards[0].job]),['canceled','readonly-job']);
+      jobs=[{...job,status:'running'}]; await page.evaluate(() => pollJobs());
+      assert.equal(await page.evaluate(() => PROJ.cards[0].status),'running');
+      const deleting=page.waitForResponse(response => response.url().endsWith('/api/job/readonly-job')
+        && response.request().method()==='DELETE');
+      page.once('dialog',dialog => dialog.accept());
+      await page.locator('#jobs .jrow').getByRole('button',{name:'删除',exact:true}).click(); await deleting;
+      await page.waitForFunction(() => PROJ.cards[0].status==='canceled' && PROJ.cards[0].job===null);
+      assert.equal(deletions.length,1); assert.equal(await page.evaluate(() => PROJ.cards[0].step),'');
+      await page.evaluate(() => flushLocalChanges());
+      assert.equal(puts.at(-1).body.cards[0].status,'canceled'); assert.equal(puts.at(-1).body.cards[0].job,null);
     });
     assert.deepEqual(errors,[]);assert.deepEqual(unexpected,[]);
     for(const resource of Object.keys(featureFiles).filter(name=>name.startsWith('/features/')))assert.ok(requests.includes(resource));
