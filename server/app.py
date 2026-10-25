@@ -87,7 +87,7 @@ MODEL_FAMILY = {
     **{cap: "minimax_h3" for cap in (
         "minimax_h3_i2v", "minimax_h3_flf2v", "minimax_h3_talk1",
         "minimax_h3_talk2", "minimax_h3_ref4", "minimax_h3_ref9",
-        "minimax_h3_ref_2pass", "minimax_h3_comic20",
+        "minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16", "minimax_h3_comic20",
         "minimax_h3_character_transfer", "minimax_h3_fusion_v2",
     )},
     "flux2_klein_edit": "flux2_klein",
@@ -614,8 +614,8 @@ def apply_input_presets(cap, params):
 
 
 def reference_video_input(cap, uploaded):
-    """仅四种 H3 视频参考能力的已填视频槽参与最终输出契约。"""
-    if (cap.get("id") not in {"minimax_h3_ref9", "minimax_h3_ref_2pass",
+    """仅已登记的 H3 视频参考能力的已填视频槽参与最终输出契约。"""
+    if (cap.get("id") not in {"minimax_h3_ref9", "minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16",
                               "minimax_h3_fusion_v2", "minimax_h3_character_transfer"}
             or cap.get("kind") != "gen" or cap.get("outputType") != "video"):
         return None
@@ -682,7 +682,7 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
     generation = tuple(round(side / 32) * 32 for side in (ideal_width, ideal_height))
     if any(side < 32 or side > 16384 for side in generation):
         raise web.HTTPBadRequest(reason="视频参考输出：32 对齐后的宽高必须在 32..16384，画面比例过于极端或分辨率越界")
-    scale = value("scale_by") if cap["id"] == "minimax_h3_ref_2pass" else 1
+    scale = value("scale_by") if cap["id"] in {"minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16"} else 1
     # 按未对齐的理想尺寸取最近偶数，每个边的量化误差不超过 1px；
     # 不从 32 对齐的生成尺寸反推比例，也不丢掉二采工作流的放大倍率。
     final_sides = (ideal_width * scale, ideal_height * scale)
@@ -1295,7 +1295,7 @@ async def api_generate(request):
             inspect_imported_videos, cap, uploaded
         )
     graph = patch_graph(cap, params, uploaded, video_metadata)
-    duration_seconds = rw.duration(cap, params) if cid == "minimax_h3_ref_2pass" else None
+    duration_seconds = rw.duration(cap, params) if cid in {"minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16"} else None
     if body.get("dry_run"):
         tpl = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
         diff = {f"#{n}.{k}": [tpl.get(n, {}).get("inputs", {}).get(k), v]
@@ -1313,6 +1313,10 @@ async def api_generate(request):
         ) else None
     )
     if not CONTROLLER_MODE and gpu_policy:
+        bf16_gpu_requirement = (
+            "此模式仅支持显存超过80GB的CUDA显卡（如PRO 6000 96GB），80GB及以下或显存未知不可接单"
+            if cid == "minimax_h3_ref_2pass_bf16" else None
+        )
         try:
             async with request.app["session"].get(
                 COMFY_HTTP + "/system_stats", timeout=aiohttp.ClientTimeout(total=5)
@@ -1320,13 +1324,17 @@ async def api_generate(request):
                 response.raise_for_status()
                 stats = await response.json()
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            raise web.HTTPServiceUnavailable(reason="无法确认执行显卡，此任务要求主 GPU 显存至少 32GB")
+            raise web.HTTPServiceUnavailable(
+                reason=bf16_gpu_requirement or "无法确认执行显卡，此任务要求主 GPU 显存至少 32GB"
+            )
         if not can_run_capability(
             cid, stats.get("devices"), gpu_policy, duration_seconds,
         ):
             raise web.HTTPBadRequest(
-                reason="此任务只能在主 GPU 显存至少 32GB 的机器上运行；"
-                       f"H3高质量不超过{MAX_4090_HIGH_QUALITY_DURATION_SECONDS:g}秒时也可使用RTX 4090"
+                reason=bf16_gpu_requirement or (
+                    "此任务只能在主 GPU 显存至少 32GB 的机器上运行；"
+                    f"H3高质量不超过{MAX_4090_HIGH_QUALITY_DURATION_SECONDS:g}秒时也可使用RTX 4090"
+                )
             )
     await require_project(request, body["project"], operate=True)
     pid = str(uuid.uuid4())

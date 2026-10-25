@@ -57,6 +57,62 @@ class ModelDispatchTest(unittest.TestCase):
             "graph": self.graph, "capability": "minimax_h3_fusion_v2", **payload,
         }, self.caps["node_classes"])
 
+    def test_bf16_two_pass_strict_gpu_gate_in_acquire(self):
+        self.enqueue(capability="minimax_h3_ref_2pass_bf16",
+                     gpu_policy=HIGH_VRAM_GPU_POLICY, duration_seconds=1)
+        cases = [
+            ("RTX A6000", 48, False),
+            ("NVIDIA RTX PRO 6000 Blackwell", 80, False),
+            ("NVIDIA RTX PRO 6000 Blackwell", 96, True),
+            ("NVIDIA RTX PRO 6000 Blackwell 96GB", None, False),
+            ("NVIDIA RTX PRO 6000", 48, False),
+            ("Quadro RTX 6000", 24, False),
+            ("RTX 6000 Ada Generation", 48, False),
+            ("Other GPU", 96, True),
+            ("NVIDIA H100 80GB HBM3", 80, False),
+            ("NVIDIA A100-SXM4-80GB", 80, False),
+            ("RTX 4090", 24, False),
+        ]
+        from distributed import can_run_capability
+        for name, gib, expected in cases:
+            with self.subTest(name=name, gib=gib):
+                caps = copy.deepcopy(self.caps)
+                caps["devices"] = [{"type": "cuda", "name": name}]
+                if gib is not None:
+                    caps["devices"][0]["vram_total"] = gib * 1024 ** 3
+                self.assertEqual(can_run_capability(
+                    "minimax_h3_ref_2pass_bf16", caps["devices"],
+                    HIGH_VRAM_GPU_POLICY, 1), expected)
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+                acquired = self.store.acquire(self.worker_id)
+                self.assertEqual(acquired is not None, expected)
+                if acquired:
+                    self.store.finish(acquired["job_id"], self.worker_id,
+                                      acquired["lease_token"], "done", capacity_released=True)
+                    self.store.heartbeat(self.worker_id, comfy_online=True,
+                                         capacity_released=True)
+                    self.enqueue(job_id=name, capability="minimax_h3_ref_2pass_bf16")
+
+    def test_bf16_two_pass_gate_cannot_bypass_models_or_primary_device(self):
+        from distributed import can_run_capability
+        cid = "minimax_h3_ref_2pass_bf16"
+        device = {"type": "cuda", "name": "Other GPU", "vram_total": 80 * 1024 ** 3 + 1}
+        self.assertTrue(can_run_capability(cid, [device]))
+        self.assertFalse(can_run_capability(cid, [self.caps["devices"][0], device]))
+        self.assertFalse(can_run_capability(cid, [{**device, "type": "cpu"}]))
+        self.assertFalse(can_run_capability(cid, None))
+        self.assertFalse(can_run_capability(cid, [{**device, "vram_total": float("inf")}]))
+        self.assertTrue(can_run_capability(cid, [{**device, "vram_total": None,
+                                                "torch_vram_total": 96 * 1024 ** 3}]))
+        self.assertTrue(can_run_capability("minimax_h3_ref_2pass", self.caps["devices"]))
+        self.assertTrue(can_run_capability("other_mode", None))
+        self.enqueue(capability=cid)
+        caps = copy.deepcopy(self.caps)
+        caps["devices"] = [device]
+        caps["input_choices"]["UNETLoader"]["unet_name"] = []
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        self.assertIsNone(self.store.acquire(self.worker_id))
+
     def test_actual_h3_graph_requires_every_exact_model(self):
         self.enqueue()
         for node_class, fields in self.choices.items():

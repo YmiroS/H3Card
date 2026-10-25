@@ -2204,6 +2204,42 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
     })
+    @mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock)
+    async def test_local_bf16_rejection_explains_exclusive_gpu_requirement(self, submit, _patch_graph):
+        cid = "minimax_h3_ref_2pass_bf16"
+        capability = {"name": "H3 BF16", "outputType": "video", "_graph_ok": True}
+        expected = "此模式仅支持显存超过80GB的CUDA显卡（如PRO 6000 96GB），80GB及以下或显存未知不可接单"
+        stats_response = self.client.server.app["session"].get.return_value.__aenter__.return_value
+        stats_response.raise_for_status = mock.Mock()
+        stats_response.json = mock.AsyncMock()
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+             mock.patch.dict(controller_app.CAPS, {cid: capability}):
+            for devices in (
+                [],
+                [{"type": "cuda", "name": "RTX 4090", "vram_total": 24 * 1024 ** 3}],
+                [{"type": "cuda", "name": "A100", "vram_total": 80 * 1024 ** 3}],
+                [{"type": "cuda", "name": "Unknown"}],
+                [{"type": "cpu", "name": "CPU", "vram_total": 96 * 1024 ** 3}],
+            ):
+                with self.subTest(devices=devices):
+                    stats_response.json.return_value = {"devices": devices}
+                    response = await self.client.post("/api/generate", json={
+                        "capability": cid, "project": "p",
+                    }, headers=self.headers)
+                    self.assertEqual(response.status, 400)
+                    self.assertEqual(await response.text(), "400: " + expected)
+                    submit.assert_not_awaited()
+            stats_response.json.side_effect = TimeoutError()
+            response = await self.client.post("/api/generate", json={
+                "capability": cid, "project": "p",
+            }, headers=self.headers)
+            self.assertEqual(response.status, 503)
+            self.assertEqual(await response.text(), "503: " + expected)
+            submit.assert_not_awaited()
+
+    @mock.patch.object(controller_app, "patch_graph", return_value={
+        "1": {"class_type": "KSampler", "inputs": {}}
+    })
     @mock.patch.object(
         controller_app, "comfy_submit", new_callable=mock.AsyncMock,
         return_value="local-long-video",

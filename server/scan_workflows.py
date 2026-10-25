@@ -77,6 +77,7 @@ DISPLAY = {
     "minimax_h3_ref4": "H3图片参考",
     "minimax_h3_ref9": "H3全能参考",
     "minimax_h3_ref_2pass": "H3全能参考(高质量)",
+    "minimax_h3_ref_2pass_bf16": "H3半满血二采",
     "minimax_h3_comic20": "漫剧4宫格",
     "minimax_h3_character_transfer": "H3人物迁移",
     "grid4_stitch": "四图拼四宫格",
@@ -146,6 +147,7 @@ MODEL_SWITCHES = {
 # Qwen 图生图固定编辑分支；文生图保留双阶段和独立负向输入，防止重扫合并两阶段步数。
 # Qwen 2.1 的图生图模型直接使用16图编辑能力；旧单图能力只保留给历史任务和项目迁移。
 BUNDLED_CAPABILITIES = {
+    "minimax_h3_ref_2pass_bf16",
     "alphagen", "minimax_h3_fusion_v2",
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",

@@ -73,5 +73,102 @@ class H3MemoryWorkflowTest(unittest.TestCase):
             self.assertRegex(steps[name], r"[\u4e00-\u9fff]")
 
 
+class H3HalfBF16WorkflowTest(unittest.TestCase):
+    cid = "minimax_h3_ref_2pass_bf16"
+
+    def setUp(self):
+        self.cap = json.loads((ROOT / "manifests" / (self.cid + ".json")).read_text(encoding="utf-8"))
+        self.old = json.loads((ROOT / "manifests/minimax_h3_ref_2pass.json").read_text(encoding="utf-8"))
+        self.raw = json.loads((ROOT / self.cap["graph"]).read_text(encoding="utf-8"))
+
+    def test_registration_and_rescan(self):
+        import scan_workflows as scan
+        cards = json.loads((ROOT / "manifests/_cards.json").read_text(encoding="utf-8"))
+        video = next(c for c in cards if c["id"] == "card_video")
+        with mock.patch.object(app, "CAPS", {}), mock.patch.object(app, "CARDS", []):
+            app.load_caps()
+            self.assertTrue(app.CAPS[self.cid]["_graph_ok"])
+            live_video = next(c for c in app.CARDS if c["id"] == "card_video")
+            self.assertIn(self.cid, {m["id"] for m in live_video["modes"]})
+        self.assertIn(self.cid, scan.BUNDLED_CAPABILITIES)
+        self.assertEqual(scan.DISPLAY[self.cid], "H3半满血二采")
+        mode = next(m for m in video["modes"] if m["id"] == self.cid)
+        self.assertEqual(mode["name"], "H3半满血二采")
+        rebuilt = scan.build_modes([self.cap])
+        self.assertEqual(rebuilt, [mode])
+        self.assertEqual(app.MODEL_FAMILY[self.cid], "minimax_h3")
+
+    def test_builder_cannot_reenable_acceleration(self):
+        self.assertFalse({"stable_mode", "strength_model", "processing_control_value"} &
+                         {i["key"] for i in self.cap["inputs"]})
+        for stable in ("on", "off"):
+            with mock.patch.object(app, "probe_video", return_value={"has_audio": True}):
+                graph = app.patch_graph(self.cap, {
+                    "stable_mode": stable, "strength_model": 2, "processing_control_value": .5,
+                    "duration": 8,
+                }, {"video[0]": "chouka/reference.mp4"})
+            self.assertEqual(graph["127"]["inputs"]["unet_name"], "minimax_h3_ref2va_bf16.safetensors")
+            self.assertEqual(graph["128"]["inputs"]["clip_name"], "qwen3vl_32b_minimax_h3_int8_convrot.safetensors")
+            self.assertFalse({"230", "232"} & graph.keys())
+            self.assertFalse(any(n["class_type"] in {"LoraLoaderModelOnly", "TESpeedMiniMaxH3"} for n in graph.values()))
+            for node in graph.values():
+                for value in node["inputs"].values():
+                    if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                        self.assertIn(value[0], graph)
+            self.assertEqual(graph["231"]["inputs"]["model"], ["127", 0])
+            for nid in ("126", "124", "199", "204"):
+                self.assertEqual(graph[nid]["inputs"]["model"], ["234", 0])
+            self.assertEqual(graph["199"]["inputs"]["scale_by"], 1.5)
+            self.assertEqual(graph["124"]["inputs"]["steps"], 20)
+            self.assertEqual(graph["203"]["inputs"]["step"], 10)
+            self.assertEqual(graph["221"]["inputs"]["frame_load_cap"], 192)
+            self.assertEqual(graph["186"]["inputs"]["length"], 192)
+
+    def test_only_intended_graph_changes_and_old_mode_intact(self):
+        old = json.loads((ROOT / self.old["graph"]).read_text(encoding="utf-8"))
+        expected = json.loads(json.dumps(old))
+        def bypass(value):
+            if isinstance(value, list):
+                if len(value) == 2 and value[0] in ("230", "232"):
+                    return bypass(old[value[0]]["inputs"]["model"])
+                return [bypass(v) for v in value]
+            if isinstance(value, dict):
+                return {k: bypass(v) for k, v in value.items()}
+            return value
+        expected = {k: bypass(v) for k, v in expected.items() if k not in ("230", "232")}
+        expected["127"]["inputs"]["unet_name"] = "minimax_h3_ref2va_bf16.safetensors"
+        self.assertEqual(self.raw, expected)
+        self.assertEqual(self.cap["source"], self.old["source"])
+        for key in ("slotLimits", "slots", "output", "rewrite"):
+            self.assertEqual(self.cap[key], self.old[key])
+        old_specs = {i["key"]: i for i in self.old["inputs"]}
+        for spec in self.cap["inputs"]:
+            if spec["key"] not in ("steps", "scale_by"):
+                self.assertEqual(spec, old_specs[spec["key"]])
+        self.assertIn("stable_mode", old_specs)
+        self.assertEqual(old["230"]["inputs"]["strength_model"], 1)
+
+    def test_worker_safety_and_output_scale(self):
+        import distributed
+        inventory = {}
+        for node in self.raw.values():
+            for key, value in node["inputs"].items():
+                if isinstance(value, str) and value.endswith(".safetensors"):
+                    inventory.setdefault(node["class_type"], {}).setdefault(key, []).append(value)
+        types = {node["class_type"]: {"model": "MODEL"}
+                 for node in self.raw.values() if isinstance(node["inputs"].get("model"), list)}
+        worker = {"input_choices": inventory, "input_types": types}
+        self.assertTrue(distributed.has_required_models(self.raw, worker))
+        inventory["UNETLoader"]["unet_name"] = ["minimax_h3_ref2va_pruned_int8_convrot.safetensors"]
+        self.assertFalse(distributed.has_required_models(self.raw, worker))
+        self.assertTrue(distributed.requires_high_vram(self.cid))
+        devices = [{"type": "cuda", "name": "NVIDIA RTX 4090", "vram_total": 24 * 1024**3}]
+        self.assertFalse(distributed.can_run_capability(self.cid, devices, duration_seconds=5))
+        def settings(cap):
+            return app.resolve_reference_video_output_settings(
+                cap, {}, {"video[0]": "reference.mp4"}, {})
+        self.assertEqual(settings(self.cap), settings(self.old))
+
+
 if __name__ == "__main__":
     unittest.main()
