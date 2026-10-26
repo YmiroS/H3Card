@@ -102,7 +102,7 @@
    },
    {
     "id": "minimax_h3_ref_2pass_bf16",
-    "name": "H3半满血二采",
+    "name": "H3满血二采",
     "slots": "img9+aud3+vid1"
    },
    {

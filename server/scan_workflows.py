@@ -77,7 +77,7 @@ DISPLAY = {
     "minimax_h3_ref4": "H3图片参考",
     "minimax_h3_ref9": "H3全能参考",
     "minimax_h3_ref_2pass": "H3全能参考(高质量)",
-    "minimax_h3_ref_2pass_bf16": "H3半满血二采",
+    "minimax_h3_ref_2pass_bf16": "H3满血二采",
     "minimax_h3_comic20": "漫剧4宫格",
     "minimax_h3_character_transfer": "H3人物迁移",
     "grid4_stitch": "四图拼四宫格",

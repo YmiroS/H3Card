@@ -1,6 +1,6 @@
 {
  "id": "minimax_h3_ref_2pass_bf16",
- "name": "H3半满血二采",
+ "name": "H3满血二采",
  "file": "Minimax H3 多图全能二采-V2",
  "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\1-minimax H3\\Minimax H3 多图全能二采-V2.json",
  "group": "视频",
@@ -358,6 +358,21 @@
     "16:9 (Widescreen)",
     "21:9 (Ultrawide)"
    ]
+  },
+  {
+   "key": "output_1080p",
+   "label": "1080P",
+   "type": "select",
+   "appearance": "switch",
+   "default": "off",
+   "options": [
+    {"value": "on", "label": "开启"},
+    {"value": "off", "label": "关闭"}
+   ],
+   "presets": {"on": {}, "off": {}},
+   "hint": "开启后覆盖分辨率预算，保留所选画面比例与潜空间二采倍率（默认 1.5，可修改）：按最终短边 1080 反算基础生成尺寸并按 32 对齐，让二采在接近 1080P 的分辨率采样，解码后再精确校正为偶数输出尺寸。不是低分辨率生成后仅超分放大。预计耗时和显存占用增大，尚未实测，不保证速度、质量或不溢出。关闭保留原有行为。",
+   "showHint": true,
+   "target": {"kind": "preset"}
   },
   {
    "key": "megapixels",

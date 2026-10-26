@@ -425,6 +425,29 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       assert.equal(Object.hasOwn(payload.params,'image_ratio'),false);
       assert.equal(Object.hasOwn(payload.params,'image_clarity'),false);
     });
+    await t.test('only BF16 two-pass exposes default-off iPhone-style 1080P switch and preserves scale',async()=>{
+      await reset('minimax_h3_ref_2pass_bf16','card_video');await paramsButton.click();
+      const toggle=page.getByRole('switch',{name:'1080P',exact:true});
+      assert.equal(await toggle.getAttribute('aria-checked'),'false');
+      assert.equal(await toggle.locator('.param-switch-track .param-switch-thumb').count(),1);
+      const hint=page.locator('#respop .knobnote').filter({hasText:'开启后覆盖分辨率预算'});
+      assert.match(await hint.innerText(),/二采倍率.*默认 1.5.*尚未实测/);
+      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.output_1080p),'off');
+      await toggle.click();
+      assert.equal(await toggle.getAttribute('aria-checked'),'true');
+      // Keep the existing advanced-control visibility; the switch must preserve saved custom scales.
+      await page.evaluate(()=>{PROJ.cards[0].params.scale_by=1.25;});
+      let params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
+      assert.equal(params.output_1080p,'on');assert.equal(params.scale_by,1.25);
+      assert.equal(Object.hasOwn(params,'output_width'),false,'trusted dimensions are server-only');
+      await toggle.click();
+      params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
+      assert.equal(params.output_1080p,'off');assert.equal(params.scale_by,1.25);
+      for(const cap of ['minimax_h3_ref_2pass','minimax_h3_ref9','minimax_h3_fusion_v2']) {
+        await reset(cap,'card_video');await paramsButton.click();
+        assert.equal(await page.getByRole('switch',{name:'1080P',exact:true}).count(),0,cap);
+      }
+    });
     await t.test('H3 image-to-video and first-last-frame popovers expose 768p shortcuts',async()=>{
       for(const cap of ['minimax_h3_i2v','minimax_h3_flf2v']) {
         await reset(cap,'card_video');await paramsButton.click();

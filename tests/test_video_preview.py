@@ -898,6 +898,51 @@ class FollowReferenceGenerateTest(unittest.IsolatedAsyncioTestCase):
             patcher.start()
             self.addCleanup(patcher.stop)
 
+    async def test_bf16_1080p_real_handler_dry_run_dispatch_and_capacity_contract(self):
+        cid = "minimax_h3_ref_2pass_bf16"
+        cap = json.loads((ROOT / "manifests" / f"{cid}.json").read_text(encoding="utf-8"))
+        cap["_graph_ok"] = True
+        controller_app.CAPS[cid] = cap
+        self.body["capability"] = cid
+        ledger = mock.Mock()
+        ledger.dimensions.side_effect = lambda *args: controller_app.CostLedger.dimensions(None, *args)
+        self.request.app["costs"] = ledger
+        for reference in (False, True):
+            self.body["assets"] = {"video[0]": self.ref} if reference else {}
+            controller_app.generation_assets.return_value = self.body["assets"]
+            for dry_run in (True, False):
+                with self.subTest(reference=reference, dry_run=dry_run):
+                    self.store.reset_mock()
+                    self.body["dry_run"] = dry_run
+                    self.body["params"] = {"output_1080p": "on", "duration": 4.1, "seed": 42,
+                                           "aspect_ratio": "9:16 (Portrait Widescreen)", "scale_by": 1.25,
+                                           "output_width": 16, "output_height": 16}
+                    response = await controller_app.api_generate(self.request)
+                    self.assertEqual(response.status, 200)
+                    if dry_run:
+                        changes = json.loads(response.text)["changed"]
+                        self.assertEqual(changes["#186.width"][1], 864)
+                        self.assertEqual(changes["#186.height"][1], 1536)
+                        self.store.enqueue.assert_not_called()
+                        continue
+                    payload = self.store.enqueue.call_args.args[1]
+                    self.assertEqual(payload["assets"], self.body["assets"])
+                    self.assertEqual(payload["duration_seconds"], 4.1)
+                    expected = payload["capacity_spec"]["expected"]
+                    self.assertEqual((expected["width"], expected["height"]), (1080, 1920))
+                    self.assertEqual(expected["count"], 1)
+                    dims = payload["capacity_spec"]["dimensions"]
+                    self.assertEqual((dims["width"], dims["height"]), (1080, 1920))
+                    self.assertEqual(dims["megapixels"], 864 * 1536 / 1024 ** 2)
+                    self.assertIn("ImageScale", self.store.enqueue.call_args.args[2])
+                    self.assertEqual(payload["gpu_policy"], controller_app.HIGH_VRAM_GPU_POLICY)
+                    if reference:
+                        self.assertEqual(expected["duration"], 4.1)
+                        self.assertAlmostEqual(expected["fps"], round(4.1 * 24) / 4.1)
+                    else:
+                        self.assertEqual(payload["graph"]["186"]["inputs"]["length"], ["131", 1])
+                        self.assertEqual(payload["graph"]["225"]["inputs"]["frame_rate"], 24)
+
     async def test_dispatch_duration_uses_current_params_not_reference_duration(self):
         for seconds in (4.013, 6.25, 19):
             with self.subTest(seconds=seconds):

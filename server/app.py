@@ -607,7 +607,7 @@ def apply_input_presets(cap, params):
             continue
         key = spec["key"]
         selected = params.get(key, spec.get("default"))
-        if selected not in presets:
+        if not isinstance(selected, str) or selected not in presets:
             raise web.HTTPBadRequest(reason=f"{spec['label']}无效：{selected}")
         params[key] = selected
         params.update(presets[selected])
@@ -623,7 +623,44 @@ def reference_video_input(cap, uploaded):
                  if spec.get("type") == "video" and uploaded.get(spec["key"])), None)
 
 
-def resolve_reference_video_output_settings(cap, params, uploaded, video_metadata):
+def resolve_h3_1080p_settings(cap, params):
+    """仅 BF16 二采开启时使用可信尺寸；不改变无视频路径的时间契约。"""
+    if cap.get("id") != "minimax_h3_ref_2pass_bf16" or params.get("output_1080p") != "on":
+        return None
+    specs = {spec["key"]: spec for spec in cap["inputs"]}
+    aspect = params.get("aspect_ratio", specs["aspect_ratio"]["default"])
+    if not isinstance(aspect, str) or aspect not in specs["aspect_ratio"]["options"]:
+        raise web.HTTPBadRequest(reason=f"画面比例无效：{aspect}")
+    match = re.match(r"^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)(?:\s|$)", aspect)
+    if not match or float(match[1]) <= 0 or float(match[2]) <= 0:
+        raise web.HTTPBadRequest(reason=f"画面比例无效：{aspect}")
+    spec = specs["scale_by"]
+    supplied = params.get("scale_by", spec["default"])
+    try:
+        scale = float(supplied) if not isinstance(supplied, bool) else math.nan
+    except (TypeError, ValueError, OverflowError):
+        scale = math.nan
+    # MiniMaxH3LatentUpscaleCombined 的真实节点范围；面板推荐范围不是硬限制。
+    if not math.isfinite(scale) or not 0.01 <= scale <= 8:
+        raise web.HTTPBadRequest(reason="1080P：潜空间放大倍率必须在 0.01..8")
+    ratio = float(match[1]) / float(match[2])
+    final = tuple(round(side / 2) * 2 for side in (
+        1080 * max(1, ratio), 1080 * max(1, 1 / ratio)))
+    generation = tuple(round(side / scale / 32) * 32 for side in final)
+    if (any(side < 2 or side > 16384 for side in final)
+            or any(side < 32 or side > 16384 for side in generation)):
+        raise web.HTTPBadRequest(reason="1080P：输出或基础生成尺寸超出节点支持范围")
+    # 不采信外部 output_*，也不把动态尺寸存入静态 preset 或模板。
+    for key in ("width", "height", "duration", "fps", "count"):
+        params.pop("output_" + key, None)
+    params.update(aspect_ratio=aspect, scale_by=scale,
+                  megapixels=generation[0] * generation[1] / 1024 ** 2,
+                  output_width=final[0], output_height=final[1], output_count=1)
+    return {"character": False, "resolution_only": True,
+            "generation": generation, "final": final}
+
+
+def resolve_reference_video_output_settings(cap, params, uploaded, video_metadata, resolution=None):
     """按当前面板参数解析输出；人物迁移的总时长仍由可信来源时间线决定。"""
     ref = reference_video_input(cap, uploaded)
     if not ref or any(spec.get("required") and spec["type"] in ("image", "audio", "video")
@@ -672,11 +709,14 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
         ratio = positive(positive(match[1], "比例宽度") / positive(match[2], "比例高度"), "画面比例")
         params["aspect_ratio"] = selected
         duration = value("duration")
-        megapixels = value("megapixels")
-        if megapixels > 16:
-            raise web.HTTPBadRequest(reason="视频参考输出：分辨率超过 ResolutionSelector 节点上限 16MP")
-        area = megapixels * 1024 * 1024
-        ideal_width, ideal_height = math.sqrt(area * ratio), math.sqrt(area / ratio)
+        if resolution:
+            ideal_width, ideal_height = (side / value("scale_by") for side in resolution["final"])
+        else:
+            megapixels = value("megapixels")
+            if megapixels > 16:
+                raise web.HTTPBadRequest(reason="视频参考输出：分辨率超过 ResolutionSelector 节点上限 16MP")
+            area = megapixels * 1024 * 1024
+            ideal_width, ideal_height = math.sqrt(area * ratio), math.sqrt(area / ratio)
     if not all(math.isfinite(side) for side in (ideal_width, ideal_height)):
         raise web.HTTPBadRequest(reason="视频参考输出：比例或分辨率超出节点支持范围")
     generation = tuple(round(side / 32) * 32 for side in (ideal_width, ideal_height))
@@ -711,9 +751,10 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
 
 
 def patch_follow_reference_video(g, cap, follow):
-    """仅改本次提交图：任意比例、H3 帧对齐，以及输出前的精确时长和偶数尺寸。"""
+    """仅改提交图：参考路径校正时间/尺寸；1080P 无参考时只校正尺寸。"""
     if not follow:
         return
+    resolution_only = follow.get("resolution_only", False)
     selectors = {str(spec["target"]["node"]) for spec in cap["inputs"]
                  if spec["key"] == "aspect_ratio"
                  and g.get(str(spec["target"]["node"]), {}).get("class_type") == "ResolutionSelector"}
@@ -722,7 +763,7 @@ def patch_follow_reference_video(g, cap, follow):
             if (isinstance(link, list) and len(link) == 2 and str(link[0]) in selectors
                     and link[1] in (0, 1)):
                 node["inputs"][field] = follow["generation"][link[1]]
-        if not follow["character"]:
+        if not follow["character"] and not resolution_only:
             if node["class_type"] == "MiniMaxH3ReferenceToVideo":
                 node["inputs"]["length"] = follow["aligned"]
             elif node["class_type"].startswith("VHS_LoadVideo"):
@@ -742,31 +783,36 @@ def patch_follow_reference_video(g, cap, follow):
         if node["class_type"] != output_class:
             continue
         images = node["inputs"]["images"]
-        if not follow["character"]:
+        if not follow["character"] and not resolution_only:
             images = append_node(f"follow_reference_trim_{nid}", "ImageFromBatch",
                                  {"image": images, "batch_index": 0, "length": follow["frames"]},
                                  "裁剪参考视频对应帧数")
             node["inputs"]["trim_to_audio"] = False
-        images = append_node(f"follow_reference_scale_{nid}", "ImageScale",
+        prefix = "h3_1080p_scale" if resolution_only else "follow_reference_scale"
+        images = append_node(f"{prefix}_{nid}", "ImageScale",
                              {"image": images, "upscale_method": "bicubic", "crop": "disabled",
                               "width": follow["final"][0], "height": follow["final"][1]},
-                             "校正参考视频画面比例")
+                             "校正1080P输出尺寸" if resolution_only else "校正参考视频画面比例")
         node["inputs"]["images"] = images
-        node["inputs"]["fps" if follow["character"] else "frame_rate"] = (
-            follow["frames"] / follow["duration"])
+        if not resolution_only:
+            node["inputs"]["fps" if follow["character"] else "frame_rate"] = (
+                follow["frames"] / follow["duration"])
 
 
 def patch_graph(cap, params, uploaded, video_metadata=None):
     """按 manifest 把用户参数写进 API 工作流模板"""
     apply_input_presets(cap, params)
+    resolution = resolve_h3_1080p_settings(cap, params)
     video_metadata = dict(video_metadata or {})
-    follow = resolve_reference_video_output_settings(cap, params, uploaded, video_metadata)
+    follow = resolve_reference_video_output_settings(cap, params, uploaded, video_metadata, resolution)
+    follow = follow or resolution
     g = copy.deepcopy(json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8")))
     labels = {s["key"]: s["label"] for s in cap["inputs"]}
     missing, blank = [], []
     for spec in cap["inputs"]:
         key, tgt = spec["key"], spec["target"]
-        if tgt.get("kind") == "preset":
+        if tgt.get("kind") == "preset" or (resolution and key == "megapixels"):
+            # 1080P 已直接写可信生成尺寸；不执行旧预算 selector（基础尺寸可超过 16MP）。
             continue
         node, field = str(tgt["node"]), tgt["input"]
         if node not in g:

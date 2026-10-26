@@ -144,6 +144,16 @@ class CostLedger:
                 continue
             output = node.get("inputs") or {}
             link = output.get("images")
+            if (capability == "minimax_h3_ref_2pass_bf16" and isinstance(link, list)
+                    and len(link) == 2 and str(link[0]).startswith("h3_1080p_scale_")
+                    and graph.get(str(link[0]), {}).get("class_type") == "ImageScale"):
+                scaled = graph[str(link[0])]["inputs"]
+                generation = graph["186"]["inputs"]
+                dims.update(width=scaled["width"], height=scaled["height"],
+                            output_width=scaled["width"], output_height=scaled["height"],
+                            output_count=1, output_fps=output["frame_rate"],
+                            megapixels=generation["width"] * generation["height"] / 1024 ** 2)
+                continue  # 没有参考视频时仅校正尺寸，不虚构 trim 或改变原有时长契约。
             if (not isinstance(link, list) or len(link) != 2
                     or not str(link[0]).startswith("follow_reference_scale_")):
                 continue
