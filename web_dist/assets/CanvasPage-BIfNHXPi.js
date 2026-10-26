@@ -1,4 +1,4 @@
-import{r as jl,a as rn,j as xe}from"./index-D6H-fk8W.js";import{e as io,A as Oi,u as Nl,s as za,o as Ml,n as zl}from"./session-DpSlpDLM.js";import{t as Ll,a as Pl,p as Il,b as Tl,u as Rl}from"./usePageRuntime-CMjdfhgd.js";var Ol=jl();const Al=`<aside id="workspace-nav" aria-label="主导航">\r
+import{r as jl,a as rn,j as xe}from"./index-DfB5YslK.js";import{e as io,A as Oi,u as Nl,s as za,o as Ml,n as zl}from"./session-DpSlpDLM.js";import{t as Ll,a as Pl,p as Il,b as Tl,u as Rl}from"./usePageRuntime-KOdexQOR.js";var Ol=jl();const Al=`<aside id="workspace-nav" aria-label="主导航">\r
   <a class="workspace-brand" href="/" aria-label="Chouka 创作空间"><img src="/icon.png" alt=""><span>Chouka<small>创作空间</small></span></a>\r
   <div class="workspace-footer">\r
     <div id="online-count" class="workspace-presence" title="Chouka 系统在线用户（近 90 秒活跃，按账号去重）" aria-live="polite"><i aria-hidden="true"></i><span><b>--</b> 人在线</span></div>\r

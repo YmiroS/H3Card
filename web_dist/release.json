@@ -1,5 +1,5 @@
 {
-  "source_commit": "5e888e8b4c3a1bd7140ec4a1c3b444302d64d798",
+  "source_commit": "884a70c8995b7e927ffd226cfd26f4222acd4302",
   "source_directory": "frontend",
   "environment": {
     "VITE_ADMIN_BASE_URL": "/",
