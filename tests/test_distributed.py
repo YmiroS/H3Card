@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT / "worker"))
 
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, WorkerBusyError,
+    BF16_TWO_PASS_CAPABILITY, can_run_capability, is_pro_6000_worker,
     capability_model_inventory, worker_capability_comparisons,
 )
 from agent import (
@@ -27,6 +28,64 @@ from agent import (
     restart_in_progress, worker_instance_status, worker_mutex_name,
 )
 import restart_node
+
+
+def worker_mode_ids():
+    modes = set()
+    for path in (ROOT / "manifests").glob("*.json"):
+        cap = json.loads(path.read_text(encoding="utf-8"))
+        if (isinstance(cap, dict) and cap.get("id") and cap.get("graph")
+                and cap.get("execution") not in {"browser", "if_studio"}):
+            modes.add(cap["id"])
+    return sorted(modes)
+
+
+class Pro6000CapabilityTest(unittest.TestCase):
+    def test_all_worker_modes_primary_device_matrix(self):
+        def gpu(name, gib=96, kind="cuda"):
+            return {"type": kind, "name": name, "vram_total": gib * 1024 ** 3}
+
+        cases = [
+            ([gpu("NVIDIA RTX PRO 6000 Blackwell Workstation Edition")], True, True),
+            ([gpu("RTX PRO 6000")], True, True),
+            ([gpu("cuda:0 NVIDIA RTX PRO 6000 Blackwell : cudaMallocAsync")], True, True),
+            ([gpu("nvidia rtx pro 6000 blackwell Server Edition")], True, True),
+            ([gpu("RTX PRO 6000", 80)], True, False),
+            ([gpu("RTX PRO 6000", 48)], True, False),
+            ([{"type": "cuda", "name": "RTX PRO 6000"}], True, False),
+            ([gpu("RTX A6000", 48)], False, False),
+            ([gpu("Quadro RTX 6000", 24)], False, False),
+            ([gpu("RTX 6000 Ada Generation", 48)], False, False),
+            ([gpu("NVIDIA H100", 96)], False, True),
+            ([gpu("Other GPU", 96)], False, True),
+            ([gpu("", 96)], False, True),
+            ([gpu(None, 96)], False, True),
+            ([gpu("RTX PRO 60000")], False, True),
+            ([gpu("RTX PRO 6000", kind="cpu")], False, False),
+            ([gpu("RTX A6000", 48), gpu("RTX PRO 6000")], False, False),
+            ([gpu("RTX PRO 6000"), gpu("RTX A6000", 48)], True, True),
+            ([], False, False), (None, False, False),
+        ]
+        for devices, reserved, bf16_allowed in cases:
+            with self.subTest(devices=devices):
+                self.assertEqual(is_pro_6000_worker(devices), reserved)
+                self.assertEqual(can_run_capability(BF16_TWO_PASS_CAPABILITY, devices), bf16_allowed)
+                for cid in worker_mode_ids() + ["unknown", "text", None]:
+                    if cid == BF16_TWO_PASS_CAPABILITY:
+                        continue
+                    with self.subTest(capability=cid):
+                        expected = not reserved
+                        if cid == "minimax_h3_ref_2pass":
+                            primary = devices[0] if devices else {}
+                            expected = (expected and primary.get("type") == "cuda"
+                                        and primary.get("vram_total", 0) >= 32_000_000_000)
+                        self.assertEqual(can_run_capability(
+                            cid, devices, duration_seconds=1), expected)
+                # 旧 H3 短时长或其他任务的 32GB policy 都不能放宽专用限制。
+                if reserved:
+                    self.assertFalse(can_run_capability(
+                        "minimax_h3_ref_2pass", devices, HIGH_VRAM_GPU_POLICY, 1))
+                    self.assertFalse(can_run_capability("zimage_t2i", devices, HIGH_VRAM_GPU_POLICY))
 
 
 class ModelDispatchTest(unittest.TestCase):
@@ -96,7 +155,7 @@ class ModelDispatchTest(unittest.TestCase):
     def test_bf16_two_pass_gate_cannot_bypass_models_or_primary_device(self):
         from distributed import can_run_capability
         cid = "minimax_h3_ref_2pass_bf16"
-        device = {"type": "cuda", "name": "Other GPU", "vram_total": 80 * 1024 ** 3 + 1}
+        device = {"type": "cuda", "name": "RTX PRO 6000", "vram_total": 80 * 1024 ** 3 + 1}
         self.assertTrue(can_run_capability(cid, [device]))
         self.assertFalse(can_run_capability(cid, [self.caps["devices"][0], device]))
         self.assertFalse(can_run_capability(cid, [{**device, "type": "cpu"}]))
@@ -112,6 +171,85 @@ class ModelDispatchTest(unittest.TestCase):
         caps["input_choices"]["UNETLoader"]["unet_name"] = []
         self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
         self.assertIsNone(self.store.acquire(self.worker_id))
+
+    def test_pro_reservation_applies_to_all_claims_before_affinity(self):
+        caps = copy.deepcopy(self.caps)
+        caps["devices"] = [{"type": "cuda", "name": "NVIDIA RTX PRO 6000 Blackwell",
+                            "vram_total": 96 * 1024 ** 3}]
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        modes = worker_mode_ids() + ["unknown", None]
+        for index, cid in enumerate(modes):
+            with self.subTest(capability=cid):
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE workers SET last_capability_id = ?, last_model_family = ? WHERE id = ?",
+                        (cid, "cached-family", self.worker_id))
+                job_id = f"pro-{index}"
+                self.enqueue(job_id=job_id, capability=cid, model_family="cached-family")
+                acquired = self.store.acquire(self.worker_id)
+                if cid == BF16_TWO_PASS_CAPABILITY:
+                    self.assertEqual(acquired["job_id"], job_id)
+                    self.store.finish(job_id, self.worker_id, acquired["lease_token"], "done",
+                                      capacity_released=True)
+                else:
+                    self.assertIsNone(acquired)
+                    self.assertEqual(self.store.dispatch_status(job_id), "queued")
+                self.store.remove_job(job_id)
+
+    def test_pro_bf16_actual_graph_still_requires_each_exact_model(self):
+        self.graph = json.loads((ROOT / "graphs/minimax_h3_ref_2pass_bf16.api.json").read_text(encoding="utf-8"))
+        caps = copy.deepcopy(self.caps)
+        caps["devices"] = [{"type": "cuda", "name": "RTX PRO 6000",
+                            "vram_total": 96 * 1024 ** 3}]
+        caps["node_classes"] = sorted({node["class_type"] for node in self.graph.values()})
+        caps["input_types"] = {node["class_type"]: {"model": "MODEL"}
+                               for node in self.graph.values()
+                               if isinstance(node.get("inputs", {}).get("model"), list)}
+        caps["input_choices"] = {}
+        for node in self.graph.values():
+            for key in ("unet_name", "clip_name", "vae_name", "lora_name"):
+                if key in node.get("inputs", {}):
+                    caps["input_choices"].setdefault(node["class_type"], {}).setdefault(key, []).append(
+                        node["inputs"][key])
+        self.store.enqueue("fusion", {
+            "graph": self.graph, "capability": BF16_TWO_PASS_CAPABILITY,
+        }, caps["node_classes"])
+        for node_class, fields in caps["input_choices"].items():
+            for key, names in fields.items():
+                for name in names:
+                    with self.subTest(model=name):
+                        incomplete = copy.deepcopy(caps)
+                        incomplete["input_choices"][node_class][key].remove(name)
+                        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=incomplete)
+                        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_reserved_larger_worker_does_not_block_non_pro_old_h3(self):
+        caps = copy.deepcopy(self.caps)
+        caps["devices"] = [{"type": "cuda", "name": "RTX PRO 6000",
+                            "vram_total": 96 * 1024 ** 3}]
+        pro_id = self.store.register_worker("ordinary-nickname", caps)["worker_id"]
+        self.store.heartbeat(pro_id, comfy_online=True)
+        self.enqueue(capability="minimax_h3_ref_2pass", duration_seconds=8)
+        self.assertIsNone(self.store.acquire(pro_id))
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_worker_nickname_and_new_policy_do_not_cancel_running_lease(self):
+        # 昵称冒充 PRO 不影响真实 5090；已运行租约不会因设备更新被追溯取消。
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET name = ? WHERE id = ?",
+                                  ("RTX PRO 6000 Blackwell", self.worker_id))
+        self.enqueue()
+        acquired = self.store.acquire(self.worker_id)
+        self.assertIsNotNone(acquired)
+        self.assertTrue(self.store.mark_running("fusion", self.worker_id, acquired["lease_token"]))
+        caps = copy.deepcopy(self.caps)
+        caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)
+        self.store.heartbeat(self.worker_id, comfy_online=True, busy=True,
+                             current_job_id="fusion", capabilities=caps)
+        self.assertEqual(self.store.dispatch_status("fusion"), "running")
+        self.assertTrue(self.store.validate_lease("fusion", self.worker_id, acquired["lease_token"]))
 
     def test_actual_h3_graph_requires_every_exact_model(self):
         self.enqueue()

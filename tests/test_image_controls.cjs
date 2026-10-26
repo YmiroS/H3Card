@@ -425,27 +425,92 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
       assert.equal(Object.hasOwn(payload.params,'image_ratio'),false);
       assert.equal(Object.hasOwn(payload.params,'image_clarity'),false);
     });
-    await t.test('only BF16 two-pass exposes default-off iPhone-style 1080P switch and preserves scale',async()=>{
+    await t.test('BF16 two-pass offers 1080p alongside low clarity choices without a separate row',async()=>{
       await reset('minimax_h3_ref_2pass_bf16','card_video');await paramsButton.click();
-      const toggle=page.getByRole('switch',{name:'1080P',exact:true});
-      assert.equal(await toggle.getAttribute('aria-checked'),'false');
-      assert.equal(await toggle.locator('.param-switch-track .param-switch-thumb').count(),1);
-      const hint=page.locator('#respop .knobnote').filter({hasText:'开启后覆盖分辨率预算'});
-      assert.match(await hint.innerText(),/二采倍率.*默认 1.5.*尚未实测/);
+      const sizes=page.locator('#respop .cgrid.k');
+      const high=sizes.getByRole('button',{name:'1080p',exact:true});
+      assert.deepEqual(await sizes.locator('button').allTextContents(),['480p','544p','640p','768p','1080p']);
+      assert.equal(await sizes.locator('button.on').innerText(),'480p','off defaults are unchanged');
+      assert.equal(await page.getByRole('switch',{name:'1080P',exact:true}).count(),0);
+      assert.equal(await page.locator('#panel .row, #respop .row').filter({has:page.getByText('1080P',{exact:true})}).count(),0);
       assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.output_1080p),'off');
-      await toggle.click();
-      assert.equal(await toggle.getAttribute('aria-checked'),'true');
-      // Keep the existing advanced-control visibility; the switch must preserve saved custom scales.
       await page.evaluate(()=>{PROJ.cards[0].params.scale_by=1.25;});
-      let params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
-      assert.equal(params.output_1080p,'on');assert.equal(params.scale_by,1.25);
-      assert.equal(Object.hasOwn(params,'output_width'),false,'trusted dimensions are server-only');
-      await toggle.click();
-      params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
-      assert.equal(params.output_1080p,'off');assert.equal(params.scale_by,1.25);
-      for(const cap of ['minimax_h3_ref_2pass','minimax_h3_ref9','minimax_h3_fusion_v2']) {
-        await reset(cap,'card_video');await paramsButton.click();
-        assert.equal(await page.getByRole('switch',{name:'1080P',exact:true}).count(),0,cap);
+      for(const label of ['480p','544p','640p','768p']) {
+        const before=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.megapixels);
+        await high.click();
+        assert.equal(await sizes.locator('button.on').innerText(),'1080p');
+        assert.equal(await high.getAttribute('title'),'1920×1080');
+        assert.match(await paramsButton.innerText(),/16:9 · 1080p · 1920×1080/);
+        assert.doesNotMatch(await paramsButton.innerText(),/480p|544p|640p|768p/);
+        assert.match(await page.locator('#respop .knobnote').filter({hasText:'1080p 档位'}).innerText(),/二采倍率.*默认 1.5.*尚未实测/);
+        let params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
+        assert.equal(params.output_1080p,'on');assert.equal(params.scale_by,1.25);
+        assert.equal(params.megapixels,before,'1080p does not misuse the MP budget');
+        for(const key of ['output_width','output_height']) assert.equal(Object.hasOwn(params,key),false,'trusted dimensions are server-only');
+        await sizes.getByRole('button',{name:label,exact:true}).click();
+        params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
+        assert.equal(params.output_1080p,'off');assert.equal(params.scale_by,1.25);
+        assert.equal(params.megapixels,await page.evaluate(p=>{
+          const c=PROJ.cards[0], spec=capOf(c).inputs.find(s=>s.key==='aspect_ratio');
+          return mpForP(c.params.aspect_ratio ?? spec.default,p);
+        },parseInt(label,10)));
+        assert.equal(await sizes.locator('button.on').innerText(),label);
+        assert.match(await paramsButton.innerText(),new RegExp(label));
+        assert.doesNotMatch(await paramsButton.innerText(),/1080p|1920×1080/);
+      }
+    });
+    await t.test('1080p survives every workflow ratio with accurate even-pixel target and all low choices available',async()=>{
+      await reset('minimax_h3_ref_2pass_bf16','card_video');await paramsButton.click();
+      const sizes=page.locator('#respop .cgrid.k');
+      await sizes.getByRole('button',{name:'1080p',exact:true}).click();
+      const before=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.megapixels);
+      const spec=runtime.capabilities.minimax_h3_ref_2pass_bf16.inputs.find(s=>s.key==='aspect_ratio');
+      for(const ratio of spec.options) {
+        const label=ratio.split(' ')[0], [w,h]=label.split(':').map(Number);
+        const target=[Math.round(1080*Math.max(1,w/h)/2)*2,Math.round(1080*Math.max(1,h/w)/2)*2].join('×');
+        await page.locator(`#respop button[title^="画面比例 ${label}"]`).click();
+        assert.deepEqual(await sizes.locator('button').allTextContents(),['480p','544p','640p','768p','1080p'],ratio);
+        assert.equal(await sizes.locator('button.on').innerText(),'1080p',ratio);
+        assert.equal(await sizes.getByRole('button',{name:'1080p',exact:true}).getAttribute('title'),target,ratio);
+        assert.ok((await paramsButton.innerText()).includes(`${label} · 1080p · ${target}`),ratio);
+        const params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
+        assert.equal(params.output_1080p,'on');assert.equal(params.aspect_ratio,ratio);
+        assert.equal(params.megapixels,before,'ratio changes preserve the old low-resolution budget');
+      }
+      await sizes.getByRole('button',{name:'768p',exact:true}).click();
+      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.output_1080p),'off');
+      assert.equal(await sizes.locator('button.on').innerText(),'768p');
+      assert.equal(await sizes.getByRole('button',{name:'768p',exact:true}).getAttribute('title'),'1792×768');
+    });
+    await t.test('saved on/off projects restore the correct clarity without a switch',async()=>{
+      const original=project.cards[0];
+      try {
+        for(const state of ['on','off']) {
+          project.cards[0]={...original,type:'card_video',cap:'minimax_h3_ref_2pass_bf16',
+            params:{output_1080p:state,aspect_ratio:'9:16 (Portrait Widescreen)',megapixels:0.7,scale_by:1.25}};
+          await page.goto(origin);await page.waitForFunction(()=>PROJ?.cards[0]?._el);
+          await page.evaluate(()=>pick(PROJ.cards[0].id));await paramsButton.click();
+          assert.equal(await page.locator('#respop .cgrid.k button.on').innerText(),state==='on'?'1080p':'640p');
+          assert.equal(await page.getByRole('switch',{name:'1080P',exact:true}).count(),0);
+          const params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
+          assert.equal(params.output_1080p,state);assert.equal(params.scale_by,1.25);
+          if(state==='on') assert.match(await paramsButton.innerText(),/9:16 · 1080p · 1080×1920/);
+          else assert.doesNotMatch(await paramsButton.innerText(),/1080p|1080×1920/);
+        }
+      } finally {project.cards[0]=original;}
+    });
+    await t.test('switching away from BF16 never leaks 1080p into other H3 modes',async()=>{
+      await reset('minimax_h3_ref_2pass_bf16','card_video');await paramsButton.click();
+      await page.locator('#respop .cgrid.k').getByRole('button',{name:'1080p',exact:true}).click();
+      const switcher=page.locator('#panel button[title="生视频模式 —— 点击换"]');
+      for(const id of ['minimax_h3_ref_2pass','minimax_h3_ref9','minimax_h3_fusion_v2','minimax_h3_flf2v']) {
+        await page.locator('#respop .x').click();await switcher.click();
+        const name=runtime.cards.find(c=>c.id==='card_video').modes.find(m=>m.id===id).name;
+        await page.locator('#menu button').filter({has:page.getByText(name,{exact:true})}).click();await paramsButton.click();
+        assert.deepEqual(await page.locator('#respop .cgrid.k button').allTextContents(),['480p','544p','640p','768p'],id);
+        assert.equal(await page.getByRole('switch',{name:'1080P',exact:true}).count(),0,id);
+        assert.equal(Object.hasOwn(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params),'output_1080p'),false,id);
+        assert.doesNotMatch(await paramsButton.innerText(),/1080p|1920×1080/,id);
       }
     });
     await t.test('H3 image-to-video and first-last-frame popovers expose 768p shortcuts',async()=>{
@@ -496,7 +561,7 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
 
     await t.test('every H3 megapixel mode offers effective 768p at all workflow ratios including 21:9',async()=>{
       const modes=Object.values(runtime.capabilities).filter(cap=>cap.id.startsWith('minimax_h3_') && cap.inputs.some(s=>s.key==='megapixels'));
-      assert.equal(modes.length,7);
+      assert.equal(modes.length,8);
       for(const cap of modes) {
         await reset(cap.id,'card_video');await paramsButton.click();
         const spec=cap.inputs.find(s=>s.key==='megapixels');

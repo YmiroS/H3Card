@@ -4,6 +4,7 @@ import hashlib
 import hmac
 import json
 import math
+import re
 import secrets
 import sqlite3
 import threading
@@ -278,7 +279,19 @@ def requires_high_vram(capability, gpu_policy=None):
     return capability in HIGH_VRAM_CAPABILITIES or gpu_policy == HIGH_VRAM_GPU_POLICY
 
 
+def is_pro_6000_worker(devices):
+    # 只认 ComfyUI 实际执行主卡的设备名，不认 worker 昵称、容量或第二张闲置卡。
+    # ComfyUI 也可能返回 "cuda:0 NVIDIA RTX PRO 6000 Blackwell : ..."。
+    primary = primary_gpu(devices)
+    return bool(
+        primary and primary.get("type") == "cuda"
+        and re.search(r"\brtx\s+pro\s+6000\b", str(primary.get("name") or ""), re.IGNORECASE)
+    )
+
+
 def can_run_capability(capability, devices, gpu_policy=None, duration_seconds=None):
+    if is_pro_6000_worker(devices) and capability != BF16_TWO_PASS_CAPABILITY:
+        return False
     if capability == BF16_TWO_PASS_CAPABILITY:
         # 共用入口先执行硬门槛，不能被 32GB 策略、短视频或亲和性兜底放宽。
         # 96GB RTX PRO 6000 和其他 >80GiB 卡均可；旧 24/48GB 6000

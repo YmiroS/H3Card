@@ -718,6 +718,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application["cleanup_pending"] = set()
         application["cleanup_tasks"] = {}
         application["session"] = mock.MagicMock()
+        application["local_gpu_state"] = {"devices": [
+            {"type": "cuda", "name": "RTX 5090", "vram_total": 32 * 1024 ** 3},
+        ]}
         application["distributed"] = self.store
         application["costs"] = self.ledger
         application.router.add_get("/controller", controller_app.controller_index)
@@ -2160,6 +2163,99 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             else:
                 self.assertEqual(controller_app.JOBS[job["id"]]["status"], "queued")
 
+    async def test_non_worker_execution_does_not_enter_pro_gpu_gate(self):
+        cases = [
+            ("browser", "此能力在浏览器中执行，请在图片合成编辑器中合成输出"),
+            ("if_studio", "IF 任务须通过用户本机桥接程序提交"),
+        ]
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+             mock.patch.object(controller_app, "check_local_capability", side_effect=AssertionError("不经worker")), \
+             mock.patch.object(controller_app, "refresh_local_gpu", new_callable=mock.AsyncMock) as refresh:
+            for execution, expected in cases:
+                with self.subTest(execution=execution), mock.patch.dict(controller_app.CAPS, {
+                    "non-worker": {"execution": execution},
+                }):
+                    response = await self.client.post("/api/generate", json={
+                        "project": "p", "capability": "non-worker",
+                    })
+                    self.assertEqual(response.status, 400)
+                    self.assertEqual(await response.text(), expected)
+            refresh.assert_not_awaited()
+
+    async def test_pro_6000_authenticated_claim_skips_every_other_worker_mode(self):
+        caps = {"node_classes": ["KSampler"], "devices": [
+            {"type": "cuda", "name": "NVIDIA RTX PRO 6000 Blackwell",
+             "vram_total": 96 * 1024 ** 3},
+        ]}
+        response = await self.client.post("/agent/v1/register", json={
+            "enrollment_token": controller_app.ENROLLMENT_TOKEN,
+            "name": "not-a-pro-nickname", "capabilities": caps,
+        })
+        self.assertEqual(response.status, 201)
+        worker = await response.json()
+        headers = {"X-Worker-ID": worker["worker_id"],
+                   "Authorization": "Bearer " + worker["worker_token"]}
+        response = await self.client.post("/agent/v1/heartbeat", headers=headers,
+                                          json={"comfy_online": True})
+        self.assertEqual(response.status, 200)
+        graph = {"1": {"class_type": "KSampler", "inputs": {}}}
+        modes = ["minimax_h3_fusion_v2", "minimax_h3_ref_2pass", "zimage_t2i",
+                 "krea2_t2i", "seedvr2_video_up", "unknown", None]
+        for index, cid in enumerate(modes):
+            job_id = f"pro-claim-{index}"
+            self.register_job(job_id)
+            self.store.enqueue(job_id, {"capability": cid, "graph": graph}, ["KSampler"])
+        response = await self.client.post("/agent/v1/jobs/acquire", headers=headers, json={})
+        self.assertEqual(response.status, 204)
+        self.register_job("bf16-claim")
+        self.store.enqueue("bf16-claim", {
+            "capability": "minimax_h3_ref_2pass_bf16", "graph": graph,
+        }, ["KSampler"])
+        response = await self.client.post("/agent/v1/jobs/acquire", headers=headers, json={})
+        self.assertEqual(response.status, 200)
+        assignment = await response.json()
+        self.assertEqual(assignment["job_id"], "bf16-claim")
+        headers["X-Lease-Token"] = assignment["lease_token"]
+        response = await self.client.post("/agent/v1/jobs/bf16-claim/start", headers=headers, json={})
+        self.assertEqual(response.status, 200)
+        for index in range(len(modes)):
+            self.assertEqual(self.store.dispatch_status(f"pro-claim-{index}"), "queued")
+
+    @mock.patch.object(controller_app, "patch_graph", return_value={
+        "1": {"class_type": "KSampler", "inputs": {}}
+    })
+    @mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock, return_value="local-pro")
+    async def test_local_pro_reservation_covers_all_worker_modes_without_per_request_network(self, submit, _graph):
+        state = self.client.server.app["local_gpu_state"]
+        state["devices"] = [{"type": "cuda", "name": "RTX PRO 6000 Blackwell",
+                             "vram_total": 96 * 1024 ** 3}]
+        session = self.client.server.app["session"]
+        stats_response = session.get.return_value.__aenter__.return_value
+        stats_response.raise_for_status = mock.Mock()
+        stats_response.json = mock.AsyncMock(return_value={"devices": state["devices"]})
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False):
+            for path in (ROOT / "manifests").glob("*.json"):
+                cap = json.loads(path.read_text(encoding="utf-8"))
+                if (not isinstance(cap, dict) or not cap.get("id") or not cap.get("graph")
+                        or cap.get("execution") in {"browser", "if_studio"}):
+                    continue
+                cid = cap["id"]
+                with self.subTest(capability=cid), mock.patch.dict(controller_app.CAPS, {
+                    cid: {"name": cid, "outputType": "video", "_graph_ok": True},
+                }):
+                    session.get.reset_mock()
+                    submit.reset_mock()
+                    response = await self.client.post("/api/generate", json={"project": "p", "capability": cid})
+                    if cid == "minimax_h3_ref_2pass_bf16":
+                        self.assertEqual(response.status, 200)
+                        submit.assert_awaited_once()
+                    else:
+                        self.assertEqual(response.status, 400)
+                        self.assertEqual(await response.text(), controller_app.PRO_6000_REQUIREMENT)
+                        submit.assert_not_awaited()
+                    if cid != "minimax_h3_ref_2pass_bf16":
+                        session.get.assert_not_called()
+
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
     })
@@ -2317,7 +2413,12 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             "text": "润色后的文本", "model": "qwen3.7-plus", "tokens": 300,
             "prompt_tokens": 200, "completion_tokens": 100, "warn": "",
         }
-        with mock.patch.object(controller_app.llm, "ready", return_value=True), \
+        self.client.server.app["local_gpu_state"]["devices"] = [
+            {"type": "cuda", "name": "RTX PRO 6000", "vram_total": 96 * 1024 ** 3},
+        ]
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+             mock.patch.object(controller_app, "check_local_capability", side_effect=AssertionError("API 不经 GPU")), \
+             mock.patch.object(controller_app.llm, "ready", return_value=True), \
              mock.patch.object(controller_app.llm, "chat", new=mock.AsyncMock(return_value=result)):
             self.own_project("copywriting", "文案项目")
             response = await self.client.post("/api/text", json={
@@ -2803,7 +2904,86 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
 
 class LocalSubmissionTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.app = {"comfy_lock": asyncio.Lock(), "cleanup_pending": set(), "session": object()}
+        self.app = {"comfy_lock": asyncio.Lock(), "cleanup_pending": set(), "session": object(),
+                    "local_gpu_state": {"devices": [{"type": "cuda", "name": "RTX 5090",
+                                                      "vram_total": 32 * 1024 ** 3}]}}
+
+    async def test_primary_gpu_reservation_at_unified_local_submit(self):
+        def gpu(name, gib=96, kind="cuda"):
+            return {"type": kind, "name": name, "vram_total": gib * 1024 ** 3}
+
+        cases = [
+            ([gpu("NVIDIA RTX PRO 6000 Blackwell")], "zimage_t2i", False),
+            ([gpu("RTX PRO 6000")], "minimax_h3_ref_2pass", False),
+            ([gpu("RTX PRO 6000")], "seedvr2_video_up", False),
+            ([gpu("RTX PRO 6000")], "text", False),
+            ([gpu("RTX PRO 6000")], None, False),
+            ([gpu("RTX PRO 6000")], "minimax_h3_ref_2pass_bf16", True),
+            ([gpu("RTX PRO 6000", 80)], "minimax_h3_ref_2pass_bf16", False),
+            ([gpu("RTX A6000", 48), gpu("RTX PRO 6000")], "zimage_t2i", True),
+            ([gpu("RTX PRO 6000"), gpu("RTX A6000", 48)], "zimage_t2i", False),
+            ([gpu("Quadro RTX 6000", 24)], "zimage_t2i", True),
+            ([gpu("RTX 6000 Ada Generation", 48)], "seedvr2_video_up", True),
+            ([gpu("NVIDIA H100")], "zimage_t2i", True),
+            ([gpu("Other 96GB")], "seedvr2_video_up", True),
+            ([gpu("")], "zimage_t2i", True),
+        ]
+        for devices, cid, allowed in cases:
+            with self.subTest(devices=devices, capability=cid), mock.patch.object(
+                controller_app, "comfy_submit", new=mock.AsyncMock(return_value="accepted"),
+            ) as submit:
+                self.app["local_gpu_state"]["devices"] = devices
+                if allowed:
+                    self.assertEqual(await controller_app.local_submit(
+                        self.app, {}, capability=cid, duration_seconds=1), "accepted")
+                    submit.assert_awaited_once()
+                else:
+                    with self.assertRaises(web.HTTPBadRequest) as raised:
+                        await controller_app.local_submit(self.app, {}, capability=cid, duration_seconds=1)
+                    expected = (controller_app.BF16_GPU_REQUIREMENT if cid == "minimax_h3_ref_2pass_bf16"
+                                else controller_app.PRO_6000_REQUIREMENT)
+                    self.assertIn(expected, raised.exception.text)
+                    submit.assert_not_awaited()
+
+    async def test_unconfirmed_device_fails_closed_without_network_query(self):
+        self.app["local_gpu_state"].clear()
+        with mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock) as submit:
+            with self.assertRaises(web.HTTPServiceUnavailable) as raised:
+                await controller_app.local_submit(self.app, {}, capability="zimage_t2i")
+            self.assertIn("无法确认执行主GPU", raised.exception.text)
+            submit.assert_not_awaited()
+
+    async def test_ws_connection_primes_device_cache_and_cancellation_invalidates_it(self):
+        session = mock.MagicMock()
+        self.app["session"] = session
+        self.app["local_gpu_state"].clear()
+        devices = [{"type": "cuda", "name": "RTX PRO 6000", "vram_total": 96 * 1024 ** 3}]
+        response = session.get.return_value.__aenter__.return_value
+        response.raise_for_status = mock.Mock()
+        response.json = mock.AsyncMock(return_value={"devices": devices})
+        listening = asyncio.Event()
+
+        async def events():
+            listening.set()
+            await asyncio.Event().wait()
+            yield None
+
+        ws = session.ws_connect.return_value.__aenter__.return_value
+        ws.__aiter__.side_effect = events
+        with mock.patch.dict(controller_app.STATE, {"comfy_online": False}):
+            task = asyncio.create_task(controller_app.ws_loop(self.app))
+            try:
+                await asyncio.wait_for(listening.wait(), 2)
+                self.assertEqual(self.app["local_gpu_state"]["devices"], devices)
+                self.assertTrue(controller_app.STATE["comfy_online"])
+                session.get.assert_called_once()
+                self.assertEqual(session.get.call_args.args[0], controller_app.COMFY_HTTP + "/system_stats")
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(self.app["local_gpu_state"], {})
+            self.assertFalse(controller_app.STATE["comfy_online"])
 
     async def test_submission_acknowledgement_does_not_wait_for_generation(self):
         with mock.patch.object(controller_app, "comfy_submit", new=mock.AsyncMock(return_value="accepted")) as submit:
@@ -3276,6 +3456,9 @@ class LocalCleanupTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtur
         response.json = mock.AsyncMock(side_effect=acknowledgement)
         self.app = self.build_app()
         self.app["session"] = self.session
+        self.app["local_gpu_state"] = {"devices": [
+            {"type": "cuda", "name": "RTX 5090", "vram_total": 32 * 1024 ** 3},
+        ]}
         self.app["comfy_lock"] = asyncio.Lock()
         self.app["cleanup_pending"] = set()
         self.app["cleanup_tasks"] = {}

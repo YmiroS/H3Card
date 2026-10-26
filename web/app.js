@@ -693,6 +693,17 @@ const RATIO_WH = {
   "21:9 (Ultrawide)": [21, 9],
 };
 const H3_P = [480, 544, 640, 768];
+const h3Output1080pSpec = cap => cap.id === "minimax_h3_ref_2pass_bf16"
+  ? cap.inputs.find(s => s.key === "output_1080p") : null;
+function h3Output1080p(c, cap) {
+  const spec = h3Output1080pSpec(cap);
+  if (!spec || (c.params.output_1080p ?? spec.default) !== "on") return null;
+  const ratio = c.params.aspect_ratio ?? cap.inputs.find(s => s.key === "aspect_ratio").default;
+  const [w, h] = RATIO_WH[ratio] || [1, 1];
+  // 与后端短边 1080、最终输出偶数尺寸的契约一致；不写入服务端专用 output_* 尺寸。
+  return {width:Math.round(1080 * Math.max(1, w / h) / 2) * 2,
+    height:Math.round(1080 * Math.max(1, h / w) / 2) * 2};
+}
 const IF_VIDEO_RESOLUTIONS = [{id:'1080p', short:1080}, {id:'2K', short:1440}, {id:'4K', short:2160}];
 function ifVideoResolution(c, cap) {
   if (cap.execution !== 'if_studio' || cap.outputType !== 'video') return null;
@@ -771,7 +782,7 @@ function refreshReferencePreview(c) {
     else el.respop._refill();
   }
 }
-const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length"]);
+const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length", "output_1080p"]);
 const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
   !RES_PARAM_KEYS.has(s.key) && !MEDIA.includes(s.type) && s.type !== "textarea"
   && (s.type === "seed" || !s.advanced) && !s.mirror && !s.rangeOf);
@@ -1053,6 +1064,8 @@ function clarityPicker(c, cap, onchange) {
     const t = document.createElement("div"); t.className = "ctitle"; t.textContent = "清晰度";
     const g = document.createElement("div"); g.className = "cgrid k";
     const curStep = whStep(cap, c);
+    const output1080Spec = h3Output1080pSpec(cap);
+    const output1080 = h3Output1080p(c, cap);
     const ifResolution = ifVideoResolution(c, cap);
     for (const s of steps) {
       const b = document.createElement("button");
@@ -1062,7 +1075,7 @@ function clarityPicker(c, cap, onchange) {
       // mp 那套按换算出的短边像素对档（0.4MP 默认正好就是 480p），
       // 别按 megapixels 原值等值比 —— 换算有 32 像素取整，原值永远差一点
       const on = mpSpec
-        ? (!ifResolution && isFinite(curVal) && Math.min(...resFromMP(mpRatio, curVal)) === s.p)
+        ? (!output1080 && !ifResolution && isFinite(curVal) && Math.min(...resFromMP(mpRatio, curVal)) === s.p)
         : (curVal != null && Math.abs(curVal - s.val) < 40);
       b.className = on ? "on" : "";
       b.textContent = s.label;
@@ -1076,6 +1089,7 @@ function clarityPicker(c, cap, onchange) {
           : `${s.val} × ${Math.round(s.val * r[2] / r[1] / multiple) * multiple}`;
       }
       b.onclick = () => {
+        if (output1080Spec) c.params.output_1080p = "off";
         if (mpSpec) { c.params.megapixels = s.val; delete c.params.if_video_resolution; }
         else {
           c.params._clarity = s.id;
@@ -1104,6 +1118,16 @@ function clarityPicker(c, cap, onchange) {
       };
       g.appendChild(b);
     }
+    // 1080p 是最终输出契约，不是 megapixels 档位；不要用 MP 上限过滤或反算它。
+    if (output1080Spec) {
+      const button = document.createElement("button");
+      const target = h3Output1080p({...c, params:{...c.params, output_1080p:"on"}}, cap);
+      button.textContent = "1080p";
+      button.className = output1080 ? "on" : "";
+      button.title = `${target.width}×${target.height}`;
+      button.onclick = () => { c.params.output_1080p = "on"; save(); onchange && onchange(); };
+      g.appendChild(button);
+    }
     if (cap.execution === 'if_studio' && cap.outputType === 'video') {
       for (const preset of IF_VIDEO_RESOLUTIONS) {
         const button = document.createElement('button');
@@ -1116,6 +1140,12 @@ function clarityPicker(c, cap, onchange) {
       }
     }
     wrap.append(t, g);
+    if (output1080Spec?.hint) {
+      const hint = document.createElement("div"); hint.className = "knobnote";
+      hint.textContent = output1080Spec.hint.replace("开启后", "1080p 档位")
+        .replace("关闭保留原有行为。", "其他清晰度档位保留原有行为。");
+      wrap.appendChild(hint);
+    }
   }
   return wrap;
 }
@@ -1176,7 +1206,10 @@ function paramsBrief(c, cap) {
   } else if (w && c.params._ratio) {
     parts.push(c.params._ratio);
   }
-  if (mp) {
+  const output1080 = h3Output1080p(c, cap);
+  if (output1080) {
+    parts.push("1080p", `${output1080.width}×${output1080.height}`);
+  } else if (mp) {
     const v = parseFloat(c.params.megapixels != null ? c.params.megapixels : mp.default);
     // 跟 ⚙ 弹窗同一口径：按短边像素报（480p/544p…），不报 MP 原值
     const ratio = c.params.aspect_ratio != null ? c.params.aspect_ratio

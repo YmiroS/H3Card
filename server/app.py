@@ -48,7 +48,7 @@ from capacity import make_spec, export_csv, model_summary_from_graph, _hash as c
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError,
-    can_run_capability, worker_capability_comparisons,
+    can_run_capability, is_pro_6000_worker, worker_capability_comparisons,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 from if_reference import IFReferenceCopies
@@ -928,12 +928,47 @@ def check_local_cleanup(app):
         raise web.HTTPConflict(text="正在停止并释放显存，或释放尚未确认；请等待或重试取消。")
 
 
-async def local_submit(app, graph, prompt_id=None):
+BF16_GPU_REQUIREMENT = "此模式仅支持显存超过80GB的CUDA显卡（如PRO 6000 96GB），80GB及以下或显存未知不可接单"
+PRO_6000_REQUIREMENT = "PRO 6000仅接收H3满血二采任务"
+
+
+async def refresh_local_gpu(app):
+    async with app["session"].get(
+        COMFY_HTTP + "/system_stats", timeout=aiohttp.ClientTimeout(total=5)
+    ) as response:
+        response.raise_for_status()
+        stats = await response.json()
+    if not isinstance(stats, dict) or not isinstance(stats.get("devices"), list):
+        raise ValueError("ComfyUI 未返回设备信息")
+    app["local_gpu_state"]["devices"] = stats["devices"]
+
+
+def check_local_capability(app, capability, gpu_policy=None, duration_seconds=None):
+    state = app.get("local_gpu_state", {})
+    if "devices" not in state:
+        raise web.HTTPServiceUnavailable(text="无法确认执行主GPU，请等待本地ComfyUI设备信息就绪后重试")
+    devices = state["devices"]
+    if can_run_capability(capability, devices, gpu_policy, duration_seconds):
+        return
+    if is_pro_6000_worker(devices) and capability != "minimax_h3_ref_2pass_bf16":
+        raise web.HTTPBadRequest(text=PRO_6000_REQUIREMENT)
+    raise web.HTTPBadRequest(reason=(
+        BF16_GPU_REQUIREMENT if capability == "minimax_h3_ref_2pass_bf16" else (
+            "此任务只能在主 GPU 显存至少 32GB 的机器上运行；"
+            f"H3高质量不超过{MAX_4090_HIGH_QUALITY_DURATION_SECONDS:g}秒时也可使用RTX 4090"
+        )
+    ))
+
+
+async def local_submit(app, graph, prompt_id=None, *, capability=None,
+                       gpu_policy=None, duration_seconds=None):
     try:
         # 这里只等提交确认，不是等出图；也限制被另一个挂起提交占住锁的等待。
         async with asyncio.timeout(30):
             async with app["comfy_lock"]:
                 check_local_cleanup(app)
+                # 所有本地 Comfy 提交共用 gate；普通请求只读缓存，不新增远端查询。
+                check_local_capability(app, capability, gpu_policy, duration_seconds)
                 return await comfy_submit(app["session"], graph, prompt_id=prompt_id)
     except asyncio.TimeoutError:
         raise web.HTTPGatewayTimeout(text=(
@@ -1082,6 +1117,13 @@ async def ws_loop(app):
         try:
             async with session.ws_connect(f"{COMFY_WS}?clientId={CLIENT_ID}",
                                           heartbeat=20) as ws:
+                # 设备随 ComfyUI 进程/连接生命周期缓存；重连先重新确认主卡。
+                try:
+                    await refresh_local_gpu(app)
+                except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as exc:
+                    app["local_gpu_state"].clear()
+                    # 确认失败只阻止新提交，不妨碍已有任务继续接收进度/产物。
+                    print(f"[ws] 无法确认执行主GPU：{exc}")
                 STATE["comfy_online"] = True
                 async for msg in ws:
                     if msg.type != aiohttp.WSMsgType.TEXT:
@@ -1093,8 +1135,12 @@ async def ws_loop(app):
                     await handle_event(session, ev, app=app)
         except Exception as e:
             STATE["comfy_online"] = False
+            app["local_gpu_state"].clear()
             print(f"[ws] 与 ComfyUI 断开：{type(e).__name__}: {e}，3 秒后重连")
             await asyncio.sleep(3)
+        finally:
+            STATE["comfy_online"] = False
+            app["local_gpu_state"].clear()
 
 
 async def handle_event(session, ev, remote=False, app=None):
@@ -1358,36 +1404,30 @@ async def api_generate(request):
             and source_video_duration > LONG_VIDEO_HIGH_VRAM_SECONDS
         ) else None
     )
+    if (not CONTROLLER_MODE and cid != "minimax_h3_ref_2pass_bf16"
+            and is_pro_6000_worker(request.app.get("local_gpu_state", {}).get("devices"))):
+        # 已确认的专用主卡直接给专用提示，不被显存检查/网络错误混淆。
+        check_local_capability(request.app, cid, gpu_policy, duration_seconds)
     if not CONTROLLER_MODE and gpu_policy:
-        bf16_gpu_requirement = (
-            "此模式仅支持显存超过80GB的CUDA显卡（如PRO 6000 96GB），80GB及以下或显存未知不可接单"
-            if cid == "minimax_h3_ref_2pass_bf16" else None
-        )
         try:
-            async with request.app["session"].get(
-                COMFY_HTTP + "/system_stats", timeout=aiohttp.ClientTimeout(total=5)
-            ) as response:
-                response.raise_for_status()
-                stats = await response.json()
+            await refresh_local_gpu(request.app)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+            request.app["local_gpu_state"].clear()
             raise web.HTTPServiceUnavailable(
-                reason=bf16_gpu_requirement or "无法确认执行显卡，此任务要求主 GPU 显存至少 32GB"
+                reason=BF16_GPU_REQUIREMENT if cid == "minimax_h3_ref_2pass_bf16"
+                else "无法确认执行显卡，此任务要求主 GPU 显存至少 32GB"
             )
-        if not can_run_capability(
-            cid, stats.get("devices"), gpu_policy, duration_seconds,
-        ):
-            raise web.HTTPBadRequest(
-                reason=bf16_gpu_requirement or (
-                    "此任务只能在主 GPU 显存至少 32GB 的机器上运行；"
-                    f"H3高质量不超过{MAX_4090_HIGH_QUALITY_DURATION_SECONDS:g}秒时也可使用RTX 4090"
-                )
-            )
+    if not CONTROLLER_MODE:
+        check_local_capability(request.app, cid, gpu_policy, duration_seconds)
     await require_project(request, body["project"], operate=True)
     pid = str(uuid.uuid4())
     await call_store(request.app, "register_job", pid, body["project"], require_user(request)["id"])
     await resource_call(request.app, "register_job_inputs", pid, uploaded)
     if not CONTROLLER_MODE:
-        actual_pid = await local_submit(request.app, graph, prompt_id=pid)
+        actual_pid = await local_submit(
+            request.app, graph, prompt_id=pid, capability=cid,
+            gpu_policy=gpu_policy, duration_seconds=duration_seconds,
+        )
         if actual_pid != pid:
             await call_store(request.app, "register_job", actual_pid, body["project"], require_user(request)["id"])
             await resource_call(request.app, "register_job_inputs", actual_pid, uploaded)
@@ -1556,7 +1596,7 @@ async def rewrite_local(request, job_name, system, user, sampling, body, t0, fel
         await require_project(request, body["project"], operate=True)
         pid = str(uuid.uuid4())
         await call_store(request.app, "register_job", pid, body["project"], require_user(request)["id"])
-        actual_pid = await local_submit(request.app, graph, prompt_id=pid)
+        actual_pid = await local_submit(request.app, graph, prompt_id=pid, capability="text")
         if actual_pid != pid:
             await call_store(request.app, "register_job", actual_pid, body["project"], require_user(request)["id"])
         pid = actual_pid
@@ -3712,6 +3752,7 @@ def make_app(auth_path=None, *, project_repository=None):
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
     app["local_output_tasks"] = {}
+    app["local_gpu_state"] = {}
     app["capacity_probe_state"] = {"task": None}
     app["lifecycle"] = {"shutting_down": False}
     app["local_test"] = local_test
