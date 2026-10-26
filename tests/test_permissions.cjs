@@ -25,8 +25,9 @@ test('所有页面统一CK标签图标，品牌图片保持透明及原始比例
     ...['icon.png', 'favicon.png', 'auth-logo.png', 'auth-art.webp'].map(name => [`/${name}`, [name, name.endsWith('.webp') ? 'image/webp' : 'image/png']]),
   ]);
   const server = createServer((req, res) => {
-    // 此项只检查真实HTML/CSS品牌展示，禁止业务脚本发起账号或画布请求。
-    res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:");
+    // 监控品牌由React挂载，只允许该文档执行同源模块；connect-src仍禁止任何账号或业务请求。
+    const monitorScript = new URL(req.url, 'http://localhost').pathname === '/monitor' ? "'self'" : "'none'";
+    res.setHeader('Content-Security-Policy', `default-src 'none'; script-src ${monitorScript}; connect-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:`);
     if (built.serve(req, res)) return;
     const item = files.get(new URL(req.url, 'http://localhost').pathname);
     if (!item) { res.writeHead(404); res.end(); return; }
@@ -46,8 +47,9 @@ test('所有页面统一CK标签图标，品牌图片保持透明及原始比例
       assert.equal(await favicon.getAttribute('href'), adminRoutes[name] ? '/favicon.png' : '/favicon.png?v=ck05',
         'Vite 解析公共图片后保留规范图标路径；旧文档仍验证原版本后缀');
       const icons = page.locator('img[src$="icon.png"], img[src$="auth-logo.png"]');
-      // 管理工作区由真实会话挂载品牌；监控页与画布、登录、导演页保留静态品牌。
+      // 管理工作区需真实会话；独立监控的品牌由React无会话挂载，其他用户页保留静态品牌。
       const expected = ['index', 'login', 'monitor'].includes(name) ? 1 : name === 'director' ? 2 : 0;
+      if (name === 'monitor') await page.locator('.brand img[src="/icon.png"]').waitFor({state:'visible'});
       assert.equal(await icons.count(), expected, `${name} 品牌入口不可遗漏`);
       for (const icon of await icons.all()) {
         await icon.evaluate(image => image.decode());
@@ -701,7 +703,7 @@ test('permissions dialogs preserve failed inputs, clear passwords and confirm re
     browser = await chromium.launch(browserOptions); const page = await browser.newPage({viewport:{width:1440,height:1000}});
     page.on('pageerror', error => errors.push(error.message));
     await page.goto('http://127.0.0.1:' + server.address().port + '/admin/permissions');
-    await page.waitForFunction(() => document.getElementById('metric-users').textContent === '4' && document.getElementById('metric-pending').textContent === '1');
+    await page.waitForFunction(() => document.getElementById('metric-users')?.textContent === '4' && document.getElementById('metric-pending')?.textContent === '1');
     assert.equal(await page.locator('#metric-enabled').innerText(), '3');
     assert.equal(await page.locator('#metric-pending').innerText(), '1');
     assert.match(await page.locator('#outbox-status').innerText(), /积压 2 条/);
@@ -768,6 +770,9 @@ test('permissions dialogs preserve failed inputs, clear passwords and confirm re
     await page.waitForFunction(() => !document.getElementById('create-user').disabled);
     assert.equal(mutations.length, writesBeforeRetry, '重试只读取，不能重新提交成功的角色变更');
     assert.equal(mutations.filter(item => item.method === 'PATCH' && item.body.role === 'admin').length, 1);
+    // 已核验的通知显式通过真实关闭入口清理，避免累计通知遮挡后续确认按钮。
+    await page.getByRole('button', {name:'关闭全部通知', exact:true}).click();
+    await page.locator('#h3-errors').waitFor({state:'detached'});
     await ownerRow.getByRole('button', {name:'停用', exact:true}).click(); dialog = page.getByRole('dialog');
     await dialog.getByRole('button', {name:'确认停用账号', exact:true}).click(); await page.locator('dialog').waitFor({state:'detached'});
     assert.equal(users.find(user => user.id === 'owner').enabled, false);
@@ -785,7 +790,8 @@ test('permissions dialogs preserve failed inputs, clear passwords and confirm re
     await page.locator('#project-search').fill(''); await all.check();
     assert.equal(await page.locator('#assign [name=owner_id] option[value=disabled]').count(), 0, '目标不包含停用账号');
     await page.locator('#assign [name=owner_id]').selectOption('viewer'); await page.locator('#assign-submit').click(); dialog = page.getByRole('dialog');
-    assert.equal(await dialog.locator('tbody tr').count(), 2); assert.equal(await dialog.locator('svg, img').count(), 0);
+    assert.equal(await dialog.locator('tbody tr').count(), 2);
+    assert.equal(await dialog.locator('[data-dialog-content] svg, [data-dialog-content] img, [data-dialog-content] script').count(), 0, '分配业务内容只按文本展示，通知区自有图标不属于画布名称HTML');
     assert.match(await dialog.innerText(), /原所有者及其授权访问者可能失去访问权限/);
     assert.match(await dialog.innerText(), /ID: owner/); assert.match(await dialog.innerText(), /ID: viewer/);
     response = page.waitForResponse(r => r.url().endsWith('/projects/assign'));
@@ -907,7 +913,7 @@ test('新版工作区跨页面保留唯一导航和底部真实账号，键盘�
         assert.equal(await page.evaluate(()=>document.documentElement.scrollWidth<=innerWidth),true,route+' '+width);
         assert.equal((await rail.boundingBox()).width,72); assert.ok((await trigger.boundingBox()).y>790);
       }
-      await trigger.click(); await menu.getByRole('button',{name:'用户信息',exact:true}).click();
+      await trigger.click(); await menu.getByRole(['controller','permissions','costs','capacity'].includes(key)?'menuitem':'button',{name:'用户信息',exact:true}).click();
       const info=page.getByRole('dialog',{name:'用户信息',exact:true});
       assert.deepEqual(await info.locator('dd').allTextContents(),['张三','admin-account','13800138000','管理员','admin-1']);
       await page.keyboard.press('Escape'); await info.waitFor({state:'detached'});
@@ -946,10 +952,11 @@ test('真实维护分级、短暂部分维护、减少动画和超时恢复，�
     const pathname=new URL(req.url,'http://localhost').pathname;
     const json=body=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(body));};
     if(built.serve(req,res))return;
-    if(pathname==='/api/auth/me')return json({user:{id:'u1',username:'viewer',role:'user'},csrf_token:'maintenance-csrf'});
+    if(pathname==='/api/auth/me'&&req.method==='GET')return json({user:{id:'u1',username:'maintenance-admin',role:'admin',phone:'13800138000'},csrf_token:'maintenance-csrf'});
     if(pathname==='/api/auth/presence'&&req.method==='POST'){assert.equal(req.headers['x-csrf-token'],'maintenance-csrf');req.resume();return json({online_users:1});}
-    if(pathname==='/api/health'&&req.method==='GET'){healthRequests++;if(stallHealth){stalledReceived?.();return;}return json({ok:true,comfy_online:comfyOnline,maintenance_active:maintenance});}
-    if(pathname==='/'){res.setHeader('Content-Type','text/html; charset=utf-8');return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><title>维护提示测试</title><main><h1>管理页标题</h1></main>'+built.runtimeTags());}
+    if(pathname==='/api/health'&&req.method==='GET'){healthRequests++;if(stallHealth){stalledReceived?.();return;}return json({ok:true,mode:'controller',comfy_online:comfyOnline,maintenance_active:maintenance});}
+    const payloads={'/api/status':{running_count:0,queued_count:0},'/api/workers':{workers:[]},'/api/jobs':{jobs:[]},'/api/projects':{projects:[]}};
+    if(req.method==='GET'&&Object.hasOwn(payloads,pathname))return json(payloads[pathname]);
     unexpected.push(req.method+' '+pathname);req.resume();res.writeHead(404);res.end();
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));let browser;
@@ -958,79 +965,139 @@ test('真实维护分级、短暂部分维护、减少动画和超时恢复，�
     const origin='http://127.0.0.1:'+server.address().port;
     await context.route('**/*',route=>new URL(route.request().url()).origin===origin?route.continue():(external.push(route.request().url()),route.abort()));
     await context.routeWebSocket('**/*',socket=>{external.push(socket.url());socket.close();});
-    await context.addInitScript(()=>{window.maintenanceIntervals=[];window.setInterval=(fn,ms)=>(maintenanceIntervals.push({fn,ms}),maintenanceIntervals.length);});
+    await context.addInitScript(()=>{
+      window.maintenanceIntervals=[];let next=1000000;
+      window.setInterval=(fn,ms)=>{const id=++next;maintenanceIntervals.push({id,fn,ms});return id;};
+      window.clearInterval=id=>{window.maintenanceIntervals=maintenanceIntervals.filter(timer=>timer.id!==id);};
+    });
     const page=await context.newPage();page.on('pageerror',error=>errors.push(error.message));
-    await page.goto(origin);await page.evaluate(()=>H3Auth.requireUser());const banner=page.locator('#maintenance-banner');await banner.waitFor({state:'visible'});
+    await page.goto(origin+'/controller');
+    await page.waitForFunction(()=>document.querySelector('#running')?.textContent==='0'&&document.querySelector('#refresh')?.disabled===false);
+    await page.locator('#auto-refresh').uncheck();
+    const banner=page.locator('#maintenance-banner');await banner.waitFor({state:'visible'});
     const visual=await banner.evaluate(node=>({position:getComputedStyle(node).position,top:getComputedStyle(node).top,background:getComputedStyle(node).backgroundColor,role:node.getAttribute('role'),live:node.getAttribute('aria-live'),iconBeforeMessage:node.querySelector('.maintenance-banner-icon').getBoundingClientRect().right<=node.querySelector('.maintenance-banner-ticker').getBoundingClientRect().left,animation:getComputedStyle(node.querySelector('.maintenance-banner-track')).animationName}));
-    assert.deepEqual({...visual,animation:undefined},{position:'fixed',top:'0px',background:'rgb(185, 28, 28)',role:'status',live:'polite',iconBeforeMessage:true,animation:undefined});assert.notEqual(visual.animation,'none');
+    assert.deepEqual({...visual,animation:undefined},{position:'sticky',top:'0px',background:'rgb(185, 28, 28)',role:'status',live:'polite',iconBeforeMessage:true,animation:undefined});assert.notEqual(visual.animation,'none');
     assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(),'系统正在维护更新，当前暂无可用执行节点，请稍后再使用。');assert.equal(await banner.locator('svg').count(),1);
     const checkHealth=async()=>{const reply=page.waitForResponse(response=>new URL(response.url()).pathname==='/api/health');await page.evaluate(()=>maintenanceIntervals.filter(timer=>timer.ms===5000).forEach(timer=>timer.fn()));await reply;};
-    comfyOnline=true;await checkHealth();
+    comfyOnline=true;const partialStarted=Date.now();await checkHealth();
     assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(),'部分节点正在维护更新，其他可用节点仍可正常使用。');
     await banner.waitFor({state:'hidden',timeout:7000});
+    assert.ok(Date.now()-partialStarted>=4750,'部分维护提示必须保留真实5秒，不能提前消失');
     await checkHealth();assert.equal(await banner.isHidden(),true,'同一轮部分维护不能每次轮询重复提示');
     comfyOnline=false;await checkHealth();await banner.waitFor({state:'visible'});
     assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(),'系统正在维护更新，当前暂无可用执行节点，请稍后再使用。');
     maintenance=false;await checkHealth();await banner.waitFor({state:'hidden'});maintenance=true;await checkHealth();await banner.waitFor({state:'visible'});
     assert.equal(await banner.count(),1);
-    await page.evaluate(styles=>{document.body.classList.add('admin-page');document.body.dataset.workspace='controller';for(const href of styles){const link=document.createElement('link');link.rel='stylesheet';link.href=href;document.head.append(link);}},built.documents.get('/controller').styles);
-    await page.waitForFunction(()=>getComputedStyle(document.querySelector('#maintenance-banner')).position==='sticky');
     for(const width of [2560,390,320]){
       await page.setViewportSize({width,height:740});
-      assert.equal(await page.evaluate(()=>{const banner=document.querySelector('#maintenance-banner').getBoundingClientRect();return document.querySelector('h1').getBoundingClientRect().top>=banner.bottom&&banner.left===0&&banner.right<=innerWidth&&document.documentElement.scrollWidth<=innerWidth;}),true,'维护横幅保留全宽且不得遮挡管理页标题');
+      assert.equal(await page.evaluate(()=>{const banner=document.querySelector('#maintenance-banner').getBoundingClientRect();return document.querySelector('h1').getBoundingClientRect().top>=banner.bottom&&banner.left===0&&Math.abs(banner.right-innerWidth)<=1&&document.documentElement.scrollWidth<=innerWidth;}),true,'真实React管理页维护横幅保留全宽且不得遮挡标题，不注入旧CSS模拟管理页');
     }
     await page.emulateMedia({reducedMotion:'reduce'});
-    assert.deepEqual(await banner.locator('.maintenance-banner-message').first().evaluate(node=>({animation:getComputedStyle(node.parentElement).animationName,whiteSpace:getComputedStyle(node).whiteSpace,textOverflow:getComputedStyle(node).textOverflow,fullWidth:node.scrollWidth<=node.clientWidth,fullHeight:node.scrollHeight<=node.clientHeight})),{animation:'none',whiteSpace:'normal',textOverflow:'clip',fullWidth:true,fullHeight:true});
-    assert.equal(await page.evaluate(()=>document.querySelector('h1').getBoundingClientRect().top>=document.querySelector('#maintenance-banner').getBoundingClientRect().bottom),true,'减少动画下多行横幅按实际高度避让');
+    for(const width of [320,390,2560]){
+      await page.setViewportSize({width,height:740});
+      assert.deepEqual(await banner.locator('.maintenance-banner-message').first().evaluate(node=>({animation:getComputedStyle(node.parentElement).animationName,whiteSpace:getComputedStyle(node).whiteSpace,textOverflow:getComputedStyle(node).textOverflow,fullWidth:node.scrollWidth<=node.clientWidth,fullHeight:node.scrollHeight<=node.clientHeight})),{animation:'none',whiteSpace:'normal',textOverflow:'clip',fullWidth:true,fullHeight:true});
+      assert.equal(await page.evaluate(()=>{const banner=document.querySelector('#maintenance-banner').getBoundingClientRect();return document.querySelector('h1').getBoundingClientRect().top>=banner.bottom&&banner.left===0&&Math.abs(banner.right-innerWidth)<=1&&document.documentElement.scrollWidth<=innerWidth;}),true,'减少动画下多行横幅按实际高度避让并保留全宽');
+    }
     stallHealth=true;const stalled=new Promise(resolve=>{stalledReceived=resolve;});
+    const timeoutStarted=Date.now(),timedOut=page.waitForEvent('requestfailed',{predicate:request=>new URL(request.url()).pathname==='/api/health',timeout:6500});
+    timedOut.catch(()=>{});
     await page.evaluate(()=>maintenanceIntervals.filter(timer=>timer.ms===5000).forEach(timer=>timer.fn()));await stalled;
     const before=healthRequests;
     await page.evaluate(()=>maintenanceIntervals.filter(timer=>timer.ms===5000).forEach(timer=>timer.fn()));
     await page.evaluate(()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve))));assert.equal(healthRequests,before,'悬挂健康请求不能重复并发');
     maintenance=false;stallHealth=false;
     // 等真实4秒超时触发后再检查，不缩短生产超时或放弃恢复断言。
-    await page.waitForEvent('requestfailed',{predicate:request=>new URL(request.url()).pathname==='/api/health',timeout:6500});
+    await timedOut;assert.ok(Date.now()-timeoutStarted>=3750,'健康请求保留真实4秒超时');
     await checkHealth();await banner.waitFor({state:'hidden'});
     assert.deepEqual(unexpected,[]);assert.deepEqual(external,[]);assert.deepEqual(errors,[]);
   } finally {if(browser)await browser.close();server.closeAllConnections();await new Promise(resolve=>server.close(resolve));}
 });
 
-test('real auth client expires protected sessions and allows a subsequent anonymous login', async () => {
-  let expired = false;
-  const session = {user:{id:'u1', username:'admin', role:'admin'}, csrf_token:'test-csrf'};
+test('真实React管理页401退出后可通过已发布登录页匿名重试并建立新会话', async () => {
+  const shipped = builtResources(['/controller', '/login', '/']);
+  const user = {id:'u1', username:'admin', display_name:'重新登录管理员', role:'admin', phone:'13800138000'};
+  const sessions = {initial:{user, csrf_token:'initial-session-csrf'}, renewed:{user, csrf_token:'renewed-session-csrf'}};
+  let phase = 'initial';
+  const requests = [], unexpected = [], external = [], errors = [], serverErrors = [];
+  const json = (res, body, status = 200) => {res.writeHead(status, {'Content-Type':'application/json; charset=utf-8'});res.end(JSON.stringify(body));};
   const server = createServer((req, res) => {
-    if (built.serve(req, res)) return;
-    if (req.url === '/api/health') {
-      res.setHeader('Content-Type', 'application/json'); return res.end('{"ok":true,"maintenance_active":false}');
-    }
-    if (req.method === 'POST' && req.url === '/api/auth/presence') {
-      req.resume(); res.setHeader('Content-Type', 'application/json'); return res.end('{"online_users":1}');
-    }
-    if (req.url === '/api/auth/me' || req.url === '/api/auth/login') {
-      req.resume();
-      res.setHeader('Content-Type', 'application/json');
-      if (expired && req.url === '/api/auth/me') { res.statusCode = 401; return res.end('{"error":"expired"}'); }
-      return res.end(JSON.stringify(session));
-    }
-    res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.end(built.runtimeTags({script:'window.expirations=0;addEventListener("h3auth:expired",()=>expirations++);'}));
+    void (async () => {
+      const pathname = new URL(req.url, 'http://localhost').pathname;
+      if (shipped.serve(req, res)) return;
+      const chunks = [];for await (const chunk of req) chunks.push(chunk);
+      const raw = Buffer.concat(chunks).toString(), body = raw ? JSON.parse(raw) : null;
+      requests.push({path:pathname, method:req.method, body, csrf:req.headers['x-csrf-token'], phase});
+      if (pathname === '/api/auth/me' && req.method === 'GET') {
+        if (phase === 'expired') return json(res, {error:'expired'}, 401);
+        return json(res, sessions[phase]);
+      }
+      if (pathname === '/api/auth/login' && req.method === 'POST') {
+        assert.equal(req.headers['x-csrf-token'], undefined, '匿名登录不携带已失效CSRF');
+        assert.equal(req.headers['content-type'], 'application/json');
+        assert.equal(body.username, 'admin');
+        if (body.password === 'wrong-test-password') return json(res, {error:'账号或密码错误'}, 401);
+        assert.deepEqual(body, {username:'admin', password:'correct-test-password'});
+        phase = 'renewed';return json(res, sessions.renewed);
+      }
+      if (pathname === '/api/auth/presence' && req.method === 'POST') {
+        assert.notEqual(phase, 'expired');
+        assert.equal(req.headers['x-csrf-token'], sessions[phase].csrf_token);
+        return json(res, {online_users:1});
+      }
+      if (pathname === '/api/status' && req.method === 'GET' && phase === 'expired') return json(res, {error:'expired'}, 401);
+      const payloads = {
+        '/api/health':{ok:true, mode:'controller', comfy_online:false, maintenance_active:false},
+        '/api/status':{running_count:0, queued_count:0}, '/api/workers':{workers:[]}, '/api/jobs':{jobs:[]},
+        '/api/projects':{projects:[], teams:[]}, '/api/cards':{cards:[], capabilities:{}, comfy_online:false, director_schema:1},
+      };
+      if (req.method === 'GET' && Object.hasOwn(payloads, pathname)) return json(res, payloads[pathname]);
+      unexpected.push(req.method + ' ' + req.url);res.writeHead(404);res.end();
+    })().catch(error => {serverErrors.push(error.message);res.destroy();});
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
   try {
     browser = await chromium.launch(browserOptions);
-    const page = await browser.newPage();
-    await page.goto('http://127.0.0.1:' + server.address().port + '/login');
-    await page.evaluate(() => H3Auth.me());
-    assert.equal(await page.evaluate(() => H3Auth.active), true);
-    expired = true;
-    const state = await page.evaluate(async () => {
-      const error = await H3Auth.me().catch(e => e.message);
-      return {error, active:H3Auth.active, expirations};
-    });
-    assert.deepEqual(state, {error:'expired', active:false, expirations:1});
-    await page.evaluate(() => H3Auth.login('admin', 'test-password'));
-    assert.equal(await page.evaluate(() => H3Auth.active), true);
+    const context = await browser.newContext({serviceWorkers:'block'}), origin = 'http://127.0.0.1:' + server.address().port;
+    await context.route('**/*', route => new URL(route.request().url()).origin === origin ? route.continue() : (external.push(route.request().url()), route.abort()));
+    await context.routeWebSocket('**/*', socket => {external.push(socket.url());socket.close();});
+    const page = await context.newPage();page.setDefaultTimeout(10000);page.on('pageerror', error => errors.push(error.message));
+    let loginNavigations = 0;
+    page.on('framenavigated', frame => {if (frame === page.mainFrame() && new URL(frame.url()).pathname === '/login') loginNavigations++;});
+    await page.goto(origin + '/controller');
+    await page.waitForFunction(() => document.querySelector('.account-trigger') && document.querySelector('#running')?.textContent === '0' && document.querySelector('#refresh')?.disabled === false);
+    await page.waitForFunction(() => document.querySelector('.workspace-presence b')?.textContent === '1');
+    assert.deepEqual(await page.evaluate(() => ['H3Auth', 'AdminUI'].filter(key => key in window)), []);
+    phase = 'expired';
+    await page.locator('#refresh').click();await page.waitForURL(origin + '/login');
+    const login = page.getByRole('button', {name:'登录', exact:true});
+    await login.waitFor();await page.waitForFunction(() => !document.querySelector('.auth-primary')?.disabled);
+    assert.equal(await page.locator('#workspace-nav, #account').count(), 0, '失效管理会话不能遗留在登录页');
+    assert.equal(loginNavigations, 1, '保护请求401只重定向一次');
+    assert.ok(requests.some(request => request.path === '/api/status' && request.phase === 'expired'));
+    assert.ok(requests.some(request => request.path === '/api/auth/me' && request.phase === 'expired'), '真实登录页独立检查匿名会话');
+    await page.getByRole('textbox', {name:'账号', exact:true}).fill('admin');
+    await page.locator('.auth-form [name=password]').fill('wrong-test-password');await login.click();
+    await page.waitForFunction(() => document.querySelector('.auth-error')?.textContent === '账号或密码错误');
+    assert.equal(new URL(page.url()).pathname, '/login', '匿名登录401只显示错误，不引起失效跳转循环');
+    assert.equal(loginNavigations, 1);
+    await page.locator('.auth-form [name=password]').fill('correct-test-password');await login.click();
+    await page.waitForURL(origin + '/');
+    await page.locator('#account .account-trigger').waitFor();
+    assert.equal(await page.locator('.account-name').textContent(), user.display_name);
+    await page.goto(origin + '/controller');
+    await page.waitForFunction(() => document.querySelector('.workspace-presence b')?.textContent === '1' && document.querySelector('#running')?.textContent === '0' && document.querySelector('#refresh')?.disabled === false);
+    assert.equal(await page.locator('#workspace-nav').count(), 1);
+    assert.deepEqual(requests.filter(request => request.path === '/api/auth/login').map(({method, body, csrf}) => ({method, body, csrf})), [
+      {method:'POST', body:{username:'admin', password:'wrong-test-password'}, csrf:undefined},
+      {method:'POST', body:{username:'admin', password:'correct-test-password'}, csrf:undefined},
+    ]);
+    const writes = requests.filter(request => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(request.method));
+    assert.ok(writes.some(request => request.path === '/api/auth/presence' && request.csrf === 'initial-session-csrf'));
+    assert.ok(writes.some(request => request.path === '/api/auth/presence' && request.csrf === 'renewed-session-csrf'));
+    assert.ok(writes.every(request => ['/api/auth/login', '/api/auth/presence'].includes(request.path)), '会话恢复不触发额外业务写入');
+    assert.equal(loginNavigations, 1);
+    assert.deepEqual(serverErrors, []);assert.deepEqual(unexpected, []);assert.deepEqual(external, []);assert.deepEqual(errors, []);
   } finally {
     if (browser) await browser.close();
     server.closeAllConnections();

@@ -3,7 +3,7 @@
 const assert = require('node:assert/strict');
 const {readFileSync, existsSync} = require('node:fs');
 const path = require('node:path');
-const {compileFunction} = require('node:vm');
+const {pathToFileURL} = require('node:url');
 
 const documentRoutes = Object.freeze({
   '/controller':'admin/controller.html',
@@ -36,7 +36,7 @@ function builtResources(routes) {
     if (file.endsWith('.js')) {
       const source = item.body.toString('utf8');
       // Vite static imports/re-exports, dynamic imports and preload dependency arrays.
-      for (const match of source.matchAll(/(?:\b(?:import|export)\s*(?:[^;"'()]*?\bfrom\s*)?["']([^"']+)["']|\bimport\s*\(\s*["']([^"']+)["']|["']((?:\.\.?\/|\/)?assets\/[^"']+\.(?:js|css))["'])/g)) {
+      for (const match of source.matchAll(/(?:\b(?:import|export)\s*(?:[^;"'()]*?\bfrom\s*)?["']((?:\.\.?\/|\/assets\/)[\w./-]+\.(?:js|css))["']|\bimport\s*\(\s*["']((?:\.\.?\/|\/assets\/)[\w./-]+\.(?:js|css))["']|["']((?:\.\.?\/|\/)?assets\/[\w./-]+\.(?:js|css))["'])/g)) {
         const dependency = match[1] || match[2] || match[3];
         add(dependency.startsWith('assets/') ? '/' + dependency : dependency, pathname);
       }
@@ -45,8 +45,9 @@ function builtResources(routes) {
     }
   }
   for (const route of routes) {
-    assert.ok(Object.hasOwn(documentRoutes, route), 'Unknown canonical admin route: ' + route);
-    const file = path.join(root, documentRoutes[route]);
+    const workspace = route === '/' || route === '/login';
+    assert.ok(workspace || Object.hasOwn(documentRoutes, route), 'Unknown canonical frontend route: ' + route);
+    const file = path.join(root, workspace ? 'index.html' : documentRoutes[route]);
     assert.ok(existsSync(file), 'Build the admin MPA into web_dist before running fixtures: ' + file);
     const html = readFileSync(file, 'utf8');
     assert.match(html, /<script\b[^>]*\btype="module"[^>]*\bsrc="\/assets\//, 'Must use a built Vite module entry');
@@ -65,15 +66,6 @@ function builtResources(routes) {
   for (const name of ['icon.png', 'favicon.png', 'auth-logo.png', 'auth-art.webp']) {
     if (existsSync(path.join(root, name))) add('/' + name);
   }
-  function findGlobal(name) {
-    const matches = [...files.entries()].filter(([url, item]) => url.endsWith('.js')
-      && new RegExp('\\.' + name + '\\s*=').test(item.body.toString('utf8')));
-    assert.equal(matches.length, 1, 'Expected one built chunk defining ' + name);
-    const [url] = matches[0];
-    assert.ok(![...documents.values()].some(document => document.scripts.includes(url)),
-      name + ' must be a shared/pure chunk, not a page entry with business side effects');
-    return url;
-  }
   return {
     files, documents,
     resource(pathname) { return documents.get(pathname) || files.get(pathname); },
@@ -82,36 +74,20 @@ function builtResources(routes) {
       if (!item) return false;
       res.setHeader('Content-Type', item.contentType); res.end(item.body); return true;
     },
-    globalModule:findGlobal,
-    runtimeTags({shell = false, script = ''} = {}) {
-      const modules = [findGlobal('H3Auth'), ...(shell ? [findGlobal('AdminUI')] : [])];
-      const styles = shell ? documents.get('/controller').styles : [];
-      return styles.map(url => `<link rel="stylesheet" href="${url}">`).join('')
-        + `<script type="module">${modules.map(url => `import ${JSON.stringify(url)};`).join('')}\n${script}</script>`;
-    },
   };
 }
 
-function loadAlertEngine() {
+async function loadAlertEngine() {
   const resources = builtResources(['/monitor']);
-  // Discover only through the shipped monitor graph, never an unused test-only engine copy.
-  const url = resources.globalModule('MonitorAlerts');
-  const source = resources.files.get(url).body.toString('utf8');
-  assert.doesNotMatch(source, /\b(?:document|H3Auth|AdminUI)\b|\bimport\s*(?:["'{*]|\()/,
-    'Alert engine chunk must run without page/auth or module dependencies');
-  // Rollup's CJS interop wrapper is initialized by its final ESM default export.
-  // Translate only that checked zero-argument call to a return; keep all shipped logic intact.
-  const finalExport = /\bexport\s+default\s+([A-Za-z_$][\w$]*)\(\);\s*$/;
-  assert.match(source, finalExport, 'Expected a final default export invoking the pure engine wrapper');
-  const executable = source.replace(finalExport, 'return $1();');
-  assert.doesNotMatch(executable, /\bexport\b/, 'No other ESM exports may be stripped from the engine');
-  // A scoped VM function keeps globals isolated but retains host-realm values for deepEqual.
-  const sandbox = {module:{exports:{}}};
-  const exported = compileFunction(executable, ['module', 'globalThis'], {filename:resources.files.get(url).file})(sandbox.module, sandbox);
-  const engine = sandbox.MonitorAlerts;
-  assert.equal(exported, engine, 'Default export and monitor global must expose the same shipped engine');
-  assert.equal(typeof engine.create, 'function', 'Built alert engine must expose create');
-  return engine;
+  // Discover only through the shipped graph and import its actual ESM, including typed schema dependencies.
+  const chunks = [...resources.files.entries()].filter(([url]) => /^\/assets\/monitor-alerts-[\w-]+\.js$/.test(url));
+  assert.equal(chunks.length, 1, 'Expected one shipped monitor alert engine chunk');
+  const [, item] = chunks[0];
+  assert.doesNotMatch(item.body.toString('utf8'), /\b(?:document|H3Auth|AdminUI|MonitorAlerts)\b/,
+    'Alert engine must not initialize a page, session or legacy global');
+  const engine = await import(pathToFileURL(item.file).href);
+  assert.equal(typeof engine.createAlertEngine, 'function', 'Built typed engine must expose createAlertEngine');
+  return {create:engine.createAlertEngine};
 }
 
 module.exports = {builtResources, documentRoutes, loadAlertEngine};

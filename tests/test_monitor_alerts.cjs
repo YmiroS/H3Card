@@ -1,7 +1,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 // Test the engine shipped to /monitor; isolated snapshots need only web_dist, not frontend/.
-const {create} = require('./helpers/admin-built-resources.cjs').loadAlertEngine();
+let create;
+test.before(async () => {
+  ({create} = await require('./helpers/admin-built-resources.cjs').loadAlertEngine());
+});
 function fixture() {
   let time = 1000;
   const values = new Map();

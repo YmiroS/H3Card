@@ -85,6 +85,9 @@ test('compiled React and management pages share Python auth without any old web 
             : url === '/admin/permissions' ? '#users'
             : url === '/controller/capacity' ? '#main-content' : '#main';
           await page.locator(selector).waitFor({state:'visible'});
+          assert.equal(await page.locator('#root').count(), 1, url + ' must mount its React root');
+          assert.equal(await page.evaluate(() => ['H3Auth', 'H3Notify', 'AdminUI', 'MonitorAlerts']
+            .some(name => Reflect.has(window, name))), false, url + ' must not load inherited admin globals');
         }
       }
       // Fabric is the sole un-hashed application library and remains protected.

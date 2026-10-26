@@ -242,7 +242,7 @@ async function releaseCapacity(page,gate,status=200) {
 }
 const estimateResponse = {mode:'historical',quality:'technical',worker_id:'w1',total_seconds:12000,daily_capacity_seconds:8*3600*1*.75,machines:1,price_total:null,lines:[{group_id:'h1',quantity:100,seconds_per_unit:60,daily_units:360},{group_id:'h2',quantity:100,seconds_per_unit:60,daily_units:360}],warnings:['测算响应警告一','测算响应警告二'],assumptions:['未包含模型切换','单机并发槽位为一']};
 const tick = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
-const loaded = page => page.waitForFunction(() => document.querySelector('#refresh-state').textContent.startsWith('最后刷新'));
+const loaded = page => page.waitForFunction(() => document.querySelector('#refresh-state')?.textContent?.startsWith('最后刷新'));
 function assertHistoryQuery(query, to=NOW, offset=0) {
   assert.deepEqual(query,{to:String(Math.floor(to.getTime()/1000)),limit:'100',offset:String(offset)});
 }
@@ -262,7 +262,7 @@ async function safeClick(page,locator) {
 }
 async function purchase(page) {
   await safeClick(page,page.locator('#tab-purchase'));
-  if(await page.locator('dialog[open]').count())await page.locator('.demand-quantity').first().evaluate(node=>{node.value='100';node.dispatchEvent(new Event('input',{bubbles:true}));});
+  if(await page.locator('dialog[open]').count())await page.locator('.demand-quantity').first().evaluate(node=>{Object.getOwnPropertyDescriptor(HTMLInputElement.prototype,'value').set.call(node,'100');node.dispatchEvent(new Event('input',{bubbles:true}));});
   else await page.locator('.demand-quantity').first().fill('100');
 }
 async function calculate(page) {
@@ -394,7 +394,7 @@ test('产能看板语法与离线路由专项', async t => {
   async function setup(options={}) {
     const context=await browser.newContext({viewport:{width:1440,height:1000},timezoneId:options.timezone || 'Asia/Shanghai',acceptDownloads:true});contexts.push(context);
     const page=await context.newPage();page.setDefaultTimeout(7000);await page.clock.setFixedTime(NOW);
-    const state={data:fixture(),gets:[],posts:[],exports:[],errors:[],getError:false,estimateError:false,reviewError:false,profileError:false,holdGet:null,holdEstimate:null};
+    const state={role:options.role || 'admin',data:fixture(),gets:[],posts:[],exports:[],errors:[],getError:false,estimateError:false,reviewError:false,profileError:false,holdGet:null,holdEstimate:null};
     state.unexpected=[];state.external=[];state.presence=[];states.push(state);
     if(options.data)state.data=options.data;
     page.on('pageerror',e=>state.errors.push(e.message));
@@ -1486,7 +1486,7 @@ test('产能看板语法与离线路由专项', async t => {
       state.estimateError=false;await page.locator('#add-demand').click();
       assert.equal(await page.locator('.demand-group').nth(1).locator('option[value=zimage_t2i]').isDisabled(),true,'重复模式首先在下拉禁用');
       // 绕过下拉禁用来验证提交端守卫，而不是让 Playwright 等待选择不可选 option。
-      await page.locator('.demand-group').nth(1).evaluate(select=>{select.querySelector('option[value=zimage_t2i]').disabled=false;select.value='zimage_t2i';});
+      await page.locator('.demand-group').nth(1).evaluate(select=>{select.querySelector('option[value=zimage_t2i]').disabled=false;select.value='zimage_t2i';select.dispatchEvent(new Event('change',{bubbles:true}));});
       await page.locator('.demand-quantity').nth(1).fill('10');const count=state.posts.length;await page.locator('#estimate-form').evaluate(form=>form.dispatchEvent(new Event('submit',{bubbles:true,cancelable:true})));
       assert.match(await page.locator('#estimate-error').innerText(),/不能重复选择/);assert.equal(state.posts.length,count);assert.equal(await page.locator('#export-estimate').isDisabled(),true);
     });
@@ -1905,6 +1905,8 @@ test('产能看板语法与离线路由专项', async t => {
       await tick(page);assert.equal(state.gets.length,2,'刷新未提交时不能启动任何证据分页请求');
       assert.equal(await page.locator('#details').textContent(),previous,'被守卫的筛选不能清空旧可读证据');
       await gate.release();await loaded(page);
+      assert.equal(await page.locator('#evidence-status').inputValue(),'','刷新中被拒绝的事件不能改变受控筛选状态');
+      await page.locator('#evidence-status').selectOption('done');
       await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
       assert.equal(state.gets.length,3);assertHistoryQuery(state.gets[2],later,100);
       assert.equal(await page.locator('[data-job-id^=window-old]').count(),0);assert.equal(await page.locator('[data-job-id=window-new-0]').count(),1);
@@ -2011,7 +2013,8 @@ test('产能看板语法与离线路由专项', async t => {
     for(const state of states) {
       assert.deepEqual(state.unexpected,[],'所有静态/API请求必须命中白名单，不允许额外业务写入');
       assert.deepEqual(state.external,[],'不允许WebSocket外联');
-      assert.ok(state.presence.length>0,'真实auth presence继续运行');
+      if(state.role==='admin')assert.ok(state.presence.length>0,'授权后的真实auth presence继续运行');
+      else assert.equal(state.presence.length,0,'未授权管理页不得启动presence旁路请求');
     }
   } finally {await Promise.all(contexts.map(context=>context.close()));await browser.close();}
 });

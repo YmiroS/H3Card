@@ -1,4 +1,4 @@
-// 真实管理页、共享壳与 auth.js 回归；所有请求只到本地白名单夹具，不访问正式服务。
+// 真实 React 管理页、共享工作区与会话回归；所有请求只到本地白名单夹具，不访问正式服务。
 // 运行示例：CHOUKA_TEST_BROWSER=chrome node --test tests/test_admin_dashboard.cjs
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
@@ -6,7 +6,7 @@ const {createServer} = require('node:http');
 const {builtResources} = require('./helpers/admin-built-resources.cjs');
 const {chromium} = require('playwright');
 
-const built = builtResources(['/controller', '/controller/costs', '/admin/permissions']);
+const built = builtResources(['/controller', '/controller/costs', '/admin/permissions', '/controller/capacity']);
 const browserOptions = process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {};
 const session = {id:'admin-id', username:'真实测试账号', display_name:'测试姓名', role:'admin'};
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; }
@@ -119,13 +119,8 @@ async function withFixture(options, run) {
         return res.end(JSON.stringify(reply.body ?? {}));
       }
       if (built.serve(req, res)) return;
-      if (req.method === 'GET' && url.pathname === '/shell') {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="/favicon.png">'
-          + '<main id="original-main"><div class="page"><header class="card page-header"><h1>真实壳层测试</h1></header><p id="business-error" role="alert">原页面业务错误必须保留</p></div></main>'
-          + built.runtimeTags({shell:true,script:'H3Auth.requireUser().then(user=>AdminUI.mount({page:new URL(location.href).searchParams.get("page")||"teams",user}));'}));
-      }
-      if (req.method === 'GET' && ['/', '/login'].includes(url.pathname)) {
+      // Redirect destinations are inert markers, not synthetic admin documents.
+      if (req.method === 'GET' && ['/', '/login', '/monitor'].includes(url.pathname)) {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
         return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="/favicon.png"><h1 id="redirect-target">本地安全跳转落点</h1>');
       }
@@ -143,10 +138,11 @@ async function withFixture(options, run) {
       external.push(route.request().url()); return route.abort();
     });
     await context.routeWebSocket('**/*', socket => { external.push(socket.url()); socket.close(); });
-    // 记录并显式触发真实 H3Auth.every 的回调；不靠固定等待，也不让后台轮询干扰交互断言。
+    // 记录并显式触发真实 React 轮询回调；不靠固定等待，也不让后台轮询干扰交互断言。
     await context.addInitScript(() => {
       window.fixtureIntervals = []; let next = 1000000;
-      window.setInterval = (fn, ms) => { fixtureIntervals.push({fn, ms}); return ++next; };
+      window.setInterval = (fn, ms) => { const id = ++next; fixtureIntervals.push({id, fn, ms}); return id; };
+      window.clearInterval = id => { window.fixtureIntervals = fixtureIntervals.filter(timer => timer.id !== id); };
       window.bluePaths = [];
       for (const name of ['beginPath', 'moveTo', 'lineTo', 'stroke']) {
         const original = CanvasRenderingContext2D.prototype[name];
@@ -160,12 +156,18 @@ async function withFixture(options, run) {
     });
     const page = await context.newPage(); page.setDefaultTimeout(8000);
     page.on('pageerror', error => pageErrors.push(error.message));
-    await run({page, origin, at, state, handlers, requests});
+    try {
+      await run({page, origin, at, state, handlers, requests});
+    } catch (error) {
+      const ui = await page.evaluate(() => ({notices:[...document.querySelectorAll('[aria-label="操作通知"]')].map(node => node.textContent), dialogs:[...document.querySelectorAll('dialog')].map(node => ({open:node.open, text:node.textContent.slice(0,300)})), rootChildren:document.getElementById('root')?.childElementCount, tail:document.body.innerText.slice(-300)})).catch(() => null);
+      console.error('Fixture diagnostics: ' + JSON.stringify({pageErrors, serverErrors, unexpected, ui}));
+      throw error;
+    }
     assert.deepEqual(pageErrors, [], '页面不得有未捕获 JS 错误');
     assert.deepEqual(serverErrors, [], '本地夹具服务器不得报错');
     assert.deepEqual(unexpected, [], '只访问明确列出的本地静态资源与 API');
     assert.deepEqual(external, [], '不允许 HTTP 或 WebSocket 外联');
-    assert.ok(requests.some(request => request.url.pathname === '/api/auth/presence' && request.method === 'POST'), '真实 auth.js 的 presence 必须继续运行');
+    assert.ok(requests.some(request => request.url.pathname === '/api/auth/presence' && request.method === 'POST'), '真实 React 会话的 presence 必须继续运行');
     for (const request of requests.filter(item => ['POST', 'PUT', 'PATCH', 'DELETE'].includes(item.method))) {
       assert.equal(request.headers['x-csrf-token'], 'fixture-csrf', '包括 presence 在内的写请求保留真实 CSRF');
       if (request.url.pathname !== '/api/auth/presence') {
@@ -185,7 +187,7 @@ async function withGrantFixture(initialGrants, run) {
   return withFixture({allowedBusinessWrites:[globalViewerRoute, ownerViewerRoute, '/api/admin/grants']}, async fixture => {
     const {page, handlers, state} = fixture;
     state.grants = structuredClone(initialGrants);
-    state.users = [session,
+    state.users = [{...session, enabled:true},
       {id:'viewer/一', username:'访问账号', display_name:'<img src=x onerror="window.grantXss=1">', role:'user', enabled:true},
       {id:'owner-id', username:'所有者账号', role:'user', enabled:true},
       {id:'other-id', username:'其他账号', role:'user', enabled:true},
@@ -216,7 +218,7 @@ async function withGrantFixture(initialGrants, run) {
       return {body:{ok:true}};
     };
     await page.goto(fixture.origin + '/admin/permissions');
-    await page.waitForFunction(() => !document.querySelector('#grant-submit').disabled);
+    await page.waitForFunction(() => document.querySelector('#grant-submit')?.disabled === false);
     await run(fixture);
     assert.equal(await page.locator('#grants img, dialog img').count(), 0, '账号花名必须转义为文本');
     assert.equal(await page.evaluate(() => window.grantXss), undefined);
@@ -225,7 +227,7 @@ async function withGrantFixture(initialGrants, run) {
 }
 async function confirmGrant(page) {
   await page.getByRole('dialog').getByRole('button', {name:'确认保存授权', exact:true}).click();
-  await page.waitForFunction(() => !document.querySelector('dialog') && !document.querySelector('#grant-submit').disabled);
+  await page.waitForFunction(() => !document.querySelector('dialog') && document.querySelector('#grant-submit')?.disabled === false);
 }
 async function dashboard(fixture) {
   await fixture.page.goto(fixture.origin + '/controller');
@@ -234,7 +236,7 @@ async function dashboard(fixture) {
 }
 async function costs(fixture) {
   await fixture.page.goto(fixture.origin + '/controller/costs');
-  await fixture.page.waitForFunction(() => document.querySelector('#tasks').textContent === '2050');
+  await fixture.page.waitForFunction(() => document.querySelector('#tasks')?.textContent === '2050');
 }
 async function tick(fixture, ms, api) {
   const response = fixture.page.waitForResponse(reply => new URL(reply.url()).pathname === api);
@@ -641,6 +643,7 @@ test('权限长列表保持全部记录且限高，分区锚点可定位并保�
     handlers['/api/admin/users'] = () => ({body:{users:Array.from({length:60}, (_, i) => ({...session, id:'user-' + i, username:'账号' + i, enabled:true}))}});
     handlers['/api/admin/grants'] = () => ({body:{grants:[]}});
     handlers['/api/admin/registrations'] = () => ({body:{requests:Array.from({length:45}, (_, i) => ({username:'申请' + i, status:'approved', created_at:1})), outbox:{pending:0}}});
+    handlers['/api/projects'] = () => ({body:{projects:[]}});
     await page.goto(fixture.origin + '/admin/permissions');
     await page.waitForFunction(() => document.querySelectorAll('#users tr').length === 60 && document.querySelectorAll('#registrations tr').length === 45);
     for (const selector of ['.accounts-scroll', '.registrations-scroll']) {
@@ -711,7 +714,8 @@ test('慢温度请求不阻塞五秒刷新，快速切卡拒绝晚到响应；�
     await page.locator('[data-range="120"]').click();
     await page.waitForFunction(() => document.querySelector('[data-temp-empty]').textContent.includes('温度历史读取失败'));
     assert.match(await page.locator('[data-temp-stats]').textContent(), /当前温度64.*最高未获取/s);
-    handlers.temperature = () => ({body:temperatureData(at, 1, 120)});
+    // Reopening starts at GPU 0 / 30 minutes; every response must match its requested selection.
+    handlers.temperature = request => ({body:temperatureData(at, Number(request.url.searchParams.get('gpu_index')), Number(request.url.searchParams.get('minutes')))});
     await page.locator('[data-temp-empty] button').click();
     await page.waitForFunction(() => !document.querySelector('canvas').hidden);
     await closeDialog(page);
@@ -757,11 +761,11 @@ test('更新并重启使用真实确认和CSRF；失败可重试；读取失败�
     assert.doesNotMatch(await page.locator('dialog').textContent(), /手动更新 requirements/);
     assert.equal(requests.filter(request => request.url.pathname.includes('sync-all')).length, 0, '打开确认窗不能立即写入');
     await page.locator('dialog [type=submit]').click();
-    await page.waitForFunction(() => document.querySelector('dialog [role=alert]').textContent.includes('真实同步失败'));
+    await page.waitForFunction(() => document.querySelector('dialog [role=alert]')?.textContent.includes('真实同步失败'));
     handlers['/api/admin/workers/sync-all'] = () => ({body:{worker_count:3, primary_count:1, skipped_count:1}});
     await page.locator('dialog [type=submit]').click();
     await page.waitForFunction(() => !document.querySelector('dialog'));
-    assert.match(await page.locator('#admin-toast').textContent(), /3.*主节点.*1.*旧版.*1/s);
+    assert.match(await page.locator('#h3-errors .h3-error-message').textContent(), /3.*主节点.*1.*旧版.*1/s);
     handlers['/api/status'] = () => ({status:500, body:{error:'状态读取失败'}});
     await page.locator('#refresh').click();
     await page.waitForFunction(() => !document.querySelector('#error').hidden);
@@ -837,7 +841,7 @@ test('全部未定价或成本全未知不能显示为免费；真实空周期�
     response.jobs = [{job_id:'only-detail', status:'done', cost_source:'actual', recognized_cost:0}];
     handlers['/api/costs'] = () => ({body:response});
     await page.goto(fixture.origin + '/controller/costs');
-    await page.waitForFunction(() => document.querySelector('#tasks').textContent === '34');
+    await page.waitForFunction(() => document.querySelector('#tasks')?.textContent === '34');
     assert.equal(await page.locator('#retail-range').textContent(), '未定价');
     assert.equal(await page.locator('#retail-mid').textContent(), '未定价');
     assert.equal(await page.locator('#internal-total').textContent(), '未知');
@@ -884,105 +888,175 @@ test('费用周期切换不被旧响应覆盖，失败保留原周期及汇总�
   });
 });
 
-test('共享dialog接受DOM/可信HTML；异步FormData完整、busy防重和禁止关闭、失败保输入、完成清密码及焦点恢复', async () => {
-  await withFixture({}, async fixture => {
-    const {page} = fixture; await dashboard(fixture); await page.locator('#refresh').focus();
-    await page.evaluate(() => {
-      const body = document.createElement('div');
-      body.innerHTML = '<label>密码<input name="password" type="password" value="保留的测试输入"></label><button type="button" disabled>原来就禁用</button>';
-      window.dialogCalls = 0; window.dialogFailure = true;
-      window.testDialog = AdminUI.dialog({title:'共享契约测试', body, submitLabel:'保存', onSubmit:async form => {
-        window.dialogCalls++; await new Promise(resolve => { window.dialogRelease = resolve; });
-        window.dialogValue = new FormData(form).get('password');
-        if (window.dialogFailure) throw new Error('真实提交失败');
-      }});
-    });
-    await page.locator('dialog [type=submit]').click();
-    assert.equal(await page.locator('[data-dialog-content]').evaluate(node => node.inert), true);
-    await page.evaluate(() => { testDialog.querySelector('form').dispatchEvent(new Event('submit', {bubbles:true, cancelable:true})); testDialog.close(); });
-    await page.keyboard.press('Escape');
-    assert.equal(await page.locator('dialog').evaluate(node => node.open), true);
-    assert.equal(await page.evaluate(() => dialogCalls), 1);
+test('真实权限弹窗保留完整FormData、busy防重及禁止关闭，失败保输入，完成和取消清密码并恢复焦点', async () => {
+  await withFixture({allowedBusinessWrites:['/api/admin/users']}, async fixture => {
+    const {page, handlers, requests} = fixture;
+    const unsafe = '<img src=x onerror="window.dialogXss=1">';
+    const users = [{...session, enabled:true}, {id:'target', username:unsafe, role:'user', enabled:true}];
+    handlers['/api/admin/users'] = () => ({body:{users}});
+    handlers['/api/admin/grants'] = () => ({body:{grants:[]}});
+    handlers['/api/admin/registrations'] = () => ({body:{requests:[]}});
+    handlers['/api/projects'] = () => ({body:{projects:[]}});
+    let gate = deferred(), received = deferred(), failed = true;
+    handlers['POST /api/admin/users'] = request => {
+      received.resolve();
+      if (failed) return {status:409, body:{error:'真实提交失败 ' + unsafe}, wait:gate.promise};
+      users.push({id:'created', username:request.body.username, role:request.body.role, enabled:true, team_leader:request.body.team_leader});
+      return {body:{ok:true}, wait:gate.promise};
+    };
+    await page.goto(fixture.origin + '/admin/permissions');
+    const trigger = page.getByRole('button', {name:'新建账号', exact:true});
+    await page.waitForFunction(() => !document.querySelector('#create-user')?.disabled);
+    await trigger.click();
+    const dialog = page.getByRole('dialog', {name:'新建账号', exact:true});
+    await dialog.locator('[name=username]').fill('真实契约账号');
+    await dialog.locator('[name=password]').fill('retained-test-password');
+    await dialog.locator('[name=role]').selectOption('admin');
+    await dialog.locator('[name=team_leader]').check();
+    const savedPassword = await dialog.locator('[name=password]').elementHandle();
+    const expected = {username:'真实契约账号', password:'retained-test-password', role:'admin', team_leader:true};
+    await dialog.getByRole('button', {name:'创建账号', exact:true}).click(); await received.promise;
+    assert.deepEqual(grantWrites(fixture).map(request => request.body), [expected], '真实请求必须包含密码、角色和checkbox，不能禁用字段导致FormData丢失');
+    assert.equal(await dialog.locator('form').getAttribute('aria-busy'), 'true');
+    assert.equal(await dialog.locator('[data-dialog-content]').evaluate(node => node.inert), true);
+    assert.deepEqual(await dialog.locator('form').evaluate(form => Object.fromEntries(new FormData(form))),
+      {username:expected.username, password:expected.password, role:expected.role, team_leader:'on'}, 'busy只设inert，不得禁用字段破坏异步FormData读取');
+    assert.equal(await dialog.getByRole('button', {name:'正在提交…', exact:true}).isDisabled(), true);
+    assert.equal(await dialog.getByRole('button', {name:'取消', exact:true}).isDisabled(), true);
+    await dialog.evaluate(node => { node.querySelector('form').dispatchEvent(new Event('submit', {bubbles:true, cancelable:true})); node.close(); });
+    await page.keyboard.press('Escape'); await settle(page);
+    assert.equal(await dialog.evaluate(node => node.open && node.matches(':modal')), true, '提交中原生close和Esc均不能关闭或降级为非模态');
+    assert.equal(grantWrites(fixture).length, 1, '重复submit不产生第二个网络写入');
     for (let i = 0; i < 5; i++) {
       await page.keyboard.press('Tab');
-      assert.equal(await page.locator('dialog').evaluate(node => node.contains(document.activeElement)), true);
+      assert.equal(await dialog.evaluate(node => node.contains(document.activeElement)), true);
     }
-    await page.evaluate(() => dialogRelease());
-    await page.waitForFunction(() => document.querySelector('dialog [role=alert]').textContent.includes('真实提交失败'));
-    assert.equal(await page.evaluate(() => dialogValue), '保留的测试输入');
-    assert.equal(await page.locator('dialog input').inputValue(), '保留的测试输入');
-    assert.equal(await page.locator('[data-dialog-content]').evaluate(node => node.inert), false);
-    assert.equal(await page.locator('[data-dialog-content] button').isDisabled(), true);
-    await page.evaluate(() => { window.dialogFailure = false; window.savedPassword = testDialog.querySelector('input'); });
-    await page.locator('dialog [type=submit]').click();
-    await page.waitForFunction(() => dialogCalls === 2);
-    await page.evaluate(() => dialogRelease()); await page.waitForFunction(() => !document.querySelector('dialog'));
-    assert.equal(await page.evaluate(() => savedPassword.value), '');
-    assert.equal(await page.locator('#refresh').evaluate(node => node === document.activeElement), true);
-    await page.evaluate(() => {
-      const dialog = AdminUI.dialog({title:'<img src=x onerror="window.dialogXss=1">', body:'<label>取消清理<input type="password" value="取消也清理"></label>'});
-      window.canceledPassword = dialog.querySelector('input');
-      AdminUI.toast('<img src=x onerror="window.toastXss=1">');
-    });
-    assert.equal(await page.locator('dialog h2 img').count(), 0);
-    assert.equal(await page.locator('#admin-toast img').count(), 0);
+    gate.resolve();
+    await page.waitForFunction(() => document.querySelector('dialog [role=alert]')?.textContent.includes('真实提交失败'));
+    assert.equal(await dialog.locator('[name=username]').inputValue(), expected.username);
+    assert.equal(await dialog.locator('[name=password]').inputValue(), expected.password);
+    assert.equal(await dialog.locator('[name=role]').inputValue(), expected.role);
+    assert.equal(await dialog.locator('[name=team_leader]').isChecked(), true);
+    assert.equal(await dialog.locator('[data-dialog-content]').evaluate(node => node.inert), false);
+    assert.equal(await dialog.locator('[data-operation-status]').evaluate(node => node === document.activeElement), true);
+    assert.ok((await dialog.locator('[role=alert]').textContent()).includes(unsafe));
+    assert.equal(await dialog.locator('img, script').count(), 0, '服务端错误必须按文本展示');
+    gate = deferred(); received = deferred(); failed = false;
+    await dialog.getByRole('button', {name:'创建账号', exact:true}).click(); await received.promise;
+    assert.deepEqual(grantWrites(fixture).map(request => request.body), [expected, expected]);
+    gate.resolve(); await dialog.waitFor({state:'detached'});
+    assert.equal(await savedPassword.evaluate(node => node.value), '');
+    assert.equal(await trigger.evaluate(node => node === document.activeElement), true);
+    const target = page.locator('#users tr').filter({hasText:unsafe}).getByRole('button', {name:'重置密码', exact:true});
+    await target.click();
+    const reset = page.getByRole('dialog', {name:'重置密码', exact:true});
+    assert.ok((await reset.textContent()).includes(unsafe));
+    assert.equal(await reset.locator('h2 img, [data-dialog-content] img, script').count(), 0);
+    await reset.locator('[name=password]').fill('cancel-test-password');
+    const canceledPassword = await reset.locator('[name=password]').elementHandle();
     await closeDialog(page);
-    assert.equal(await page.evaluate(() => canceledPassword.value), '');
-    assert.equal(await page.evaluate(() => window.dialogXss || window.toastXss), undefined);
+    assert.equal(await canceledPassword.evaluate(node => node.value), '');
+    assert.equal(await target.evaluate(node => node === document.activeElement), true);
+    await trigger.click();
+    await dialog.locator('[name=role]').selectOption('monitor');
+    assert.equal(await dialog.locator('[name=team_leader]').isDisabled(), true);
+    await closeDialog(page);
+    handlers['/api/admin/users'] = () => ({status:500, body:{error:'真实读取失败 ' + unsafe}});
+    await page.locator('#refresh').click();
+    await page.waitForFunction(() => document.querySelector('#h3-errors')?.textContent.includes('真实读取失败'));
+    assert.ok((await page.locator('#h3-errors').textContent()).includes(unsafe));
+    assert.equal(await page.locator('#h3-errors img, #h3-errors script').count(), 0, '真实错误通知不能解释服务端HTML');
+    assert.equal(requests.filter(request => request.method !== 'GET' && request.url.pathname !== '/api/auth/presence').length, 2, '取消重置和创建不得写入');
+    assert.equal(await page.evaluate(() => window.dialogXss), undefined);
+    assert.deepEqual(await page.evaluate(() => ['H3Auth', 'AdminUI', 'H3Notify'].filter(key => key in window)), [], 'React管理页不重新引入共享全局');
   });
 });
 
-test('共享mount按真实角色显示导航并基于响应头为其余三页提示本地副本，不覆盖业务错误', async () => {
+test('四个真实React管理页从响应头识别隔离副本，唯一导航不覆盖各页业务错误', async () => {
   await withFixture({sandboxHeader:true}, async fixture => {
-    const {page, state, handlers} = fixture;
+    const {page, handlers, requests} = fixture;
     handlers['/api/health'] = () => ({body:{mode:'controller', maintenance_active:false}});
-    for (const key of ['capacity', 'permissions', 'teams']) {
-      if (key === 'teams') state.user = {...session, role:'user', team_leader:true};
-      await page.goto(fixture.origin + '/shell?page=' + key);
+    handlers['/api/capacity'] = () => ({body:{overview:{}, workers:[], groups:[], details:[], details_total:0}});
+    handlers['/api/admin/users'] = () => ({body:{users:[{...session, enabled:true}]}});
+    handlers['/api/admin/grants'] = () => ({body:{grants:[]}});
+    handlers['/api/admin/registrations'] = () => ({body:{requests:[]}});
+    for (const [key, route, api, title] of [
+      ['capacity', '/controller/capacity', '/api/capacity', '产能评估'],
+      ['permissions', '/admin/permissions', '/api/admin/users', '账号与权限'],
+      ['controller', '/controller', '/api/status', '运行面板'],
+      ['costs', '/controller/costs', '/api/costs', '费用统计'],
+    ]) {
+      const original = handlers[api], message = key + '真实业务读取失败';
+      handlers[api] = () => ({status:500, body:{error:message}});
+      await page.goto(fixture.origin + route);
       await page.locator('#sandbox-note').waitFor({state:'visible'});
+      await page.waitForFunction(message => document.querySelector('#error')?.textContent.includes(message), message);
       assert.equal(await page.locator('#sandbox-note').count(), 1);
       assert.match(await page.locator('#sandbox-note').textContent(), /本地隔离数据副本/);
-      assert.equal(await page.locator('#original-main').count(), 1, '保留原main语义节点');
-      assert.equal(await page.locator('#business-error').textContent(), '原页面业务错误必须保留');
+      assert.equal(await page.getByRole('heading', {name:title, exact:true}).count(), 1, '共享工作区保留真实业务标题');
+      assert.equal(await page.locator('#error').isVisible(), true);
       assert.equal(await page.locator('body').getAttribute('data-workspace'), key);
-      assert.equal(await page.locator('#workspace-nav .workspace-link[aria-current=page]').getAttribute('href'), {capacity:'/controller/capacity', permissions:'/admin/permissions', teams:'/teams'}[key]);
+      assert.equal(await page.locator('#workspace-nav .workspace-link[aria-current=page]').getAttribute('href'), route);
       assert.deepEqual(await page.locator('#workspace-nav .workspace-link').evaluateAll(links => links.map(link => link.getAttribute('aria-label'))),
-        key === 'teams' ? ['画布', '导演工作台', '项目组'] : ['画布', '导演工作台', '项目组', '运行面板', '账号与权限', '费用评估', '产能统计']);
+        ['画布', '导演工作台', '项目组', '运行面板', '账号与权限', '费用评估', '产能统计']);
       assert.equal(await page.locator('#workspace-nav[data-admin-sidebar]').count(), 1);
       assert.equal(await page.locator('#account .account-trigger').count(), 1);
       assert.equal(await page.locator('.sidebar, .side-actions, .admin-mobile-account').count(), 0);
+      const health = page.waitForResponse(response => new URL(response.url()).pathname === '/api/health');
+      await page.evaluate(() => fixtureIntervals.filter(timer => timer.ms === 5000).forEach(timer => timer.fn()));
+      await health; await settle(page);
+      assert.ok((await page.locator('#error').textContent()).includes(message), '后续副本识别不得清空真实业务错误');
+      assert.equal(await page.locator('#sandbox-note').count(), 1, '重复健康响应不重复挂载副本提示');
+      handlers[api] = original;
     }
-    state.user = {...session};
     await dashboard(fixture);
     await page.locator('#sandbox-note').waitFor({state:'visible'});
-    assert.equal(await page.locator('#sandbox-note').count(), 1, '运行页复用原提示');
+    assert.equal(await page.locator('#sandbox-note').count(), 1, '运行页复用共享提示');
     assert.equal(await page.locator('#sync-all').isDisabled(), true, '响应头显示副本时即使JSON无sandbox也禁止同步');
     await page.locator('#refresh').click();
     await page.waitForFunction(() => document.querySelector('#main').getAttribute('aria-busy') === null);
     assert.equal(await page.locator('#sandbox-note').isVisible(), true);
     assert.equal(await page.locator('#sync-all').isDisabled(), true);
     await costs(fixture); await page.locator('#sandbox-note').waitFor({state:'visible'});
-    assert.equal(await page.locator('#sandbox-note').count(), 1, '费用页复用原提示');
+    assert.equal(await page.locator('#sandbox-note').count(), 1, '费用页复用共享提示');
+    assert.equal(requests.filter(request => request.method !== 'GET' && request.url.pathname !== '/api/auth/presence').length, 0, '读取失败和副本识别不发业务写入');
   });
 });
 
-test('单一工作区导航复用真实账号popover、键盘焦点与品牌，重复mount不产生副本', async () => {
+test('真实重新加载及跨页导航保留唯一工作区、账号popover、键盘焦点与品牌', async () => {
   await withFixture({}, async fixture => {
-    const {page} = fixture; await dashboard(fixture);
-    await page.evaluate(() => AdminUI.mount({page:'dashboard', user:H3Auth.user}));
-    assert.equal(await page.locator('body').getAttribute('data-workspace'), 'controller');
-    assert.equal(await page.locator('#workspace-nav .workspace-links').count(), 1);
-    assert.equal(await page.locator('.workspace-link[aria-current=page]').getAttribute('href'), '/controller');
-    assert.equal(await page.locator('.workspace-brand').getAttribute('href'), '/');
-    assert.equal(await page.locator('.workspace-brand img').getAttribute('src'), '/icon.png');
-    assert.ok((await page.locator('.workspace-brand > span').textContent()).trim(), '品牌文字不得丢失');
-    assert.equal(await page.locator('.workspace-footer .workspace-presence b').count(), 1);
-    assert.equal(await page.locator('.workspace-footer #account.account-bar').count(), 1);
-    await checkAccount(page);
+    const {page, handlers} = fixture; await dashboard(fixture);
+    handlers['/api/admin/users'] = () => ({body:{users:[{...session, enabled:true}]}});
+    handlers['/api/admin/grants'] = () => ({body:{grants:[]}});
+    handlers['/api/admin/registrations'] = () => ({body:{requests:[]}});
+    for (const [route, key] of [['/controller', 'controller'], ['/controller/costs', 'costs'], ['/admin/permissions', 'permissions'], ['/controller', 'controller']]) {
+      if (new URL(page.url()).pathname !== route) {
+        await page.locator('#workspace-nav .workspace-link[href="' + route + '"]').click();
+        await page.waitForURL(fixture.origin + route);
+      }
+      await page.locator('#account .account-trigger').waitFor();
+      await page.reload();
+      await page.locator('#account .account-trigger').waitFor();
+      assert.equal(await page.locator('body').getAttribute('data-workspace'), key);
+      assert.equal(await page.locator('#workspace-nav .workspace-links').count(), 1);
+      assert.equal(await page.locator('.workspace-link[aria-current=page]').getAttribute('href'), route);
+      assert.equal(await page.locator('.workspace-brand').getAttribute('href'), '/');
+      assert.equal(await page.locator('.workspace-brand img').getAttribute('src'), '/icon.png');
+      assert.ok((await page.locator('.workspace-brand > span').textContent()).trim(), '品牌文字不得丢失');
+      assert.equal(await page.locator('.workspace-footer .workspace-presence b').count(), 1);
+      assert.equal(await page.locator('.workspace-footer #account.account-bar').count(), 1);
+      await checkAccount(page);
+      assert.deepEqual(await page.evaluate(() => ['H3Auth', 'AdminUI', 'H3Notify'].filter(key => key in window)), []);
+    }
     const trigger = page.locator('.account-trigger');
-    await trigger.focus(); await page.keyboard.press('Enter'); await page.keyboard.press('Tab');
-    assert.equal(await page.locator('#account-menu .account-action').first().evaluate(node => node === document.activeElement), true);
-    await page.getByRole('button', {name:'用户信息', exact:true}).click();
+    await trigger.focus(); await page.keyboard.press('Enter');
+    const infoAction = page.getByRole('menuitem', {name:'用户信息', exact:true});
+    assert.equal(await infoAction.evaluate(node => node === document.activeElement), true, '打开菜单后焦点进入第一个真实菜单项');
+    await page.keyboard.press('ArrowDown');
+    assert.equal(await page.getByRole('menuitem', {name:'修改密码', exact:true}).evaluate(node => node === document.activeElement), true);
+    await page.keyboard.press('Home');
+    assert.equal(await infoAction.evaluate(node => node === document.activeElement), true);
+    await page.keyboard.press('Enter');
     assert.deepEqual(await page.getByRole('dialog', {name:'用户信息', exact:true}).locator('dd').allTextContents(),
       ['测试姓名', '真实测试账号', '未填写', '管理员', session.id]);
     await closeDialog(page);
@@ -1024,10 +1098,12 @@ test('维护health真和假与本地隔离、温度history并存，暂停业务�
       assert.equal(businessRequests(requests).length, before, '维护检查不能触发历史、任务或节点业务读取');
     }
     await closeDialog(page);
-    // 即使人为绕过禁用状态，真实业务守卫仍拒绝副本同步。
+    // DOM属性虽可被修改，React仍按受控disabled prop抑制click；不会进入handler，也不应期待旧壳guard-toast。
     await page.locator('#sync-all').evaluate(button => { button.disabled = false; button.click(); });
+    await settle(page);
+    assert.equal(await page.locator('#sync-all').isEnabled(), true, '确实解除原生DOM禁用后再检验React事件保护');
     assert.equal(await page.locator('dialog').count(), 0);
-    assert.match(await page.locator('#admin-toast').textContent(), /隔离副本/);
+    assert.equal(await page.locator('#sandbox-note').isVisible(), true, '绕过DOM属性不解除隔离状态');
     assert.equal(requests.filter(request => request.url.pathname.includes('sync-all')).length, 0);
     assert.equal(await page.locator('[data-delete-worker]').evaluateAll(buttons=>buttons.length>0&&buttons.every(button=>button.disabled)),true,'隔离副本禁用设备删除');
     await page.locator('[data-delete-worker]').first().evaluate(button=>{button.disabled=false;button.click();});
@@ -1036,20 +1112,20 @@ test('维护health真和假与本地隔离、温度history并存，暂停业务�
   });
 });
 
-test('正式环境不显示副本提示；普通用户不能通过共享导航进入管理员页面', async () => {
+test('正式环境无副本提示；真实管理入口在任何业务读取前将普通用户和监控展示员分别重定向', async () => {
   await withFixture({}, async fixture => {
-    const {page, state} = fixture;
-    await page.goto(fixture.origin + '/shell?page=teams');
-    await page.locator('[data-admin-sidebar]').waitFor(); await settle(page);
+    const {page, state, requests} = fixture;
+    await dashboard(fixture); await settle(page);
     assert.equal(await page.locator('#sandbox-note').count(), 0);
-    state.user = {...session, role:'user', team_leader:false};
-    await page.goto(fixture.origin + '/shell?page=teams');
-    await page.locator('[data-admin-sidebar]').waitFor();
-    assert.deepEqual(await page.locator('#workspace-nav .workspace-link').evaluateAll(links => links.map(link => link.getAttribute('href'))), ['/', '/director']);
-    assert.equal(await page.locator('#workspace-nav [aria-current=page]').count(), 0, '普通账号没有项目组管理入口');
-    assert.equal(await page.locator('#account .account-trigger').count(), 1);
-    await page.goto(fixture.origin + '/controller');
-    await page.waitForURL(fixture.origin + '/');
-    assert.equal(await page.locator('#redirect-target').isVisible(), true);
+    for (const [role, teamLeader, destination] of [['user', false, '/'], ['user', true, '/'], ['monitor', false, '/monitor']]) {
+      state.user = {...session, role, team_leader:teamLeader};
+      const before = requests.length;
+      await page.goto(fixture.origin + '/controller');
+      await page.waitForURL(fixture.origin + destination);
+      assert.equal(await page.locator('#redirect-target').isVisible(), true, '落点只验证跳转，不启动目标页独立业务');
+      assert.equal(await page.locator('#workspace-nav, #account .account-trigger').count(), 0, '未授权账号不能先挂载管理员工作区');
+      assert.deepEqual(requests.slice(before).map(request => ({method:request.method, path:request.url.pathname})),
+        [{method:'GET', path:'/api/auth/me'}], '角色检查前不得读取health、节点、任务、项目或启动presence，更不得写入业务');
+    }
   });
 });
