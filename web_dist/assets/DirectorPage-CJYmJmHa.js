@@ -1,4 +1,4 @@
-import{c as Gt,j as Pt}from"./index-DJjebwgX.js";import{u as pi}from"./usePageRuntime-C-h57arZ.js";const ui=`<aside class="sidebar">\r
+import{c as Gt,j as Pt}from"./index-D4dCpfso.js";import{u as pi}from"./usePageRuntime-Cbfl-CEO.js";const ui=`<aside class="sidebar">\r
   <div class="workspace-label">创作空间</div>\r
   <select id="projects" aria-label="选择导演项目"><option value="">选择项目</option></select>\r
   <button id="new-project" class="new-project">＋ 新建导演项目</button>\r
