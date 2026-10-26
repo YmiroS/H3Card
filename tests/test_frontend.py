@@ -1,4 +1,5 @@
 """React distribution catalog and auth boundary tests (no Node runtime required)."""
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,9 +11,10 @@ from yarl import URL
 
 from server.auth import COOKIE, auth_middleware, register_auth_routes, setup_local_test_auth
 from server.auth_store import AuthStore
-from server.frontend import PUBLIC_FILES, load_frontend
+from server.frontend import PAGE_FILES, PROTECTED_FILES, PUBLIC_FILES, load_frontend
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / 'server'))
 PASSWORD = 'frontend-test-password'
 CHUNK = '/assets/index-12345678.js'
 CSS = '/assets/index-abcdefgh.css'
@@ -28,6 +30,14 @@ def build_fixture(root):
         (root / route.lstrip('/')).write_text('/* fixture */', encoding='utf-8')
     for name in PUBLIC_FILES:
         (root / name).write_bytes(b'public fixture')
+    (root / 'admin').mkdir()
+    for name in PAGE_FILES.values():
+        (root / name).write_text(
+            f'<link rel="stylesheet" href="{CSS}"><script type="module" src="{CHUNK}"></script>'
+            f'<main>{name}</main>', encoding='utf-8')
+    (root / 'vendor').mkdir()
+    for name in PROTECTED_FILES:
+        (root / name).write_bytes(b'/* compiled vendor fixture, not old web */')
     return load_frontend(root)
 
 
@@ -46,8 +56,12 @@ class FrontendCatalogTests(unittest.TestCase):
             (root / 'manifest.json').write_text('{}', encoding='utf-8')
             frontend = load_frontend(root)
             self.assertEqual(set(frontend.assets), {CHUNK, CSS, *('/' + name for name in PUBLIC_FILES)})
-            with self.assertRaises(TypeError):
-                frontend.assets['/private.html'] = root / 'private.html'
+            self.assertEqual(dict(frontend.pages), {route: root.resolve() / name for route, name in PAGE_FILES.items()})
+            self.assertEqual(set(frontend.protected_assets), {'/vendor/fabric.min.js'})
+            self.assertNotIn('/vendor/fabric.min.js', frontend.assets)
+            for mapping in (frontend.assets, frontend.pages, frontend.protected_assets):
+                with self.assertRaises(TypeError):
+                    mapping['/private.html'] = root / 'private.html'
 
     def test_missing_build_is_a_clear_error_not_legacy_fallback(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -74,6 +88,37 @@ class FrontendCatalogTests(unittest.TestCase):
                 (root / route.lstrip('/')).unlink()
                 with self.assertRaisesRegex(RuntimeError, 'missing approved index.html assets'):
                     load_frontend(root)
+
+    def test_all_compiled_pages_are_required_without_fallback(self):
+        for name in PAGE_FILES.values():
+            with self.subTest(page=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory) / 'web_dist'
+                build_fixture(root)
+                (root / name).unlink()
+                with self.assertRaisesRegex(RuntimeError, 'missing required page') as error:
+                    load_frontend(root)
+                self.assertIn(str(root.resolve() / name), str(error.exception))
+
+    def test_every_document_validates_its_own_chunks_and_disallows_private_or_external_refs(self):
+        for name in ('index.html', *PAGE_FILES.values()):
+            for reference in ('/assets/missing-12345678.js', '/auth.js', '/admin/controller.html',
+                              '/vendor/fabric.min.js', '/assets/index-12345678.js.map',
+                              'https://example.invalid/remote.js', '/assets/%69ndex-12345678.js'):
+                with self.subTest(page=name, reference=reference), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory) / 'web_dist'
+                    build_fixture(root)
+                    with (root / name).open('a', encoding='utf-8') as document:
+                        document.write(f'<script src="{reference}"></script>')
+                    with self.assertRaisesRegex(RuntimeError, 'missing approved ' + name + ' assets'):
+                        load_frontend(root)
+
+    def test_missing_protected_vendor_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'web_dist'
+            build_fixture(root)
+            (root / 'vendor' / 'fabric.min.js').unlink()
+            with self.assertRaisesRegex(RuntimeError, 'missing required protected asset'):
+                load_frontend(root)
 
     def test_missing_login_public_assets_are_rejected(self):
         for name in PUBLIC_FILES:
@@ -122,7 +167,10 @@ class FrontendAuthTests(unittest.IsolatedAsyncioTestCase):
         self.sessions = {role: self.store.login(role, PASSWORD) for role in ('admin', 'user', 'monitor')}
         self.app = web.Application(middlewares=[auth_middleware])
         self.app['auth_store'] = self.store
-        register_auth_routes(self.app, ROOT / 'web', frontend=self.frontend)
+        register_auth_routes(self.app, self.root / 'no-old-web', frontend=self.frontend)
+        from server.monitor import register_monitor_routes
+        register_monitor_routes(self.app, web_root=self.root / 'no-old-web', frontend=self.frontend,
+                                get_jobs=lambda: (), get_health=lambda *_: {})
         self.client = TestClient(TestServer(self.app))
         await self.client.start_server()
         self.addAsyncCleanup(self.client.close)
@@ -201,6 +249,55 @@ class FrontendAuthTests(unittest.IsolatedAsyncioTestCase):
                     'X-CSRF-Token': self.sessions['monitor']['csrf_token']})
                 self.assertEqual(response.status, 403)
 
+    async def test_monitor_reads_exact_compiled_document_with_original_roles(self):
+        for role, status in ((None, 302), ('user', 403), ('admin', 200), ('monitor', 200)):
+            for method in ('GET', 'HEAD'):
+                response = await self.client.request(method, '/monitor',
+                    headers=self.headers(role) if role else {}, allow_redirects=False)
+                self.assertEqual(response.status, status)
+                self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+                if method == 'GET' and status == 200:
+                    self.assertEqual(await response.read(), self.frontend.pages['/monitor'].read_bytes())
+
+    async def test_protected_vendor_is_dist_only_authenticated_exact_get_head(self):
+        route = '/vendor/fabric.min.js'
+        path = self.frontend.protected_assets[route]
+        for role in ('admin', 'user'):
+            for method in ('GET', 'HEAD'):
+                response = await self.client.request(method, route + '?v=1', headers=self.headers(role))
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.content_type, 'text/javascript')
+                self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+                if method == 'GET':
+                    self.assertEqual(await response.read(), path.read_bytes())
+            for encoded in ('/vendor/%66abric.min.js', '/vendor/fabric.min%2Ejs',
+                            '/vendor%2Ffabric.min.js', '/vendor/fabric.min.js/extra',
+                            '/vendor/private.js', '/vendor/'):
+                response = await self.client.session.get(URL(self.origin + encoded, encoded=True),
+                    headers=self.headers(role), allow_redirects=False)
+                self.assertEqual(response.status, 404, encoded)
+            for method in ('POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'):
+                response = await self.client.request(method, route, headers={
+                    **self.headers(role), 'Origin': self.origin,
+                    'X-CSRF-Token': self.sessions[role]['csrf_token']})
+                self.assertEqual(response.status, 405)
+        for method in ('GET', 'HEAD'):
+            response = await self.client.request(method, route, allow_redirects=False)
+            self.assertEqual(response.status, 302)
+            self.assertEqual(response.headers['Location'], '/login')
+        path.unlink()
+        self.assertEqual((await self.client.get(route, headers=self.headers('admin'))).status, 404)
+
+    async def test_integrated_auth_never_reads_old_login_code_or_public_fallbacks(self):
+        for role in (None, 'admin', 'user', 'monitor'):
+            for route in ('/auth.js', '/auth-page.css'):
+                response = await self.client.get(route, headers=self.headers(role) if role else {},
+                                                 allow_redirects=False)
+                self.assertEqual(response.status, 404)
+        for name in PAGE_FILES.values():
+            response = await self.client.get('/' + name, headers=self.headers('admin'))
+            self.assertEqual(response.status, 404)
+
     async def test_frontend_does_not_weaken_csrf_or_source_validation(self):
         headers = self.headers('user')
         for extra in ({}, {'Origin': self.origin}, {
@@ -241,6 +338,10 @@ class FrontendAuthTests(unittest.IsolatedAsyncioTestCase):
                 response = await client.get(route, allow_redirects=False)
                 self.assertEqual(response.status, 200)
                 self.assertEqual(await response.read(), (ROOT / 'web' / 'login.html').read_bytes())
+            for route in ('/auth.js', '/auth-page.css', '/auth-art.webp', '/auth-logo.png', '/favicon.png', '/icon.png'):
+                response = await client.get(route, allow_redirects=False)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.read(), (ROOT / 'web' / route.lstrip('/')).read_bytes())
             response = await client.get(CHUNK, allow_redirects=False)
             self.assertEqual(response.status, 302)
         finally:

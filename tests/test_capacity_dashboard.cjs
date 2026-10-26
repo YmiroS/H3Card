@@ -5,8 +5,8 @@ const {readFileSync,existsSync} = require('node:fs');
 const {execFileSync} = require('node:child_process');
 const path = require('node:path');
 const {chromium} = require('playwright');
-const web = path.join(__dirname, '..', 'web');
-const html = readFileSync(path.join(web, 'capacity.html'), 'utf8');
+const {builtResources} = require('./helpers/admin-built-resources.cjs');
+const built = builtResources(['/controller/capacity', '/controller']);
 const NOW = new Date('2026-10-08T10:30:00Z');
 const ATTACK = '<img src=x onerror="window.injected=true">';
 function fixture() {
@@ -230,6 +230,16 @@ function deferCapacity(state,offset=0) {
   };
   return {request,release:(status)=>resume(status)};
 }
+async function releaseCapacity(page,gate,status=200) {
+  const query=await gate.request;
+  const response=page.waitForResponse(reply=>{
+    const url=new URL(reply.url());
+    return url.pathname==='/api/capacity' && url.searchParams.get('offset')===query.offset && reply.status()===status;
+  });
+  await gate.release(status);
+  await (await response).finished();
+  await tick(page); // Let the real fetch/json handlers settle, without inspecting module state.
+}
 const estimateResponse = {mode:'historical',quality:'technical',worker_id:'w1',total_seconds:12000,daily_capacity_seconds:8*3600*1*.75,machines:1,price_total:null,lines:[{group_id:'h1',quantity:100,seconds_per_unit:60,daily_units:360},{group_id:'h2',quantity:100,seconds_per_unit:60,daily_units:360}],warnings:['测算响应警告一','测算响应警告二'],assumptions:['未包含模型切换','单机并发槽位为一']};
 const tick = page => page.evaluate(() => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve))));
 const loaded = page => page.waitForFunction(() => document.querySelector('#refresh-state').textContent.startsWith('最后刷新'));
@@ -325,7 +335,16 @@ async function positionMatrix(page,end=false) {
   await waitMatrixScroll(page);
   await page.locator('#summary-machines .scroll').evaluate((node,end)=>node.scrollTo({left:end?node.scrollWidth:0,top:0,behavior:'instant'}),end);
   await waitMatrixScroll(page);
-  assert.equal(await page.locator('#summary-machines .scroll').evaluate(node=>node.scrollLeft),end?await page.locator('#summary-machines .scroll').evaluate(node=>node.scrollWidth-node.clientWidth):0);
+  const position=await page.locator('#summary-machines .scroll').evaluate((node,end)=>{
+    const left=node.scrollLeft;
+    // Chromium's stable thin scrollbar can reserve 10px in clientWidth without adding
+    // that gutter to the actual scroll range. Verify the browser's clamp, not that formula.
+    node.scrollBy({left:end?1:-1,behavior:'instant'});
+    return {left,clamped:node.scrollLeft,overflow:node.scrollWidth>node.clientWidth};
+  },end);
+  if(end)assert.ok(position.overflow && position.left>0,'矩阵末端必须经过实际横向滚动');
+  else assert.equal(position.left,0);
+  assert.equal(position.clamped,position.left,end?'右端已到浏览器实际滚动边界':'左端已到浏览器实际滚动边界');
 }
 async function assertQuietModelCells(page) {
   const cells=page.locator('#summary-machines .business-row [data-label="模型名称"], #summary-machines .business-row [data-label="模型精度"]');
@@ -366,8 +385,10 @@ async function assertModelLabels(row,names,labels) {
 }
 
 test('产能看板语法与离线路由专项', async t => {
-  const scripts = [...html.matchAll(/<script(?:\s[^>]*)?>([\s\S]*?)<\/script>/g)].map(match=>match[1]).filter(Boolean);
-  for(const script of scripts) execFileSync(process.execPath,['--check','-'],{input:script});
+  // Inline scripts disappeared in the MPA: syntax-check every shipped module in the graph.
+  const scripts = [...built.files.entries()].filter(([url])=>url.endsWith('.js'));
+  assert.ok(scripts.length > 0, '产能测试必须检查真实构建模块，而不是空的内联脚本列表');
+  for(const [, item] of scripts) execFileSync(process.execPath,['--input-type=module','--check','-'],{input:item.body});
   const browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER?{channel:process.env.CHOUKA_TEST_BROWSER}:{});
   const contexts=[],states=[];
   async function setup(options={}) {
@@ -382,8 +403,8 @@ test('产能看板语法与离线路由专项', async t => {
       const request=route.request(),url=new URL(request.url());
       assert.equal(url.origin,'http://capacity.test','测试不允许连接外部服务');
       const json=(data,status=200)=>route.fulfill({status,contentType:'application/json',body:JSON.stringify(data)});
-      if(['/icon.png','/favicon.png'].includes(url.pathname))return route.fulfill({contentType:'image/png',body:readFileSync(path.join(web,url.pathname.slice(1)))});
-      if(['/capacity-page.js','/auth.js','/admin-shell.js','/admin-shell.css','/controller-page.js'].includes(url.pathname))return route.fulfill({contentType:url.pathname.endsWith('.css')?'text/css':'text/javascript',body:readFileSync(path.join(web,url.pathname.slice(1)),'utf8')});
+      const resource = request.method()==='GET' && built.resource(url.pathname);
+      if(resource)return route.fulfill({contentType:resource.contentType,body:resource.body});
       if(url.pathname==='/api/auth/presence') {
         assert.equal(request.method(),'POST');assert.equal(request.headers()['x-csrf-token'],'synthetic-csrf');
         state.presence.push(request.postDataJSON());return json({online_users:7});
@@ -441,8 +462,6 @@ test('产能看板语法与离线路由专项', async t => {
       if(url.pathname==='/api/capacity/export') {state.exports.push(Object.fromEntries(url.searchParams));return route.fulfill({contentType:'text/csv',headers:{'Content-Disposition':'attachment; filename="capacity.csv"'},body:'类别,数量\n合成,1'});}
       const controllerPayloads={'/api/health':{mode:'controller',ok:true,maintenance_active:false},'/api/status':{running_count:0,queued_count:0},'/api/workers':{workers:[]},'/api/jobs':{jobs:[]},'/api/projects':{projects:[]}};
       if(controllerPayloads[url.pathname])return json(controllerPayloads[url.pathname]);
-      if(url.pathname==='/controller')return route.fulfill({contentType:'text/html',body:readFileSync(path.join(web,'controller.html'),'utf8')});
-      if(url.pathname==='/controller/capacity')return route.fulfill({contentType:'text/html',body:html});
       if(url.pathname==='/')return route.fulfill({contentType:'text/html',body:'<!doctype html><title>合成目标</title>'});
       state.unexpected.push(request.method()+' '+url.pathname);return route.fulfill({status:404,body:'未声明的夹具路由'});
     });
@@ -1876,10 +1895,12 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(await page.locator('.summary-spec').first().isDisabled(),true);
       assert.equal(await page.locator('#details').textContent(),previous);assert.equal(await page.locator('#capacity-stats').textContent(),stats);
       await page.locator('.summary-detail-toggle').first().click();assert.equal(await page.locator('[data-evidence-entry]').first().isDisabled(),true,'刷新中才懒挂载的任务证据入口也应禁用');
-      assert.equal(await page.evaluate(()=>allEvidence()),null,'ready=false时全集读取本身也不能启动');
+      // Deliver DOM events even to disabled controls: handlers must guard the refresh
+      // window themselves, not just rely on native disabled controls suppressing clicks.
       await page.evaluate(()=>{
         const select=document.querySelector('#evidence-status');select.value='done';select.dispatchEvent(new Event('change',{bubbles:true}));
-        filterEvidence();showEvidence('h1');document.querySelector('#next').onclick();document.querySelector('#previous').onclick();
+        for(const selector of ['#open-evidence','[data-evidence-entry]','#next','#previous'])
+          document.querySelector(selector).dispatchEvent(new MouseEvent('click',{bubbles:true}));
       });
       await tick(page);assert.equal(state.gets.length,2,'刷新未提交时不能启动任何证据分页请求');
       assert.equal(await page.locator('#details').textContent(),previous,'被守卫的筛选不能清空旧可读证据');
@@ -1894,13 +1915,16 @@ test('产能看板语法与离线路由专项', async t => {
       for(const status of [200,500]) {
         const {page,state}=await setup({data:capacitySnapshot('pending-old'),pagedDetails:true,evidence:true});
         const oldGate=deferCapacity(state,100);await page.locator('#evidence-group').selectOption('h1');await oldGate.request;
-        await page.evaluate(()=>{window.oldEvidenceRead=Promise.resolve(evidencePending.promise || evidencePending).catch(()=>null);});
         state.data=capacitySnapshot('pending-new');const newGate=deferCapacity(state,100);
         await page.locator('#refresh').click();await newGate.request;
-        await page.evaluate(()=>{window.newEvidencePending=evidencePending;});
-        await oldGate.release(status);await page.evaluate(()=>window.oldEvidenceRead);await tick(page);
-        assert.equal(await page.evaluate(()=>evidencePending===window.newEvidencePending),true,'旧finally不能清掉新pending');
-        await page.locator('#evidence-status').selectOption('done');await tick(page);assert.equal(state.gets.length,4,'新pending应被同快照筛选复用');
+        await releaseCapacity(page,oldGate,status);
+        assert.match(await page.locator('#evidence-state').textContent(),/正在读取/,'旧成功或失败不能结束新快照的读取态');
+        assert.equal(await page.locator('#details > details').count(),0,'新全集返回前不得渲染旧证据');
+        for(const [selector,value] of [['#evidence-status','done'],['#evidence-source','historical']]) {
+          await page.locator(selector).selectOption(value);await tick(page);
+          assert.equal(state.gets.length,4,'旧finally不能清掉新pending；重复筛选必须共享同一次新读取');
+          assert.match(await page.locator('#evidence-state').textContent(),/正在读取/);
+        }
         await newGate.release();await loaded(page);await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
         assert.equal(await page.locator('[data-job-id=pending-new-0]').count(),1);assert.equal(await page.locator('[data-job-id^=pending-old]').count(),0);
         assert.equal(await page.locator('#error').isVisible(),false);assert.deepEqual(state.errors,[]);
@@ -1909,12 +1933,14 @@ test('产能看板语法与离线路由专项', async t => {
     await t.test('证据快照竞态3：旧pending晚于新cache返回不能覆盖，新全集本地翻页不重新读取',async()=>{
       const {page,state}=await setup({data:capacitySnapshot('cache-old'),pagedDetails:true,evidence:true});
       const oldGate=deferCapacity(state,100);await page.locator('#evidence-size').selectOption('10');await oldGate.request;
-      await page.evaluate(()=>{window.oldEvidenceRead=Promise.resolve(evidencePending.promise || evidencePending).catch(()=>null);});
       state.data=capacitySnapshot('cache-new');await refresh(page);
       await page.waitForFunction(()=>document.querySelector('#evidence-state').textContent.startsWith('筛选 125 / 全集 125'));
-      await page.evaluate(()=>{window.newEvidenceCache=evidenceCache;});
-      await oldGate.release();await page.evaluate(()=>window.oldEvidenceRead);await tick(page);
-      assert.equal(await page.evaluate(()=>evidenceCache===window.newEvidenceCache),true,'旧响应不能提交到新快照cache');
+      const committed=await page.locator('#details').textContent();
+      await releaseCapacity(page,oldGate);
+      assert.equal(await page.locator('#details').textContent(),committed,'旧响应不能覆盖新快照已经提交的缓存视图');
+      assert.match(await page.locator('#evidence-state').textContent(),/^筛选 125 \/ 全集 125/);
+      await page.locator('#evidence-status').selectOption('done');await tick(page);
+      assert.equal(state.gets.length,4,'新全集筛选必须复用新缓存而非重读旧分页');
       await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#page-note').textContent==='第 2 页');
       assert.equal(await page.locator('[data-job-id=cache-new-10]').count(),1);assert.equal(await page.locator('[data-job-id^=cache-old]').count(),0);
       assert.equal(state.gets.length,4);assert.deepEqual(state.posts,[]);assert.deepEqual(state.errors,[]);
@@ -1934,15 +1960,14 @@ test('产能看板语法与离线路由专项', async t => {
     await t.test('证据快照竞态5：刷新失败清除不确定依据，旧pending晚到无效且重试恢复筛选分页采购',async()=>{
       const {page,state}=await setup({data:capacitySnapshot('failed-old'),pagedDetails:true,evidence:true});
       const oldGate=deferCapacity(state,100);await page.locator('#evidence-size').selectOption('10');await oldGate.request;
-      await page.evaluate(()=>{window.oldEvidenceRead=Promise.resolve(evidencePending.promise || evidencePending).catch(()=>null);});
       const failed=deferCapacity(state);await page.locator('#refresh').click();await failed.request;await failed.release(500);
       await page.waitForFunction(()=>document.querySelector('#refresh-state').textContent==='读取失败');
       assert.match(await page.locator('#error').innerText(),/快照刷新合成失败/);assert.equal(await page.locator('#evidence-size').count(),0);
       const count=state.gets.length;
-      await page.evaluate(()=>{filterEvidence();showEvidence('h1');document.querySelector('#next').onclick();document.querySelector('#previous').onclick();});
+      await page.evaluate(()=>{for(const id of ['open-evidence','next','previous'])document.getElementById(id).dispatchEvent(new MouseEvent('click',{bubbles:true}));});
       await page.locator('#tab-scenarios').click();await page.locator('#tab-purchase').click();await tick(page);
       assert.equal(state.gets.length,count);assert.equal(await page.locator('#estimate-submit').isDisabled(),true);
-      state.data=capacitySnapshot('failed-retry');await refresh(page);await oldGate.release();await page.evaluate(()=>window.oldEvidenceRead);await tick(page);
+      state.data=capacitySnapshot('failed-retry');await refresh(page);await releaseCapacity(page,oldGate);
       assert.equal(await page.locator('#error').isVisible(),false);assert.equal(await page.locator('#evidence-size').inputValue(),'10');assert.equal(await page.locator('#evidence-size').isEnabled(),true);
       await page.locator('#next').click();await page.waitForFunction(()=>document.querySelector('#page-note').textContent==='第 2 页');assert.equal(await page.locator('[data-job-id=failed-retry-10]').count(),1);
       assert.equal(await page.locator('[data-job-id^=failed-old]').count(),0);await purchase(page);await calculate(page);assert.deepEqual(state.errors,[]);
@@ -1952,7 +1977,7 @@ test('产能看板语法与离线路由专项', async t => {
       assert.equal(await page.locator('#evidence-group').count(),0);assert.equal(await page.locator('#demands > *').count(),0);
       const gate=deferCapacity(state);state.data=capacitySnapshot('lazy-new');await page.locator('#refresh').click();await gate.request;
       await page.locator('#task-evidence > summary').click();await page.locator('#tab-scenarios').click();await page.locator('#tab-purchase').click();
-      await page.evaluate(()=>{filterEvidence();showEvidence();document.querySelector('#next').onclick();});await tick(page);
+      await page.evaluate(()=>{for(const id of ['open-evidence','next','previous'])document.getElementById(id).dispatchEvent(new MouseEvent('click',{bubbles:true}));});await tick(page);
       assert.equal(await page.locator('#evidence-group').count(),0,'未提交时不能挂载旧快照筛选DOM');assert.equal(await page.locator('#demands > *').count(),0);
       assert.equal(state.gets.length,2);assert.equal(await page.locator('#refresh').isEnabled(),true);assert.equal(await page.locator('#tab-machines').isEnabled(),true);
       await gate.release();await loaded(page);assert.equal(await page.locator('#evidence-group').count(),1);assert.equal(await page.locator('#details > details').count(),100);

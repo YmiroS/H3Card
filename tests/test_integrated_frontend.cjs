@@ -2,6 +2,7 @@
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
 const path = require('node:path');
+const fs = require('node:fs');
 const {spawn} = require('node:child_process');
 const {once} = require('node:events');
 const {chromium} = require('playwright');
@@ -32,7 +33,7 @@ async function startService() {
   }};
 }
 
-test('compiled React UI and legacy administration share the real Python session and origin',
+test('compiled React and management pages share Python auth without any old web runtime',
   {timeout:90000}, async () => {
     const service = await startService();
     let browser;
@@ -86,6 +87,23 @@ test('compiled React UI and legacy administration share the real Python session 
           await page.locator(selector).waitFor({state:'visible'});
         }
       }
+      // Fabric is the sole un-hashed application library and remains protected.
+      const vendor = await page.request.get(service.origin + '/vendor/fabric.min.js');
+      assert.equal(vendor.status(), 200);
+      assert.equal(vendor.headers()['cache-control'], 'private, no-store');
+      assert.deepEqual(await vendor.body(), fs.readFileSync(path.join(root, 'web_dist', 'vendor', 'fabric.min.js')));
+      await page.evaluate(() => new Promise((resolve, reject) => {
+        const script = document.createElement('script');
+        script.src = '/vendor/fabric.min.js'; script.onload = resolve; script.onerror = reject;
+        document.head.append(script);
+      }));
+      assert.equal(await page.evaluate(() => typeof window.fabric.Canvas), 'function');
+      for (const url of ['/app.js', '/style.css', '/admin-shell.js', '/auth.js', '/auth-page.css',
+        '/controller-page.js', '/costs-page.js', '/capacity-page.js', '/monitor-page.js',
+        '/image-composer.js', '/image-composer.css', '/admin/controller.html', '/admin/permissions.html',
+        '/admin/costs.html', '/admin/capacity.html', '/admin/monitor.html']) {
+        assert.equal((await page.request.get(service.origin + url)).status(), 404, url);
+      }
       const missing = await page.request.get(service.origin + '/assets/not-a-release.js');
       const privateFile = await page.request.get(service.origin + '/release.json');
       const unsafe = await page.request.post(service.origin + '/api/projects', {data:{}, headers:{Origin:service.origin}});
@@ -94,6 +112,24 @@ test('compiled React UI and legacy administration share the real Python session 
       });
       assert.deepEqual({missing:missing.status(), privateFile:privateFile.status(), unsafe:unsafe.status(), logout:logout.status()},
         {missing:404, privateFile:404, unsafe:403, logout:200});
+      const adminPages = ['/controller', '/controller/costs', '/controller/capacity', '/admin/permissions'];
+      for (const url of [...adminPages, '/monitor', '/vendor/fabric.min.js']) {
+        const anonymous = await page.request.get(service.origin + url, {maxRedirects:0});
+        assert.equal(anonymous.status(), 302, url);
+        assert.equal(anonymous.headers().location, '/login');
+      }
+      const artistLogin = await page.request.post(service.origin + '/api/auth/login', {
+        data:{username:'artist', password}, headers:{Origin:service.origin},
+      });
+      assert.equal(artistLogin.status(), 200);
+      const artistSession = await artistLogin.json();
+      for (const url of [...adminPages, '/monitor', '/api/admin/users', '/api/workers', '/api/costs', '/api/capacity']) {
+        assert.equal((await page.request.get(service.origin + url)).status(), 403, url);
+      }
+      assert.equal((await page.request.get(service.origin + '/vendor/fabric.min.js')).status(), 200);
+      assert.equal((await page.request.post(service.origin + '/api/auth/logout', {
+        headers:{Origin:service.origin, 'X-CSRF-Token':artistSession.csrf_token},
+      })).status(), 200);
       await page.goto(service.origin + '/login.html');
       await page.waitForURL(service.origin + '/login');
       await page.locator('input[name="username"]').fill('monitor');
@@ -101,10 +137,12 @@ test('compiled React UI and legacy administration share the real Python session 
       await page.getByRole('button', {name:'登录', exact:true}).click();
       await page.waitForURL(service.origin + '/monitor');
       const policy = {};
-      for (const url of ['/', '/api/projects', '/admin/permissions']) {
+      for (const url of ['/', '/api/projects', '/admin/permissions', '/controller', '/controller/costs',
+        '/controller/capacity', '/vendor/fabric.min.js']) {
         policy[url] = (await page.request.get(service.origin + url)).status();
       }
-      assert.deepEqual(policy, {'/':403, '/api/projects':403, '/admin/permissions':403});
+      assert.deepEqual(policy, {'/':403, '/api/projects':403, '/admin/permissions':403,
+        '/controller':403, '/controller/costs':403, '/controller/capacity':403, '/vendor/fabric.min.js':403});
       await page.goto(service.origin + '/login');
       await page.waitForURL(service.origin + '/monitor');
       assert.deepEqual(errors, []);

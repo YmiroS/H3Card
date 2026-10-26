@@ -2,11 +2,10 @@
 // NODE_PATH=/private/tmp/h3card-phone-tests.KeKBHn/node_modules CHOUKA_TEST_BROWSER=chrome node --test tests/test_monitor_page.cjs
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {readFileSync, existsSync} = require('node:fs');
 const {createServer} = require('node:http');
-const path = require('node:path');
 const {chromium} = require('playwright');
-const web = path.join(__dirname, '..', 'web');
+const {builtResources} = require('./helpers/admin-built-resources.cjs');
+const built = builtResources(['/monitor']);
 const at = Math.floor(Date.now() / 1000);
 const attack = '<img src=x onerror="window.injected=1">';
 const gate = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return {promise, resolve}; };
@@ -19,10 +18,8 @@ function history(index = 0, minutes = 30) {
   return {worker_id:'a',gpu_index:index,minutes,from:at-minutes*60,to:at,gap_seconds:60,server_time:at,points:[{at:at-500,temperature_c:41+index},{at:at-450,temperature_c:null},{at:at-400,temperature_c:47+index},{at:at-200,temperature_c:51+index},{at:at-150,temperature_c:53+index}]};
 }
 async function fixture(run, options = {}) {
-  assert.ok(existsSync(path.join(web,'monitor-alerts.js')), '请等待独立告警引擎落盘后再运行页面测试');
   const state = {data:summary(), status:200, user:{id:'monitor-test',username:'monitor-screen',role:'monitor',phone:''}, detailStatus:200, temperatureStatus:200, ...options};
   const requests = [], unexpected = [], errors = [], waiting = new Set();
-  const staticFiles = new Set(['monitor-page.js','monitor-alerts.js','monitor.css','auth.js','icon.png','favicon.png']);
   const server = createServer((req,res) => {
     waiting.add(res); res.once('close', () => waiting.delete(res));
     void (async () => {
@@ -52,9 +49,8 @@ async function fixture(run, options = {}) {
         if (state.tempGate && index===0) await Promise.race([state.tempGate.promise,new Promise(r=>res.once('close',r))]);
         if (!res.destroyed) json(state.temperatureStatus===200?history(index,Number(url.searchParams.get('minutes'))):{error:attack},state.temperatureStatus); return;
       }
-      if (p === '/monitor') { res.setHeader('Content-Type','text/html'); return res.end(readFileSync(path.join(web,'monitor.html'))); }
+      if (built.serve(req, res)) return;
       if (p === '/login') { res.setHeader('Content-Type','text/html'); return res.end('<!doctype html><title>登录</title><h1>重新登录</h1>'); }
-      if (staticFiles.has(p.slice(1))) { res.setHeader('Content-Type',p.endsWith('.js')?'text/javascript':p.endsWith('.css')?'text/css':'image/png'); return res.end(readFileSync(path.join(web,p.slice(1)))); }
       unexpected.push(req.method+' '+p); res.writeHead(404); res.end();
     })().catch(e=>{errors.push(e.message);res.destroy();});
   });

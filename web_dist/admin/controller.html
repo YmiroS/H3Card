@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="dark" />
+    <title>运行面板 · Chouka</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+
+
+    <script type="module" crossorigin src="/assets/controller-MxhVYBRb.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/modulepreload-polyfill-B5Qt9EMX.js">
+    <link rel="modulepreload" crossorigin href="/assets/auth-Dme5mBO-.js">
+    <link rel="modulepreload" crossorigin href="/assets/admin-shell-113Cp2zd.js">
+    <link rel="stylesheet" crossorigin href="/assets/admin-shell-C5Yk98rV.css">
+  </head>
+  <body class="admin-page" data-workspace="controller">
+    <main id="main" tabindex="-1">
+      <div class="page">
+        <header class="card page-header">
+          <div>
+            <h1>运行面板</h1>
+            <div class="page-caption">
+              <span class="subtitle" id="service-subtitle">正在读取中间层运行状态</span>
+            </div>
+          </div>
+          <div class="header-actions">
+            <span class="muted small" id="refresh-state" role="status">正在加载…</span
+            ><label class="check-label"
+              ><input id="auto-refresh" type="checkbox" checked />每5秒刷新</label
+            ><button type="button" class="primary" id="refresh">立即刷新</button
+            ><button type="button" id="sync-all" disabled>一键更新全部节点</button>
+          </div>
+        </header>
+        <div id="sandbox-note" class="notice-box admin-sandbox" hidden>
+          本地隔离数据副本：不连接正式执行端。节点同步已禁用，避免修改正式机器。
+        </div>
+        <div id="error" class="f-error" role="alert" hidden>
+          <div>
+            <b id="error-message"></b>
+            <p>已载入内容仅为上次快照，不能作为实时状态；未知数据不记为零。</p>
+          </div>
+          <button type="button" id="retry">重试读取</button>
+        </div>
+        <section class="metrics f-metrics6" aria-label="运行概览">
+          <article class="card metric">
+            <div class="metric-content">
+              <p class="metric-label">中间层服务</p>
+              <p class="metric-value compact" id="service">未获取</p>
+              <p class="metric-note" id="service-mode">等待服务响应</p>
+            </div>
+          </article>
+          <article class="card metric">
+            <div class="metric-content">
+              <p class="metric-label">在线执行端</p>
+              <p class="metric-value" id="workers">未获取</p>
+              <p class="metric-note">含禁用与同步中的在线节点</p>
+            </div>
+          </article>
+          <article class="card metric">
+            <div class="metric-content">
+              <p class="metric-label">正在运行</p>
+              <p class="metric-value" id="running">未获取</p>
+              <p class="metric-note">由中间层调度的任务</p>
+            </div>
+          </article>
+          <article class="card metric">
+            <div class="metric-content">
+              <p class="metric-label">排队任务</p>
+              <p class="metric-value" id="queued">未获取</p>
+              <p class="metric-note">等待可用执行端</p>
+            </div>
+          </article>
+          <article class="card metric">
+            <div class="metric-content">
+              <p class="metric-label">ComfyUI</p>
+              <p class="metric-value compact" id="comfy">未获取</p>
+              <p class="metric-note">单节点状态见下表</p>
+            </div>
+          </article>
+          <article class="card metric">
+            <div class="metric-content">
+              <p class="metric-label">服务运行时间</p>
+              <p class="metric-value compact" id="uptime">未获取</p>
+              <p class="metric-note">本次中间层服务启动至今</p>
+            </div>
+          </article>
+        </section>
+        <div class="dashboard-grid">
+          <section class="card" aria-labelledby="workers-title">
+            <div class="section-heading">
+              <div>
+                <h2 id="workers-title">Windows 执行端</h2>
+                <p class="section-subtitle">
+                  状态、任务接收、ComfyUI 与同步分开显示；多显卡不合并显存
+                </p>
+              </div>
+              <span class="muted small" id="worker-count">正在读取</span>
+            </div>
+            <div class="table-wrap">
+              <table class="workers-table f-workers">
+                <thead>
+                  <tr>
+                    <th>执行端 / 主机</th>
+                    <th>运行与接收状态</th>
+                    <th>GPU / 显存</th>
+                    <th>温度</th>
+                    <th>系统内存</th>
+                    <th>当前任务</th>
+                    <th>同步 / 心跳</th>
+                    <th>详情 / 趋势</th>
+                  </tr>
+                </thead>
+                <tbody id="worker-rows">
+                  <tr>
+                    <td colspan="8" class="loading-note">正在读取执行端…</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+            <p class="table-note">
+              显存条按已用容量占总容量的真实比例显示；离线或过期读数不作实时数据。点击行末入口查看真实采集的温度历史。
+            </p>
+          </section>
+          <aside class="right-column" aria-label="需要关注及配置">
+            <section class="card">
+              <div class="section-heading">
+                <h2 class="heading-inline">
+                  <span class="danger" id="attention-icon"></span>需要关注
+                </h2>
+              </div>
+              <div
+                class="attention-list"
+                id="attention-list"
+                tabindex="0"
+                role="region"
+                aria-label="需要关注的节点列表"
+              >
+                <p class="muted small">正在读取节点状态…</p>
+              </div>
+            </section>
+            <section class="card">
+              <div class="section-heading"><h2>服务配置摘要</h2></div>
+              <dl class="f-config-definition" id="config-rows">
+                <dt>运行模式</dt>
+                <dd>未获取</dd>
+                <dt>可用能力</dt>
+                <dd>未获取</dd>
+                <dt>任务记录</dt>
+                <dd>未获取</dd>
+                <dt>大模型接口</dt>
+                <dd>未获取</dd>
+                <dt>页面地址</dt>
+                <dd>/controller</dd>
+                <dt>创作画布</dt>
+                <dd>/</dd>
+              </dl>
+            </section>
+          </aside>
+        </div>
+        <section class="card">
+          <div class="section-heading">
+            <div>
+              <h2>最近任务</h2>
+              <p class="section-subtitle">最近30条任务，保留步骤、过程进度、执行时间及完整错误</p>
+            </div>
+            <label class="filter-label"
+              >任务状态<select id="jobs-filter">
+                <option value="all">全部状态</option>
+                <option value="running">运行中</option>
+                <option value="queued">排队中</option>
+                <option value="assigned">已分配</option>
+                <option value="done">已完成</option>
+                <option value="error">异常</option>
+                <option value="canceled">已取消</option>
+                <option value="cancel_requested">正在取消</option>
+              </select></label
+            >
+          </div>
+          <div class="table-wrap f-job-scroll">
+            <table class="jobs-table">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>姓名 / 项目 / 卡片</th>
+                  <th>模式</th>
+                  <th>过程进度 / 步骤</th>
+                  <th>执行端</th>
+                  <th>创建时间</th>
+                  <th>耗时 / 错误</th>
+                </tr>
+              </thead>
+              <tbody id="job-rows">
+                <tr>
+                  <td colspan="7" class="loading-note">正在读取任务…</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="table-note" id="job-note">任务来自中间层真实记录，不包含未上报的本地任务。</p>
+        </section>
+      </div>
+    </main>
+  </body>
+</html>

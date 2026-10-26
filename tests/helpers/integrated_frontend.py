@@ -3,6 +3,7 @@ import asyncio
 from contextlib import ExitStack
 import json
 from pathlib import Path
+import shutil
 import sys
 from unittest import mock
 
@@ -18,18 +19,32 @@ async def main():
     fixture = AuthFixture()
     fixture.auth_setup()
     fixture.auth.create_user('monitor', PASSWORD, role='monitor')
+    fixture.auth.create_user('artist', PASSWORD)
     fixture.auth.db.execute("UPDATE users SET phone='13800138000'")
     fixture.own_project('browser', '整合验收画布')
+    # Real business persistence is isolated; only immutable compiled code stays in
+    # the checkout. In particular the runtime has no fixture.root/web directory.
+    shutil.copyfile(ROOT / 'pricing.json', fixture.root / 'pricing.json')
+    for name in ('manifests', 'graphs'):
+        shutil.copytree(ROOT / name, fixture.root / name)
+    file_response = controller_app.web.FileResponse
+
+    class DistOnlyFileResponse(file_response):
+        def __init__(self, path, *args, **kwargs):
+            candidate = Path(path).resolve()
+            for old_web in (ROOT / 'web', fixture.root / 'web'):
+                if candidate.is_relative_to(old_web.resolve()):
+                    raise AssertionError(f'Legacy web runtime dependency: {candidate}')
+            super().__init__(path, *args, **kwargs)
+
     try:
         with ExitStack() as stack:
-            distributed_type = controller_app.DistributedStore
-            costs_type = controller_app.CostLedger
+            stack.enter_context(mock.patch.object(controller_app, 'ROOT', fixture.root))
+            stack.enter_context(mock.patch.object(controller_app, 'static_asset',
+                new=mock.AsyncMock(side_effect=AssertionError('Legacy static handler used'))))
+            stack.enter_context(mock.patch.object(controller_app.web, 'FileResponse', DistOnlyFileResponse))
             stack.enter_context(mock.patch.object(controller_app, 'CONTROLLER_MODE', True))
             stack.enter_context(mock.patch.object(controller_app, 'EXECUTION_MODE', 'controller'))
-            stack.enter_context(mock.patch.object(controller_app, 'DistributedStore',
-                side_effect=lambda *_: distributed_type(fixture.root / 'data' / 'control.db')))
-            stack.enter_context(mock.patch.object(controller_app, 'CostLedger',
-                side_effect=lambda *_: costs_type(fixture.root / 'data' / 'control.db', ROOT / 'pricing.json')))
             stack.enter_context(mock.patch.object(controller_app, 'ws_loop', new=mock.AsyncMock()))
             stack.enter_context(mock.patch.object(controller_app, 'setup_dingtalk', return_value=None))
             stack.enter_context(mock.patch.object(controller_app, 'load_jobs', return_value=None))

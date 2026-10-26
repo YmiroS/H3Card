@@ -4,8 +4,10 @@ const path = require('node:path');
 const {execFileSync} = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
+const DOCUMENTS = ['index.html', ...['controller', 'permissions', 'costs', 'capacity', 'monitor']
+  .map(page => `admin/${page}.html`)];
+const REQUIRED_STATIC_FILES = ['favicon.png', 'icon.png', 'auth-art.webp', 'auth-logo.png', 'vendor/fabric.min.js'];
 const PRODUCTION_ENV = {
-  VITE_ADMIN_BASE_URL:'/',
   VITE_IF_BRIDGE_URL:'http://127.0.0.1:8278',
 };
 
@@ -54,20 +56,32 @@ function validateDistribution(directory) {
     }
     return file;
   }
-  const index = fs.readFileSync(regularFile('index.html'), 'utf8');
-  const assets = [];
-  for (const tag of index.matchAll(/<(script|link)\b[^>]*>/gi)) {
-    const attribute = tag[1].toLowerCase() === 'script' ? 'src' : 'href';
-    const reference = new RegExp(`\\b${attribute}\\s*=\\s*["']([^"']+)["']`, 'i').exec(tag[0]);
-    if (!reference) continue;
-    const url = reference[1];
-    if (/^(?:[a-z]+:|\/\/)/i.test(url)) throw new Error(`Non-local distribution asset: ${url}`);
-    const relative = decodeURIComponent(url.split(/[?#]/)[0]).replace(/^\//, '');
-    regularFile(relative);
-    if (/^assets\/.+[-.][A-Za-z0-9_-]{6,}\.(?:js|css)$/.test(relative)) assets.push(relative);
+  const assets = new Set();
+  for (const document of DOCUMENTS) {
+    const html = fs.readFileSync(regularFile(document), 'utf8');
+    let javascript = false;
+    for (const tag of html.matchAll(/<(script|link)\b[^>]*>/gi)) {
+      const script = tag[1].toLowerCase() === 'script';
+      const attribute = script ? 'src' : 'href';
+      const reference = new RegExp(`\\b${attribute}\\s*=\\s*["']([^"']+)["']`, 'i').exec(tag[0]);
+      if (!reference) continue;
+      const url = reference[1];
+      if (/^(?:[a-z]+:|\/\/)/i.test(url)) throw new Error(`Non-local distribution asset: ${url}`);
+      const relative = decodeURIComponent(url.split(/[?#]/)[0]).replace(/^\//, '');
+      regularFile(relative);
+      const hashed = /^\/assets\/[A-Za-z0-9_][A-Za-z0-9_.-]*-[A-Za-z0-9_-]{8,}\.(?:js|css)$/.test(url);
+      if (!hashed && (script || !['/favicon.png', '/icon.png'].includes(url))) {
+        throw new Error(`Distribution ${document} requires a hashed JavaScript/CSS asset, not a legacy source reference: ${url}`);
+      }
+      if (hashed) {
+        assets.add(relative);
+        if (script && relative.endsWith('.js')) javascript = true;
+      }
+    }
+    if (!javascript) throw new Error(`Distribution ${document} must reference a hashed JavaScript asset.`);
   }
-  if (!assets.some(file => file.endsWith('.js'))) throw new Error('Distribution index must reference a hashed JavaScript asset.');
-  return assets;
+  for (const file of REQUIRED_STATIC_FILES) regularFile(file);
+  return [...assets];
 }
 
 function buildFrontend({root = ROOT, runCommand = execFileSync, npmCli, rename = fs.renameSync} = {}) {
@@ -89,11 +103,12 @@ function buildFrontend({root = ROOT, runCommand = execFileSync, npmCli, rename =
     npm(['run', 'check'], {NODE_ENV:'test'});
     npm(['run', 'build', '--', '--outDir', staging, '--emptyOutDir', '--base', '/'], {NODE_ENV:'production'});
     if (frontendCommit(root, runCommand) !== commit) throw new Error('Frontend HEAD changed during the build; release not installed.');
-    const index = path.join(staging, 'index.html');
-    if (!fs.lstatSync(index).isFile()) throw new Error('Distribution requires a regular index.html file.');
-    // Vite can mix CRLF and CRCRLF on Windows. Normalize only HTML, never fingerprinted assets.
-    fs.writeFileSync(index, fs.readFileSync(index, 'utf8').replace(/\r\n?/g, '\n'));
     const assets = validateDistribution(staging);
+    // Vite can mix CRLF and CRCRLF on Windows. Normalize only HTML, never fingerprinted assets.
+    for (const document of DOCUMENTS) {
+      const file = path.join(staging, document);
+      fs.writeFileSync(file, fs.readFileSync(file, 'utf8').replace(/\r\n?/g, '\n'));
+    }
     // Build provenance only. The HTTP service must serve index/assets, never this metadata file.
     fs.writeFileSync(path.join(staging, 'release.json'), JSON.stringify({
       source_commit:commit, source_directory:'frontend', environment:PRODUCTION_ENV,

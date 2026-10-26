@@ -1,0 +1,257 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>产能评估</title>
+    <link rel="icon" type="image/png" href="/favicon.png" />
+
+
+    <script type="module" crossorigin src="/assets/capacity-CY0gmdFc.js"></script>
+    <link rel="modulepreload" crossorigin href="/assets/modulepreload-polyfill-B5Qt9EMX.js">
+    <link rel="modulepreload" crossorigin href="/assets/auth-Dme5mBO-.js">
+    <link rel="modulepreload" crossorigin href="/assets/admin-shell-113Cp2zd.js">
+    <link rel="stylesheet" crossorigin href="/assets/admin-shell-C5Yk98rV.css">
+    <link rel="stylesheet" crossorigin href="/assets/capacity-BclCSRfb.css">
+  </head>
+  <body data-workspace="capacity">
+    <main id="main-content" class="page capacity-page" tabindex="-1">
+      <header class="page-header card">
+        <div>
+          <h1>产能评估</h1>
+          <p class="subtitle">真实任务与独立规格分组，查看机器产能、证据和每日需求。</p>
+          <div class="page-caption">
+            <span id="refresh-state" class="state" role="status">正在验证身份…</span>
+          </div>
+        </div>
+        <div class="header-actions"><button id="refresh" type="button">立即刷新</button></div>
+      </header>
+      <div id="error" class="error" role="alert" hidden></div>
+      <div id="write-status" class="write-status" role="status" hidden></div>
+      <div class="tabs" role="tablist" aria-label="产能评估视图">
+        <button
+          id="tab-machines"
+          role="tab"
+          aria-selected="true"
+          aria-controls="panel-machines"
+          tabindex="0"
+        >
+          机器产能
+        </button>
+        <button
+          id="tab-scenarios"
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-scenarios"
+          tabindex="-1"
+        >
+          场景对比
+        </button>
+        <button
+          id="tab-purchase"
+          role="tab"
+          aria-selected="false"
+          aria-controls="panel-purchase"
+          tabindex="-1"
+        >
+          采购测算
+        </button>
+      </div>
+      <div id="capacity-stats" class="metrics" aria-label="产能数据概览"></div>
+      <section id="panel-machines" role="tabpanel" aria-labelledby="tab-machines" tabindex="0">
+        <section id="machine-summary" aria-label="在线机器业务简览">
+          <div class="summary-toolbar">
+            <h2 id="online-count">当前在线 — 台</h2>
+            <label class="offline-toggle"
+              ><input id="include-offline" type="checkbox" />包含离线</label
+            >
+          </div>
+          <p class="summary-note hint">
+            在线状态是当前状态；业务为全部历史记录中跑过的业务，不代表当前均可执行。平均生成时间仅计成功任务执行耗时，不含排队，非纯
+            GPU
+            耗时，也不是合格日产能。同一业务的任务规格、模型或采样条件不同，不能直接按耗时做性能排名。
+          </p>
+          <div id="summary-machines"></div>
+          <div class="matrix-actions">
+            <button type="button" id="open-purchase">进入多模式采购测算</button
+            ><button type="button" id="open-evidence">展开全部任务证据</button>
+          </div>
+        </section>
+        <details id="technical-details" class="section advanced">
+          <summary>详细统计与机器配置</summary>
+          <div class="summary">
+            <section class="section">
+              <div class="section-head">
+                <h2>生成任务</h2>
+                <span class="hint">不是产物数量</span>
+              </div>
+              <div id="task-metrics" class="metrics pad"></div>
+              <p id="coverage" class="hint pad"></p>
+            </section>
+            <section class="section">
+              <div class="section-head">
+                <h2>实际产物</h2>
+                <span class="hint">仅已知输出，不从请求推断</span>
+              </div>
+              <div id="output-metrics" class="metrics pad"></div>
+              <p class="hint pad">图片、视频、时长分别统计；未知不记为零，也不计为人工合格。</p>
+            </section>
+          </div>
+          <section class="section">
+            <div class="section-head">
+              <h2>机器配置与状态</h2>
+              <span class="hint">按 Worker ID 区分，名称相同不合并</span>
+            </div>
+            <p class="notice hint">
+              配置为当前或最后上报信息，不代表历史执行快照，也不是最低采购配置。系统可见内存不是标称容量，多卡显存不相加。
+            </p>
+            <div id="workers" class="worker-grid"></div>
+          </section>
+          <section class="section">
+            <div class="section-head">
+              <h2>业务规格分组</h2>
+              <span class="hint">原始统计保留失败、取消与异常记录</span>
+            </div>
+            <div id="machine-groups"></div>
+          </section>
+        </details>
+      </section>
+      <section
+        id="panel-scenarios"
+        role="tabpanel"
+        aria-labelledby="tab-scenarios"
+        tabindex="0"
+        hidden
+      >
+        <section class="section">
+          <div class="section-head">
+            <h2>同场景证据对比</h2>
+            <label class="field"
+              ><span>业务 / 精确规格 / 来源</span
+              ><select id="scenario-filter"></select
+            ></label>
+          </div>
+          <p class="notice hint">
+            只并列相同业务、规格键与证据来源。历史配置、模型版本或缓存条件缺失时，不视为受控跑分；未测试的配置不能按显存或价格推算。
+          </p>
+          <div id="scenario-groups"></div>
+        </section>
+      </section>
+      <section
+        id="panel-purchase"
+        role="tabpanel"
+        aria-labelledby="tab-purchase"
+        tabindex="0"
+        hidden
+      >
+        <div class="procurement">
+          <section class="section">
+            <div class="section-head"><h2>每日多场景需求</h2></div>
+            <form id="estimate-form" class="pad">
+              <div class="form-grid">
+                <label class="field"
+                  ><span>电脑显卡配置选择</span
+                  ><select id="estimate-worker" required></select
+                ></label>
+                <label class="field"
+                  ><span>每日计划生产小时</span
+                  ><input id="hours" type="number" min="0.1" max="24" step="0.1" value="8" required
+                /></label>
+                <label class="field"
+                  ><span>整机报价（元，可选）</span
+                  ><input
+                    id="price"
+                    type="number"
+                    min="0"
+                    step="0.01"
+                    placeholder="未填写则不计价格"
+                /></label>
+              </div>
+              <p id="mode-note" class="notice">
+                按成功任务平均执行耗时参考，不是合格产物日产量或采购承诺。
+              </p>
+              <p class="hint">
+                固定按 100% 可用时间、75% 生产容量计算（预留 25% 应对波动）；每日数量按任务/天填写。
+              </p>
+              <div>
+                <h3>每日需求</h3>
+                <p id="demand-note" class="hint" role="status"></p>
+                <div id="demands"></div>
+                <button id="add-demand" type="button" disabled>增加场景</button>
+              </div>
+              <button id="estimate-submit" class="primary" type="submit" disabled>
+                计算机器需求
+              </button>
+            </form>
+          </section>
+          <section class="section">
+            <div class="section-head">
+              <h2>测算结果与依据</h2>
+              <button id="export-estimate" disabled>导出测算 CSV</button>
+            </div>
+            <div id="estimate-error" class="error" role="alert" hidden></div>
+            <div id="estimate-result" class="pad" aria-live="polite">
+              <p class="muted">填写每日需求后计算。没有样本的场景不能按零耗时处理。</p>
+            </div>
+          </section>
+        </div>
+      </section>
+      <details id="task-evidence" class="section advanced">
+        <summary>任务证据与人工标记</summary>
+        <section aria-labelledby="evidence-heading">
+          <div class="section-head">
+            <h2 id="evidence-heading">任务证据与人工标记</h2>
+            <span id="detail-count" class="hint"></span>
+          </div>
+          <p class="hint pad">
+            明细每页最多 100 条。人工验收 /
+            标准样本是人工声明，不等于系统自动验证通过；历史记录不可补写为完整采集证据。
+          </p>
+          <template id="evidence-filter-template"
+            ><div class="evidence-filters">
+              <label class="field"
+                ><span>独立原分组（按真实 group_id）</span
+                ><select id="evidence-group">
+                  <option value="">全部原分组</option>
+                </select></label
+              ><label class="field"
+                ><span>任务状态</span
+                ><select id="evidence-status">
+                  <option value="">全部状态</option>
+                  <option value="done">已完成</option>
+                  <option value="error">失败</option>
+                  <option value="canceled">已取消</option>
+                  <option value="queued">排队中</option>
+                  <option value="running">运行中</option>
+                </select></label
+              ><label class="field"
+                ><span>采集来源</span
+                ><select id="evidence-source">
+                  <option value="">全部来源</option>
+                  <option value="historical">历史运行参考</option>
+                  <option value="captured">采集业务样本</option>
+                  <option value="standard">标准样本（人工标签）</option>
+                </select></label
+              ><label class="field"
+                ><span>每页最多 100 条</span
+                ><select id="evidence-size">
+                  <option value="100">100 条 / 页</option>
+                  <option value="50">50 条 / 页</option>
+                  <option value="25">25 条 / 页</option>
+                  <option value="10">10 条 / 页</option>
+                </select></label
+              >
+            </div></template
+          >
+          <div id="evidence-filters"></div>
+          <p id="evidence-state" class="hint pad" role="status" hidden></p>
+          <div id="details"></div>
+          <div class="pager">
+            <button id="previous" disabled>上一页</button><span id="page-note" class="hint"></span
+            ><button id="next" disabled>下一页</button>
+          </div>
+        </section>
+      </details>
+    </main>
+  </body>
+</html>

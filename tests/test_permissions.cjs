@@ -5,7 +5,11 @@ const { readFileSync } = require('node:fs');
 const path = require('node:path');
 const { createServer } = require('node:http');
 const { chromium } = require('playwright');
+const {builtResources, documentRoutes} = require('./helpers/admin-built-resources.cjs');
+const built = builtResources(Object.keys(documentRoutes));
 
+// Canvas/team legacy regressions below deliberately retain their original business fixtures;
+// every admin/monitor document and standalone admin auth/shell test uses the shipped MPA.
 const web = path.join(__dirname, '..', 'web');
 const source = readFileSync(path.join(web, 'app.js'), 'utf8');
 const helpers = source.slice(source.indexOf('const canOperate'), source.indexOf('const jpost ='));
@@ -13,17 +17,19 @@ const presenceHelpers = source.slice(source.indexOf('const PRESENCE_COLORS'), so
 const browserOptions = process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {};
 
 test('所有页面统一CK标签图标，品牌图片保持透明及原始比例', async () => {
-  const pages = ['index', 'login', 'director', 'permissions', 'teams', 'controller', 'costs', 'capacity'];
+  const pages = ['index', 'login', 'director', 'permissions', 'teams', 'controller', 'costs', 'capacity', 'monitor'];
+  const adminRoutes = Object.fromEntries(Object.entries(documentRoutes).map(([route, file]) => [path.basename(file, '.html'), route]));
   const files = new Map([
-    ...pages.map(name => [`/${name}.html`, [`${name}.html`, 'text/html; charset=utf-8']]),
+    ...pages.filter(name => !adminRoutes[name]).map(name => [`/${name}.html`, [`${name}.html`, 'text/html; charset=utf-8']]),
     ...['style', 'auth-page', 'director', 'admin-shell'].map(name => [`/${name}.css`, [`${name}.css`, 'text/css']]),
     ...['icon.png', 'favicon.png', 'auth-logo.png', 'auth-art.webp'].map(name => [`/${name}`, [name, name.endsWith('.webp') ? 'image/webp' : 'image/png']]),
   ]);
   const server = createServer((req, res) => {
-    const item = files.get(new URL(req.url, 'http://localhost').pathname);
-    if (!item) { res.writeHead(404); res.end(); return; }
     // 此项只检查真实HTML/CSS品牌展示，禁止业务脚本发起账号或画布请求。
     res.setHeader('Content-Security-Policy', "default-src 'none'; style-src 'self' 'unsafe-inline'; img-src 'self' data:");
+    if (built.serve(req, res)) return;
+    const item = files.get(new URL(req.url, 'http://localhost').pathname);
+    if (!item) { res.writeHead(404); res.end(); return; }
     res.setHeader('Content-Type', item[1]);
     res.end(readFileSync(path.join(web, item[0])));
   });
@@ -34,13 +40,14 @@ test('所有页面统一CK标签图标，品牌图片保持透明及原始比例
     const page = await browser.newPage({viewport:{width:1440, height:900}});
     const origin = 'http://127.0.0.1:' + server.address().port;
     for (const name of pages) {
-      await page.goto(`${origin}/${name}.html`);
+      await page.goto(origin + (adminRoutes[name] || `/${name}.html`));
       const favicon = page.locator('link[rel="icon"]');
       assert.equal(await favicon.count(), 1, `${name} 必须声明唯一标签图标`);
-      assert.equal(await favicon.getAttribute('href'), '/favicon.png?v=ck05');
+      assert.equal(await favicon.getAttribute('href'), adminRoutes[name] ? '/favicon.png' : '/favicon.png?v=ck05',
+        'Vite 解析公共图片后保留规范图标路径；旧文档仍验证原版本后缀');
       const icons = page.locator('img[src$="icon.png"], img[src$="auth-logo.png"]');
-      // 管理页由真实会话动态挂载唯一品牌；静态画布、登录和导演页保留上游品牌。
-      const expected = ['index', 'login'].includes(name) ? 1 : name === 'director' ? 2 : 0;
+      // 管理工作区由真实会话挂载品牌；监控页与画布、登录、导演页保留静态品牌。
+      const expected = ['index', 'login', 'monitor'].includes(name) ? 1 : name === 'director' ? 2 : 0;
       assert.equal(await icons.count(), expected, `${name} 品牌入口不可遗漏`);
       for (const icon of await icons.all()) {
         await icon.evaluate(image => image.decode());
@@ -335,11 +342,8 @@ test('production permissions page renders account names as text and sends author
       res.setHeader('Content-Type', 'application/json; charset=utf-8');
       return res.end(JSON.stringify(payloads[req.url]));
     }
-    const files = {'/':'permissions.html', '/auth.js':'auth.js', '/style.css':'style.css', '/admin-shell.js':'admin-shell.js', '/admin-shell.css':'admin-shell.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
-    const file = req.method === 'GET' && files[new URL(req.url, 'http://localhost').pathname];
-    if (!file) { unexpected.push(req.method + ' ' + req.url); req.resume(); res.writeHead(404); return res.end(); }
-    res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
-    res.end(readFileSync(path.join(web, file)));
+    if (built.serve(req, res)) return;
+    unexpected.push(req.method + ' ' + req.url); req.resume(); res.writeHead(404); res.end();
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
@@ -356,7 +360,7 @@ test('production permissions page renders account names as text and sends author
       external.push(route.request().url()); return route.abort();
     });
     await page.context().routeWebSocket('**/*', socket => { external.push(socket.url()); socket.close(); });
-    await page.goto(origin);
+    await page.goto(origin + '/admin/permissions');
     await page.waitForFunction(() => document.querySelectorAll('#users tr').length === 3);
     assert.match(await page.locator('#users').innerText(), /<script>alert\(1\)<\/script>/);
     assert.equal(await page.locator('#users script, #users img').count(), 0);
@@ -688,17 +692,15 @@ test('permissions dialogs preserve failed inputs, clear passwords and confirm re
       '/api/admin/registrations':{requests:[{username:unsafeName, display_name:unsafeName, status:'pending', created_at:1, decided_by:''}], outbox:{pending:2, oldest_at:1}},
     };
     if (Object.hasOwn(payloads, url)) { res.setHeader('Content-Type', 'application/json'); return res.end(JSON.stringify(payloads[url])); }
-    const files = {'/':'permissions.html', '/auth.js':'auth.js', '/admin-shell.js':'admin-shell.js', '/admin-shell.css':'admin-shell.css', '/icon.png':'icon.png', '/favicon.png':'favicon.png'};
-    const file = files[url]; if (!file) { res.writeHead(404); return res.end(); }
-    res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
-    res.end(readFileSync(path.join(web, file)));
+    if (built.serve(req, res)) return;
+    res.writeHead(404); res.end();
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;
   try {
     browser = await chromium.launch(browserOptions); const page = await browser.newPage({viewport:{width:1440,height:1000}});
     page.on('pageerror', error => errors.push(error.message));
-    await page.goto('http://127.0.0.1:' + server.address().port);
+    await page.goto('http://127.0.0.1:' + server.address().port + '/admin/permissions');
     await page.waitForFunction(() => document.getElementById('metric-users').textContent === '4' && document.getElementById('metric-pending').textContent === '1');
     assert.equal(await page.locator('#metric-enabled').innerText(), '3');
     assert.equal(await page.locator('#metric-pending').innerText(), '1');
@@ -804,8 +806,7 @@ test('permissions dialogs preserve failed inputs, clear passwords and confirm re
 test('新版工作区跨页面保留唯一导航和底部真实账号，键盘、触摸、角色及改密退出契约不变', async () => {
   let user = {id:'admin-1', username:'admin-account', display_name:'张三', phone:'13800138000', role:'admin'}, localTest = false;
   const mutations = [], unexpected = [], external = [], errors = [];
-  const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html', '/director':'director.html', '/teams':'teams.html', '/controller':'controller.html',
-    '/admin/permissions':'permissions.html', '/controller/costs':'costs.html', '/controller/capacity':'capacity.html',
+  const files = {...require('./helpers/frontend-static.cjs').canvasFiles, '/':'index.html', '/director':'director.html', '/teams':'teams.html',
     '/app.js':'app.js', '/auth.js':'auth.js', '/style.css':'style.css', '/director.js':'director.js', '/director.css':'director.css',
     '/director_edit.js':'director_edit.js', '/icon.png':'icon.png', '/favicon.png':'favicon.png',
     '/image-composer.css':'image-composer.css', '/vendor/fabric.min.js':'vendor/fabric.min.js',
@@ -831,6 +832,7 @@ test('新版工作区跨页面保留唯一导航和底部真实账号，键盘�
       '/api/capacity':{overview:{}, workers:[], groups:[], details:[], details_total:0}, '/api/teams':{teams:[]}, '/api/team-candidates':{users:[]}};
     if (req.method === 'GET' && Object.hasOwn(payloads, pathname)) return reply(res, payloads[pathname]);
     if (req.method === 'GET' && pathname === '/login') { res.setHeader('Content-Type','text/html'); return res.end('<h1>登录</h1>'); }
+    if (built.serve(req, res)) return;
     const file = req.method === 'GET' && files[pathname];
     if (!file) { unexpected.push(req.method + ' ' + pathname); req.resume(); res.writeHead(404); return res.end(); }
     res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : file.endsWith('.png') ? 'image/png' : 'text/html; charset=utf-8');
@@ -943,12 +945,11 @@ test('真实维护分级、短暂部分维护、减少动画和超时恢复，�
   const server=createServer((req,res)=>{
     const pathname=new URL(req.url,'http://localhost').pathname;
     const json=body=>{res.setHeader('Content-Type','application/json');res.end(JSON.stringify(body));};
-    if(pathname==='/auth.js'){res.setHeader('Content-Type','text/javascript');return res.end(readFileSync(path.join(web,'auth.js')));}
+    if(built.serve(req,res))return;
     if(pathname==='/api/auth/me')return json({user:{id:'u1',username:'viewer',role:'user'},csrf_token:'maintenance-csrf'});
     if(pathname==='/api/auth/presence'&&req.method==='POST'){assert.equal(req.headers['x-csrf-token'],'maintenance-csrf');req.resume();return json({online_users:1});}
     if(pathname==='/api/health'&&req.method==='GET'){healthRequests++;if(stallHealth){stalledReceived?.();return;}return json({ok:true,comfy_online:comfyOnline,maintenance_active:maintenance});}
-    if(pathname==='/admin-shell.css'){res.setHeader('Content-Type','text/css');return res.end(readFileSync(path.join(web,'admin-shell.css')));}
-    if(pathname==='/'){res.setHeader('Content-Type','text/html; charset=utf-8');return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><title>维护提示测试</title><main><h1>管理页标题</h1></main><script src="/auth.js"></script>');}
+    if(pathname==='/'){res.setHeader('Content-Type','text/html; charset=utf-8');return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="data:,"><title>维护提示测试</title><main><h1>管理页标题</h1></main>'+built.runtimeTags());}
     unexpected.push(req.method+' '+pathname);req.resume();res.writeHead(404);res.end();
   });
   await new Promise(resolve=>server.listen(0,'127.0.0.1',resolve));let browser;
@@ -972,7 +973,7 @@ test('真实维护分级、短暂部分维护、减少动画和超时恢复，�
     assert.equal(await banner.locator('.maintenance-banner-message').first().textContent(),'系统正在维护更新，当前暂无可用执行节点，请稍后再使用。');
     maintenance=false;await checkHealth();await banner.waitFor({state:'hidden'});maintenance=true;await checkHealth();await banner.waitFor({state:'visible'});
     assert.equal(await banner.count(),1);
-    await page.evaluate(()=>{document.body.classList.add('admin-page');document.body.dataset.workspace='controller';const link=document.createElement('link');link.rel='stylesheet';link.href='/admin-shell.css';document.head.append(link);});
+    await page.evaluate(styles=>{document.body.classList.add('admin-page');document.body.dataset.workspace='controller';for(const href of styles){const link=document.createElement('link');link.rel='stylesheet';link.href=href;document.head.append(link);}},built.documents.get('/controller').styles);
     await page.waitForFunction(()=>getComputedStyle(document.querySelector('#maintenance-banner')).position==='sticky');
     for(const width of [2560,390,320]){
       await page.setViewportSize({width,height:740});
@@ -998,9 +999,7 @@ test('real auth client expires protected sessions and allows a subsequent anonym
   let expired = false;
   const session = {user:{id:'u1', username:'admin', role:'admin'}, csrf_token:'test-csrf'};
   const server = createServer((req, res) => {
-    if (req.url === '/auth.js') {
-      res.setHeader('Content-Type', 'text/javascript'); return res.end(readFileSync(path.join(web, 'auth.js')));
-    }
+    if (built.serve(req, res)) return;
     if (req.url === '/api/health') {
       res.setHeader('Content-Type', 'application/json'); return res.end('{"ok":true,"maintenance_active":false}');
     }
@@ -1014,7 +1013,7 @@ test('real auth client expires protected sessions and allows a subsequent anonym
       return res.end(JSON.stringify(session));
     }
     res.setHeader('Content-Type', 'text/html; charset=utf-8');
-    res.end('<script src="/auth.js"></script><script>window.expirations=0;addEventListener("h3auth:expired",()=>expirations++);</script>');
+    res.end(built.runtimeTags({script:'window.expirations=0;addEventListener("h3auth:expired",()=>expirations++);'}));
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   let browser;

@@ -7,6 +7,7 @@ import threading
 import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from collections import defaultdict
 from pathlib import Path
 from unittest.mock import ANY, patch
@@ -750,7 +751,8 @@ class StoreTests(unittest.TestCase):
     def test_v6_phone_migration_preserves_global_grants_and_reopens(self):
         legacy = self.path.parent / 'v6.sqlite'
         migrations = Path(__file__).resolve().parents[1] / 'server/migrations'
-        with sqlite3.connect(legacy) as db:
+        # sqlite3's transaction context does not close the connection on Windows.
+        with closing(sqlite3.connect(legacy)) as db, db:
             for script in sorted(migrations.glob('00[1-6]_*.sql')):
                 db.executescript(script.read_text(encoding='utf-8'))
             self.assertEqual(db.execute('PRAGMA user_version').fetchone()[0], 6)

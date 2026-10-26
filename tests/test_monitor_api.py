@@ -3,6 +3,7 @@ import asyncio
 import copy
 import json
 import os
+import re
 import sys
 from contextlib import ExitStack
 from pathlib import Path
@@ -321,11 +322,8 @@ class MonitorAPITests(AuthFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_real_controller_worker_http_and_monitor_revocation(self):
         import app as application
-        import shutil
 
         await self.client.close()
-        for name in ("monitor.html", "monitor.css", "monitor-page.js", "monitor-alerts.js"):
-            shutil.copyfile(Path(__file__).resolve().parents[1] / "web" / name, self.web_root / name)
         (self.root / "pricing.json").write_text("{}", encoding="utf-8")
         with ExitStack() as stack:
             for name, value in (
@@ -368,9 +366,17 @@ class MonitorAPITests(AuthFixture, unittest.IsolatedAsyncioTestCase):
 
                 monitor_headers = await self.login("release-screen")
                 self.client.session.headers.update(monitor_headers)
-                self.assertEqual((await self.client.get("/monitor")).status, 200)
-                for path in ("/monitor.css", "/monitor-page.js", "/monitor-alerts.js"):
+                response = await self.client.get("/monitor")
+                self.assertEqual(response.status, 200)
+                document = await response.text()
+                self.assertEqual(document, app['frontend'].pages['/monitor'].read_text(encoding='utf-8'))
+                resources = re.findall(r'<(?:script|link|img)\b[^>]*(?:src|href)="([^"]+)"', document)
+                self.assertTrue(any(path.startswith('/assets/') and path.endswith('.js') for path in resources))
+                for path in resources:
+                    self.assertIn(path, app['frontend'].assets)
                     self.assertEqual((await self.client.get(path)).status, 200)
+                for path in ("/monitor.css", "/monitor-page.js", "/monitor-alerts.js"):
+                    self.assertEqual((await self.client.get(path)).status, 404)
                 for path in ("/api/projects", "/api/workers", "/api/admin/users", "/controller"):
                     self.assertEqual((await self.client.get(path)).status, 403)
                 # 使用 monitor 自己的有效 CSRF 仍不能执行管理写入。

@@ -70,7 +70,7 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                 self.assertEqual(response.status, 200)
                 self.assertEqual(await response.read(), shell)
         self.assertIn(b'/assets/', shell)
-        self.assertEqual((await self.client.get('/if-studio.js')).status, 200)
+        self.assertEqual((await self.client.get('/if-studio.js')).status, 404)
         card_data = await (await self.client.get('/api/cards')).json()
         for card_id, capability in (('card_image', 'if_image'), ('card_video', 'if_video')):
             card = next(card for card in card_data['cards'] if card['id'] == card_id)
@@ -102,7 +102,7 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.get('/capacity.html')).status, 404)
         self.assertEqual((await self.client.get('/controller/capacity')).status, 404)
         self.assertEqual((await self.client.get('/permissions.html')).status, 404)
-        self.assertEqual((await self.client.get('/app.js')).status, 200)
+        self.assertEqual((await self.client.get('/app.js')).status, 404)
 
     async def test_spa_pages_retain_user_team_leader_and_monitor_boundaries(self):
         self.auth.create_user('ordinary', PASSWORD)
@@ -118,26 +118,31 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                     self.assertEqual(response.status, 200 if allowed else 403)
             for route in ('/controller', '/controller/costs', '/controller/capacity', '/admin/permissions'):
                 self.assertEqual((await self.client.get(route, allow_redirects=False)).status, 403)
-        # Monitor keeps the legacy page and can read only exact built browser assets.
+        # Monitor reads its compiled document and only exact built browser assets.
         response = await self.client.get('/monitor')
         self.assertEqual(response.status, 200)
-        self.assertEqual(await response.read(), (ROOT / 'web' / 'monitor.html').read_bytes())
+        self.assertEqual(await response.read(), self.client.app['frontend'].pages['/monitor'].read_bytes())
         for route in self.client.app['frontend'].assets:
             self.assertEqual((await self.client.get(route)).status, 200)
         self.assertEqual((await self.client.get('/api/projects')).status, 403)
 
-    async def test_legacy_admin_and_monitor_html_are_not_replaced_by_spa(self):
-        for route, name in (('/admin/permissions', 'permissions.html'), ('/monitor', 'monitor.html')):
-            response = await self.client.get(route)
-            self.assertEqual(response.status, 200)
-            self.assertEqual(await response.read(), (ROOT / 'web' / name).read_bytes())
-        with mock.patch.object(controller_app, 'CONTROLLER_MODE', True):
-            for route, name in (('/controller', 'controller.html'),
-                                ('/controller/costs', 'costs.html'),
-                                ('/controller/capacity', 'capacity.html')):
-                response = await self.client.get(route)
-                self.assertEqual(response.status, 200)
-                self.assertEqual(await response.read(), (ROOT / 'web' / name).read_bytes())
+    async def test_compiled_admin_and_monitor_pages_are_specific_documents_not_spa_or_old_web(self):
+        frontend = self.client.app['frontend']
+        # Changing the business root must not affect the immutable frontend code root.
+        self.assertFalse((self.root / 'web').exists())
+        with mock.patch.object(controller_app, 'ROOT', self.root), \
+                mock.patch.object(controller_app, 'CONTROLLER_MODE', True), \
+                mock.patch.object(controller_app, 'static_asset', side_effect=AssertionError('legacy static read')):
+            for route, path in frontend.pages.items():
+                for method in ('GET', 'HEAD'):
+                    response = await self.client.request(method, route)
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+                    if method == 'GET':
+                        body = await response.read()
+                        self.assertEqual(body, path.read_bytes())
+                        self.assertNotEqual(body, frontend.index.read_bytes())
+                self.assertEqual((await self.client.get('/' + path.relative_to(ROOT / 'web_dist').as_posix())).status, 404)
 
     async def test_if_reference_route_is_wired_and_authenticated(self):
         self.assertIsInstance(self.client.app['if_reference_copies'], controller_app.IFReferenceCopies)
@@ -147,56 +152,47 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         response = await self.client.get('/api/if-reference')
         self.assertEqual(response.status, 401)
 
-    async def test_local_admin_modules_remain_explicit_authenticated_routes(self):
-        routes = {
-            '/admin-shell.css': 'text/css',
-            '/admin-shell.js': 'text/javascript',
-            '/controller-page.js': 'text/javascript',
-            '/costs-page.js': 'text/javascript',
-        }
-        for route, content_type in routes.items():
+    async def test_legacy_code_routes_are_not_registered_in_integrated_application(self):
+        from server.routes import STATIC_ASSETS
+        routes = {'/' + name for name in STATIC_ASSETS} - {'/vendor/fabric.min.js'}
+        routes.update(('/auth.js', '/auth-page.css'))
+        registered = {resource.canonical for resource in self.client.app.router.resources()}
+        for route in routes:
             with self.subTest(route=route):
+                self.assertNotIn(route, registered)
                 response = await self.client.get(route)
-                self.assertEqual(response.status, 200)
-                self.assertEqual(response.content_type, content_type)
-                self.assertGreater(len(await response.read()), 0)
+                self.assertEqual(response.status, 404)
         self.client.session.cookie_jar.clear()
         for route in routes:
             with self.subTest(route=route, anonymous=True):
                 response = await self.client.get(route, allow_redirects=False)
-                self.assertEqual(response.status, 302)
-                self.assertTrue(response.headers['Location'].startswith('/login'))
-
-    async def test_image_composer_assets_use_explicit_authenticated_routes(self):
-        assets = {
-            '/image-composer.js': ('text/javascript', b'// composer fixture'),
-            '/image-composer.css': ('text/css', b'/* composer fixture */'),
-            '/vendor/fabric.min.js': ('text/javascript', b'// fabric fixture'),
-        }
-        # 使用临时静态资源；不依赖另一 agent 的编辑器，也不写业务 web/data。
-        for route, (_content_type, content) in assets.items():
-            path = self.root / 'web' / route.lstrip('/')
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(content)
-        hidden = self.root / 'web' / 'vendor' / 'private.js'
-        hidden.write_bytes(b'not public')
-        with mock.patch.object(controller_app, 'ROOT', self.root):
-            for route, (content_type, content) in assets.items():
-                with self.subTest(route=route):
-                    response = await self.client.get(route)
-                    self.assertEqual(response.status, 200)
-                    self.assertEqual(response.content_type, content_type)
-                    self.assertEqual(await response.read(), content)
-            for route in ('/vendor/', '/vendor/private.js', '/image-composer.js.map',
-                          '/web/image-composer.js', '/vendor/%2e%2e/server/app.py'):
-                with self.subTest(unlisted=route):
-                    self.assertEqual((await self.client.get(route)).status, 404)
-            self.client.session.cookie_jar.clear()
-            for route in assets:
-                with self.subTest(route=route, anonymous=True):
-                    response = await self.client.get(route, allow_redirects=False)
-                    self.assertEqual(response.status, 302)
+                self.assertIn(response.status, (302, 404))
+                if response.status == 302:
                     self.assertTrue(response.headers['Location'].startswith('/login'))
+
+    async def test_image_vendor_uses_explicit_authenticated_dist_route_without_old_web(self):
+        route = '/vendor/fabric.min.js'
+        expected = self.client.app['frontend'].protected_assets[route].read_bytes()
+        self.assertFalse((self.root / 'web').exists())
+        with mock.patch.object(controller_app, 'ROOT', self.root):
+            for method in ('GET', 'HEAD'):
+                response = await self.client.request(method, route)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.content_type, 'text/javascript')
+                self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+                if method == 'GET':
+                    self.assertEqual(await response.read(), expected)
+            for hidden in ('/vendor/', '/vendor/private.js', '/image-composer.js', '/image-composer.css',
+                           '/image-composer.js.map', '/web/image-composer.js', '/vendor/%2e%2e/server/app.py'):
+                with self.subTest(unlisted=hidden):
+                    self.assertEqual((await self.client.get(hidden)).status, 404)
+            self.auth.create_user('vendor-monitor', PASSWORD, role='monitor')
+            await self.login('vendor-monitor')
+            self.assertEqual((await self.client.get(route)).status, 403)
+            self.client.session.cookie_jar.clear()
+            response = await self.client.get(route, allow_redirects=False)
+            self.assertEqual(response.status, 302)
+            self.assertTrue(response.headers['Location'].startswith('/login'))
 
     async def test_online_presence_requires_login_and_counts_active_user(self):
         response = await self.client.post('/api/auth/presence', headers=self.headers)
@@ -233,15 +229,14 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             response = await self.client.get(route)
             self.assertEqual(response.status, 200)
             self.assertEqual(await response.read(), shell)
-        # Legacy administration retains its own online indicator, not canvas presence.
-        response = await self.client.get('/admin-shell.js')
-        self.assertEqual(response.status, 200)
-        text = await response.text()
-        self.assertIn('Chouka 系统在线用户（近 90 秒活跃，按账号去重）', text)
-        self.assertIn('<b>--</b> 人在线', text)
-        self.assertNotIn('人使用中', text)
-        response = await self.client.get('/app.js')
-        self.assertIn('${users.size} 人使用中', await response.text())
+        # Both indicators now live in fingerprinted chunks, never legacy code routes.
+        chunks = '\n'.join(path.read_text(encoding='utf-8')
+                           for path in self.client.app['frontend'].assets.values() if path.suffix == '.js')
+        self.assertIn('Chouka 系统在线用户（近 90 秒活跃，按账号去重）', chunks)
+        self.assertIn('<b>--</b> 人在线', chunks)
+        self.assertIn('人使用中', chunks)
+        for route in ('/admin-shell.js', '/app.js'):
+            self.assertEqual((await self.client.get(route)).status, 404)
 
     async def test_auth_page_assets_are_explicitly_public(self):
         self.client.session.cookie_jar.clear()
@@ -260,8 +255,9 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                     self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
         response = await self.client.get('/assets/missing-12345678.js', allow_redirects=False)
         self.assertEqual(response.status, 404)
+        for route in ('/auth.js', '/auth-page.css'):
+            self.assertEqual((await self.client.get(route, allow_redirects=False)).status, 404)
         assets = {
-            '/auth-page.css': 'text/css',
             '/auth-art.webp': 'image/webp',
             '/auth-logo.png': 'image/png',
             '/icon.png': 'image/png',

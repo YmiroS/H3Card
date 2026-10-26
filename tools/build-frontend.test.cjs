@@ -35,11 +35,13 @@ function fixture(t) {
   write(root, 'unrelated/keep.txt', 'leave alone');
   return {root, frontend, commit};
 }
+const documents = ['index.html', ...['controller', 'permissions', 'costs', 'capacity', 'monitor'].map(page => `admin/${page}.html`)];
 function artifacts(directory) {
-  write(directory, 'index.html', '<link href="/assets/index-ABC12345.css" rel="stylesheet">'
+  for (const document of documents) write(directory, document, '<link href="/assets/index-ABC12345.css" rel="stylesheet">'
     + '<script type="module" src="/assets/index-ABC12345.js"></script>');
   write(directory, 'assets/index-ABC12345.js', 'console.log("release");');
   write(directory, 'assets/index-ABC12345.css', 'body { color: black; }');
+  for (const file of ['favicon.png', 'icon.png', 'auth-art.webp', 'auth-logo.png', 'vendor/fabric.min.js']) write(directory, file);
 }
 function npmStub(options = {}) {
   const calls = [];
@@ -77,7 +79,6 @@ test('clean indexed frontend builds through Node/npm CLI with production overrid
     assert.equal(call.command, process.execPath);
     assert.equal(call.execution.cwd, frontend);
     assert.equal(call.execution.shell, undefined);
-    assert.equal(call.execution.env.VITE_ADMIN_BASE_URL, '/');
     assert.equal(call.execution.env.VITE_IF_BRIDGE_URL, 'http://127.0.0.1:8278');
   }
   const buildCall = stub.calls[2];
@@ -87,7 +88,7 @@ test('clean indexed frontend builds through Node/npm CLI with production overrid
   assert.deepEqual(validateDistribution(result.destination), ['assets/index-ABC12345.css', 'assets/index-ABC12345.js']);
   const release = JSON.parse(fs.readFileSync(path.join(result.destination, 'release.json'), 'utf8'));
   assert.equal(release.source_commit, commit);
-  assert.equal(release.environment.VITE_ADMIN_BASE_URL, '/');
+  assert.deepEqual(release.environment, {VITE_IF_BRIDGE_URL:'http://127.0.0.1:8278'});
   assert.doesNotMatch(fs.readFileSync(path.join(result.destination, 'index.html'), 'utf8'), /release\.json/);
   assert.equal(fs.existsSync(path.join(result.destination, 'assets/old.js')), false);
   assert.equal(git(frontend, 'status', '--porcelain'), '');
@@ -96,21 +97,23 @@ test('clean indexed frontend builds through Node/npm CLI with production overrid
 });
 
 for (const [name, ending, normalized] of [['CRLF', '\r\n', '\n'], ['CRCRLF', '\r\r\n', '\n\n']]) {
-  test(`normalizes generated ${name} index to LF without changing hashed JS/CSS bytes`, t => {
+  test(`normalizes all generated ${name} documents to LF without changing hashed JS/CSS bytes`, t => {
     const {root} = fixture(t);
     const lines = ['<!doctype html>', '<link href="/assets/index-ABC12345.css" rel="stylesheet">',
       '<script src="/assets/index-ABC12345.js"></script>', ''];
     const javascript = Buffer.from('const value = 1;\r\nconsole.log(value);\r\r\n');
     const stylesheet = Buffer.from('body {\r\n  color: black;\r\r\n}\r\n');
     const stub = npmStub({afterBuild:out => {
-      write(out, 'index.html', lines.join(ending));
+      for (const document of documents) write(out, document, lines.join(ending));
       write(out, 'assets/index-ABC12345.js', javascript);
       write(out, 'assets/index-ABC12345.css', stylesheet);
     }});
     const {destination} = build(root, stub);
-    const index = fs.readFileSync(path.join(destination, 'index.html'), 'utf8');
-    assert.equal(index, lines.join(normalized));
-    assert.equal(index.includes('\r'), false);
+    for (const document of documents) {
+      const html = fs.readFileSync(path.join(destination, document), 'utf8');
+      assert.equal(html, lines.join(normalized));
+      assert.equal(html.includes('\r'), false);
+    }
     assert.deepEqual(fs.readFileSync(path.join(destination, 'assets/index-ABC12345.js')), javascript);
     assert.deepEqual(fs.readFileSync(path.join(destination, 'assets/index-ABC12345.css')), stylesheet);
   });
@@ -160,6 +163,27 @@ test('a successful command with missing hashed output is not published', t => {
   assert.throws(() => build(root, stub), /ENOENT/);
   preserved(root);
 });
+
+for (const file of [...documents.slice(1), 'favicon.png', 'icon.png', 'auth-art.webp', 'auth-logo.png', 'vendor/fabric.min.js']) {
+  test(`missing ${file} prevents publication and preserves the previous release`, t => {
+    const {root} = fixture(t);
+    const stub = npmStub({afterBuild:out => fs.unlinkSync(path.join(out, file))});
+    assert.throws(() => build(root, stub), /ENOENT/);
+    preserved(root);
+  });
+}
+
+for (const reference of ['/auth.js', '/admin-shell.css', 'https://example.invalid/page.js', '/assets/missing-ABC12345.js']) {
+  test(`admin entry rejects invalid resource ${reference} before publication`, t => {
+    const {root} = fixture(t);
+    const stub = npmStub({afterBuild:out => {
+      if (reference.startsWith('/') && !reference.startsWith('/assets/')) write(out, reference.slice(1), 'legacy');
+      write(out, 'admin/permissions.html', `<script src="${reference}"></script>`);
+    }});
+    assert.throws(() => build(root, stub), /legacy source reference|Non-local|ENOENT/);
+    preserved(root);
+  });
+}
 
 test('frontend changes during a build prevent publication', t => {
   const {root, frontend} = fixture(t);

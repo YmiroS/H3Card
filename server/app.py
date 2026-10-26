@@ -3260,7 +3260,7 @@ async def api_preview_file(request):
 
 async def permissions_page(request):
     require_admin(request)
-    return web.FileResponse(ROOT / "web" / "permissions.html")
+    return web.FileResponse(request.app['frontend'].pages['/admin/permissions'])
 
 
 async def teams_page(request):
@@ -3288,22 +3288,24 @@ async def if_studio_index(request):
 
 
 async def controller_index(request):
+    require_admin(request)
     if not CONTROLLER_MODE:
         raise web.HTTPNotFound(reason="中间层运行面板只在 controller 模式提供")
-    return web.FileResponse(ROOT / "web" / "controller.html")
+    return web.FileResponse(request.app['frontend'].pages['/controller'])
 
 
 async def controller_costs(request):
+    require_admin(request)
     if not CONTROLLER_MODE:
         raise web.HTTPNotFound(reason="费用统计只在 controller 模式提供")
-    return web.FileResponse(ROOT / "web" / "costs.html")
+    return web.FileResponse(request.app['frontend'].pages['/controller/costs'])
 
 
 async def controller_capacity(request):
     require_admin(request)
     if not CONTROLLER_MODE:
         raise web.HTTPNotFound(reason="产能评估只在 controller 模式提供")
-    return web.FileResponse(ROOT / "web" / "capacity.html")
+    return web.FileResponse(request.app['frontend'].pages['/controller/capacity'])
 
 
 def capacity_query(request):
@@ -3820,7 +3822,7 @@ def make_app(auth_path=None, *, project_repository=None):
     app.on_response_prepare.append(no_cache)
     register_monitor_routes(
         app, web_root=ROOT / "web", get_jobs=monitor_jobs_snapshot,
-        get_health=monitor_health_snapshot)
+        get_health=monitor_health_snapshot, frontend=frontend)
     register_page_routes(
         app, index=index, director_index=director_index, if_studio_index=if_studio_index,
         controller_index=controller_index, controller_costs=controller_costs,

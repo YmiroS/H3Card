@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import re
 import sys
 import tempfile
 import threading
@@ -921,6 +922,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.own_project("p")
 
         application = self.build_app()
+        # Direct handler fixtures use the same required compiled page catalog as
+        # make_app; legacy auth registration remains isolated to this test app.
+        application['frontend'] = controller_app.load_frontend(controller_app.FRONTEND_ROOT)
         application["comfy_lock"] = asyncio.Lock()
         application["capacity_probe_state"] = {"task": None}
         application["cleanup_pending"] = set()
@@ -990,12 +994,17 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(response.status, 200)
         self.assertIn("产能评估", await response.text())
         dashboard = await (await self.client.get("/controller")).text()
-        self.assertIn('src="/admin-shell.js"', dashboard)
-        shell = (ROOT / 'web/admin-shell.js').read_text(encoding='utf-8')
-        self.assertIn("H3Auth.mountAccount", shell)
-        navigation = (ROOT / 'web/auth.js').read_text(encoding='utf-8')
-        self.assertLess(navigation.index("add('costs', '费用评估', '/controller/costs')"),
-                        navigation.index("add('capacity', '产能统计', '/controller/capacity')"))
+        self.assertEqual(dashboard, self.client.app['frontend'].pages['/controller'].read_text(encoding='utf-8'))
+        self.assertIn('/assets/', dashboard)
+        self.assertNotIn('src="/admin-shell.js"', dashboard)
+        chunks = '\n'.join(path.read_text(encoding='utf-8')
+                           for path in self.client.app['frontend'].assets.values() if path.suffix == '.js')
+        self.assertIn("H3Auth.mountAccount", chunks)
+        costs_nav = re.search(r'''["']费用评估["'],\s*["']/controller/costs["']''', chunks)
+        capacity_nav = re.search(r'''["']产能统计["'],\s*["']/controller/capacity["']''', chunks)
+        self.assertIsNotNone(costs_nav)
+        self.assertIsNotNone(capacity_nav)
+        self.assertLess(costs_nav.start(), capacity_nav.start())
         report = await (await self.client.get("/api/capacity")).json()
         self.assertEqual(report["overview"]["tasks"], 0)
         self.assertEqual((await self.client.get("/capacity.html")).status, 404)
@@ -1894,12 +1903,14 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn('id="worker-rows"', dashboard)
         self.assertIn("GPU / 显存", dashboard)
         self.assertIn("一键更新全部节点", dashboard)
-        self.assertIn('src="/admin-shell.js"', dashboard)
-        self.assertIn('src="/controller-page.js"', dashboard)
-        shell = (ROOT / 'web/admin-shell.js').read_text(encoding='utf-8')
-        self.assertIn("H3Auth.mountAccount", shell)
-        navigation = (ROOT / 'web/auth.js').read_text(encoding='utf-8')
-        self.assertIn("add('costs', '费用评估', '/controller/costs')", navigation)
+        self.assertEqual(dashboard, self.client.app['frontend'].pages['/controller'].read_text(encoding='utf-8'))
+        self.assertIn('/assets/', dashboard)
+        for old_script in ('/admin-shell.js', '/controller-page.js'):
+            self.assertNotIn(old_script, dashboard)
+        chunks = '\n'.join(path.read_text(encoding='utf-8')
+                           for path in self.client.app['frontend'].assets.values() if path.suffix == '.js')
+        self.assertIn("H3Auth.mountAccount", chunks)
+        self.assertRegex(chunks, r'''["']费用评估["'],\s*["']/controller/costs["']''')
 
         response = await self.client.get("/controller/costs")
         self.assertEqual(response.status, 200)
@@ -1907,9 +1918,10 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn("<title>费用统计 · Chouka</title>", costs_page)
         self.assertIn("建议收费区间", costs_page)
         self.assertIn("内部总成本", costs_page)
-        self.assertIn('src="/costs-page.js"', costs_page)
-        costs_script = (ROOT / 'web/costs-page.js').read_text(encoding='utf-8')
-        self.assertIn("limit:'2000'", costs_script)
+        self.assertEqual(costs_page, self.client.app['frontend'].pages['/controller/costs'].read_text(encoding='utf-8'))
+        self.assertIn('/assets/', costs_page)
+        self.assertNotIn('/costs-page.js', costs_page)
+        self.assertRegex(chunks, r'''limit:\s*["']2000["']''')
 
         response = await self.client.get("/api/health")
         self.assertEqual(response.status, 200)

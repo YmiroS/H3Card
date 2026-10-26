@@ -2,14 +2,12 @@
 // 运行示例：CHOUKA_TEST_BROWSER=chrome node --test tests/test_admin_dashboard.cjs
 const {test} = require('node:test');
 const assert = require('node:assert/strict');
-const {readFileSync} = require('node:fs');
 const {createServer} = require('node:http');
-const path = require('node:path');
+const {builtResources} = require('./helpers/admin-built-resources.cjs');
 const {chromium} = require('playwright');
 
-const web = path.join(__dirname, '..', 'web');
+const built = builtResources(['/controller', '/controller/costs', '/admin/permissions']);
 const browserOptions = process.env.CHOUKA_TEST_BROWSER ? {channel:process.env.CHOUKA_TEST_BROWSER} : {};
-const staticFiles = new Set(['auth.js', 'admin-shell.js', 'admin-shell.css', 'controller-page.js', 'costs-page.js', 'favicon.png', 'icon.png']);
 const session = {id:'admin-id', username:'真实测试账号', display_name:'测试姓名', role:'admin'};
 function deferred() { let resolve; const promise = new Promise(done => { resolve = done; }); return {promise, resolve}; }
 function workers(at) {
@@ -120,21 +118,12 @@ async function withFixture(options, run) {
         res.writeHead(reply.status || 200, {'Content-Type':'application/json; charset=utf-8'});
         return res.end(JSON.stringify(reply.body ?? {}));
       }
-      if (req.method === 'GET' && ['/controller', '/controller/costs', '/admin/permissions'].includes(url.pathname)) {
-        res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.end(readFileSync(path.join(web, url.pathname === '/admin/permissions' ? 'permissions.html' : url.pathname.endsWith('costs') ? 'costs.html' : 'controller.html')));
-      }
-      if (req.method === 'GET' && staticFiles.has(url.pathname.slice(1))) {
-        const file = url.pathname.slice(1);
-        res.setHeader('Content-Type', file.endsWith('.js') ? 'text/javascript' : file.endsWith('.css') ? 'text/css' : 'image/png');
-        return res.end(readFileSync(path.join(web, file)));
-      }
+      if (built.serve(req, res)) return;
       if (req.method === 'GET' && url.pathname === '/shell') {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');
-        return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="/favicon.png"><link rel="stylesheet" href="/admin-shell.css">'
+        return res.end('<!doctype html><meta charset="utf-8"><link rel="icon" href="/favicon.png">'
           + '<main id="original-main"><div class="page"><header class="card page-header"><h1>真实壳层测试</h1></header><p id="business-error" role="alert">原页面业务错误必须保留</p></div></main>'
-          + '<script src="/auth.js"></script><script src="/admin-shell.js"></script>'
-          + '<script>H3Auth.requireUser().then(user=>AdminUI.mount({page:new URL(location.href).searchParams.get("page")||"teams",user}));</script>');
+          + built.runtimeTags({shell:true,script:'H3Auth.requireUser().then(user=>AdminUI.mount({page:new URL(location.href).searchParams.get("page")||"teams",user}));'}));
       }
       if (req.method === 'GET' && ['/', '/login'].includes(url.pathname)) {
         res.setHeader('Content-Type', 'text/html; charset=utf-8');

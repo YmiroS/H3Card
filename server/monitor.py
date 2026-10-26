@@ -237,11 +237,12 @@ async def _response(callback, *args, **kwargs):
                         headers={"Cache-Control": "no-store"})
 
 
-def register_monitor_routes(app, *, web_root, get_jobs, get_health):
+def register_monitor_routes(app, *, web_root, get_jobs, get_health, frontend=None):
     """get_jobs 在事件循环取轻量快照；get_health(app, workers) 在线程池返回健康数据。"""
     async def page(request):
         require_monitor(request)
-        return web.FileResponse(web_root / "monitor.html", headers={"Cache-Control": "no-store"})
+        path = frontend.pages['/monitor'] if frontend is not None else web_root / 'monitor.html'
+        return web.FileResponse(path, headers={"Cache-Control": "no-store"})
 
     async def summary(request):
         require_monitor(request)

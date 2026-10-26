@@ -15,7 +15,7 @@ from aiohttp import web
 from yarl import URL
 
 from .auth_store import AuthError
-from .frontend import (PUBLIC_FILES, is_frontend_asset, is_missing_frontend_asset,
+from .frontend import (is_frontend_asset, is_missing_frontend_asset,
                        register_frontend_assets)
 
 COOKIE = 'h3card_session'
@@ -275,8 +275,13 @@ async def _browser_request(request, handler):
         raise web.HTTPForbidden(text='监控展示员仅可访问只读监控页面')
     if is_missing_frontend_asset(request):
         raise web.HTTPNotFound()
-    if is_frontend_asset(request) or (path in PUBLIC and request.method in ('GET', 'HEAD')):
+    public_pages = {'/login', '/login.html'} if request.app.get('frontend') else PUBLIC
+    if is_frontend_asset(request) or (path in public_pages and request.method in ('GET', 'HEAD')):
         return await handler(request)
+    # Removed legacy public code routes are not login dependencies in integrated apps.
+    if (request.app.get('frontend') is not None and path in PUBLIC - public_pages
+            and request.method in ('GET', 'HEAD')):
+        raise web.HTTPNotFound()
     if not await call_store(request.app, 'has_admin'):
         raise web.HTTPServiceUnavailable(text='请先初始化管理员账号')
     if path == '/api/auth/login' and request.method == 'POST':
@@ -570,11 +575,11 @@ def register_auth_routes(app, web_root, *, frontend=None):
 
     app.router.add_get('/login', login_page)
     app.router.add_get('/login.html', login_redirect if frontend else login_page)
-    app.router.add_get('/auth.js', auth_script)
-    for asset in AUTH_ASSETS:
-        if frontend is None or asset.lstrip('/') not in PUBLIC_FILES:
+    if frontend is None:
+        app.router.add_get('/auth.js', auth_script)
+        for asset in AUTH_ASSETS:
             app.router.add_get(asset, public_asset)
-    if frontend is not None:
+    else:
         register_frontend_assets(app, frontend)
     app.router.add_get('/api/auth/me', me)
     app.router.add_post('/api/auth/presence', online_presence)

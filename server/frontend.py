@@ -1,4 +1,4 @@
-"""Explicit catalog for the tracked React build; never mount a static directory."""
+"""Explicit catalog for the tracked frontend build; never mount a static directory."""
 import re
 from dataclasses import dataclass
 from functools import partial
@@ -6,11 +6,18 @@ from html.parser import HTMLParser
 from pathlib import Path
 from types import MappingProxyType
 from typing import Mapping
-from urllib.parse import urlsplit
 
 from aiohttp import web
 
 PUBLIC_FILES = frozenset({'favicon.png', 'icon.png', 'auth-art.webp', 'auth-logo.png'})
+PAGE_FILES = MappingProxyType({
+    '/controller': 'admin/controller.html',
+    '/admin/permissions': 'admin/permissions.html',
+    '/controller/costs': 'admin/costs.html',
+    '/controller/capacity': 'admin/capacity.html',
+    '/monitor': 'admin/monitor.html',
+})
+PROTECTED_FILES = frozenset({'vendor/fabric.min.js'})
 # Do not depend on the host's Windows registry MIME registrations (notably WebP).
 CONTENT_TYPES = {
     '.js': 'text/javascript', '.css': 'text/css', '.woff': 'font/woff',
@@ -29,6 +36,8 @@ ASSET_PATH = re.compile(
 class Frontend:
     index: Path
     assets: Mapping[str, Path]
+    pages: Mapping[str, Path]
+    protected_assets: Mapping[str, Path]
 
 
 class _EntryReferences(HTMLParser):
@@ -40,9 +49,8 @@ class _EntryReferences(HTMLParser):
         attribute = {'script': 'src', 'link': 'href'}.get(tag)
         value = dict(attrs).get(attribute) if attribute else None
         if value:
-            url = urlsplit(value)
-            if not url.scheme and not url.netloc:
-                self.paths.add('/' + url.path.lstrip('/'))
+            # Build documents must not smuggle remote or relative runtime dependencies.
+            self.paths.add(value)
 
 
 def load_frontend(root):
@@ -63,15 +71,32 @@ def load_frontend(root):
         if not path.is_file() or path.is_symlink():
             raise RuntimeError(f'React frontend build missing required public asset: {path}')
         assets['/' + name] = path
-    references = _EntryReferences()
-    try:
-        references.feed(index.read_text(encoding='utf-8'))
-    except (OSError, UnicodeError, ValueError) as exc:
-        raise RuntimeError(f'React frontend build has unreadable index.html: {index}') from exc
-    missing = references.paths - assets.keys()
-    if missing:
-        raise RuntimeError(f'React frontend build missing approved index.html assets: {sorted(missing)}')
-    return Frontend(index, MappingProxyType(assets))
+    pages = {}
+    for route, name in PAGE_FILES.items():
+        path = root / name
+        if not path.is_file() or path.is_symlink() or path.parent.is_symlink():
+            raise RuntimeError(f'React frontend build missing required page: {path}')
+        pages[route] = path
+    for path in (index, *pages.values()):
+        references = _EntryReferences()
+        name = path.relative_to(root).as_posix()
+        try:
+            references.feed(path.read_text(encoding='utf-8'))
+        except (OSError, UnicodeError, ValueError) as exc:
+            raise RuntimeError(f'React frontend build has unreadable {name}: {path}') from exc
+        missing = references.paths - assets.keys()
+        if missing:
+            raise RuntimeError(f'React frontend build missing approved {name} assets: {sorted(missing)}')
+        if not any(url.startswith('/assets/') and url.endswith('.js') for url in references.paths):
+            raise RuntimeError(f'React frontend build missing fingerprinted entry JavaScript: {path}')
+    protected = {}
+    for name in sorted(PROTECTED_FILES):
+        path = root / name
+        if not path.is_file() or path.is_symlink() or path.parent.is_symlink():
+            raise RuntimeError(f'React frontend build missing required protected asset: {path}')
+        protected['/' + name] = path
+    return Frontend(index, MappingProxyType(assets), MappingProxyType(pages),
+                    MappingProxyType(protected))
 
 
 def is_frontend_asset(request):
@@ -96,7 +121,23 @@ async def _asset(request, *, path):
     return web.FileResponse(path, headers={'Content-Type': CONTENT_TYPES[path.suffix]})
 
 
+async def _protected_asset(request, *, path):
+    # Authentication/readiness/source checks remain in the application middleware.
+    from .auth import require_user
+    user = require_user(request)
+    if user['role'] == 'monitor':
+        raise web.HTTPForbidden()
+    frontend = request.app['frontend']
+    if (request.method not in ('GET', 'HEAD') or request.path != request.rel_url.raw_path
+            or frontend.protected_assets.get(request.path) != path
+            or not path.is_file() or path.is_symlink() or path.parent.is_symlink()):
+        raise web.HTTPNotFound()
+    return web.FileResponse(path, headers={'Content-Type': CONTENT_TYPES[path.suffix]})
+
+
 def register_frontend_assets(app, frontend):
     app['frontend'] = frontend
     for url, path in frontend.assets.items():
         app.router.add_get(url, partial(_asset, path=path))
+    for url, path in frontend.protected_assets.items():
+        app.router.add_get(url, partial(_protected_asset, path=path))

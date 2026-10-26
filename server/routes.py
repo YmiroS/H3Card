@@ -24,9 +24,11 @@ def register_page_routes(app, *, index, director_index, if_studio_index,
                           ("/controller/capacity", controller_capacity),
                           ("/admin/permissions", permissions_page), ("/teams", teams_page)):
         app.router.add_get(path, handler)
-    # Never expose web/ as a directory: admin HTML and backup files are private.
-    for name in STATIC_ASSETS:
-        app.router.add_get("/" + name, partial(static_asset, name=name))
+    # Integrated apps register only the immutable build catalog (including protected
+    # vendor resources). Legacy web assets are fixtures for standalone apps only.
+    if app.get('frontend') is None:
+        for name in STATIC_ASSETS:
+            app.router.add_get("/" + name, partial(static_asset, name=name))
 
 
 def register_project_routes(app, *, api_projects, api_project_create, api_project_get,
