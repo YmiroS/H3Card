@@ -1,4 +1,4 @@
-import{r as Nl,e as io,A as Oi,t as Ml,f as Bi,a as zl,p as Ll,b as Pl,u as Il,s as za,o as Tl,n as Rl,c as Zt,j as xe,L as Ol}from"./index-D4dCpfso.js";import{u as Al}from"./usePageRuntime-Cbfl-CEO.js";var Fl=Nl();const ql=`\r
+import{r as Nl,e as io,A as Oi,t as Ml,f as Bi,a as zl,p as Ll,b as Pl,u as Il,s as za,o as Tl,n as Rl,c as Zt,j as xe,L as Ol}from"./index-DYLb3XWo.js";import{u as Al}from"./usePageRuntime-CBZ4cUw7.js";var Fl=Nl();const ql=`\r
 <!-- ---------- 左侧项目栏 ---------- -->\r
 <aside id="side" aria-label="画布项目"><div id="react-projects"></div><a class="dot" id="dot" title="ComfyUI 连接状态" aria-label="ComfyUI 连接状态"></a></aside>\r
 \r
