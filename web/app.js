@@ -700,9 +700,20 @@ function h3Output1080p(c, cap) {
   if (!spec || (c.params.output_1080p ?? spec.default) !== "on") return null;
   const ratio = c.params.aspect_ratio ?? cap.inputs.find(s => s.key === "aspect_ratio").default;
   const [w, h] = RATIO_WH[ratio] || [1, 1];
-  // 与后端短边 1080、最终输出偶数尺寸的契约一致；不写入服务端专用 output_* 尺寸。
-  return {width:Math.round(1080 * Math.max(1, w / h) / 2) * 2,
-    height:Math.round(1080 * Math.max(1, h / w) / 2) * 2};
+  const scaleSpec = cap.inputs.find(s => s.key === "scale_by");
+  const supplied = Number(c.params.scale_by ?? scaleSpec.default);
+  const scale = Number.isFinite(supplied) && supplied >= 0.01 && supplied <= 8
+    ? supplied : Number(scaleSpec.default);
+  // 与后端 float 运算顺序及 Python round（恰好半数取偶）一致；不写入 output_*。
+  const round = value => {
+    const lower = Math.floor(value);
+    return value - lower === 0.5 ? lower + lower % 2 : Math.round(value);
+  };
+  const ratioValue = w / h;
+  const base = [1080 * Math.max(1, ratioValue), 1080 * Math.max(1, 1 / ratioValue)];
+  const generation = base.map(side => round(side / 32) * 32);
+  const [width, height] = base.map(side => round(side * scale / 2) * 2);
+  return {base, generation, width, height};
 }
 const IF_VIDEO_RESOLUTIONS = [{id:'1080p', short:1080}, {id:'2K', short:1440}, {id:'4K', short:2160}];
 function ifVideoResolution(c, cap) {
@@ -785,7 +796,8 @@ function refreshReferencePreview(c) {
 const RES_PARAM_KEYS = new Set(["megapixels", "width", "height", "aspect_ratio", "resolution", "scale_to_length", "output_1080p"]);
 const popoverParams = (cap) => ((cap && cap.inputs) || []).filter(s =>
   !RES_PARAM_KEYS.has(s.key) && !MEDIA.includes(s.type) && s.type !== "textarea"
-  && (s.type === "seed" || !s.advanced) && !s.mirror && !s.rangeOf);
+  && (s.type === "seed" || !s.advanced || (s.key === "scale_by" && h3Output1080pSpec(cap)))
+  && !s.mirror && !s.rangeOf);
 
 /** 「⚙ 参数」弹窗：点按钮弹出（不是面板内展开），里面是清晰度、画面比例和当前模式的常规参数。 */
 function openResPop(c, anchor) {
@@ -1118,13 +1130,13 @@ function clarityPicker(c, cap, onchange) {
       };
       g.appendChild(b);
     }
-    // 1080p 是最终输出契约，不是 megapixels 档位；不要用 MP 上限过滤或反算它。
+    // 1080p 指首采理想短边，不是最终成片或 megapixels 档位；不按 MP 上限过滤。
     if (output1080Spec) {
       const button = document.createElement("button");
       const target = h3Output1080p({...c, params:{...c.params, output_1080p:"on"}}, cap);
       button.textContent = "1080p";
       button.className = output1080 ? "on" : "";
-      button.title = `${target.width}×${target.height}`;
+      button.title = `1080p 首采（理想 ${target.base.join("×")}，节点 ${target.generation.join("×")}，32 对齐）；最终成片按二采倍率计算`;
       button.onclick = () => { c.params.output_1080p = "on"; save(); onchange && onchange(); };
       g.appendChild(button);
     }
@@ -1208,7 +1220,7 @@ function paramsBrief(c, cap) {
   }
   const output1080 = h3Output1080p(c, cap);
   if (output1080) {
-    parts.push("1080p", `${output1080.width}×${output1080.height}`);
+    parts.push("1080p首采", `二采${output1080.width}×${output1080.height}`);
   } else if (mp) {
     const v = parseFloat(c.params.megapixels != null ? c.params.megapixels : mp.default);
     // 跟 ⚙ 弹窗同一口径：按短边像素报（480p/544p…），不报 MP 原值

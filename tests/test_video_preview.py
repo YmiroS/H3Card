@@ -6,6 +6,7 @@ import math
 import sys
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
@@ -464,6 +465,53 @@ class ReferenceVideoOutputTest(unittest.TestCase):
             finally:
                 ledger.close()
 
+    def test_bf16_1080p_delivery_and_first_pass_metadata_survive_graph_only_backfill(self):
+        cid = "minimax_h3_ref_2pass_bf16"
+        with tempfile.TemporaryDirectory() as folder, closing(
+                controller_app.CostLedger(Path(folder) / "costs.db", ROOT / "pricing.json")) as ledger:
+            ledger.db.execute("CREATE TABLE dispatch_jobs(job_id TEXT,status TEXT,worker_id TEXT,"
+                              "payload_json TEXT,created_at REAL,updated_at REAL)")
+            snapshots = {}
+            for ratio in ("16:9 (Widescreen)", "9:16 (Portrait Widescreen)", "21:9 (Ultrawide)"):
+                for reference in (False, True):
+                    assets = {"video[0]": self.ref} if reference else {}
+                    for scale in (1, 1.5, 2):
+                        _, params, graph = self.patch(cid, params={
+                            "output_1080p": "on", "aspect_ratio": ratio, "scale_by": scale,
+                            "duration": 7.375, "megapixels": .2,
+                            "output_width": 2, "output_height": 2,
+                        }, assets=assets)
+                        job_id = f"{ratio.split()[0]}-{reference}-{scale}"
+                        ledger.record_job({"id": job_id, "capability": cid, "status": "queued", "created": 1},
+                                          params, assets, graph)
+                        payload = json.dumps({"capability": cid, "graph": graph, "assets": assets})
+                        ledger.db.execute("INSERT INTO dispatch_jobs VALUES (?,?,?,?,?,?)",
+                                          (job_id, "queued", "worker", payload, 1, 1))
+                        before = dict(ledger.db.execute(
+                            "SELECT * FROM cost_events WHERE job_id=?", (job_id,)).fetchone())
+                        snapshots[job_id] = (before, params, graph, reference)
+            ledger.db.commit()
+            ledger.backfill([])
+            for job_id, (before, params, graph, reference) in snapshots.items():
+                with self.subTest(job_id=job_id):
+                    after = dict(ledger.db.execute(
+                        "SELECT * FROM cost_events WHERE job_id=?", (job_id,)).fetchone())
+                    old_dims, dims = (json.loads(row["dimensions_json"]) for row in (before, after))
+                    generation = graph["186"]["inputs"]
+                    for key in ("width", "height", "output_width", "output_height", "output_fps",
+                                "output_count", "megapixels"):
+                        self.assertEqual(dims[key], old_dims[key], key)
+                    self.assertEqual(dims["megapixels"], generation["width"] * generation["height"] / 1024 ** 2)
+                    spec = controller_app.make_spec(cid, {}, graph, dims)
+                    self.assertEqual((spec["expected"]["width"], spec["expected"]["height"]),
+                                     (params["output_width"], params["output_height"]))
+                    self.assertEqual(spec["expected"]["count"], 1)
+                    if reference:
+                        self.assertEqual(dims["output_duration"], 7.375)
+                        self.assertEqual(dims["output_fps"], round(7.375 * 24) / 7.375)
+                    for key in ("estimated_min_micros", "estimated_max_micros"):
+                        self.assertEqual(after[key], before[key], key)
+
     def test_no_video_preserves_old_graph_and_does_not_manufacture_output_fields(self):
         for cid in self.capabilities:
             cap = self.cap(cid)
@@ -910,38 +958,40 @@ class FollowReferenceGenerateTest(unittest.IsolatedAsyncioTestCase):
         for reference in (False, True):
             self.body["assets"] = {"video[0]": self.ref} if reference else {}
             controller_app.generation_assets.return_value = self.body["assets"]
-            for dry_run in (True, False):
-                with self.subTest(reference=reference, dry_run=dry_run):
-                    self.store.reset_mock()
-                    self.body["dry_run"] = dry_run
-                    self.body["params"] = {"output_1080p": "on", "duration": 4.1, "seed": 42,
-                                           "aspect_ratio": "9:16 (Portrait Widescreen)", "scale_by": 1.25,
-                                           "output_width": 16, "output_height": 16}
-                    response = await controller_app.api_generate(self.request)
-                    self.assertEqual(response.status, 200)
-                    if dry_run:
-                        changes = json.loads(response.text)["changed"]
-                        self.assertEqual(changes["#186.width"][1], 864)
-                        self.assertEqual(changes["#186.height"][1], 1536)
-                        self.store.enqueue.assert_not_called()
-                        continue
-                    payload = self.store.enqueue.call_args.args[1]
-                    self.assertEqual(payload["assets"], self.body["assets"])
-                    self.assertEqual(payload["duration_seconds"], 4.1)
-                    expected = payload["capacity_spec"]["expected"]
-                    self.assertEqual((expected["width"], expected["height"]), (1080, 1920))
-                    self.assertEqual(expected["count"], 1)
-                    dims = payload["capacity_spec"]["dimensions"]
-                    self.assertEqual((dims["width"], dims["height"]), (1080, 1920))
-                    self.assertEqual(dims["megapixels"], 864 * 1536 / 1024 ** 2)
-                    self.assertIn("ImageScale", self.store.enqueue.call_args.args[2])
-                    self.assertEqual(payload["gpu_policy"], controller_app.HIGH_VRAM_GPU_POLICY)
-                    if reference:
-                        self.assertEqual(expected["duration"], 4.1)
-                        self.assertAlmostEqual(expected["fps"], round(4.1 * 24) / 4.1)
-                    else:
-                        self.assertEqual(payload["graph"]["186"]["inputs"]["length"], ["131", 1])
-                        self.assertEqual(payload["graph"]["225"]["inputs"]["frame_rate"], 24)
+            for scale in (1, 1.25, 1.5, 2):
+                final = tuple(round(v * scale / 2) * 2 for v in (1080, 1920))
+                for dry_run in (True, False):
+                    with self.subTest(reference=reference, scale=scale, dry_run=dry_run):
+                        self.store.reset_mock()
+                        self.body["dry_run"] = dry_run
+                        self.body["params"] = {"output_1080p": "on", "duration": 4.1, "seed": 42,
+                                               "aspect_ratio": "9:16 (Portrait Widescreen)", "scale_by": scale,
+                                               "output_width": 16, "output_height": 16}
+                        response = await controller_app.api_generate(self.request)
+                        self.assertEqual(response.status, 200)
+                        if dry_run:
+                            changes = json.loads(response.text)["changed"]
+                            self.assertEqual(changes["#186.width"][1], 1088)
+                            self.assertEqual(changes["#186.height"][1], 1920)
+                            self.store.enqueue.assert_not_called()
+                            continue
+                        payload = self.store.enqueue.call_args.args[1]
+                        self.assertEqual(payload["assets"], self.body["assets"])
+                        self.assertEqual(payload["duration_seconds"], 4.1)
+                        expected = payload["capacity_spec"]["expected"]
+                        self.assertEqual((expected["width"], expected["height"]), final)
+                        self.assertEqual(expected["count"], 1)
+                        dims = payload["capacity_spec"]["dimensions"]
+                        self.assertEqual((dims["width"], dims["height"]), final)
+                        self.assertEqual(dims["megapixels"], 1088 * 1920 / 1024 ** 2)
+                        self.assertIn("ImageScale", self.store.enqueue.call_args.args[2])
+                        self.assertEqual(payload["gpu_policy"], controller_app.HIGH_VRAM_GPU_POLICY)
+                        if reference:
+                            self.assertEqual(expected["duration"], 4.1)
+                            self.assertAlmostEqual(expected["fps"], round(4.1 * 24) / 4.1)
+                        else:
+                            self.assertEqual(payload["graph"]["186"]["inputs"]["length"], ["131", 1])
+                            self.assertEqual(payload["graph"]["225"]["inputs"]["frame_rate"], 24)
 
     async def test_dispatch_duration_uses_current_params_not_reference_duration(self):
         for seconds in (4.013, 6.25, 19):

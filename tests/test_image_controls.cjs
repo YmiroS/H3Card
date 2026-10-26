@@ -9,7 +9,21 @@ const {chromium} = require('playwright');
 const root = path.join(__dirname, '..');
 const python = process.env.CHOUKA_TEST_PYTHON || path.join(root, '..', 'python_embeded', 'python.exe');
 const runtime = JSON.parse(execFileSync(python, ['-B', '-X', 'utf8', '-c',
-  `import sys,json;sys.path.insert(0,${JSON.stringify(root)});from server import app;app.load_caps();print(json.dumps({'cards':app.CARDS,'capabilities':app.CAPS}))`],
+  `import sys,json
+sys.path.insert(0,${JSON.stringify(root)})
+from server import app
+app.load_caps()
+cap = app.CAPS['minimax_h3_ref_2pass_bf16']
+sizes = []
+for ratio in next(s for s in cap['inputs'] if s['key'] == 'aspect_ratio')['options']:
+    for scale in (None, .01, .25, .5, 1, 1.025, 1.075, 1.25, 1.5, 2, '2', 3.05, 6.5):
+        params = {'output_1080p': 'on', 'aspect_ratio': ratio}
+        if scale is not None:
+            params['scale_by'] = scale
+        resolved = app.resolve_h3_1080p_settings(cap, params)
+        sizes.append({'ratio': ratio, 'scale': scale, 'base': resolved['base'],
+                      'generation': resolved['generation'], 'final': resolved['final']})
+print(json.dumps({'cards':app.CARDS,'capabilities':app.CAPS,'h3Sizes':sizes}))`],
   {encoding:'utf8', maxBuffer:8 * 1024 * 1024}));
 const CASES = [
   ['zimage_t2i', 9, 't2i'], ['krea2_t2i', 8, 't2i'], ['qwen_image_2512_t2i', 6, 't2i'], ['qwen_image_21_t2i', 40, 't2i'],
@@ -439,10 +453,10 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
         const before=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.megapixels);
         await high.click();
         assert.equal(await sizes.locator('button.on').innerText(),'1080p');
-        assert.equal(await high.getAttribute('title'),'1920×1080');
-        assert.match(await paramsButton.innerText(),/16:9 · 1080p · 1920×1080/);
+        assert.equal(await high.getAttribute('title'),'1080p 首采（理想 1920×1080，节点 1920×1088，32 对齐）；最终成片按二采倍率计算');
+        assert.match(await paramsButton.innerText(),/16:9 · 1080p首采 · 二采2400×1350/);
         assert.doesNotMatch(await paramsButton.innerText(),/480p|544p|640p|768p/);
-        assert.match(await page.locator('#respop .knobnote').filter({hasText:'1080p 档位'}).innerText(),/二采倍率.*默认 1.5.*尚未实测/);
+        assert.match(await page.locator('#respop .knobnote').filter({hasText:'1080p 档位'}).innerText(),/首采理想短边设为 1080.*32 对齐.*二采倍率.*默认 1.5.*2880×1620.*尚未实测/);
         let params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
         assert.equal(params.output_1080p,'on');assert.equal(params.scale_by,1.25);
         assert.equal(params.megapixels,before,'1080p does not misuse the MP budget');
@@ -459,28 +473,73 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
         assert.doesNotMatch(await paramsButton.innerText(),/1080p|1920×1080/);
       }
     });
-    await t.test('1080p survives every workflow ratio with accurate even-pixel target and all low choices available',async()=>{
+    await t.test('1080p first pass stays selected across ratios and live multiplier edits with truthful final summaries',async()=>{
       await reset('minimax_h3_ref_2pass_bf16','card_video');await paramsButton.click();
       const sizes=page.locator('#respop .cgrid.k');
-      await sizes.getByRole('button',{name:'1080p',exact:true}).click();
+      const high=sizes.getByRole('button',{name:'1080p',exact:true});
+      const scale=page.locator('#respop .row').filter({has:page.getByText('潜空间放大倍率',{exact:true})}).locator('input[type=number]');
+      assert.equal(await scale.inputValue(),'1.5');
+      await high.click();
+      assert.match(await paramsButton.innerText(),/16:9 · 1080p首采 · 二采2880×1620/);
+      assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.scale_by),1.5);
       const before=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.megapixels);
-      const spec=runtime.capabilities.minimax_h3_ref_2pass_bf16.inputs.find(s=>s.key==='aspect_ratio');
-      for(const ratio of spec.options) {
-        const label=ratio.split(' ')[0], [w,h]=label.split(':').map(Number);
-        const target=[Math.round(1080*Math.max(1,w/h)/2)*2,Math.round(1080*Math.max(1,h/w)/2)*2].join('×');
-        await page.locator(`#respop button[title^="画面比例 ${label}"]`).click();
-        assert.deepEqual(await sizes.locator('button').allTextContents(),['480p','544p','640p','768p','1080p'],ratio);
-        assert.equal(await sizes.locator('button.on').innerText(),'1080p',ratio);
-        assert.equal(await sizes.getByRole('button',{name:'1080p',exact:true}).getAttribute('title'),target,ratio);
-        assert.ok((await paramsButton.innerText()).includes(`${label} · 1080p · ${target}`),ratio);
-        const params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
-        assert.equal(params.output_1080p,'on');assert.equal(params.aspect_ratio,ratio);
-        assert.equal(params.megapixels,before,'ratio changes preserve the old low-resolution budget');
+      for(const multiplier of [1.5,2]) {
+        await scale.fill(String(multiplier));
+        assert.match(await paramsButton.innerText(),multiplier===2?/16:9 · 1080p首采 · 二采3840×2160/:/16:9 · 1080p首采 · 二采2880×1620/,'editing scale updates the visible summary before another click');
+        assert.equal(await sizes.locator('button.on').innerText(),'1080p','editing scale must not downgrade the first pass');
+        for(const expected of runtime.h3Sizes.filter(item=>item.scale===multiplier)) {
+          const label=expected.ratio.split(' ')[0];
+          await page.locator(`#respop button[title^="画面比例 ${label}"]`).click();
+          assert.deepEqual(await sizes.locator('button').allTextContents(),['480p','544p','640p','768p','1080p'],label);
+          assert.equal(await sizes.locator('button.on').innerText(),'1080p',label);
+          assert.equal(await high.getAttribute('title'),`1080p 首采（理想 ${expected.base.join('×')}，节点 ${expected.generation.join('×')}，32 对齐）；最终成片按二采倍率计算`,label);
+          assert.ok((await paramsButton.innerText()).includes(`${label} · 1080p首采 · 二采${expected.final.join('×')}`),`${label} × ${multiplier}`);
+          const params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
+          assert.equal(params.output_1080p,'on');assert.equal(params.aspect_ratio,expected.ratio);
+          assert.equal(params.scale_by,multiplier);
+          assert.equal(params.megapixels,before,'ratio and scale changes preserve the old low-resolution budget');
+          for(const key of ['output_width','output_height']) assert.equal(Object.hasOwn(params,key),false);
+        }
+        await page.locator('#respop button[title^="画面比例 16:9"]').click();
+        assert.match(await paramsButton.innerText(),multiplier===2?/二采3840×2160/:/二采2880×1620/);
       }
       await sizes.getByRole('button',{name:'768p',exact:true}).click();
       assert.equal(await page.evaluate(()=>payloadOf(PROJ.cards[0]).params.output_1080p),'off');
       assert.equal(await sizes.locator('button.on').innerText(),'768p');
-      assert.equal(await sizes.getByRole('button',{name:'768p',exact:true}).getAttribute('title'),'1792×768');
+      assert.equal(await sizes.getByRole('button',{name:'768p',exact:true}).getAttribute('title'),'1376×768');
+      await scale.fill('1.5');
+      assert.equal(await sizes.locator('button.on').innerText(),'768p');
+      assert.doesNotMatch(await paramsButton.innerText(),/1080p|首采|二采/,'off retains the original brief');
+    });
+    await t.test('1080p summary matches Python float and ties-to-even rules, including capability defaults',async()=>{
+      await reset('minimax_h3_ref_2pass_bf16','card_video');
+      const actual=await page.evaluate(cases=>{
+        const cap=capOf(PROJ.cards[0]);
+        return cases.map(({ratio,scale})=>{
+          const c={...PROJ.cards[0],params:{output_1080p:'on',aspect_ratio:ratio}};
+          if(scale!==null) c.params.scale_by=scale;
+          const result=h3Output1080p(c,cap);
+          return {base:result.base,generation:result.generation,final:[result.width,result.height],brief:paramsBrief(c,cap)};
+        });
+      },runtime.h3Sizes);
+      for(const [index,expected] of runtime.h3Sizes.entries()) {
+        const {brief,...dimensions}=actual[index];
+        const {ratio,scale,...sizes}=expected;
+        assert.deepEqual(dimensions,sizes,`${ratio} × ${scale ?? 'default'}`);
+        assert.ok(brief.includes(`${ratio.split(' ')[0]} · 1080p首采 · 二采${expected.final.join('×')}`));
+      }
+      const size=(label,scale)=>actual[runtime.h3Sizes.findIndex(item=>item.ratio.startsWith(label+' ') && item.scale===scale)].final;
+      assert.deepEqual(size('16:9',null),[2880,1620]);
+      assert.deepEqual(size('9:16',null),[1620,2880]);
+      assert.deepEqual(size('21:9',null),[3780,1620]);
+      assert.deepEqual(size('1:1',1.075),[1160,1160],'580.5 rounds to even 580, not JS Math.round 581');
+      assert.deepEqual(size('2:3',1.25),[1350,2024],'1012.5 rounds down to even before doubling');
+      const changedDefault=await page.evaluate(()=>{
+        const source=capOf(PROJ.cards[0]);
+        const cap={...source,inputs:source.inputs.map(s=>s.key==='scale_by'?{...s,default:2}:s)};
+        return paramsBrief({...PROJ.cards[0],params:{output_1080p:'on'}},cap);
+      });
+      assert.match(changedDefault,/16:9 · 1080p首采 · 二采3840×2160/,'summary reads the capability default, not a hard-coded multiplier');
     });
     await t.test('saved on/off projects restore the correct clarity without a switch',async()=>{
       const original=project.cards[0];
@@ -494,8 +553,8 @@ test('generation cards expose real runtime controls and honor workflow seeds', a
           assert.equal(await page.getByRole('switch',{name:'1080P',exact:true}).count(),0);
           const params=await page.evaluate(()=>payloadOf(PROJ.cards[0]).params);
           assert.equal(params.output_1080p,state);assert.equal(params.scale_by,1.25);
-          if(state==='on') assert.match(await paramsButton.innerText(),/9:16 · 1080p · 1080×1920/);
-          else assert.doesNotMatch(await paramsButton.innerText(),/1080p|1080×1920/);
+          if(state==='on') assert.match(await paramsButton.innerText(),/9:16 · 1080p首采 · 二采1350×2400/);
+          else assert.doesNotMatch(await paramsButton.innerText(),/1080p|首采|二采/);
         }
       } finally {project.cards[0]=original;}
     });

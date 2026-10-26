@@ -167,6 +167,10 @@ class CostLedger:
             dims.update(width=scaled["width"], height=scaled["height"], duration=seconds,
                         output_width=scaled["width"], output_height=scaled["height"],
                         output_duration=seconds, output_fps=fps, output_count=1)
+            if capability == "minimax_h3_ref_2pass_bf16":
+                # 参考路径的派发图也已含可信首采宽高；无 params 恢复时补齐实际 MP。
+                generation = graph["186"]["inputs"]
+                dims.setdefault("megapixels", generation["width"] * generation["height"] / 1024 ** 2)
 
         if capability == "minimax_h3_comic20":
             dims["segment_count"] = max(1, dims.get("image_count") or 0)

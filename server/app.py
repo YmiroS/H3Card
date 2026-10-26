@@ -647,12 +647,18 @@ def resolve_h3_1080p_settings(cap, params):
     if not math.isfinite(scale) or not 0.01 <= scale <= 8:
         raise web.HTTPBadRequest(reason="1080P：潜空间放大倍率必须在 0.01..8")
     ratio = float(match[1]) / float(match[2])
-    final = tuple(round(side / 2) * 2 for side in (
-        1080 * max(1, ratio), 1080 * max(1, 1 / ratio)))
-    generation = tuple(round(side / scale / 32) * 32 for side in final)
-    if (any(side < 2 or side > 16384 for side in final)
-            or any(side < 32 or side > 16384 for side in generation)):
-        raise web.HTTPBadRequest(reason="1080P：输出或基础生成尺寸超出节点支持范围")
+    if not math.isfinite(ratio) or ratio <= 0:
+        raise web.HTTPBadRequest(reason=f"画面比例无效：{aspect}")
+    # 1080P 指首采理想短边；倍率只影响节点 199 和最终输出，不反向缩小首采。
+    base = (1080 * max(1, ratio), 1080 * max(1, 1 / ratio))
+    if not all(math.isfinite(side) for side in base):
+        raise web.HTTPBadRequest(reason="1080P：基础生成尺寸超出节点支持范围")
+    generation = tuple(round(side / 32) * 32 for side in base)
+    if any(side < 32 or side > 16384 for side in generation):
+        raise web.HTTPBadRequest(reason="1080P：基础生成尺寸超出节点支持范围")
+    final = tuple(round(side * scale / 2) * 2 for side in base)
+    if any(side < 2 or side > 16384 for side in final):
+        raise web.HTTPBadRequest(reason="1080P：输出尺寸超出节点支持范围")
     # 不采信外部 output_*，也不把动态尺寸存入静态 preset 或模板。
     for key in ("width", "height", "duration", "fps", "count"):
         params.pop("output_" + key, None)
@@ -660,7 +666,7 @@ def resolve_h3_1080p_settings(cap, params):
                   megapixels=generation[0] * generation[1] / 1024 ** 2,
                   output_width=final[0], output_height=final[1], output_count=1)
     return {"character": False, "resolution_only": True,
-            "generation": generation, "final": final}
+            "base": base, "generation": generation, "final": final}
 
 
 def resolve_reference_video_output_settings(cap, params, uploaded, video_metadata, resolution=None):
@@ -713,7 +719,8 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
         params["aspect_ratio"] = selected
         duration = value("duration")
         if resolution:
-            ideal_width, ideal_height = (side / value("scale_by") for side in resolution["final"])
+            # 复用未量化首采尺寸；偶数输出再除倍率在小倍率时会丢失精度。
+            ideal_width, ideal_height = resolution["base"]
         else:
             megapixels = value("megapixels")
             if megapixels > 16:
@@ -750,7 +757,8 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
     params.update(output_width=final[0], output_height=final[1], output_duration=duration,
                   output_fps=frames / duration, output_count=1)
     return {"character": character, "generation": generation, "final": final,
-            "frames": frames, "aligned": aligned, "duration": duration}
+            "frames": frames, "aligned": aligned, "duration": duration,
+            "h3_1080p": bool(resolution)}
 
 
 def patch_follow_reference_video(g, cap, follow):
@@ -795,7 +803,8 @@ def patch_follow_reference_video(g, cap, follow):
         images = append_node(f"{prefix}_{nid}", "ImageScale",
                              {"image": images, "upscale_method": "bicubic", "crop": "disabled",
                               "width": follow["final"][0], "height": follow["final"][1]},
-                             "校正1080P输出尺寸" if resolution_only else "校正参考视频画面比例")
+                             "校正二采输出尺寸" if resolution_only or follow.get("h3_1080p")
+                             else "校正参考视频画面比例")
         node["inputs"]["images"] = images
         if not resolution_only:
             node["inputs"]["fps" if follow["character"] else "frame_rate"] = (
