@@ -15,6 +15,8 @@ from aiohttp import web
 from yarl import URL
 
 from .auth_store import AuthError
+from .frontend import (PUBLIC_FILES, is_frontend_asset, is_missing_frontend_asset,
+                       register_frontend_assets)
 
 COOKIE = 'h3card_session'
 AUTH_ASSETS = {
@@ -133,7 +135,7 @@ def _monitor_allowed(request):
     # 同时核对解码路径和原始路径，拒绝编码斜杠、双重编码及路径伪装。
     path = request.path
     raw_path = request.rel_url.raw_path
-    return (path in MONITOR_READ and raw_path == path) or (
+    return is_frontend_asset(request) or (path in MONITOR_READ and raw_path == path) or (
         MONITOR_WORKER.fullmatch(path) is not None
         and MONITOR_WORKER.fullmatch(raw_path) is not None
         and all(part not in ('.', '..') for part in path.split('/')))
@@ -271,7 +273,9 @@ async def _browser_request(request, handler):
     # 必须在公开资源、登录/注册的提前返回之前执行，监控角色默认无业务访问权。
     if session is not None and session['user']['role'] == 'monitor' and not _monitor_allowed(request):
         raise web.HTTPForbidden(text='监控展示员仅可访问只读监控页面')
-    if path in PUBLIC and request.method in ('GET', 'HEAD'):
+    if is_missing_frontend_asset(request):
+        raise web.HTTPNotFound()
+    if is_frontend_asset(request) or (path in PUBLIC and request.method in ('GET', 'HEAD')):
         return await handler(request)
     if not await call_store(request.app, 'has_admin'):
         raise web.HTTPServiceUnavailable(text='请先初始化管理员账号')
@@ -526,7 +530,7 @@ async def assign_projects(request):
     return web.json_response({'ok': True, 'count': count})
 
 
-def register_auth_routes(app, web_root):
+def register_auth_routes(app, web_root, *, frontend=None):
     redirect_origin = os.environ.get('CHOUKA_HTTPS_REDIRECT_ORIGIN', '')
     if not redirect_origin and os.environ.get('CHOUKA_TLS_CERT') and os.environ.get('CHOUKA_TLS_KEY'):
         redirect_origin = f"https://dinghaichouka.youku.com:{os.environ.get('CHOUKA_HTTPS_PORT', '8443')}"
@@ -549,7 +553,10 @@ def register_auth_routes(app, web_root):
     root = Path(web_root)
 
     async def login_page(request):
-        return web.FileResponse(root / 'login.html')
+        return web.FileResponse(frontend.index if frontend else root / 'login.html')
+
+    async def login_redirect(request):
+        raise web.HTTPFound('/login')
 
     async def auth_script(request):
         return web.FileResponse(root / 'auth.js')
@@ -562,10 +569,13 @@ def register_auth_routes(app, web_root):
         return web.FileResponse(root / name, headers={'Content-Type': AUTH_ASSETS[request.path]})
 
     app.router.add_get('/login', login_page)
-    app.router.add_get('/login.html', login_page)
+    app.router.add_get('/login.html', login_redirect if frontend else login_page)
     app.router.add_get('/auth.js', auth_script)
     for asset in AUTH_ASSETS:
-        app.router.add_get(asset, public_asset)
+        if frontend is None or asset.lstrip('/') not in PUBLIC_FILES:
+            app.router.add_get(asset, public_asset)
+    if frontend is not None:
+        register_frontend_assets(app, frontend)
     app.router.add_get('/api/auth/me', me)
     app.router.add_post('/api/auth/presence', online_presence)
     app.router.add_post('/api/auth/login', login)

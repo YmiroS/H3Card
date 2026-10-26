@@ -27,7 +27,8 @@ test('test snapshots exclude runtime files, credentials and path escapes', () =>
     assert.equal(sourceFile(file), false, file);
   }
   for (const file of ['web/features/task-panel.js', 'server/projects.py', 'tests/test_project.py',
-    'tools/run-tests.cjs', 'manifests/cards.json', 'package-lock.json']) assert.equal(sourceFile(file), true, file);
+    'tools/run-tests.cjs', 'manifests/cards.json', 'package-lock.json', 'web_dist/index.html',
+    'web_dist/assets/index-ABC12345.js', 'web_dist/release.json']) assert.equal(sourceFile(file), true, file);
 });
 
 test('snapshot includes uncommitted source but never copies local runtime data', t => {
@@ -38,12 +39,20 @@ test('snapshot includes uncommitted source but never copies local runtime data',
   execFileSync('git', ['-C', source, 'add', 'web/app.js']);
   write(source, 'web/app.js', 'edited');
   write(source, 'server/new.py', 'new code');
+  write(source, 'web_dist/index.html', 'built frontend');
+  write(source, 'web_dist/assets/index-ABC12345.js', 'built asset');
+  write(source, 'web_dist/release.json', '{"source_commit":"fixture"}');
+  write(source, 'frontend/src/main.tsx', 'not needed to run the distribution');
   write(source, 'data/auth.db', 'do not copy');
   write(source, 'worker/config.json', 'do not copy');
   write(source, '.env.controller', 'do not copy');
-  assert.equal(snapshot(source, target), 2);
+  assert.equal(snapshot(source, target), 5);
   assert.equal(fs.readFileSync(path.join(target, 'web/app.js'), 'utf8'), 'edited');
   assert.equal(fs.readFileSync(path.join(target, 'server/new.py'), 'utf8'), 'new code');
+  assert.equal(fs.readFileSync(path.join(target, 'web_dist/index.html'), 'utf8'), 'built frontend');
+  assert.equal(fs.readFileSync(path.join(target, 'web_dist/assets/index-ABC12345.js'), 'utf8'), 'built asset');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(target, 'web_dist/release.json'), 'utf8')).source_commit, 'fixture');
+  assert.equal(fs.existsSync(path.join(target, 'frontend')), false);
   assert.equal(fs.existsSync(path.join(target, 'data')), false);
   assert.equal(fs.existsSync(path.join(target, 'worker')), false);
 });

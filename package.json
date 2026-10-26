@@ -8,10 +8,11 @@
   },
   "scripts": {
     "check": "node tools/check-web.cjs",
+    "build:frontend": "node tools/build-frontend.cjs",
     "test": "npm run check && npm run test:tooling && node tools/run-tests.cjs all",
     "test:python": "node tools/run-tests.cjs python",
     "test:web": "node tools/run-tests.cjs web",
-    "test:tooling": "node --test tools/tooling.test.cjs",
+    "test:tooling": "node --test tools/tooling.test.cjs tools/build-frontend.test.cjs",
     "test:install-browser": "playwright install chromium"
   },
   "devDependencies": {

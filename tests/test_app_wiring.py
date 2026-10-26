@@ -63,10 +63,13 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
 
         # 登录后主页面可用；管理页只认管理员。
         self.headers = await self.login()
-        self.assertEqual((await self.client.get('/')).status, 200)
-        response = await self.client.get('/if-studio')
-        self.assertEqual(response.status, 200)
-        self.assertIn(b'https://ifs.alibaba-inc.com/', await response.read())
+        shell = (ROOT / 'web_dist' / 'index.html').read_bytes()
+        for route in ('/', '/director', '/if-studio', '/teams'):
+            with self.subTest(spa=route):
+                response = await self.client.get(route)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.read(), shell)
+        self.assertIn(b'/assets/', shell)
         self.assertEqual((await self.client.get('/if-studio.js')).status, 200)
         card_data = await (await self.client.get('/api/cards')).json()
         for card_id, capability in (('card_image', 'if_image'), ('card_video', 'if_video')):
@@ -100,6 +103,41 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual((await self.client.get('/controller/capacity')).status, 404)
         self.assertEqual((await self.client.get('/permissions.html')).status, 404)
         self.assertEqual((await self.client.get('/app.js')).status, 200)
+
+    async def test_spa_pages_retain_user_team_leader_and_monitor_boundaries(self):
+        self.auth.create_user('ordinary', PASSWORD)
+        self.auth.create_user('leader', PASSWORD, team_leader=True)
+        self.auth.create_user('screen', PASSWORD, role='monitor')
+        for username in ('ordinary', 'leader', 'screen'):
+            self.client.session.cookie_jar.clear()
+            await self.login(username)
+            for route in ('/', '/director', '/if-studio', '/teams'):
+                with self.subTest(username=username, route=route):
+                    response = await self.client.get(route, allow_redirects=False)
+                    allowed = username != 'screen' and (route != '/teams' or username == 'leader')
+                    self.assertEqual(response.status, 200 if allowed else 403)
+            for route in ('/controller', '/controller/costs', '/controller/capacity', '/admin/permissions'):
+                self.assertEqual((await self.client.get(route, allow_redirects=False)).status, 403)
+        # Monitor keeps the legacy page and can read only exact built browser assets.
+        response = await self.client.get('/monitor')
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), (ROOT / 'web' / 'monitor.html').read_bytes())
+        for route in self.client.app['frontend'].assets:
+            self.assertEqual((await self.client.get(route)).status, 200)
+        self.assertEqual((await self.client.get('/api/projects')).status, 403)
+
+    async def test_legacy_admin_and_monitor_html_are_not_replaced_by_spa(self):
+        for route, name in (('/admin/permissions', 'permissions.html'), ('/monitor', 'monitor.html')):
+            response = await self.client.get(route)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), (ROOT / 'web' / name).read_bytes())
+        with mock.patch.object(controller_app, 'CONTROLLER_MODE', True):
+            for route, name in (('/controller', 'controller.html'),
+                                ('/controller/costs', 'costs.html'),
+                                ('/controller/capacity', 'capacity.html')):
+                response = await self.client.get(route)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(await response.read(), (ROOT / 'web' / name).read_bytes())
 
     async def test_if_reference_route_is_wired_and_authenticated(self):
         self.assertIsInstance(self.client.app['if_reference_copies'], controller_app.IFReferenceCopies)
@@ -190,26 +228,38 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertNotIn(viewer['id'], active)
 
     async def test_navigation_distinguishes_system_online_from_canvas_presence(self):
-        for route in ('/', '/director', '/admin-shell.js'):
-            with self.subTest(route=route):
-                response = await self.client.get(route)
-                self.assertEqual(response.status, 200)
-                text = await response.text()
-                self.assertIn('Chouka 系统在线用户（近 90 秒活跃，按账号去重）', text)
-                self.assertIn('<b>--</b> 人在线', text)
-                self.assertNotIn('人使用中', text)
+        shell = (ROOT / 'web_dist' / 'index.html').read_bytes()
+        for route in ('/', '/director'):
+            response = await self.client.get(route)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), shell)
+        # Legacy administration retains its own online indicator, not canvas presence.
+        response = await self.client.get('/admin-shell.js')
+        self.assertEqual(response.status, 200)
+        text = await response.text()
+        self.assertIn('Chouka 系统在线用户（近 90 秒活跃，按账号去重）', text)
+        self.assertIn('<b>--</b> 人在线', text)
+        self.assertNotIn('人使用中', text)
         response = await self.client.get('/app.js')
         self.assertIn('${users.size} 人使用中', await response.text())
 
     async def test_auth_page_assets_are_explicitly_public(self):
         self.client.session.cookie_jar.clear()
-        for route in ('/login', '/login.html'):
-            response = await self.client.get(route, allow_redirects=False)
-            self.assertEqual(response.status, 200)
-            html = await response.text()
-            self.assertIn('id="register-panel"', html)
-            self.assertIn('/auth-page.css', html)
-            self.assertNotIn('id="register-dialog"', html)
+        response = await self.client.get('/login', allow_redirects=False)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), (ROOT / 'web_dist' / 'index.html').read_bytes())
+        response = await self.client.get('/login.html', allow_redirects=False)
+        self.assertEqual(response.status, 302)
+        self.assertEqual(response.headers['Location'], '/login')
+        # The login shell's exact built resources are public, including HEAD.
+        for route in self.client.app['frontend'].assets:
+            for method in ('GET', 'HEAD'):
+                with self.subTest(asset=route, method=method):
+                    response = await self.client.request(method, route, allow_redirects=False)
+                    self.assertEqual(response.status, 200)
+                    self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+        response = await self.client.get('/assets/missing-12345678.js', allow_redirects=False)
+        self.assertEqual(response.status, 404)
         assets = {
             '/auth-page.css': 'text/css',
             '/auth-art.webp': 'image/webp',

@@ -64,12 +64,15 @@ from server.image_controls import image_controls, patch_image_controls
 from server.director_bridge import import_director, link_director, project_director, reference_storyboard, sync_card_job
 from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
+from server.frontend import load_frontend
 from server.project_repository import ProjectRepository, InvalidProjectId
 from server.project_service import ProjectService, ProjectError
 from server.routes import (register_page_routes, register_project_routes, register_media_routes,
                            register_generation_routes, register_controller_routes, register_worker_routes)
 
 ROOT = Path(__file__).resolve().parent.parent          # chouka/
+# Build is shipped with the code, not the mutable runtime/data root.
+FRONTEND_ROOT = ROOT / "web_dist"
 PACK = ROOT.parent                                     # 整合包根目录
 COMFY_INPUT = PACK / "ComfyUI" / "input"
 COMFY_HTTP = os.environ.get("CHOUKA_COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
@@ -3238,7 +3241,7 @@ async def permissions_page(request):
 
 async def teams_page(request):
     require_team_leader(request)
-    return web.FileResponse(ROOT / "web" / "teams.html")
+    return web.FileResponse(request.app['frontend'].index)
 
 
 async def static_asset(request, *, name):
@@ -3247,17 +3250,17 @@ async def static_asset(request, *, name):
 
 async def index(request):
     require_user(request)
-    return web.FileResponse(ROOT / "web" / "index.html")
+    return web.FileResponse(request.app['frontend'].index)
 
 
 async def director_index(request):
     require_user(request)
-    return web.FileResponse(ROOT / "web" / "director.html")
+    return web.FileResponse(request.app['frontend'].index)
 
 
 async def if_studio_index(request):
     require_user(request)
-    return web.FileResponse(ROOT / "web" / "if-studio.html")
+    return web.FileResponse(request.app['frontend'].index)
 
 
 async def controller_index(request):
@@ -3743,6 +3746,7 @@ def make_app(auth_path=None, *, project_repository=None):
         if local_test or not CONTROLLER_MODE:
             raise RuntimeError("管理隔离验收必须使用完整鉴权的 controller 模式")
         validate_runtime(ROOT, auth_path or os.environ.get("CHOUKA_AUTH_DB") or ROOT / "data" / "auth.db")
+    frontend = load_frontend(FRONTEND_ROOT)
     n = load_caps()
     load_jobs()
     app = web.Application(client_max_size=512 * 1024 ** 2,
@@ -3768,7 +3772,7 @@ def make_app(auth_path=None, *, project_repository=None):
     app["online_presence"] = {}
     app["online_presence_window"] = 90
     app["presence_access_changed"] = partial(handle_presence_access_changed, app)
-    register_auth_routes(app, ROOT / "web")
+    register_auth_routes(app, ROOT / "web", frontend=frontend)
     app["project_repository"] = project_repository or ProjectRepository(PROJ_DIR)
     app["project_service"] = ProjectService(app["project_repository"])
     register_edit_routes(

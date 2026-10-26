@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements-controller.txt
 
 COPY server/ server/
 COPY web/ web/
+COPY web_dist/ web_dist/
 COPY manifests/ manifests/
 COPY graphs/ graphs/
 COPY pricing.json ./

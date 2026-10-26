@@ -154,7 +154,7 @@ class DirectorApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture
         await self.switch_user("filmmaker")
         response = await self.client.get("/director")
         self.assertEqual(response.status, 200, await response.text())
-        self.assertEqual(await response.text(), self.static_files["director.html"])
+        self.assertEqual(await response.read(), self.application["frontend"].index.read_bytes())
         self.assertEqual(response.content_type, "text/html")
         self.assertIn("no-store", response.headers["Cache-Control"])
 

@@ -5,7 +5,7 @@ const path = require('node:path');
 const {spawn, execFileSync} = require('node:child_process');
 
 const ROOT = path.resolve(__dirname, '..');
-const SOURCE_DIRS = new Set(['server', 'web', 'worker', 'tests', 'tools', 'manifests', 'graphs', 'desktop', 'extension']);
+const SOURCE_DIRS = new Set(['server', 'web', 'web_dist', 'worker', 'tests', 'tools', 'manifests', 'graphs', 'desktop', 'extension']);
 const ROOT_FILES = new Set(['package.json', 'package-lock.json', 'pricing.json', 'requirements-controller.txt',
   'Dockerfile.controller', 'compose.controller.yml', 'start-controller.sh', 'llm.json.例子',
   '启动Windows节点.bat', '启动Windows节点_4090.bat', '启动Windows节点_A6000.bat']);

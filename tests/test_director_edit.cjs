@@ -41,7 +41,8 @@ host.ARTIFACT_DIR = isolated / 'data' / 'artifacts'
 host.COMFY_INPUT = isolated / 'comfy-input'
 host.COMFY_INPUT.mkdir(parents=True)
 host.JOBS.clear()
-host.register_auth_routes = lambda application, _: register_auth_routes(application, real / 'web')
+# This regression deliberately mounts legacy HTML/auth; the integrated React UI has its own smoke test.
+host.register_auth_routes = lambda application, _, *, frontend: register_auth_routes(application, real / 'web')
 async def director_index(request):
     host.require_user(request)
     return web.FileResponse(real / 'web' / 'director.html')

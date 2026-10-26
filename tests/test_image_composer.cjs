@@ -44,7 +44,8 @@ host.COMFY_INPUT.mkdir(parents=True)
 host.JOBS.clear()
 # Avoid production LAN discovery; do not replace any feature/auth/resource route.
 host.lan_ips = lambda: []
-host.register_auth_routes = lambda application, _: register_auth_routes(application, real / 'web')
+# This regression deliberately mounts legacy HTML/auth; the integrated React UI has its own smoke test.
+host.register_auth_routes = lambda application, _, *, frontend: register_auth_routes(application, real / 'web')
 async def index(request):
     host.require_user(request)
     return web.FileResponse(real / 'web' / 'index.html')

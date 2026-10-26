@@ -1,0 +1,117 @@
+'use strict';
+const {test} = require('node:test');
+const assert = require('node:assert/strict');
+const path = require('node:path');
+const {spawn} = require('node:child_process');
+const {once} = require('node:events');
+const {chromium} = require('playwright');
+
+const root = path.resolve(__dirname, '..');
+const password = 'Test-password-123';
+
+async function startService() {
+  const child = spawn(process.env.CHOUKA_TEST_PYTHON || 'python3',
+    ['-B', '-X', 'utf8', path.join(__dirname, 'helpers', 'integrated_frontend.py')],
+    {cwd:root, env:process.env, stdio:['pipe', 'pipe', 'pipe'], windowsHide:true});
+  let logs = '';
+  child.stderr.on('data', chunk => { logs += chunk; });
+  const origin = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`Python service startup timed out\n${logs}`)), 30000);
+    child.once('error', error => { clearTimeout(timer); reject(error); });
+    child.once('exit', code => { clearTimeout(timer); reject(new Error(`Python exited ${code}\n${logs}`)); });
+    child.stdout.on('data', chunk => {
+      logs += chunk;
+      const match = /FRONTEND_READY (\{[^\n]+\})/.exec(logs);
+      if (match) { clearTimeout(timer); resolve(JSON.parse(match[1]).origin); }
+    });
+  }).catch(error => { child.stdin.end(); throw error; });
+  return {origin, async close() {
+    const exited = once(child, 'exit');
+    child.stdin.end('\n');
+    await exited;
+  }};
+}
+
+test('compiled React UI and legacy administration share the real Python session and origin',
+  {timeout:90000}, async () => {
+    const service = await startService();
+    let browser;
+    try {
+      browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER && process.env.CHOUKA_TEST_BROWSER !== 'chromium'
+        ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
+      const context = await browser.newContext();
+      const errors = [], external = [];
+      await context.route('**/*', route => {
+        if (new URL(route.request().url()).origin !== service.origin) {
+          external.push(route.request().url());
+          return route.abort('blockedbyclient');
+        }
+        return route.continue();
+      });
+      const page = await context.newPage();
+      page.on('pageerror', error => errors.push(error.message));
+      await page.goto(service.origin + '/');
+      await page.waitForURL(service.origin + '/login');
+      await page.locator('input[name="username"]').fill('admin');
+      await page.locator('input[name="password"]').fill(password);
+      await page.getByRole('button', {name:'登录', exact:true}).click();
+      await page.waitForURL(service.origin + '/');
+      await page.locator('#plist').waitFor({state:'visible'});
+      assert.equal(await page.evaluate(() => document.body.dataset.choukaPage), 'canvas');
+      const session = await page.evaluate(async () => (await fetch('/api/auth/me')).json());
+      assert.equal(session.user.role, 'admin');
+      assert.ok(session.csrf_token);
+      await page.goto(service.origin + '/?project=browser');
+      await page.locator('#ptitle').filter({hasText:'整合验收画布'}).waitFor({state:'visible'});
+      assert.equal(await page.locator('#world').count(), 1);
+      page.once('dialog', dialog => dialog.accept('整合验收已保存'));
+      const renamed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/projects/browser/rename');
+      await page.locator('#plist .pitem .ren').click();
+      assert.equal((await renamed).status(), 200);
+      await page.reload();
+      await page.locator('#ptitle').filter({hasText:'整合验收已保存'}).waitFor({state:'visible'});
+      await page.goto(service.origin + '/director?project=browser');
+      await page.waitForFunction(() => document.body.dataset.choukaPage === 'director');
+      await page.goto(service.origin + '/if-studio');
+      await page.waitForFunction(() => document.body.dataset.choukaPage === 'ifStudio');
+      for (const url of ['/teams', '/controller', '/controller/costs', '/controller/capacity', '/admin/permissions', '/monitor']) {
+        const response = await page.goto(service.origin + url);
+        assert.equal(new URL(page.url()).origin, service.origin);
+        assert.equal(response.status(), 200);
+        if (url === '/teams') await page.waitForFunction(() => document.body.dataset.choukaPage === 'teams');
+        else {
+          const selector = url === '/monitor' ? '#snapshot-content'
+            : url === '/admin/permissions' ? '#users'
+            : url === '/controller/capacity' ? '#main-content' : '#main';
+          await page.locator(selector).waitFor({state:'visible'});
+        }
+      }
+      const missing = await page.request.get(service.origin + '/assets/not-a-release.js');
+      const privateFile = await page.request.get(service.origin + '/release.json');
+      const unsafe = await page.request.post(service.origin + '/api/projects', {data:{}, headers:{Origin:service.origin}});
+      const logout = await page.request.post(service.origin + '/api/auth/logout', {
+        headers:{Origin:service.origin, 'X-CSRF-Token':session.csrf_token},
+      });
+      assert.deepEqual({missing:missing.status(), privateFile:privateFile.status(), unsafe:unsafe.status(), logout:logout.status()},
+        {missing:404, privateFile:404, unsafe:403, logout:200});
+      await page.goto(service.origin + '/login.html');
+      await page.waitForURL(service.origin + '/login');
+      await page.locator('input[name="username"]').fill('monitor');
+      await page.locator('input[name="password"]').fill(password);
+      await page.getByRole('button', {name:'登录', exact:true}).click();
+      await page.waitForURL(service.origin + '/monitor');
+      const policy = {};
+      for (const url of ['/', '/api/projects', '/admin/permissions']) {
+        policy[url] = (await page.request.get(service.origin + url)).status();
+      }
+      assert.deepEqual(policy, {'/':403, '/api/projects':403, '/admin/permissions':403});
+      await page.goto(service.origin + '/login');
+      await page.waitForURL(service.origin + '/monitor');
+      assert.deepEqual(errors, []);
+      // IF may embed its upstream; the test deliberately blocks it rather than contacting a live service.
+      assert.ok(external.every(url => new URL(url).origin !== service.origin));
+    } finally {
+      if (browser) await browser.close();
+      await service.close();
+    }
+  });
