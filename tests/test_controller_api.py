@@ -398,6 +398,124 @@ class CostLedgerTest(unittest.TestCase):
         self.store.clear_finished()
         self.assertEqual(self.ledger.report()["overview"]["tasks"], 3)
 
+    def test_backfill_preserves_all_columns_of_terminal_events(self):
+        for status in ("done", "error", "canceled"):
+            for recent in (False, True):
+                with self.subTest(status=status, recent=recent):
+                    job_id = f"terminal-{status}-{recent}"
+                    self.ledger.record_job({
+                        "id": job_id, "capability": "minimax_h3_character_transfer",
+                        "status": status, "created": 1, "started": 100, "ended": 280,
+                        "project": "original-project", "projectName": "原项目",
+                        "card": "original-card", "cardName": "原卡片",
+                        "worker_id": "original-worker",
+                    }, params={"width": 720, "height": 1280, "duration": 10},
+                        model_family="original-model")
+                    self.store.enqueue(job_id, {
+                        "capability": "zimage_t2i", "model_family": "changed-model",
+                        "assets": {"images[0]": "changed.png"}, "graph": {},
+                    })
+                    before = dict(self.ledger.db.execute(
+                        "SELECT * FROM cost_events WHERE job_id=?", (job_id,),
+                    ).fetchone())
+                    jobs = [{
+                        "id": job_id, "capability": "zimage_t2i", "status": "running",
+                        "created": 2, "started": 300, "ended": 500,
+                        "project": "changed-project", "projectName": "改写项目",
+                        "card": "changed-card", "cardName": "改写卡片",
+                        "worker_id": "changed-worker",
+                    }] if recent else []
+                    self.ledger.backfill(jobs)
+                    after = dict(self.ledger.db.execute(
+                        "SELECT * FROM cost_events WHERE job_id=?", (job_id,),
+                    ).fetchone())
+                    self.assertEqual(before, after)
+
+    def test_backfill_inserts_missing_terminal_events_only_once(self):
+        for status in ("done", "error", "canceled"):
+            job_id = "missing-" + status
+            self.store.enqueue(job_id, {
+                "capability": "zimage_t2i", "assets": {"images[0]": "reference.png"},
+            })
+            with self.store.lock, self.store.db:
+                self.store.db.execute(
+                    "UPDATE dispatch_jobs SET status=? WHERE job_id=?", (status, job_id),
+                )
+        self.assertEqual(self.ledger.db.execute("SELECT COUNT(*) FROM cost_events").fetchone()[0], 0)
+        self.ledger.backfill([])
+        before = [dict(row) for row in self.ledger.db.execute("SELECT * FROM cost_events ORDER BY job_id")]
+        self.assertEqual(len(before), 3)
+        for row in before:
+            with self.subTest(status=row["status"]):
+                self.assertEqual(row["job_id"], "missing-" + row["status"])
+                self.assertEqual(json.loads(row["dimensions_json"])["image_count"], 1)
+                self.assertIsNone(row["total_cost_micros"])
+                self.assertEqual(row["cost_source"], "estimated" if row["status"] == "done" else None)
+        self.ledger.backfill([])
+        after = [dict(row) for row in self.ledger.db.execute("SELECT * FROM cost_events ORDER BY job_id")]
+        self.assertEqual(before, after)
+
+    def test_backfill_syncs_unfinished_events_to_done(self):
+        for status in ("queued", "running"):
+            with self.subTest(status=status):
+                job_id = "recover-" + status
+                self.store.enqueue(job_id, {"capability": "krea2_t2i"})
+                with self.store.lock, self.store.db:
+                    self.store.db.execute(
+                        "UPDATE dispatch_jobs SET status='done' WHERE job_id=?", (job_id,),
+                    )
+                self.ledger.record_job({
+                    "id": job_id, "capability": "krea2_t2i", "status": status,
+                    "created": 1,
+                })
+                self.ledger.backfill([{
+                    "id": job_id, "capability": "krea2_t2i", "status": "done",
+                    "created": 1, "started": 100, "ended": 280,
+                    "worker_id": "recovered-worker",
+                }])
+                row = dict(self.ledger.db.execute(
+                    "SELECT * FROM cost_events WHERE job_id=?", (job_id,),
+                ).fetchone())
+                self.assertEqual(row["status"], "done")
+                self.assertEqual(row["worker_id"], "recovered-worker")
+                self.assertEqual(row["runtime_seconds"], 180)
+                self.assertEqual(row["total_cost_micros"], 250_000)
+                self.assertEqual(row["cost_source"], "actual")
+
+    def test_backfill_does_not_invent_estimates_for_unknown_terminal_costs(self):
+        for status in ("done", "error", "canceled"):
+            with self.subTest(status=status):
+                job_id = "unknown-" + status
+                self.store.enqueue(job_id, {"capability": "zimage_t2i"})
+                with self.store.lock, self.store.db:
+                    self.store.db.execute(
+                        "UPDATE dispatch_jobs SET status=? WHERE job_id=?", (status, job_id),
+                    )
+                self.ledger.record_job({
+                    "id": job_id, "capability": "zimage_t2i", "status": status,
+                    "created": 1,
+                })
+                with self.ledger.lock, self.ledger.db:
+                    self.ledger.db.execute(
+                        """UPDATE cost_events SET estimated_min_micros=NULL,
+                           estimated_max_micros=NULL WHERE job_id=?""", (job_id,),
+                    )
+                before = dict(self.ledger.db.execute(
+                    "SELECT * FROM cost_events WHERE job_id=?", (job_id,),
+                ).fetchone())
+                self.assertIsNone(before["total_cost_micros"])
+                self.assertIsNone(before["cost_source"])
+                self.assertNotEqual(self.ledger.estimate("zimage_t2i"), (None, None))
+                self.ledger.backfill([])
+                after = dict(self.ledger.db.execute(
+                    "SELECT * FROM cost_events WHERE job_id=?", (job_id,),
+                ).fetchone())
+                self.assertEqual(before, after)
+        report = self.ledger.report()
+        self.assertEqual(report["overview"]["unknown_cost_tasks"], 3)
+        self.assertEqual(report["overview"]["estimated_cost"], 0)
+        self.assertTrue(all(job["cost_source"] == "unknown" for job in report["jobs"]))
+
     def test_api_cost_uses_separate_input_and_output_token_rates(self):
         self.ledger.record_api(
             "text", "qwen3.7-plus", 1_000_000, 1_000_000, 250,
@@ -433,6 +551,92 @@ class CostLedgerTest(unittest.TestCase):
             (53_600_000, 80_400_000, "output_second_resolution"),
         )
 
+    def test_free_capabilities_are_priced_zero_not_unknown(self):
+        free = ("gimmvfi_interp", "seedvr2_image_up", "seedvr2_video_up",
+                "depth_image", "depth_video", "depthcrafter_video",
+                "qwen_image_reverse", "qwen_video_reverse", "alphagen",
+                "if_image", "if_video")
+        for capability in free:
+            with self.subTest(capability=capability):
+                self.assertEqual(self.ledger.retail_quote(capability), (0, 0, "per_job"))
+                self.ledger.record_job({
+                    "id": "free-" + capability, "capability": capability,
+                    "status": "queued", "created": 1,
+                })
+                self.ledger.start_job("free-" + capability, "worker-1", 100)
+                self.ledger.finish_job("free-" + capability, "done", 280, "worker-1")
+        report = self.ledger.report()
+        self.assertEqual(report["overview"]["retail_known_tasks"], len(free))
+        self.assertEqual(report["overview"]["retail_unknown_tasks"], 0)
+        self.assertEqual(report["overview"]["retail_max"], 0)
+        self.assertAlmostEqual(report["overview"]["actual_cost"], len(free) * 0.25, places=6)
+        self.assertTrue(all(job["retail_source"] == "priced" for job in report["jobs"]))
+        self.assertEqual(self.ledger.estimate("qwen_image_reverse"), (48_000, 48_000))
+        self.assertEqual(self.ledger.estimate("seedvr2_video_up"), (320_000, 320_000))
+        self.assertEqual(self.ledger.retail_quote("unregistered_capability")[:2], (None, None))
+
+    def test_historical_free_and_paid_retail_quotes_do_not_change_failed_costs(self):
+        for job_id, capability, status in (
+                ("historical-free", "depth_image", "done"),
+                ("historical-paid", "minimax_h3_fusion_v2", "done"),
+                ("historical-error", "minimax_h3_ref_2pass_bf16", "error"),
+                ("historical-cancel", "minimax_h3_ref_2pass_bf16", "canceled")):
+            self.ledger.record_job({
+                "id": job_id, "capability": capability, "status": status,
+                "created": 1, "started": 100, "ended": 280,
+            }, historical=True)
+        before = [dict(row) for row in self.ledger.db.execute("SELECT * FROM cost_events ORDER BY job_id")]
+        report = self.ledger.report()
+        after = [dict(row) for row in self.ledger.db.execute("SELECT * FROM cost_events ORDER BY job_id")]
+        self.assertEqual(before, after)
+        self.assertEqual(report["overview"]["retail_known_tasks"], 2)
+        self.assertEqual(report["overview"]["retail_min"], 3.0)
+        self.assertEqual(report["overview"]["retail_max"], 5.0)
+        self.assertAlmostEqual(report["overview"]["actual_cost"], 1.0, places=6)
+        self.assertTrue(all(job["retail_source"] == "not_billable" for job in report["jobs"]
+                            if job["status"] in ("error", "canceled")))
+
+    def test_fusion_retail_matches_h3_reference_without_gpu_cost_change(self):
+        self.assertEqual(
+            self.ledger.retail_quote("minimax_h3_fusion_v2"),
+            self.ledger.retail_quote("minimax_h3_ref9"),
+        )
+        self.ledger.record_job({
+            "id": "fusion-priced", "capability": "minimax_h3_fusion_v2",
+            "status": "queued", "created": 1,
+        })
+        self.ledger.start_job("fusion-priced", "worker-1", 100)
+        self.ledger.finish_job("fusion-priced", "done", 280, "worker-1")
+        report = self.ledger.report()
+        self.assertEqual(report["overview"]["retail_min"], 3.0)
+        self.assertEqual(report["overview"]["retail_max"], 5.0)
+        self.assertAlmostEqual(report["overview"]["actual_cost"], 0.25, places=6)
+        self.assertEqual(report["jobs"][0]["category_name"], "视频生成")
+
+    def test_bf16_two_pass_retail_is_four_times_standard_two_pass(self):
+        for dimensions in ({}, {"width": 1920, "height": 1080, "duration": 10},
+                           {"width": 1080, "height": 1920, "duration": 15}):
+            with self.subTest(dimensions=dimensions):
+                standard = self.ledger.retail_quote("minimax_h3_ref_2pass", dimensions)
+                full = self.ledger.retail_quote("minimax_h3_ref_2pass_bf16", dimensions)
+                self.assertEqual(standard, (4_000_000, 6_000_000, "per_segment"))
+                self.assertEqual(full, (standard[0] * 4, standard[1] * 4, standard[2]))
+
+    def test_bf16_two_pass_retail_does_not_change_gpu_cost(self):
+        self.ledger.record_job({
+            "id": "bf16-priced", "capability": "minimax_h3_ref_2pass_bf16",
+            "status": "queued", "created": 1,
+        })
+        self.ledger.start_job("bf16-priced", "worker-pro", 100)
+        self.ledger.finish_job("bf16-priced", "done", 280, "worker-pro")
+        report = self.ledger.report()
+        self.assertEqual(report["overview"]["retail_min"], 16.0)
+        self.assertEqual(report["overview"]["retail_max"], 24.0)
+        self.assertEqual(report["overview"]["retail_mid"], 20.0)
+        self.assertAlmostEqual(report["overview"]["actual_cost"], 0.25, places=6)
+        self.assertEqual(report["jobs"][0]["category_name"], "视频生成")
+        self.assertEqual(report["jobs"][0]["retail_basis"], "per_segment")
+
     def test_image_retail_prices_match_published_ranges(self):
         expected = {
             "zimage_t2i": (0.08, 0.15),
@@ -441,6 +645,10 @@ class CostLedgerTest(unittest.TestCase):
             "krea2_i2i": (0.30, 0.60),
             "flux2_klein_edit": (0.20, 0.40),
             "qwen_image_21_multi": (0.30, 0.60),
+            "qwen_image_edit_2511_i2i": (0.30, 0.60),
+            "qwen_image_21_i2i": (0.30, 0.60),
+            "qwen_image_21_t2i": (0.30, 0.60),
+            "qwen_image_2512_t2i": (0.30, 0.60),
             "flux2_klein_storyboard9": (1.0, 2.0),
         }
         for capability, (low, high) in expected.items():

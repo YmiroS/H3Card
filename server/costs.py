@@ -343,8 +343,14 @@ class CostLedger:
             tables = {row[0] for row in self.db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
             )}
+            # 启动回填仅补缺失或未完成账目，终态历史记录必须原样保留。
             dispatch = list(self.db.execute(
-                "SELECT job_id,status,worker_id,payload_json,created_at,updated_at FROM dispatch_jobs"
+                """SELECT d.job_id,d.status,d.worker_id,d.payload_json,d.created_at,d.updated_at
+                   FROM dispatch_jobs d
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM cost_events c WHERE c.job_id=d.job_id
+                       AND c.status IN ('done','error','canceled')
+                   )"""
             )) if "dispatch_jobs" in tables else []
         for row in dispatch:
             payload = json.loads(row["payload_json"] or "{}")
