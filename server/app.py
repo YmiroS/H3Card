@@ -1794,6 +1794,19 @@ async def job_submitter_info(request, jobs):
     return await call_store(request.app, 'job_submitters', [job['id'] for job in jobs])
 
 
+def job_queue_snapshot(app, jobs):
+    # Presentation only: never persist snapshots or infer positions from queue_remaining.
+    counts = distributed_store(app).queue_ahead_snapshot() if CONTROLLER_MODE else {}
+    return {
+        job['id']: {
+            'queue_ahead': counts.get(job['id']) if job.get('status') == 'queued' else None,
+            'queue_order': '按提交顺序统计，实际调度可能调整' if CONTROLLER_MODE else None,
+            'queue_wait_seconds': None,
+        }
+        for job in jobs
+    }
+
+
 async def api_job(request):
     pid = request.match_info["pid"]
     permission = await authorized_job(request, pid)
@@ -1803,7 +1816,8 @@ async def api_job(request):
     node_name = job_node_names(request.app, [job]).get(pid)
     submitters = await job_submitter_info(request, [job])
     return web.json_response(
-        job | job_display_info(job, node_name) | submitters.get(pid, {}) | {"permission": permission}
+        job | job_display_info(job, node_name) | submitters.get(pid, {})
+        | job_queue_snapshot(request.app, [job])[pid] | {"permission": permission}
     )
 
 
@@ -1817,10 +1831,11 @@ async def api_jobs(request):
             break
     jobs = [job for job, _permission in visible]
     node_names = job_node_names(request.app, jobs)
+    queue_snapshot = job_queue_snapshot(request.app, jobs)
     submitters = await job_submitter_info(request, jobs)
     return web.json_response({"jobs": [
         job | job_display_info(job, node_names.get(job["id"]))
-        | submitters.get(job['id'], {}) | {"permission": permission}
+        | submitters.get(job['id'], {}) | queue_snapshot[job['id']] | {"permission": permission}
         for job, permission in visible
     ]})
 

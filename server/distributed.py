@@ -763,6 +763,14 @@ class DistributedStore:
                 "maintenance_ack": maintenance_ack,
             }
 
+    def queue_ahead_snapshot(self):
+        """Submission-order counts, not worker-specific execution positions."""
+        with self.lock:
+            rows = self.db.execute(
+                "SELECT job_id FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
+            ).fetchall()
+        return {row["job_id"]: index for index, row in enumerate(rows)}
+
     def job_worker_names(self, job_ids):
         job_ids = list(job_ids)
         if not job_ids:

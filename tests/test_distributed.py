@@ -116,6 +116,49 @@ class ModelDispatchTest(unittest.TestCase):
             "graph": self.graph, "capability": "minimax_h3_fusion_v2", **payload,
         }, self.caps["node_classes"])
 
+    def test_queue_snapshot_global_order_and_only_pending(self):
+        self.enqueue('b', user='other')
+        self.enqueue('a', user='self')
+        self.enqueue('running')
+        with self.store.lock:
+            self.store.db.execute('UPDATE dispatch_jobs SET created_at = 1')
+            self.store.db.execute("UPDATE dispatch_jobs SET status = 'running' WHERE job_id = 'running'")
+            self.store.db.commit()
+        self.assertEqual(self.store.queue_ahead_snapshot(), {'a': 0, 'b': 1})
+        self.assertTrue(all(isinstance(n, int) for n in self.store.queue_ahead_snapshot().values()))
+
+    def test_queue_api_copies_privacy_and_single_list_consistency(self):
+        import app as host
+        from types import SimpleNamespace
+        jobs = {
+            'private': {'id': 'private', 'created': 1, 'status': 'queued'},
+            'visible': {'id': 'visible', 'created': 2, 'status': 'queued'},
+            'done': {'id': 'done', 'created': 3, 'status': 'done'},
+        }
+        request = SimpleNamespace(app={}, match_info={'pid': 'visible'})
+        store = mock.Mock()
+        store.queue_ahead_snapshot.return_value = {'private': 0, 'visible': 1}
+        async def permission(_request, jid):
+            return 'operate' if jid != 'private' else None
+        async def run():
+            with mock.patch.object(host, 'CONTROLLER_MODE', True), \
+                    mock.patch.object(host, 'JOBS', jobs), \
+                    mock.patch.object(host, 'distributed_store', return_value=store), \
+                    mock.patch.object(host, 'job_permission', side_effect=permission), \
+                    mock.patch.object(host, 'job_node_names', return_value={}), \
+                    mock.patch.object(host, 'job_submitter_info', new=mock.AsyncMock(return_value={})):
+                listing = json.loads((await host.api_jobs(request)).text)['jobs']
+                store.queue_ahead_snapshot.assert_called_once()
+                single = json.loads((await host.api_job(request)).text)
+                self.assertEqual(single['queue_ahead'], 1)
+                self.assertEqual(single, next(j for j in listing if j['id'] == 'visible'))
+                self.assertNotIn('private', [j['id'] for j in listing])
+                self.assertIsNone(next(j for j in listing if j['id'] == 'done')['queue_ahead'])
+                self.assertNotIn('queue_ahead', jobs['visible'])
+            with mock.patch.object(host, 'CONTROLLER_MODE', False):
+                self.assertIsNone(host.job_queue_snapshot({}, [jobs['visible']])['visible']['queue_ahead'])
+        asyncio.run(run())
+
     def test_bf16_two_pass_strict_gpu_gate_in_acquire(self):
         self.enqueue(capability="minimax_h3_ref_2pass_bf16",
                      gpu_policy=HIGH_VRAM_GPU_POLICY, duration_seconds=1)

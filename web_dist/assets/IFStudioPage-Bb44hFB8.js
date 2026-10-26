@@ -1,4 +1,4 @@
-import{c as D,j as L}from"./index-CLEEz1a9.js";import{u as Q}from"./usePageRuntime-pdhbs-wp.js";const Z=`<main>\r
+import{c as D,j as L}from"./index-DJjebwgX.js";import{u as Q}from"./usePageRuntime-C-h57arZ.js";const Z=`<main>\r
   <header class="toolbar">\r
     <div class="heading"><h1>IF Studio</h1><p>使用本机 IF 账号生成图片或视频，并加入 Chouka 画布。</p></div>\r
     <div class="import">\r
