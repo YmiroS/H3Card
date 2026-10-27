@@ -295,6 +295,8 @@ test('compiled React and management pages share Python auth without any old web 
         headers:viewerHeaders,
         data:{capability:stored.cap, project:'browser', card:stored.id, params:stored.params, assets:{}, dry_run:true},
       })).status(), 403);
+      // Stop workspace auth polling before logout so it cannot race the legacy-login redirect check.
+      await page.goto('about:blank');
       assert.equal((await page.request.post(service.origin + '/api/auth/logout', {
         headers:viewerHeaders,
       })).status(), 200);
@@ -322,7 +324,7 @@ test('compiled React and management pages share Python auth without any old web 
     }
   });
 
-test('compiled image crop persists and exports real PNG through isolated Python APIs',
+test('compiled image crop and brush persist and export real PNG through isolated Python APIs',
   {timeout:60000}, async () => {
     const service = await startService();
     let browser;
@@ -418,6 +420,54 @@ test('compiled image crop persists and exports real PNG through isolated Python 
         [0,0,0,0], [0,255,0,255], [0,255,0,255], [0,0,0,0],
       ]});
       assert.deepEqual((await getCard()).params.composition.layers[0], stored);
+      const draw = async (from, to) => {
+        const bounds = await editor.locator('[data-brush-surface]').boundingBox();
+        assert.ok(bounds);
+        await page.mouse.move(bounds.x + from[0] * bounds.width / 64, bounds.y + from[1] * bounds.height / 64);
+        await page.mouse.down();
+        await page.mouse.move(bounds.x + to[0] * bounds.width / 64, bounds.y + to[1] * bounds.height / 64, {steps:6});
+        await page.mouse.up();
+      };
+      await editor.getByRole('button', {name:'画笔', exact:true}).click();
+      await editor.getByLabel('笔刷大小 · 画布 px', {exact:true}).fill('8');
+      await editor.getByLabel('笔刷大小 · 画布 px', {exact:true}).press('Tab');
+      await editor.getByLabel('画笔颜色', {exact:true}).fill('#0000ff');
+      await draw([46,46], [54,46]);
+      await editor.locator('[data-layer-id="one"] [data-layer-action="select"]').click();
+      await editor.getByRole('button', {name:'橡皮擦', exact:true}).click();
+      await draw([30,14], [34,14]);
+      await editor.getByRole('button', {name:'恢复像素', exact:true}).click();
+      await draw([30,14], [34,14]);
+      const brushSaved = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/projects/browser' && response.request().method() === 'PUT');
+      await editor.getByRole('button', {name:'保存编辑稿', exact:true}).click();
+      assert.equal((await brushSaved).status(), 200);
+      const brushCard = await getCard(), brushDraft = brushCard.params.composition;
+      assert.equal(brushDraft.version, 2);
+      const paintLayer = brushDraft.layers.find(layer => layer.kind === 'paint');
+      assert.ok(paintLayer);
+      assert.equal(paintLayer.paint.strokes.length, 1);
+      assert.equal(paintLayer.asset, undefined);
+      assert.equal(brushCard.assets['composite:' + paintLayer.id], undefined);
+      assert.deepEqual(brushDraft.layers[0].effects.map(stroke => stroke.tool), ['erase','restore']);
+      assert.deepEqual(brushDraft.layers[0].asset, asset);
+      await editor.getByRole('button', {name:'关闭', exact:true}).click();
+      await page.reload();
+      await open();
+      await crop.getByRole('button', {name:'取消裁剪', exact:true}).click();
+      const brushExported = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/projects/browser' && response.request().method() === 'PUT');
+      await editor.getByRole('button', {name:'合成 PNG', exact:true}).click();
+      assert.equal((await brushExported).status(), 200);
+      const brushOutput = (await getCard()).outputs[0];
+      const brushPixels = await page.evaluate(async url => {
+        const bitmap = await createImageBitmap(await (await fetch(url)).blob());
+        const canvas = document.createElement('canvas'); canvas.width = bitmap.width; canvas.height = bitmap.height;
+        const ctx = canvas.getContext('2d'); ctx.drawImage(bitmap,0,0); bitmap.close();
+        return [[50,46],[32,14],[10,10]].map(([x,y]) => [...ctx.getImageData(x,y,1,1).data]);
+      }, brushOutput.url);
+      assert.deepEqual(brushPixels, [[0,0,255,255],[0,255,0,255],[0,0,0,0]]);
+      assert.deepEqual((await getCard()).params.composition, brushDraft);
       assert.deepEqual(errors, []);
       assert.deepEqual(generated, []);
     } finally {
