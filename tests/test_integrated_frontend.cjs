@@ -462,10 +462,10 @@ test('compiled image crop and brush persist and export real PNG through isolated
       const zoomed = await editor.locator('[data-composition-bounds]').boundingBox();
       assert.ok(zoomed);
       await page.mouse.click(zoomed.x + 32 * zoomed.width / 64, zoomed.y + 14 * zoomed.height / 64);
-      await editor.getByLabel('快捷画笔颜色', {exact:true}).waitFor({state:'visible'});
-      assert.equal(await editor.getByLabel('快捷画笔颜色', {exact:true}).inputValue(), '#00ff00');
+      await editor.getByLabel('画笔颜色', {exact:true}).waitFor({state:'visible'});
+      assert.equal(await editor.getByLabel('画笔颜色', {exact:true}).inputValue(), '#00ff00');
       assert.deepEqual((await getCard()).params.composition.layers[0], stored);
-      const sizeSlider = editor.getByLabel('快捷笔刷大小 / px', {exact:true});
+      const sizeSlider = editor.getByRole('slider', {name:'笔刷大小 · 画布 px滑块', exact:true});
       assert.equal(await sizeSlider.getAttribute('type'), 'range');
       await sizeSlider.focus();
       await sizeSlider.press('Home');
@@ -474,7 +474,7 @@ test('compiled image crop and brush persist and export real PNG through isolated
       const brushPreview = editor.locator('[data-brush-cursor]');
       assert.equal(await brushPreview.isVisible(), true);
       assert.equal(await brushPreview.textContent(), '8 px');
-      await editor.getByLabel('快捷画笔颜色', {exact:true}).fill('#0000ff');
+      await editor.getByLabel('画笔颜色', {exact:true}).fill('#0000ff');
       await draw([46,46], [54,46]);
       await editor.locator('[data-layer-id="one"] [data-layer-action="select"]').click();
       await editor.getByRole('button', {name:'橡皮擦', exact:true}).click();
