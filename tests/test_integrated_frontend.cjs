@@ -420,16 +420,16 @@ test('compiled image crop and brush persist and export real PNG through isolated
         [0,0,0,0], [0,255,0,255], [0,255,0,255], [0,0,0,0],
       ]});
       assert.deepEqual((await getCard()).params.composition.layers[0], stored);
-      const draw = async (from, to) => {
+      const draw = async (from, to, button = 'left') => {
         const bounds = await editor.locator('[data-composition-bounds]').boundingBox();
         assert.ok(bounds);
         await page.mouse.move(bounds.x + from[0] * bounds.width / 64, bounds.y + from[1] * bounds.height / 64);
-        await page.mouse.down();
+        await page.mouse.down({button});
         await page.mouse.move(bounds.x + to[0] * bounds.width / 64, bounds.y + to[1] * bounds.height / 64, {steps:6});
-        await page.mouse.up();
+        await page.mouse.up({button});
       };
-      await editor.getByRole('button', {name:'拖动画布', exact:true}).click();
-      await draw([30,14], [34,14]);
+      assert.equal(await editor.getByRole('button', {name:'拖动画布', exact:true}).count(), 0);
+      await draw([30,14], [34,14], 'middle');
       const beforeZoom = await editor.locator('[data-composition-bounds]').boundingBox();
       assert.ok(beforeZoom);
       await page.mouse.move(beforeZoom.x + beforeZoom.width / 2, beforeZoom.y + beforeZoom.height / 2);
@@ -442,8 +442,15 @@ test('compiled image crop and brush persist and export real PNG through isolated
       await editor.getByLabel('快捷画笔颜色', {exact:true}).waitFor({state:'visible'});
       assert.equal(await editor.getByLabel('快捷画笔颜色', {exact:true}).inputValue(), '#00ff00');
       assert.deepEqual((await getCard()).params.composition.layers[0], stored);
-      await editor.getByLabel('快捷笔刷大小 / px', {exact:true}).fill('8');
-      await editor.getByLabel('快捷笔刷大小 / px', {exact:true}).press('Tab');
+      const sizeSlider = editor.getByLabel('快捷笔刷大小 / px', {exact:true});
+      assert.equal(await sizeSlider.getAttribute('type'), 'range');
+      await sizeSlider.focus();
+      await sizeSlider.press('Home');
+      for (let step = 1; step < 8; step++) await sizeSlider.press('ArrowRight');
+      assert.equal(await sizeSlider.inputValue(), '8');
+      const brushPreview = editor.locator('[data-brush-cursor]');
+      assert.equal(await brushPreview.isVisible(), true);
+      assert.equal(await brushPreview.textContent(), '8 px');
       await editor.getByLabel('快捷画笔颜色', {exact:true}).fill('#0000ff');
       await draw([46,46], [54,46]);
       await editor.locator('[data-layer-id="one"] [data-layer-action="select"]').click();
