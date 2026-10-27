@@ -379,6 +379,29 @@ test('compiled image crop and brush persist and export real PNG through isolated
         await crop.waitFor({state:'visible'});
       };
       await open();
+      await crop.getByRole('button', {name:'取消裁剪', exact:true}).click();
+      assert.equal(await page.evaluate(() => typeof window.ChoukaImageComposer), 'undefined');
+      await editor.getByRole('button', {name:'打开画布设置', exact:true}).click();
+      const clarity = editor.getByLabel('画布清晰度', {exact:true});
+      assert.equal(await clarity.inputValue(), 'custom');
+      await editor.getByRole('button', {name:'16:9', exact:true}).click();
+      assert.equal(await editor.getByLabel('画布宽度 / px', {exact:true}).inputValue(), '114');
+      assert.equal(await editor.getByRole('button', {name:'16:9', exact:true}).getAttribute('aria-pressed'), 'true');
+      await clarity.selectOption('1080');
+      const presetSaved = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/projects/browser' && response.request().method() === 'PUT');
+      await editor.getByRole('button', {name:'保存编辑稿', exact:true}).click();
+      assert.equal((await presetSaved).status(), 200);
+      const presetCard = (await (await page.request.get(service.origin + '/api/projects/browser')).json())
+        .cards.find(card => card.id === 'crop-browser');
+      assert.deepEqual([presetCard.params.composition.width, presetCard.params.composition.height], [1920,1080]);
+      assert.deepEqual(presetCard.params.composition.layers[0].asset, asset);
+      await editor.getByRole('button', {name:'撤销', exact:true}).click();
+      await editor.getByRole('button', {name:'撤销', exact:true}).click();
+      assert.equal(await editor.getByLabel('画布宽度 / px', {exact:true}).inputValue(), '64');
+      assert.equal(await editor.getByLabel('画布高度 / px', {exact:true}).inputValue(), '64');
+      await editor.getByRole('button', {name:'裁剪图片', exact:true}).click();
+      await crop.waitFor({state:'visible'});
       for (const [label, value] of [['裁剪 X / px', 4], ['裁剪 Y / px', 0],
         ['裁剪宽度 / px', 4], ['裁剪高度 / px', 4]]) {
         const input = crop.getByLabel(label, {exact:true});
