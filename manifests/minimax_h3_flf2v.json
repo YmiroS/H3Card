@@ -85,6 +85,21 @@
    }
   },
   {
+   "key": "sound",
+   "label": "声音",
+   "type": "select",
+   "appearance": "switch",
+   "default": "off",
+   "options": [
+    {"value": "on", "label": "开启"},
+    {"value": "off", "label": "关闭"}
+   ],
+   "presets": {"on": {}, "off": {}},
+   "hint": "默认关闭，输出不带音轨；开启后保留工作流原音轨。参考或驱动音频仍参与画面生成，不关闭 H3 内部联合采样。",
+   "target": {"kind": "preset"},
+   "disconnectWhenOff": [{"node": "132", "input": "audio"}]
+  },
+  {
    "key": "duration",
    "label": "时长(秒)",
    "type": "slider",

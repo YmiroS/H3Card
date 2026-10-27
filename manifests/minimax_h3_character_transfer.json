@@ -18,7 +18,7 @@
  },
  "graph": "graphs/minimax_h3_character_transfer.api.json",
  "output": {"node": "29"},
- "note": "放入一段动作来源视频和一张人物参考图，自动把视频里的主要表演者替换成参考人物，并保留原动作、镜头、场景和音轨。长视频会按“单段时长”自动切段并连续生成，最终重新拼成与来源视频等长的成片。建议先用 5~10 秒短视频确认人物和动作效果，再处理完整长视频。",
+ "note": "放入一段动作来源视频和一张人物参考图，自动把视频里的主要表演者替换成参考人物，并保留原动作、镜头、场景，声音开关开启时保留原音轨。长视频会按“单段时长”自动切段并连续生成，最终重新拼成与来源视频等长的成片。建议先用 5~10 秒短视频确认人物和动作效果，再处理完整长视频。",
  "rewrite": {"regime": "h3_ref"},
  "compare": false,
  "patch": {
@@ -68,6 +68,21 @@
    "max": 1792,
    "step": 32,
    "target": {"node": "11", "input": "height", "vtype": "INT"}
+  },
+  {
+   "key": "sound",
+   "label": "声音",
+   "type": "select",
+   "appearance": "switch",
+   "default": "off",
+   "options": [
+    {"value": "on", "label": "开启"},
+    {"value": "off", "label": "关闭"}
+   ],
+   "presets": {"on": {}, "off": {}},
+   "hint": "默认关闭，输出不带音轨；开启后保留工作流原音轨。参考或驱动音频仍参与画面生成，不关闭 H3 内部联合采样。分段采样节点内部音频处理仍保留。",
+   "target": {"kind": "preset"},
+   "disconnectWhenOff": [{"node": "23", "input": "audio"}]
   },
   {
    "key": "duration",

@@ -260,7 +260,7 @@ NOTES = {
     ),
     H3_CHARACTER_TRANSFER: (
         "放入一段动作来源视频和一张人物参考图，自动把视频里的主要表演者替换成参考人物，"
-        "并保留原动作、镜头、场景和音轨。长视频会按“单段时长”自动切段并连续生成，"
+        "并保留原动作、镜头、场景，声音开关开启时保留原音轨。长视频会按“单段时长”自动切段并连续生成，"
         "最终重新拼成与来源视频等长的成片。建议先用 5~10 秒短视频确认效果，再处理完整长视频。"
     ),
     "grid4_stitch": "四张图按「左上 → 右上 → 左下 → 右下」拼成一张四宫格，正好是「漫剧4宫格」"
@@ -564,6 +564,31 @@ CAP_INPUT_PRESETS = {
         "target": {"kind": "preset"},
     }],
 }
+CAP_INPUT_PRESETS.update({
+    wid: [*CAP_INPUT_PRESETS.get(wid, []), {
+        "key": "sound", "label": "声音", "type": "select", "appearance": "switch",
+        "default": "off",
+        "options": [{"value": "on", "label": "开启"}, {"value": "off", "label": "关闭"}],
+        "presets": {"on": {}, "off": {}},
+        "hint": "默认关闭，输出不带音轨；开启后保留工作流原音轨。参考或驱动音频仍参与画面生成，不关闭 H3 内部联合采样。" + ("分段采样节点内部音频处理仍保留。" if wid == "minimax_h3_character_transfer" else ""),
+        "target": {"kind": "preset"},
+        "disconnectWhenOff": [{"node": node, "input": field} for node, field in cuts],
+    }]
+    for wid, cuts in {
+        "minimax_h3_i2v": [("189", "audio")],
+        "minimax_h3_flf2v": [("132", "audio")],
+        "minimax_h3_ref4": [("38", "audio")],
+        "minimax_h3_ref9": [("38", "audio")],
+        "minimax_h3_ref_2pass": [("225", "audio"), ("210", "any_input")],
+        "minimax_h3_ref_2pass_bf16": [("225", "audio"), ("210", "any_input")],
+        "minimax_h3_fusion_v2": [("148", "audio")],
+        "minimax_h3_fusion_v2_bf16": [("148", "audio")],
+        "minimax_h3_comic20": [("79", "audio"), ("207", "initial_value2")],
+        "minimax_h3_talk1": [("142", "audio")],
+        "minimax_h3_talk2": [("142", "audio")],
+        "minimax_h3_character_transfer": [("23", "audio")],
+    }.items()
+})
 CAP_DURATION_WARNINGS = {
     "minimax_h3_ref9": {
         "warnAbove": 8,
@@ -1977,6 +2002,7 @@ def h3_character_transfer_inputs(api):
         {"key": "height", "label": "高", "type": "number", "default": timeline["height"],
          "min": 256, "max": 1344, "step": 32,
          "target": {"node": "11", "input": "height", "vtype": "INT"}},
+        *copy.deepcopy(CAP_INPUT_PRESETS[H3_CHARACTER_TRANSFER]),
         {"key": "duration", "label": "单段时长(秒)", "type": "slider",
          "min": 5, "max": 15, "step": 1, "default": timeline["generation_seconds"],
          "hint": "长视频会按这个长度自动切段。10 秒兼顾连贯性和显存；调短会增加分段数量和总耗时。",

@@ -578,7 +578,7 @@ class ReferenceVideoOutputTest(unittest.TestCase):
     def test_six_seconds_pad_158_but_trim_144_not_slow_motion(self):
         for cid in self.capabilities[:3]:
             with self.subTest(cid=cid):
-                cap, _, graph = self.patch(cid)
+                cap, _, graph = self.patch(cid, params={"sound": "on"})
                 original = self.graph(cap)
                 for nid, node in graph.items():
                     if node["class_type"] == "MiniMaxH3ReferenceToVideo":
@@ -672,7 +672,8 @@ class ReferenceVideoOutputTest(unittest.TestCase):
             with self.subTest(preview=preview):
                 cap, params, graph = self.patch(
                     self.capabilities[3], {"duration": 300.013, "has_audio": False},
-                    {"duration": 7, "preview_seconds": preview, "width": 970, "height": 550})
+                    {"duration": 7, "preview_seconds": preview, "width": 970, "height": 550,
+                     "sound": "on"})
                 self.assertEqual(params["duration"], 7)
                 self.assertEqual(params["preview_seconds"], preview)
                 planner = graph["11"]["inputs"]
@@ -705,6 +706,22 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                 original = self.graph(cap)
                 self.assertEqual(graph["30"]["inputs"], {**original["30"]["inputs"], "seed": 42})
                 self.assertEqual(graph["23"]["inputs"]["audio"], original["23"]["inputs"]["audio"])
+
+    def test_output_sound_switch_keeps_reference_duration_and_video_frames(self):
+        for cid in self.capabilities:
+            for selected in ({}, {"sound": "off"}, {"sound": "on"}):
+                with self.subTest(cid=cid, selected=selected):
+                    cap, params, graph = self.patch(cid, params=selected)
+                    output = self.output(graph, cid == self.capabilities[3])
+                    if selected.get("sound") == "on":
+                        self.assertEqual(output["audio"],
+                                         self.output(self.graph(cap), cid == self.capabilities[3])["audio"])
+                    else:
+                        self.assertNotIn("audio", output)
+                    self.assertEqual(params["output_duration"], 6)
+                    images = graph[output["images"][0]]["inputs"]
+                    self.assertEqual((images["width"], images["height"]),
+                                     (params["output_width"], params["output_height"]))
 
     def test_muted_references_disconnect_audio_only(self):
         for cid in self.capabilities[:2]:

@@ -914,6 +914,11 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
         g["238"]["inputs"]["value"] = re.sub(pattern, lambda match: references[match[0]], prompt)
     patch_h3_character_transfer(g, cap, params, uploaded, video_metadata)
     patch_follow_reference_video(g, cap, follow)
+    for spec in cap["inputs"]:
+        if spec.get("disconnectWhenOff") and params[spec["key"]] == "off":
+            # 还要切断二采显存清理、漫剧循环携带的音频依赖，避免解码支路照跑。
+            for drop in spec["disconnectWhenOff"]:
+                g[str(drop["node"])]["inputs"].pop(drop["input"], None)
     try:
         patch_image_controls(g, cap["id"], params)
     except ValueError as exc:
