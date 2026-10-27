@@ -144,11 +144,12 @@ class CostLedger:
                 continue
             output = node.get("inputs") or {}
             link = output.get("images")
-            if (capability == "minimax_h3_ref_2pass_bf16" and isinstance(link, list)
+            if (capability in {"minimax_h3_ref_2pass_bf16", "minimax_h3_fusion_v2_bf16"}
+                    and isinstance(link, list)
                     and len(link) == 2 and str(link[0]).startswith("h3_1080p_scale_")
                     and graph.get(str(link[0]), {}).get("class_type") == "ImageScale"):
                 scaled = graph[str(link[0])]["inputs"]
-                generation = graph["186"]["inputs"]
+                generation = graph["136" if capability == "minimax_h3_fusion_v2_bf16" else "186"]["inputs"]
                 dims.update(width=scaled["width"], height=scaled["height"],
                             output_width=scaled["width"], output_height=scaled["height"],
                             output_count=1, output_fps=output["frame_rate"],
@@ -167,9 +168,9 @@ class CostLedger:
             dims.update(width=scaled["width"], height=scaled["height"], duration=seconds,
                         output_width=scaled["width"], output_height=scaled["height"],
                         output_duration=seconds, output_fps=fps, output_count=1)
-            if capability == "minimax_h3_ref_2pass_bf16":
+            if capability in {"minimax_h3_ref_2pass_bf16", "minimax_h3_fusion_v2_bf16"}:
                 # 参考路径的派发图也已含可信首采宽高；无 params 恢复时补齐实际 MP。
-                generation = graph["186"]["inputs"]
+                generation = graph["136" if capability == "minimax_h3_fusion_v2_bf16" else "186"]["inputs"]
                 dims.setdefault("megapixels", generation["width"] * generation["height"] / 1024 ** 2)
 
         if capability == "minimax_h3_comic20":

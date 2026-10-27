@@ -48,7 +48,7 @@ from capacity import make_spec, export_csv, model_summary_from_graph, _hash as c
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError,
-    can_run_capability, is_pro_6000_worker, worker_capability_comparisons,
+    BF16_HIGH_VRAM_CAPABILITIES, can_run_capability, is_pro_6000_worker, worker_capability_comparisons,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 from if_reference import IFReferenceCopies
@@ -91,7 +91,7 @@ MODEL_FAMILY = {
         "minimax_h3_i2v", "minimax_h3_flf2v", "minimax_h3_talk1",
         "minimax_h3_talk2", "minimax_h3_ref4", "minimax_h3_ref9",
         "minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16", "minimax_h3_comic20",
-        "minimax_h3_character_transfer", "minimax_h3_fusion_v2",
+        "minimax_h3_character_transfer", "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
     )},
     "flux2_klein_edit": "flux2_klein",
     "flux2_klein_storyboard9": "flux2_klein",
@@ -619,7 +619,8 @@ def apply_input_presets(cap, params):
 def reference_video_input(cap, uploaded):
     """仅已登记的 H3 视频参考能力的已填视频槽参与最终输出契约。"""
     if (cap.get("id") not in {"minimax_h3_ref9", "minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16",
-                              "minimax_h3_fusion_v2", "minimax_h3_character_transfer"}
+                              "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
+                              "minimax_h3_character_transfer"}
             or cap.get("kind") != "gen" or cap.get("outputType") != "video"):
         return None
     return next((uploaded.get(spec["key"]) for spec in cap.get("inputs", [])
@@ -627,8 +628,10 @@ def reference_video_input(cap, uploaded):
 
 
 def resolve_h3_1080p_settings(cap, params):
-    """仅 BF16 二采开启时使用可信尺寸；不改变无视频路径的时间契约。"""
-    if cap.get("id") != "minimax_h3_ref_2pass_bf16" or params.get("output_1080p") != "on":
+    """仅已登记 BF16 模式开启时使用可信尺寸；不改变无视频路径的时间契约。"""
+    single_pass = cap.get("id") == "minimax_h3_fusion_v2_bf16"
+    if (cap.get("id") not in {"minimax_h3_ref_2pass_bf16", "minimax_h3_fusion_v2_bf16"}
+            or params.get("output_1080p") != "on"):
         return None
     specs = {spec["key"]: spec for spec in cap["inputs"]}
     aspect = params.get("aspect_ratio", specs["aspect_ratio"]["default"])
@@ -637,19 +640,21 @@ def resolve_h3_1080p_settings(cap, params):
     match = re.match(r"^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)(?:\s|$)", aspect)
     if not match or float(match[1]) <= 0 or float(match[2]) <= 0:
         raise web.HTTPBadRequest(reason=f"画面比例无效：{aspect}")
-    spec = specs["scale_by"]
-    supplied = params.get("scale_by", spec["default"])
-    try:
-        scale = float(supplied) if not isinstance(supplied, bool) else math.nan
-    except (TypeError, ValueError, OverflowError):
-        scale = math.nan
-    # MiniMaxH3LatentUpscaleCombined 的真实节点范围；面板推荐范围不是硬限制。
-    if not math.isfinite(scale) or not 0.01 <= scale <= 8:
-        raise web.HTTPBadRequest(reason="1080P：潜空间放大倍率必须在 0.01..8")
+    scale = 1
+    if not single_pass:
+        spec = specs["scale_by"]
+        supplied = params.get("scale_by", spec["default"])
+        try:
+            scale = float(supplied) if not isinstance(supplied, bool) else math.nan
+        except (TypeError, ValueError, OverflowError):
+            scale = math.nan
+        # MiniMaxH3LatentUpscaleCombined 的真实节点范围；面板推荐范围不是硬限制。
+        if not math.isfinite(scale) or not 0.01 <= scale <= 8:
+            raise web.HTTPBadRequest(reason="1080P：潜空间放大倍率必须在 0.01..8")
     ratio = float(match[1]) / float(match[2])
     if not math.isfinite(ratio) or ratio <= 0:
         raise web.HTTPBadRequest(reason=f"画面比例无效：{aspect}")
-    # 1080P 指首采理想短边；倍率只影响节点 199 和最终输出，不反向缩小首采。
+    # 1080P 指首采理想短边；单采固定 1 倍，二采倍率只影响潜空间放大和最终输出。
     base = (1080 * max(1, ratio), 1080 * max(1, 1 / ratio))
     if not all(math.isfinite(side) for side in base):
         raise web.HTTPBadRequest(reason="1080P：基础生成尺寸超出节点支持范围")
@@ -662,8 +667,11 @@ def resolve_h3_1080p_settings(cap, params):
     # 不采信外部 output_*，也不把动态尺寸存入静态 preset 或模板。
     for key in ("width", "height", "duration", "fps", "count"):
         params.pop("output_" + key, None)
-    params.update(aspect_ratio=aspect, scale_by=scale,
-                  megapixels=generation[0] * generation[1] / 1024 ** 2,
+    if single_pass:
+        params.pop("scale_by", None)
+    else:
+        params["scale_by"] = scale
+    params.update(aspect_ratio=aspect, megapixels=generation[0] * generation[1] / 1024 ** 2,
                   output_width=final[0], output_height=final[1], output_count=1)
     return {"character": False, "resolution_only": True,
             "base": base, "generation": generation, "final": final}
@@ -803,7 +811,8 @@ def patch_follow_reference_video(g, cap, follow):
         images = append_node(f"{prefix}_{nid}", "ImageScale",
                              {"image": images, "upscale_method": "bicubic", "crop": "disabled",
                               "width": follow["final"][0], "height": follow["final"][1]},
-                             "校正二采输出尺寸" if resolution_only or follow.get("h3_1080p")
+                             ("校正单采输出尺寸" if cap.get("id") == "minimax_h3_fusion_v2_bf16"
+                              else "校正二采输出尺寸") if resolution_only or follow.get("h3_1080p")
                              else "校正参考视频画面比例")
         node["inputs"]["images"] = images
         if not resolution_only:
@@ -887,7 +896,7 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
     if blank:
         raise web.HTTPBadRequest(
             reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
-    if cap["id"] == "minimax_h3_fusion_v2":
+    if cap["id"] in {"minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16"}:
         # H3 会跳过空槽并连续编号；界面里的槽号在提交时一次性换算，避免连锁替换。
         references = {}
         for prefix, label in (("ref_images.ref_image_", "Picture"),
@@ -941,7 +950,7 @@ def check_local_cleanup(app):
 
 
 BF16_GPU_REQUIREMENT = "此模式仅支持显存超过80GB的CUDA显卡（如PRO 6000 96GB），80GB及以下或显存未知不可接单"
-PRO_6000_REQUIREMENT = "PRO 6000仅接收H3满血二采任务"
+PRO_6000_REQUIREMENT = "PRO 6000仅接收H3满血二采或H3无损融合单采满血剪枝任务"
 
 
 async def refresh_local_gpu(app):
@@ -962,10 +971,10 @@ def check_local_capability(app, capability, gpu_policy=None, duration_seconds=No
     devices = state["devices"]
     if can_run_capability(capability, devices, gpu_policy, duration_seconds):
         return
-    if is_pro_6000_worker(devices) and capability != "minimax_h3_ref_2pass_bf16":
+    if is_pro_6000_worker(devices) and capability not in BF16_HIGH_VRAM_CAPABILITIES:
         raise web.HTTPBadRequest(text=PRO_6000_REQUIREMENT)
     raise web.HTTPBadRequest(reason=(
-        BF16_GPU_REQUIREMENT if capability == "minimax_h3_ref_2pass_bf16" else (
+        BF16_GPU_REQUIREMENT if capability in BF16_HIGH_VRAM_CAPABILITIES else (
             "此任务只能在主 GPU 显存至少 32GB 的机器上运行；"
             f"H3高质量不超过{MAX_4090_HIGH_QUALITY_DURATION_SECONDS:g}秒时也可使用RTX 4090"
         )
@@ -1399,7 +1408,7 @@ async def api_generate(request):
             inspect_imported_videos, cap, uploaded
         )
     graph = patch_graph(cap, params, uploaded, video_metadata)
-    duration_seconds = rw.duration(cap, params) if cid in {"minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16"} else None
+    duration_seconds = rw.duration(cap, params) if cid in HIGH_VRAM_CAPABILITIES else None
     if body.get("dry_run"):
         tpl = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
         diff = {f"#{n}.{k}": [tpl.get(n, {}).get("inputs", {}).get(k), v]
@@ -1416,7 +1425,7 @@ async def api_generate(request):
             and source_video_duration > LONG_VIDEO_HIGH_VRAM_SECONDS
         ) else None
     )
-    if (not CONTROLLER_MODE and cid != "minimax_h3_ref_2pass_bf16"
+    if (not CONTROLLER_MODE and cid not in BF16_HIGH_VRAM_CAPABILITIES
             and is_pro_6000_worker(request.app.get("local_gpu_state", {}).get("devices"))):
         # 已确认的专用主卡直接给专用提示，不被显存检查/网络错误混淆。
         check_local_capability(request.app, cid, gpu_policy, duration_seconds)
@@ -1426,7 +1435,7 @@ async def api_generate(request):
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             request.app["local_gpu_state"].clear()
             raise web.HTTPServiceUnavailable(
-                reason=BF16_GPU_REQUIREMENT if cid == "minimax_h3_ref_2pass_bf16"
+                reason=BF16_GPU_REQUIREMENT if cid in BF16_HIGH_VRAM_CAPABILITIES
                 else "无法确认执行显卡，此任务要求主 GPU 显存至少 32GB"
             )
     if not CONTROLLER_MODE:

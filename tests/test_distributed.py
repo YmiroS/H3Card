@@ -20,7 +20,8 @@ sys.path.insert(0, str(ROOT / "worker"))
 
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, WorkerBusyError,
-    BF16_TWO_PASS_CAPABILITY, can_run_capability, is_pro_6000_worker,
+    BF16_TWO_PASS_CAPABILITY, BF16_HIGH_VRAM_CAPABILITIES, HIGH_VRAM_CAPABILITIES,
+    can_run_capability, is_pro_6000_worker,
     capability_model_inventory, worker_capability_comparisons,
 )
 from agent import (
@@ -41,6 +42,13 @@ def worker_mode_ids():
 
 
 class Pro6000CapabilityTest(unittest.TestCase):
+    def test_bf16_high_vram_allowlist_is_exact_and_uses_larger_gpu_dispatch(self):
+        self.assertIsInstance(BF16_HIGH_VRAM_CAPABILITIES, frozenset)
+        self.assertEqual(BF16_HIGH_VRAM_CAPABILITIES, frozenset({
+            BF16_TWO_PASS_CAPABILITY, "minimax_h3_fusion_v2_bf16",
+        }))
+        self.assertTrue(BF16_HIGH_VRAM_CAPABILITIES <= HIGH_VRAM_CAPABILITIES)
+
     def test_all_worker_modes_primary_device_matrix(self):
         def gpu(name, gib=96, kind="cuda"):
             return {"type": kind, "name": name, "vram_total": gib * 1024 ** 3}
@@ -69,9 +77,11 @@ class Pro6000CapabilityTest(unittest.TestCase):
         for devices, reserved, bf16_allowed in cases:
             with self.subTest(devices=devices):
                 self.assertEqual(is_pro_6000_worker(devices), reserved)
-                self.assertEqual(can_run_capability(BF16_TWO_PASS_CAPABILITY, devices), bf16_allowed)
+                for cid in BF16_HIGH_VRAM_CAPABILITIES:
+                    with self.subTest(capability=cid):
+                        self.assertEqual(can_run_capability(cid, devices), bf16_allowed)
                 for cid in worker_mode_ids() + ["unknown", "text", None]:
-                    if cid == BF16_TWO_PASS_CAPABILITY:
+                    if cid in BF16_HIGH_VRAM_CAPABILITIES:
                         continue
                     with self.subTest(capability=cid):
                         expected = not reserved
@@ -230,7 +240,7 @@ class ModelDispatchTest(unittest.TestCase):
                 job_id = f"pro-{index}"
                 self.enqueue(job_id=job_id, capability=cid, model_family="cached-family")
                 acquired = self.store.acquire(self.worker_id)
-                if cid == BF16_TWO_PASS_CAPABILITY:
+                if cid in BF16_HIGH_VRAM_CAPABILITIES:
                     self.assertEqual(acquired["job_id"], job_id)
                     self.store.finish(job_id, self.worker_id, acquired["lease_token"], "done",
                                       capacity_released=True)
@@ -267,6 +277,123 @@ class ModelDispatchTest(unittest.TestCase):
                         self.assertIsNone(self.store.acquire(self.worker_id))
         self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
         self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def fusion_bf16_caps(self):
+        self.graph = json.loads((ROOT / "graphs/minimax_h3_fusion_v2_bf16.api.json").read_text(encoding="utf-8"))
+        caps = copy.deepcopy(self.caps)
+        caps["devices"] = [{"type": "cuda", "name": "RTX PRO 6000",
+                            "vram_total": 96 * 1024 ** 3}]
+        caps["input_choices"]["UNETLoader"]["unet_name"] = [
+            "Cobijada_H3_Hybrid_Uncensored_pruned_hybrid_BF16_pruned.safetensors",
+        ]
+        return caps
+
+    def test_fusion_bf16_raw_graph_changes_only_node_127_model(self):
+        original = copy.deepcopy(self.graph)
+        caps = self.fusion_bf16_caps()
+        original["127"]["inputs"]["unet_name"] = (
+            "Cobijada_H3_Hybrid_Uncensored_pruned_hybrid_BF16_pruned.safetensors"
+        )
+        self.assertEqual(self.graph, original)
+        self.assertEqual(capability_model_inventory(caps), {
+            ("UNETLoader", "unet_name", "Cobijada_H3_Hybrid_Uncensored_pruned_hybrid_BF16_pruned.safetensors"),
+            ("LoraLoaderModelOnly", "lora_name", "minimax_h3_ref2v_turbo_8step_v1.0_768p_comfyui_bf16.safetensors"),
+            ("CLIPLoader", "clip_name", "qwen3vl_32b_minimax_h3_int8_convrot.safetensors"),
+            ("VAELoader", "vae_name", "minimax_h3_video_vae_fp16.safetensors"),
+            ("VAELoader", "vae_name", "minimax_h3_audio_vae_fp32.safetensors"),
+        })
+
+    def test_fusion_bf16_raw_graph_claim_requires_each_exact_model_and_node(self):
+        caps = self.fusion_bf16_caps()
+        self.enqueue(capability="minimax_h3_fusion_v2_bf16")
+        for node_class, fields in caps["input_choices"].items():
+            for key, names in fields.items():
+                for name in names:
+                    with self.subTest(missing_model=name):
+                        incomplete = copy.deepcopy(caps)
+                        incomplete["input_choices"][node_class][key].remove(name)
+                        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=incomplete)
+                        self.assertIsNone(self.store.acquire(self.worker_id))
+                        self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+        for node_class in caps["node_classes"]:
+            with self.subTest(missing_node=node_class):
+                incomplete = copy.deepcopy(caps)
+                incomplete["node_classes"].remove(node_class)
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=incomplete)
+                self.assertIsNone(self.store.acquire(self.worker_id))
+                self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+        for replacement in (
+            self.choices["UNETLoader"]["unet_name"][0],
+            "other/" + caps["input_choices"]["UNETLoader"]["unet_name"][0],
+            caps["input_choices"]["UNETLoader"]["unet_name"][0].replace("BF16", "bf16"),
+        ):
+            with self.subTest(wrong_model=replacement):
+                incomplete = copy.deepcopy(caps)
+                incomplete["input_choices"]["UNETLoader"]["unet_name"] = [replacement]
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=incomplete)
+                self.assertIsNone(self.store.acquire(self.worker_id))
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        assignment = self.store.acquire(self.worker_id)
+        self.assertIsNotNone(assignment)
+        self.assertEqual(assignment["job_id"], "fusion")
+        self.assertEqual(assignment["payload"]["graph"], self.graph)
+        self.assertEqual(assignment["payload"]["capability"], "minimax_h3_fusion_v2_bf16")
+
+    def test_fusion_bf16_raw_graph_primary_cuda_gate_cannot_be_bypassed(self):
+        caps = self.fusion_bf16_caps()
+        cid = "minimax_h3_fusion_v2_bf16"
+        limit = 80 * 1024 ** 3
+        primary = {"type": "cuda", "name": "RTX PRO 6000", "vram_total": limit + 1}
+        cases = [
+            ([{**primary, "vram_total": limit}], False),
+            ([primary], True),
+            ([{**primary, "vram_total": 96 * 1024 ** 3}], True),
+            ([{**primary, "name": "Other GPU"}], True),
+            ([{**primary, "type": "cpu"}], False),
+            ([self.caps["devices"][0], primary], False),
+            ([{**primary, "name": "RTX 4090", "vram_total": 24 * 1024 ** 3}], False),
+            ([{**primary, "name": "RTX PRO 6000 96GB", "vram_total": None}], False),
+            ([{**primary, "vram_total": float("inf")}], False),
+            ([{**primary, "vram_total": None, "torch_vram_total": limit + 1}], True),
+            ([], False),
+            (None, False),
+        ]
+        for index, (devices, expected) in enumerate(cases):
+            for policy in (None, HIGH_VRAM_GPU_POLICY, "unrestricted"):
+                with self.subTest(devices=devices, gpu_policy=policy):
+                    self.assertEqual(can_run_capability(cid, devices, policy, 1), expected)
+                    job_id = f"fusion-bf16-{index}-{policy}"
+                    self.enqueue(job_id=job_id, capability=cid, gpu_policy=policy, duration_seconds=1)
+                    self.store.heartbeat(self.worker_id, comfy_online=True, capacity_released=True,
+                                         capabilities={**caps, "devices": devices})
+                    assignment = self.store.acquire(self.worker_id)
+                    self.assertEqual(assignment is not None, expected)
+                    if assignment:
+                        self.assertEqual(assignment["job_id"], job_id)
+                        self.store.finish(job_id, self.worker_id, assignment["lease_token"],
+                                          "done", capacity_released=True)
+                    else:
+                        self.assertEqual(self.store.dispatch_status(job_id), "queued")
+                    self.store.remove_job(job_id)
+
+    def test_fusion_bf16_prefers_idle_larger_eligible_gpu_for_actual_graph(self):
+        caps = self.fusion_bf16_caps()
+        caps["devices"] = [{"type": "cuda", "name": "Other GPU",
+                            "vram_total": 80 * 1024 ** 3 + 1}]
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        larger_caps = copy.deepcopy(caps)
+        larger_caps["devices"] = [{"type": "cuda", "name": "RTX PRO 6000",
+                                   "vram_total": 96 * 1024 ** 3}]
+        larger = self.store.register_worker("larger-bf16", larger_caps)["worker_id"]
+        self.store.heartbeat(larger, comfy_online=True)
+        # No explicit policy: the capability itself must trigger larger-GPU preference.
+        self.enqueue(capability="minimax_h3_fusion_v2_bf16")
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+        assignment = self.store.acquire(larger)
+        self.assertIsNotNone(assignment)
+        self.assertEqual(assignment["job_id"], "fusion")
+        self.assertEqual(assignment["payload"]["graph"], self.graph)
 
     def test_reserved_larger_worker_does_not_block_non_pro_old_h3(self):
         caps = copy.deepcopy(self.caps)

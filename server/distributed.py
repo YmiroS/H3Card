@@ -17,11 +17,14 @@ from capacity import CapacityStore
 
 LIVE_DISPATCH = ("assigned", "running", "cancel_requested")
 FINISHED_DISPATCH = ("done", "error", "canceled")
-HIGH_VRAM_CAPABILITIES = frozenset({"minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16"})
+HIGH_VRAM_CAPABILITIES = frozenset({
+    "minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16", "minimax_h3_fusion_v2_bf16",
+})
 HIGH_VRAM_GPU_POLICY = "primary_gpu_vram_gte_32gb"
 MIN_HIGH_QUALITY_VRAM_BYTES = 32_000_000_000
 BF16_TWO_PASS_CAPABILITY = "minimax_h3_ref_2pass_bf16"
-# devices 的显存字段单位是 bytes；此模式要求严格超过 80 GiB，而不是 >=80。
+BF16_HIGH_VRAM_CAPABILITIES = frozenset({BF16_TWO_PASS_CAPABILITY, "minimax_h3_fusion_v2_bf16"})
+# devices 的显存字段单位是 bytes；这两种模式要求严格超过 80 GiB，而不是 >=80。
 BF16_TWO_PASS_VRAM_EXCLUSIVE_BYTES = 80 * 1024 ** 3
 MAX_4090_HIGH_QUALITY_DURATION_SECONDS = 5
 MODEL_INPUT_NAMES = frozenset({
@@ -290,9 +293,9 @@ def is_pro_6000_worker(devices):
 
 
 def can_run_capability(capability, devices, gpu_policy=None, duration_seconds=None):
-    if is_pro_6000_worker(devices) and capability != BF16_TWO_PASS_CAPABILITY:
+    if is_pro_6000_worker(devices) and capability not in BF16_HIGH_VRAM_CAPABILITIES:
         return False
-    if capability == BF16_TWO_PASS_CAPABILITY:
+    if capability in BF16_HIGH_VRAM_CAPABILITIES:
         # 共用入口先执行硬门槛，不能被 32GB 策略、短视频或亲和性兜底放宽。
         # 96GB RTX PRO 6000 和其他 >80GiB 卡均可；旧 24/48GB 6000
         # 或仅凭 PRO/Blackwell 名称、显存未知的设备不能获得豁免。

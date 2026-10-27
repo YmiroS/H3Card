@@ -71,6 +71,52 @@ test('compiled React and management pages share Python auth without any old web 
       assert.equal((await renamed).status(), 200);
       await page.reload();
       await page.locator('#ptitle').filter({hasText:'整合验收已保存'}).waitFor({state:'visible'});
+      const fusionId = 'minimax_h3_fusion_v2_bf16';
+      const catalog = await (await page.request.get(service.origin + '/api/cards')).json();
+      const fusion = catalog.capabilities[fusionId];
+      assert.equal(fusion.name, 'H3无损融合单采满血剪枝');
+      assert.equal(fusion.slots, 'img6+aud3+vid1');
+      const created = await page.request.post(service.origin + '/api/projects/browser/cards', {
+        headers:{Origin:service.origin, 'X-CSRF-Token':session.csrf_token},
+        data:{card:{id:'fusion-browser', type:'card_video', cap:'minimax_h3_fusion_v2',
+          x:120, y:60, name:'满血单采验收', assets:{}, outputs:[],
+          params:{prompt:'电影镜头', seed:123, megapixels:1.1, aspect_ratio:'16:9 (Widescreen)'}}},
+      });
+      assert.equal(created.status(), 200, await created.text());
+      await page.reload();
+      await page.locator('#world .card .ch').click();
+      await page.locator('#panel .foot .tcap').first().click();
+      await page.getByText(fusion.name, {exact:true}).last().click();
+      await page.locator('#panel button[title^="点开弹窗"]').click();
+      const clarity = page.locator('#respop .cgrid.k');
+      await clarity.getByRole('button', {name:'1080p', exact:true}).click();
+      assert.equal(await clarity.locator('.on').textContent(), '1080p');
+      assert.match(await page.locator('#panel button[title^="点开弹窗"]').textContent(), /1920×1080/);
+      const saved = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/projects/browser' && response.request().method() === 'PUT');
+      await page.locator('#respop').getByRole('button', {name:'9:16', exact:true}).click();
+      assert.equal((await saved).status(), 200);
+      await page.reload();
+      await page.locator('#world .card .ch').click();
+      assert.match(await page.locator('#panel .foot .tcap').first().textContent(), /H3无损融合单采满血剪枝/);
+      assert.match(await page.locator('#panel button[title^="点开弹窗"]').textContent(), /1080×1920/);
+      const project = await (await page.request.get(service.origin + '/api/projects/browser')).json();
+      const stored = project.cards.find(card => card.id === 'fusion-browser');
+      assert.equal(stored.cap, fusionId);
+      assert.equal(stored.params.output_1080p, 'on');
+      assert.equal(stored.params.scale_by, undefined);
+      assert.deepEqual(Object.keys(stored.params).filter(key => key.startsWith('output_')), ['output_1080p']);
+      const dry = await page.request.post(service.origin + '/api/generate', {
+        headers:{Origin:service.origin, 'X-CSRF-Token':session.csrf_token},
+        data:{capability:stored.cap, project:'browser', card:stored.id, params:stored.params, assets:{}, dry_run:true},
+      });
+      assert.equal(dry.status(), 200, await dry.text());
+      const changed = (await dry.json()).changed;
+      assert.deepEqual(changed['#136.width'][1], 1088);
+      assert.deepEqual(changed['#136.height'][1], 1920);
+      assert.equal(changed['#h3_1080p_scale_148.width'][1], 1080);
+      assert.equal(changed['#h3_1080p_scale_148.height'][1], 1920);
+      assert.equal(changed['#h3_1080p_scale_148.image'][1][0], '122');
       await page.goto(service.origin + '/director?project=browser');
       await page.waitForFunction(() => document.body.dataset.choukaPage === 'director');
       await page.goto(service.origin + '/if-studio');

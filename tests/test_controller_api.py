@@ -25,7 +25,7 @@ import rewrite
 import scan_workflows
 import translate as prompt_translate
 from costs import CostLedger
-from distributed import DistributedStore
+from distributed import BF16_HIGH_VRAM_CAPABILITIES, DistributedStore
 
 
 class PromptTranslationProtectionTest(unittest.TestCase):
@@ -2458,14 +2458,14 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                     session.get.reset_mock()
                     submit.reset_mock()
                     response = await self.client.post("/api/generate", json={"project": "p", "capability": cid})
-                    if cid == "minimax_h3_ref_2pass_bf16":
+                    if cid in BF16_HIGH_VRAM_CAPABILITIES:
                         self.assertEqual(response.status, 200)
                         submit.assert_awaited_once()
                     else:
                         self.assertEqual(response.status, 400)
                         self.assertEqual(await response.text(), controller_app.PRO_6000_REQUIREMENT)
                         submit.assert_not_awaited()
-                    if cid != "minimax_h3_ref_2pass_bf16":
+                    if cid not in BF16_HIGH_VRAM_CAPABILITIES:
                         session.get.assert_not_called()
 
     @mock.patch.object(controller_app, "patch_graph", return_value={
@@ -2508,6 +2508,90 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             }, headers=self.headers)
             self.assertEqual(response.status, 503)
             submit.assert_not_awaited()
+
+    @mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock)
+    async def test_local_fusion_bf16_refresh_gates_real_graph_before_submit(self, submit):
+        controller_app.load_caps()
+        cid = "minimax_h3_fusion_v2_bf16"
+        self.assertEqual(controller_app.CAPS[cid]["name"], "H3无损融合单采满血剪枝")
+        state = self.client.server.app["local_gpu_state"]
+        session = self.client.server.app["session"]
+        stats_response = session.get.return_value.__aenter__.return_value
+        stats_response.raise_for_status = mock.Mock()
+        stats_response.json = mock.AsyncMock()
+        submit.side_effect = lambda _session, _graph, *, prompt_id: prompt_id
+        gib = 1024 ** 3
+
+        def gpu(vram=96 * gib, name="RTX PRO 6000", kind="cuda"):
+            return {"type": kind, "name": name, "vram_total": vram}
+
+        cases = [
+            ([gpu(48 * gib)], False),
+            ([gpu(80 * gib)], False),
+            ([gpu(24 * gib, "RTX 4090")], False),
+            ([gpu(None)], False),
+            ([gpu(kind="cpu")], False),
+            ([gpu(48 * gib, "RTX A6000"), gpu()], False),
+            ([], False),
+            ([gpu(80 * gib + 1)], True),
+            ([gpu()], True),
+            ([gpu(name="NVIDIA H100")], True),
+        ]
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False):
+            for devices, allowed in cases:
+                with self.subTest(devices=devices):
+                    # A stale eligible cache must neither reject the new mode early nor bypass refresh.
+                    state["devices"] = [gpu()]
+                    stats_response.json.return_value = {"devices": devices}
+                    session.get.reset_mock()
+                    submit.reset_mock()
+                    response = await self.client.post("/api/generate", json={
+                        "capability": cid, "project": "p", "params": {"duration": 5},
+                    }, headers=self.headers)
+                    self.assertEqual(response.status, 200 if allowed else 400, await response.text())
+                    session.get.assert_called_once()
+                    self.assertEqual(session.get.call_args.args[0], controller_app.COMFY_HTTP + "/system_stats")
+                    self.assertEqual(state["devices"], devices)
+                    if not allowed:
+                        self.assertEqual(await response.text(), "400: " + controller_app.BF16_GPU_REQUIREMENT)
+                        submit.assert_not_awaited()
+                        continue
+                    submit.assert_awaited_once()
+                    graph = submit.await_args.args[1]
+                    self.assertIs(submit.await_args.args[0], session)
+                    self.assertEqual(graph["127"]["inputs"]["unet_name"],
+                                     "Cobijada_H3_Hybrid_Uncensored_pruned_hybrid_BF16_pruned.safetensors")
+                    self.assertEqual(graph["232"]["inputs"]["clip_name"],
+                                     "qwen3vl_32b_minimax_h3_int8_convrot.safetensors")
+                    self.assertEqual(sum(node["class_type"] == "SamplerCustomAdvanced"
+                                         for node in graph.values()), 1)
+                    job = await response.json()
+                    self.assertEqual(job["id"], submit.await_args.kwargs["prompt_id"])
+                    self.assertEqual(job["capability"], cid)
+                    self.assertEqual(job["name"], "H3无损融合单采满血剪枝")
+
+    @mock.patch.object(controller_app, "comfy_submit", new_callable=mock.AsyncMock)
+    async def test_local_both_bf16_refresh_failure_clears_cache_and_never_submits(self, submit):
+        controller_app.load_caps()
+        state = self.client.server.app["local_gpu_state"]
+        stats_response = self.client.server.app["session"].get.return_value.__aenter__.return_value
+        stats_response.raise_for_status = mock.Mock()
+        stats_response.json = mock.AsyncMock()
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False):
+            for cid in ("minimax_h3_ref_2pass_bf16", "minimax_h3_fusion_v2_bf16"):
+                for error in (TimeoutError(), aiohttp.ClientConnectionError(), ValueError("invalid stats")):
+                    with self.subTest(capability=cid, error=type(error).__name__):
+                        state["devices"] = [{"type": "cuda", "name": "RTX PRO 6000",
+                                             "vram_total": 96 * 1024 ** 3}]
+                        stats_response.json.side_effect = error
+                        response = await self.client.post("/api/generate", json={
+                            "capability": cid, "project": "p",
+                        }, headers=self.headers)
+                        self.assertEqual(response.status, 503, await response.text())
+                        self.assertEqual(await response.text(), "503: " + controller_app.BF16_GPU_REQUIREMENT)
+                        self.assertEqual(state, {})
+                        submit.assert_not_awaited()
+            self.assertEqual(controller_app.JOBS, {})
 
     @mock.patch.object(controller_app, "patch_graph", return_value={
         "1": {"class_type": "KSampler", "inputs": {}}
@@ -3132,6 +3216,15 @@ class LocalSubmissionTest(unittest.IsolatedAsyncioTestCase):
             ([gpu("RTX PRO 6000")], None, False),
             ([gpu("RTX PRO 6000")], "minimax_h3_ref_2pass_bf16", True),
             ([gpu("RTX PRO 6000", 80)], "minimax_h3_ref_2pass_bf16", False),
+            ([gpu("RTX PRO 6000")], "minimax_h3_fusion_v2_bf16", True),
+            ([gpu("RTX PRO 6000", 80)], "minimax_h3_fusion_v2_bf16", False),
+            ([{**gpu("RTX PRO 6000", 80), "vram_total": 80 * 1024 ** 3 + 1}],
+             "minimax_h3_fusion_v2_bf16", True),
+            ([gpu("RTX A6000", 48)], "minimax_h3_fusion_v2_bf16", False),
+            ([gpu("RTX 4090", 24)], "minimax_h3_fusion_v2_bf16", False),
+            ([gpu("RTX PRO 6000", kind="cpu")], "minimax_h3_fusion_v2_bf16", False),
+            ([gpu("RTX A6000", 48), gpu("RTX PRO 6000")], "minimax_h3_fusion_v2_bf16", False),
+            ([gpu("NVIDIA H100")], "minimax_h3_fusion_v2_bf16", True),
             ([gpu("RTX A6000", 48), gpu("RTX PRO 6000")], "zimage_t2i", True),
             ([gpu("RTX PRO 6000"), gpu("RTX A6000", 48)], "zimage_t2i", False),
             ([gpu("Quadro RTX 6000", 24)], "zimage_t2i", True),
@@ -3152,7 +3245,7 @@ class LocalSubmissionTest(unittest.IsolatedAsyncioTestCase):
                 else:
                     with self.assertRaises(web.HTTPBadRequest) as raised:
                         await controller_app.local_submit(self.app, {}, capability=cid, duration_seconds=1)
-                    expected = (controller_app.BF16_GPU_REQUIREMENT if cid == "minimax_h3_ref_2pass_bf16"
+                    expected = (controller_app.BF16_GPU_REQUIREMENT if cid in BF16_HIGH_VRAM_CAPABILITIES
                                 else controller_app.PRO_6000_REQUIREMENT)
                     self.assertIn(expected, raised.exception.text)
                     submit.assert_not_awaited()
