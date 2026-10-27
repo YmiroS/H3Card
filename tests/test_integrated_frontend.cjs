@@ -75,6 +75,7 @@ test('compiled React and management pages share Python auth without any old web 
       assert.equal(archived.history_only, true);
       assert.equal(archived.permission, 'read');
       assert.equal(archived.cardName, '数据库历史卡片0');
+      assert.equal(archived.nodeName, '数据库历史执行端');
       assert.equal(Object.hasOwn(archived, 'progress'), false);
       assert.equal(adminHistory.find(job => job.id === 'orphan-history').permission, 'read');
       assert.deepEqual([...new Set(adminHistory.map(job => job.submitter_username).filter(Boolean))].sort(),
@@ -91,6 +92,7 @@ test('compiled React and management pages share Python auth without any old web 
       assert.match(await page.locator('#jobs').textContent(), /数据库历史卡片129/);
       assert.match(await page.locator('#jobs').textContent(), /无归属历史/);
       const archivedRow = page.locator('#jobs .jrow').filter({hasText:'数据库历史卡片129'});
+      assert.match(await archivedRow.textContent(), /执行节点：数据库历史执行端/);
       assert.equal(await archivedRow.getByRole('button', {name:'停止', exact:true}).count(), 0);
       assert.equal(await archivedRow.getByRole('button', {name:'删除', exact:true}).count(), 0);
       await page.locator('#jobs .jlist').hover();
@@ -180,6 +182,8 @@ test('compiled React and management pages share Python auth without any old web 
             await page.waitForFunction(() => document.querySelectorAll('#job-rows tr').length === 19);
             assert.match(await page.locator('#job-rows tr').first().textContent(), /db-history-111/);
             assert.match(await page.locator('#job-rows tr').last().textContent(), /db-history-129/);
+            assert.equal(await page.locator('#job-rows tr').first().locator('td').nth(4).textContent(),
+              '数据库历史执行端');
             const screenshot = path.join(require('node:os').tmpdir(), `controller-global-history-${process.pid}.png`);
             await page.screenshot({path:screenshot, fullPage:true});
             console.log('History browser evidence: ' + screenshot);

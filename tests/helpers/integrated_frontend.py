@@ -73,6 +73,7 @@ async def main():
             # These records exist ONLY in the controller database, as on the real
             # service after jobs.json has discarded older tasks. No graph is executed.
             store, ledger = application['distributed'], application['costs']
+            history_worker = store.register_worker('数据库历史执行端', {})['worker_id']
             for index in range(130):
                 jid = f'db-history-{index:03}'
                 owner = artist if index % 2 else fixture.admin
@@ -86,10 +87,10 @@ async def main():
                 }
                 with store.db:
                     store.db.execute(
-                        'INSERT INTO dispatch_jobs(job_id,payload_json,status,created_at,updated_at) '
-                        'VALUES(?,?,?,?,?)',
+                        'INSERT INTO dispatch_jobs(job_id,payload_json,status,created_at,updated_at,worker_id) '
+                        'VALUES(?,?,?,?,?,?)',
                         (jid, json.dumps({'capability': 'zimage_t2i', 'graph': {}}),
-                         job['status'], job['created'], job['created']))
+                         job['status'], job['created'], job['created'], history_worker))
                 ledger.record_job(job)
             server = TestServer(application, host='127.0.0.1')
             await server.start_server()
