@@ -626,6 +626,70 @@ class WorkerCapabilityComparisonTest(unittest.TestCase):
             "name": "other/model.safetensors",
         }])
 
+    def test_model_comparison_counts_each_file_once_across_37_selectors(self):
+        primary_caps = {
+            "node_classes": [f"Loader{i:02}" for i in range(37)],
+            "input_choices": {
+                f"Loader{i:02}": {"model_name": ["base.safetensors", "required.safetensors"]}
+                for i in range(37)
+            },
+            "input_types": {},
+        }
+        worker_caps = copy.deepcopy(primary_caps)
+        for choices in worker_caps["input_choices"].values():
+            choices["model_name"] = ["base.safetensors", "extra.safetensors"]
+        self.assertEqual(len(capability_model_inventory(primary_caps)), 74)
+
+        for reverse in (False, True):
+            with self.subTest(reverse=reverse):
+                if reverse:
+                    for caps in (primary_caps, worker_caps):
+                        caps["input_choices"] = dict(reversed(list(caps["input_choices"].items())))
+                _, workers = worker_capability_comparisons([
+                    self.worker("primary", primary_caps, primary=True),
+                    self.worker("worker", worker_caps),
+                ])
+                comparison = workers[1]["capability_comparison"]
+                self.assertEqual(comparison["status"], "missing")
+                self.assertEqual(comparison["missing_models"], [{
+                    "node_class": "Loader00", "input": "model_name", "name": "required.safetensors",
+                }])
+                self.assertEqual(comparison["extra_models"], [{
+                    "node_class": "Loader00", "input": "model_name", "name": "extra.safetensors",
+                }])
+
+    def test_model_comparison_preserves_exact_relative_paths_and_versions(self):
+        worker_caps = copy.deepcopy(self.primary_caps)
+        worker_caps["input_choices"]["CheckpointLoader"]["ckpt_name"] = []
+        _, workers = worker_capability_comparisons([
+            self.worker("primary", self.primary_caps, primary=True),
+            self.worker("worker", worker_caps),
+        ])
+        self.assertEqual(
+            [item["name"] for item in workers[1]["capability_comparison"]["missing_models"]],
+            ["models/v1/model.safetensors", "models/v2/model.safetensors"],
+        )
+
+    def test_model_available_in_other_input_does_not_hide_selector_mismatch(self):
+        primary_caps = copy.deepcopy(self.primary_caps)
+        primary_caps["input_choices"]["CheckpointLoader"]["model_name"] = [
+            "models/v2/model.safetensors",
+        ]
+        worker_caps = copy.deepcopy(primary_caps)
+        worker_caps["input_choices"]["CheckpointLoader"]["ckpt_name"] = [
+            "models/v1/model.safetensors",
+        ]
+        _, workers = worker_capability_comparisons([
+            self.worker("primary", primary_caps, primary=True),
+            self.worker("worker", worker_caps),
+        ])
+        comparison = workers[1]["capability_comparison"]
+        self.assertEqual(comparison["status"], "missing")
+        self.assertEqual(comparison["missing_models"], [{
+            "node_class": "CheckpointLoader", "input": "ckpt_name",
+            "name": "models/v2/model.safetensors",
+        }])
+
     def test_missing_or_ambiguous_primary_never_claims_a_complete_inventory(self):
         worker = self.worker("worker", self.primary_caps)
         baseline, compared = worker_capability_comparisons([worker])

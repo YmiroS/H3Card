@@ -199,10 +199,12 @@ def _capability_comparison(primary_capabilities, primary_models, worker_capabili
         status = "complete"
 
     def model_items(items):
-        return [
-            {"node_class": node_class, "input": input_name, "name": name}
-            for node_class, input_name, name in sorted(items)
-        ]
+        models = {}
+        # 同一文件可出现在多个节点参数中；展示清单按精确相对路径去重，保留稳定的代表项。
+        for node_class, input_name, name in sorted(items):
+            if name not in models:
+                models[name] = {"node_class": node_class, "input": input_name, "name": name}
+        return list(models.values())
 
     return {
         "status": status,

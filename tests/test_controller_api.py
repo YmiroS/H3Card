@@ -2001,21 +2001,31 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         primary_caps = {
             "agent_version": 5,
             "is_primary_node": True,
-            "node_classes": ["CheckpointLoader", "KSampler"],
+            "node_classes": ["CheckpointLoader", "UNETLoader", "KSampler"],
             "input_choices": {
                 "CheckpointLoader": {
                     "ckpt_name": ["models/v1.safetensors", "models/v2.safetensors"],
                 },
+                "UNETLoader": {
+                    "unet_name": ["models/v1.safetensors", "models/v2.safetensors"],
+                },
             },
-            "input_types": {"CheckpointLoader": {"ckpt_name": "COMBO"}},
+            "input_types": {
+                "CheckpointLoader": {"ckpt_name": "COMBO"},
+                "UNETLoader": {"unet_name": "COMBO"},
+            },
         }
         worker_caps = {
             "agent_version": 4,
-            "node_classes": ["CheckpointLoader"],
+            "node_classes": ["CheckpointLoader", "UNETLoader"],
             "input_choices": {
                 "CheckpointLoader": {"ckpt_name": ["models/v1.safetensors"]},
+                "UNETLoader": {"unet_name": ["models/v1.safetensors"]},
             },
-            "input_types": {"CheckpointLoader": {"ckpt_name": "COMBO"}},
+            "input_types": {
+                "CheckpointLoader": {"ckpt_name": "COMBO"},
+                "UNETLoader": {"unet_name": "COMBO"},
+            },
         }
         primary = self.store.register_worker("gpu-primary", primary_caps)
         worker = self.store.register_worker("gpu-worker", worker_caps)
