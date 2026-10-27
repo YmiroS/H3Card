@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import hashlib
 import json
 import re
@@ -942,6 +943,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_get("/api/cards", controller_app.api_cards)
         application.router.add_post("/api/reload", controller_app.api_reload)
         application.router.add_get("/api/jobs", controller_app.api_jobs)
+        application.router.add_get("/api/jobs/history", controller_app.api_jobs_history)
         application.router.add_get("/api/job/{pid}", controller_app.api_job)
         application.router.add_post("/api/jobs/clear", controller_app.api_jobs_clear)
         application.router.add_post("/api/job/{pid}/cancel", controller_app.api_cancel)
@@ -2278,6 +2280,157 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         for job in (jobs[0], jobs[-1]):
             self.assertEqual(job["submitter_username"], "admin")
             self.assertEqual(job["nodeName"], "历史执行端")
+        paged, cursor = [], None
+        while True:
+            params = {"limit": 100}
+            if cursor:
+                params["cursor"] = cursor
+            page = await (await self.client.get("/api/jobs/history", params=params)).json()
+            self.assertLessEqual(len(page["jobs"]), 100)
+            self.assertEqual(page["total"], 1001)
+            paged.extend(page["jobs"])
+            cursor = page["next_cursor"]
+            if cursor is None:
+                break
+        self.assertEqual([job["id"] for job in paged], [job["id"] for job in jobs])
+
+    async def test_database_only_history_keyset_pages_merge_live_without_requeue(self):
+        records = [(f"archive-{index:04}", json.dumps({"capability": "zimage_t2i",
+                    "graph": {"private": "must not be returned"}}), "done", 100, 100)
+                   for index in range(205)]
+        with self.store.db:
+            self.store.db.executemany(
+                "INSERT INTO dispatch_jobs(job_id,payload_json,status,created_at,updated_at) "
+                "VALUES(?,?,?,?,?)", records)
+        controller_app.JOBS["archive-0000"] = {
+            "id": "archive-0000", "created": 100, "status": "running", "progress": .25,
+        }
+        controller_app.JOBS["memory-only"] = {
+            "id": "memory-only", "created": 100, "status": "done",
+        }
+        self.register_job("archive-0204")
+        self.ledger.record_job({"id": "archive-0204", "created": 100, "status": "done",
+                               "capability": "zimage_t2i", "project": "p",
+                               "projectName": "历史画布", "card": "old-card", "cardName": "数据库卡片"})
+        before_jobs = dict(controller_app.JOBS)
+        before_dispatch = [tuple(row) for row in self.store.db.execute("SELECT * FROM dispatch_jobs")]
+        before_ledger = [tuple(row) for row in self.ledger.db.execute("SELECT * FROM cost_events")]
+        self.store.db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        statements = []
+        self.store.db.set_trace_callback(statements.append)
+        jobs, cursor = [], None
+        with mock.patch.object(controller_app, "save_jobs", side_effect=AssertionError("history wrote jobs")), \
+             mock.patch.object(self.store, "enqueue", side_effect=AssertionError("archive requeued")):
+            while True:
+                params = {"limit": "50"}
+                if cursor:
+                    params["cursor"] = cursor
+                response = await self.client.get("/api/jobs/history", params=params)
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertIn("no-store", response.headers["Cache-Control"])
+                page = await response.json()
+                self.assertLessEqual(len(page["jobs"]), 50)
+                self.assertEqual(page["total"], 206)
+                jobs.extend(page["jobs"])
+                self.assertEqual(page["has_more"], page["next_cursor"] is not None)
+                cursor = page["next_cursor"]
+                if cursor is None:
+                    break
+        self.store.db.set_trace_callback(None)
+        self.assertEqual(len(jobs), 206)
+        self.assertEqual(len({job["id"] for job in jobs}), 206)
+        self.assertEqual([job["id"] for job in jobs], sorted(
+            ["memory-only", *[row[0] for row in records]], reverse=True))
+        by_id = {job["id"]: job for job in jobs}
+        self.assertEqual(by_id["archive-0000"]["status"], "running")
+        self.assertEqual(by_id["archive-0000"]["progress"], .25)
+        archived = by_id["archive-0204"]
+        self.assertTrue(archived["history_only"])
+        self.assertEqual(archived["permission"], "read")
+        self.assertEqual(archived["cardName"], "数据库卡片")
+        self.assertEqual(archived["projectName"], "历史画布")
+        self.assertEqual(archived["submitter_username"], "admin")
+        for key in ("graph", "payload_json", "outputs", "progress", "error", "started", "ended"):
+            self.assertNotIn(key, archived)
+        self.assertTrue(all("SELECT * FROM dispatch_jobs" not in sql for sql in statements))
+        self.assertEqual(controller_app.JOBS, before_jobs)
+        self.assertEqual([tuple(row) for row in self.store.db.execute("SELECT * FROM dispatch_jobs")], before_dispatch)
+        self.assertEqual([tuple(row) for row in self.ledger.db.execute("SELECT * FROM cost_events")], before_ledger)
+        self.assertEqual((await self.client.post("/api/job/archive-0204/cancel")).status, 403)
+        self.assertEqual((await self.client.delete("/api/job/archive-0204")).status, 403)
+        self.assertEqual((await (await self.client.post("/api/jobs/clear")).json())["removed"], 0)
+        self.assertEqual(self.store.dispatch_status("archive-0204"), "done")
+
+    async def test_history_cursor_is_stable_with_new_jobs_and_filters_old_errors(self):
+        with self.store.db:
+            self.store.db.executemany(
+                "INSERT INTO dispatch_jobs(job_id,payload_json,status,created_at,updated_at) "
+                "VALUES(?, '{}', ?, ?, 1)",
+                [(f"db-{index:03}", "error" if index < 2 else "done", index)
+                 for index in range(120)])
+        first = await (await self.client.get("/api/jobs/history?limit=50")).json()
+        controller_app.JOBS["new-arrival"] = {"id": "new-arrival", "created": 1000, "status": "queued"}
+        collected = first["jobs"][:]
+        cursor = first["next_cursor"]
+        while cursor:
+            page = await (await self.client.get("/api/jobs/history", params={"limit": 50, "cursor": cursor})).json()
+            collected.extend(page["jobs"])
+            cursor = page["next_cursor"]
+        self.assertEqual([job["id"] for job in collected], [f"db-{i:03}" for i in reversed(range(120))])
+        filtered = await (await self.client.get("/api/jobs/history?status=error&limit=1")).json()
+        self.assertEqual(filtered["total"], 2)
+        self.assertEqual([job["id"] for job in filtered["jobs"]], ["db-001"])
+        second = await (await self.client.get("/api/jobs/history", params={
+            "status": "error", "cursor": filtered["next_cursor"]})).json()
+        self.assertEqual([job["id"] for job in second["jobs"]], ["db-000"])
+        self.assertFalse(second["has_more"])
+        for params in ({"limit": 0}, {"limit": 101}, {"limit": "x"}, {"status": "invalid"},
+                       {"cursor": "invalid"}, {"cursor": filtered["next_cursor"], "status": "all"}):
+            self.assertEqual((await self.client.get("/api/jobs/history", params=params)).status, 400)
+        for role in ("user", "monitor"):
+            self.auth.create_user(f"history-denied-{role}", auth_support.PASSWORD, role=role)
+            self.client.session.headers.update(await self.login(f"history-denied-{role}"))
+            self.assertEqual((await self.client.get("/api/jobs/history")).status, 403)
+
+    async def test_history_rejects_unbindable_cursor_values_as_bad_requests(self):
+        for created, jid in ((1 << 63, "id"), (-(1 << 63) - 1, "id"), (10, "\ud800")):
+            cursor = base64.urlsafe_b64encode(json.dumps([created, jid, "all"]).encode()).decode()
+            response = await self.client.get("/api/jobs/history", params={"cursor": cursor})
+            self.assertEqual(response.status, 400, await response.text())
+        for created in (-(1 << 63), (1 << 63) - 1):
+            cursor = base64.urlsafe_b64encode(json.dumps([created, "id", "all"]).encode()).decode()
+            response = await self.client.get("/api/jobs/history", params={"cursor": cursor})
+            self.assertEqual(response.status, 200, await response.text())
+
+    async def test_history_does_not_resurrect_cleared_dispatch_or_api_billing_events(self):
+        self.ledger.record_job({"id": "already-cleared", "created": 1,
+                               "status": "done", "capability": "zimage_t2i"})
+        self.ledger.record_api("text", "test-only", 1, 1, 10)
+        with self.store.db:
+            self.store.db.executemany(
+                "INSERT INTO dispatch_jobs(job_id,payload_json,status,created_at,updated_at) "
+                "VALUES(?, '{}', ?, 1, 1)",
+                [("assigned-only", "assigned"), ("cancel-pending-only", "cancel_requested")])
+        page = await (await self.client.get("/api/jobs/history")).json()
+        self.assertEqual(page["total"], 2)
+        self.assertEqual({job["id"] for job in page["jobs"]}, {"assigned-only", "cancel-pending-only"})
+        queued = await (await self.client.get("/api/jobs/history?status=queued")).json()
+        running = await (await self.client.get("/api/jobs/history?status=running")).json()
+        self.assertEqual(queued["jobs"][0]["status"], "queued")
+        self.assertEqual(running["jobs"][0]["status"], "running")
+        self.assertTrue(queued["jobs"][0]["history_only"])
+        self.assertNotIn("progress", running["jobs"][0])
+
+    async def test_local_history_pages_do_not_require_distributed_database(self):
+        controller_app.JOBS.update({f"local-{i}": {"id": f"local-{i}", "created": i,
+                                                   "status": "done"} for i in range(3)})
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+             mock.patch.object(controller_app, "distributed_store", side_effect=AssertionError("local DB read")):
+            page = await (await self.client.get("/api/jobs/history?limit=2")).json()
+            self.assertEqual([job["id"] for job in page["jobs"]], ["local-2", "local-1"])
+            self.assertEqual(page["total"], 3)
+            self.assertTrue(page["has_more"])
+            self.assertTrue(all(job["nodeName"] == "本机" for job in page["jobs"]))
 
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
         self.own_project("project-1")

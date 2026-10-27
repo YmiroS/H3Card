@@ -401,6 +401,10 @@ class DistributedStore:
                     ON dispatch_jobs(status, created_at);
                 CREATE INDEX IF NOT EXISTS idx_dispatch_worker
                     ON dispatch_jobs(worker_id, status);
+                CREATE INDEX IF NOT EXISTS idx_dispatch_history
+                    ON dispatch_jobs(created_at DESC, job_id DESC);
+                CREATE INDEX IF NOT EXISTS idx_dispatch_status_history
+                    ON dispatch_jobs(status, created_at DESC, job_id DESC);
 
                 CREATE TABLE IF NOT EXISTS worker_temperature_samples (
                     worker_id TEXT NOT NULL,
@@ -432,6 +436,76 @@ class DistributedStore:
             for name, definition in sync_columns.items():
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE workers ADD COLUMN {name} {definition}")
+
+    def job_history_page(self, live_jobs, *, limit, status="all", before=None):
+        """Read a bounded dispatch archive page; never restore it into the execution queue."""
+        live = [{"id": job["id"], "created": job["created"], "status": job["status"]}
+                for job in live_jobs]
+        live_json = _json(live)
+        status_groups = {"queued": ("queued", "assigned"),
+                         "running": ("running", "cancel_requested")}
+        statuses = status_groups.get(status, (status,))
+        where = ["d.job_id NOT IN (SELECT json_extract(value, '$.id') FROM json_each(?))"]
+        params = [live_json]
+        if status != "all":
+            where.append(f"d.status IN ({','.join('?' for _ in statuses)})")
+            params.extend(statuses)
+        count_where = " AND ".join(where)
+        count_params = list(params)
+        if before is not None:
+            where.append("(d.created_at, d.job_id) < (?, ?)")
+            params.extend(before)
+        # Limit the indexed dispatch scan BEFORE reading ledger metadata or payload JSON.
+        with self.lock:
+            total = self.db.execute(
+                f"SELECT COUNT(*) FROM dispatch_jobs d WHERE {count_where}", count_params
+            ).fetchone()[0]
+            rows = self.db.execute(
+                f"""SELECT d.job_id, d.created_at, d.status FROM dispatch_jobs d
+                    WHERE {' AND '.join(where)}
+                    ORDER BY d.created_at DESC, d.job_id DESC LIMIT ?""",
+                (*params, limit + 1),
+            ).fetchall()
+            candidates = [{"id": row["job_id"], "created": row["created_at"],
+                           "status": {"assigned": "queued", "cancel_requested": "running"}.get(
+                               row["status"], row["status"])} for row in rows]
+            matching_live = [job for job in live if status == "all" or job["status"] == status]
+            total += len(matching_live)
+            candidates.extend(job for job in matching_live
+                              if before is None or (job["created"], job["id"]) < before)
+            candidates.sort(key=lambda job: (job["created"], job["id"]), reverse=True)
+            has_more = len(candidates) > limit
+            page = candidates[:limit]
+            has_ledger = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='cost_events'"
+            ).fetchone() is not None
+            ledger_join = ("LEFT JOIN cost_events c ON c.job_id=d.job_id AND c.event_kind='generation'"
+                           if has_ledger else "")
+            ledger_columns = (", c.project_id, c.project_name, c.card_id, c.card_name, "
+                              "c.started_at, c.ended_at" if has_ledger else "")
+            capability_sql = "json_extract(d.payload_json, '$.capability')"
+            if has_ledger:
+                capability_sql = f"COALESCE(NULLIF(c.capability, ''), {capability_sql})"
+            # A page, not the entire archive, is bound into this metadata query.
+            if page:
+                metadata = self.db.execute(
+                    f"""SELECT d.job_id, {capability_sql} AS capability
+                        {ledger_columns} FROM dispatch_jobs d {ledger_join}
+                        WHERE d.job_id IN ({','.join('?' for _ in page)})""",
+                    [job["id"] for job in page],
+                ).fetchall()
+                by_id = {row["job_id"]: dict(row) for row in metadata}
+                for job in page:
+                    row = by_id.get(job["id"], {})
+                    for source, target in (("project_id", "project"), ("project_name", "projectName"),
+                                           ("card_id", "card"), ("card_name", "cardName"),
+                                           ("started_at", "started"), ("ended_at", "ended")):
+                        if row.get(source) is not None:
+                            job[target] = row[source]
+                    capability = row.get("capability")
+                    if capability:
+                        job["capability"] = capability
+        return page, has_more, total
 
     def register_worker(self, name, capabilities=None):
         now = time.time()

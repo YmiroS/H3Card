@@ -12,6 +12,8 @@
 启动：  chouka\\启动抽卡系统.bat
 """
 import asyncio
+import base64
+import binascii
 import copy
 import hmac
 import hashlib
@@ -1868,6 +1870,75 @@ async def api_jobs(request):
     ]})
 
 
+async def api_jobs_history(request):
+    require_admin(request)
+    status = request.query.get("status", "all")
+    if status not in {"all", "queued", "running", "done", "error", "canceled"}:
+        raise web.HTTPBadRequest(text="非法任务状态")
+    try:
+        limit = int(request.query.get("limit", "50"))
+        if not 1 <= limit <= 100:
+            raise ValueError
+    except ValueError:
+        raise web.HTTPBadRequest(text="分页大小必须在 1–100 之间")
+    before = None
+    cursor = request.query.get("cursor")
+    if cursor is not None:
+        try:
+            if len(cursor) > 1024:
+                raise ValueError
+            created, jid, cursor_status = json.loads(base64.b64decode(
+                cursor + "=" * (-len(cursor) % 4), altchars=b"-_", validate=True))
+            if (isinstance(created, bool) or not isinstance(created, (int, float))
+                    or not math.isfinite(created) or not isinstance(jid, str)
+                    or not jid or cursor_status != status
+                    or (isinstance(created, int) and not -(1 << 63) <= created < (1 << 63))):
+                raise ValueError
+            jid.encode("utf-8")
+            before = (created, jid)
+        except (ValueError, TypeError, OverflowError, binascii.Error, UnicodeError):
+            raise web.HTTPBadRequest(text="非法历史分页游标")
+    # Snapshot current jobs only. Archived rows must never enter JOBS/save_jobs/dispatch.
+    live = {jid: dict(job) for jid, job in JOBS.items()}
+    if CONTROLLER_MODE:
+        page, has_more, total = await asyncio.to_thread(
+            distributed_store(request.app).job_history_page, list(live.values()),
+            limit=limit, status=status, before=before)
+    else:
+        matching = sorted((job for job in live.values()
+                           if status == "all" or job["status"] == status),
+                          key=lambda job: (job["created"], job["id"]), reverse=True)
+        total = len(matching)
+        candidates = [job for job in matching
+                      if before is None or (job["created"], job["id"]) < before]
+        has_more = len(candidates) > limit
+        page = candidates[:limit]
+    next_cursor = None
+    if has_more and page:
+        last = page[-1]
+        next_cursor = base64.urlsafe_b64encode(json.dumps(
+            [last["created"], last["id"], status], separators=(",", ":")
+        ).encode()).decode().rstrip("=")
+    jobs = []
+    for item in page:
+        current = live.get(item["id"])
+        if current is not None:
+            permission = await job_permission(request, item["id"])
+            jobs.append(item | current | {"permission": permission or "read"})
+        else:
+            jobs.append(item | {"history_only": True, "permission": "read"})
+    nodes = job_node_names(request.app, jobs)
+    submitters = await job_submitter_info(request, jobs)
+    queue = job_queue_snapshot(request.app, jobs)
+    response = web.json_response({
+        "jobs": [job | job_display_info(job, nodes.get(job["id"]))
+                 | submitters.get(job["id"], {}) | queue[job["id"]] for job in jobs],
+        "next_cursor": next_cursor, "has_more": has_more, "total": total,
+    })
+    response.headers["Cache-Control"] = "no-store"
+    return response
+
+
 LIVE = ("queued", "running")
 JOBS_FILE = ROOT / "data" / "jobs.json"
 
@@ -2422,6 +2493,8 @@ async def cancel_local_and_release(app, pid):
 
 async def check_task_mutation(request, pid):
     await authorized_job(request, pid, operate=True)
+    if pid not in JOBS:
+        raise web.HTTPForbidden(text="归档历史任务为只读")
     if (not CONTROLLER_MODE and JOBS.get(pid, {}).get("status") == "running"
             and require_user(request)["role"] != "admin"):
         raise web.HTTPConflict(text="本地执行器仅支持全局中断，请由管理员取消运行中的任务")
@@ -3859,7 +3932,8 @@ def make_app(auth_path=None, *, project_repository=None):
     register_generation_routes(
         app, api_health=api_health, api_status=api_status, api_cards=api_cards,
         api_reload=api_reload, api_generate=api_generate, api_rewrite=api_rewrite,
-        api_text=api_text, api_jobs=api_jobs, api_jobs_clear=api_jobs_clear,
+        api_text=api_text, api_jobs=api_jobs, api_jobs_history=api_jobs_history,
+        api_jobs_clear=api_jobs_clear,
         api_job=api_job, api_cancel=api_cancel, api_job_delete=api_job_delete)
     register_media_routes(
         app, api_upload=api_upload, api_preview_file=api_preview_file,

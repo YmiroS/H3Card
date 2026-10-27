@@ -18,6 +18,7 @@ import{reactExports as e,HttpClient as b,errorMessage as m,jsxRuntimeExports as 
 [hidden] { display: none !important; }\r
 \r
 :scope.auth-screen {\r
+  isolation: isolate;\r
   min-width: 280px;\r
   min-height: 100dvh;\r
   background: var(--auth-bg);\r
