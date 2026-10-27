@@ -221,7 +221,7 @@ class ModelSummaryTests(unittest.TestCase):
     def test_real_seedvr_names_roles_and_vae_separation(self):
         for graph, name, precision in (
                 ("seedvr2_image_up", "seedvr2_ema_3b_fp8_e4m3fn.safetensors", "FP8"),
-                ("seedvr2_video_up", "seedvr2_ema_3b_fp16.safetensors", "FP16")):
+                ("seedvr2_video_up", "seedvr2_ema_7b_fp16.safetensors", "FP16")):
             with self.subTest(graph=graph):
                 self.assertEqual(model_summary_from_graph(self.real_graph(graph)), {
                     "models": [{"name": name, "role": "放大模型", "precision": precision,
