@@ -2,6 +2,7 @@ import asyncio
 import hashlib
 import json
 import re
+import sqlite3
 import sys
 import tempfile
 import threading
@@ -941,6 +942,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_get("/api/cards", controller_app.api_cards)
         application.router.add_post("/api/reload", controller_app.api_reload)
         application.router.add_get("/api/jobs", controller_app.api_jobs)
+        application.router.add_get("/api/job/{pid}", controller_app.api_job)
+        application.router.add_post("/api/jobs/clear", controller_app.api_jobs_clear)
         application.router.add_post("/api/job/{pid}/cancel", controller_app.api_cancel)
         application.router.add_delete("/api/job/{pid}", controller_app.api_job_delete)
         application.router.add_post("/api/generate", controller_app.api_generate)
@@ -2177,6 +2180,104 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         health = await (await self.client.get("/api/health")).json()
         self.assertFalse(health["maintenance_active"])
         self.assertTrue(health["comfy_online"])
+
+    async def test_admin_lists_all_users_history_beyond_sixty_without_user_leaks(self):
+        alice = self.auth.create_user("history-alice", auth_support.PASSWORD)
+        bob = self.auth.create_user("history-bob", auth_support.PASSWORD)
+        for owner in (alice, bob):
+            project = owner["username"]
+            self.own_project(project, owner=owner)
+            for index in range(75):
+                jid = f"{project}-{index}"
+                self.register_job(jid, project, owner)
+                controller_app.JOBS[jid] = {
+                    "id": jid, "project": project, "created": index,
+                    "status": "done", "capability": "zimage_t2i", "name": "历史任务",
+                }
+        response = await self.client.get("/api/jobs")
+        self.assertEqual(response.status, 200, await response.text())
+        jobs = (await response.json())["jobs"]
+        self.assertEqual(len(jobs), 150)
+        self.assertEqual([job["created"] for job in jobs], sorted(
+            [job["created"] for job in jobs], reverse=True))
+        self.assertEqual({job["submitter_username"] for job in jobs}, {
+            alice["username"], bob["username"],
+        })
+        self.assertTrue(all(job["permission"] == "operate" for job in jobs))
+
+        headers = await self.login(alice["username"])
+        self.client.session.headers.update(headers)
+        jobs = (await (await self.client.get("/api/jobs")).json())["jobs"]
+        self.assertEqual(len(jobs), 60)
+        self.assertTrue(all(job["project"] == alice["username"] for job in jobs))
+        self.assertTrue(all("submitter_username" not in job for job in jobs))
+        self.assertEqual((await self.client.get(f"/api/job/{bob['username']}-0")).status, 404)
+
+        self.auth.create_user("history-monitor", auth_support.PASSWORD, role="monitor")
+        self.client.session.headers.update(await self.login("history-monitor"))
+        self.assertEqual((await self.client.get("/api/jobs")).status, 403)
+
+    async def test_admin_reads_orphaned_and_deleted_project_history_without_mutation(self):
+        self.own_project("deleted-history")
+        self.register_job("deleted-job", "deleted-history")
+        self.auth.set_project_state("deleted-history", "deleted")
+        for jid in ("orphan-job", "deleted-job"):
+            controller_app.JOBS[jid] = {
+                "id": jid, "created": 1, "status": "done", "capability": "zimage_t2i",
+            }
+        jobs = (await (await self.client.get("/api/jobs")).json())["jobs"]
+        self.assertEqual({job["id"] for job in jobs}, {"orphan-job", "deleted-job"})
+        self.assertTrue(all(job["permission"] == "read" for job in jobs))
+        for jid in ("orphan-job", "deleted-job"):
+            response = await self.client.get(f"/api/job/{jid}")
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual((await response.json())["permission"], "read")
+            self.assertEqual((await self.client.post(f"/api/job/{jid}/cancel")).status, 403)
+            self.assertEqual((await self.client.delete(f"/api/job/{jid}")).status, 403)
+        response = await self.client.post("/api/jobs/clear")
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())["removed"], 0)
+        self.assertEqual(set(controller_app.JOBS), {"orphan-job", "deleted-job"})
+        self.assertEqual((await self.client.get("/api/job/does-not-exist")).status, 404)
+
+        self.auth.create_user("history-reader", auth_support.PASSWORD)
+        self.client.session.headers.update(await self.login("history-reader"))
+        self.assertEqual((await (await self.client.get("/api/jobs")).json())["jobs"], [])
+        for jid in ("orphan-job", "deleted-job"):
+            self.assertEqual((await self.client.get(f"/api/job/{jid}")).status, 404)
+
+    async def test_all_retained_history_survives_save_and_reload_beyond_sixty(self):
+        jobs_file = Path(self.temp.name) / "all-history.json"
+        for index in range(1001):
+            jid = f"history-{index}"
+            controller_app.JOBS[jid] = {
+                "id": jid, "created": index, "status": "done", "capability": "zimage_t2i",
+            }
+        worker = self.store.register_worker("历史执行端", {})["worker_id"]
+        for jid in ("history-0", "history-1000"):
+            self.register_job(jid)
+            self.store.enqueue(jid, {"capability": "zimage_t2i", "graph": {}})
+            with self.store.db:
+                self.store.db.execute(
+                    "UPDATE dispatch_jobs SET worker_id=?,status='done' WHERE job_id=?", (worker, jid))
+        self.auth.db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        self.store.db.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)
+        with mock.patch.object(controller_app, "JOBS_FILE", jobs_file):
+            self.old_save_jobs()
+            saved = json.loads(jobs_file.read_text(encoding="utf-8"))
+            self.assertEqual(len(saved), 1001)
+            self.assertEqual(saved[-1]["id"], "history-0")
+            controller_app.JOBS.clear()
+            controller_app.load_jobs()
+        response = await self.client.get("/api/jobs")
+        self.assertEqual(response.status, 200, await response.text())
+        jobs = (await response.json())["jobs"]
+        self.assertEqual(len(jobs), 1001)
+        self.assertEqual(jobs[0]["id"], "history-1000")
+        self.assertEqual(jobs[-1]["id"], "history-0")
+        for job in (jobs[0], jobs[-1]):
+            self.assertEqual(job["submitter_username"], "admin")
+            self.assertEqual(job["nodeName"], "历史执行端")
 
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
         self.own_project("project-1")

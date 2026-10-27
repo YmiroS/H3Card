@@ -155,6 +155,7 @@ class ModelDispatchTest(unittest.TestCase):
                     mock.patch.object(host, 'JOBS', jobs), \
                     mock.patch.object(host, 'distributed_store', return_value=store), \
                     mock.patch.object(host, 'job_permission', side_effect=permission), \
+                    mock.patch.object(host, 'require_user', return_value={'role': 'user'}), \
                     mock.patch.object(host, 'job_node_names', return_value={}), \
                     mock.patch.object(host, 'job_submitter_info', new=mock.AsyncMock(return_value={})):
                 listing = json.loads((await host.api_jobs(request)).text)['jobs']

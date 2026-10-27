@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import shutil
 import sys
+import time
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -19,9 +20,10 @@ async def main():
     fixture = AuthFixture()
     fixture.auth_setup()
     fixture.auth.create_user('monitor', PASSWORD, role='monitor')
-    fixture.auth.create_user('artist', PASSWORD)
+    artist = fixture.auth.create_user('artist', PASSWORD)
     fixture.auth.db.execute("UPDATE users SET phone='13800138000'")
     fixture.own_project('browser', '整合验收画布')
+    fixture.own_project('artist-history', '其他用户历史画布', owner=artist)
     # Real business persistence is isolated; only immutable compiled code stays in
     # the checkout. In particular the runtime has no fixture.root/web directory.
     shutil.copyfile(ROOT / 'pricing.json', fixture.root / 'pricing.json')
@@ -48,7 +50,24 @@ async def main():
             stack.enter_context(mock.patch.object(controller_app, 'ws_loop', new=mock.AsyncMock()))
             stack.enter_context(mock.patch.object(controller_app, 'setup_dingtalk', return_value=None))
             stack.enter_context(mock.patch.object(controller_app, 'load_jobs', return_value=None))
+            stack.enter_context(mock.patch.object(controller_app, 'JOBS_FILE', fixture.root / 'data' / 'jobs.json'))
             stack.enter_context(mock.patch.dict(controller_app.JOBS, {}, clear=True))
+            now = time.time()
+            for index in range(75):
+                jid = f'history-{index}'
+                owner = artist if index % 2 else fixture.admin
+                project = 'artist-history' if index % 2 else 'browser'
+                fixture.register_job(jid, project, owner)
+                controller_app.JOBS[jid] = {
+                    'id': jid, 'project': project, 'created': now - index,
+                    'status': 'error' if index > 60 else 'done',
+                    'capability': 'zimage_t2i', 'name': '历史模式', 'cardName': f'历史卡片{index}',
+                    'error': f'历史错误{index}' if index > 60 else None,
+                }
+            controller_app.JOBS['orphan-history'] = {
+                'id': 'orphan-history', 'created': now - 100, 'status': 'done',
+                'capability': 'zimage_t2i', 'name': '无归属历史',
+            }
             application = controller_app.make_app(
                 auth_path=fixture.root / 'data' / 'auth.db', project_repository=fixture.projects)
             server = TestServer(application, host='127.0.0.1')

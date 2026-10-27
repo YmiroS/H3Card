@@ -65,6 +65,16 @@ test('compiled React and management pages share Python auth without any old web 
       await page.goto(service.origin + '/?project=browser');
       await page.locator('#ptitle').filter({hasText:'整合验收画布'}).waitFor({state:'visible'});
       assert.equal(await page.locator('#world').count(), 1);
+      const adminHistory = (await (await page.request.get(service.origin + '/api/jobs')).json()).jobs;
+      assert.equal(adminHistory.length, 76);
+      assert.equal(adminHistory.find(job => job.id === 'orphan-history').permission, 'read');
+      assert.deepEqual([...new Set(adminHistory.map(job => job.submitter_username).filter(Boolean))].sort(),
+        ['admin', 'artist']);
+      await page.locator('#jobsbtn').click();
+      await page.waitForFunction(() => document.querySelectorAll('#jobs .jrow').length === 76);
+      assert.match(await page.locator('#jobs .jrow').last().textContent(), /无归属历史/);
+      assert.match(await page.locator('#jobs').textContent(), /历史卡片74/);
+      await page.locator('#jobs .x').click();
       page.once('dialog', dialog => dialog.accept('整合验收已保存'));
       const renamed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/projects/browser/rename');
       await page.locator('#plist .pitem .ren').click();
@@ -131,6 +141,17 @@ test('compiled React and management pages share Python auth without any old web 
             : url === '/admin/permissions' ? '#users'
             : url === '/controller/capacity' ? '#main-content' : '#main';
           await page.locator(selector).waitFor({state:'visible'});
+          if (url === '/controller') {
+            await page.waitForFunction(() => document.querySelectorAll('#job-rows tr').length === 76);
+            assert.match(await page.locator('#job-note').textContent(), /系统保留 76 条记录/);
+            await page.locator('#jobs-filter').selectOption('error');
+            await page.waitForFunction(() => document.querySelectorAll('#job-rows tr').length === 14);
+            assert.match(await page.locator('#job-rows tr').first().textContent(), /history-61/);
+            assert.match(await page.locator('#job-rows tr').last().textContent(), /history-74/);
+            const screenshot = path.join(require('node:os').tmpdir(), `controller-global-history-${process.pid}.png`);
+            await page.screenshot({path:screenshot, fullPage:true});
+            console.log('History browser evidence: ' + screenshot);
+          }
           assert.equal(await page.locator('#root').count(), 1, url + ' must mount its React root');
           assert.equal(await page.evaluate(() => ['H3Auth', 'H3Notify', 'AdminUI', 'MonitorAlerts']
             .some(name => Reflect.has(window, name))), false, url + ' must not load inherited admin globals');
@@ -172,6 +193,15 @@ test('compiled React and management pages share Python auth without any old web 
       });
       assert.equal(artistLogin.status(), 200);
       const artistSession = await artistLogin.json();
+      const artistHistory = (await (await page.request.get(service.origin + '/api/jobs')).json()).jobs;
+      assert.equal(artistHistory.length, 37);
+      assert.ok(artistHistory.every(job => job.project === 'artist-history'));
+      assert.ok(artistHistory.every(job => !Object.hasOwn(job, 'submitter_username')));
+      await page.goto(service.origin + '/?project=artist-history');
+      await page.locator('#jobsbtn').click();
+      await page.waitForFunction(() => document.querySelectorAll('#jobs .jrow').length === 37);
+      assert.equal(await page.locator('#jobs .jowner').count(), 0);
+      assert.equal((await page.request.get(service.origin + '/api/job/orphan-history')).status(), 404);
       for (const url of [...adminPages, '/monitor', '/api/admin/users', '/api/workers', '/api/costs', '/api/capacity']) {
         assert.equal((await page.request.get(service.origin + url)).status(), 403, url);
       }

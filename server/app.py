@@ -1769,9 +1769,13 @@ async def job_permission(request, jid):
     user = require_user(request)
     acl = await call_store(request.app, "get_job", jid)
     if acl:
-        return await call_store(request.app, "project_permission", user["id"], acl["project_id"])
-    if user["role"] == "admin" and await resource_call(request.app, "is_legacy_job", jid):
+        permission = await call_store(request.app, "project_permission", user["id"], acl["project_id"])
+        if permission:
+            return permission
+    elif user["role"] == "admin" and await resource_call(request.app, "is_legacy_job", jid):
         return "operate"
+    if user["role"] == "admin" and jid in JOBS:
+        return "read"
     return None
 
 
@@ -1793,14 +1797,23 @@ def job_display_info(job, node_name):
 
 def job_node_names(app, jobs):
     if CONTROLLER_MODE:
-        return distributed_store(app).job_worker_names(job["id"] for job in jobs)
+        names = {}
+        # 全量历史可能超过 SQLite 单条 IN 查询的参数上限。
+        for start in range(0, len(jobs), 500):
+            names.update(distributed_store(app).job_worker_names(
+                job["id"] for job in jobs[start:start + 500]))
+        return names
     return {job["id"]: "本机" for job in jobs}
 
 
 async def job_submitter_info(request, jobs):
     if require_user(request)['role'] != 'admin':
         return {}
-    return await call_store(request.app, 'job_submitters', [job['id'] for job in jobs])
+    submitters = {}
+    for start in range(0, len(jobs), 500):
+        submitters.update(await call_store(
+            request.app, 'job_submitters', [job['id'] for job in jobs[start:start + 500]]))
+    return submitters
 
 
 def job_queue_snapshot(app, jobs):
@@ -1831,12 +1844,13 @@ async def api_job(request):
 
 
 async def api_jobs(request):
+    is_admin = require_user(request)["role"] == "admin"
     visible = []
     for job in sorted(list(JOBS.values()), key=lambda j: j["created"], reverse=True):
         permission = await job_permission(request, job["id"])
         if permission:
             visible.append((job, permission))
-        if len(visible) == 60:
+        if not is_admin and len(visible) == 60:
             break
     jobs = [job for job, _permission in visible]
     node_names = job_node_names(request.app, jobs)
@@ -2300,11 +2314,11 @@ def save_jobs():
 
     只在**状态变了**的时候写（新建 / 开跑 / 完成 / 失败 / 取消 / 删除），不跟着进度写：
     进度每秒十几条，而且重启之后那个数字毫无意义（活儿早断了）。
-    存的条数跟 `/api/jobs` 返回的一样是最近 60 条，不然文件会一直长。
+    保留全部尚未主动删除或清空的记录，避免重启后管理员只能看到最近 60 条。
     """
     try:
         JOBS_FILE.parent.mkdir(parents=True, exist_ok=True)
-        keep = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)[:60]
+        keep = sorted(JOBS.values(), key=lambda j: j["created"], reverse=True)
         JOBS_FILE.write_text(json.dumps(keep, ensure_ascii=False), encoding="utf-8")
     except OSError as e:
         print(f"[任务] 记录存盘失败（不影响出图）：{e}")
