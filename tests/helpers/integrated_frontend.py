@@ -21,6 +21,8 @@ async def main():
     fixture.auth_setup()
     fixture.auth.create_user('monitor', PASSWORD, role='monitor')
     artist = fixture.auth.create_user('artist', PASSWORD)
+    viewer = fixture.auth.create_user('viewer', PASSWORD)
+    fixture.auth.set_grant(viewer['id'], fixture.admin['id'], 'read')
     fixture.auth.db.execute("UPDATE users SET phone='13800138000'")
     fixture.own_project('browser', '整合验收画布')
     fixture.own_project('artist-history', '其他用户历史画布', owner=artist)

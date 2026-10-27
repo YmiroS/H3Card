@@ -246,6 +246,58 @@ test('compiled React and management pages share Python auth without any old web 
       assert.equal((await page.request.post(service.origin + '/api/auth/logout', {
         headers:{Origin:service.origin, 'X-CSRF-Token':artistSession.csrf_token},
       })).status(), 200);
+      const viewerLogin = await page.request.post(service.origin + '/api/auth/login', {
+        data:{username:'viewer', password}, headers:{Origin:service.origin},
+      });
+      assert.equal(viewerLogin.status(), 200);
+      const viewerSession = await viewerLogin.json();
+      const readProject = await (await page.request.get(service.origin + '/api/projects/browser')).json();
+      assert.equal(readProject.permission, 'read');
+      const viewerWrites = [];
+      const recordViewerWrite = request => {
+        const pathname = new URL(request.url()).pathname;
+        if (!['GET', 'HEAD'].includes(request.method()) &&
+          /^\/api\/(generate|upload|text|rewrite|projects)(\/|$)/.test(pathname)) viewerWrites.push(pathname);
+      };
+      page.on('request', recordViewerWrite);
+      await page.goto(service.origin + '/?project=browser');
+      await page.locator('#world .card .ch').click();
+      await page.locator('#panel [data-readonly-notice]').waitFor({state:'visible'});
+      const readonlyPrompt = page.locator('#panel textarea').first();
+      assert.equal(await readonlyPrompt.inputValue(), stored.params.prompt);
+      assert.equal(await readonlyPrompt.getAttribute('readonly'), '');
+      await readonlyPrompt.click();
+      await readonlyPrompt.press('ControlOrMeta+a');
+      await readonlyPrompt.press('Backspace');
+      assert.equal(await readonlyPrompt.inputValue(), stored.params.prompt);
+      assert.equal(await page.locator('#panel .go').isDisabled(), true);
+      for (const button of await page.locator('#panel .foot .tcap:not([data-readonly-view])').all()) {
+        assert.equal(await button.isDisabled(), true);
+      }
+      await page.locator('#panel button[title^="点开弹窗"]').click();
+      await page.locator('#respop [data-readonly-notice]').waitFor({state:'visible'});
+      assert.equal(await page.locator('#respop .cgrid.k .on').textContent(), '1080p');
+      for (const button of await page.locator('#respop button:not([data-readonly-view])').all()) {
+        assert.equal(await button.isDisabled(), true);
+      }
+      const readonlyScreenshot = path.join(require('node:os').tmpdir(), `readonly-card-parameters-${process.pid}.png`);
+      await page.screenshot({path:readonlyScreenshot, fullPage:true});
+      console.log('Readonly parameter browser evidence: ' + readonlyScreenshot);
+      await page.locator('#respop .x').click();
+      assert.deepEqual(viewerWrites, []);
+      page.off('request', recordViewerWrite);
+      assert.deepEqual(await (await page.request.get(service.origin + '/api/projects/browser')).json(), readProject);
+      const viewerHeaders = {Origin:service.origin, 'X-CSRF-Token':viewerSession.csrf_token};
+      assert.equal((await page.request.put(service.origin + '/api/projects/browser', {
+        headers:viewerHeaders, data:readProject,
+      })).status(), 403);
+      assert.equal((await page.request.post(service.origin + '/api/generate', {
+        headers:viewerHeaders,
+        data:{capability:stored.cap, project:'browser', card:stored.id, params:stored.params, assets:{}, dry_run:true},
+      })).status(), 403);
+      assert.equal((await page.request.post(service.origin + '/api/auth/logout', {
+        headers:viewerHeaders,
+      })).status(), 200);
       await page.goto(service.origin + '/login.html');
       await page.waitForURL(service.origin + '/login');
       await page.locator('input[name="username"]').fill('monitor');
