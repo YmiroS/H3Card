@@ -321,3 +321,107 @@ test('compiled React and management pages share Python auth without any old web 
       await service.close();
     }
   });
+
+test('compiled image crop persists and exports real PNG through isolated Python APIs',
+  {timeout:60000}, async () => {
+    const service = await startService();
+    let browser;
+    try {
+      browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER && process.env.CHOUKA_TEST_BROWSER !== 'chromium'
+        ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
+      const page = await browser.newPage();
+      const errors = [], generated = [];
+      page.on('pageerror', error => errors.push(error.message));
+      page.on('request', request => {
+        if (new URL(request.url()).pathname === '/api/generate') generated.push(request.url());
+      });
+      await page.route('**/*', route => new URL(route.request().url()).origin === service.origin
+        ? route.continue() : route.abort('blockedbyclient'));
+      const login = await page.request.post(service.origin + '/api/auth/login', {
+        data:{username:'admin', password}, headers:{Origin:service.origin},
+      });
+      assert.equal(login.status(), 200);
+      const session = await login.json();
+      const headers = {Origin:service.origin, 'X-CSRF-Token':session.csrf_token};
+      await page.goto(service.origin + '/?project=browser');
+      await page.locator('#ptitle').filter({hasText:'整合验收画布'}).waitFor({state:'visible'});
+      const source = Buffer.from(await page.evaluate(() => {
+        const canvas = document.createElement('canvas');
+        canvas.width = canvas.height = 8;
+        const ctx = canvas.getContext('2d');
+        ctx.fillStyle = 'red'; ctx.fillRect(0, 0, 8, 8);
+        ctx.fillStyle = 'lime'; ctx.fillRect(4, 0, 4, 4);
+        return canvas.toDataURL('image/png').split(',')[1];
+      }), 'base64');
+      const upload = await page.request.post(service.origin + '/api/upload?project=browser&local_only=1', {
+        headers, multipart:{file:{name:'crop-source.png', mimeType:'image/png', buffer:source}},
+      });
+      assert.equal(upload.status(), 200, await upload.text());
+      const uploaded = await upload.json(), asset = uploaded.files?.[0] || uploaded;
+      const created = await page.request.post(service.origin + '/api/projects/browser/cards', {
+        headers, data:{card:{id:'crop-browser', type:'card_tools', cap:'image_composite', x:100, y:50,
+          assets:{}, outputs:[], params:{composition:{version:1, width:64, height:64,
+            background:'transparent', layers:[{id:'one', name:'裁剪验收', asset,
+              x:8, y:8, width:32, height:24, angle:0, opacity:1, visible:true, locked:false}]}}}},
+      });
+      assert.equal(created.status(), 200, await created.text());
+      await page.reload();
+      const editor = page.locator('[data-image-composer]');
+      const crop = editor.locator('[data-image-crop]');
+      const open = async () => {
+        await page.locator('#world .card .ch').click();
+        await page.locator('#panel .go').click();
+        await editor.getByRole('button', {name:'保存编辑稿', exact:true}).waitFor({state:'visible'});
+        await editor.locator('[data-layer-id="one"] [data-layer-action="select"]').click();
+        await editor.getByRole('button', {name:'裁剪图片', exact:true}).click();
+        await crop.waitFor({state:'visible'});
+      };
+      await open();
+      for (const [label, value] of [['裁剪 X / px', 4], ['裁剪 Y / px', 0],
+        ['裁剪宽度 / px', 4], ['裁剪高度 / px', 4]]) {
+        const input = crop.getByLabel(label, {exact:true});
+        await input.fill(String(value)); await input.press('Tab');
+      }
+      await crop.getByRole('button', {name:'应用裁剪', exact:true}).click();
+      const saved = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/projects/browser' && response.request().method() === 'PUT');
+      await editor.getByRole('button', {name:'保存编辑稿', exact:true}).click();
+      assert.equal((await saved).status(), 200);
+      const getCard = async () => (await (await page.request.get(service.origin + '/api/projects/browser')).json())
+        .cards.find(card => card.id === 'crop-browser');
+      const stored = (await getCard()).params.composition.layers[0];
+      assert.deepEqual(stored.crop, {x:4, y:0, width:4, height:4});
+      assert.deepEqual([stored.x, stored.y, stored.width, stored.height], [24, 8, 16, 12]);
+      assert.deepEqual(stored.asset, asset);
+      await editor.getByRole('button', {name:'关闭', exact:true}).click();
+      await page.reload();
+      await open();
+      assert.equal(await crop.getByLabel('裁剪 X / px', {exact:true}).inputValue(), '4');
+      assert.equal(await crop.getByLabel('裁剪宽度 / px', {exact:true}).inputValue(), '4');
+      await crop.getByRole('button', {name:'取消裁剪', exact:true}).click();
+      const exported = page.waitForResponse(response =>
+        new URL(response.url()).pathname === '/api/projects/browser' && response.request().method() === 'PUT');
+      await editor.getByRole('button', {name:'合成 PNG', exact:true}).click();
+      assert.equal((await exported).status(), 200);
+      const output = (await getCard()).outputs[0];
+      const pixels = await page.evaluate(async url => {
+        const response = await fetch(url);
+        if (!response.ok) throw new Error('PNG read failed: ' + response.status);
+        const bitmap = await createImageBitmap(await response.blob());
+        const canvas = document.createElement('canvas');
+        canvas.width = bitmap.width; canvas.height = bitmap.height;
+        const ctx = canvas.getContext('2d'); ctx.drawImage(bitmap, 0, 0); bitmap.close();
+        return {size:[canvas.width, canvas.height], samples:[[10,10], [26,10], [38,18], [26,24]]
+          .map(([x,y]) => [...ctx.getImageData(x,y,1,1).data])};
+      }, output.url);
+      assert.deepEqual(pixels, {size:[64,64], samples:[
+        [0,0,0,0], [0,255,0,255], [0,255,0,255], [0,0,0,0],
+      ]});
+      assert.deepEqual((await getCard()).params.composition.layers[0], stored);
+      assert.deepEqual(errors, []);
+      assert.deepEqual(generated, []);
+    } finally {
+      if (browser) await browser.close();
+      await service.close();
+    }
+  });
