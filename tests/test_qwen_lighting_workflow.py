@@ -20,13 +20,13 @@ class QwenLightingWorkflowTest(unittest.TestCase):
         self.graph = read_json(self.cap["graph"])
         self.fields = {field["key"]: field for field in self.cap["inputs"]}
 
-    def test_toolbox_mode_and_single_image_contract(self):
+    def test_image_generation_mode_and_single_image_contract(self):
         cards = read_json("manifests/_cards.json")
         matches = [(card, mode) for card in cards for mode in card["modes"]
                    if mode["id"] == "qwen_lighting"]
         self.assertEqual(len(matches), 1)
         card, mode = matches[0]
-        self.assertEqual(card["id"], "card_tools")
+        self.assertEqual(card["id"], "card_image")
         self.assertEqual(mode, {
             "id": "qwen_lighting", "name": "灯光模式", "slots": "img1+aud0+vid0",
         })
@@ -34,7 +34,9 @@ class QwenLightingWorkflowTest(unittest.TestCase):
         self.assertEqual(self.cap["name"], mode["name"])
         self.assertEqual(self.cap["slots"], mode["slots"])
         self.assertEqual(self.cap["card"], card["id"])
-        self.assertEqual(self.cap["kind"], "tool")
+        self.assertEqual(self.cap["kind"], "gen")
+        toolbox = next(card for card in cards if card["id"] == "card_tools")
+        self.assertNotIn("qwen_lighting", [mode["id"] for mode in toolbox["modes"]])
         self.assertEqual(self.cap["outputType"], "image")
         self.assertEqual([self.cap[k] for k in ("images", "audios", "videos")], [1, 0, 0])
         self.assertEqual(self.cap["slotLimits"], {
