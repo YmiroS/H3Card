@@ -11,17 +11,22 @@
  },
  "85": {
   "class_type": "VAEEncode",
-  "inputs": {"pixels": ["84", 0], "vae": ["118", 0]},
+  "inputs": {"pixels": ["84", 0], "vae": ["10", 0]},
   "_meta": {"title": "重打光图像编码"}
+ },
+ "114": {
+  "class_type": "QwenMultiangleLightningNode",
+  "inputs": {"image": ["41", 0], "light_azimuth": 60, "light_elevation": 30, "light_intensity": 1, "light_color_hex": "#ffffff", "cinematic_mode": true, "light_configs_json": "[]"},
+  "_meta": {"title": "原版可视化灯光提示词"}
  },
  "68": {
   "class_type": "TextEncodeQwenImageEditPlus",
-  "inputs": {"clip": ["117", 0], "vae": ["118", 0], "image1": ["41", 0], "prompt": "仅调整图1的灯光：使用自然柔和的中性光照，保持合理的明暗层次与阴影，避免过曝。保留原图人物身份、面部特征、姿态、服装、物体、背景、构图和材质细节，不新增或删除内容。"},
+  "inputs": {"clip": ["61", 0], "vae": ["10", 0], "image1": ["41", 0], "prompt": ["114", 0]},
   "_meta": {"title": "重打光正面条件"}
  },
  "69": {
   "class_type": "TextEncodeQwenImageEditPlus",
-  "inputs": {"clip": ["117", 0], "vae": ["118", 0], "image1": ["41", 0], "prompt": "泛黄，AI感，不真实，丑陋，油腻的皮肤，异常的肢体，不协调的肢体"},
+  "inputs": {"clip": ["61", 0], "vae": ["10", 0], "image1": ["41", 0], "prompt": "泛黄，AI感，不真实，丑陋，油腻的皮肤，异常的肢体，不协调的肢体"},
   "_meta": {"title": "重打光负面条件"}
  },
  "70": {
@@ -34,32 +39,32 @@
   "inputs": {"conditioning": ["69", 0], "reference_latents_method": "index_timestep_zero"},
   "_meta": {"title": "负面参考潜空间设置"}
  },
- "9": {
+ "12": {
   "class_type": "UNETLoader",
-  "inputs": {"unet_name": "qwen_image_edit_2511_bf16.safetensors", "weight_dtype": "fp8_e4m3fn"},
-  "_meta": {"title": "加载本地 Qwen Image Edit 2511"}
+  "inputs": {"unet_name": "qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_comfyui.safetensors", "weight_dtype": "fp8_e4m3fn"},
+  "_meta": {"title": "加载原版 Qwen Image Edit 2511 Lightning 模型"}
  },
- "10": {
+ "117": {
   "class_type": "LoraLoaderModelOnly",
-  "inputs": {"model": ["9", 0], "lora_name": "Qwen-Image-Edit-2511-Lightning-4steps-V1-bf16.safetensors", "strength_model": 1},
-  "_meta": {"title": "加载本地 Qwen 四步加速 LoRA"}
+  "inputs": {"model": ["12", 0], "lora_name": "Qwen-Edit-2511_LightningRemap_Alpha0.2.safetensors", "strength_model": 1},
+  "_meta": {"title": "加载原版 Qwen Lightning Remap LoRA"}
  },
  "67": {
   "class_type": "ModelSamplingAuraFlow",
-  "inputs": {"model": ["10", 0], "shift": 3.1},
+  "inputs": {"model": ["117", 0], "shift": 3.1, "sampling": "flow"},
   "_meta": {"title": "设置重打光模型采样偏移"}
  },
  "64": {
   "class_type": "CFGNorm",
-  "inputs": {"model": ["67", 0], "strength": 0.95},
+  "inputs": {"model": ["67", 0], "strength": 0.95, "pre_cfg": false},
   "_meta": {"title": "重打光引导强度归一化"}
  },
- "117": {
+ "61": {
   "class_type": "CLIPLoader",
   "inputs": {"clip_name": "qwen_2.5_vl_7b_fp8_scaled.safetensors", "type": "qwen_image", "device": "default"},
   "_meta": {"title": "加载 Qwen 文本编码器"}
  },
- "118": {
+ "10": {
   "class_type": "VAELoader",
   "inputs": {"vae_name": "qwen_image_vae.safetensors"},
   "_meta": {"title": "加载 Qwen 图像编解码器"}
@@ -71,7 +76,7 @@
  },
  "8": {
   "class_type": "VAEDecode",
-  "inputs": {"samples": ["65", 0], "vae": ["118", 0]},
+  "inputs": {"samples": ["65", 0], "vae": ["10", 0]},
   "_meta": {"title": "重打光结果解码"}
  },
  "115": {

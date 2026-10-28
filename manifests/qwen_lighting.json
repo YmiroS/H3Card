@@ -18,7 +18,7 @@
  },
  "graph": "graphs/qwen_lighting.api.json",
  "output": {"node": "115"},
- "note": "同版本本地接入：原文件的 QwenMultiangleLightningNode、RHHiddenNodes 隐藏依赖未移植，不要求安装这些插件，也不宣称与原插件实现或效果一致。采用已公开、本机已配置的 Qwen Image Edit 2511 + Lightning 四步模型链路，以显式 MODEL/CLIP/VAE 连接替代 AnythingEverywhere。灯光专用面板由前端新模块将结构化灯光参数转换为提示词，提交适配器只将构建后的 params.prompt 送入正面条件；本 manifest 不声明方位、颜色等 UI 专属控件。默认仅安全重打光，尽量保留原图主体、构图与材质；原图直接参与正负条件，潜空间编码保持原图比例缩放到约 1.5MP，输出尺寸随缩放结果，不保证与输入像素尺寸一致。",
+ "note": "对齐《可视化灯光调节(重打光lora强化版)》原工作流：依赖原版 ComfyUI-qwenmultianglelight 插件的 QwenMultiangleLightningNode（本机核对 HEAD ff08430033dc987e65e6bcae472c96b808120255），由五个标量生成单灯提示词并直连正面条件，不使用前端拼接的 params.prompt；light_configs_json 固定为空列表。严格使用 qwen_image_edit_2511_fp8_e4m3fn_scaled_lightning_comfyui.safetensors 与 Qwen-Edit-2511_LightningRemap_Alpha0.2.safetensors（强度 1），保持原版四步采样、参考条件和模型链，不可用其他 Lightning LoRA 替代。API 默认沿用 Chouka 的 60°/30°/强度 1/白光/电影模式，原生归档 graphs/qwen_lighting.workflow.json 保留源紫色单灯样例及调试节点用于追溯。原图直接参与正负条件与灯光预览，潜空间编码保持原图比例缩放到约 1.5MP，输出不保证与输入像素尺寸一致；实际出图效果仍需实机验收。",
  "rewrite": null,
  "compare": true,
  "parameterPanel": "lighting",
@@ -29,10 +29,29 @@
    "target": {"node": "41", "input": "image", "kind": "upload_image"}
   },
   {
-   "key": "prompt", "label": "重打光提示词", "type": "textarea", "advanced": true,
-   "default": "仅调整图1的灯光：使用自然柔和的中性光照，保持合理的明暗层次与阴影，避免过曝。保留原图人物身份、面部特征、姿态、服装、物体、背景、构图和材质细节，不新增或删除内容。",
-   "hint": "接收灯光专用面板构建后的提示词；不依赖原隐藏灯光节点。",
-   "target": {"node": "68", "input": "prompt"}
+   "key": "light_azimuth", "label": "灯光方位", "type": "slider", "advanced": true, "mirror": true,
+   "default": 60, "min": 0, "max": 360, "step": 1,
+   "target": {"node": "114", "input": "light_azimuth", "vtype": "INT"}
+  },
+  {
+   "key": "light_elevation", "label": "灯光仰角", "type": "slider", "advanced": true, "mirror": true,
+   "default": 30, "min": -90, "max": 90, "step": 1,
+   "target": {"node": "114", "input": "light_elevation", "vtype": "INT"}
+  },
+  {
+   "key": "light_intensity", "label": "灯光强度", "type": "slider", "advanced": true, "mirror": true,
+   "default": 1, "min": 0, "max": 10, "step": 0.1,
+   "target": {"node": "114", "input": "light_intensity", "vtype": "FLOAT"}
+  },
+  {
+   "key": "light_color_hex", "label": "灯光颜色", "type": "text", "advanced": true, "mirror": true,
+   "default": "#ffffff",
+   "target": {"node": "114", "input": "light_color_hex", "vtype": "STRING"}
+  },
+  {
+   "key": "cinematic_mode", "label": "电影光照", "type": "boolean", "advanced": true, "mirror": true,
+   "default": true,
+   "target": {"node": "114", "input": "cinematic_mode", "vtype": "BOOLEAN"}
   },
   {
    "key": "negative_prompt", "label": "负向提示词", "type": "textarea", "advanced": true,
@@ -48,7 +67,7 @@
   {
    "key": "steps", "label": "采样步数", "type": "slider", "advanced": false,
    "default": 4, "min": 1, "max": 40, "step": 1,
-   "hint": "同版本 Lightning 四步加速 LoRA，建议保持 4 步。",
+   "hint": "原版 Lightning 模型 + LightningRemap Alpha0.2 LoRA，建议保持 4 步。",
    "target": {"node": "65", "input": "steps", "vtype": "INT"}
   },
   {
