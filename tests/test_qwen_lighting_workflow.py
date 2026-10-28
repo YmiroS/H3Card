@@ -83,7 +83,7 @@ class QwenLightingWorkflowTest(unittest.TestCase):
         self.assertEqual(self.graph["69"]["inputs"]["prompt"], NEGATIVE_PROMPT)
         mp = self.fields["megapixels"]
         self.assertEqual([mp[k] for k in ("type", "default", "min", "max", "step")],
-                         ["slider", 1.5, 0.25, 4, 0.25])
+                         ["slider", 1.5, 0.25, 16, 0.01])
         for key in ("seed", "steps", "megapixels"):
             self.assertIs(self.fields[key]["advanced"], False)
         self.assertEqual(mp["target"]["vtype"], "FLOAT")

@@ -41,8 +41,8 @@
   },
   {
    "key": "megapixels", "label": "处理像素（MP）", "type": "slider", "advanced": false,
-   "default": 1.5, "min": 0.25, "max": 4, "step": 0.25,
-   "hint": "保持原图比例；默认约 1.5MP，调高会增加显存占用。",
+   "default": 1.5, "min": 0.25, "max": 16, "step": 0.01,
+   "hint": "保持原图比例；1080P/2K/4K 按 16:9 等效总像素设置，非固定宽高。默认约 1.5MP，4K 显著增加显存占用。",
    "target": {"node": "84", "input": "megapixels", "vtype": "FLOAT"}
   },
   {
