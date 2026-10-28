@@ -31,11 +31,7 @@
    {
     "id": "qwen_lighting",
     "name": "灯光模式",
-    "slots": "img1+aud0+vid0",
-    "modelSwitch": {
-     "qwen2511": "qwen_lighting",
-     "qwen21": "qwen_lighting_21"
-    }
+    "slots": "img1+aud0+vid0"
    },
    {
     "id": "flux2_klein_storyboard9",

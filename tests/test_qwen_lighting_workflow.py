@@ -29,7 +29,6 @@ class QwenLightingWorkflowTest(unittest.TestCase):
         self.assertEqual(card["id"], "card_image")
         self.assertEqual(mode, {
             "id": "qwen_lighting", "name": "灯光模式", "slots": "img1+aud0+vid0",
-            "modelSwitch": {"qwen2511": "qwen_lighting", "qwen21": "qwen_lighting_21"},
         })
         self.assertEqual(self.cap["id"], mode["id"])
         self.assertEqual(self.cap["name"], mode["name"])

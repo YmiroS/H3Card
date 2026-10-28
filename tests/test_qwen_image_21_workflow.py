@@ -1,6 +1,5 @@
 import json
 import sys
-import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -146,133 +145,6 @@ class QwenImage21WorkflowTest(unittest.TestCase):
                 self.assertNotEqual(label, "处理中")
 
 
-class QwenImage21LightingWorkflowTest(unittest.TestCase):
-    def setUp(self):
-        self.cap = json.loads((ROOT / "manifests/qwen_lighting_21.json").read_text(encoding="utf-8"))
-        self.graph = json.loads((ROOT / self.cap["graph"]).read_text(encoding="utf-8"))
-
-    def test_single_original_and_backend_targets(self):
-        self.assertEqual(self.cap["slotLimits"]["image"], {"min": 1, "max": 1})
-        self.assertEqual(self.cap["parameterPanel"], "lighting")
-        self.assertTrue(self.cap["compare"])
-        self.assertEqual(self.cap["card"], "card_image")
-        self.assertEqual(self.graph["41"]["inputs"]["image"], "")
-        fields = {spec["key"]: spec for spec in self.cap["inputs"]}
-        self.assertEqual(set(fields), {
-            "images[0]", "prompt", "negative_prompt", "megapixels", "steps", "cfg", "seed"})
-        for field in fields.values():
-            target = field["target"]
-            self.assertIn(target["input"], self.graph[target["node"]]["inputs"])
-            if "default" in field:
-                self.assertEqual(field["default"], self.graph[target["node"]]["inputs"][target["input"]])
-        for assets in ({}, {"images[1]": "chouka/other.png"}):
-            with self.subTest(assets=assets), self.assertRaises(web.HTTPBadRequest):
-                app.patch_graph(self.cap, {}, assets)
-
-    def test_relight_request_reaches_actual_graph_without_old_model_settings(self):
-        prompt = "Remove original lighting. Use ONLY ONE new light from image-left and below."
-        params = {"prompt": prompt, "negative_prompt": "no extra light", "seed": 42,
-                  "megapixels": 3840 * 2160 / (1024 * 1024), "steps": 32, "cfg": 1.2,
-                  "light_azimuth": -52, "light_elevation": -59, "custom_history": "keep"}
-        graph = app.patch_graph(self.cap, params, {"images[0]": "chouka/original.png"})
-        self.assertEqual(graph["41"]["inputs"]["image"], "chouka/original.png")
-        self.assertEqual(graph["68"]["inputs"]["prompt"], prompt)
-        self.assertEqual(graph["68"]["inputs"]["negative_prompt"], "no extra light")
-        self.assertEqual(graph["84"]["inputs"]["megapixels"], params["megapixels"])
-        self.assertEqual([graph["65"]["inputs"][k] for k in ("seed", "steps", "cfg")], [42, 32, 1.2])
-        self.assertEqual(graph["68"]["inputs"]["resolution"], 0)
-        self.assertEqual(params["custom_history"], "keep")
-        self.assertEqual(self.graph["65"]["inputs"]["steps"], 40)
-
-    def test_model_chain_uses_21_weights_and_original_sampling_without_2511_lora(self):
-        reference = json.loads((ROOT / "graphs/qwen_image_21_i2i.api.json").read_text(encoding="utf-8"))
-        for new, old in (("9", "2"), ("117", "3"), ("118", "4"), ("67", "14"), ("64", "7")):
-            self.assertEqual(self.graph[new]["class_type"], reference[old]["class_type"])
-            expected = {k: v for k, v in reference[old]["inputs"].items() if k != "model"}
-            actual = {k: v for k, v in self.graph[new]["inputs"].items() if k != "model"}
-            self.assertEqual(actual, expected)
-        self.assertEqual(self.graph["67"]["inputs"]["model"], ["9", 0])
-        self.assertEqual(self.graph["64"]["inputs"]["model"], ["67", 0])
-        self.assertEqual(self.graph["65"]["inputs"]["model"], ["64", 0])
-        sampler = self.graph["65"]["inputs"]
-        self.assertEqual([sampler[k] for k in ("steps", "cfg", "sampler_name", "scheduler", "denoise")],
-                         [40, 1, "euler", "simple", 1])
-        self.assertFalse(any("Lora" in node["class_type"] for node in self.graph.values()))
-        self.assertEqual(app.model_family("qwen_lighting_21"), "qwen_image_21")
-        self.assertEqual(app.model_name("qwen_lighting_21"), "Qwen Image 2.1")
-        self.assertEqual(app.model_name("qwen_lighting"), "Qwen Image Edit 2511")
-
-    def test_reference_and_sampling_latent_share_original_aspect_and_pixel_budget(self):
-        self.assertEqual(self.graph["84"]["inputs"], {
-            "image": ["41", 0], "upscale_method": "lanczos", "megapixels": 1.5,
-            "resolution_steps": 32})
-        encoder = self.graph["68"]["inputs"]
-        self.assertEqual(encoder["images.image_1"], ["84", 0])
-        self.assertEqual(encoder["resolution"], 0)
-        self.assertEqual([k for k in encoder if k.startswith("images.")], ["images.image_1"])
-        self.assertEqual(self.graph["65"]["inputs"]["latent_image"], ["68", 2])
-        self.assertEqual(self.graph["65"]["inputs"]["positive"], ["68", 0])
-        self.assertEqual(self.graph["65"]["inputs"]["negative"], ["68", 1])
-        self.assertFalse(any(n["class_type"] in ("EmptyLatentImage", "ResolutionSelector")
-                             for n in self.graph.values()))
-        fields = {field["key"]: field for field in self.cap["inputs"]}
-        self.assertEqual(fields["megapixels"]["max"], 16)
-        self.assertNotIn("aspect_ratio", fields)
-        self.assertNotIn("encode_resolution", fields)
-
-    def test_native_workflow_links_widgets_and_titles_match_api_graph(self):
-        native = json.loads((ROOT / "graphs/qwen_lighting_21.workflow.json").read_text(encoding="utf-8"))
-        nodes = {str(node["id"]): node for node in native["nodes"]}
-        links = {link[0]: link for link in native["links"]}
-        self.assertEqual(set(nodes), set(self.graph))
-        for node_id, expected in self.graph.items():
-            actual = nodes[node_id]
-            self.assertEqual(actual["type"], expected["class_type"])
-            self.assertEqual(actual["title"], expected["_meta"]["title"])
-            self.assertEqual(actual["mode"], 0)
-            inputs = {slot["name"]: slot for slot in actual.get("inputs", [])}
-            for key, value in expected["inputs"].items():
-                with self.subTest(node=node_id, input=key):
-                    if isinstance(value, list):
-                        link = links[inputs[key]["link"]]
-                        self.assertEqual([str(link[1]), link[2]], value)
-                        self.assertEqual(link[3], actual["id"])
-                        self.assertEqual(actual["inputs"][link[4]]["name"], key)
-                        source_output = nodes[str(link[1])]["outputs"][link[2]]
-                        self.assertEqual(source_output["type"], inputs[key]["type"])
-                        self.assertIn(link[0], source_output["links"])
-                    else:
-                        self.assertEqual(actual["widgets_values_named"][key], value)
-        self.assertEqual(set(self.graph), scan_workflows.upstream(self.graph, "115") | {"115"})
-        for title in app.step_labels(self.graph).values():
-            self.assertRegex(title, r"[\u4e00-\u9fff]")
-
-    def test_rescan_keeps_one_lighting_mode_with_both_models_in_one_image_card(self):
-        original = json.loads((ROOT / "manifests/qwen_lighting.json").read_text(encoding="utf-8"))
-        expected = {"id": "qwen_lighting", "name": "灯光模式", "slots": "img1+aud0+vid0",
-                    "modelSwitch": {"qwen2511": "qwen_lighting", "qwen21": "qwen_lighting_21"}}
-        self.assertEqual(scan_workflows.build_modes([original, self.cap]), [expected])
-        self.assertTrue({"qwen_lighting", "qwen_lighting_21"} <= scan_workflows.BUNDLED_CAPABILITIES)
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            (root / "manifests").mkdir()
-            (root / "graphs").mkdir()
-            for cap in (original, self.cap):
-                (root / "manifests" / (cap["id"] + ".json")).write_text(
-                    json.dumps(cap, ensure_ascii=False), encoding="utf-8")
-                (root / cap["graph"]).write_text("{}", encoding="utf-8")
-            with mock.patch.multiple(scan_workflows, ROOT=root, ALIASES={},
-                                     BUNDLED_CAPABILITIES={"qwen_lighting", "qwen_lighting_21"}), \
-                    mock.patch.object(scan_workflows, "load_object_info", return_value={}), \
-                    mock.patch.object(scan_workflows, "load_zh", return_value={}), \
-                    mock.patch.object(sys, "argv", ["scan_workflows.py"]):
-                scan_workflows.main()
-            cards = json.loads((root / "manifests/_cards.json").read_text(encoding="utf-8"))
-            images = [card for card in cards if card["id"] == "card_image"]
-            self.assertEqual(len(images), 1)
-            self.assertEqual(images[0]["modes"], [expected])
-
-
 class QwenImage21RuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def test_reload_cards_and_authenticated_dry_runs(self):
         self.auth_setup()
@@ -295,8 +167,7 @@ class QwenImage21RuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.Auth
                 self.assertEqual(response.status, 200)
                 data = await response.json()
                 card = next(c for c in data["cards"] if c["id"] == "card_image")
-                expected = {"文生图": "qwen_image_21_t2i", "图生图": "qwen_image_21_multi",
-                            "灯光模式": "qwen_lighting_21"}
+                expected = {"文生图": "qwen_image_21_t2i", "图生图": "qwen_image_21_multi"}
                 for mode, capability_id in expected.items():
                     item = next(m for m in card["modes"] if m["name"] == mode)
                     self.assertEqual(item["modelSwitch"]["qwen21"], capability_id)
@@ -313,19 +184,6 @@ class QwenImage21RuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.Auth
                     self.assertEqual(changed[f"#{prompt_node}.value"][1], "保留图1人物，替换背景")
                     if mode == "multi" and count == 1:
                         self.assertEqual(changed["#54.images.image_16"][1], "<断开>")
-                for capability_id in ("qwen_lighting", "qwen_lighting_21"):
-                    prompt = "Remove original lighting. Use ONLY ONE new light from image-left."
-                    response = await client.post("/api/generate", json={
-                        "capability": capability_id, "project": "p", "dry_run": True,
-                        "assets": {"images[0]": "chouka/image0.png"},
-                        "params": {"prompt": prompt, "seed": 42, "megapixels": 7.91015625},
-                    })
-                    self.assertEqual(response.status, 200, await response.text())
-                    changed = (await response.json())["changed"]
-                    self.assertEqual(changed["#68.prompt"][1], prompt)
-                    self.assertEqual(changed["#41.image"][1], "chouka/image0.png")
-                    self.assertEqual(changed["#84.megapixels"][1], 7.91015625)
-                    self.assertEqual(changed["#65.seed"][1], 42)
 
 
 if __name__ == "__main__":

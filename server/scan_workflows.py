@@ -142,7 +142,6 @@ MODEL_SWITCHES = {
     "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i",
                    "qwen2511": "qwen_image_edit_2511_i2i", "qwen21": "qwen_image_21_multi"},
     "depth_video": {"da3": "depth_video", "depthcrafter": "depthcrafter_video"},
-    "qwen_lighting": {"qwen2511": "qwen_lighting", "qwen21": "qwen_lighting_21"},
 }
 
 # API 图和输入槽随项目维护，不依赖原作者本机的界面工作流路径。
@@ -153,7 +152,6 @@ BUNDLED_CAPABILITIES = {
     "alphagen", "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
-    "qwen_lighting", "qwen_lighting_21",
 }
 
 # 风格卡：画布上唯一一张**不对应任何工作流**的卡。它没有 manifest、没有能力，
@@ -2172,8 +2170,7 @@ def main():
         if not (ROOT / m["graph"]).exists():
             raise FileNotFoundError(m["graph"])
         manifests.append(m)
-        card_group = "image" if m["card"] == "card_image" else m["card"]
-        groups.setdefault(card_group, []).append(m)
+        groups.setdefault(m["card"], []).append(m)
 
     CARD_META = {
         "image": ("card_image", "生图", "🖼"),
