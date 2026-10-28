@@ -107,6 +107,8 @@ MODEL_FAMILY = {
     "qwen_image_21_t2i": "qwen_image_21",
     "qwen_image_21_i2i": "qwen_image_21",
     "qwen_image_21_multi": "qwen_image_21",
+    "qwen_lighting": "qwen_image_edit_2511",
+    "qwen_lighting_21": "qwen_image_21",
     "qwen_image_reverse": "qwen35_27b",
     "qwen_video_reverse": "qwen35_27b",
     "rmbg_cutout": "rmbg2",
