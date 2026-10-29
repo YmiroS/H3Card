@@ -2361,6 +2361,26 @@ async def api_worker_delete(request):
     return web.json_response({"ok": True})
 
 
+async def api_worker_restart(request):
+    require_admin(request)
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError) as exc:
+        raise web.HTTPBadRequest(reason="请求体必须为 JSON 对象") from exc
+    if not isinstance(body, dict) or set(body) != {"action"}:
+        raise web.HTTPBadRequest(reason="请求体只能包含 action")
+    try:
+        result = distributed_store(request.app).request_worker_restart(
+            request.match_info["worker_id"], body["action"])
+    except ValueError as exc:
+        raise web.HTTPBadRequest(reason=str(exc)) from exc
+    except KeyError as exc:
+        raise web.HTTPNotFound(reason="Worker 不存在") from exc
+    except WorkerBusyError as exc:
+        raise web.HTTPConflict(reason=str(exc)) from exc
+    return web.json_response({"ok": True, **result}, status=202)
+
+
 async def api_workers_sync_all(request):
     require_admin(request)
     result = distributed_store(request.app).request_sync_all()
@@ -3955,7 +3975,7 @@ def make_app(auth_path=None, *, project_repository=None):
             api_capacity_estimate=api_capacity_estimate, api_capacity_review=api_capacity_review,
             api_capacity_probe_outputs=api_capacity_probe_outputs, api_capacity_worker=api_capacity_worker,
             api_worker_enabled=api_worker_enabled, api_worker_delete=api_worker_delete,
-            api_workers_sync_all=api_workers_sync_all)
+            api_worker_restart=api_worker_restart, api_workers_sync_all=api_workers_sync_all)
         if not admin_sandbox:
             register_worker_routes(
                 app, api_agent_register=api_agent_register, api_agent_heartbeat=api_agent_heartbeat,

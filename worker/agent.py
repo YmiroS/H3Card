@@ -39,6 +39,25 @@ def worker_mutex_name(config_path):
     return "Global\\ChoukaWorker-" + digest
 
 
+def windows_boot_identity():
+    if os.name != "nt":
+        raise AgentError("整机重启只能在 Windows Worker 上运行")
+    command = (
+        "$ErrorActionPreference = 'Stop'; "
+        "(Get-CimInstance Win32_OperatingSystem).LastBootUpTime.ToUniversalTime()."
+        "ToString(\"yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'\", [Globalization.CultureInfo]::InvariantCulture)"
+    )
+    result = subprocess.run(
+        ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", command],
+        capture_output=True, text=True, encoding="utf-8", errors="replace",
+        timeout=20, check=False, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+    )
+    identity = result.stdout.strip()
+    if result.returncode != 0 or not re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{7}Z", identity):
+        raise AgentError("无法取得 Windows LastBootUpTime，拒绝猜测系统启动标识")
+    return identity
+
+
 def restart_in_progress(config_path):
     config_path = Path(config_path).resolve()
     try:
@@ -49,7 +68,8 @@ def restart_in_progress(config_path):
     except (OSError, ValueError) as exc:
         raise AgentError(f"无法读取 Worker 重启状态：{exc}") from exc
     maintenance = state.get("maintenance")
-    if not isinstance(maintenance, dict) or maintenance.get("status") != "restarting":
+    if (not isinstance(maintenance, dict) or maintenance.get("action") == "reboot_host"
+            or maintenance.get("status") != "restarting"):
         return False
     try:
         deadline = float(maintenance.get("deadline") or 0)
@@ -177,6 +197,7 @@ class WorkerAgent:
         self.local_busy = False
         self.pending_sync = None
         maintenance = self.state.get("maintenance")
+        self.boot_identity = None
         if isinstance(maintenance, dict) and maintenance.get("request_id"):
             status = str(maintenance.get("status") or "restarting")
             self.sync_report = {
@@ -186,6 +207,9 @@ class WorkerAgent:
                 ),
                 "message": str(maintenance.get("message") or "正在重启节点服务"),
             }
+            if maintenance.get("action") == "reboot_host" and status == "ready":
+                self.sync_report.update({key: maintenance.get(key) for key in (
+                    "boot_identity_before", "boot_identity_after")})
         else:
             self.sync_report = None
         self.stop_event = asyncio.Event()
@@ -430,7 +454,9 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 5,
+            "agent_version": 6,
+            "supports_service_restart": os.name == "nt",
+            "supports_host_reboot": os.name == "nt",
             "supports_capacity_telemetry": 1,
             "supports_file_sync": True,
             "supports_code_restart": True,
@@ -496,17 +522,28 @@ class WorkerAgent:
 
     def queue_sync(self, command):
         if self.is_primary_node:
-            print("[Worker] 主节点不执行文件同步请求", flush=True)
+            print("[Worker] 主节点不执行维护请求", flush=True)
             return
+        action = command.get("type")
         request_id = str(command.get("request_id") or "")
-        if not request_id:
+        if not request_id or action not in ("sync_files", "reboot_host", "restart_services"):
             return
-        if self.pending_sync and self.pending_sync.get("request_id") == request_id:
+        # 重复心跳不能覆盖排队或执行中的请求；终态 ACK 后仍保留去重记录。
+        if self.pending_sync:
             return
-        if self.sync_report and self.sync_report.get("request_id") == request_id:
+        if self.sync_report and (self.sync_report.get("request_id") == request_id
+                                 or self.sync_report.get("status") == "running"):
             return
-        self.pending_sync = {"request_id": request_id}
-        print(f"[Worker] 已收到文件同步请求：{request_id}", flush=True)
+        if request_id in self.state.get("attempted_host_reboots", []):
+            return
+        if request_id == (self.state.get("maintenance") or {}).get("request_id"):
+            return
+        if request_id == self.state.get("last_maintenance_request_id"):
+            return
+        if request_id == (self.state.get("last_restart_result") or {}).get("request_id"):
+            return
+        self.pending_sync = {"request_id": request_id, "type": action}
+        print(f"[Worker] 已收到维护请求 {action}：{request_id}，等待空闲", flush=True)
 
     def sync_script_path(self):
         return self.configured_path("sync_script", "../同步主节点模型和用户.bat")
@@ -624,16 +661,18 @@ class WorkerAgent:
             cwd=launcher.parent, timeout=30,
         )
 
-        timeout = max(float(self.config.get("restart_timeout_seconds", 300)), 60.0)
+        timeout = max(float(self.config.get("restart_timeout_seconds", 300)), 60.0) if commit else 900.0
         restart_token = uuid.uuid4().hex
         log_path = self.configured_path("restart_log", "logs/restart-node.log")
         log_path.parent.mkdir(parents=True, exist_ok=True)
         maintenance = {
             "request_id": request_id,
+            "action": "sync_files" if commit else "restart_services",
             "restart_token": restart_token,
             "status": "restarting",
             "phase": "starting_supervisor",
-            "message": f"代码已更新至 {commit[:12]}，正在重启 ComfyUI 和 Worker",
+            "message": (f"代码已更新至 {commit[:12]}，正在重启 ComfyUI 和 Worker"
+                        if commit else "正在重启 ComfyUI 和 Worker，不更新代码、不重启 Windows"),
             "target_commit": commit,
             "deadline": time.time() + timeout,
             "log_path": str(log_path),
@@ -693,7 +732,8 @@ class WorkerAgent:
 
     def refresh_restart_report(self):
         maintenance = self.state.get("maintenance")
-        if not isinstance(maintenance, dict) or not maintenance.get("request_id"):
+        if (not isinstance(maintenance, dict) or not maintenance.get("request_id")
+                or maintenance.get("action") == "reboot_host"):
             return
         request_id = str(maintenance["request_id"])
         status = str(maintenance.get("status") or "restarting")
@@ -708,7 +748,7 @@ class WorkerAgent:
             self.sync_report = {
                 "request_id": request_id,
                 "status": "done",
-                "message": str(maintenance.get("message") or "代码更新和节点重启完成")[:1000],
+                "message": str(maintenance.get("message") or "节点服务重启完成")[:1000],
             }
             return
         if time.time() >= float(maintenance.get("deadline") or 0):
@@ -730,7 +770,8 @@ class WorkerAgent:
         )
         if matching_restart and self.comfy_online and self.fresh_capabilities_ready:
             commit = str(maintenance.get("target_commit") or "")[:12]
-            message = f"代码 {commit} 已拉取，ComfyUI 和 Worker 已重启并就绪"
+            message = (f"代码 {commit} 已拉取，ComfyUI 和 Worker 已重启并就绪" if commit
+                       else "ComfyUI 和 Worker 已重启并就绪，未更新代码、未重启 Windows")
             maintenance.update(status="ready", phase="ready", message=message)
             self._save_state()
             self.sync_report = {
@@ -745,18 +786,126 @@ class WorkerAgent:
             "message": str(maintenance.get("message") or "正在重启 ComfyUI 和 Worker"),
         }
 
+    async def schedule_host_reboot(self, request_id):
+        if os.name != "nt":
+            raise AgentError("整机重启只能在 Windows Worker 上运行")
+        previous = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
+        if (request_id in self.state.get("attempted_host_reboots", [])
+                or previous.get("request_id") == request_id and previous.get("attempted")):
+            return
+        identity = await asyncio.to_thread(windows_boot_identity)
+        self.boot_identity = identity
+        now = time.time()
+        maintenance = {
+            "request_id": request_id, "action": "reboot_host", "status": "running",
+            "phase": "awaiting_running_ack", "attempted": True,
+            "boot_identity_before": identity, "started_at": now, "deadline": now + 900,
+            "message": "正在请求 Windows 重启；自动恢复取决于现有启动配置，可手动恢复 Worker",
+        }
+        # attempted 包括网络不确定的情况；历史请求也不能在后续维护结束后被重放。
+        self.state.setdefault("attempted_host_reboots", []).append(request_id)
+        self.state["maintenance"] = maintenance
+        self._save_state()
+        self.sync_report = {key: maintenance[key] for key in ("request_id", "status", "message")}
+        reply = await self._json_request(
+            "POST", self.server + "/agent/v1/heartbeat", headers=self._agent_headers(),
+            json={"comfy_online": self.comfy_online, "busy": True, "local_busy": True,
+                  "current_job_id": None, "maintenance": dict(self.sync_report)},
+        )
+        ack = (reply or {}).get("maintenance_ack") or {}
+        if ack.get("request_id") != request_id or ack.get("status") != "running":
+            raise AgentError("服务端未确认整机重启维护状态，未执行 shutdown")
+        await self.local_status()
+        if self.current or self.local_busy or self.release_failed or not self.comfy_online:
+            raise AgentError("无法再次确认节点空闲，未执行 shutdown")
+        maintenance["phase"] = "shutdown_requested"
+        self._save_state()
+        result = await asyncio.to_thread(
+            subprocess.run, ["shutdown.exe", "/r", "/t", "0"],
+            capture_output=True, timeout=30, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+        if result.returncode != 0:
+            raise AgentError(f"Windows 重启命令失败，退出码 {result.returncode}")
+        self.fresh_capabilities_ready = False
+        # 保持 Worker/心跳运行；命令返回成功不代表 OS 已重启。
+
+    async def refresh_host_reboot_report(self):
+        maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
+        if maintenance.get("action") != "reboot_host":
+            return
+        if self.pending_sync and self.pending_sync.get("request_id") != maintenance.get("request_id"):
+            return
+        if maintenance.get("status") == "ready":
+            return
+        if getattr(self, "boot_identity", None) is None:
+            try:
+                self.boot_identity = await asyncio.to_thread(windows_boot_identity)
+            except Exception:
+                pass  # 无证据不能报成功；保持维护，15 分钟后报未确认恢复。
+        before = maintenance.get("boot_identity_before")
+        after = getattr(self, "boot_identity", None)
+        if (before and after and before != after and maintenance.get("attempted")
+                and self.comfy_online and self.fresh_capabilities_ready):
+            message = "已确认 Windows 启动标识变化，ComfyUI 和 Worker 已恢复并完成能力扫描"
+            maintenance.update(status="ready", phase="ready", message=message, boot_identity_after=after)
+            self.state["maintenance"] = maintenance
+            self._save_state()
+            self.last_capability_scan = 0.0
+            self.sync_report = {"request_id": maintenance["request_id"], "status": "done",
+                                "message": message, "boot_identity_before": before,
+                                "boot_identity_after": after}
+        elif maintenance.get("deadline") and time.time() >= float(maintenance["deadline"]):
+            message = "重启超过15分钟，未确认 Windows 重启及服务恢复；请检查其他应用并手动恢复 Worker"
+            maintenance.update(status="error", phase="error", message=message)
+            self.state["maintenance"] = maintenance
+            self._save_state()
+            self.sync_report = {"request_id": maintenance["request_id"], "status": "error", "message": message}
+
+    def maintenance_blocks_jobs(self):
+        maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
+        return (maintenance.get("status") in {"running", "restarting", "error"}
+                or bool(self.sync_report and self.sync_report.get("status") in {"running", "error"}))
+
     async def execute_pending_sync(self):
         command = self.pending_sync
-        if not command:
+        if (not command or self.current or self.local_busy or self.release_failed
+                or self.sync_report and self.sync_report.get("status") == "running"):
+            return
+        # 再检查一次本机队列；不能仅依赖心跳的旧 busy 快照。
+        await self.local_status()
+        if self.current or self.local_busy or self.release_failed:
             return
         request_id = command["request_id"]
+        action = command["type"]
         self.sync_report = {
             "request_id": request_id,
             "status": "running",
-            "message": "正在同步 ComfyUI、模型和用户目录",
+            "message": ("正在同步 ComfyUI、模型和用户目录" if action == "sync_files"
+                        else "正在重启节点服务，未更新代码"),
         }
-        print(f"[Worker] 开始同步文件并更新节点：{request_id}", flush=True)
+        print(f"[Worker] 开始维护 {action}：{request_id}", flush=True)
         try:
+            if action in ("reboot_host", "restart_services"):
+                if not self.comfy_online:
+                    raise AgentError("无法确认 ComfyUI 队列空闲，已停止重启")
+                if action == "reboot_host":
+                    await self.schedule_host_reboot(request_id)
+                else:
+                    # 服务重启也可能影响共享 ComfyUI；执行前由服务端原子复核同宿主范围。
+                    reply = await self._json_request(
+                        "POST", self.server + "/agent/v1/heartbeat", headers=self._agent_headers(),
+                        json={"comfy_online": self.comfy_online, "busy": True, "local_busy": True,
+                              "current_job_id": None, "maintenance": dict(self.sync_report)},
+                    )
+                    ack = (reply or {}).get("maintenance_ack") or {}
+                    if ack.get("request_id") != request_id or ack.get("status") != "running":
+                        raise AgentError("服务端未确认服务重启维护状态，未执行重启")
+                    await self.local_status()
+                    if self.current or self.local_busy or self.release_failed or not self.comfy_online:
+                        raise AgentError("无法再次确认节点空闲，未执行重启")
+                    await self.schedule_node_restart(request_id, "")
+                return
             if os.name != "nt":
                 raise AgentError("文件同步脚本只能在 Windows Worker 上运行")
             script = self.sync_script_path()
@@ -778,7 +927,15 @@ class WorkerAgent:
                 "status": "error",
                 "message": str(exc)[:1000],
             }
-            print(f"[Worker] 节点同步更新失败：{exc}", flush=True)
+            if action in ("reboot_host", "restart_services"):
+                previous = self.state.get("maintenance") or {}
+                self.state["maintenance"] = {
+                    **(previous if previous.get("request_id") == request_id else {}),
+                    **self.sync_report, "action": action, "phase": "error",
+                }
+                self.fresh_capabilities_ready = False
+                self._save_state()
+            print(f"[Worker] 节点维护失败：{exc}", flush=True)
         finally:
             self.pending_sync = None
 
@@ -793,6 +950,8 @@ class WorkerAgent:
                 now = time.time()
                 include_caps = (
                     not self.current
+                    and (not (self.sync_report and self.sync_report.get("status") == "running")
+                         or (self.state.get("maintenance") or {}).get("action") == "reboot_host")
                     and now - self.last_capability_scan >= capability_interval
                 )
                 if include_caps:
@@ -800,9 +959,8 @@ class WorkerAgent:
                 elif now - self.last_telemetry_scan >= telemetry_interval:
                     await self.scan_telemetry()
                 self.refresh_restart_report()
-                sync_running = bool(
-                    self.sync_report and self.sync_report.get("status") == "running"
-                )
+                await self.refresh_host_reboot_report()
+                sync_running = bool(self.pending_sync) or self.maintenance_blocks_jobs()
                 body = {
                     "comfy_online": self.comfy_online,
                     "busy": (bool(self.current) or self.local_busy
@@ -813,7 +971,7 @@ class WorkerAgent:
                     "current_job_id": self.current["job_id"] if self.current else None,
                     "capacity_released": bool(
                         self.current is None and not self.release_failed
-                        and self.comfy_online and not self.local_busy
+                        and self.comfy_online and not self.local_busy and not sync_running
                     ),
                 }
                 if self.telemetry:
@@ -836,16 +994,17 @@ class WorkerAgent:
                         and acknowledgement.get("request_id") == self.sync_report.get("request_id")
                         and acknowledgement.get("status") == self.sync_report.get("status")):
                     maintenance = self.state.get("maintenance")
+                    self.state["last_maintenance_request_id"] = self.sync_report["request_id"]
                     if (isinstance(maintenance, dict)
                             and maintenance.get("request_id") == self.sync_report.get("request_id")):
                         self.state["last_restart_result"] = dict(maintenance)
                         self.state.pop("maintenance", None)
-                        self._save_state()
+                    self._save_state()
                     self.sync_report = None
                 for command in (reply or {}).get("commands", []):
                     if command.get("type") in ("cancel_job", "abort_job"):
                         await self.cancel_current(command.get("job_id"))
-                    elif command.get("type") == "sync_files":
+                    elif command.get("type") in ("sync_files", "reboot_host", "restart_services"):
                         self.queue_sync(command)
             except asyncio.CancelledError:
                 raise
@@ -904,7 +1063,8 @@ class WorkerAgent:
             return False
 
     async def acquire(self):
-        if self.release_failed or not self.comfy_online or self.local_busy or self.current:
+        if (self.release_failed or not self.comfy_online or self.local_busy or self.current
+                or self.pending_sync or self.maintenance_blocks_jobs()):
             return None
         return await self._json_request(
             "POST", self.server + "/agent/v1/jobs/acquire",
@@ -1269,6 +1429,7 @@ class WorkerAgent:
             await self.ensure_registered()
             await self.scan_capabilities()
             self.refresh_restart_report()
+            await self.refresh_host_reboot_report()
             self.last_capability_scan = 0.0
             heartbeat = asyncio.create_task(self.heartbeat_loop())
             try:

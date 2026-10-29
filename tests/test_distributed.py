@@ -878,6 +878,159 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(self.store.dispatch_status("active-job"), "queued")
         self.assertEqual(self.store.list_workers(), [])
 
+    def test_restart_validation_and_maintenance_lifecycle(self):
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"], "supports_service_restart": True, "supports_host_reboot": True,
+            "hardware": {"host_id": str(time.time_ns())},
+            "supports_code_restart": True,
+        })
+        for action in (None, [], {}, True, "sync_files", "restart_windows"):
+            with self.subTest(action=action), self.assertRaises(ValueError):
+                self.store.request_worker_restart(self.worker_id, action)
+        for action in ("reboot_host", "restart_services"):
+            request = self.store.request_worker_restart(self.worker_id, action)
+            worker = self.store.list_workers()[0]
+            self.assertEqual(worker["sync_action"], action)
+            self.assertEqual(worker["sync_status"], "pending")
+            self.assertIn("等待节点空闲", worker["sync_message"])
+            self.store.enqueue(action, {"graph": {}})
+            self.assertIsNone(self.store.acquire(self.worker_id))
+            command = {"type": action, "request_id": request["request_id"]}
+            for _ in range(2):
+                self.assertEqual(self.store.heartbeat(self.worker_id, comfy_online=True)["commands"], [command])
+            # 批量同步不能抢占手动重启，无论它仍在排队还是已经运行。
+            for status in ("pending", "running"):
+                if status == "running":
+                    self.store.heartbeat(self.worker_id, comfy_online=True, maintenance={
+                        "request_id": request["request_id"], "status": status,
+                    })
+                with self.assertRaises(WorkerBusyError):
+                    self.store.request_worker_restart(self.worker_id, action)
+                batch = self.store.request_sync_all()
+                self.assertEqual(batch["worker_count"], 0)
+                self.assertEqual(batch["skipped_count"], 1)
+                self.assertEqual(self.store.list_workers()[0]["sync_request_id"], request["request_id"])
+            for status in ("error", "error", "running"):
+                reply = self.store.heartbeat(self.worker_id, comfy_online=True, maintenance={
+                    "request_id": request["request_id"], "status": status, "message": "failed",
+                })
+                self.assertEqual(reply["commands"], [])
+            self.assertEqual(self.store.list_workers()[0]["sync_status"], "error")
+            self.assertIsNone(self.store.acquire(self.worker_id))
+        batch = self.store.request_sync_all()
+        self.assertEqual(batch["worker_count"], 1)
+        self.assertEqual(self.store.list_workers()[0]["sync_action"], "sync_files")
+
+    def test_restart_while_job_running_keeps_lease_and_blocks_next_job(self):
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"], "supports_service_restart": True, "supports_host_reboot": True,
+            "hardware": {"host_id": str(time.time_ns())},
+        })
+        self.store.enqueue("current", {"graph": {}})
+        assigned = self.store.acquire(self.worker_id)
+        request = self.store.request_worker_restart(self.worker_id, "restart_services")
+        heartbeat = self.store.heartbeat(self.worker_id, comfy_online=True, current_job_id="current")
+        self.assertEqual(heartbeat["lease_ttl_seconds"], self.store.lease_seconds)
+        self.assertEqual(heartbeat["commands"], [{"type": "restart_services", "request_id": request["request_id"]}])
+        self.assertTrue(self.store.finish("current", self.worker_id, assigned["lease_token"], "done"))
+        self.store.enqueue("next", {"graph": {}})
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        report = {"request_id": request["request_id"], "status": "done", "message": "ready"}
+        for _ in range(2):
+            reply = self.store.heartbeat(self.worker_id, comfy_online=True, maintenance=report)
+            self.assertEqual(reply["maintenance_ack"], {"request_id": request["request_id"], "status": "done"})
+            self.assertEqual(reply["commands"], [])
+        self.assertIsNotNone(self.store.acquire(self.worker_id))
+
+    def test_restart_uses_normalized_latest_registration_and_id_tiebreak(self):
+        caps = {"supports_service_restart": True, "supports_host_reboot": True,
+            "hardware": {"host_id": str(time.time_ns())}, "supports_code_restart": True}
+        older = self.store.register_worker("same", caps)["worker_id"]
+        newer = self.store.register_worker(" SAME ", caps)["worker_id"]
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET created_at = 1 WHERE id = ?", (older,))
+            self.store.db.execute("UPDATE workers SET created_at = 2 WHERE id = ?", (newer,))
+        with self.assertRaises(WorkerBusyError):
+            self.store.request_worker_restart(older, "restart_services")
+        self.assertEqual(next(w for w in self.store.list_workers() if w["id"] in (older, newer))["id"], newer)
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET created_at = 3 WHERE id IN (?, ?)", (older, newer))
+        latest, stale = sorted((older, newer), reverse=True)
+        with self.assertRaises(WorkerBusyError):
+            self.store.request_worker_restart(stale, "restart_services")
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET last_seen=0 WHERE id=?", (stale,))
+        self.store.request_worker_restart(latest, "reboot_host")
+        self.assertEqual(self.store.heartbeat(stale)["commands"], [])
+
+    def test_service_restart_timeout_and_same_request_late_recovery(self):
+        caps = {"supports_service_restart": True, "supports_host_reboot": True,
+                "hardware": {"host_id": "timeout-host"}}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        for action in ("restart_services", "reboot_host"):
+            self.store.heartbeat(self.worker_id, comfy_online=True)
+            request = self.store.request_worker_restart(self.worker_id, action)
+            report = {"request_id": request["request_id"], "status": "running",
+                      "boot_identity_before": "before", "boot_identity_after": "after"}
+            self.store.heartbeat(self.worker_id, comfy_online=True, maintenance=report)
+            started = self.store.list_workers()[0]["sync_started_at"]
+            with mock.patch("distributed.time.time", return_value=started + 901):
+                self.assertEqual(self.store.list_workers()[0]["sync_status"], "error")
+            self.assertIsNone(self.store.acquire(self.worker_id))
+            self.store.heartbeat(self.worker_id, comfy_online=True,
+                                 maintenance={**report, "status": "done", "request_id": "wrong"})
+            self.assertEqual(self.store.list_workers()[0]["sync_status"], "error")
+            self.store.heartbeat(self.worker_id, comfy_online=True, maintenance={**report, "status": "done"})
+            self.assertEqual(self.store.list_workers()[0]["sync_status"], "done")
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET sync_action='sync_files', sync_status='running', sync_started_at=0 WHERE id=?", (self.worker_id,))
+        self.assertEqual(self.store.list_workers()[0]["sync_status"], "running")
+
+    def test_host_completion_without_boot_change_evidence_remains_error(self):
+        caps = {"supports_host_reboot": True, "hardware": {"host_id": "proof-host"}}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        request = self.store.request_worker_restart(self.worker_id, "reboot_host")
+        for evidence in ({}, {"boot_identity_before": "same", "boot_identity_after": "same"}):
+            reply = self.store.heartbeat(self.worker_id, comfy_online=True, maintenance={
+                "request_id": request["request_id"], "status": "done", **evidence})
+            self.assertEqual(reply["maintenance_ack"]["status"], "error")
+            self.assertIsNone(self.store.acquire(self.worker_id))
+        self.store.heartbeat(self.worker_id, comfy_online=True, maintenance={
+            "request_id": request["request_id"], "status": "done",
+            "boot_identity_before": "before", "boot_identity_after": "after"})
+        self.assertEqual(self.store.list_workers()[0]["sync_status"], "done")
+
+    def test_host_restart_refuses_known_shared_host_and_reserves_dispatch(self):
+        caps = {"supports_service_restart": True, "supports_host_reboot": True,
+                "hardware": {"host_id": "shared"}}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        peer = self.store.register_worker("peer", caps)["worker_id"]
+        for action in ("reboot_host", "restart_services"):
+            with self.assertRaisesRegex(WorkerBusyError, "host_id"):
+                self.store.request_worker_restart(self.worker_id, action)
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET retired=1 WHERE id=?", (peer,))
+        request = self.store.request_worker_restart(self.worker_id, "reboot_host")
+        # 排队以后出现新的同宿主 Worker，也不能领任务；执行前 ACK 重新原子检查范围。
+        peer = self.store.register_worker("late-peer", {"host_id": "shared"})["worker_id"]
+        self.store.heartbeat(peer, comfy_online=True)
+        self.store.enqueue("must-not-dispatch", {"graph": {}})
+        self.assertIsNone(self.store.acquire(peer))
+        reply = self.store.heartbeat(self.worker_id, comfy_online=True, maintenance={
+            "request_id": request["request_id"], "status": "running"})
+        self.assertEqual(reply["maintenance_ack"]["status"], "error")
+        self.assertIsNone(self.store.acquire(peer))
+
+    def test_restart_capabilities_are_independent_and_host_requires_stable_id(self):
+        self.store.heartbeat(self.worker_id, capabilities={"supports_service_restart": True})
+        with self.assertRaises(WorkerBusyError):
+            self.store.request_worker_restart(self.worker_id, "reboot_host")
+        self.store.heartbeat(self.worker_id, capabilities={"supports_host_reboot": True})
+        with self.assertRaisesRegex(WorkerBusyError, "host_id"):
+            self.store.request_worker_restart(self.worker_id, "reboot_host")
+        with self.assertRaises(WorkerBusyError):
+            self.store.request_worker_restart(self.worker_id, "restart_services")
+
     def test_sync_all_skips_workers_without_sync_support(self):
         request = self.store.request_sync_all()
         self.assertEqual(request["worker_count"], 0)
@@ -1411,6 +1564,8 @@ class DistributedStoreMigrationTest(unittest.TestCase):
                 self.assertIn("sync_request_id", columns)
                 self.assertIn("sync_status", columns)
                 self.assertIn("sync_finished_at", columns)
+                self.assertIn("sync_action", columns)
+                self.assertEqual(store.list_workers()[0]["sync_action"], "sync_files")
                 self.assertIn("retired", columns)
                 self.assertEqual(
                     store.db.execute(
@@ -1651,6 +1806,286 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
     def failed_requests(self):
         return [kwargs["json"] for _, url, kwargs in self.requests if url.endswith("/failed")]
 
+    async def test_service_restart_capability_is_windows_only(self):
+        self.agent.scan_telemetry = mock.AsyncMock()
+        self.agent._json_request = mock.AsyncMock(side_effect=lambda _method, url:
+            {"KSampler": {}} if url.endswith("object_info") else {"system": {}, "devices": []})
+        for name in ("nt", "posix"):
+            with mock.patch("agent.os.name", name):
+                caps = await self.agent.scan_capabilities()
+            self.assertEqual(caps["agent_version"], 6)
+            self.assertIs(caps["supports_service_restart"], name == "nt")
+            self.assertIs(caps["supports_host_reboot"], name == "nt")
+
+    async def test_manual_node_restart_waits_for_task_and_does_not_sync_or_pull(self):
+        agent = self.agent
+        agent.schedule_node_restart = mock.AsyncMock()
+        agent.run_local_command = mock.AsyncMock(side_effect=AssertionError("must not sync"))
+        agent.pull_code = mock.AsyncMock(side_effect=AssertionError("must not pull"))
+        agent._json_request = mock.AsyncMock(side_effect=lambda _method, url, **_kwargs:
+            {"maintenance_ack": {"request_id": "manual", "status": "running"}} if url.endswith("heartbeat") else {})
+        command = {"type": "restart_services", "request_id": "manual"}
+        agent.queue_sync(command)
+        agent.queue_sync(command)
+        agent.queue_sync({"type": "sync_files", "request_id": "other"})
+        self.assertEqual(agent.pending_sync, command)
+        self.assertIsNone(await agent.acquire())
+        agent.current = self.assignment
+        await agent.execute_pending_sync()
+        agent.schedule_node_restart.assert_not_awaited()
+        agent.current = None
+        agent.local_busy = True
+        await agent.execute_pending_sync()
+        agent.schedule_node_restart.assert_not_awaited()
+        agent.local_busy = False
+        await agent.execute_pending_sync()
+        agent.schedule_node_restart.assert_awaited_once_with("manual", "")
+        agent.pull_code.assert_not_awaited()
+        agent.run_local_command.assert_not_awaited()
+        agent.queue_sync(command)
+        agent.queue_sync({"type": "reboot_host", "request_id": "other"})
+        self.assertIsNone(agent.pending_sync)
+
+    async def test_host_reboot_persists_before_ack_and_uses_fixed_command_once(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        agent.pull_code = mock.AsyncMock(side_effect=AssertionError("no pull"))
+        agent.schedule_node_restart = mock.AsyncMock(side_effect=AssertionError("no service stop"))
+
+        async def reply(_method, url, **kwargs):
+            if url.endswith("heartbeat"):
+                state = agent.state["maintenance"]
+                self.assertTrue(state["attempted"])
+                self.assertEqual(state["boot_identity_before"], "boot-before")
+                self.assertEqual(state["action"], "reboot_host")
+                agent._save_state.assert_called()
+                run.assert_not_called()
+                return {"maintenance_ack": {"request_id": "host", "status": "running"}}
+            return {}
+
+        agent._json_request = mock.AsyncMock(side_effect=reply)
+        with mock.patch("agent.os.name", "nt"), \
+             mock.patch("agent.windows_boot_identity", return_value="boot-before"), \
+             mock.patch("agent.subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+            command = {"type": "reboot_host", "request_id": "host"}
+            agent.queue_sync(command)
+            await agent.execute_pending_sync()
+            agent.queue_sync(command)
+            await agent.schedule_host_reboot("host")
+            run.assert_called_once()
+            self.assertEqual(run.call_args.args[0], ["shutdown.exe", "/r", "/t", "0"])
+            self.assertEqual(agent.sync_report["status"], "running")
+            self.assertIsNone(agent.pending_sync)
+            agent.pull_code.assert_not_awaited()
+            agent.schedule_node_restart.assert_not_awaited()
+            # 后续别的维护覆盖 last_restart_result 后，旧整机命令仍不可重放。
+            agent.state.pop("maintenance")
+            agent.state["last_restart_result"] = {"request_id": "newer", "status": "ready"}
+            agent.sync_report = None
+            agent.queue_sync(command)
+            self.assertIsNone(agent.pending_sync)
+            await agent.schedule_host_reboot("host")
+            run.assert_called_once()
+
+    async def test_host_reboot_waits_for_matching_running_ack_without_blocking_loop(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        ack_requested, release_ack = asyncio.Event(), asyncio.Event()
+
+        async def request(_method, url, **_kwargs):
+            if url.endswith("heartbeat"):
+                ack_requested.set()
+                await release_ack.wait()
+                return {"maintenance_ack": {"request_id": "host", "status": "running"}}
+            return {}
+
+        agent._json_request = mock.AsyncMock(side_effect=request)
+        with mock.patch("agent.os.name", "nt"), \
+             mock.patch("agent.windows_boot_identity", return_value="before"), \
+             mock.patch("agent.subprocess.run", return_value=mock.Mock(returncode=0)) as run:
+            agent.queue_sync({"type": "reboot_host", "request_id": "host"})
+            agent.current = self.assignment
+            await agent.execute_pending_sync()
+            self.assertFalse(ack_requested.is_set())
+            agent.current = None
+            task = asyncio.create_task(agent.execute_pending_sync())
+            try:
+                await asyncio.wait_for(ack_requested.wait(), 1)
+                run.assert_not_called()
+                self.assertIsNone(await agent.acquire())
+                agent.queue_sync({"type": "reboot_host", "request_id": "duplicate"})
+                self.assertEqual(agent.pending_sync["request_id"], "host")
+            finally:
+                release_ack.set()
+                await task
+            run.assert_called_once()
+
+    async def test_host_reboot_preflight_and_post_ack_busy_do_not_shutdown(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        for case in ("non_windows", "no_boot_identity", "busy_after_ack"):
+            agent.state, agent.pending_sync, agent.sync_report = {}, None, None
+            agent.comfy_online, agent.local_busy = True, False
+
+            async def request(_method, url, **_kwargs):
+                if url.endswith("heartbeat"):
+                    if case == "busy_after_ack":
+                        agent.current = self.assignment
+                    return {"maintenance_ack": {"request_id": "host", "status": "running"}}
+                return {}
+
+            agent._json_request = mock.AsyncMock(side_effect=request)
+            with self.subTest(case=case), mock.patch("agent.os.name", "posix" if case == "non_windows" else "nt"), \
+                 mock.patch("agent.windows_boot_identity", side_effect=AgentError("no identity") if case == "no_boot_identity" else None,
+                            return_value="before"), \
+                 mock.patch("agent.subprocess.run", side_effect=AssertionError("must not execute")) as run:
+                agent.queue_sync({"type": "reboot_host", "request_id": "host"})
+                await agent.execute_pending_sync()
+                self.assertEqual(agent.sync_report["status"], "error")
+                run.assert_not_called()
+            agent.current = None
+
+    async def test_host_reboot_ack_failure_and_shutdown_failure_never_retry(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        for case in ("missing", "wrong_request", "wrong_status", "network", "shutdown"):
+            agent.state, agent.pending_sync, agent.sync_report = {}, None, None
+            agent.comfy_online = True
+            response = {"maintenance_ack": {"request_id": "host", "status": "running"}}
+            if case == "missing":
+                response = {}
+            elif case == "wrong_request":
+                response["maintenance_ack"]["request_id"] = "other"
+            elif case == "wrong_status":
+                response["maintenance_ack"]["status"] = "error"
+
+            async def reply(_method, url, **_kwargs):
+                if url.endswith("heartbeat"):
+                    if case == "network":
+                        raise AgentError("network failed")
+                    return response
+                return {}
+
+            agent._json_request = mock.AsyncMock(side_effect=reply)
+            with self.subTest(case=case), mock.patch("agent.os.name", "nt"), \
+                 mock.patch("agent.windows_boot_identity", return_value="boot-before"), \
+                 mock.patch("agent.subprocess.run", return_value=mock.Mock(returncode=5)) as run:
+                agent.queue_sync({"type": "reboot_host", "request_id": "host"})
+                await agent.execute_pending_sync()
+                self.assertEqual(run.call_count, 1 if case == "shutdown" else 0)
+                self.assertEqual(agent.sync_report["status"], "error")
+                self.assertTrue(agent.state["maintenance"]["attempted"])
+                agent.queue_sync({"type": "reboot_host", "request_id": "host"})
+                self.assertIsNone(agent.pending_sync)
+                await agent.schedule_host_reboot("host")
+                self.assertEqual(run.call_count, 1 if case == "shutdown" else 0)
+                self.assertIsNone(await agent.acquire())
+
+    async def test_host_recovery_requires_os_boot_change_and_fresh_comfy_scan(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        for boot, online, fresh in (("before", True, True), (None, True, True),
+                                    ("after", False, True), ("after", True, False),
+                                    ("after", True, True)):
+            agent.state = {"maintenance": {"request_id": "host", "action": "reboot_host",
+                "status": "running", "attempted": True, "boot_identity_before": "before",
+                "deadline": time.time() + 900}}
+            agent.boot_identity = boot
+            agent.comfy_online, agent.fresh_capabilities_ready = online, fresh
+            agent.sync_report = {"request_id": "host", "status": "running"}
+            with mock.patch("agent.windows_boot_identity", side_effect=AgentError("no boot evidence")), \
+                 mock.patch("agent.subprocess.run", side_effect=AssertionError("must not reboot on recovery")):
+                await agent.refresh_host_reboot_report()
+            expected = "done" if boot == "after" and online and fresh else "running"
+            self.assertEqual(agent.sync_report["status"], expected, (boot, online, fresh))
+        self.assertEqual(agent.sync_report["boot_identity_after"], "after")
+
+    async def test_host_reboot_timeout_stays_blocked_but_late_proven_recovery_can_finish(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        agent.state = {"maintenance": {"request_id": "host", "action": "reboot_host",
+            "status": "running", "attempted": True, "boot_identity_before": "before", "deadline": time.time() - 1}}
+        agent.boot_identity = "before"
+        agent.comfy_online, agent.fresh_capabilities_ready = True, True
+        await agent.refresh_host_reboot_report()
+        self.assertEqual(agent.sync_report["status"], "error")
+        self.assertIsNone(await agent.acquire())
+        agent.boot_identity = "after"
+        await agent.refresh_host_reboot_report()
+        self.assertEqual(agent.sync_report["status"], "done")
+
+    async def test_new_worker_recovers_persisted_host_request_without_repeating_shutdown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.json"
+            config.write_text(json.dumps({"server_url": "http://controller", "comfy_input_dir": str(root),
+                                          "state_file": "state.json"}), encoding="utf-8")
+            (root / "state.json").write_text(json.dumps({"host_id": "stable", "maintenance": {
+                "request_id": "host", "action": "reboot_host", "status": "running", "attempted": True,
+                "boot_identity_before": "before", "deadline": time.time() + 900}}), encoding="utf-8")
+            self.assertFalse(restart_in_progress(config))
+            recovered = WorkerAgent(config)
+            self.assertFalse(recovered.fresh_capabilities_ready)
+            self.assertIsNone(recovered.pending_sync)
+            recovered._json_request = mock.AsyncMock(side_effect=[
+                {"system": {}, "devices": []}, {"KSampler": {}}])
+            recovered.scan_telemetry = mock.AsyncMock()
+            with mock.patch("agent.windows_boot_identity", return_value="after"), \
+                 mock.patch("agent.subprocess.run", side_effect=AssertionError("no repeated shutdown")):
+                await recovered.scan_capabilities()
+                await recovered.refresh_host_reboot_report()
+            self.assertEqual(recovered.sync_report["status"], "done")
+            reloaded = WorkerAgent(config)
+            self.assertEqual(reloaded.sync_report["boot_identity_before"], "before")
+            self.assertEqual(reloaded.sync_report["boot_identity_after"], "after")
+
+    def test_host_reboot_does_not_block_worker_startup_and_boot_probe_is_fixed(self):
+        from agent import windows_boot_identity
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.json"
+            config.write_text(json.dumps({"state_file": "state.json"}), encoding="utf-8")
+            (Path(directory) / "state.json").write_text(json.dumps({"maintenance": {
+                "request_id": "host", "action": "reboot_host", "status": "restarting",
+                "attempted": True, "deadline": time.time() + 900}}), encoding="utf-8")
+            self.assertFalse(restart_in_progress(config))
+        identity = "2026-10-29T02:30:00.1234567Z"
+        with mock.patch("agent.os.name", "nt"), mock.patch("agent.subprocess.run",
+                return_value=mock.Mock(returncode=0, stdout=identity + "\n")) as run:
+            self.assertEqual(windows_boot_identity(), identity)
+            self.assertEqual(run.call_args.args[0][:4], ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command"])
+            self.assertIn("Win32_OperatingSystem", run.call_args.args[0][-1])
+            self.assertIn("LastBootUpTime.ToUniversalTime()", run.call_args.args[0][-1])
+            run.return_value.stdout = "worker-pid-123"
+            with self.assertRaises(AgentError):
+                windows_boot_identity()
+
+    async def test_terminal_ack_deduplicates_commands_and_failure_stays_blocked(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        for status in ("done", "error"):
+            agent.stop_event = asyncio.Event()
+            agent.state = {"maintenance": {"request_id": status,
+                           "status": "ready" if status == "done" else "error", "message": status}}
+            agent.sync_report = {"request_id": status, "status": status, "message": status}
+
+            async def reply(_method, url, **_kwargs):
+                if url.endswith("heartbeat"):
+                    agent.stop_event.set()
+                    return {"maintenance_ack": {"request_id": status, "status": status},
+                            "commands": [{"type": "reboot_host", "request_id": status}]}
+                return {}
+
+            agent._json_request = mock.AsyncMock(side_effect=reply)
+            await agent.heartbeat_loop()
+            self.assertIsNone(agent.sync_report)
+            self.assertIsNone(agent.pending_sync)
+            self.assertEqual(agent.state["last_maintenance_request_id"], status)
+            self.assertNotIn("maintenance", agent.state)
+            self.assertEqual(agent.maintenance_blocks_jobs(), status == "error")
+            agent.queue_sync({"type": "restart_services", "request_id": "new-" + status})
+            self.assertIsNotNone(agent.pending_sync)
+            agent.pending_sync = None
+
     async def test_sync_command_waits_for_files_then_pulls_and_restarts(self):
         calls = []
 
@@ -1684,45 +2119,50 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls[-1][1], ("sync-1", "abc123def456"))
 
     async def test_restart_handoff_waits_for_supervisor_ack_and_keeps_log(self):
-        process = mock.Mock()
-        process.poll.return_value = None
-        process.terminate = mock.Mock()
-        self.agent.stop_event = asyncio.Event()
-        self.agent.config = {"restart_timeout_seconds": 60}
-        self.agent.run_local_command = mock.AsyncMock(return_value="paths valid")
-        self.agent._save_state = mock.Mock()
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            worker_dir = repo / "worker"
-            worker_dir.mkdir()
-            helper = worker_dir / "restart_node.py"
-            helper.write_text("", encoding="utf-8")
-            launcher = repo / "启动Windows节点.bat"
-            launcher.write_text("", encoding="utf-8")
-            self.agent.config_path = worker_dir / "config.json"
+        for commit in ("abc123def456", ""):
+            with self.subTest(commit=commit):
+                process = mock.Mock()
+                process.poll.return_value = None
+                process.terminate = mock.Mock()
+                self.agent.stop_event = asyncio.Event()
+                self.agent.config = {"restart_timeout_seconds": 60}
+                self.agent.run_local_command = mock.AsyncMock(return_value="paths valid")
+                self.agent._save_state = mock.Mock()
+                with tempfile.TemporaryDirectory() as directory:
+                    repo = Path(directory)
+                    worker_dir = repo / "worker"
+                    worker_dir.mkdir()
+                    helper = worker_dir / "restart_node.py"
+                    helper.write_text("", encoding="utf-8")
+                    launcher = repo / "启动Windows节点.bat"
+                    launcher.write_text("", encoding="utf-8")
+                    self.agent.config_path = worker_dir / "config.json"
 
-            def acknowledged_state():
-                state = copy.deepcopy(self.agent.state)
-                state["maintenance"]["phase"] = "waiting_for_old_worker"
-                return state
+                    def acknowledged_state():
+                        state = copy.deepcopy(self.agent.state)
+                        state["maintenance"]["phase"] = "waiting_for_old_worker"
+                        return state
 
-            self.agent._load_state = mock.Mock(side_effect=acknowledged_state)
-            with mock.patch.object(self.agent, "code_repo_path", return_value=repo), \
-                 mock.patch.object(self.agent, "node_launcher_path", return_value=launcher), \
-                 mock.patch("agent.os.name", "nt"), \
-                 mock.patch("agent.uuid.uuid4", return_value=mock.Mock(hex="restart-1")), \
-                 mock.patch("agent.subprocess.Popen", return_value=process) as spawn, \
-                 mock.patch("agent.asyncio.create_subprocess_exec", new=mock.AsyncMock()) as async_spawn:
-                await self.agent.schedule_node_restart("sync-1", "abc123def456")
+                    self.agent._load_state = mock.Mock(side_effect=acknowledged_state)
+                    with mock.patch.object(self.agent, "code_repo_path", return_value=repo), \
+                         mock.patch.object(self.agent, "node_launcher_path", return_value=launcher), \
+                         mock.patch("agent.os.name", "nt"), \
+                         mock.patch("agent.uuid.uuid4", return_value=mock.Mock(hex="restart-1")), \
+                         mock.patch("agent.subprocess.Popen", return_value=process) as spawn, \
+                         mock.patch("agent.asyncio.create_subprocess_exec", new=mock.AsyncMock()) as async_spawn:
+                        await self.agent.schedule_node_restart("sync-1", commit)
 
-        self.assertTrue(self.agent.stop_event.is_set())
-        self.assertEqual(self.agent.state["maintenance"]["phase"], "waiting_for_old_worker")
-        command = spawn.call_args.args[0]
-        self.assertIn("--restart-token", command)
-        self.assertEqual(command[command.index("--restart-token") + 1], "restart-1")
-        self.assertIsNot(spawn.call_args.kwargs["stdout"], subprocess.DEVNULL)
-        async_spawn.assert_not_awaited()
-        self.agent.run_local_command.assert_awaited_once()
+                self.assertEqual(self.agent.state["maintenance"]["action"], "sync_files" if commit else "restart_services")
+                if not commit:
+                    self.assertNotIn("代码已更新", self.agent.state["maintenance"]["message"])
+                self.assertTrue(self.agent.stop_event.is_set())
+                self.assertEqual(self.agent.state["maintenance"]["phase"], "waiting_for_old_worker")
+                command = spawn.call_args.args[0]
+                self.assertIn("--restart-token", command)
+                self.assertEqual(command[command.index("--restart-token") + 1], "restart-1")
+                self.assertIsNot(spawn.call_args.kwargs["stdout"], subprocess.DEVNULL)
+                async_spawn.assert_not_awaited()
+                self.agent.run_local_command.assert_awaited_once()
 
     async def test_restart_supervisor_spawn_failure_is_persisted_without_stopping_worker(self):
         self.agent.stop_event = asyncio.Event()

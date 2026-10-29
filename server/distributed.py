@@ -328,6 +328,17 @@ def _worker_name_key(name):
     return str(name).strip().casefold()
 
 
+def _worker_host_id(capabilities):
+    if not isinstance(capabilities, dict):
+        return None
+    for source in (capabilities.get("hardware"), capabilities.get("telemetry"), capabilities):
+        if isinstance(source, dict):
+            value = source.get("host_id")
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
 def _primary_node(capabilities):
     return isinstance(capabilities, dict) and capabilities.get("is_primary_node") is True
 
@@ -374,6 +385,7 @@ class DistributedStore:
                     last_capability_id TEXT,
                     last_model_family TEXT,
                     sync_request_id TEXT,
+                    sync_action TEXT NOT NULL DEFAULT 'sync_files',
                     sync_status TEXT NOT NULL DEFAULT 'idle',
                     sync_message TEXT,
                     sync_requested_at REAL,
@@ -427,6 +439,7 @@ class DistributedStore:
                 self.db.execute("ALTER TABLE workers ADD COLUMN retired INTEGER NOT NULL DEFAULT 0")
             sync_columns = {
                 "sync_request_id": "TEXT",
+                "sync_action": "TEXT NOT NULL DEFAULT 'sync_files'",
                 "sync_status": "TEXT NOT NULL DEFAULT 'idle'",
                 "sync_message": "TEXT",
                 "sync_requested_at": "REAL",
@@ -578,14 +591,82 @@ class DistributedStore:
             )
         return True
 
+    def _expire_service_restarts_locked(self, now):
+        self.db.execute(
+            """UPDATE workers SET sync_status = 'error', sync_finished_at = ?, updated_at = ?,
+                   sync_message = '重启超过15分钟，尚未确认恢复；请检查节点并手动恢复服务'
+               WHERE retired = 0 AND sync_action IN ('restart_services', 'reboot_host')
+                 AND sync_status = 'running' AND sync_started_at <= ?""",
+            (now, now, now - 900),
+        )
+
+    def _check_restart_host_locked(self, worker_id, capabilities, action, now):
+        host_id = _worker_host_id(capabilities)
+        if not host_id:
+            if action == "reboot_host":
+                raise WorkerBusyError("缺少稳定 host_id，无法确认整机重启范围")
+            return
+        target = self.db.execute("SELECT name FROM workers WHERE id = ?", (worker_id,)).fetchone()
+        for peer in self.db.execute("SELECT * FROM workers WHERE retired = 0 AND id != ?", (worker_id,)):
+            if _worker_host_id(json.loads(peer["capabilities_json"] or "{}")) != host_id:
+                continue
+            # 仅忽略已经离线且无任务/维护的旧注册；不猜测多个 Worker 是否共享 ComfyUI。
+            active = (_worker_name_key(peer["name"]) != _worker_name_key(target["name"])
+                      or now - peer["last_seen"] <= self.offline_seconds
+                      or peer["busy"] or peer["current_job_id"]
+                      or peer["sync_status"] in ("pending", "running")
+                      or self.db.execute(
+                          "SELECT 1 FROM dispatch_jobs WHERE worker_id = ? AND status IN ('assigned', 'running', 'cancel_requested')",
+                          (peer["id"],)).fetchone())
+            if active:
+                raise WorkerBusyError("同一 host_id 存在其他 Worker，无法安全封锁整机或共享 ComfyUI，请先停止其他实例并清理旧注册")
+
+    def request_worker_restart(self, worker_id, action):
+        if not isinstance(action, str) or action not in ("reboot_host", "restart_services"):
+            raise ValueError("action 必须为 restart_services 或 reboot_host")
+        now = time.time()
+        with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT * FROM workers WHERE id = ? AND retired = 0", (worker_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError("Worker 不存在")
+            latest = next((item for item in self.db.execute(
+                "SELECT id, name FROM workers WHERE retired = 0 ORDER BY created_at DESC, id DESC"
+            ) if _worker_name_key(item["name"]) == _worker_name_key(row["name"])), None)
+            capabilities = json.loads(row["capabilities_json"] or "{}")
+            if now - row["last_seen"] > self.offline_seconds:
+                raise WorkerBusyError("Worker 已离线")
+            if _primary_node(capabilities):
+                raise WorkerBusyError("主节点不支持远程重启")
+            if latest is None or latest["id"] != worker_id:
+                raise WorkerBusyError("只能重启同名最新注册的 Worker")
+            support = "supports_host_reboot" if action == "reboot_host" else "supports_service_restart"
+            if not isinstance(capabilities, dict) or capabilities.get(support) is not True:
+                raise WorkerBusyError("Worker 不支持此重启操作，请先升级 Worker")
+            self._check_restart_host_locked(worker_id, capabilities, action, now)
+            if row["sync_status"] in ("pending", "running"):
+                raise WorkerBusyError("Worker 已有等待中或执行中的维护请求")
+            request_id = str(uuid.uuid4())
+            scope = ("重启 Windows 整机，自动恢复取决于现有启动配置，可手动恢复 Worker"
+                     if action == "reboot_host" else "重启 ComfyUI 和 Worker，不重启 Windows")
+            self.db.execute(
+                """UPDATE workers SET sync_request_id = ?, sync_action = ?,
+                       sync_status = 'pending', sync_message = ?, sync_requested_at = ?,
+                       sync_started_at = NULL, sync_finished_at = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (request_id, action, f"等待节点空闲；{scope}", now, now, worker_id),
+            )
+        return {"worker_id": worker_id, "request_id": request_id, "action": action}
+
     def request_sync_all(self):
         now = time.time()
         request_id = str(uuid.uuid4())
         with self.lock, self.db:
             rows = self.db.execute(
-                """SELECT id, name, capabilities_json FROM workers
+                """SELECT id, name, capabilities_json, sync_action, sync_status FROM workers
                    WHERE retired = 0
-                   ORDER BY name COLLATE NOCASE, created_at DESC, id DESC"""
+                   ORDER BY created_at DESC, id DESC"""
             ).fetchall()
             worker_ids = []
             skipped_count = 0
@@ -601,14 +682,16 @@ class DistributedStore:
                     primary_count += 1
                     continue
                 if (not isinstance(capabilities, dict)
-                        or not capabilities.get("supports_code_restart")):
+                        or not capabilities.get("supports_code_restart")
+                        or (row["sync_action"] in ("reboot_host", "restart_services")
+                            and row["sync_status"] in ("pending", "running"))):
                     skipped_count += 1
                     continue
                 worker_ids.append(row["id"])
             for worker_id in worker_ids:
                 self.db.execute(
                     """UPDATE workers
-                       SET sync_request_id = ?, sync_status = 'pending',
+                       SET sync_request_id = ?, sync_action = 'sync_files', sync_status = 'pending',
                            sync_message = ?, sync_requested_at = ?,
                            sync_started_at = NULL, sync_finished_at = NULL,
                            updated_at = ?
@@ -706,9 +789,10 @@ class DistributedStore:
                   current_job_id=None, maintenance=None, capacity_released=False):
         now = time.time()
         with self.lock, self.db:
+            self._expire_service_restarts_locked(now)
             self._requeue_expired_locked(now)
             row = self.db.execute(
-                """SELECT id, capabilities_json, sync_request_id, sync_status
+                """SELECT id, capabilities_json, sync_request_id, sync_action, sync_status
                    FROM workers WHERE id = ? AND retired = 0""",
                 (worker_id,),
             ).fetchone()
@@ -751,8 +835,23 @@ class DistributedStore:
                 report_request_id = str(maintenance.get("request_id") or "")
                 report_status = str(maintenance.get("status") or "")
                 if (report_request_id == sync_request_id
-                        and report_status in {"running", "done", "error"}):
+                        and report_status in {"running", "done", "error"}
+                        and (sync_status in {"pending", "running"} or report_status == sync_status
+                             or sync_status == "error" and report_status == "done")):
                     message = str(maintenance.get("message") or "")[:1000]
+                    if row["sync_action"] in ("reboot_host", "restart_services") and report_status == "running":
+                        try:
+                            self._check_restart_host_locked(worker_id, effective_capabilities, row["sync_action"], now)
+                        except WorkerBusyError as exc:
+                            report_status, message = "error", str(exc)
+                    if row["sync_action"] == "reboot_host" and report_status == "done":
+                        before = maintenance.get("boot_identity_before")
+                        after = maintenance.get("boot_identity_after")
+                        if (not isinstance(before, str) or not before.strip()
+                                or not isinstance(after, str) or not after.strip()
+                                or before == after or not comfy_online):
+                            report_status = "error"
+                            message = "缺少 Windows 启动标识变化及 ComfyUI 恢复证据，未确认整机重启完成"
                     finished_at = now if report_status in {"done", "error"} else None
                     self.db.execute(
                         """UPDATE workers
@@ -794,7 +893,7 @@ class DistributedStore:
 
             if sync_request_id and sync_status == "pending":
                 commands.append({
-                    "type": "sync_files",
+                    "type": row["sync_action"],
                     "request_id": sync_request_id,
                 })
 
@@ -867,10 +966,11 @@ class DistributedStore:
 
     def list_workers(self):
         now = time.time()
-        with self.lock:
+        with self.lock, self.db:
+            self._expire_service_restarts_locked(now)
             rows = self.db.execute(
                 """SELECT * FROM workers WHERE retired = 0
-                   ORDER BY name COLLATE NOCASE, created_at DESC, id DESC"""
+                   ORDER BY created_at DESC, id DESC"""
             ).fetchall()
         workers = []
         seen_names = set()
@@ -926,6 +1026,14 @@ class DistributedStore:
             if not worker or not worker["enabled"] or not worker["comfy_online"]:
                 return None
             capabilities = json.loads(worker["capabilities_json"] or "{}")
+            host_id = _worker_host_id(capabilities)
+            if host_id and any(
+                _worker_host_id(json.loads(peer["capabilities_json"] or "{}")) == host_id
+                for peer in self.db.execute(
+                    """SELECT capabilities_json FROM workers WHERE retired = 0
+                       AND sync_action IN ('reboot_host', 'restart_services') AND sync_status IN ('pending', 'running', 'error')""")
+            ):
+                return None
             if (not _primary_node(capabilities)
                     and worker["sync_status"] in ("pending", "running", "error")):
                 return None

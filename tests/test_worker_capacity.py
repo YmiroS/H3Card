@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import json
+import os
 import sys
 import tempfile
 import time
@@ -344,7 +345,9 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             "name": "actual CUDA device", "type": "cuda", "index": 2, "vram_total": 1234,
         }])
         self.assertEqual(caps["telemetry"]["execution_device"], hardware["execution_device"])
-        self.assertEqual(caps["agent_version"], 5)
+        self.assertEqual(caps["agent_version"], 6)
+        self.assertIs(caps["supports_service_restart"], os.name == "nt")
+        self.assertIs(caps["supports_host_reboot"], os.name == "nt")
         self.assertEqual(caps["supports_capacity_telemetry"], 1)
         self.assertIs(caps["is_primary_node"], True)
         self.assertNotIn("private-", json.dumps(caps))
