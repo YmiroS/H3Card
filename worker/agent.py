@@ -646,6 +646,19 @@ class WorkerAgent:
         )
         return commit.strip(), output
 
+    async def restart_comfy_only(self):
+        if os.name != "nt":
+            raise AgentError("ComfyUI 自动重启只能在 Windows Worker 上运行")
+        repo = self.code_repo_path().resolve()
+        helper = repo / "worker" / "restart_node.py"
+        launcher = self.node_launcher_path().resolve()
+        timeout = max(float(self.config.get("restart_timeout_seconds", 300)), 60.0)
+        await self.run_local_command(
+            sys.executable, str(helper), "--config", str(self.config_path),
+            "--launcher", str(launcher), "--comfy-only",
+            cwd=repo, timeout=timeout * 2 + 120,
+        )
+
     async def schedule_node_restart(self, request_id, commit):
         if os.name != "nt":
             raise AgentError("节点重启只能在 Windows Worker 上运行")
@@ -1057,9 +1070,17 @@ class WorkerAgent:
         except Exception as exc:
             self.release_failed = (
                 f"显存释放未确认：{type(exc).__name__}: {exc}；"
-                "已停止接单，请检查 ComfyUI 后重启相关进程。"
+                "已停止接单，正在自动重启 ComfyUI，Worker 保持运行。"
             )
             print(f"[Worker] {self.release_failed}", flush=True)
+            try:
+                await self.restart_comfy_only()
+            except Exception as restart_exc:
+                self.release_failed += (
+                    f" 自动重启失败：{type(restart_exc).__name__}: {restart_exc}；"
+                    "请检查 ComfyUI 后重启相关进程。"
+                )
+                print(f"[Worker] {self.release_failed}", flush=True)
             return False
 
     async def acquire(self):

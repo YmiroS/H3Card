@@ -35,6 +35,33 @@ class WorkerFixture:
         return WorkerAgent(path)
 
 
+class WorkerCleanupRestartTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_unconfirmed_cleanup_restarts_services(self):
+        worker = self.make_worker()
+        worker._json_request = mock.AsyncMock(return_value={"cleanup_complete": False})
+        worker.restart_comfy_only = mock.AsyncMock()
+        self.assertFalse(await worker.cancel_and_release({"job_id": "job-1"}))
+        worker.restart_comfy_only.assert_awaited_once()
+        worker.restart_comfy_only.assert_awaited_once_with()
+        self.assertIsNotNone(worker.release_failed)
+
+    async def test_cleanup_503_restarts_services_even_if_restart_fails(self):
+        worker = self.make_worker()
+        worker._json_request = mock.AsyncMock(side_effect=RuntimeError("503 cleanup timeout"))
+        worker.restart_comfy_only = mock.AsyncMock(side_effect=RuntimeError("launcher missing"))
+        self.assertFalse(await worker.cancel_and_release({"job_id": "job-1"}))
+        worker.restart_comfy_only.assert_awaited_once()
+        self.assertIn("自动重启失败", worker.release_failed)
+        self.assertIsNone(await worker.acquire())
+
+    async def test_confirmed_cleanup_does_not_restart(self):
+        worker = self.make_worker()
+        worker._json_request = mock.AsyncMock(return_value={"cleanup_complete": True, "cancelled": True})
+        worker.restart_comfy_only = mock.AsyncMock()
+        self.assertTrue(await worker.cancel_and_release({"job_id": "job-1"}))
+        worker.restart_comfy_only.assert_not_awaited()
+
+
 class WorkerCapacityIdentityTest(WorkerFixture, unittest.TestCase):
     def test_identity_persists_without_registration_and_is_not_hostname(self):
         worker = self.make_worker()

@@ -251,6 +251,7 @@ def main():
     parser.add_argument("--request-id")
     parser.add_argument("--restart-token")
     parser.add_argument("--wait-comfy", action="store_true")
+    parser.add_argument("--comfy-only", action="store_true")
     args = parser.parse_args()
 
     config_path = Path(args.config).resolve()
@@ -264,6 +265,17 @@ def main():
         except Exception as exc:
             log_event(f"ComfyUI 就绪检查失败：{type(exc).__name__}: {exc}")
             raise SystemExit(1) from exc
+        return
+    if args.comfy_only:
+        if not args.launcher:
+            parser.error("重启 ComfyUI 需要 --launcher")
+        launcher = Path(args.launcher).resolve()
+        if not launcher.is_file():
+            raise SystemExit(f"找不到启动脚本：{launcher}")
+        stop_comfy(comfy_url)
+        start_launcher(launcher, timeout)
+        wait_for_comfy_ready(comfy_url, time.time() + timeout)
+        log_event("ComfyUI 已重启，原 Worker 保持运行")
         return
     if args.worker_pid is None or not args.launcher:
         parser.error("重启节点需要 --worker-pid 和 --launcher")
