@@ -51,6 +51,7 @@ from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError,
     BF16_HIGH_VRAM_CAPABILITIES, can_run_capability, is_pro_6000_worker, worker_capability_comparisons,
+    is_windows_worker, generation_worker_reason,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 from if_reference import IFReferenceCopies
@@ -1401,6 +1402,14 @@ async def api_generate(request):
     cap = CAPS.get(cid)
     if not cap:
         raise web.HTTPBadRequest(reason=f"未知能力 {cid}")
+    target_worker_id = body.get("target_worker_id")
+    if "target_worker_id" in body:
+        if (not isinstance(target_worker_id, str) or not target_worker_id.strip()
+                or len(target_worker_id) > 128):
+            raise web.HTTPBadRequest(text="target_worker_id 必须为非空执行端 ID")
+        if (not CONTROLLER_MODE or cap.get("execution") in {"browser", "if_studio"}
+                or cap.get("outputType") != "video"):
+            raise web.HTTPBadRequest(text="仅控制器模式的非 IF 视频能力支持指定执行端")
     if cap.get("execution") == "browser":
         raise web.HTTPBadRequest(text="此能力在浏览器中执行，请在图片合成编辑器中合成输出")
     if cap.get("execution") == "if_studio":
@@ -1447,6 +1456,16 @@ async def api_generate(request):
             )
     if not CONTROLLER_MODE:
         check_local_capability(request.app, cid, gpu_policy, duration_seconds)
+    if target_worker_id is not None:
+        # Validate the final patched graph and effective GPU policy before any job ACL,
+        # public job record or queue entry is created. Busy targets may queue normally.
+        worker = next((item for item in distributed_store(request.app).list_generation_workers()
+                       if item["id"] == target_worker_id), None)
+        if worker is None:
+            raise web.HTTPBadRequest(text="指定执行端不存在、已退役或不是同名最新注册")
+        reason = generation_worker_reason(worker, graph, cid, gpu_policy, duration_seconds)
+        if reason:
+            raise web.HTTPBadRequest(text=reason)
     await require_project(request, body["project"], operate=True)
     pid = str(uuid.uuid4())
     await call_store(request.app, "register_job", pid, body["project"], require_user(request)["id"])
@@ -1481,6 +1500,8 @@ async def api_generate(request):
                  "project": body.get("project"),
                  "projectName": body.get("projectName"),
                  "card": body.get("card"), "cardName": body.get("cardName")}
+    if target_worker_id is not None:
+        JOBS[pid]["target_worker_id"] = target_worker_id
     if CONTROLLER_MODE:
         required_nodes = {
             nd.get("class_type") for nd in graph.values()
@@ -1503,6 +1524,8 @@ async def api_generate(request):
                 cid, {**params, "output_kind": cap.get("outputType")}, graph, dimensions,
             ),
         }
+        if target_worker_id is not None:
+            dispatch_payload["target_worker_id"] = target_worker_id
         if gpu_policy:
             dispatch_payload["gpu_policy"] = gpu_policy
         if duration_seconds is not None:
@@ -2313,6 +2336,39 @@ async def api_agent_failed(request):
     if ledger:
         ledger.finish_job(pid, dispatch_status, ended_at, worker_id)
     return web.json_response({"ok": True})
+
+
+async def api_generation_workers(request):
+    """Authenticated, minimal picker data; /api/workers stays admin-only."""
+    require_user(request)
+    cid = request.query.get("capability")
+    cap = CAPS.get(cid)
+    if (not cap or cap.get("execution") in {"browser", "if_studio"}
+            or cap.get("outputType") != "video"):
+        raise web.HTTPBadRequest(text="请选择非 IF 的视频能力")
+    if not CONTROLLER_MODE:
+        return web.json_response({"workers": [], "controller_mode": False})
+    if not cap.get("_graph_ok"):
+        raise web.HTTPBadRequest(text="此能力的工作流暂不可用")
+    try:
+        graph = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        raise web.HTTPBadRequest(text="此能力的工作流暂不可用")
+    # Templates provide an early compatibility hint only. Submission checks the
+    # final graph, imported-video policy and user-selected duration again.
+    gpu_policy = HIGH_VRAM_GPU_POLICY if cid in HIGH_VRAM_CAPABILITIES else None
+    duration_seconds = rw.duration(cap, {}) if cid in HIGH_VRAM_CAPABILITIES else None
+    workers = []
+    for worker in distributed_store(request.app).list_generation_workers():
+        if not is_windows_worker(worker):
+            continue
+        reason = generation_worker_reason(worker, graph, cid, gpu_policy, duration_seconds)
+        item = {key: worker[key] for key in ("id", "name", "state")}
+        item["selectable"] = reason is None
+        if reason:
+            item["reason"] = reason
+        workers.append(item)
+    return web.json_response({"workers": workers, "controller_mode": True})
 
 
 async def api_workers(request):
@@ -3951,7 +4007,8 @@ def make_app(auth_path=None, *, project_repository=None):
         teams_page=teams_page, static_asset=static_asset)
     register_generation_routes(
         app, api_health=api_health, api_status=api_status, api_cards=api_cards,
-        api_reload=api_reload, api_generate=api_generate, api_rewrite=api_rewrite,
+        api_reload=api_reload, api_generate=api_generate,
+        api_generation_workers=api_generation_workers, api_rewrite=api_rewrite,
         api_text=api_text, api_jobs=api_jobs, api_jobs_history=api_jobs_history,
         api_jobs_clear=api_jobs_clear,
         api_job=api_job, api_cancel=api_cancel, api_job_delete=api_job_delete)

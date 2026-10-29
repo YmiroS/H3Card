@@ -11,7 +11,7 @@ STATIC = {'/favicon.png', '/icon.png', '/auth-art.webp', '/auth-logo.png',
           '/style.css', '/auth-page.css', '/auth.js', '/app.js', '/director.css',
           '/director.js', '/director_edit.js', '/admin-shell.css',
           '/admin-shell.js', '/controller-page.js', '/costs-page.js'}
-READ_APIS = {'/api/health', '/api/status', '/api/workers', '/api/jobs',
+READ_APIS = {'/api/health', '/api/status', '/api/workers', '/api/generation/workers', '/api/jobs',
              '/api/projects', '/api/cards', '/api/team-candidates', '/api/teams',
              '/api/capacity', '/api/capacity/export', '/api/costs', '/api/auth/me'}
 AUTH_WRITES = {'/api/auth/login', '/api/auth/logout', '/api/auth/password',

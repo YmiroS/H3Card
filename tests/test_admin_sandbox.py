@@ -36,6 +36,17 @@ class SandboxBoundaryTests(unittest.TestCase):
                              ('DELETE', '/api/workers/example')]:
             self.assertFalse(allowed(method, path), (method, path))
 
+    def test_generation_worker_picker_is_read_only_and_generation_stays_blocked(self):
+        for method in ('GET', 'HEAD'):
+            self.assertTrue(allowed(method, '/api/generation/workers'))
+            for path in ('/api/generation/workers/', '/api/generation/workers/other',
+                         '/api/generation/workers-extra'):
+                self.assertFalse(allowed(method, path))
+        for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            self.assertFalse(allowed(method, '/api/generation/workers'))
+        self.assertFalse(allowed('POST', '/api/generate'))
+        self.assertFalse(allowed('POST', '/agent/v1/jobs/acquire'))
+
     def test_phone_allowlist_is_exact_and_does_not_open_other_auth_routes(self):
         self.assertTrue(allowed('POST', '/api/auth/phone'))
         for path in ('/api/auth/phone/', '/api/auth/phone/other-user', '/api/auth/phones',
@@ -320,6 +331,35 @@ class SandboxApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await response.json())['sandbox'])
         with self.assertRaisesRegex(RuntimeError, '禁止服务端出站'):
             await self.application['session'].get('http://127.0.0.1:1')
+
+    async def test_generation_picker_read_allowed_but_target_submission_stays_isolated(self):
+        graph = {'1': {'class_type': 'VideoNode', 'inputs': {}}}
+        (self.root / 'picker.api.json').write_text(json.dumps(graph), encoding='utf-8')
+        cap = {'id': 'picker-video', 'outputType': 'video', '_graph_ok': True,
+               'graph': 'picker.api.json'}
+        store = self.application['distributed']
+        worker_id = store.register_worker('Windows copy', {
+            'hardware': {'os': {'name': 'Windows'}}, 'node_classes': ['VideoNode'],
+        })['worker_id']
+        store.heartbeat(worker_id, comfy_online=True)
+        path = '/api/generation/workers?capability=picker-video'
+        with mock.patch.dict(app.CAPS, {'picker-video': cap}):
+            self.assertEqual((await self.client.get(path)).status, 401)
+            headers = await self.login('local-user', 'Local-User-74!')
+            response = await self.client.get(path)
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual(response.headers['X-H3Card-Sandbox'], 'local-copy')
+            self.assertEqual(await response.json(), {'controller_mode': True, 'workers': [{
+                'id': worker_id, 'name': 'Windows copy', 'state': 'idle', 'selectable': True,
+            }]})
+            self.assertEqual((await self.client.get('/api/workers')).status, 403)
+            self.assertEqual((await self.client.get(path, headers={'Host': 'remote.invalid'})).status, 403)
+            response = await self.client.post('/api/generate', headers=headers, json={
+                'project': 'p', 'capability': 'picker-video', 'target_worker_id': worker_id,
+            })
+            self.assertEqual(response.status, 403)
+            self.assertIn('本地隔离', (await response.json())['error'])
+            self.assertEqual(store.queue_ahead_snapshot(), {})
 
     async def test_management_assets_are_explicitly_registered_without_web_fallback(self):
         await self.login()

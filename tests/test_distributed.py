@@ -126,6 +126,56 @@ class ModelDispatchTest(unittest.TestCase):
             "graph": self.graph, "capability": "minimax_h3_fusion_v2", **payload,
         }, self.caps["node_classes"])
 
+    def test_target_binding_skips_other_workers_and_survives_expired_lease(self):
+        other = self.store.register_worker("other", self.caps)["worker_id"]
+        self.store.heartbeat(other, comfy_online=True)
+        self.enqueue(target_worker_id=self.worker_id)
+        self.assertIsNone(self.store.acquire(other))
+        first = self.store.acquire(self.worker_id)
+        self.assertEqual(first["payload"]["target_worker_id"], self.worker_id)
+        with self.store.db:
+            self.store.db.execute("UPDATE dispatch_jobs SET lease_expires_at=0 WHERE job_id='fusion'")
+        self.assertIsNone(self.store.acquire(other))
+        self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+        self.store.heartbeat(self.worker_id, comfy_online=True)
+        second = self.store.acquire(self.worker_id)
+        self.assertEqual(second["payload"]["target_worker_id"], self.worker_id)
+        self.assertNotEqual(first["lease_token"], second["lease_token"])
+        self.assertFalse(self.store.validate_lease("fusion", self.worker_id, first["lease_token"]))
+
+    def test_target_binding_bypasses_larger_gpu_preference_but_not_own_checks(self):
+        larger_caps = copy.deepcopy(self.caps)
+        larger_caps["devices"][0].update(name="RTX A6000", vram_total=48 * 1024 ** 3)
+        larger = self.store.register_worker("larger", larger_caps)["worker_id"]
+        self.store.heartbeat(larger, comfy_online=True)
+        self.enqueue(capability="minimax_h3_ref_2pass", target_worker_id=self.worker_id,
+                     gpu_policy=HIGH_VRAM_GPU_POLICY, duration_seconds=10)
+        self.assertIsNone(self.store.acquire(larger))
+        for failure in ("nodes", "models", "vram"):
+            caps = copy.deepcopy(self.caps)
+            if failure == "nodes":
+                caps["node_classes"] = []
+            elif failure == "models":
+                caps["input_choices"] = {}
+            else:
+                caps["devices"][0].update(name="RTX 4090", vram_total=24 * 1024 ** 3)
+            with self.subTest(failure=failure):
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+                self.assertIsNone(self.store.acquire(self.worker_id))
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=self.caps)
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_busy_target_queues_without_reassignment(self):
+        other = self.store.register_worker("other", self.caps)["worker_id"]
+        self.store.heartbeat(other, comfy_online=True)
+        self.store.heartbeat(self.worker_id, comfy_online=True, busy=True)
+        self.enqueue(target_worker_id=self.worker_id)
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.assertIsNone(self.store.acquire(other))
+        self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+        self.store.heartbeat(self.worker_id, comfy_online=True, busy=False)
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
     def test_queue_snapshot_global_order_and_only_pending(self):
         self.enqueue('b', user='other')
         self.enqueue('a', user='self')

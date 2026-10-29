@@ -68,13 +68,14 @@ def register_media_routes(app, *, api_upload, api_preview_file, api_preview_stat
 
 
 def register_generation_routes(app, *, api_health, api_status, api_cards, api_reload,
-                               api_generate, api_rewrite, api_text, api_jobs,
+                               api_generate, api_generation_workers, api_rewrite, api_text, api_jobs,
                                api_jobs_clear, api_jobs_history, api_job, api_cancel, api_job_delete):
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/cards", api_cards)
     app.router.add_post("/api/reload", api_reload)
     app.router.add_post("/api/generate", api_generate)
+    app.router.add_get("/api/generation/workers", api_generation_workers)
     app.router.add_post("/api/rewrite", api_rewrite)
     app.router.add_post("/api/text", api_text)
     app.router.add_get("/api/jobs", api_jobs)

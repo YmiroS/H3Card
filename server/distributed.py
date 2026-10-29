@@ -320,6 +320,34 @@ def can_run_capability(capability, devices, gpu_policy=None, duration_seconds=No
     )
 
 
+def is_windows_worker(worker):
+    capabilities = worker.get("capabilities")
+    hardware = capabilities.get("hardware") if isinstance(capabilities, dict) else None
+    os_info = hardware.get("os") if isinstance(hardware, dict) else None
+    return isinstance(os_info, dict) and os_info.get("name") == "Windows"
+
+
+def generation_worker_reason(worker, graph, capability, gpu_policy=None, duration_seconds=None):
+    """Public selection checks; never include model paths or management details."""
+    if not is_windows_worker(worker):
+        return "只能指定 Windows 执行端"
+    if worker["state"] not in {"idle", "busy"}:
+        return {
+            "offline": "执行端已离线", "syncing": "执行端正在同步或维护",
+            "disabled": "执行端已停用", "error": "执行端异常或 ComfyUI 未在线",
+        }.get(worker["state"], "执行端暂不可用")
+    capabilities = worker["capabilities"]
+    required = {node.get("class_type") for node in graph.values()
+                if isinstance(node, dict) and node.get("class_type")}
+    if not required.issubset(set(capabilities.get("node_classes") or [])):
+        return "执行端缺少此能力所需节点"
+    if not has_required_models(graph, capabilities):
+        return "执行端缺少此能力所需模型或模型清单不完整"
+    if not can_run_capability(capability, capabilities.get("devices"), gpu_policy, duration_seconds):
+        return "执行端不满足此任务的显卡、显存或时长要求"
+    return None
+
+
 def _hash_token(token):
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
 
@@ -502,7 +530,8 @@ class DistributedStore:
             # A page, not the entire archive, is bound into this metadata query.
             if page:
                 metadata = self.db.execute(
-                    f"""SELECT d.job_id, {capability_sql} AS capability
+                    f"""SELECT d.job_id, {capability_sql} AS capability,
+                        json_extract(d.payload_json, '$.target_worker_id') AS target_worker_id
                         {ledger_columns} FROM dispatch_jobs d {ledger_join}
                         WHERE d.job_id IN ({','.join('?' for _ in page)})""",
                     [job["id"] for job in page],
@@ -512,7 +541,8 @@ class DistributedStore:
                     row = by_id.get(job["id"], {})
                     for source, target in (("project_id", "project"), ("project_name", "projectName"),
                                            ("card_id", "card"), ("card_name", "cardName"),
-                                           ("started_at", "started"), ("ended_at", "ended")):
+                                           ("started_at", "started"), ("ended_at", "ended"),
+                                           ("target_worker_id", "target_worker_id")):
                         if row.get(source) is not None:
                             job[target] = row[source]
                     capability = row.get("capability")
@@ -1005,6 +1035,30 @@ class DistributedStore:
             workers.append(item)
         return workers
 
+    def _service_maintenance_hosts_locked(self):
+        hosts = {}
+        for row in self.db.execute(
+            """SELECT capabilities_json, sync_status FROM workers WHERE retired = 0
+               AND sync_action IN ('reboot_host', 'restart_services')
+               AND sync_status IN ('pending', 'running', 'error')"""
+        ):
+            host_id = _worker_host_id(json.loads(row["capabilities_json"] or "{}"))
+            if host_id:
+                state = "error" if row["sync_status"] == "error" else "syncing"
+                if hosts.get(host_id) != "error":
+                    hosts[host_id] = state
+        return hosts
+
+    def list_generation_workers(self):
+        with self.lock:
+            workers = self.list_workers()
+            maintenance = self._service_maintenance_hosts_locked()
+            for worker in workers:
+                host_id = _worker_host_id(worker["capabilities"])
+                if worker["state"] in {"idle", "busy"} and host_id in maintenance:
+                    worker["state"] = maintenance[host_id]
+            return workers
+
     def enqueue(self, job_id, payload, required_nodes=None):
         now = time.time()
         with self.lock, self.db:
@@ -1027,12 +1081,7 @@ class DistributedStore:
                 return None
             capabilities = json.loads(worker["capabilities_json"] or "{}")
             host_id = _worker_host_id(capabilities)
-            if host_id and any(
-                _worker_host_id(json.loads(peer["capabilities_json"] or "{}")) == host_id
-                for peer in self.db.execute(
-                    """SELECT capabilities_json FROM workers WHERE retired = 0
-                       AND sync_action IN ('reboot_host', 'restart_services') AND sync_status IN ('pending', 'running', 'error')""")
-            ):
+            if host_id and host_id in self._service_maintenance_hosts_locked():
                 return None
             if (not _primary_node(capabilities)
                     and worker["sync_status"] in ("pending", "running", "error")):
@@ -1061,8 +1110,11 @@ class DistributedStore:
             ).fetchall()
             eligible = []
             for row in rows:
-                required = set(json.loads(row["required_nodes_json"] or "[]"))
                 payload = json.loads(row["payload_json"])
+                target_worker_id = payload.get("target_worker_id")
+                if target_worker_id is not None and target_worker_id != worker_id:
+                    continue
+                required = set(json.loads(row["required_nodes_json"] or "[]"))
                 capability = payload.get("capability")
                 gpu_policy = payload.get("gpu_policy")
                 if (not required.issubset(available_nodes)
@@ -1072,7 +1124,7 @@ class DistributedStore:
                             payload.get("duration_seconds"),
                         )):
                     continue
-                if requires_high_vram(capability, gpu_policy) and any(
+                if target_worker_id is None and requires_high_vram(capability, gpu_policy) and any(
                     primary_gpu_vram_bytes(other.get("devices")) > current_vram
                     and required.issubset(set(other.get("node_classes") or []))
                     and has_required_models(payload.get("graph") or {}, other)

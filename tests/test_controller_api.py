@@ -949,6 +949,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_post("/api/job/{pid}/cancel", controller_app.api_cancel)
         application.router.add_delete("/api/job/{pid}", controller_app.api_job_delete)
         application.router.add_post("/api/generate", controller_app.api_generate)
+        application.router.add_get("/api/generation/workers", controller_app.api_generation_workers)
         application.router.add_post("/api/text", controller_app.api_text)
         application.router.add_get("/api/projects", controller_app.api_projects)
         application.router.add_post("/api/projects", controller_app.api_project_create)
@@ -996,6 +997,321 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         controller_app.JOBS.clear()
         controller_app.STEPS.clear()
         controller_app.WEIGHTS.clear()
+
+    def target_fixture(self):
+        graph = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "exact.safetensors"}},
+            "2": {"class_type": "KSampler", "inputs": {"model": ["1", 0]}},
+        }
+        (self.root / "target.api.json").write_text(json.dumps(graph), encoding="utf-8")
+        cap = {"id": "target-video", "name": "测试视频", "outputType": "video",
+               "_graph_ok": True, "graph": "target.api.json"}
+        caps = {"hardware": {"os": {"name": "Windows"}, "secret_path": "not-public"},
+                "node_classes": ["UNETLoader", "KSampler"],
+                "input_choices": {"UNETLoader": {"unet_name": ["exact.safetensors"]}},
+                "input_types": {"KSampler": {"model": "MODEL"}},
+                "devices": [{"type": "cuda", "name": "RTX 5090", "vram_total": 32 * 1024 ** 3}]}
+        worker_id = self.store.register_worker("Windows target", caps)["worker_id"]
+        self.store.heartbeat(worker_id, comfy_online=True)
+        return cap, graph, caps, worker_id
+
+    async def test_generation_workers_user_minimal_read_and_auth_boundaries(self):
+        cap, _graph, caps, worker_id = self.target_fixture()
+        self.store.register_worker("Linux", {**caps, "hardware": {"os": {"name": "Linux"}}})
+        self.store.register_worker("unknown-os", {"node_classes": caps["node_classes"]})
+        self.auth.create_user("picker-user", auth_support.PASSWORD)
+        self.client.session.headers.update(await self.login("picker-user"))
+        path = "/api/generation/workers?capability=target-video"
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "ROOT", self.root):
+            response = await self.client.get(path)
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertIn("no-store", response.headers["Cache-Control"])
+            self.assertEqual(await response.json(), {"controller_mode": True, "workers": [{
+                "id": worker_id, "name": "Windows target", "state": "idle", "selectable": True,
+            }]})
+            self.assertEqual((await self.client.head(path)).status, 200)
+            self.assertEqual((await self.client.get("/api/workers")).status, 403)
+            self.assertEqual((await self.client.post("/api/admin/workers/sync-all", json={})).status, 403)
+            self.auth.create_user("picker-monitor", auth_support.PASSWORD, role="monitor")
+            self.client.session.headers.update(await self.login("picker-monitor"))
+            self.assertEqual((await self.client.get(path)).status, 403)
+            self.assertEqual((await self.client.head(path)).status, 403)
+            self.client.session.cookie_jar.clear()
+            self.assertEqual((await self.client.get(path)).status, 401)
+
+    async def test_generation_workers_states_compatibility_and_latest_registration(self):
+        cap, _graph, caps, old_id = self.target_fixture()
+        latest = self.store.register_worker("  WINDOWS TARGET  ", caps)["worker_id"]
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET created_at=1 WHERE id=?", (old_id,))
+        self.store.heartbeat(latest, comfy_online=True, busy=True)
+        expected = {latest: ("busy", True)}
+        for state in ("offline", "disabled", "syncing", "error", "comfy-offline",
+                      "missing-nodes", "missing-models", "reserved-gpu", "retired"):
+            worker_caps = json.loads(json.dumps(caps))
+            if state == "missing-nodes":
+                worker_caps["node_classes"] = []
+            elif state == "missing-models":
+                worker_caps["input_choices"] = {}
+            elif state == "reserved-gpu":
+                worker_caps["devices"][0]["name"] = "RTX PRO 6000"
+            worker_id = self.store.register_worker(state, worker_caps)["worker_id"]
+            self.store.heartbeat(worker_id, comfy_online=state != "comfy-offline")
+            with self.store.db:
+                if state == "offline":
+                    self.store.db.execute("UPDATE workers SET last_seen=0 WHERE id=?", (worker_id,))
+                elif state == "disabled":
+                    self.store.set_worker_enabled(worker_id, False)
+                elif state in {"syncing", "error"}:
+                    self.store.db.execute("UPDATE workers SET sync_status=? WHERE id=?",
+                                          ("pending" if state == "syncing" else "error", worker_id))
+                elif state == "retired":
+                    self.store.retire_worker(worker_id)
+            if state != "retired":
+                expected[worker_id] = (state if state in {"offline", "disabled", "syncing", "error"}
+                                       else "error" if state == "comfy-offline" else "idle", False)
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "ROOT", self.root):
+            response = await self.client.get("/api/generation/workers?capability=target-video")
+            self.assertEqual(response.status, 200, await response.text())
+            workers = (await response.json())["workers"]
+        self.assertEqual({w["id"]: (w["state"], w["selectable"]) for w in workers}, expected)
+        for worker in workers:
+            self.assertEqual(set(worker), {"id", "name", "state", "selectable"}
+                             | ({"reason"} if not worker["selectable"] else set()))
+            if not worker["selectable"]:
+                self.assertRegex(worker["reason"], "[\u4e00-\u9fff]")
+                self.assertNotIn("exact.safetensors", worker["reason"])
+
+    async def test_target_workers_share_acquire_host_maintenance_gate(self):
+        cap, graph, caps, _worker_id = self.target_fixture()
+        caps = {**caps, "hardware": {**caps["hardware"], "host_id": "shared-host"},
+                "supports_service_restart": True}
+        peer = self.store.register_worker("maintenance host", caps)["worker_id"]
+        self.store.heartbeat(peer, comfy_online=True)
+        self.store.request_worker_restart(peer, "restart_services")
+        primary = self.store.register_worker("  MAINTENANCE HOST  ", {
+            **caps, "is_primary_node": True,
+        })["worker_id"]
+        ordinary = self.store.register_worker("same-host ordinary", caps)["worker_id"]
+        self.store.heartbeat(primary, comfy_online=True)
+        self.store.heartbeat(ordinary, comfy_online=True)
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET created_at=1 WHERE id=?", (peer,))
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "ROOT", self.root), \
+             mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(controller_app, "cost_ledger", return_value=None):
+            for action in ("restart_services", "reboot_host"):
+                for state in ("pending", "running", "error"):
+                    with self.subTest(action=action, state=state), self.store.db:
+                        self.store.db.execute(
+                            "UPDATE workers SET sync_action=?, sync_status=? WHERE id=?",
+                            (action, state, peer),
+                        )
+                        response = await self.client.get(
+                            "/api/generation/workers?capability=target-video")
+                        self.assertEqual(response.status, 200, await response.text())
+                        workers = {w["id"]: w for w in (await response.json())["workers"]}
+                        self.assertNotIn(peer, workers)
+                        for target in (primary, ordinary):
+                            self.assertFalse(workers[target]["selectable"])
+                            self.assertEqual(workers[target]["state"],
+                                             "error" if state == "error" else "syncing")
+                            response = await self.client.post("/api/generate", json={
+                                "project": "p", "capability": "target-video",
+                                "target_worker_id": target,
+                            })
+                            self.assertEqual(response.status, 400, await response.text())
+                            self.assertIsNone(self.store.acquire(target))
+                        self.assertEqual(controller_app.JOBS, {})
+                        self.assertEqual(self.store.queue_ahead_snapshot(), {})
+                        self.assertEqual(self.auth.db.execute(
+                            "SELECT COUNT(*) FROM job_acl").fetchone()[0], 0)
+            with self.store.db:
+                self.store.db.execute("UPDATE workers SET sync_status='done' WHERE id=?", (peer,))
+                self.store.db.execute(
+                    "UPDATE workers SET sync_action='sync_files', sync_status='pending' WHERE id=?",
+                    (primary,),
+                )
+            response = await self.client.get("/api/generation/workers?capability=target-video")
+            workers = {w["id"]: w for w in (await response.json())["workers"]}
+            self.assertTrue(workers[primary]["selectable"])
+            self.assertTrue(workers[ordinary]["selectable"])
+            response = await self.client.post("/api/generate", json={
+                "project": "p", "capability": "target-video", "target_worker_id": primary,
+            })
+            self.assertEqual(response.status, 200, await response.text())
+            job = await response.json()
+            self.assertEqual(self.store.acquire(primary)["job_id"], job["id"])
+
+    async def test_target_generate_busy_queues_and_persists_public_binding(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        other = self.store.register_worker("other", caps)["worker_id"]
+        self.store.heartbeat(other, comfy_online=True)
+        self.store.heartbeat(worker_id, comfy_online=True, busy=True)
+        jobs_file = self.root / "jobs.json"
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(controller_app, "cost_ledger", return_value=None), \
+             mock.patch.object(controller_app, "JOBS_FILE", jobs_file), \
+             mock.patch.object(controller_app, "save_jobs", self.old_save_jobs):
+            response = await self.client.post("/api/generate", json={
+                "project": "p", "capability": "target-video", "target_worker_id": worker_id,
+            })
+            self.assertEqual(response.status, 200, await response.text())
+            job = await response.json()
+            self.assertEqual(job["target_worker_id"], worker_id)
+            self.assertEqual(job["status"], "queued")
+            self.assertIsNone(self.store.acquire(worker_id))
+            self.assertIsNone(self.store.acquire(other))
+            saved = json.loads(jobs_file.read_text(encoding="utf-8"))
+            self.assertEqual(saved[0]["target_worker_id"], worker_id)
+            public = await (await self.client.get("/api/job/" + job["id"])).json()
+            self.assertEqual(public["target_worker_id"], worker_id)
+            self.store.heartbeat(worker_id, comfy_online=True, busy=False)
+            assignment = self.store.acquire(worker_id)
+            self.assertEqual(assignment["job_id"], job["id"])
+            self.assertEqual(assignment["payload"]["target_worker_id"], worker_id)
+            self.store.finish(job["id"], worker_id, assignment["lease_token"], "done")
+            controller_app.JOBS.clear()
+            history = await (await self.client.get("/api/jobs/history")).json()
+            self.assertEqual(history["jobs"][0]["target_worker_id"], worker_id)
+            self.assertTrue(history["jobs"][0]["history_only"])
+
+    async def test_unbound_generate_keeps_automatic_dispatch_without_windows_restriction(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        other = self.store.register_worker("Linux automatic", {
+            **caps, "hardware": {"os": {"name": "Linux"}},
+        })["worker_id"]
+        self.store.heartbeat(other, comfy_online=True)
+        self.store.heartbeat(worker_id, comfy_online=True, busy=True)
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(controller_app, "cost_ledger", return_value=None):
+            response = await self.client.post("/api/generate", json={
+                "project": "p", "capability": "target-video",
+            })
+        self.assertEqual(response.status, 200, await response.text())
+        job = await response.json()
+        self.assertNotIn("target_worker_id", job)
+        assignment = self.store.acquire(other)
+        self.assertEqual(assignment["job_id"], job["id"])
+        self.assertNotIn("target_worker_id", assignment["payload"])
+
+    async def test_target_generate_rejects_bad_target_before_register_or_enqueue(self):
+        cap, graph, caps, old_id = self.target_fixture()
+        latest = self.store.register_worker("Windows target", caps)["worker_id"]
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET created_at=1 WHERE id=?", (old_id,))
+        self.store.heartbeat(latest, comfy_online=True)
+        targets = [None, "", " ", [], {}, 1, True, "x" * 129, "unknown", old_id]
+        for state in ("offline", "disabled", "syncing", "error", "comfy-offline", "retired",
+                      "Linux", "missing-os", "missing-nodes", "missing-models"):
+            worker_caps = json.loads(json.dumps(caps))
+            if state == "Linux":
+                worker_caps["hardware"]["os"]["name"] = "Linux"
+            elif state == "missing-os":
+                worker_caps.pop("hardware")
+            elif state == "missing-nodes":
+                worker_caps["node_classes"] = []
+            elif state == "missing-models":
+                worker_caps["input_choices"] = {}
+            worker_id = self.store.register_worker(state, worker_caps)["worker_id"]
+            self.store.heartbeat(worker_id, comfy_online=state != "comfy-offline")
+            with self.store.db:
+                if state == "offline":
+                    self.store.db.execute("UPDATE workers SET last_seen=0 WHERE id=?", (worker_id,))
+                elif state == "disabled":
+                    self.store.set_worker_enabled(worker_id, False)
+                elif state in {"syncing", "error"}:
+                    self.store.db.execute("UPDATE workers SET sync_status=? WHERE id=?",
+                                          ("running" if state == "syncing" else "error", worker_id))
+                elif state == "retired":
+                    self.store.retire_worker(worker_id)
+            targets.append(worker_id)
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(self.auth, "register_job", wraps=self.auth.register_job) as register, \
+             mock.patch.object(self.store, "enqueue", wraps=self.store.enqueue) as enqueue:
+            for target in targets:
+                with self.subTest(target=target):
+                    response = await self.client.post("/api/generate", json={
+                        "project": "p", "capability": "target-video", "target_worker_id": target,
+                    })
+                    self.assertEqual(response.status, 400, await response.text())
+            register.assert_not_called()
+            enqueue.assert_not_called()
+        self.assertEqual(controller_app.JOBS, {})
+        self.assertEqual(self.store.queue_ahead_snapshot(), {})
+
+    async def test_target_scope_and_picker_capability_validation(self):
+        cap, graph, _caps, worker_id = self.target_fixture()
+        with mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(controller_app, "ROOT", self.root):
+            for mode, capability in ((False, cap), (True, {**cap, "execution": "if_studio"}),
+                                     (True, {**cap, "outputType": "image"}),
+                                     (True, {**cap, "execution": "browser"})):
+                with self.subTest(mode=mode, capability=capability), \
+                     mock.patch.object(controller_app, "CONTROLLER_MODE", mode), \
+                     mock.patch.dict(controller_app.CAPS, {"target-video": capability}):
+                    response = await self.client.post("/api/generate", json={
+                        "project": "p", "capability": "target-video", "target_worker_id": worker_id,
+                    })
+                    self.assertEqual(response.status, 400, await response.text())
+                    response = await self.client.get("/api/generation/workers?capability=target-video")
+                    self.assertEqual(response.status, 400 if mode else 200)
+                    if not mode:
+                        self.assertEqual(await response.json(), {"workers": [], "controller_mode": False})
+            for query in ("", "?capability=unknown"):
+                self.assertEqual((await self.client.get("/api/generation/workers" + query)).status, 400)
+        self.assertEqual(controller_app.JOBS, {})
+        self.assertEqual(self.auth.db.execute("SELECT COUNT(*) FROM job_acl").fetchone()[0], 0)
+
+    async def test_target_final_graph_and_effective_gpu_policy_rechecked(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        body = {"project": "p", "capability": "target-video", "target_worker_id": worker_id}
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "ROOT", self.root), \
+             mock.patch.object(self.auth, "register_job", wraps=self.auth.register_job) as register, \
+             mock.patch.object(self.store, "enqueue", wraps=self.store.enqueue) as enqueue:
+            picker = await (await self.client.get("/api/generation/workers?capability=target-video")).json()
+            self.assertTrue(picker["workers"][0]["selectable"])
+            for final_graph in ({**graph, "3": {"class_type": "MissingNode", "inputs": {}}},
+                                {**graph, "1": {"class_type": "UNETLoader", "inputs": {
+                                    "unet_name": "different.safetensors"}}}):
+                with self.subTest(graph=final_graph), \
+                     mock.patch.object(controller_app, "patch_graph", return_value=final_graph):
+                    response = await self.client.post("/api/generate", json=body)
+                    self.assertEqual(response.status, 400, await response.text())
+            caps["devices"][0].update(name="RTX 4090", vram_total=24 * 1024 ** 3)
+            self.store.heartbeat(worker_id, comfy_online=True, capabilities=caps)
+            with mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+                 mock.patch.object(controller_app, "inspect_imported_videos", return_value=(11, {})):
+                response = await self.client.post("/api/generate", json=body)
+                self.assertEqual(response.status, 400, await response.text())
+                self.assertIn("显存", await response.text())
+            with mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": cap}), \
+                 mock.patch.object(controller_app, "patch_graph", return_value=graph):
+                for duration in (6, 10):
+                    response = await self.client.post("/api/generate", json={
+                        **body, "capability": "minimax_h3_ref_2pass", "params": {"duration": duration},
+                    })
+                    self.assertEqual(response.status, 400, await response.text())
+            register.assert_not_called()
+            enqueue.assert_not_called()
+        self.assertEqual(controller_app.JOBS, {})
+        with mock.patch.dict(controller_app.CAPS, {"minimax_h3_ref_2pass": cap}), \
+             mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(controller_app, "cost_ledger", return_value=None):
+            response = await self.client.post("/api/generate", json={
+                **body, "capability": "minimax_h3_ref_2pass", "params": {"duration": 5},
+            })
+            self.assertEqual(response.status, 200, await response.text())
+            assignment = self.store.acquire(worker_id)
+            self.assertEqual(assignment["payload"]["duration_seconds"], 5)
+            self.assertEqual(assignment["payload"]["gpu_policy"], controller_app.HIGH_VRAM_GPU_POLICY)
 
     async def test_capacity_permissions_and_navigation(self):
         response = await self.client.get("/controller/capacity")

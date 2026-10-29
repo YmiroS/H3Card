@@ -144,6 +144,15 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                         self.assertNotEqual(body, frontend.index.read_bytes())
                 self.assertEqual((await self.client.get('/' + path.relative_to(ROOT / 'web_dist').as_posix())).status, 404)
 
+    async def test_generation_workers_route_is_wired_in_single_machine_mode(self):
+        path = '/api/generation/workers?capability=minimax_h3_ref9'
+        response = await self.client.get(path)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(await response.json(), {'workers': [], 'controller_mode': False})
+        self.assertEqual((await self.client.head(path)).status, 200)
+        self.client.session.cookie_jar.clear()
+        self.assertEqual((await self.client.get(path)).status, 401)
+
     async def test_if_reference_route_is_wired_and_authenticated(self):
         self.assertIsInstance(self.client.app['if_reference_copies'], controller_app.IFReferenceCopies)
         response = await self.client.get('/api/if-reference')
