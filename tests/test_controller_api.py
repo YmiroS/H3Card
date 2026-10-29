@@ -1015,6 +1015,45 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.store.heartbeat(worker_id, comfy_online=True)
         return cap, graph, caps, worker_id
 
+    async def test_generation_captures_only_authorized_reference_headers_with_bounded_probe_budget(self):
+        graph = {
+            "1": {"class_type": "LoadImage", "inputs": {"image": "chouka/first.png"}},
+            "2": {"class_type": "LoadImage", "inputs": {"image": "chouka/second.png"}},
+            "3": {"class_type": "LoadImage", "inputs": {"image": "/private/never-read.png"}},
+            "4": {"class_type": "LoadImage", "inputs": {"image": "unused-template.png"}},
+            "5": {"class_type": "MiniMaxH3ReferenceToVideo", "inputs": {
+                "width": 1344, "height": 768, "length": 73, "ref_image_size": "max",
+                "ref_images.ref_image_0": ["1", 0], "ref_images.ref_image_1": ["2", 0],
+                "ref_images.ref_image_2": ["3", 0],
+            }},
+        }
+        cap = {"id": "diagnostic-image", "name": "诊断测试", "kind": "gen", "outputType": "image",
+               "_graph_ok": True, "graph": "unused.api.json", "inputs": []}
+        assets = {"images[0]": "chouka/first.png", "images[1]": "chouka/second.png"}
+        self.register_asset("first.png")
+        self.register_asset("second.png")
+        clock = types.SimpleNamespace(time=time.time, monotonic=mock.Mock(side_effect=[100, 100, 104]))
+        with mock.patch.dict(controller_app.CAPS, {cap["id"]: cap}), \
+             mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(controller_app, "generation_assets", new=mock.AsyncMock(return_value=assets)), \
+             mock.patch.object(controller_app, "cost_ledger", return_value=None), \
+             mock.patch.object(controller_app, "time", clock), \
+             mock.patch.object(controller_app, "probe_video", return_value={"width": 2048, "height": 2048}) as probe:
+            response = await self.client.post("/api/generate", json={"project": "p", "capability": cap["id"]})
+        self.assertEqual(response.status, 200, await response.text())
+        job = await response.json()
+        probe.assert_called_once_with("chouka/first.png", timeout=3)
+        raw = self.store.db.execute("SELECT payload_json FROM dispatch_jobs WHERE job_id=?", (job["id"],)).fetchone()[0]
+        payload = json.loads(raw)
+        self.assertEqual(payload["graph"], graph)
+        load = payload["capacity_spec"]["reference_load"]
+        self.assertFalse(load["complete"])
+        self.assertEqual(load["groups"][0]["image_count"], 3)
+        self.assertEqual(load["groups"][0]["references"][0]["width"], 2048)
+        self.assertIsNone(load["groups"][0]["references"][1]["width"])
+        self.assertNotIn("private", json.dumps(load))
+        self.assertNotIn("first.png", json.dumps(load))
+
     async def test_generation_workers_user_minimal_read_and_auth_boundaries(self):
         cap, _graph, caps, worker_id = self.target_fixture()
         self.store.register_worker("Linux", {**caps, "hardware": {"os": {"name": "Linux"}}})
@@ -3617,6 +3656,30 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(cost_job["cost_source"], "actual")
         self.assertEqual(cost_job["worker_name"], "gpu-01")
 
+    async def test_diagnostic_events_are_lease_scoped_durable_and_not_ui_progress(self):
+        credentials = self.store.register_worker("diagnostic-worker", {})
+        worker_id = credentials["worker_id"]
+        headers = {"X-Worker-ID": worker_id, "Authorization": f"Bearer {credentials['worker_token']}"}
+        self.store.heartbeat(worker_id, comfy_online=True)
+        self.register_job("diagnostic-job")
+        self.store.enqueue("diagnostic-job", {"graph": {}})
+        assignment = self.store.acquire(worker_id)
+        diagnostic = {"version": 1, "execution_error": {"message": "CUDA out of memory"}}
+        event = {"type": "capacity_diagnostics", "data": {"diagnostics": diagnostic}}
+        invalid = await self.client.post("/agent/v1/jobs/diagnostic-job/event",
+                                         headers={**headers, "X-Lease-Token": "wrong"}, json=event)
+        self.assertEqual(invalid.status, 409)
+        with mock.patch.object(controller_app, "handle_event", new=mock.AsyncMock()) as ui_event:
+            response = await self.client.post("/agent/v1/jobs/diagnostic-job/event",
+                headers={**headers, "X-Lease-Token": assignment["lease_token"]}, json=event)
+        self.assertEqual(response.status, 200)
+        self.assertTrue((await response.json())["recorded"])
+        ui_event.assert_not_awaited()
+        self.assertEqual(self.store.dispatch_status("diagnostic-job"), "assigned")
+        row = self.store.db.execute("SELECT measurements_json FROM capacity_attempts WHERE id=?",
+                                   (assignment["attempt_id"],)).fetchone()
+        self.assertEqual(json.loads(row[0])["diagnostics"]["execution_error"]["message"], "CUDA out of memory")
+
     async def test_cleanup_pending_events_keep_lease_until_worker_failure_report(self):
         credentials = self.store.register_worker("cleanup-worker", {})
         worker_id = credentials["worker_id"]
@@ -3662,6 +3725,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(response.status, 200)
         self.assertEqual(self.store.dispatch_status("cleanup-job"), "error")
         self.assertFalse(controller_app.JOBS["cleanup-job"]["cleanup_pending"])
+        row = self.store.db.execute("SELECT measurements_json FROM capacity_attempts WHERE id=?",
+                                   (assignment["attempt_id"],)).fetchone()
+        self.assertEqual(json.loads(row[0])["diagnostics"]["execution_error"]["message"], "OOM")
         for current in ("cleanup-job", None):
             await self.client.post("/agent/v1/heartbeat", headers=headers, json={
                 "comfy_online": True, "busy": True, "local_busy": True,

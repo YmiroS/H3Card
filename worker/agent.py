@@ -28,9 +28,19 @@ class AgentError(RuntimeError):
 
 
 class JobFailed(AgentError):
-    def __init__(self, message, canceled=False):
+    def __init__(self, message, canceled=False, *, exception_type=None,
+                 node_id=None, node_type=None):
         super().__init__(message)
         self.canceled = canceled
+        self.exception_type = exception_type
+        self.node_id = node_id
+        self.node_type = node_type
+
+    @classmethod
+    def from_execution_error(cls, data):
+        return cls(data.get("exception_message") or "ComfyUI 执行失败",
+                   exception_type=data.get("exception_type"),
+                   node_id=data.get("node_id"), node_type=data.get("node_type"))
 
 
 def worker_mutex_name(config_path):
@@ -404,6 +414,194 @@ class WorkerAgent:
         self.capabilities["telemetry"] = self.telemetry
         return self.telemetry
 
+    @staticmethod
+    def _diagnostic_text(value, limit=160):
+        return str(value)[:limit] if isinstance(value, (str, int, float)) else None
+
+    def _diagnostic_device(self):
+        # Comfy's CUDA index may be logical while nvidia-smi reports physical indices.
+        # Without an explicit UUID mapping, even a single visible GPU is not proof.
+        if any(key in os.environ for key in ("CUDA_VISIBLE_DEVICES", "NVIDIA_VISIBLE_DEVICES")):
+            return None
+        devices = self.capabilities.get("devices")
+        device = (devices[0] if isinstance(devices, (list, tuple)) and devices
+                  and isinstance(devices[0], dict) else {})
+        index = device.get("index")
+        if device.get("type") != "cuda" or type(index) is not int or index < 0:
+            return None
+        return index
+
+    def init_diagnostics(self, assignment):
+        # Freeze the mapping even when unknown. Never merge devices within an attempt.
+        index = self._diagnostic_device()
+        assignment["_diagnostic_state"] = {
+            "device_index": index, "seen_at": None, "started_at": time.time(),
+            "identity": tuple(assignment.get(key) for key in
+                              ("job_id", "attempt_id", "lease_token")),
+        }
+        diagnostics = {
+            "version": 1, "execution_error": None, "cleanup_error": None,
+            "cleanup_complete": None, "last_node": None, "last_progress_at": None,
+            "memory": {
+                "source": "nvidia-smi", "sample_count": 0, "missing_samples": 0,
+                "first_at": None, "last_at": None, "max_gap_seconds": 0,
+                "device_index": index, "device_name": None, "total_bytes": None,
+                "used_peak_bytes": None, "free_min_bytes": None,
+                "before": None, "after": None, "latest": None, "peak_node": None,
+            },
+        }
+        assignment.setdefault("_capacity_measurements", {})["diagnostics"] = diagnostics
+        return diagnostics
+
+    def observe_diagnostic_memory(self, assignment, telemetry, *, boundary=None, fresh_since=None):
+        # No await: observations and snapshots are atomic with respect to task switches.
+        try:
+            state = assignment["_diagnostic_state"]
+            if assignment.get("_diagnostics_final") and boundary is None:
+                return
+            if (self.current is not assignment or state["identity"] != tuple(
+                    assignment.get(key) for key in ("job_id", "attempt_id", "lease_token"))):
+                return
+            diagnostics = assignment["_capacity_measurements"]["diagnostics"]
+            memory = diagnostics["memory"]
+            telemetry = telemetry if isinstance(telemetry, dict) else {}
+            at = telemetry.get("collected_at")
+            timestamp_ok = type(at) in (int, float) and math.isfinite(at) and at > 0
+            anchor = memory["last_at"] if memory["last_at"] is not None else state["started_at"]
+            if not timestamp_ok:
+                memory["missing_samples"] += 1
+                memory["max_gap_seconds"] = max(memory["max_gap_seconds"], time.time() - anchor, 0)
+                # A missing timestamp is not a sample and cannot advance deduplication.
+                return
+            if state["seen_at"] is not None and at <= state["seen_at"]:
+                return
+            state["seen_at"] = at
+            memory["max_gap_seconds"] = max(memory["max_gap_seconds"], at - anchor, 0)
+            index = state["device_index"]
+            gpus = telemetry.get("gpus")
+            gpus = gpus if isinstance(gpus, (list, tuple)) else []
+            matches = [gpu for gpu in gpus if isinstance(gpu, dict)
+                       and type(gpu.get("index")) is int and gpu["index"] == index]
+            gpu = matches[0] if len(matches) == 1 else {}
+            total, used = gpu.get("memory_total_bytes"), gpu.get("memory_used_bytes")
+            if index != self._diagnostic_device():
+                state["mapping_changed"] = True
+            valid = (timestamp_ok and at >= state["started_at"] and index is not None
+                     and not state.get("mapping_changed")
+                     and (fresh_since is None or at >= fresh_since)
+                     and all(type(value) in (int, float) and math.isfinite(value)
+                             for value in (total, used)) and total > 0 and 0 <= used <= total)
+            # If the collector captured a different mapping, do not attribute its sample.
+            sampled_devices = telemetry.get("execution_device")
+            if sampled_devices is not None:
+                mapping_ok = (isinstance(sampled_devices, (list, tuple)) and bool(sampled_devices)
+                              and isinstance(sampled_devices[0], dict)
+                              and sampled_devices[0].get("type") == "cuda"
+                              and type(sampled_devices[0].get("index")) is int
+                              and sampled_devices[0]["index"] == index)
+                if not mapping_ok:
+                    state["mapping_changed"] = True
+                valid = valid and mapping_ok
+            if not valid:
+                memory["missing_samples"] += 1
+                return
+            # NVML/nvidia-smi sampled free space, not a precise PyTorch allocator peak.
+            sample = {"at": at, "total_bytes": int(total), "used_bytes": int(used),
+                      "free_bytes": int(total) - int(used)}
+            memory["sample_count"] += 1
+            if memory["first_at"] is None:
+                memory["first_at"] = at
+            memory["last_at"] = at
+            memory["latest"] = sample
+            memory["total_bytes"] = sample["total_bytes"]
+            memory["device_name"] = self._diagnostic_text(gpu.get("name"))
+            if memory["used_peak_bytes"] is None or sample["used_bytes"] > memory["used_peak_bytes"]:
+                memory["used_peak_bytes"] = sample["used_bytes"]
+                memory["peak_node"] = copy.deepcopy(diagnostics["last_node"])
+            free = sample["free_bytes"]
+            memory["free_min_bytes"] = free if memory["free_min_bytes"] is None else min(
+                memory["free_min_bytes"], free)
+            if boundary in ("before", "after"):
+                memory[boundary] = copy.deepcopy(sample)
+        except Exception:
+            # Diagnostics are best-effort; malformed probes cannot fail a generation.
+            pass
+
+    async def sample_diagnostics(self, assignment, boundary):
+        state = assignment.get("_diagnostic_state")
+        assignment["_capacity_measurements"]["diagnostics"]["memory"][boundary] = None
+        since = time.time()
+        try:
+            telemetry = await self.scan_telemetry()
+        except Exception:
+            telemetry = None
+        if assignment.get("_diagnostic_state") is state:
+            self.observe_diagnostic_memory(assignment, telemetry, boundary=boundary, fresh_since=since)
+
+    def record_execution_error(self, assignment, exc, stage):
+        diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+        if diagnostics is None or diagnostics["execution_error"] is not None:
+            return
+        diagnostics["execution_error"] = {
+            "message": str(exc)[:12000],
+            "exception_type": self._diagnostic_text(getattr(exc, "exception_type", None))
+                              or type(exc).__name__[:160],
+            "node_id": self._diagnostic_text(getattr(exc, "node_id", None)),
+            "node_type": self._diagnostic_text(getattr(exc, "node_type", None)),
+            "stage": stage,
+        }
+
+    def observe_diagnostic_progress(self, assignment, event_type, data):
+        try:
+            diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+            if (self.current is not assignment or diagnostics is None or event_type not in
+                    ("executing", "progress", "progress_state", "executed")):
+                return
+            node_id = self._diagnostic_text(data.get("node"))
+            if node_id is not None:
+                node = (assignment["payload"].get("graph") or {}).get(node_id) or {}
+                node_type = node.get("class_type") if isinstance(node, dict) else None
+                diagnostics["last_node"] = {"id": node_id, "type": self._diagnostic_text(node_type)}
+            diagnostics["last_progress_at"] = time.time()
+        except Exception:
+            pass
+
+    def queue_diagnostics(self, assignment):
+        # One in-flight report per attempt; never await network on the execution path.
+        try:
+            if self.current is not assignment or "_diagnostic_state" not in assignment:
+                return
+            state = assignment["_diagnostic_state"]
+            if state["identity"] != tuple(assignment.get(key) for key in
+                                          ("job_id", "attempt_id", "lease_token")):
+                return
+            task = assignment.get("_diagnostics_report_task")
+            if task is not None and not task.done():
+                return
+            diagnostics = copy.deepcopy(assignment["_capacity_measurements"]["diagnostics"])
+
+            async def report():
+                try:
+                    if (self.current is assignment and not assignment.get("_diagnostics_final")
+                            and assignment.get("_diagnostic_state") is state
+                            and state["identity"] == tuple(assignment.get(key) for key in
+                                ("job_id", "attempt_id", "lease_token"))):
+                        await self.report_event(assignment, {
+                            "type": "capacity_diagnostics", "data": {"diagnostics": diagnostics},
+                        })
+                except (Exception, asyncio.CancelledError):
+                    pass  # Controller restarts/offline diagnostics must not affect leases or cleanup.
+
+            assignment["_diagnostics_report_task"] = asyncio.create_task(report())
+        except Exception:
+            pass
+
+    def finish_diagnostic_reports(self, assignment):
+        assignment["_diagnostics_final"] = True
+        task = assignment.pop("_diagnostics_report_task", None)
+        if task is not None and not task.done():
+            task.cancel()
+
     async def scan_capabilities(self):
         await self.scan_telemetry()
         try:
@@ -454,7 +652,8 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 6,
+            "agent_version": 7,
+            "supports_task_diagnostics": 1,
             "supports_service_restart": os.name == "nt",
             "supports_host_reboot": os.name == "nt",
             "supports_capacity_telemetry": 1,
@@ -970,7 +1169,17 @@ class WorkerAgent:
                 if include_caps:
                     await self.scan_capabilities()
                 elif now - self.last_telemetry_scan >= telemetry_interval:
-                    await self.scan_telemetry()
+                    observed_assignment = self.current
+                    observed_state = (observed_assignment.get("_diagnostic_state")
+                                      if observed_assignment is not None else None)
+                    try:
+                        telemetry = await self.scan_telemetry()
+                    except Exception:
+                        telemetry = None
+                    if (observed_assignment is not None and self.current is observed_assignment
+                            and observed_assignment.get("_diagnostic_state") is observed_state):
+                        self.observe_diagnostic_memory(observed_assignment, telemetry)
+                        self.queue_diagnostics(observed_assignment)
                 self.refresh_restart_report()
                 await self.refresh_host_reboot_report()
                 sync_running = bool(self.pending_sync) or self.maintenance_blocks_jobs()
@@ -1066,8 +1275,15 @@ class WorkerAgent:
                 if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
                         or not isinstance(ack.get("cancelled"), bool)):
                     raise AgentError("ComfyUI 未确认 cleanup_complete")
+            diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+            if diagnostics is not None:
+                diagnostics["cleanup_complete"] = True
             return True
         except Exception as exc:
+            diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+            if diagnostics is not None:
+                diagnostics["cleanup_complete"] = False
+                diagnostics["cleanup_error"] = str(exc)[:4000]
             self.release_failed = (
                 f"显存释放未确认：{type(exc).__name__}: {exc}；"
                 "已停止接单，正在自动重启 ComfyUI，Worker 保持运行。"
@@ -1194,11 +1410,15 @@ class WorkerAgent:
                     )
 
     async def report_event(self, assignment, event):
+        options = {}
+        if event.get("type") == "capacity_diagnostics":
+            # Bound diagnostics even if the caller changes; business events keep 30s.
+            options["timeout"] = aiohttp.ClientTimeout(total=2, connect=1, sock_connect=1)
         await self._json_request(
             "POST",
             self.server + f"/agent/v1/jobs/{assignment['job_id']}/event",
             headers=self._agent_headers(assignment["lease_token"]),
-            json=event,
+            json=event, **options,
         )
 
     async def history_finished(self, job_id):
@@ -1216,7 +1436,7 @@ class WorkerAgent:
             if event_type == "execution_interrupted":
                 raise JobFailed("任务已取消", canceled=True)
             if event_type == "execution_error":
-                raise JobFailed(data.get("exception_message") or "ComfyUI 执行失败")
+                raise JobFailed.from_execution_error(data)
         raise JobFailed("ComfyUI 执行失败")
 
     async def execute_comfy(self, assignment):
@@ -1257,6 +1477,24 @@ class WorkerAgent:
                     msg = None
                 if assignment.get("cancel_requested"):
                     raise JobFailed("任务已取消", canceled=True)
+                # Preserve WS metadata before history polling or event transport can fail.
+                # Cleanup must start before any diagnostic/event network await.
+                event = None
+                if msg is not None and msg.type == aiohttp.WSMsgType.TEXT:
+                    try:
+                        parsed = json.loads(msg.data)
+                        if isinstance(parsed, dict) and isinstance(parsed.get("data"), dict):
+                            event = parsed
+                    except ValueError:
+                        pass
+                if event is not None and event["data"].get("prompt_id") == job_id:
+                    event_type, data = event.get("type"), event["data"]
+                    self.observe_diagnostic_progress(assignment, event_type, data)
+                    if event_type == "execution_error":
+                        self.start_cleanup(assignment)
+                        self.record_execution_error(
+                            assignment, JobFailed.from_execution_error(data), "execute")
+                        self.queue_diagnostics(assignment)
                 if time.monotonic() >= next_history_check:
                     next_history_check = time.monotonic() + 5
                     try:
@@ -1272,11 +1510,9 @@ class WorkerAgent:
                     raise JobFailed("ComfyUI WebSocket 已断开")
                 if msg.type != aiohttp.WSMsgType.TEXT:
                     continue
-                try:
-                    event = json.loads(msg.data)
-                except ValueError:
+                if event is None:
                     continue
-                data = event.get("data") or {}
+                data = event["data"]
                 if data.get("prompt_id") != job_id:
                     continue
                 event_type = event.get("type")
@@ -1297,12 +1533,15 @@ class WorkerAgent:
                     self.start_cleanup(assignment)
                 now = time.monotonic()
                 if event_type != "progress_state" or now - last_progress >= 0.5:
-                    await self.report_event(assignment, event)
+                    try:
+                        await self.report_event(assignment, event)
+                    except Exception:
+                        if event_type not in ("execution_error", "execution_interrupted"):
+                            raise
                     if event_type == "progress_state":
                         last_progress = now
                 if event_type == "execution_error":
-                    message = data.get("exception_message") or "ComfyUI 执行失败"
-                    raise JobFailed(message)
+                    raise JobFailed.from_execution_error(data)
                 if event_type == "execution_interrupted":
                     raise JobFailed("任务已取消", canceled=True)
                 if event_type == "execution_success" or (
@@ -1383,10 +1622,16 @@ class WorkerAgent:
         job_id = assignment["job_id"]
         measurements = {}
         assignment["_capacity_measurements"] = measurements
+        assignment.pop("_diagnostics_final", None)
+        diagnostics = self.init_diagnostics(assignment)
+        stage = "prepare"
         # 旧 Controller 没有 attempt_id，仍按原租约正常执行和回报。
         attempt = {"attempt_id": assignment["attempt_id"]} if assignment.get("attempt_id") else {}
         print(f"[Worker] 领取任务 {job_id}")
         try:
+            # Explicit fresh boundary probe; cached self.telemetry is never a before sample.
+            await self.sample_diagnostics(assignment, "before")
+            self.queue_diagnostics(assignment)
             # 准备过程会原地改图，必须先做独立快照；只回报差异布尔值。
             original_graph = copy.deepcopy(assignment["payload"].get("graph") or {})
             await self.prepare_inputs(assignment)
@@ -1396,17 +1641,22 @@ class WorkerAgent:
             )
             prepared = time.monotonic()
             measurements["prepare_seconds"] = prepared - started
+            stage = "execute"
             await self.execute_comfy(assignment)
             executed = time.monotonic()
             measurements["execute_seconds"] = executed - prepared
             if assignment.get("cancel_requested"):
                 raise JobFailed("任务已取消", canceled=True)
+            stage = "upload"
             outputs = await self.collect_outputs(assignment)
             uploaded = time.monotonic()
             measurements["upload_seconds"] = uploaded - executed
             if assignment.get("cancel_requested"):
                 raise JobFailed("任务已取消", canceled=True)
             measurements["total_seconds"] = uploaded - started
+            await self.sample_diagnostics(assignment, "after")
+            self.finish_diagnostic_reports(assignment)
+            stage = "report"
             await self._json_request(
                 "POST", self.server + f"/agent/v1/jobs/{job_id}/complete",
                 headers=self._agent_headers(assignment["lease_token"]),
@@ -1419,9 +1669,16 @@ class WorkerAgent:
         except (Exception, asyncio.CancelledError) as exc:
             canceled = (isinstance(exc, JobFailed) and exc.canceled
                         or bool(assignment.get("cancel_requested")))
-            released = await asyncio.shield(self.start_cleanup(assignment))
+            cleanup = self.start_cleanup(assignment)
+            self.record_execution_error(assignment, exc, stage)
+            released = await asyncio.shield(cleanup)
+            diagnostics["cleanup_complete"] = bool(released)
+            if not released and diagnostics["cleanup_error"] is None:
+                diagnostics["cleanup_error"] = str(self.release_failed or "显存释放未确认")[:4000]
             # 未完成阶段保持缺失；总时长记录到清理返回，释放失败仍明确标为未释放。
             measurements["total_seconds"] = time.monotonic() - started
+            await self.sample_diagnostics(assignment, "after")
+            self.finish_diagnostic_reports(assignment)
             error = str(exc) if released else self.release_failed
             print(f"[Worker] 任务失败 {job_id}：{error}")
             try:
@@ -1437,6 +1694,7 @@ class WorkerAgent:
             if isinstance(exc, asyncio.CancelledError):
                 raise
         finally:
+            self.finish_diagnostic_reports(assignment)
             task = assignment.get("_cleanup_task")
             if task is not None:
                 await asyncio.shield(task)

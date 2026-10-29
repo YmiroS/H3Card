@@ -64,6 +64,7 @@ from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_
 from server.resource_access import ResourceAccess
 from server.edit_api import register_edit_routes
 from server.image_controls import image_controls, patch_image_controls
+from server.reference_load import make_reference_load
 from server.director_bridge import import_director, link_director, project_director, reference_storyboard, sync_card_job
 from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
@@ -453,7 +454,7 @@ FPS_RE = re.compile(r"([\d.]+)\s+fps\b")
 AUDIO_STREAM_RE = re.compile(r"^\s*Stream #\d+:\d+.*:\s*Audio:", re.MULTILINE)
 
 
-def probe_video(ref):
+def probe_video(ref, *, timeout=20):
     """视频素材的 fps/frames/duration/has_audio 和考虑 SAR、旋转后的显示宽高。
 
     ref 是 ComfyUI input 目录里的相对路径（"chouka/ck_xxx.mp4"），本地
@@ -472,7 +473,7 @@ def probe_video(ref):
         # ffmpeg 没有 -i 之外的元数据命令（包里也没有 ffprobe），
         # 所以就是"只给输入、让它报错退出"，要的信息在 stderr 里
         r = subprocess.run([str(exe), "-i", str(p)], capture_output=True,
-                           text=True, errors="ignore", timeout=20)
+                           text=True, errors="ignore", timeout=timeout)
     except Exception as e:
         print(f"[抽卡系统] 探视频信息失败 {p.name}：{e}")
         return {}
@@ -1520,11 +1521,27 @@ async def api_generate(request):
         dimensions = await asyncio.to_thread(
             ledger.dimensions, cid, params, uploaded, graph, cached_probe,
         ) if ledger else {}
+        uploaded_refs = set(uploaded.values())
+        probe_deadline = time.monotonic() + 3
+        def reference_probe(ref):
+            # 额外诊断共用三秒预算；耗尽后留未知，不能拖住任务提交。
+            if ref not in uploaded_refs:
+                return {}
+            if ref in video_metadata:
+                return video_metadata[ref]
+            remaining = probe_deadline - time.monotonic()
+            if remaining <= 0:
+                return {}
+            video_metadata[ref] = probe_video(ref, timeout=remaining)
+            return video_metadata[ref]
+
+        reference_load = await asyncio.to_thread(make_reference_load, graph, reference_probe)
         dispatch_payload = {
             "graph": graph, "assets": uploaded, "capability": cid,
             "model_family": family,
             "capacity_spec": make_spec(
                 cid, {**params, "output_kind": cap.get("outputType")}, graph, dimensions,
+                reference_load=reference_load,
             ),
         }
         if target_worker_id is not None:
@@ -2121,6 +2138,12 @@ async def api_agent_event(request):
         raise web.HTTPBadRequest(reason="事件 data 必须是 JSON 对象")
     data["prompt_id"] = pid
     event_type = event.get("type")
+    if event_type == "capacity_diagnostics":
+        recorded = await asyncio.to_thread(
+            distributed_store(request.app).record_capacity_diagnostics,
+            pid, worker_id, lease_token, data.get("diagnostics"),
+        )
+        return web.json_response({"ok": True, "recorded": recorded})
     if event_type == "execution_cached":
         nodes = data.get("nodes")
         if isinstance(nodes, list):
@@ -2128,6 +2151,14 @@ async def api_agent_event(request):
                 pid, worker_id, lease_token, nodes[:4096],
             )
 
+    if event_type == "execution_error":
+        await asyncio.to_thread(distributed_store(request.app).record_capacity_diagnostics, pid, worker_id, lease_token, {
+            "version": 1, "execution_error": {
+                "message": data.get("exception_message"), "exception_type": data.get("exception_type"),
+                "node_id": str(data["node_id"]) if data.get("node_id") is not None else None,
+                "node_type": data.get("node_type"), "stage": "execute",
+            },
+        })
     # 新 Worker 在显存清理确认后才补报 /failed；旧 Worker 保留即时终态语义。
     if event_type in ("execution_error", "execution_interrupted"):
         if data.get("cleanup_pending") is True:
@@ -3543,9 +3574,10 @@ def capacity_model_references(report):
     return report
 
 
-async def capacity_report(request):
+async def capacity_report(request, *, include_diagnostics=False):
     require_admin(request)
     query = capacity_query(request)
+    query["include_diagnostics"] = include_diagnostics
     store = distributed_store(request.app)
 
     def build_report():
@@ -3585,7 +3617,7 @@ async def api_capacity(request):
 
 
 async def api_capacity_export(request):
-    report = await capacity_report(request)
+    report = await capacity_report(request, include_diagnostics=True)
     content = await asyncio.to_thread(export_csv, report)
     return web.Response(text=content, content_type="text/csv", charset="utf-8", headers={
         "Content-Disposition": 'attachment; filename="machine-capacity.csv"',

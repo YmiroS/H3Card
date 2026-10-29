@@ -939,6 +939,22 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertEqual(self.store.dispatch_status("atomic-job"), "assigned")
         self.assertEqual(self.store.list_workers()[0]["state"], "busy")
 
+    def test_capacity_diagnostics_require_active_lease_and_do_not_change_dispatch(self):
+        self.store.enqueue("diagnostic-job", {"graph": {}, "capability": "test"})
+        assignment = self.store.acquire(self.worker_id)
+        diagnostic = {"version": 1, "execution_error": {"message": "CUDA out of memory"}}
+        self.assertFalse(self.store.record_capacity_diagnostics(
+            "diagnostic-job", self.worker_id, "wrong-token", diagnostic))
+        self.assertTrue(self.store.record_capacity_diagnostics(
+            "diagnostic-job", self.worker_id, assignment["lease_token"], diagnostic))
+        self.assertEqual(self.store.dispatch_status("diagnostic-job"), "assigned")
+        row = self.store.db.execute("SELECT measurements_json FROM capacity_attempts WHERE id=?",
+                                    (assignment["attempt_id"],)).fetchone()
+        self.assertEqual(json.loads(row[0])["diagnostics"]["execution_error"]["message"], "CUDA out of memory")
+        self.store.finish("diagnostic-job", self.worker_id, assignment["lease_token"], "error")
+        self.assertFalse(self.store.record_capacity_diagnostics(
+            "diagnostic-job", self.worker_id, assignment["lease_token"], diagnostic))
+
     def test_capacity_release_requires_explicit_idle_confirmation(self):
         with mock.patch.object(self.store.capacity, "observe_worker") as observe:
             for kwargs in ({}, {"capacity_released": True, "busy": True},
@@ -1965,7 +1981,8 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         for name in ("nt", "posix"):
             with mock.patch("agent.os.name", name):
                 caps = await self.agent.scan_capabilities()
-            self.assertEqual(caps["agent_version"], 6)
+            self.assertEqual(caps["agent_version"], 7)
+            self.assertEqual(caps["supports_task_diagnostics"], 1)
             self.assertIs(caps["supports_service_restart"], name == "nt")
             self.assertIs(caps["supports_host_reboot"], name == "nt")
 
@@ -2792,7 +2809,9 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         await receiving.wait()
         await self.agent.cancel_current("job-1")
         await self.cleanup_started.wait()
-        self.agent.report_event.assert_not_awaited()
+        business_events = [call.args[1] for call in self.agent.report_event.await_args_list
+                           if call.args[1]["type"] != "capacity_diagnostics"]
+        self.assertEqual(business_events, [])
         self.agent.collect_outputs.assert_not_awaited()
         self.assertEqual(self.failed_requests(), [])
         self.cleanup_ack.set()
@@ -2825,8 +2844,10 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 ))
                 task = asyncio.create_task(self.agent.execute(self.assignment))
                 await self.cleanup_started.wait()
-                event = self.agent.report_event.await_args.args[1]
-                self.assertTrue(event["data"]["cleanup_pending"])
+                events = [call.args[1] for call in self.agent.report_event.await_args_list
+                          if call.args[1]["type"] == event_type]
+                self.assertEqual(len(events), 1)
+                self.assertTrue(events[0]["data"]["cleanup_pending"])
                 self.assertIs(self.agent.current, self.assignment)
                 self.assertEqual(self.failed_requests(), [])
                 self.cleanup_ack.set()

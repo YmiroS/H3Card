@@ -1285,6 +1285,12 @@ class DistributedStore:
             if self.validate_lease(job_id, worker_id, lease_token):
                 self.capacity.cache(job_id, worker_id, _hash_token(lease_token), nodes)
 
+    def record_capacity_diagnostics(self, job_id, worker_id, lease_token, diagnostics):
+        with self.lock, self.db:
+            if not self.validate_lease(job_id, worker_id, lease_token):
+                return False
+            return self.capacity.diagnostics(job_id, worker_id, _hash_token(lease_token), diagnostics)
+
     def dispatch_status(self, job_id, worker_id=None):
         query = "SELECT status FROM dispatch_jobs WHERE job_id = ?"
         values = [job_id]

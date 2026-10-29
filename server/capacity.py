@@ -36,7 +36,7 @@ PERFORMANCE = DIMENSIONS | {
     "select_every_nth", "skip_first_frames", "lora_strength", "strength_model",
     "strength_clip", "normalize", "interpolation", "format", "quality", "crf",
     "output_kind", "workflow_version", "model_version", "environment_id",
-    "type", "pre_cfg", "scale_by",
+    "type", "pre_cfg", "scale_by", "ref_image_size",
 }
 MODEL_KEYS = {"ckpt_name", "model_name", "unet_name", "vae_name", "clip_name",
               "clip_name1", "clip_name2", "lora_name", "control_net_name"}
@@ -143,7 +143,47 @@ def _image_contract(graph):
     return {}
 
 
-def make_spec(capability, params, graph, dimensions):
+def _reference_load(value):
+    if not isinstance(value, dict) or value.get("version") != 1:
+        return None
+    result = {"version": 1, "source": "submitted_graph_estimate", "groups": [],
+              "complete": value.get("complete") is True}
+    groups = value.get("groups")
+    if not isinstance(groups, list) or len(groups) > 64:
+        return dict(result, complete=False, invalid=True)
+    for group in groups:
+        if not isinstance(group, dict) or not _token(group.get("node_id")):
+            return dict(result, groups=[], complete=False, invalid=True)
+        node_type = group.get("node_type")
+        if node_type not in ("MiniMaxH3ReferenceToVideo", "TextEncodeQwenImageEditPlus", "TextEncodeQwenImage21"):
+            return dict(result, groups=[], complete=False, invalid=True)
+        item = {"node_id": group["node_id"], "node_type": node_type,
+                "ref_image_size": group.get("ref_image_size") if group.get("ref_image_size") in ("max", "match") else None}
+        for key in ("width", "height", "frames", "image_count", "video_count", "audio_count",
+                    "video_audio_count", "image_pixels", "video_pixel_frames"):
+            number = _num(group.get(key))
+            item[key] = number if number is not None and number <= 1e16 else None
+        references = group.get("references")
+        if not isinstance(references, list) or len(references) > 64:
+            return dict(result, groups=[], complete=False, invalid=True)
+        item["references"] = []
+        for reference in references:
+            if (not isinstance(reference, dict) or reference.get("kind") not in ("image", "video", "audio", "video_audio")
+                    or not _token(reference.get("input"))):
+                return dict(result, groups=[], complete=False, invalid=True)
+            ref = {"kind": reference["kind"], "input": reference["input"],
+                   "source_node": _token(reference.get("source_node")),
+                   "estimated": reference.get("estimated") is True}
+            for key in ("raw_width", "raw_height", "raw_frames", "raw_fps", "raw_duration",
+                        "width", "height", "frames", "duration"):
+                number = _num(reference.get(key))
+                ref[key] = number if number is not None and number <= 1e16 else None
+            item["references"].append(ref)
+        result["groups"].append(item)
+    return result
+
+
+def make_spec(capability, params, graph, dimensions, *, reference_load=None):
     """只保留白名单性能参数及拓扑；素材、种子、提示词不进入指纹或落盘。"""
     params = params if isinstance(params, dict) else {}
     graph = graph if isinstance(graph, dict) else {}
@@ -231,6 +271,9 @@ def make_spec(capability, params, graph, dimensions):
               "graph_fingerprint": _hash(topology), "models": sorted(models),
               "model_version": model_version, "workflow_version": workflow_version,
               "expected": expected, "warnings": warnings, "complete": not warnings}
+    load = _reference_load(reference_load)
+    if load is not None:
+        result["reference_load"] = load
     result["spec_key"] = _hash({k: v for k, v in result.items() if k != "warnings"})
     return result
 
@@ -535,6 +578,9 @@ def _safe_spec(value, capability):
               "models": sorted({v["name"] for n in graph.values() for k, v in n["inputs"].items()
                                 if _model_key(k, n["type"]) and isinstance(v, dict)}),
               "expected": expected, "warnings": warnings, "complete": not warnings}
+    load = _reference_load(value.get("reference_load"))
+    if load is not None:
+        result["reference_load"] = load
     result["spec_key"] = _hash({k: v for k, v in result.items() if k != "warnings"})
     return result
 
@@ -599,6 +645,130 @@ def _nodes(value):
     return result
 
 
+def _diagnostic_number(value, *, maximum=1e16, integer=False):
+    if value is None:
+        return None
+    number = _num(value)
+    if number is None or number > maximum or (integer and number != int(number)):
+        raise ValueError("诊断数值无效")
+    return int(number) if integer else number
+
+
+def _diagnostic_node(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or not _token(value.get("id")):
+        raise ValueError("诊断节点无效")
+    return {"id": value["id"], "type": _token(value.get("type"))}
+
+
+def _diagnostic_text(value, limit):
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("诊断文本无效")
+    return value.replace("\x00", "")[:limit]
+
+
+def _memory_sample(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ValueError("显存样本无效")
+    sample = {key: _diagnostic_number(value.get(key), integer=key != "at")
+              for key in ("at", "total_bytes", "used_bytes", "free_bytes")}
+    if (any(v is None for v in sample.values()) or sample["total_bytes"] <= 0
+            or sample["used_bytes"] + sample["free_bytes"] != sample["total_bytes"]):
+        raise ValueError("显存样本不一致")
+    return sample
+
+
+def _diagnostics(value):
+    if not isinstance(value, dict) or value.get("version") != 1:
+        raise ValueError("诊断版本无效")
+    result = {"version": 1}
+    if value.get("invalid") is True:
+        return dict(result, invalid=True)
+    if "execution_error" in value:
+        error = value["execution_error"]
+        if error is None:
+            result["execution_error"] = None
+        elif isinstance(error, dict):
+            result["execution_error"] = {
+                "message": _diagnostic_text(error.get("message"), 12000),
+                "exception_type": _token(error.get("exception_type")),
+                "node_id": _token(error.get("node_id")), "node_type": _token(error.get("node_type")),
+                "stage": error.get("stage") if error.get("stage") in ("prepare", "execute", "upload", "report") else None,
+            }
+        else:
+            raise ValueError("执行错误无效")
+    if "cleanup_error" in value:
+        result["cleanup_error"] = _diagnostic_text(value["cleanup_error"], 4000)
+    if "cleanup_complete" in value:
+        if value["cleanup_complete"] is not None and type(value["cleanup_complete"]) is not bool:
+            raise ValueError("清理状态无效")
+        result["cleanup_complete"] = value["cleanup_complete"]
+    if "last_node" in value:
+        result["last_node"] = _diagnostic_node(value["last_node"])
+    if "last_progress_at" in value:
+        result["last_progress_at"] = _diagnostic_number(value["last_progress_at"], maximum=1e12)
+    if "memory" in value:
+        memory = value["memory"]
+        try:
+            if not isinstance(memory, dict) or memory.get("source") != "nvidia-smi":
+                raise ValueError("显存来源无效")
+            safe = {"source": "nvidia-smi"}
+            for key in ("sample_count", "missing_samples"):
+                safe[key] = _diagnostic_number(memory.get(key), maximum=1e9, integer=True)
+            for key in ("first_at", "last_at", "max_gap_seconds", "total_bytes", "used_peak_bytes", "free_min_bytes"):
+                safe[key] = _diagnostic_number(memory.get(key), integer=key.endswith("bytes"))
+            safe["device_index"] = _diagnostic_number(memory.get("device_index"), maximum=255, integer=True)
+            safe["device_name"] = _text(memory.get("device_name"))
+            for key in ("before", "after", "latest"):
+                safe[key] = _memory_sample(memory.get(key))
+            safe["peak_node"] = _diagnostic_node(memory.get("peak_node"))
+            if safe["first_at"] is not None and safe["last_at"] is not None and safe["last_at"] < safe["first_at"]:
+                raise ValueError("显存采样时间倒序")
+            total = safe["total_bytes"]
+            if total is not None and any(safe[k] is not None and safe[k] > total for k in ("used_peak_bytes", "free_min_bytes")):
+                raise ValueError("显存采样超过设备容量")
+            if safe["sample_count"] and (not total or safe["used_peak_bytes"] is None or safe["free_min_bytes"] is None):
+                raise ValueError("显存采样缺少容量或极值")
+            result["memory"] = safe
+        except (ValueError, TypeError):
+            result["memory"] = {"source": "nvidia-smi", "invalid": True}
+    return result
+
+
+def _merge_diagnostics(previous, incoming):
+    if not isinstance(previous, dict) or previous.get("invalid") is True:
+        return incoming
+    if incoming.get("invalid") is True:
+        return previous
+    result = dict(previous)
+    for key, value in incoming.items():
+        if value is not None:
+            result[key] = value
+    if isinstance(incoming.get("execution_error"), dict):
+        error = dict(previous.get("execution_error") or {})
+        error.update({key: val for key, val in incoming["execution_error"].items()
+                      if val not in (None, "") and error.get(key) in (None, "")})
+        result["execution_error"] = error
+    if previous.get("cleanup_complete") is True:
+        result["cleanup_complete"] = True
+    old_memory, new_memory = previous.get("memory") or {}, incoming.get("memory") or {}
+    def order(memory):
+        return tuple(memory.get(key) or 0 for key in ("last_at", "sample_count", "missing_samples"))
+    if old_memory and (not new_memory or new_memory.get("invalid") is True or order(old_memory) > order(new_memory)):
+        result["memory"] = old_memory
+    elif old_memory and order(old_memory) == order(new_memory):
+        result["memory"] = dict(old_memory, **{key: val for key, val in new_memory.items() if val is not None})
+    if (previous.get("last_progress_at") or 0) > (incoming.get("last_progress_at") or 0):
+        result["last_progress_at"] = previous["last_progress_at"]
+        result["last_node"] = previous.get("last_node")
+    return result
+
+
 def _measurements(value):
     if value is None:
         return None
@@ -617,6 +787,11 @@ def _measurements(value):
         result["graph_changed"] = value["graph_changed"]
     if "cached_nodes" in value:
         result["cached_nodes"] = _nodes(value["cached_nodes"])
+    if "diagnostics" in value:
+        try:
+            result["diagnostics"] = _diagnostics(value["diagnostics"])
+        except (ValueError, TypeError):
+            result["diagnostics"] = {"version": 1, "invalid": True}
     return result
 
 
@@ -879,6 +1054,12 @@ class CapacityStore:
                                 (now, now, getattr(self.store, "offline_seconds", 30), attempt["id"]))
             if attempt["ended_at"] is not None:
                 return
+            previous = _load(attempt["measurements_json"], {}) or {}
+            if previous.get("diagnostics"):
+                safe_measurements = safe_measurements or {}
+                safe_measurements["diagnostics"] = _merge_diagnostics(
+                    previous["diagnostics"], safe_measurements.get("diagnostics") or {},
+                )
             self.db.execute("""UPDATE capacity_attempts SET ended_at=?,status=?,measurements_json=?
                 WHERE id=?""", (now, status, _json(safe_measurements), attempt["id"]))
             self.db.execute("""UPDATE capacity_tasks SET status=?,outputs_json=?
@@ -925,6 +1106,28 @@ class CapacityStore:
             self.db.execute("""DELETE FROM capacity_configs WHERE valid_from<?
                 AND id NOT IN (SELECT config_id FROM capacity_attempts)
                 AND id NOT IN (SELECT config_id FROM capacity_observations)""", (now - 30 * 86400,))
+
+    def diagnostics(self, job_id, worker_id, lease_hash, value):
+        try:
+            incoming = _diagnostics(value)
+        except (ValueError, TypeError):
+            return False
+        if incoming.get("invalid") is True:
+            return False
+        with self.lock:
+            attempt = self.db.execute("""SELECT a.id,a.measurements_json FROM capacity_attempts a
+                JOIN capacity_tasks t ON t.current_attempt=a.id WHERE a.job_id=? AND a.worker_id=?
+                AND a.lease_hash=? AND a.ended_at IS NULL""", (job_id, worker_id, lease_hash)).fetchone()
+            if not attempt:
+                return False
+            measurements = _load(attempt["measurements_json"], {}) or {}
+            merged = _merge_diagnostics(measurements.get("diagnostics"), incoming)
+            if merged == measurements.get("diagnostics"):
+                return True
+            measurements["diagnostics"] = merged
+            self.db.execute("UPDATE capacity_attempts SET measurements_json=? WHERE id=?",
+                            (_json(measurements), attempt["id"]))
+            return True
 
     def cache(self, job_id, worker_id, lease_hash, nodes):
         try:
@@ -1116,7 +1319,8 @@ class CapacityStore:
             warnings.append("存在执行或产物节点的部分缓存，不能作为生成基线；不视为全缓存")
         return occupied, warnings
 
-    def report(self, start=None, end=None, worker_id=None, capability=None, limit=100, offset=0):
+    def report(self, start=None, end=None, worker_id=None, capability=None, limit=100, offset=0, *,
+               include_diagnostics=False):
         start, end = _timestamp(start), _timestamp(end)
         if start is not None and end is not None and start >= end:
             raise ValueError("开始时间必须早于结束时间")
@@ -1425,6 +1629,15 @@ class CapacityStore:
                 "model_evidence": {"total_samples": len(rows),
                     "recorded_samples": sum(v["samples"] for v in bucket["model_variants"].values()),
                     "variants": [bucket["model_variants"][key] for key in sorted(bucket["model_variants"])]},
+                "reference_load": spec.get("reference_load"),
+                "task_diagnostics": [
+                    {"job_id": row["job_id"], "attempt_id": attempt["id"],
+                     "worker_id": attempt["worker_id"], "config_id": attempt["config_id"],
+                     "status": attempt["status"], "started_at": attempt["started_at"],
+                     "ended_at": attempt["ended_at"], "diagnostics": attempt["measurements"]["diagnostics"]}
+                    for row in rows for attempt in row["attempts"]
+                    if isinstance(attempt.get("measurements"), dict) and "diagnostics" in attempt["measurements"]
+                ] if include_diagnostics else [],
                 "last_sample_at": max((r["created_at"] for r in successful if r["runtime_seconds"] is not None), default=None),
                 "config": _load(configs.get(config_id, {}).get("hardware_json")),
                 "config_source": configs.get(config_id, {}).get("source"),
@@ -1565,7 +1778,8 @@ def export_csv(report):
               "agent_version", "supports_capacity_telemetry",
               "days", "samples", "done", "error", "canceled", "measured", "mean_seconds",
               "p50_seconds", "p90_seconds", "runtime_seconds", "reference_per_hour", "output_count",
-              "unit", "occupied_seconds", "seconds_per_unit", "qualified_seconds_per_unit", "eligible", "warnings"]
+              "unit", "occupied_seconds", "seconds_per_unit", "qualified_seconds_per_unit", "eligible", "warnings",
+              "reference_load", "task_diagnostics"]
     def cell(value):
         if value is None:
             return ""

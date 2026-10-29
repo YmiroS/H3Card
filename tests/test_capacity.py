@@ -1101,6 +1101,124 @@ class CapacityTests(unittest.TestCase):
         self.assertFalse(self.group()["eligible"])
         self.assertEqual(self.group()["output_count"], 1)
 
+    @staticmethod
+    def diagnostics():
+        return {"version": 1,
+                "execution_error": {"message": "CUDA out of memory", "exception_type": "torch.OutOfMemoryError",
+                                    "node_id": "2", "node_type": "KSampler", "stage": "execute"},
+                "cleanup_error": "Memory cleanup not confirmed within 120 seconds", "cleanup_complete": False,
+                "last_node": {"id": "2", "type": "KSampler"}, "last_progress_at": 1002,
+                "memory": {"source": "nvidia-smi", "sample_count": 2, "missing_samples": 1,
+                           "first_at": 1000, "last_at": 1005, "max_gap_seconds": 5,
+                           "device_index": 0, "device_name": "GPU A", "total_bytes": 100,
+                           "used_peak_bytes": 95, "free_min_bytes": 5,
+                           "before": {"at": 1000, "total_bytes": 100, "used_bytes": 20, "free_bytes": 80},
+                           "after": None,
+                           "latest": {"at": 1005, "total_bytes": 100, "used_bytes": 95, "free_bytes": 5},
+                           "peak_node": {"id": "2", "type": "KSampler"}}}
+
+    def test_diagnostics_preserve_both_errors_and_export_all_attempt_evidence(self):
+        diagnostic = self.diagnostics()
+        diagnostic["private_prompt"] = "DO-NOT-PERSIST"
+        diagnostic["execution_error"]["traceback"] = "DO-NOT-PERSIST"
+        diagnostic["memory"]["config"] = "DO-NOT-PERSIST"
+        self.capture(status="error", outputs=[], measurements=self.measurements(diagnostics=diagnostic))
+        self.assertEqual(self.capacity.report()["groups"][0]["task_diagnostics"], [])
+        report = self.capacity.report(limit=1, offset=1, include_diagnostics=True)
+        self.assertEqual(report["details"], [])
+        stored = json.loads(self.db.execute("SELECT measurements_json FROM capacity_attempts").fetchone()[0])
+        self.assertEqual(stored["diagnostics"]["execution_error"]["message"], "CUDA out of memory")
+        self.assertIs(stored["diagnostics"]["cleanup_complete"], False)
+        self.assertEqual(stored["diagnostics"]["memory"]["free_min_bytes"], 5)
+        self.assertNotIn("DO-NOT-PERSIST", json.dumps(stored))
+        row = next(csv.DictReader(io.StringIO(export_csv(report).lstrip("\ufeff"))))
+        attempts = json.loads(row["task_diagnostics"])
+        self.assertEqual(attempts[0]["job_id"], "j1")
+        self.assertEqual(attempts[0]["diagnostics"], stored["diagnostics"])
+
+    def test_live_diagnostics_reject_wrong_attempt_and_survive_terminal_and_restart(self):
+        self.capacity.enqueue("live", self.payload, 1000)
+        attempt = self.capacity.assigned("live", self.worker, "lease-one", 1000)
+        self.capacity.running("live", "w1", "lease-one", 1001)
+        self.assertFalse(self.capacity.diagnostics("live", "other", "lease-one", self.diagnostics()))
+        self.assertFalse(self.capacity.diagnostics("live", "w1", "wrong", self.diagnostics()))
+        self.assertTrue(self.capacity.diagnostics("live", "w1", "lease-one", self.diagnostics()))
+        restarted = CapacityStore(self.store)
+        stored = json.loads(self.db.execute("SELECT measurements_json FROM capacity_attempts WHERE id=?", (attempt,)).fetchone()[0])
+        self.assertIn("diagnostics", stored)
+        restarted.terminal("live", "w1", "lease-one", "error", 1010, measurements={"total_seconds": 10})
+        self.assertFalse(restarted.diagnostics("live", "w1", "lease-one", self.diagnostics()))
+        stored = json.loads(self.db.execute("SELECT measurements_json FROM capacity_attempts WHERE id=?", (attempt,)).fetchone()[0])
+        self.assertEqual(stored["total_seconds"], 10)
+        self.assertEqual(stored["diagnostics"]["memory"]["sample_count"], 2)
+
+    def test_live_diagnostics_do_not_roll_back_newer_memory_or_clear_original_error(self):
+        self.capacity.enqueue("live", self.payload, 1000)
+        self.capacity.assigned("live", self.worker, "lease", 1000)
+        current = self.diagnostics()
+        self.assertTrue(self.capacity.diagnostics("live", "w1", "lease", current))
+        stale = self.diagnostics()
+        stale["execution_error"] = None
+        stale["cleanup_error"] = None
+        stale["last_progress_at"] = 1001
+        stale["memory"].update(last_at=1001, sample_count=1, used_peak_bytes=20, free_min_bytes=80)
+        self.assertTrue(self.capacity.diagnostics("live", "w1", "lease", stale))
+        stored = json.loads(self.db.execute("SELECT measurements_json FROM capacity_attempts").fetchone()[0])["diagnostics"]
+        self.assertEqual(stored["memory"]["used_peak_bytes"], 95)
+        self.assertEqual(stored["last_progress_at"], 1002)
+        self.assertEqual(stored["execution_error"]["message"], "CUDA out of memory")
+
+    def test_same_sample_and_partial_error_do_not_erase_cleanup_or_original_error(self):
+        previous = capacity_module._diagnostics(self.diagnostics())
+        previous["cleanup_complete"] = True
+        previous["memory"]["after"] = dict(previous["memory"]["latest"])
+        incoming = capacity_module._diagnostics(self.diagnostics())
+        incoming["execution_error"] = {}
+        merged = capacity_module._merge_diagnostics(previous, incoming)
+        self.assertIs(merged["cleanup_complete"], True)
+        self.assertEqual(merged["memory"]["after"], previous["memory"]["after"])
+        self.assertEqual(merged["execution_error"], previous["execution_error"])
+        incoming["execution_error"] = {"message": "secondary reporting failure", "node_type": None}
+        self.assertEqual(capacity_module._merge_diagnostics(previous, incoming)["execution_error"], previous["execution_error"])
+
+    def test_repeated_live_snapshot_does_not_write_again(self):
+        self.capacity.enqueue("live", self.payload, 1000)
+        self.capacity.assigned("live", self.worker, "lease", 1000)
+        self.assertTrue(self.capacity.diagnostics("live", "w1", "lease", self.diagnostics()))
+        before = self.db.total_changes
+        self.assertTrue(self.capacity.diagnostics("live", "w1", "lease", self.diagnostics()))
+        self.assertEqual(self.db.total_changes, before)
+
+    def test_invalid_memory_does_not_discard_error_or_phase_timings(self):
+        for invalid in (float("nan"), float("inf"), -1, True):
+            diagnostic = self.diagnostics()
+            diagnostic["memory"]["free_min_bytes"] = invalid
+            sanitized = capacity_module._measurements({"total_seconds": 10, "diagnostics": diagnostic})
+            self.assertEqual(sanitized["total_seconds"], 10)
+            self.assertIs(sanitized["diagnostics"]["memory"]["invalid"], True)
+            self.assertEqual(sanitized["diagnostics"]["execution_error"]["message"], "CUDA out of memory")
+        self.capture(measurements={"total_seconds": 10, "diagnostics": "invalid"})
+        stored = json.loads(self.db.execute("SELECT measurements_json FROM capacity_attempts").fetchone()[0])
+        self.assertEqual(stored, {"total_seconds": 10, "diagnostics": {"version": 1, "invalid": True}})
+
+    def test_reference_load_is_private_safe_preserved_and_part_of_spec_identity(self):
+        load = {"version": 1, "source": "submitted_graph_estimate", "complete": False,
+                "groups": [{"node_id": "45", "node_type": "MiniMaxH3ReferenceToVideo", "ref_image_size": "max",
+                            "width": 1344, "height": 768, "frames": 73, "image_count": 1,
+                            "video_count": 0, "audio_count": 0, "video_audio_count": 0,
+                            "image_pixels": 4194304, "video_pixel_frames": 0,
+                            "references": [{"kind": "image", "input": "ref_images.ref_image_0", "source_node": "47",
+                                            "raw_width": 2048, "raw_height": 2048, "width": 2048, "height": 2048,
+                                            "estimated": True, "path": "DO-NOT-PERSIST"}], "prompt": "DO-NOT-PERSIST"}]}
+        spec = make_spec("image", self.params, self.graph, self.dims, reference_load=load)
+        self.capture(payload={"capability": "image", "capacity_spec": spec})
+        persisted = json.loads(self.db.execute("SELECT spec_json FROM capacity_tasks").fetchone()[0])
+        self.assertEqual(persisted["reference_load"]["groups"][0]["image_pixels"], 4194304)
+        self.assertNotIn("DO-NOT-PERSIST", json.dumps(persisted))
+        self.assertNotEqual(spec["spec_key"], self.payload["capacity_spec"]["spec_key"])
+        row = next(csv.DictReader(io.StringIO(export_csv(self.capacity.report()).lstrip("\ufeff"))))
+        self.assertEqual(json.loads(row["reference_load"]), persisted["reference_load"])
+
     def test_missing_nullable_measurements_do_not_fail_task(self):
         self.capture(measurements={"prepare_seconds": None, "total_seconds": None, "new_version_field": "ignored"})
         detail = self.capacity.report()["details"][0]
