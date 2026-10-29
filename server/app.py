@@ -1463,7 +1463,10 @@ async def api_generate(request):
                        if item["id"] == target_worker_id), None)
         if worker is None:
             raise web.HTTPBadRequest(text="指定执行端不存在、已退役或不是同名最新注册")
-        reason = generation_worker_reason(worker, graph, cid, gpu_policy, duration_seconds)
+        reason = generation_worker_reason(
+            worker, graph, cid, gpu_policy, duration_seconds,
+            targeted_video=cap.get("outputType") == "video",
+        )
         if reason:
             raise web.HTTPBadRequest(text=reason)
     await require_project(request, body["project"], operate=True)
@@ -2362,7 +2365,10 @@ async def api_generation_workers(request):
     for worker in distributed_store(request.app).list_generation_workers():
         if not is_windows_worker(worker):
             continue
-        reason = generation_worker_reason(worker, graph, cid, gpu_policy, duration_seconds)
+        reason = generation_worker_reason(
+            worker, graph, cid, gpu_policy, duration_seconds,
+            targeted_video=cap.get("outputType") == "video",
+        )
         item = {key: worker[key] for key in ("id", "name", "state")}
         item["selectable"] = reason is None
         if reason:

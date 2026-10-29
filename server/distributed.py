@@ -294,8 +294,11 @@ def is_pro_6000_worker(devices):
     )
 
 
-def can_run_capability(capability, devices, gpu_policy=None, duration_seconds=None):
-    if is_pro_6000_worker(devices) and capability not in BF16_HIGH_VRAM_CAPABILITIES:
+def can_run_capability(capability, devices, gpu_policy=None, duration_seconds=None, *,
+                       targeted_video=False):
+    # 显式指定的视频仅豁免 PRO 6000 专用保留规则，不豁免下方显存/策略门槛。
+    if (is_pro_6000_worker(devices) and capability not in BF16_HIGH_VRAM_CAPABILITIES
+            and not targeted_video):
         return False
     if capability in BF16_HIGH_VRAM_CAPABILITIES:
         # 共用入口先执行硬门槛，不能被 32GB 策略、短视频或亲和性兜底放宽。
@@ -327,7 +330,8 @@ def is_windows_worker(worker):
     return isinstance(os_info, dict) and os_info.get("name") == "Windows"
 
 
-def generation_worker_reason(worker, graph, capability, gpu_policy=None, duration_seconds=None):
+def generation_worker_reason(worker, graph, capability, gpu_policy=None, duration_seconds=None, *,
+                             targeted_video=False):
     """Public selection checks; never include model paths or management details."""
     if not is_windows_worker(worker):
         return "只能指定 Windows 执行端"
@@ -343,7 +347,8 @@ def generation_worker_reason(worker, graph, capability, gpu_policy=None, duratio
         return "执行端缺少此能力所需节点"
     if not has_required_models(graph, capabilities):
         return "执行端缺少此能力所需模型或模型清单不完整"
-    if not can_run_capability(capability, capabilities.get("devices"), gpu_policy, duration_seconds):
+    if not can_run_capability(capability, capabilities.get("devices"), gpu_policy, duration_seconds,
+                              targeted_video=targeted_video):
         return "执行端不满足此任务的显卡、显存或时长要求"
     return None
 
@@ -1117,11 +1122,20 @@ class DistributedStore:
                 required = set(json.loads(row["required_nodes_json"] or "[]"))
                 capability = payload.get("capability")
                 gpu_policy = payload.get("gpu_policy")
+                # api_generate 从服务端能力清单生成的输出类型；仅有 target 不代表视频。
+                # 旧队列项缺少可信输出类型时不启用例外。
+                capacity_spec = payload.get("capacity_spec")
+                targeted_video = (
+                    target_worker_id == worker_id
+                    and isinstance(capacity_spec, dict)
+                    and isinstance(capacity_spec.get("expected"), dict)
+                    and capacity_spec["expected"].get("kind") == "video"
+                )
                 if (not required.issubset(available_nodes)
                         or not has_required_models(payload.get("graph") or {}, capabilities)
                         or not can_run_capability(
                             capability, capabilities.get("devices"), gpu_policy,
-                            payload.get("duration_seconds"),
+                            payload.get("duration_seconds"), targeted_video=targeted_video,
                         )):
                     continue
                 if target_worker_id is None and requires_high_vram(capability, gpu_policy) and any(

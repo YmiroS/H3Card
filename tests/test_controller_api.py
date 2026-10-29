@@ -1070,7 +1070,8 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                     self.store.retire_worker(worker_id)
             if state != "retired":
                 expected[worker_id] = (state if state in {"offline", "disabled", "syncing", "error"}
-                                       else "error" if state == "comfy-offline" else "idle", False)
+                                       else "error" if state == "comfy-offline" else "idle",
+                                       state == "reserved-gpu")
         with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
              mock.patch.object(controller_app, "ROOT", self.root):
             response = await self.client.get("/api/generation/workers?capability=target-video")
@@ -1179,6 +1180,122 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             history = await (await self.client.get("/api/jobs/history")).json()
             self.assertEqual(history["jobs"][0]["target_worker_id"], worker_id)
             self.assertTrue(history["jobs"][0]["history_only"])
+
+    async def test_pro_targeted_video_picker_submit_and_acquire_agree(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)
+        other = self.store.register_worker("other PRO 6000", caps)["worker_id"]
+        self.store.heartbeat(other, comfy_online=True)
+        cases = [
+            ("target-video", 96 * 1024 ** 3, True),
+            ("target-video", 24 * 1024 ** 3, True),
+            ("minimax_h3_ref_2pass", 24 * 1024 ** 3, False),
+            ("minimax_h3_ref_2pass", 32 * 1024 ** 3, True),
+        ] + [(cid, vram, allowed)
+             for cid in controller_app.BF16_HIGH_VRAM_CAPABILITIES
+             for vram, allowed in ((None, False), (80 * 1024 ** 3, False),
+                                   (80 * 1024 ** 3 + 1, True))]
+        for cid, vram, allowed in cases:
+            with self.subTest(capability=cid, vram=vram), \
+                 mock.patch.dict(controller_app.CAPS, {cid: {**cap, "id": cid}}), \
+                 mock.patch.object(controller_app, "ROOT", self.root), \
+                 mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+                 mock.patch.object(controller_app, "cost_ledger", return_value=None):
+                caps["devices"][0]["vram_total"] = vram
+                self.store.heartbeat(worker_id, comfy_online=True, capabilities=caps)
+                response = await self.client.get("/api/generation/workers?capability=" + cid)
+                self.assertEqual(response.status, 200, await response.text())
+                picked = next(w for w in (await response.json())["workers"] if w["id"] == worker_id)
+                self.assertEqual(picked["selectable"], allowed)
+                response = await self.client.post("/api/generate", json={
+                    "project": "p", "capability": cid, "target_worker_id": worker_id,
+                    "params": {"duration": 1},
+                })
+                self.assertEqual(response.status, 200 if allowed else 400, await response.text())
+                if not allowed:
+                    self.assertEqual(self.store.queue_ahead_snapshot(), {})
+                    continue
+                job = await response.json()
+                self.assertIsNone(self.store.acquire(other))
+                claim = self.store.acquire(worker_id)
+                self.assertEqual(claim["job_id"], job["id"])
+                self.assertEqual(claim["payload"]["target_worker_id"], worker_id)
+                self.assertEqual(claim["payload"]["capacity_spec"]["expected"]["kind"], "video")
+                self.store.finish(job["id"], worker_id, claim["lease_token"], "done",
+                                  capacity_released=True)
+                self.store.remove_job(job["id"])
+
+    async def test_pro_targeted_video_does_not_bypass_node_model_or_imported_video_policy(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)
+        self.store.heartbeat(worker_id, comfy_online=True, capabilities=caps)
+        with mock.patch.dict(controller_app.CAPS, {"target-video": cap}), \
+             mock.patch.object(controller_app, "ROOT", self.root), \
+             mock.patch.object(self.auth, "register_job", wraps=self.auth.register_job) as register, \
+             mock.patch.object(self.store, "enqueue", wraps=self.store.enqueue) as enqueue:
+            for failure in ("nodes", "models", "final-node", "final-model", "policy"):
+                worker_caps = json.loads(json.dumps(caps))
+                final_graph = json.loads(json.dumps(graph))
+                if failure == "nodes":
+                    worker_caps["node_classes"] = []
+                elif failure == "models":
+                    worker_caps["input_choices"] = {}
+                elif failure == "final-node":
+                    final_graph["3"] = {"class_type": "MissingNode", "inputs": {}}
+                elif failure == "final-model":
+                    final_graph["1"]["inputs"]["unet_name"] = "different.safetensors"
+                else:
+                    worker_caps["devices"][0]["vram_total"] = 24 * 1024 ** 3
+                self.store.heartbeat(worker_id, comfy_online=True, capabilities=worker_caps)
+                with self.subTest(failure=failure), \
+                     mock.patch.object(controller_app, "patch_graph", return_value=final_graph), \
+                     mock.patch.object(controller_app, "inspect_imported_videos", return_value=(11, {})):
+                    response = await self.client.get("/api/generation/workers?capability=target-video")
+                    picked = (await response.json())["workers"][0]
+                    self.assertEqual(picked["selectable"], failure not in {"nodes", "models"})
+                    response = await self.client.post("/api/generate", json={
+                        "project": "p", "capability": "target-video", "target_worker_id": worker_id,
+                    })
+                    self.assertEqual(response.status, 400, await response.text())
+            register.assert_not_called()
+            enqueue.assert_not_called()
+        self.assertEqual(controller_app.JOBS, {})
+
+    async def test_pro_random_and_non_video_cannot_request_targeted_exception(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)
+        self.store.heartbeat(worker_id, comfy_online=True, capabilities=caps)
+        for kind in ("video", "image"):
+            with self.subTest(kind=kind), \
+                 mock.patch.dict(controller_app.CAPS, {"target-video": {**cap, "outputType": kind}}), \
+                 mock.patch.object(controller_app, "ROOT", self.root), \
+                 mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+                 mock.patch.object(controller_app, "cost_ledger", return_value=None):
+                body = {"project": "p", "capability": "target-video", "outputType": "video",
+                        "targeted_video": True, "capacity_spec": {"expected": {"kind": "video"}},
+                        "params": {"output_kind": "video"}}
+                if kind == "image":
+                    response = await self.client.get("/api/generation/workers?capability=target-video")
+                    self.assertEqual(response.status, 400, await response.text())
+                    with mock.patch.object(self.store, "enqueue", wraps=self.store.enqueue) as enqueue, \
+                         mock.patch.object(self.auth, "register_job", wraps=self.auth.register_job) as register:
+                        response = await self.client.post("/api/generate", json={
+                            **body, "target_worker_id": worker_id,
+                        })
+                        self.assertEqual(response.status, 400, await response.text())
+                        enqueue.assert_not_called()
+                        register.assert_not_called()
+                response = await self.client.post("/api/generate", json=body)
+                self.assertEqual(response.status, 200, await response.text())
+                job = await response.json()
+                self.assertIsNone(self.store.acquire(worker_id))
+                row = self.store.db.execute("SELECT payload_json FROM dispatch_jobs WHERE job_id=?",
+                                            (job["id"],)).fetchone()
+                payload = json.loads(row["payload_json"])
+                self.assertNotIn("target_worker_id", payload)
+                self.assertEqual(payload["capacity_spec"]["expected"]["kind"], kind)
+                self.assertEqual(self.store.dispatch_status(job["id"]), "queued")
+                self.store.remove_job(job["id"])
 
     async def test_unbound_generate_keeps_automatic_dispatch_without_windows_restriction(self):
         cap, graph, caps, worker_id = self.target_fixture()

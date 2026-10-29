@@ -97,6 +97,32 @@ class Pro6000CapabilityTest(unittest.TestCase):
                         "minimax_h3_ref_2pass", devices, HIGH_VRAM_GPU_POLICY, 1))
                     self.assertFalse(can_run_capability("zimage_t2i", devices, HIGH_VRAM_GPU_POLICY))
 
+    def test_targeted_video_only_bypasses_pro_reservation(self):
+        for gib in (0, 24, 32, 80, 96):
+            devices = [{"type": "cuda", "name": "RTX PRO 6000",
+                        "vram_total": gib * 1024 ** 3}]
+            for cid, policy, expected in (
+                ("minimax_h3_fusion_v2", None, True),
+                ("seedvr2_video_up", None, True),
+                ("minimax_h3_ref_2pass", None, gib >= 32),
+                ("minimax_h3_fusion_v2", HIGH_VRAM_GPU_POLICY, gib >= 32),
+            ):
+                with self.subTest(gib=gib, capability=cid, policy=policy):
+                    self.assertFalse(can_run_capability(cid, devices, policy, 1))
+                    self.assertEqual(can_run_capability(
+                        cid, devices, policy, 1, targeted_video=True), expected)
+
+    def test_targeted_video_keeps_both_bf16_strict_vram_gates(self):
+        limit = 80 * 1024 ** 3
+        for cid in BF16_HIGH_VRAM_CAPABILITIES:
+            for vram in (None, 0, limit - 1, limit, limit + 1, 96 * 1024 ** 3):
+                for targeted in (False, True):
+                    with self.subTest(capability=cid, vram=vram, targeted=targeted):
+                        self.assertEqual(can_run_capability(
+                            cid, [{"type": "cuda", "name": "RTX PRO 6000", "vram_total": vram}],
+                            HIGH_VRAM_GPU_POLICY, 1, targeted_video=targeted,
+                        ), vram is not None and vram > limit)
+
 
 class ModelDispatchTest(unittest.TestCase):
     def setUp(self):
@@ -299,6 +325,82 @@ class ModelDispatchTest(unittest.TestCase):
                     self.assertIsNone(acquired)
                     self.assertEqual(self.store.dispatch_status(job_id), "queued")
                 self.store.remove_job(job_id)
+
+    def test_pro_targeted_video_claim_is_bound_and_random_video_stays_reserved(self):
+        caps = copy.deepcopy(self.caps)
+        caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        other = self.store.register_worker("other PRO 6000", caps)["worker_id"]
+        self.store.heartbeat(other, comfy_online=True)
+        spec = {"expected": {"kind": "video"}}
+        self.enqueue(job_id="random", capacity_spec=spec)
+        self.enqueue(target_worker_id=self.worker_id, capacity_spec=spec)
+        self.assertIsNone(self.store.acquire(other))
+        first = self.store.acquire(self.worker_id)
+        self.assertEqual(first["job_id"], "fusion")
+        self.assertEqual(first["payload"]["graph"], self.graph)
+        self.assertEqual(first["payload"]["target_worker_id"], self.worker_id)
+        self.assertEqual(self.store.dispatch_status("random"), "queued")
+        with self.store.db:
+            self.store.db.execute("UPDATE dispatch_jobs SET lease_expires_at=0 WHERE job_id='fusion'")
+        self.assertIsNone(self.store.acquire(other))
+        self.store.heartbeat(self.worker_id, comfy_online=True)
+        second = self.store.acquire(self.worker_id)
+        self.assertEqual(second["job_id"], "fusion")
+        self.assertNotEqual(first["lease_token"], second["lease_token"])
+
+    def test_pro_targeted_video_still_requires_nodes_models_and_gpu_policy(self):
+        caps = copy.deepcopy(self.caps)
+        caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)
+        self.enqueue(target_worker_id=self.worker_id, capacity_spec={"expected": {"kind": "video"}},
+                     gpu_policy=HIGH_VRAM_GPU_POLICY)
+        for failure in ("nodes", "models", "wrong-model", "vram", "unknown-vram"):
+            incomplete = copy.deepcopy(caps)
+            if failure == "nodes":
+                incomplete["node_classes"].pop()
+            elif failure == "models":
+                incomplete["input_choices"] = {}
+            elif failure == "wrong-model":
+                incomplete["input_choices"]["UNETLoader"]["unet_name"] = ["wrong.safetensors"]
+            else:
+                incomplete["devices"][0]["vram_total"] = 24 * 1024 ** 3 if failure == "vram" else None
+            with self.subTest(failure=failure):
+                self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=incomplete)
+                self.assertIsNone(self.store.acquire(self.worker_id))
+                self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "fusion")
+
+    def test_pro_target_without_trusted_video_identity_cannot_use_exception(self):
+        caps = copy.deepcopy(self.caps)
+        caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        for spec in (None, {}, {"expected": {}}, {"expected": {"kind": "image"}},
+                     {"expected": {"kind": "text"}}, {"expected": "video"}, "video"):
+            for cid in ("zimage_t2i", "minimax_h3_fusion_v2"):
+                with self.subTest(spec=spec, capability=cid):
+                    self.enqueue(capability=cid, target_worker_id=self.worker_id, capacity_spec=spec,
+                                 outputType="video", targeted_video=True)
+                    self.assertIsNone(self.store.acquire(self.worker_id))
+                    self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+                    self.store.remove_job("fusion")
+
+    def test_pro_targeted_bf16_claim_keeps_strict_vram_gate(self):
+        for cid in BF16_HIGH_VRAM_CAPABILITIES:
+            for vram in (None, 80 * 1024 ** 3, 80 * 1024 ** 3 + 1):
+                with self.subTest(capability=cid, vram=vram):
+                    caps = copy.deepcopy(self.caps)
+                    caps["devices"][0].update(name="RTX PRO 6000", vram_total=vram)
+                    self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+                    self.enqueue(capability=cid, target_worker_id=self.worker_id,
+                                 capacity_spec={"expected": {"kind": "video"}},
+                                 gpu_policy=HIGH_VRAM_GPU_POLICY, duration_seconds=1)
+                    claim = self.store.acquire(self.worker_id)
+                    self.assertEqual(claim is not None, vram is not None and vram > 80 * 1024 ** 3)
+                    if claim:
+                        self.store.finish("fusion", self.worker_id, claim["lease_token"], "done",
+                                          capacity_released=True)
+                    self.store.remove_job("fusion")
 
     def test_pro_bf16_actual_graph_still_requires_each_exact_model(self):
         self.graph = json.loads((ROOT / "graphs/minimax_h3_ref_2pass_bf16.api.json").read_text(encoding="utf-8"))
