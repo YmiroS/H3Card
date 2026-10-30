@@ -294,6 +294,21 @@ class ResourceAccess:
             for name, resource_id in rows:
                 self.store.db.execute('INSERT OR IGNORE INTO job_inputs VALUES (?,?,?)', (jid, name, resource_id))
 
+    def list_job_inputs(self, user_id, jid):
+        """只读可信输入索引，按任务画布的当前资源权限过滤。"""
+        with self.store.lock:
+            job = self.store.get_job(jid)
+            if not job:
+                return []
+            rows = self.store.db.execute(
+                "SELECT r.locator FROM job_inputs i "
+                "JOIN resources r ON i.resource_id=r.resource_id "
+                "WHERE i.job_id=? AND r.kind='upload' AND r.state='ready' "
+                "ORDER BY i.name", (jid,)).fetchall()
+            return [row['locator'] for row in rows
+                    if self.authorize(user_id, 'upload', row['locator'],
+                                      project_id=job['project_id'])]
+
     def job_input_allowed(self, jid, name):
         name = safe_relative(name, single=True)
         with self.store.lock:

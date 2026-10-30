@@ -231,6 +231,61 @@ class ResourceAccessTests(unittest.TestCase):
         self.store.set_project_state('a', 'deleted')
         self.assertFalse(self.access.job_input_allowed('job1', 'source.png'))
 
+    def test_list_job_inputs_rechecks_current_user_and_project_permissions(self):
+        self.store.register_job('job1', 'a', self.a)
+        self.access.register_job_inputs('job1', ['chouka/source.png'])
+        self.assertEqual(self.access.list_job_inputs(self.a, 'job1'), ['source.png'])
+        self.assertEqual(self.access.list_job_inputs(self.b, 'job1'), [])
+        self.store.set_grant(self.b, self.a, 'read')
+        self.assertEqual(self.access.list_job_inputs(self.b, 'job1'), ['source.png'])
+        self.store.delete_grant(self.b, self.a)
+        self.assertEqual(self.access.list_job_inputs(self.b, 'job1'), [])
+        self.store.set_user(self.a, enabled=False)
+        self.assertEqual(self.access.list_job_inputs(self.a, 'job1'), [])
+        self.store.set_user(self.a, enabled=True)
+        self.store.set_project_state('a', 'deleted')
+        self.assertEqual(self.access.list_job_inputs(self.a, 'job1'), [])
+        self.assertEqual(self.access.list_job_inputs(self.admin, 'job1'), [])
+
+    def test_list_job_inputs_is_read_only_and_only_uses_registered_inputs(self):
+        self.store.register_job('job1', 'a', self.a)
+        self.store.register_job('empty', 'a', self.a)
+        self.access.register('a', 'upload', 'current.png')
+        self.access.register_job_inputs('job1', ['chouka/source.png', 'chouka/source.png'])
+        changes = self.store.db.total_changes
+        statements = []
+        self.store.db.set_trace_callback(statements.append)
+        try:
+            self.assertEqual(self.access.list_job_inputs(self.a, 'job1'), ['source.png'])
+            self.assertEqual(self.access.list_job_inputs(self.a, 'empty'), [])
+            self.assertEqual(self.access.list_job_inputs(self.a, 'missing'), [])
+        finally:
+            self.store.db.set_trace_callback(None)
+        self.assertEqual(self.store.db.total_changes, changes)
+        self.assertTrue(statements)
+        self.assertTrue(all(sql.lstrip().upper().startswith('SELECT') for sql in statements))
+
+    def test_list_job_inputs_filters_pending_non_upload_and_wrong_project(self):
+        self.store.register_job('job1', 'a', self.a)
+        for name in ('pending.png', 'unbound.png', 'moved.png'):
+            self.access.register('a', 'upload', name)
+        self.access.register_job_inputs('job1', [
+            'chouka/source.png', 'chouka/pending.png', 'chouka/unbound.png', 'chouka/moved.png'])
+        artifact = self.access.register('a', 'artifact', 'job1/output.png')
+        with self.store._tx():
+            self.store.db.execute("UPDATE resources SET state='pending' WHERE locator='pending.png'")
+            self.store.db.execute(
+                "DELETE FROM project_resources WHERE resource_id IN "
+                "(SELECT resource_id FROM resources WHERE locator='unbound.png')")
+            self.store.db.execute(
+                "UPDATE project_resources SET project_id='b' WHERE resource_id IN "
+                "(SELECT resource_id FROM resources WHERE locator='moved.png')")
+            # 防御性覆盖：即使历史索引存在非上传记录，也不应作为素材返回。
+            self.store.db.execute('INSERT INTO job_inputs VALUES (?,?,?)',
+                                  ('job1', 'output.png', artifact['resource_id']))
+        for user in (self.a, self.admin):
+            self.assertEqual(self.access.list_job_inputs(user, 'job1'), ['source.png'])
+
     def test_traversal_and_comfy_full_locator(self):
         for value in ('../secret', '/secret', 'a/b', '%2e%2e', 'a\\b'):
             with self.assertRaises(ValueError):

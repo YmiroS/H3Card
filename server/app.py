@@ -31,7 +31,7 @@ import sys
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 from collections import defaultdict
 from functools import partial
 
@@ -1891,6 +1891,22 @@ async def api_job(request):
         job | job_display_info(job, node_name) | submitters.get(pid, {})
         | job_queue_snapshot(request.app, [job])[pid] | {"permission": permission}
     )
+
+
+async def api_job_inputs(request):
+    pid = request.match_info["pid"]
+    await authorized_job(request, pid)
+    names = await resource_call(request.app, "list_job_inputs",
+                                require_user(request)["id"], pid)
+    assets = []
+    for name in names:
+        kind = kind_of(name)
+        if kind not in ("image", "video", "audio"):
+            continue
+        assets.append({"ref": "chouka/" + name,
+                       "url": "/api/upload/" + quote(name, safe=""),
+                       "kind": kind, "origin": name})
+    return web.json_response({"assets": assets})
 
 
 async def api_jobs(request):
@@ -4049,7 +4065,8 @@ def make_app(auth_path=None, *, project_repository=None):
         api_generation_workers=api_generation_workers, api_rewrite=api_rewrite,
         api_text=api_text, api_jobs=api_jobs, api_jobs_history=api_jobs_history,
         api_jobs_clear=api_jobs_clear,
-        api_job=api_job, api_cancel=api_cancel, api_job_delete=api_job_delete)
+        api_job=api_job, api_job_inputs=api_job_inputs,
+        api_cancel=api_cancel, api_job_delete=api_job_delete)
     register_media_routes(
         app, api_upload=api_upload, api_preview_file=api_preview_file,
         api_preview_status=api_preview_status, api_thumbnail=api_thumbnail,
