@@ -13,7 +13,7 @@ set "COMFY_LOG=%LOG_DIR%\comfy.log"
 set "WORKER_LOG=%LOG_DIR%\worker.log"
 set "COMFY_HOST=127.0.0.1"
 set "COMFY_PORT=8188"
-set "RESERVE_VRAM=8"
+set "RESERVE_VRAM=2"
 rem Do not use --highvram or --gpu-only: H3 BF16 needs staged model offloading.
 set "COMFY_EXTRA_ARGS=--windows-standalone-build"
 
