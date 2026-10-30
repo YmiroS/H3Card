@@ -690,7 +690,7 @@ class DistributedStore:
                        sync_status = 'pending', sync_message = ?, sync_requested_at = ?,
                        sync_started_at = NULL, sync_finished_at = NULL, updated_at = ?
                    WHERE id = ?""",
-                (request_id, action, f"等待节点空闲；{scope}", now, now, worker_id),
+                (request_id, action, f"等待节点接收，收到后立即执行并中断当前任务；{scope}", now, now, worker_id),
             )
         return {"worker_id": worker_id, "request_id": request_id, "action": action}
 

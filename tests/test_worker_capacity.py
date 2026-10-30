@@ -758,7 +758,7 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             "name": "actual CUDA device", "type": "cuda", "index": 2, "vram_total": 1234,
         }])
         self.assertEqual(caps["telemetry"]["execution_device"], hardware["execution_device"])
-        self.assertEqual(caps["agent_version"], 7)
+        self.assertEqual(caps["agent_version"], 8)
         self.assertEqual(caps["supports_task_diagnostics"], 1)
         self.assertIs(caps["supports_service_restart"], os.name == "nt")
         self.assertIs(caps["supports_host_reboot"], os.name == "nt")

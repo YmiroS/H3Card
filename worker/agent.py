@@ -652,7 +652,7 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 7,
+            "agent_version": 8,
             "supports_task_diagnostics": 1,
             "supports_service_restart": os.name == "nt",
             "supports_host_reboot": os.name == "nt",
@@ -742,7 +742,8 @@ class WorkerAgent:
         if request_id == (self.state.get("last_restart_result") or {}).get("request_id"):
             return
         self.pending_sync = {"request_id": request_id, "type": action}
-        print(f"[Worker] 已收到维护请求 {action}：{request_id}，等待空闲", flush=True)
+        timing = "等待空闲" if action == "sync_files" else "立即执行，将中断当前任务"
+        print(f"[Worker] 已收到维护请求 {action}：{request_id}，{timing}", flush=True)
 
     def sync_script_path(self):
         return self.configured_path("sync_script", "../同步主节点模型和用户.bat")
@@ -1027,13 +1028,10 @@ class WorkerAgent:
         ack = (reply or {}).get("maintenance_ack") or {}
         if ack.get("request_id") != request_id or ack.get("status") != "running":
             raise AgentError("服务端未确认整机重启维护状态，未执行 shutdown")
-        await self.local_status()
-        if self.current or self.local_busy or self.release_failed or not self.comfy_online:
-            raise AgentError("无法再次确认节点空闲，未执行 shutdown")
         maintenance["phase"] = "shutdown_requested"
         self._save_state()
         result = await asyncio.to_thread(
-            subprocess.run, ["shutdown.exe", "/r", "/t", "0"],
+            subprocess.run, ["shutdown.exe", "/r", "/f", "/t", "0"],
             capture_output=True, timeout=30, check=False,
             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
@@ -1081,15 +1079,18 @@ class WorkerAgent:
 
     async def execute_pending_sync(self):
         command = self.pending_sync
-        if (not command or self.current or self.local_busy or self.release_failed
+        if (not command
                 or self.sync_report and self.sync_report.get("status") == "running"):
             return
-        # 再检查一次本机队列；不能仅依赖心跳的旧 busy 快照。
-        await self.local_status()
-        if self.current or self.local_busy or self.release_failed:
-            return
-        request_id = command["request_id"]
         action = command["type"]
+        if action == "sync_files":
+            if self.current or self.local_busy or self.release_failed:
+                return
+            # 文件同步仍须确认空闲；人工重启不等待队列或显存清理。
+            await self.local_status()
+            if self.current or self.local_busy or self.release_failed:
+                return
+        request_id = command["request_id"]
         self.sync_report = {
             "request_id": request_id,
             "status": "running",
@@ -1099,8 +1100,6 @@ class WorkerAgent:
         print(f"[Worker] 开始维护 {action}：{request_id}", flush=True)
         try:
             if action in ("reboot_host", "restart_services"):
-                if not self.comfy_online:
-                    raise AgentError("无法确认 ComfyUI 队列空闲，已停止重启")
                 if action == "reboot_host":
                     await self.schedule_host_reboot(request_id)
                 else:
@@ -1113,9 +1112,6 @@ class WorkerAgent:
                     ack = (reply or {}).get("maintenance_ack") or {}
                     if ack.get("request_id") != request_id or ack.get("status") != "running":
                         raise AgentError("服务端未确认服务重启维护状态，未执行重启")
-                    await self.local_status()
-                    if self.current or self.local_busy or self.release_failed or not self.comfy_online:
-                        raise AgentError("无法再次确认节点空闲，未执行重启")
                     await self.schedule_node_restart(request_id, "")
                 return
             if os.name != "nt":
@@ -1228,6 +1224,9 @@ class WorkerAgent:
                         await self.cancel_current(command.get("job_id"))
                     elif command.get("type") in ("sync_files", "reboot_host", "restart_services"):
                         self.queue_sync(command)
+                # 主循环可能正阻塞在长任务上；人工重启由心跳直接执行。
+                if self.pending_sync and self.pending_sync["type"] in ("reboot_host", "restart_services"):
+                    await self.execute_pending_sync()
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

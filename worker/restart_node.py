@@ -61,10 +61,10 @@ def update_maintenance(state_path, *, request_id=None, expected_restart_token=No
     return True
 
 
-def wait_for_process_exit(pid, timeout=60):
+def wait_for_process_exit(pid, timeout=60, *, terminate=False):
     synchronize = 0x00100000
     kernel32 = ctypes.windll.kernel32
-    handle = kernel32.OpenProcess(synchronize, False, int(pid))
+    handle = kernel32.OpenProcess(synchronize | (0x0001 if terminate else 0), False, int(pid))
     if not handle:
         error = kernel32.GetLastError()
         if error == 87:
@@ -73,6 +73,13 @@ def wait_for_process_exit(pid, timeout=60):
             raise RuntimeError("没有权限确认旧 Worker 是否已经退出")
         raise RuntimeError(f"无法确认旧 Worker 状态，Windows 错误码 {error}")
     try:
+        if terminate and kernel32.WaitForSingleObject(handle, 0) != 0:
+            # 只结束旧 Worker，不能杀进程树：本监督器也是它的子进程。
+            if not kernel32.TerminateProcess(handle, 1):
+                error = kernel32.GetLastError()
+                # 接管握手后旧 Worker 可能自行退出；同一句柄确认，避免误报权限失败。
+                if kernel32.WaitForSingleObject(handle, 0) != 0:
+                    raise RuntimeError(f"无法中断旧 Worker，Windows 错误码 {error}")
         result = kernel32.WaitForSingleObject(handle, int(timeout * 1000))
         if result == 0:
             return
@@ -306,7 +313,9 @@ def main():
             log_path=str(log_path),
         )
         log_event(f"重启监督器已接管请求 {request_id}，等待旧 Worker PID {args.worker_pid} 退出")
-        wait_for_process_exit(args.worker_pid)
+        wait_for_process_exit(
+            args.worker_pid, terminate=maintenance.get("action") == "restart_services",
+        )
         old_worker_exited = True
         update_maintenance(
             state_path, request_id=request_id,

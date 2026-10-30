@@ -1060,7 +1060,8 @@ class DistributedStoreTest(unittest.TestCase):
             worker = self.store.list_workers()[0]
             self.assertEqual(worker["sync_action"], action)
             self.assertEqual(worker["sync_status"], "pending")
-            self.assertIn("等待节点空闲", worker["sync_message"])
+            self.assertIn("收到后立即执行并中断当前任务", worker["sync_message"])
+            self.assertNotIn("等待节点空闲", worker["sync_message"])
             self.store.enqueue(action, {"graph": {}})
             self.assertIsNone(self.store.acquire(self.worker_id))
             command = {"type": action, "request_id": request["request_id"]}
@@ -1981,39 +1982,80 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         for name in ("nt", "posix"):
             with mock.patch("agent.os.name", name):
                 caps = await self.agent.scan_capabilities()
-            self.assertEqual(caps["agent_version"], 7)
+            self.assertEqual(caps["agent_version"], 8)
             self.assertEqual(caps["supports_task_diagnostics"], 1)
             self.assertIs(caps["supports_service_restart"], name == "nt")
             self.assertIs(caps["supports_host_reboot"], name == "nt")
 
-    async def test_manual_node_restart_waits_for_task_and_does_not_sync_or_pull(self):
+    async def test_manual_service_restart_does_not_wait_for_task_queue_release_or_comfy(self):
         agent = self.agent
         agent.schedule_node_restart = mock.AsyncMock()
+        agent.local_status = mock.AsyncMock(side_effect=AssertionError("must not check idle"))
         agent.run_local_command = mock.AsyncMock(side_effect=AssertionError("must not sync"))
         agent.pull_code = mock.AsyncMock(side_effect=AssertionError("must not pull"))
-        agent._json_request = mock.AsyncMock(side_effect=lambda _method, url, **_kwargs:
-            {"maintenance_ack": {"request_id": "manual", "status": "running"}} if url.endswith("heartbeat") else {})
-        command = {"type": "restart_services", "request_id": "manual"}
-        agent.queue_sync(command)
-        agent.queue_sync(command)
-        agent.queue_sync({"type": "sync_files", "request_id": "other"})
-        self.assertEqual(agent.pending_sync, command)
-        self.assertIsNone(await agent.acquire())
-        agent.current = self.assignment
-        await agent.execute_pending_sync()
-        agent.schedule_node_restart.assert_not_awaited()
-        agent.current = None
-        agent.local_busy = True
-        await agent.execute_pending_sync()
-        agent.schedule_node_restart.assert_not_awaited()
-        agent.local_busy = False
-        await agent.execute_pending_sync()
-        agent.schedule_node_restart.assert_awaited_once_with("manual", "")
+        for case in ("task", "queue", "release", "offline"):
+            agent.pending_sync, agent.sync_report = None, None
+            agent.current = self.assignment if case == "task" else None
+            agent.local_busy = case == "queue"
+            agent.release_failed = "显存释放未确认" if case == "release" else None
+            agent.comfy_online = case != "offline"
+            agent.schedule_node_restart.reset_mock()
+            agent._json_request = mock.AsyncMock(return_value={
+                "maintenance_ack": {"request_id": case, "status": "running"}})
+            command = {"type": "restart_services", "request_id": case}
+            agent.queue_sync(command)
+            agent.queue_sync(command)
+            agent.queue_sync({"type": "sync_files", "request_id": "other"})
+            self.assertEqual(agent.pending_sync, command)
+            self.assertIsNone(await agent.acquire())
+            await agent.execute_pending_sync()
+            agent.schedule_node_restart.assert_awaited_once_with(case, "")
+            agent.queue_sync(command)
+            self.assertIsNone(agent.pending_sync)
+        agent.local_status.assert_not_awaited()
         agent.pull_code.assert_not_awaited()
         agent.run_local_command.assert_not_awaited()
+
+    async def test_file_sync_still_waits_for_task_queue_or_release_confirmation(self):
+        agent = self.agent
+        agent.run_local_command = mock.AsyncMock(side_effect=AssertionError("must wait"))
+        agent.pull_code = mock.AsyncMock(side_effect=AssertionError("must wait"))
+        agent.local_status = mock.AsyncMock()
+        command = {"type": "sync_files", "request_id": "sync"}
         agent.queue_sync(command)
-        agent.queue_sync({"type": "reboot_host", "request_id": "other"})
-        self.assertIsNone(agent.pending_sync)
+        for case in ("task", "queue", "release"):
+            agent.current = self.assignment if case == "task" else None
+            agent.local_busy = case == "queue"
+            agent.release_failed = "显存释放未确认" if case == "release" else None
+            await agent.execute_pending_sync()
+            self.assertEqual(agent.pending_sync, command)
+            self.assertIsNone(agent.sync_report)
+        agent.run_local_command.assert_not_awaited()
+        agent.pull_code.assert_not_awaited()
+
+    async def test_heartbeat_executes_service_restart_while_main_job_is_running(self):
+        agent = self.agent
+        agent.current = self.assignment
+        agent.local_busy = True
+        agent.stop_event = asyncio.Event()
+        agent.local_status = mock.AsyncMock()
+        agent.start_cleanup = mock.Mock(side_effect=AssertionError("must not wait for cleanup"))
+        command = {"type": "restart_services", "request_id": "manual"}
+
+        async def request(_method, _url, **kwargs):
+            if kwargs["json"].get("maintenance"):
+                return {"maintenance_ack": {"request_id": "manual", "status": "running"}}
+            return {"commands": [command], "lease_ttl_seconds": 60}
+
+        async def restart(_request_id, _commit):
+            agent.stop_event.set()
+
+        agent._json_request = mock.AsyncMock(side_effect=request)
+        agent.schedule_node_restart = mock.AsyncMock(side_effect=restart)
+        await asyncio.wait_for(agent.heartbeat_loop(), 1)
+        agent.schedule_node_restart.assert_awaited_once_with("manual", "")
+        self.assertIs(agent.current, self.assignment)
+        agent.start_cleanup.assert_not_called()
 
     async def test_host_reboot_persists_before_ack_and_uses_fixed_command_once(self):
         agent = self.agent
@@ -2042,7 +2084,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             agent.queue_sync(command)
             await agent.schedule_host_reboot("host")
             run.assert_called_once()
-            self.assertEqual(run.call_args.args[0], ["shutdown.exe", "/r", "/t", "0"])
+            self.assertEqual(run.call_args.args[0], ["shutdown.exe", "/r", "/f", "/t", "0"])
             self.assertEqual(agent.sync_report["status"], "running")
             self.assertIsNone(agent.pending_sync)
             agent.pull_code.assert_not_awaited()
@@ -2074,9 +2116,10 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
              mock.patch("agent.subprocess.run", return_value=mock.Mock(returncode=0)) as run:
             agent.queue_sync({"type": "reboot_host", "request_id": "host"})
             agent.current = self.assignment
-            await agent.execute_pending_sync()
-            self.assertFalse(ack_requested.is_set())
-            agent.current = None
+            agent.local_busy = True
+            agent.release_failed = "显存释放未确认"
+            agent.comfy_online = False
+            agent.local_status = mock.AsyncMock(side_effect=AssertionError("must not check idle"))
             task = asyncio.create_task(agent.execute_pending_sync())
             try:
                 await asyncio.wait_for(ack_requested.wait(), 1)
@@ -2088,18 +2131,18 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 release_ack.set()
                 await task
             run.assert_called_once()
+            agent.local_status.assert_not_awaited()
+            self.assertIs(agent.current, self.assignment)
 
-    async def test_host_reboot_preflight_and_post_ack_busy_do_not_shutdown(self):
+    async def test_host_reboot_preflight_failures_do_not_shutdown(self):
         agent = self.agent
         agent._save_state = mock.Mock()
-        for case in ("non_windows", "no_boot_identity", "busy_after_ack"):
+        for case in ("non_windows", "no_boot_identity"):
             agent.state, agent.pending_sync, agent.sync_report = {}, None, None
             agent.comfy_online, agent.local_busy = True, False
 
             async def request(_method, url, **_kwargs):
                 if url.endswith("heartbeat"):
-                    if case == "busy_after_ack":
-                        agent.current = self.assignment
                     return {"maintenance_ack": {"request_id": "host", "status": "running"}}
                 return {}
 
@@ -2531,6 +2574,68 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(RuntimeError, "Windows 错误码 5"):
                 restart_node.wait_for_process_exit(321, timeout=1)
         kernel32.CloseHandle.assert_called_once_with(123)
+
+    def test_manual_restart_terminates_only_old_worker_before_waiting(self):
+        kernel32 = mock.Mock()
+        kernel32.OpenProcess.return_value = 123
+        kernel32.WaitForSingleObject.side_effect = [0x102, 0]
+        kernel32.TerminateProcess.return_value = 1
+        with mock.patch.object(restart_node.ctypes, "windll", mock.Mock(kernel32=kernel32), create=True):
+            restart_node.wait_for_process_exit(321, timeout=1, terminate=True)
+        kernel32.OpenProcess.assert_called_once_with(0x00100001, False, 321)
+        kernel32.TerminateProcess.assert_called_once_with(123, 1)
+        self.assertEqual(kernel32.WaitForSingleObject.call_args_list,
+                         [mock.call(123, 0), mock.call(123, 1000)])
+        kernel32.CloseHandle.assert_called_once_with(123)
+
+    def test_manual_restart_accepts_worker_exiting_between_probe_and_termination(self):
+        kernel32 = mock.Mock()
+        kernel32.OpenProcess.return_value = 123
+        kernel32.WaitForSingleObject.side_effect = [0x102, 0, 0]
+        kernel32.TerminateProcess.return_value = 0
+        kernel32.GetLastError.return_value = 5
+        with mock.patch.object(restart_node.ctypes, "windll", mock.Mock(kernel32=kernel32), create=True):
+            restart_node.wait_for_process_exit(321, timeout=1, terminate=True)
+        kernel32.TerminateProcess.assert_called_once_with(123, 1)
+        self.assertEqual(kernel32.WaitForSingleObject.call_args_list,
+                         [mock.call(123, 0), mock.call(123, 0), mock.call(123, 1000)])
+        kernel32.CloseHandle.assert_called_once_with(123)
+
+    def test_manual_restart_does_not_continue_after_worker_termination_failure(self):
+        kernel32 = mock.Mock()
+        kernel32.OpenProcess.return_value = 123
+        kernel32.WaitForSingleObject.return_value = 0x102
+        kernel32.TerminateProcess.return_value = 0
+        kernel32.GetLastError.return_value = 5
+        with mock.patch.object(restart_node.ctypes, "windll", mock.Mock(kernel32=kernel32), create=True):
+            with self.assertRaisesRegex(RuntimeError, "无法中断旧 Worker"):
+                restart_node.wait_for_process_exit(321, terminate=True)
+        kernel32.CloseHandle.assert_called_once_with(123)
+
+    def test_restart_supervisor_forces_worker_exit_only_for_manual_service_restart(self):
+        for action in ("restart_services", "sync_files"):
+            with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                config = root / "config.json"
+                config.write_text(json.dumps({"state_file": "state.json"}), encoding="utf-8")
+                (root / "state.json").write_text(json.dumps({"maintenance": {
+                    "request_id": "manual", "action": action, "restart_token": "token",
+                    "deadline": time.time() + 300,
+                }}), encoding="utf-8")
+                launcher = root / "start.bat"
+                launcher.write_text("", encoding="utf-8")
+                with mock.patch.object(sys, "argv", ["restart_node.py", "--config", str(config),
+                        "--worker-pid", "321", "--launcher", str(launcher)]), \
+                     mock.patch.object(restart_node, "configure_logging", return_value=root / "log"), \
+                     mock.patch.object(restart_node, "wait_for_process_exit") as wait, \
+                     mock.patch.object(restart_node, "stop_comfy") as stop, \
+                     mock.patch.object(restart_node, "start_launcher"), \
+                     mock.patch.object(restart_node, "wait_for_comfy_ready"), \
+                     mock.patch.object(restart_node, "start_worker"), \
+                     mock.patch.object(restart_node, "wait_for_restart_result"):
+                    restart_node.main()
+                wait.assert_called_once_with(321, terminate=action == "restart_services")
+                stop.assert_called_once_with("http://127.0.0.1:8188")
 
     def test_restart_result_requires_matching_token_and_propagates_error(self):
         worker = mock.Mock()
