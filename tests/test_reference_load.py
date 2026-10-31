@@ -75,13 +75,13 @@ class ReferenceLoadTests(unittest.TestCase):
         image1, image2, video, sound, audio = group["references"]
         self.assertEqual((image1["width"], image1["height"]), (2720, 2048))
         self.assertEqual((image2["width"], image2["height"]), (1024, 768))
-        self.assertEqual((video["width"], video["height"], video["frames"]), (1344, 768, 124))
+        self.assertEqual((video["width"], video["height"], video["frames"]), (1344, 768, 141))
         self.assertEqual(video["raw_frames"], 240)
-        self.assertEqual(video["duration"], 124 / 24)
-        self.assertEqual(sound["duration"], 124 / 24)
+        self.assertEqual(video["duration"], 141 / 24)
+        self.assertAlmostEqual(sound["duration"], 130 / 24, places=5)
         self.assertEqual(audio["duration"], 30)
         self.assertEqual(group["image_pixels"], 2720 * 2048 + 1024 * 768)
-        self.assertEqual(group["video_pixel_frames"], 1344 * 768 * 124)
+        self.assertEqual(group["video_pixel_frames"], 1344 * 768 * 141)
         self.assertEqual(probe.call_count, 4)
         self.assertEqual(graph, original)
         serialized = json.dumps(result, allow_nan=False)
@@ -122,20 +122,36 @@ class ReferenceLoadTests(unittest.TestCase):
         wide = first(self.estimate(graph, metadata(4000, 500)))
         self.assertEqual((wide["width"], wide["height"]), (2880, 352))
 
-    def test_generation_aligns_up_but_retained_video_aligns_down(self):
+    def test_generation_and_reference_align_up_without_dropping_source_tail(self):
         graph = graph_with("VHS_LoadVideoFFmpeg", VIDEO)
-        for length, source, generated, retained in ((125, 200, 141, 141), (124, 123, 124, 107),
+        for length, source, generated, retained in ((125, 200, 141, 141), (124, 123, 124, 124),
+                                                    (92, 92, 107, 107), (124, 92, 124, 107),
+                                                    (39, 92, 39, 39), (90, 90, 90, 90),
                                                     (5, 240, 5, 5), (1, 5, 5, 5)):
             with self.subTest(length=length, source=source):
                 graph["consumer"]["inputs"]["length"] = length
                 result = self.estimate(graph, metadata(frames=source))
                 self.assertEqual(result["groups"][0]["frames"], generated)
                 self.assertEqual(first(result)["frames"], retained)
+                self.assertEqual(first(result)["raw_frames"], source)
+                self.assertAlmostEqual(first(result)["duration"], retained / 24, places=5)
                 self.assertTrue(result["complete"])
         result = self.estimate(graph, metadata(frames=4))
         self.assertIsNone(first(result)["frames"])
         self.assertIsNone(result["groups"][0]["video_pixel_frames"])
         self.assertFalse(result["complete"])
+
+    def test_padded_reference_video_does_not_pad_paired_audio(self):
+        graph = graph_with("VHS_LoadVideo", VIDEO, force_rate=24)
+        graph["consumer"]["inputs"]["length"] = 107
+        graph["consumer"]["inputs"][SOUND] = ["source", 2]
+        result = self.estimate(graph, metadata(frames=92, fps=24, duration=3.85))
+        video, audio = result["groups"][0]["references"]
+        self.assertEqual(video["raw_frames"], 92)
+        self.assertEqual(video["frames"], 107)
+        self.assertAlmostEqual(video["duration"], 107 / 24, places=5)
+        self.assertAlmostEqual(audio["duration"], 92 / 24, places=5)
+        self.assertTrue(result["complete"])
 
     def test_no_references_does_not_probe_disconnected_template(self):
         probe = Mock(side_effect=AssertionError("must not probe"))
@@ -393,18 +409,18 @@ class ReferenceLoadTests(unittest.TestCase):
                            skip_first_frames=11, select_every_nth=2)
         graph["consumer"]["inputs"]["length"] = 400
         result = self.estimate(graph, metadata(frames=240))
-        self.assertEqual(first(result)["frames"], 73)
+        self.assertEqual(first(result)["frames"], 90)  # 80 real frames plus repeated tail.
         graph["source"]["inputs"]["frame_load_cap"] = 0
         result = self.estimate(graph, metadata(frames=240))
-        self.assertEqual(first(result)["frames"], 107)  # ceil((240 - 11) / 2) = 115
+        self.assertEqual(first(result)["frames"], 124)  # ceil((240 - 11) / 2) = 115, padded to 124.
         self.assertTrue(result["complete"])
 
     def test_vhs_rate_conversion_uses_cv_first_frame_semantics(self):
         graph = graph_with("VHS_LoadVideo", VIDEO, force_rate=24)
         graph["consumer"]["inputs"]["length"] = 400
         result = self.estimate(graph, metadata(frames=100, fps=10, duration=10))
-        # CV yields floor((100-1)*24/10)+1 = 238, then H3 retains 226.
-        self.assertEqual(first(result)["frames"], 226)
+        # CV yields floor((100-1)*24/10)+1 = 238, then H3 pads to 243.
+        self.assertEqual(first(result)["frames"], 243)
         self.assertEqual(first(result)["raw_fps"], 10)
         self.assertTrue(result["complete"])
 
@@ -413,10 +429,10 @@ class ReferenceLoadTests(unittest.TestCase):
                            frame_load_cap=130)
         graph["consumer"]["inputs"]["length"] = 400
         result = self.estimate(graph, metadata(frames=300, fps=30, duration=10))
-        self.assertEqual(first(result)["frames"], 124)
+        self.assertEqual(first(result)["frames"], 141)
         graph["source"]["inputs"]["frame_load_cap"] = 0
         result = self.estimate(graph, metadata(frames=300, fps=30, duration=10))
-        self.assertEqual(first(result)["frames"], 158)  # 7 * 24 -> 168 -> 158
+        self.assertEqual(first(result)["frames"], 175)  # 7 * 24 -> 168 -> 175
         self.assertTrue(result["complete"])
         for loader, settings in (("VHS_LoadVideo", {"start_time": 1}),
                                  ("VHS_LoadVideoFFmpeg", {"skip_first_frames": 1}),

@@ -157,7 +157,8 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtur
         form.add_field("file", original, filename="original.mov", content_type="video/quicktime")
         with mock.patch.object(controller_app, "ROOT", self.root), \
              mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
-             mock.patch.object(controller_app, "probe_video", return_value={}), \
+             mock.patch.object(controller_app, "probe_video", return_value={
+                 "frames": 92, "fps": 24, "duration": 3.85}) as probe, \
              mock.patch.object(controller_app, "comfy_upload", new_callable=mock.AsyncMock) as upload:
             upload.return_value = "chouka/original.mov"
             response = await self.client.post(
@@ -165,6 +166,8 @@ class VideoPreviewTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtur
         asset = (await response.json())["files"][0]
         self.assertTrue(asset["ref"].startswith("chouka/ck_"))
         self.assertTrue(asset["ref"].endswith(".mov"))
+        self.assertEqual(asset["frames"], 92)
+        probe.assert_called_once_with(asset["ref"], count_frames=True)
         upload.assert_not_awaited()
         response = await self.client.get(asset["url"])
         self.assertEqual(await response.read(), original)
@@ -611,6 +614,40 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                     duration_spec = next(s for s in cap["inputs"] if s["key"] == "duration")
                     self.assertEqual(graph[duration_spec["target"]["node"]]["inputs"]["value"], seconds)
 
+    def test_reference_92_frames_generates_107_and_delivers_exactly_92(self):
+        for cid in (*self.capabilities[:3], "minimax_h3_fusion_v2_bf16", "minimax_h3_ref_2pass_bf16"):
+            with self.subTest(cid=cid):
+                _, params, graph = self.patch(
+                    cid, {"frames": 92, "fps": 24, "duration": 3.85},
+                    {"duration": 92 / 24})
+                reference = next(n["inputs"] for n in graph.values()
+                                 if n["class_type"] == "MiniMaxH3ReferenceToVideo")
+                loader = next(n["inputs"] for n in graph.values()
+                              if n["class_type"].startswith("VHS_LoadVideo"))
+                self.assertEqual(reference["length"], 107)
+                self.assertEqual(loader["frame_load_cap"], 107)
+                self.assertEqual(loader["force_rate"], 24)
+                self.assertEqual(loader.get("skip_first_frames", 0), 0)
+                self.assertEqual(loader.get("start_time", 0), 0)
+                output = self.output(graph)
+                trim = graph[graph[output["images"][0]]["inputs"]["image"][0]]["inputs"]
+                self.assertEqual(trim["length"], 92)
+                self.assertEqual(trim["batch_index"], 0)
+                self.assertEqual(output["frame_rate"], 24)
+                self.assertEqual(params["output_duration"], 92 / 24)
+
+    def test_reference_frame_metadata_does_not_override_manual_duration(self):
+        for seconds, expected_frames in ((3, 72), (4, 96), (5.5, 132)):
+            with self.subTest(seconds=seconds):
+                _, params, graph = self.patch(
+                    "minimax_h3_fusion_v2", {"frames": 92, "fps": 24, "duration": 3.85},
+                    {"duration": seconds})
+                output = self.output(graph)
+                trim = graph[graph[output["images"][0]]["inputs"]["image"][0]]["inputs"]
+                self.assertEqual(trim["length"], expected_frames)
+                self.assertEqual(params["duration"], seconds)
+                self.assertEqual(output["frame_rate"], 24)
+
     def test_submitted_duration_shorter_than_five_frames_is_rejected_before_generation(self):
         for cid in self.capabilities[:3]:
             for seconds in (0.02, 0.1):
@@ -897,6 +934,37 @@ class FollowReferenceProbeTest(unittest.TestCase):
         self.assertEqual((info["fps"], info["frames"], info["duration"]), (24, 150, 6.25))
         self.assertEqual(info["has_audio"], audio)
         return info
+
+    def test_exact_count_uses_decoded_video_not_container_audio_duration(self):
+        stderr = ("Duration: 00:00:04.00, start: 0.000000\n"
+                  "  Stream #0:0: Video: h264, yuv420p, 2522x1080, 24 fps\n"
+                  "  Stream #0:1: Audio: aac, 44100 Hz, stereo\n")
+        result = mock.Mock(returncode=0, stderr=stderr,
+                           stdout="frame=1\nprogress=continue\nframe=92\nprogress=end\n")
+        with mock.patch.object(controller_app, "ffmpeg_bin", return_value=Path("ffmpeg")), \
+             mock.patch.object(controller_app.Path, "exists", return_value=True), \
+             mock.patch.object(controller_app.subprocess, "run", return_value=result) as run:
+            info = controller_app.probe_video("chouka/reference.mp4", count_frames=True)
+        self.assertEqual(info["frames"], 92)
+        self.assertEqual(info["duration"], 4)
+        self.assertEqual(info["fps"], 24)
+        command = run.call_args.args[0]
+        self.assertEqual(command[command.index("-map") + 1], "0:v:0")
+        self.assertEqual(command[command.index("-fps_mode") + 1], "passthrough")
+        self.assertNotIn("-r", command)
+        self.assertNotIn("-c", command)
+        self.assertIn("-an", command)
+
+    def test_failed_or_incomplete_count_does_not_claim_estimated_frames_are_exact(self):
+        for code, progress in ((1, "frame=91\nprogress=end\n"),
+                               (0, "frame=91\nprogress=continue\n"),
+                               (0, "frame=0\nprogress=end\n")):
+            with self.subTest(code=code, progress=progress), \
+                 mock.patch.object(controller_app, "ffmpeg_bin", return_value=Path("ffmpeg")), \
+                 mock.patch.object(controller_app.Path, "exists", return_value=True), \
+                 mock.patch.object(controller_app.subprocess, "run", return_value=mock.Mock(
+                     returncode=code, stderr="Duration: 00:00:04.00, 24 fps", stdout=progress)):
+                self.assertEqual(controller_app.probe_video("chouka/reference.mp4", count_frames=True), {})
 
     def test_silent_video_keeps_dimensions_without_inventing_audio(self):
         info = self.probe("1920x1080", audio=False)

@@ -343,7 +343,7 @@ def _reference(reader, name, kind, value, group):
         if media["frames"] and group["frames"]:
             n = min(media["frames"], group["frames"])
             if n >= 5:
-                n -= (n - 5) % 17
+                n += (5 - n) % 17
                 result.update(frames=n, duration=_number(n / 24))
     elif kind in ("audio", "video_audio") and media["type"] == "audio":
         result["duration"] = media["duration"]
@@ -404,8 +404,9 @@ def _make_reference_load(graph, probe):
         for ref in group["references"]:
             if ref["kind"] == "video_audio":
                 video = videos.get(ref["input"].rsplit("_", 1)[-1])
-                if video and video["duration"] is not None and ref["duration"] is not None:
-                    ref["duration"] = min(ref["duration"], video["duration"])
+                retained = reader.media(args[video["input"]])["frames"] if video else None
+                if retained and group["frames"] and video["duration"] is not None and ref["duration"] is not None:
+                    ref["duration"] = _number(min(ref["duration"], min(retained, group["frames"]) / 24))
                 else:
                     ref["duration"] = None
             fields = ("width", "height", "frames") if ref["kind"] in ("image", "video") else ("duration",)

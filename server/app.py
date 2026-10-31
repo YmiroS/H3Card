@@ -454,13 +454,10 @@ FPS_RE = re.compile(r"([\d.]+)\s+fps\b")
 AUDIO_STREAM_RE = re.compile(r"^\s*Stream #\d+:\d+.*:\s*Audio:", re.MULTILINE)
 
 
-def probe_video(ref, *, timeout=20):
-    """视频素材的 fps/frames/duration/has_audio 和考虑 SAR、旋转后的显示宽高。
+def probe_video(ref, *, timeout=20, count_frames=False):
+    """探测视频信息；上传/媒体接口解码计数，负载诊断只读取容器估算。
 
-    ref 是 ComfyUI input 目录里的相对路径（"chouka/ck_xxx.mp4"），本地
-    data/uploads/ 下有同名副本，先用本地那份。
-    总帧数按 时长 × 帧率 算 —— 跟 VHS 自己用的 `CAP_PROP_FRAME_COUNT` 同一个来源
-    （容器元数据），所以「只处理前几帧」拿它当分母是对的。
+    ref 是 ComfyUI input 相对路径，优先读取本地 data/uploads 同名副本。
     """
     if not ref or ".." in str(ref):
         return {}
@@ -469,13 +466,17 @@ def probe_video(ref, *, timeout=20):
     exe = ffmpeg_bin()
     if not (p.exists() and exe):
         return {}
+    command = [str(exe), "-i", str(p)]
+    if count_frames:
+        command += ["-map", "0:v:0", "-an", "-sn", "-dn", "-fps_mode", "passthrough",
+                    "-f", "null", "-", "-progress", "pipe:1", "-nostats"]
     try:
-        # ffmpeg 没有 -i 之外的元数据命令（包里也没有 ffprobe），
-        # 所以就是"只给输入、让它报错退出"，要的信息在 stderr 里
-        r = subprocess.run([str(exe), "-i", str(p)], capture_output=True,
+        r = subprocess.run(command, capture_output=True,
                            text=True, errors="ignore", timeout=timeout)
     except Exception as e:
         print(f"[抽卡系统] 探视频信息失败 {p.name}：{e}")
+        return {}
+    if count_frames and r.returncode != 0:
         return {}
     err = r.stderr or ""
     fps = FPS_RE.search(err)
@@ -486,7 +487,12 @@ def probe_video(ref, *, timeout=20):
     if dur:
         h, m, s = dur.groups()
         out["duration"] = round(int(h) * 3600 + int(m) * 60 + float(s), 3)
-    if "fps" in out and "duration" in out:
+    if count_frames:
+        counts = re.findall(r"^frame=(\d+)\s*$", r.stdout or "", re.MULTILINE)
+        if not counts or int(counts[-1]) < 1 or "progress=end" not in (r.stdout or ""):
+            return {}
+        out["frames"] = int(counts[-1])
+    elif "fps" in out and "duration" in out:
         out["frames"] = int(round(out["fps"] * out["duration"]))
     # 只读第一条视频流及其附属元数据，避免第二视频流的尺寸/旋转覆盖主画面。
     streams = re.split(r"(?=^\s*Stream #\d+:\d+)", err, flags=re.MULTILINE)
@@ -1329,7 +1335,7 @@ async def api_upload(request):
         if item["kind"] == "video":
             # 帧率给「目标帧率」反算倍数用，总帧数给「只处理前几帧」当分母。
             # 上传时探一次存下来，面板就不用每次开都去探文件
-            item.update(await asyncio.to_thread(probe_video, ref))
+            item.update(await asyncio.to_thread(probe_video, ref, count_frames=True))
             request.app["video_previews"].ensure(safe)
         saved.append(item)
     if not saved:
@@ -1345,7 +1351,7 @@ async def api_media(request):
     if not parsed:
         raise web.HTTPBadRequest(text="无法识别素材")
     await require_resource(request, *parsed, project_id=request.query.get("project"))
-    return web.json_response(await asyncio.to_thread(probe_video, ref))
+    return web.json_response(await asyncio.to_thread(probe_video, ref, count_frames=True))
 
 
 def h3_image_copy(source):
