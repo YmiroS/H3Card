@@ -1368,7 +1368,8 @@ def h3_image_copy(source):
         raise web.HTTPUnprocessableEntity(text="H3 引用图片无法读取；原素材未修改") from exc
 
 
-async def generation_assets(request, assets, project_id=None, capability_id=None):
+async def generation_assets(request, assets, project_id=None, capability_id=None,
+                            compress_reference_images_2k=True):
     """仅替换提交引用，保留项目原片；H3 图片最长边 2K，视频使用兼容 MP4。"""
     replacements = {}
     for ref in set(assets.values()):
@@ -1398,7 +1399,7 @@ async def generation_assets(request, assets, project_id=None, capability_id=None
         for name in await resource_call(request.app, "pending_external_uploads",
                                         list(set(assets.values()))):
             replacements[f"chouka/{name}"] = ROOT / "data" / "uploads" / name
-    if model_family(capability_id) == "minimax_h3":
+    if model_family(capability_id) == "minimax_h3" and compress_reference_images_2k:
         # Merge AFTER external uploads: an original must never overwrite its 2K copy.
         for value in set(assets.values()):
             if not value:
@@ -1470,7 +1471,10 @@ async def api_generate(request):
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
-    uploaded = await generation_assets(request, body.get("assets") or {}, body["project"], cid)
+    uploaded = await generation_assets(
+        request, body.get("assets") or {}, body["project"], cid,
+        compress_reference_images_2k=params.get("compress_reference_images_2k") != "off",
+    )
     source_video_duration, video_metadata = None, {}
     if not body.get("dry_run") or reference_video_input(cap, uploaded):
         source_video_duration, video_metadata = await asyncio.to_thread(

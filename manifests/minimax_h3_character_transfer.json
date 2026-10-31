@@ -28,6 +28,28 @@
   "image": "images[0]"
  },
  "inputs": [
+{
+  "key": "compress_reference_images_2k",
+  "label": "参考图压缩至 2K",
+  "type": "select",
+  "appearance": "switch",
+  "default": "on",
+  "options": [
+    {
+      "value": "on",
+      "label": "开启"
+    },
+    {
+      "value": "off",
+      "label": "关闭"
+    }
+  ],
+  "hint": "关闭后使用原始尺寸提交，可能导致内存/显存溢出、生成失败。原素材不受影响。",
+  "showHint": true,
+  "target": {
+    "kind": "preset"
+  }
+},
   {
    "key": "video[0]",
    "label": "动作来源视频",
