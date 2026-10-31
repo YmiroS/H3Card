@@ -294,6 +294,10 @@ class H3FusionRuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFix
         self.own_project('p')
         self.enterContext(mock.patch.object(app, 'PROJ_DIR', self.root / 'data/projects'))
         self.register_asset('cat.png')
+        from PIL import Image
+        image_path = self.access.local_path('upload', 'cat.png')
+        image_path.parent.mkdir(parents=True, exist_ok=True)
+        Image.new('RGB', (64, 32)).save(image_path)
         application = self.build_app()
         application.router.add_post('/api/reload', app.api_reload)
         application.router.add_get('/api/cards', app.api_cards)

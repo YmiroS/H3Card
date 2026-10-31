@@ -1348,8 +1348,28 @@ async def api_media(request):
     return web.json_response(await asyncio.to_thread(probe_video, ref))
 
 
-async def generation_assets(request, assets, project_id=None):
-    """项目保留原片引用；真正提交的图和 Worker 素材清单统一使用兼容 MP4。"""
+def h3_image_copy(source):
+    """Return a submission-only PNG, or None when the original is within 2K."""
+    import io
+    from PIL import Image, ImageOps
+
+    try:
+        with Image.open(source) as original:
+            if max(original.size) <= 2048:
+                return None
+            image = ImageOps.exif_transpose(original)
+            image.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
+            if image.mode not in ("RGB", "RGBA", "L", "LA", "I", "I;16"):
+                image = image.convert("RGBA" if "transparency" in image.info else "RGB")
+            output = io.BytesIO()
+            image.save(output, format="PNG")
+            return output.getvalue()
+    except (OSError, ValueError, Image.DecompressionBombError) as exc:
+        raise web.HTTPUnprocessableEntity(text="H3 引用图片无法读取；原素材未修改") from exc
+
+
+async def generation_assets(request, assets, project_id=None, capability_id=None):
+    """仅替换提交引用，保留项目原片；H3 图片最长边 2K，视频使用兼容 MP4。"""
     replacements = {}
     for ref in set(assets.values()):
         if not ref or kind_of(ref) != "video" or not ref.startswith("chouka/"):
@@ -1378,6 +1398,38 @@ async def generation_assets(request, assets, project_id=None):
         for name in await resource_call(request.app, "pending_external_uploads",
                                         list(set(assets.values()))):
             replacements[f"chouka/{name}"] = ROOT / "data" / "uploads" / name
+    if model_family(capability_id) == "minimax_h3":
+        # Merge AFTER external uploads: an original must never overwrite its 2K copy.
+        for value in set(assets.values()):
+            if not value:
+                continue
+            ref = await resource_call(request.app, "reference", value)
+            if not ref:
+                raise web.HTTPBadRequest(text="无法识别 H3 引用素材")
+            await require_resource(request, *ref, project_id=project_id)
+            source = await resource_call(request.app, "local_path", *ref)
+            if source.suffix.lower() not in IMG_EXT:
+                continue
+            if ref[0] == "comfy":
+                await cache_comfy_outputs(request, {"outputs": [{"url": value}]})
+            data = await asyncio.to_thread(h3_image_copy, source)
+            if data is None:
+                continue
+            await require_resource(request, *ref, project_id=project_id)
+            parent = await resource_call(request.app, "lookup", *ref)
+            name = f"h3_{uuid.uuid4().hex}.png"
+            path = ROOT / "data" / "uploads" / name
+            await resource_call(request.app, "register", project_id, "upload", name,
+                                parent_id=parent["resource_id"], state="pending", external=True)
+            temporary = path.with_suffix(".png.part")
+            try:
+                await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+                await asyncio.to_thread(temporary.write_bytes, data)
+                os.replace(temporary, path)
+                await resource_call(request.app, "publish", "upload", name)
+            finally:
+                await asyncio.to_thread(temporary.unlink, missing_ok=True)
+            replacements[value] = path
     for ref, path in replacements.items():
         resolved[ref] = f"chouka/{path.name}" if CONTROLLER_MODE else await comfy_upload(
             request.app["session"], "file", path.name, await asyncio.to_thread(path.read_bytes),
@@ -1418,7 +1470,7 @@ async def api_generate(request):
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
-    uploaded = await generation_assets(request, body.get("assets") or {}, body["project"])
+    uploaded = await generation_assets(request, body.get("assets") or {}, body["project"], cid)
     source_video_duration, video_metadata = None, {}
     if not body.get("dry_run") or reference_video_input(cap, uploaded):
         source_video_duration, video_metadata = await asyncio.to_thread(
