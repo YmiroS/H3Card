@@ -172,7 +172,7 @@ class H3HalfBF16WorkflowTest(unittest.TestCase):
             cap = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(cap, dict) and "output_1080p" in {s["key"] for s in cap.get("inputs", [])}:
                 supported.add(cap["id"])
-        self.assertEqual(supported, {self.cid, "minimax_h3_fusion_v2_bf16"})
+        self.assertEqual(supported, {self.cid})
         for selected in ("on", "off"):
             params = {"output_1080p": selected, "output_width": 999}
             app.apply_input_presets(self.cap, params)
@@ -344,7 +344,7 @@ class H3HalfBF16WorkflowTest(unittest.TestCase):
     def test_1080p_other_capabilities_ignore_switch(self):
         for path in (ROOT / "manifests").glob("minimax_h3_*.json"):
             cap = json.loads(path.read_text(encoding="utf-8"))
-            if cap["id"] in {self.cid, "minimax_h3_fusion_v2_bf16"}:
+            if cap["id"] == self.cid:
                 continue
             import copy
             cap = copy.deepcopy(cap)
@@ -492,28 +492,20 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
         self.assertFalse(any("scale_by" in n["inputs"] or "LatentUpscale" in n["class_type"]
                              for n in self.raw.values()))
 
-    def test_manifest_preserves_original_controls_and_server_only_1080p(self):
+    def test_manifest_preserves_original_controls_without_1080p(self):
         self.assertEqual(self.cap["name"], self.name)
         self.assertEqual(self.cap["source"], "graphs/" + self.cid + ".api.json")
         self.assertEqual(self.cap["graph"], self.cap["source"])
         for key in self.old.keys() - {"id", "name", "source", "graph", "note", "inputs"}:
             self.assertEqual(self.cap[key], self.old[key], key)
-        self.assertEqual([s for s in self.cap["inputs"] if s["key"] != "output_1080p"], self.old["inputs"])
-        self.assertNotIn("scale_by", {s["key"] for s in self.cap["inputs"]})
-        field = next(s for s in self.cap["inputs"] if s["key"] == "output_1080p")
-        self.assertEqual((field["label"], field["type"], field["appearance"], field["default"]),
-                         ("1080P", "select", "switch", "off"))
-        self.assertEqual(field["target"], {"kind": "preset"})
-        self.assertEqual(field["presets"], {"on": {}, "off": {}})
-        self.assertEqual(field["options"], [{"value": "on", "label": "开启"}, {"value": "off", "label": "关闭"}])
-        self.assertTrue(field["showHint"])
-        for text in ("覆盖分辨率预算", "比例", "单采", "32", "最近偶数", "1920×1080", "耗时", "显存", "未实测"):
-            self.assertIn(text, field["hint"])
+        self.assertEqual(self.cap["inputs"], self.old["inputs"])
+        keys = {s["key"] for s in self.cap["inputs"]}
+        self.assertNotIn("output_1080p", keys)
+        self.assertNotIn("scale_by", keys)
         self.assertIn(self.model, self.cap["note"])
-        for selected in ("on", "off"):
-            params = {"output_1080p": selected, "output_width": 999}
-            app.apply_input_presets(self.cap, params)
-            self.assertEqual(params["output_width"], 999)
+
+    def test_stale_1080p_on_does_not_resolve_high_resolution_settings(self):
+        self.assertIsNone(app.resolve_h3_1080p_settings(self.cap, {"output_1080p": "on"}))
 
     def test_registration_and_rescan(self):
         import scan_workflows as scan
@@ -554,107 +546,98 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
         self.assertEqual(graph["145"]["inputs"]["strength_model"], .75)
         self.assertEqual(graph["147"], self.raw["147"])
 
-    def test_1080p_all_eight_ratios_reference_and_no_reference(self):
+    def test_stale_1080p_values_preserve_all_ratios_budgets_and_reference_paths(self):
         import scan_workflows as scan
-        expected = {"1:1": (1080, 1080), "2:3": (1080, 1620), "3:2": (1620, 1080),
-                    "3:4": (1080, 1440), "4:3": (1440, 1080), "9:16": (1080, 1920),
-                    "16:9": (1920, 1080), "21:9": (2520, 1080)}
         options = next(s for s in self.cap["inputs"] if s["key"] == "aspect_ratio")["options"]
-        self.assertEqual({s.split()[0] for s in options}, set(expected))
+        self.assertEqual({s.split()[0] for s in options},
+                         {"1:1", "2:3", "3:2", "3:4", "4:3", "9:16", "16:9", "21:9"})
         for ratio in options:
-            final = expected[ratio.split()[0]]
-            generation = tuple(round(v / 32) * 32 for v in final)
-            for reference in (False, True):
-                with self.subTest(ratio=ratio, reference=reference):
-                    params, graph = self.patch({"output_1080p": "on", "aspect_ratio": ratio,
-                                                "megapixels": "ignored-budget"}, reference)
-                    h3 = graph["136"]["inputs"]
-                    self.assertEqual((h3["width"], h3["height"]), generation)
-                    self.assertEqual((params["output_width"], params["output_height"]), final)
-                    self.assertEqual(params["megapixels"], generation[0] * generation[1] / 1024 ** 2)
-                    self.assertNotIn("scale_by", params)
-                    scales = [n for n in graph.values() if n["class_type"] == "ImageScale"]
-                    self.assertEqual(len(scales), 1)
-                    correction = graph[graph["148"]["inputs"]["images"][0]]
-                    self.assertEqual(correction["class_type"], "ImageScale")
-                    self.assertEqual(correction["_meta"]["title"], "校正单采输出尺寸")
-                    scaled = correction["inputs"]
-                    self.assertEqual((scaled["width"], scaled["height"]), final)
-                    self.assertEqual((scaled["upscale_method"], scaled["crop"]), ("bicubic", "disabled"))
-                    if reference:
-                        trim = graph[scaled["image"][0]]
-                        self.assertEqual(trim["class_type"], "ImageFromBatch")
-                        self.assertEqual(trim["inputs"]["image"], ["122", 0])
-                        self.assertEqual(trim["inputs"]["length"], 144)
-                        self.assertEqual(h3["length"], 158)
-                        self.assertEqual(graph["185"]["inputs"]["frame_load_cap"], 158)
-                        self.assertEqual(graph["148"]["inputs"]["frame_rate"], 24)
-                        self.assertEqual(params["output_duration"], 6)
-                    else:
-                        self.assertEqual(scaled["image"], ["122", 0])
-                        self.assertEqual(h3["length"], ["224", 1])
-                        self.assertNotIn("output_duration", params)
-                        self.assertNotIn("output_fps", params)
-                    for nid in ("127", "145", "156", "165", "232", "234", "235", "123",
-                                "147", "125", "126", "121", "122", "224", "227"):
-                        self.assertEqual(graph[nid], self.raw[nid], nid)
-                    self.assertEqual([nid for nid, n in graph.items()
-                                      if n["class_type"] == "SamplerCustomAdvanced"], ["125"])
-                    self.assertFalse(any("LatentUpscale" in n["class_type"] or "scale_by" in n["inputs"]
-                                         for n in graph.values()))
-                    live = scan.upstream(graph, "148")
-                    self.assertNotIn("228", live)
-                    self.assertIn("122", live)
-                    self.assertIn("125", live)
-                    self.assertEqual("185" in live, reference)
-                    added_types = {n["class_type"] for n in graph.values()} - {
-                        n["class_type"] for n in self.raw.values()}
-                    self.assertEqual(added_types, {"ImageScale", "ImageFromBatch"} if reference else {"ImageScale"})
+            for megapixels in (.2, .8, 1.1, 1.31):
+                for reference in (False, True):
+                    normal = {"aspect_ratio": ratio, "megapixels": megapixels}
+                    baseline, expected = self.patch(normal, reference)
+                    for selected in ("on", "off", None, "", "ON", "true", 0, 1, True, False, [], {}):
+                        with self.subTest(ratio=ratio, megapixels=megapixels,
+                                          reference=reference, selected=selected):
+                            params, graph = self.patch({**normal, "output_1080p": selected}, reference)
+                            self.assertEqual(graph, expected)
+                            self.assertEqual({k: v for k, v in params.items() if k != "output_1080p"}, baseline)
+                            self.assertEqual(params["megapixels"], megapixels)
+                            self.assertEqual(graph["228"]["inputs"]["megapixels"], megapixels)
+                            self.assertEqual(graph["129"]["inputs"]["noise_seed"], 42)
+                            self.assertNotIn("scale_by", params)
+                            h3 = graph["136"]["inputs"]
+                            scales = [n for n in graph.values() if n["class_type"] == "ImageScale"]
+                            self.assertEqual(len(scales), 1 if reference else 0)
+                            if reference:
+                                scaled = graph[graph["148"]["inputs"]["images"][0]]["inputs"]
+                                self.assertEqual((scaled["width"], scaled["height"]),
+                                                 (baseline["output_width"], baseline["output_height"]))
+                                trim = graph[scaled["image"][0]]
+                                self.assertEqual(trim["class_type"], "ImageFromBatch")
+                                self.assertEqual(trim["inputs"]["image"], ["122", 0])
+                                self.assertEqual(trim["inputs"]["length"], 144)
+                                self.assertEqual(h3["length"], 158)
+                                self.assertEqual(graph["185"]["inputs"]["frame_load_cap"], 158)
+                                self.assertEqual(graph["148"]["inputs"]["frame_rate"], 24)
+                                self.assertEqual(params["output_duration"], 6)
+                            else:
+                                self.assertEqual(graph["148"]["inputs"]["images"], ["122", 0])
+                                self.assertEqual(h3["length"], ["224", 1])
+                                self.assertNotIn("output_duration", params)
+                                self.assertNotIn("output_fps", params)
+                            for nid in ("127", "145", "156", "165", "232", "234", "235", "123",
+                                        "147", "125", "126", "121", "122", "224", "227"):
+                                self.assertEqual(graph[nid], self.raw[nid], nid)
+                            self.assertEqual([nid for nid, n in graph.items()
+                                              if n["class_type"] == "SamplerCustomAdvanced"], ["125"])
+                            self.assertFalse(any("LatentUpscale" in n["class_type"] or "scale_by" in n["inputs"]
+                                                 for n in graph.values()))
+                            live = scan.upstream(graph, "148")
+                            self.assertEqual("228" in live, not reference)
+                            self.assertIn("122", live)
+                            self.assertIn("125", live)
+                            self.assertEqual("185" in live, reference)
+                            added_types = {n["class_type"] for n in graph.values()} - {
+                                n["class_type"] for n in self.raw.values()}
+                            self.assertEqual(added_types, {"ImageScale", "ImageFromBatch"} if reference else set())
 
     def test_spoofed_dimensions_and_scale_cannot_change_single_pass_resolution(self):
         spoof = {"output_" + key: 999 for key in ("width", "height", "duration", "fps", "count")}
         for reference in (False, True):
             for selected in ("on", "off"):
-                baseline, expected = self.patch({"output_1080p": selected}, reference)
+                baseline, expected = self.patch(reference=reference)
                 for scale in (None, 0, -1, .01, 1, 1.5, 8, "nan", "inf", True, [], {}):
                     with self.subTest(reference=reference, selected=selected, scale=scale):
                         params, graph = self.patch({"output_1080p": selected, "scale_by": scale,
                                                     "width": 999, "height": 999, **spoof}, reference)
                         self.assertEqual(graph, expected)
-                        if selected == "on":
-                            self.assertNotIn("scale_by", params)
-                        if reference or selected == "on":
+                        if reference:
                             self.assertEqual((params["output_width"], params["output_height"]),
                                              (baseline["output_width"], baseline["output_height"]))
                             self.assertEqual(params["output_count"], 1)
-                        if not reference and selected == "on":
-                            self.assertNotIn("output_duration", params)
-                            self.assertNotIn("output_fps", params)
-                        elif reference:
                             self.assertEqual(params["output_duration"], 6)
                             self.assertEqual(params["output_fps"], 24)
 
-    def test_no_reference_1080p_preserves_17n_plus_5_time_and_optional_assets(self):
+    def test_no_reference_stale_1080p_preserves_17n_plus_5_time_and_optional_assets(self):
         import scan_workflows as scan
         for duration in (5, 6, 7.375):
-            with self.subTest(duration=duration):
-                _, low = self.patch({"duration": duration})
-                params, high = self.patch({"duration": duration, "output_1080p": "on"})
-                for nid in ("224", "227", "185", "121", "122", "125"):
-                    self.assertEqual(high[nid], low[nid])
-                self.assertEqual(high["224"]["inputs"]["expression"],
-                                 "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17")
-                self.assertEqual(high["136"]["inputs"]["length"], ["224", 1])
-                self.assertEqual({k: v for k, v in high["148"]["inputs"].items() if k != "images"},
-                                 {k: v for k, v in low["148"]["inputs"].items() if k != "images"})
-                self.assertFalse(any(n["class_type"] == "ImageFromBatch" for n in high.values()))
-                self.assertFalse(any(k.startswith("ref_") and k != "ref_image_size"
-                                     for k in high["136"]["inputs"]))
-                live = scan.upstream(high, "148")
-                self.assertFalse({"185", "199", "188", "189", "190", "191", "192", "182", "183", "184"} & live)
-                self.assertNotIn("output_duration", params)
-                self.assertNotIn("output_fps", params)
-                self.assertEqual(params["duration"], duration)
+            for selected in ("on", "off"):
+                with self.subTest(duration=duration, selected=selected):
+                    _, expected = self.patch({"duration": duration})
+                    params, graph = self.patch({"duration": duration, "output_1080p": selected})
+                    self.assertEqual(graph, expected)
+                    self.assertEqual(graph["224"]["inputs"]["expression"],
+                                     "max(5, round(a * 24)) + (5 - (max(5, round(a * 24)) % 17)) % 17")
+                    self.assertEqual(graph["136"]["inputs"]["length"], ["224", 1])
+                    self.assertFalse(any(n["class_type"] == "ImageFromBatch" for n in graph.values()))
+                    self.assertFalse(any(k.startswith("ref_") and k != "ref_image_size"
+                                         for k in graph["136"]["inputs"]))
+                    live = scan.upstream(graph, "148")
+                    self.assertFalse({"185", "199", "188", "189", "190", "191", "192", "182", "183", "184"} & live)
+                    self.assertNotIn("output_duration", params)
+                    self.assertNotIn("output_fps", params)
+                    self.assertEqual(params["duration"], duration)
 
     def test_reference_preserves_panel_duration_trim_and_separate_audio_contract(self):
         for duration in (5, 6, 7.375, 4.1):
@@ -662,13 +645,15 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
                 with self.subTest(duration=duration, has_audio=has_audio):
                     assets = {"video[0]": "chouka/reference.mp4", "images[0]": "chouka/one.png",
                               "audio[0]": "chouka/audio.wav"}
-                    params = {"seed": 42, "output_1080p": "on", "duration": duration,
-                              "aspect_ratio": "4:3 (Standard)"}
+                    normal = {"seed": 42, "duration": duration, "aspect_ratio": "4:3 (Standard)"}
+                    params = {**normal, "output_1080p": "on"}
                     metadata = {assets["video[0]"]: {"has_audio": has_audio, "width": 720,
                                                     "height": 1280, "duration": 19.125}}
+                    baseline = dict(normal)
                     with mock.patch.object(app, "probe_video", side_effect=AssertionError("unexpected probe")):
                         high = app.patch_graph(self.cap, params, assets, metadata)
-                        low = app.patch_graph(self.cap, {**params, "output_1080p": "off"}, assets, metadata)
+                        low = app.patch_graph(self.cap, baseline, assets, metadata)
+                    self.assertEqual(high, low)
                     frames = round(duration * 24)
                     aligned = max(5, frames)
                     aligned += (5 - aligned % 17) % 17
@@ -684,7 +669,8 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
                     self.assertEqual(high["148"]["inputs"]["frame_rate"], frames / duration)
                     self.assertEqual(params["output_duration"], duration)
                     self.assertEqual(params["output_fps"], frames / duration)
-                    self.assertEqual((params["output_width"], params["output_height"]), (1440, 1080))
+                    self.assertEqual((params["output_width"], params["output_height"]),
+                                     (baseline["output_width"], baseline["output_height"]))
                     h3 = high["136"]["inputs"]
                     self.assertEqual(h3["ref_videos.ref_video_0"], ["185", 0])
                     self.assertEqual(h3["ref_images.ref_image_0"], ["199", 0])
@@ -706,45 +692,42 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
                         self.patch({"prompt": token, "output_1080p": selected}, assets=assets)
                     self.assertIn(token, error.exception.reason)
 
-    def test_1080p_rejects_invalid_switch_and_ratio(self):
-        for value in (None, "", "ON", "true", 0, 1, True, False, [], {}):
-            with self.subTest(switch=value), self.assertRaises(app.web.HTTPBadRequest):
-                self.patch({"output_1080p": value})
-        for reference in (False, True):
-            for value in (None, "", "16:9", "0:9", "9:0", "1000000:1", [], {}):
-                with self.subTest(ratio=value, reference=reference), self.assertRaises(app.web.HTTPBadRequest):
-                    self.patch({"output_1080p": "on", "aspect_ratio": value}, reference)
-        for duration in (0, .1, -1, "nan", "inf", 151):
-            with self.subTest(duration=duration), self.assertRaises(app.web.HTTPBadRequest):
-                self.patch({"output_1080p": "on", "duration": duration}, True)
+    def test_reference_rejects_invalid_duration_with_stale_1080p_values(self):
+        for selected in ("on", "off"):
+            for duration in (0, .1, -1, "nan", "inf", 151):
+                with self.subTest(selected=selected, duration=duration), self.assertRaises(app.web.HTTPBadRequest):
+                    self.patch({"output_1080p": selected, "duration": duration}, True)
 
-    def test_1080p_trusted_cost_and_output_spec_dimensions(self):
+    def test_stale_1080p_cost_and_output_specs_match_normal_budget_graph(self):
         for reference in (False, True):
-            with self.subTest(reference=reference):
-                spoof = {"output_" + k: 999 for k in ("width", "height", "duration", "fps", "count")}
-                params, graph = self.patch({"output_1080p": "on", "scale_by": 8,
-                                            "megapixels": .2, **spoof}, reference)
-                assets = {"video[0]": "chouka/reference.mp4"} if reference else {}
-                dims = app.CostLedger.dimensions(None, self.cid, params, assets, graph)
-                recovered = app.CostLedger.dimensions(None, self.cid, {}, assets, graph)
-                for recorded in (dims, recovered):
-                    for key, expected in (("width", 1920), ("height", 1080), ("output_width", 1920),
-                                          ("output_height", 1080), ("output_count", 1)):
-                        self.assertEqual(recorded[key], expected)
-                    self.assertEqual(recorded["megapixels"], 1920 * 1088 / 1024 ** 2)
-                for supplied, dimensions in ((params, {}), (params, dims), ({}, recovered)):
-                    spec = app.make_spec(self.cid, supplied, graph, dimensions)
-                    self.assertEqual(spec["expected"]["kind"], "video")
-                    self.assertEqual(spec["expected"]["width"], 1920)
-                    self.assertEqual(spec["expected"]["height"], 1080)
-                    self.assertEqual(spec["expected"]["count"], 1)
+            assets = {"video[0]": "chouka/reference.mp4"} if reference else {}
+            baseline, expected_graph = self.patch({"megapixels": .2}, reference)
+            expected_dims = app.CostLedger.dimensions(None, self.cid, baseline, assets, expected_graph)
+            expected_recovered = app.CostLedger.dimensions(None, self.cid, {}, assets, expected_graph)
+            for selected in ("on", "off"):
+                with self.subTest(reference=reference, selected=selected):
+                    params, graph = self.patch({"output_1080p": selected, "scale_by": 8,
+                                                "megapixels": .2}, reference)
+                    self.assertEqual(graph, expected_graph)
+                    dims = app.CostLedger.dimensions(None, self.cid, params, assets, graph)
+                    recovered = app.CostLedger.dimensions(None, self.cid, {}, assets, graph)
+                    self.assertEqual(dims, expected_dims)
+                    self.assertEqual(recovered, expected_recovered)
+                    for supplied, dimensions, normal_params, normal_dims in (
+                            (params, {}, baseline, {}), (params, dims, baseline, expected_dims),
+                            ({}, recovered, {}, expected_recovered)):
+                        spec = app.make_spec(self.cid, supplied, graph, dimensions)
+                        normal_spec = app.make_spec(self.cid, normal_params, expected_graph, normal_dims)
+                        self.assertEqual(spec["expected"], normal_spec["expected"])
+                        self.assertEqual(spec["expected"]["kind"], "video")
+                        if reference:
+                            from capacity import CapacityStore
+                            actual = {**spec["expected"], "valid": True, "bytes": 100000}
+                            self.assertEqual(CapacityStore._technical(spec, "done", [actual]), (1, [actual], []))
+                            wrong = {**actual, "width": actual["width"] + 32}
+                            self.assertEqual(CapacityStore._technical(spec, "done", [wrong])[0], 0)
                     if reference:
-                        from capacity import CapacityStore
-                        actual = {**spec["expected"], "valid": True, "bytes": 100000}
-                        self.assertEqual(CapacityStore._technical(spec, "done", [actual]), (1, [actual], []))
-                        wrong = {**actual, "width": 1920, "height": 1088}
-                        self.assertEqual(CapacityStore._technical(spec, "done", [wrong])[0], 0)
-                self.assertEqual(dims["output_fps"], 24)
+                        self.assertEqual(dims["output_fps"], 24)
 
 
 if __name__ == "__main__":

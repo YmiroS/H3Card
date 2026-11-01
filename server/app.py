@@ -638,9 +638,8 @@ def reference_video_input(cap, uploaded):
 
 
 def resolve_h3_1080p_settings(cap, params):
-    """仅已登记 BF16 模式开启时使用可信尺寸；不改变无视频路径的时间契约。"""
-    single_pass = cap.get("id") == "minimax_h3_fusion_v2_bf16"
-    if (cap.get("id") not in {"minimax_h3_ref_2pass_bf16", "minimax_h3_fusion_v2_bf16"}
+    """仅 BF16 二采模式开启时使用可信尺寸；不改变无视频路径的时间契约。"""
+    if (cap.get("id") != "minimax_h3_ref_2pass_bf16"
             or params.get("output_1080p") != "on"):
         return None
     specs = {spec["key"]: spec for spec in cap["inputs"]}
@@ -650,21 +649,19 @@ def resolve_h3_1080p_settings(cap, params):
     match = re.match(r"^(\d+(?:\.\d+)?):(\d+(?:\.\d+)?)(?:\s|$)", aspect)
     if not match or float(match[1]) <= 0 or float(match[2]) <= 0:
         raise web.HTTPBadRequest(reason=f"画面比例无效：{aspect}")
-    scale = 1
-    if not single_pass:
-        spec = specs["scale_by"]
-        supplied = params.get("scale_by", spec["default"])
-        try:
-            scale = float(supplied) if not isinstance(supplied, bool) else math.nan
-        except (TypeError, ValueError, OverflowError):
-            scale = math.nan
-        # MiniMaxH3LatentUpscaleCombined 的真实节点范围；面板推荐范围不是硬限制。
-        if not math.isfinite(scale) or not 0.01 <= scale <= 8:
-            raise web.HTTPBadRequest(reason="1080P：潜空间放大倍率必须在 0.01..8")
+    spec = specs["scale_by"]
+    supplied = params.get("scale_by", spec["default"])
+    try:
+        scale = float(supplied) if not isinstance(supplied, bool) else math.nan
+    except (TypeError, ValueError, OverflowError):
+        scale = math.nan
+    # MiniMaxH3LatentUpscaleCombined 的真实节点范围；面板推荐范围不是硬限制。
+    if not math.isfinite(scale) or not 0.01 <= scale <= 8:
+        raise web.HTTPBadRequest(reason="1080P：潜空间放大倍率必须在 0.01..8")
     ratio = float(match[1]) / float(match[2])
     if not math.isfinite(ratio) or ratio <= 0:
         raise web.HTTPBadRequest(reason=f"画面比例无效：{aspect}")
-    # 1080P 指首采理想短边；单采固定 1 倍，二采倍率只影响潜空间放大和最终输出。
+    # 1080P 指首采理想短边；二采倍率只影响潜空间放大和最终输出。
     base = (1080 * max(1, ratio), 1080 * max(1, 1 / ratio))
     if not all(math.isfinite(side) for side in base):
         raise web.HTTPBadRequest(reason="1080P：基础生成尺寸超出节点支持范围")
@@ -677,10 +674,7 @@ def resolve_h3_1080p_settings(cap, params):
     # 不采信外部 output_*，也不把动态尺寸存入静态 preset 或模板。
     for key in ("width", "height", "duration", "fps", "count"):
         params.pop("output_" + key, None)
-    if single_pass:
-        params.pop("scale_by", None)
-    else:
-        params["scale_by"] = scale
+    params["scale_by"] = scale
     params.update(aspect_ratio=aspect, megapixels=generation[0] * generation[1] / 1024 ** 2,
                   output_width=final[0], output_height=final[1], output_count=1)
     return {"character": False, "resolution_only": True,
@@ -821,8 +815,7 @@ def patch_follow_reference_video(g, cap, follow):
         images = append_node(f"{prefix}_{nid}", "ImageScale",
                              {"image": images, "upscale_method": "bicubic", "crop": "disabled",
                               "width": follow["final"][0], "height": follow["final"][1]},
-                             ("校正单采输出尺寸" if cap.get("id") == "minimax_h3_fusion_v2_bf16"
-                              else "校正二采输出尺寸") if resolution_only or follow.get("h3_1080p")
+                             "校正二采输出尺寸" if resolution_only or follow.get("h3_1080p")
                              else "校正参考视频画面比例")
         node["inputs"]["images"] = images
         if not resolution_only:

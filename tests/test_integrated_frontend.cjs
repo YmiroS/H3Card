@@ -127,9 +127,11 @@ test('compiled React and management pages share Python auth without any old web 
       await page.getByText(fusion.name, {exact:true}).last().click();
       await page.locator('#panel button[title^="点开弹窗"]').click();
       const clarity = page.locator('#respop .cgrid.k');
-      await clarity.getByRole('button', {name:'1080p', exact:true}).click();
-      assert.equal(await clarity.locator('.on').textContent(), '1080p');
-      assert.match(await page.locator('#panel button[title^="点开弹窗"]').textContent(), /1920×1080/);
+      assert.deepEqual(await clarity.locator('button').allTextContents(), ['480p', '544p', '640p', '768p']);
+      assert.equal(await clarity.getByRole('button', {name:'1080p', exact:true}).count(), 0);
+      await clarity.getByRole('button', {name:'768p', exact:true}).click();
+      assert.equal(await clarity.locator('.on').textContent(), '768p');
+      assert.match(await page.locator('#panel button[title^="点开弹窗"]').textContent(), /768p/);
       const saved = page.waitForResponse(response =>
         new URL(response.url()).pathname === '/api/projects/browser' && response.request().method() === 'PUT');
       await page.locator('#respop').getByRole('button', {name:'9:16', exact:true}).click();
@@ -137,24 +139,32 @@ test('compiled React and management pages share Python auth without any old web 
       await page.reload();
       await page.locator('#world .card .ch').click();
       assert.match(await page.locator('#panel .foot .tcap').first().textContent(), /H3无损融合单采满血剪枝/);
-      assert.match(await page.locator('#panel button[title^="点开弹窗"]').textContent(), /1080×1920/);
+      assert.match(await page.locator('#panel button[title^="点开弹窗"]').textContent(), /9:16.*768p/);
+      await page.locator('#panel button[title^="点开弹窗"]').click();
+      assert.equal(await page.locator('#respop .cgrid.k').getByRole('button', {name:'1080p', exact:true}).count(), 0);
+      await page.locator('#respop .x').click();
       const project = await (await page.request.get(service.origin + '/api/projects/browser')).json();
       const stored = project.cards.find(card => card.id === 'fusion-browser');
       assert.equal(stored.cap, fusionId);
-      assert.equal(stored.params.output_1080p, 'on');
+      assert.equal(stored.params.output_1080p, undefined);
       assert.equal(stored.params.scale_by, undefined);
-      assert.deepEqual(Object.keys(stored.params).filter(key => key.startsWith('output_')), ['output_1080p']);
+      assert.deepEqual(Object.keys(stored.params).filter(key => key.startsWith('output_')), []);
       const dry = await page.request.post(service.origin + '/api/generate', {
         headers:{Origin:service.origin, 'X-CSRF-Token':session.csrf_token},
         data:{capability:stored.cap, project:'browser', card:stored.id, params:stored.params, assets:{}, dry_run:true},
       });
       assert.equal(dry.status(), 200, await dry.text());
       const changed = (await dry.json()).changed;
-      assert.deepEqual(changed['#136.width'][1], 1088);
-      assert.deepEqual(changed['#136.height'][1], 1920);
-      assert.equal(changed['#h3_1080p_scale_148.width'][1], 1080);
-      assert.equal(changed['#h3_1080p_scale_148.height'][1], 1920);
-      assert.equal(changed['#h3_1080p_scale_148.image'][1][0], '122');
+      assert.equal(changed['#228.aspect_ratio'][1], '9:16 (Portrait Widescreen)');
+      assert.equal(changed['#228.megapixels'][1], stored.params.megapixels);
+      assert.equal(Object.keys(changed).some(key => key.startsWith('#h3_1080p_scale_')), false);
+      const stale = await page.request.post(service.origin + '/api/generate', {
+        headers:{Origin:service.origin, 'X-CSRF-Token':session.csrf_token},
+        data:{capability:stored.cap, project:'browser', card:stored.id,
+          params:{...stored.params, output_1080p:'on'}, assets:{}, dry_run:true},
+      });
+      assert.equal(stale.status(), 200, await stale.text());
+      assert.deepEqual((await stale.json()).changed, changed);
       await page.goto(service.origin + '/director?project=browser');
       await page.waitForFunction(() => document.body.dataset.choukaPage === 'director');
       await page.goto(service.origin + '/if-studio');
@@ -276,7 +286,8 @@ test('compiled React and management pages share Python auth without any old web 
       }
       await page.locator('#panel button[title^="点开弹窗"]').click();
       await page.locator('#respop [data-readonly-notice]').waitFor({state:'visible'});
-      assert.equal(await page.locator('#respop .cgrid.k .on').textContent(), '1080p');
+      assert.equal(await page.locator('#respop .cgrid.k .on').textContent(), '768p');
+      assert.equal(await page.locator('#respop .cgrid.k').getByRole('button', {name:'1080p', exact:true}).count(), 0);
       for (const button of await page.locator('#respop button:not([data-readonly-view])').all()) {
         assert.equal(await button.isDisabled(), true);
       }
