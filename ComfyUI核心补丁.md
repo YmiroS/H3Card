@@ -22,6 +22,23 @@ python_embeded\python.exe -B -m pytest -p no:cacheprovider -q ComfyUI/tests-unit
 python_embeded\python.exe -B ComfyUI/custom_nodes/ComfyUI_MiniMaxH3_Director/tests/test_h3_context_core_037.py
 ```
 
+## 2026-11-01：H3 参考视频保尾补帧
+
+本次 ComfyUI 定制提交为 `8aafce8a089f88e64d1cbc01ba65ce8e184c6e38`，补丁随主应用保存在 `worker/0001-Preserve-H3-reference-video-endings-with-repeated-fr.patch`，包含节点修改和 CPU 回归测试。它不会通过前端打包或 Worker 的主应用代码同步自动应用到 ComfyUI。
+
+- 不再把参考视频向下截到 `5+17*n` 帧；保留目标区间内全部真实帧，缩放后重复最后一帧补到下一个合法长度，例如 92 帧补到 107 帧。
+- 配对音轨只保留真实视频帧对应的区间，不重复补齐音轨。
+- 主应用按真实解码帧数返回素材元数据，前端按 `frames / fps` 填入时长。对于本次 24fps、92 帧素材，默认输出裁到 92 帧；手动时长和已有画布参数不自动覆盖。
+
+当前本机 `GPU-5090-01` 的源码已包含该提交，不要重复应用。其他节点须先备份并确认基线，在其 ComfyUI 仓库内按实际路径运行：
+
+```bash
+git apply --check ../chouka/worker/0001-Preserve-H3-reference-video-endings-with-repeated-fr.patch
+git apply ../chouka/worker/0001-Preserve-H3-reference-video-endings-with-repeated-fr.patch
+```
+
+检查不通过时不要强制覆盖新版节点或测试。应用后需重启该节点的 ComfyUI 才能加载新代码。补帧及参数回归已验证，但真实 GPU 生成的结尾动作、画面质量仍待验收，不能把保留参考帧等同于生成画面逐帧复现。
+
 ## 0.33.0 历史补丁记录
 
 > **背景**：`D:\ComfyUI_Mie_V33` 这个整合包标称 ComfyUI **0.33.0**，但 MiniMax H3 相关的

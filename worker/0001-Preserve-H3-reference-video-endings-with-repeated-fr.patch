@@ -1,0 +1,190 @@
+From 8aafce8a089f88e64d1cbc01ba65ce8e184c6e38 Mon Sep 17 00:00:00 2001
+From: =?UTF-8?q?=E7=A6=BE=E5=B0=9A?= <heshang.ys@alibaba-inc.com>
+Date: Sun, 1 Nov 2026 02:25:58 +0800
+Subject: [PATCH] Preserve H3 reference video endings with repeated-frame
+ alignment
+
+Pad the resized reference to the next model frame grid instead of dropping its tail, while retaining the real audio interval.
+---
+ comfy_extras/nodes_minimax_h3.py     |  6 +-
+ tests-unit/test_minimax_h3_memory.py | 96 ++++++++++++++++++++++------
+ 2 files changed, 82 insertions(+), 20 deletions(-)
+
+diff --git a/comfy_extras/nodes_minimax_h3.py b/comfy_extras/nodes_minimax_h3.py
+index c088a0aa..b0b932c4 100644
+--- a/comfy_extras/nodes_minimax_h3.py
++++ b/comfy_extras/nodes_minimax_h3.py
+@@ -324,10 +324,12 @@ class MiniMaxH3ReferenceToVideo(io.ComfyNode):
+             n = min(video_frames.shape[0], frame_count)
+             if n < 5:
+                 raise ValueError("MiniMax H3 reference videos need at least 5 frames (~0.2s at 24 fps)")
+-            n -= (n - 5) % 17
+             frames = _resize(video_frames[:n], cw, ch, "disabled")
++            padded_count = align_frame_count(n)
++            if padded_count > n:
++                frames = torch.cat((frames, frames[-1:].expand(padded_count - n, -1, -1, -1)), dim=0)
+             if soundtrack is not None:
+-                # Keep the paired soundtrack on the same retained 24 fps interval.
++                # Keep audio on the retained real-frame interval, without tail padding.
+                 soundtrack = dict(soundtrack)
+                 audio_length = round(n / FPS * soundtrack["sample_rate"])
+                 soundtrack["waveform"] = soundtrack["waveform"][..., :audio_length]
+diff --git a/tests-unit/test_minimax_h3_memory.py b/tests-unit/test_minimax_h3_memory.py
+index 371168c5..22d95e87 100644
+--- a/tests-unit/test_minimax_h3_memory.py
++++ b/tests-unit/test_minimax_h3_memory.py
+@@ -119,7 +119,7 @@ if __name__ == "__main__":
+                 self.assertEqual(result[1]["samples"].tensors[0].shape[2], 7)
+                 clip.tokenize.assert_called_once_with("test", minimax_ref_items=[])
+ 
+-        def run_reference(self, source_frames, target_frames, kept_frames, sample_rate=240, audio_samples=None):
++        def run_reference(self, source_frames, target_frames, kept_frames, padded_frames, sample_rate=240, audio_samples=None):
+             levels = (torch.arange(source_frames, dtype=torch.float32) % 251) / 255
+             video = levels[:, None, None, None].expand(-1, 2, 2, 3).clone()
+             video_before = video.clone()
+@@ -140,8 +140,16 @@ if __name__ == "__main__":
+             audio_vae = Mock()
+             audio_vae.audio_sample_rate = 240
+             audio_vae.encode.side_effect = lambda waveform: torch.zeros(1, 32, 2, round(waveform.shape[1] / 240 * 40))
+-            # Spy, not a replacement: real resize, resample and encode helper execute.
+-            with patch.object(ref_nodes, "_resize", wraps=ref_nodes._resize) as resize:
++            # Capture the real resize output to check padding and the no-copy aligned path.
++            resized_batches = []
++            real_resize = ref_nodes._resize
++
++            def record_resize(*args, **kwargs):
++                resized = real_resize(*args, **kwargs)
++                resized_batches.append(resized)
++                return resized
++
++            with patch.object(ref_nodes, "_resize", side_effect=record_resize) as resize:
+                 positive, latent = ref_nodes.MiniMaxH3ReferenceToVideo.execute(
+                     clip=clip, vae=vae, audio_vae=audio_vae, prompt="<Video 1> <Audio 1>",
+                     width=32, height=32, length=target_frames,
+@@ -151,16 +159,27 @@ if __name__ == "__main__":
+             self.assertEqual(resize.call_count, 1)
+             retained = resize.call_args.args[0]
+             self.assertEqual(len(retained), kept_frames)
+-            self.assertEqual((len(retained) - 5) % 17, 0)
+             self.assertLessEqual(len(retained), source_frames)
+             torch.testing.assert_close(retained, video[:kept_frames])
+             encoded_frames = vae.encode.call_args.args[0]
+-            self.assertEqual(tuple(encoded_frames.shape), (kept_frames, 32, 32, 3))
++            self.assertEqual(tuple(encoded_frames.shape), (padded_frames, 32, 32, 3))
++            self.assertEqual((padded_frames - 5) % 17, 0)
++            torch.testing.assert_close(encoded_frames[:kept_frames], resized_batches[0], rtol=0, atol=0)
+             # The real PIL Lanczos path quantizes to 8-bit image values.
+-            torch.testing.assert_close(encoded_frames[:, 0, 0, 0], levels[:kept_frames], rtol=0, atol=1 / 255)
++            expected_frames = levels[:kept_frames, None, None, None].expand(-1, 32, 32, 3)
++            torch.testing.assert_close(encoded_frames[:kept_frames], expected_frames, rtol=0, atol=1 / 255)
++            if padded_frames > kept_frames:
++                torch.testing.assert_close(
++                    encoded_frames[kept_frames:],
++                    resized_batches[0][-1:].expand(padded_frames - kept_frames, -1, -1, -1),
++                    rtol=0, atol=0,
++                )
++            else:
++                self.assertIs(encoded_frames, resized_batches[0])
+             block = positive[0][1]["minimax_refs"][0]
+             self.assertEqual(block["kind"], "video_audio")
+-            self.assertEqual(block["latent_t"], 2 + 5 * ((kept_frames - 5) // 17))
++            self.assertEqual(block["latent_t"], 2 + 5 * ((padded_frames - 5) // 17))
++            self.assertEqual(tuple(block["latent"].shape), (1, 24, block["latent_t"], 2, 2))
+             self.assertEqual((block["latent_h"], block["latent_w"]), (2, 2))
+             audio_input = audio_vae.encode.call_args.args[0]
+             retained_samples = min(audio_samples, round(kept_frames / 24 * sample_rate))
+@@ -175,7 +194,8 @@ if __name__ == "__main__":
+             torch.testing.assert_close(items[1]["data"], encoded_frames[::12])
+             self.assertEqual(items[1]["timestamps"], [i / 2 for i in range(len(encoded_frames[::12]))])
+             target_count = target_frames + (5 - target_frames) % 17
+-            self.assertLessEqual(kept_frames, target_count)
++            self.assertEqual(kept_frames, min(source_frames, target_count))
++            self.assertLessEqual(padded_frames, target_count)
+             self.assertEqual(latent["samples"].tensors[0].shape[2], 2 + 5 * ((target_count - 5) // 17))
+             self.assertEqual(latent["samples"].tensors[1].shape[-1], round(target_count / 24 * 40))
+             self.assertIs(soundtrack["waveform"], original_waveform)
+@@ -183,20 +203,54 @@ if __name__ == "__main__":
+             torch.testing.assert_close(video, video_before, rtol=0, atol=0)
+ 
+         def test_long_video_truncated_before_real_resize(self):
+-            self.run_reference(1000, 39, 39)
++            self.run_reference(1000, 39, 39, 39)
+ 
+         def test_short_and_exact_video_grid(self):
+-            for source, target, kept in ((5, 39, 5), (21, 39, 5), (22, 39, 22),
+-                                          (38, 124, 22), (39, 124, 39), (40, 124, 39),
+-                                          (56, 56, 56), (100, 23, 39)):
+-                with self.subTest(source=source, target=target, kept=kept):
+-                    self.run_reference(source, target, kept)
++            for source, target, kept, padded in (
++                (5, 39, 5, 5), (21, 39, 21, 22), (22, 39, 22, 22),
++                (38, 124, 38, 39), (39, 124, 39, 39), (40, 124, 40, 56),
++                (56, 56, 56, 56), (92, 124, 92, 107), (100, 23, 39, 39),
++                (107, 124, 107, 107), (124, 124, 124, 124), (92, 90, 90, 90),
++                (92, 22, 22, 22),
++            ):
++                with self.subTest(source=source, target=target, kept=kept, padded=padded):
++                    self.run_reference(source, target, kept, padded)
+ 
+         def test_audio_trim_precedes_real_resample(self):
+-            self.run_reference(100, 39, 39, sample_rate=480)
++            self.run_reference(100, 39, 39, 39, sample_rate=480)
++            self.run_reference(92, 124, 92, 107, sample_rate=480)
+ 
+         def test_short_soundtrack_is_not_padded(self):
+-            self.run_reference(100, 39, 39, audio_samples=100)
++            self.run_reference(100, 39, 39, 39, audio_samples=100)
++            self.run_reference(92, 124, 92, 107, audio_samples=100)
++
++        def test_padded_qwen_references_without_video_vae(self):
++            clip, audio_vae = Mock(), Mock()
++            clip.encode_from_tokens_scheduled.return_value = [[torch.zeros(1), {"original": True}]]
++            videos = {
++                "ref_video_1": (torch.arange(92, dtype=torch.float32) / 255)[:, None, None, None].expand(-1, 2, 2, 3).clone(),
++                "ref_video_2": (torch.arange(40, dtype=torch.float32) / 255)[:, None, None, None].expand(-1, 2, 2, 3).clone(),
++            }
++            soundtrack = {"sample_rate": 240, "waveform": torch.ones(1, 2, 2000)}
++            before = copy.deepcopy((videos, soundtrack))
++            positive, _ = ref_nodes.MiniMaxH3ReferenceToVideo.execute(
++                clip=clip, audio_vae=audio_vae, prompt="", width=32, height=32, length=124,
++                ref_videos=videos, ref_video_audios={"ref_video_audio_1": soundtrack},
++            )
++            items = clip.tokenize.call_args.kwargs["minimax_ref_items"]
++            self.assertEqual([item["type"] for item in items], ["audio", "video", "video"])
++            for item, kept, padded in zip(items[1:], (92, 40), (107, 56)):
++                indices = list(range(0, padded, 12))
++                expected = torch.tensor([min(i, kept - 1) / 255 for i in indices])
++                self.assertEqual(tuple(item["data"].shape), (len(indices), 32, 32, 3))
++                torch.testing.assert_close(
++                    item["data"], expected[:, None, None, None].expand(-1, 32, 32, 3),
++                    rtol=0, atol=1 / 255,
++                )
++                self.assertEqual(item["timestamps"], [i / 2 for i in range(len(indices))])
++            self.assertNotIn("minimax_refs", positive[0][1])
++            audio_vae.encode.assert_not_called()
++            self.assert_tree_equal((videos, soundtrack), before)
+ 
+         def test_fewer_than_five_frames_rejected_before_resize_or_encode(self):
+             for count in (0, 1, 4):
+@@ -230,10 +284,16 @@ if __name__ == "__main__":
+                 ref_videos={"ref_video_1": torch.zeros(40, 2, 2, 3), "ref_video_2": torch.zeros(21, 2, 2, 3)},
+                 ref_video_audios=soundtracks, ref_audios={"ref_audio_1": standalone},
+             )
+-            for call, count, value in zip(audio_vae.encode.call_args_list, (390, 50, 1100), (1.0, 2.0, 3.0)):
++            for call, count, value in zip(audio_vae.encode.call_args_list, (390, 210, 1100), (1.0, 2.0, 3.0)):
+                 self.assertEqual(tuple(call.args[0].shape), (1, count, 2))
+                 self.assertTrue(torch.all(call.args[0] == value))
+-            self.assertEqual([b["kind"] for b in positive[0][1]["minimax_refs"]], ["video_audio", "video_audio", "audio"])
++            blocks = positive[0][1]["minimax_refs"]
++            self.assertEqual([b["kind"] for b in blocks], ["video_audio", "video_audio", "audio"])
++            self.assertEqual([len(call.args[0]) for call in vae.encode.call_args_list], [39, 22])
++            self.assertEqual([b["latent_t"] for b in blocks[:2]], [12, 7])
++            items = clip.tokenize.call_args.kwargs["minimax_ref_items"]
++            self.assertEqual([item["type"] for item in items], ["audio", "video", "audio", "video", "audio"])
++            self.assertEqual([len(item["data"]) for item in items if item["type"] == "video"], [4, 2])
+             self.assert_tree_equal((soundtracks, standalone), before)
+ 
+     def conditioning_fixture():
+-- 
+2.53.0.windows.1
+
