@@ -43,6 +43,32 @@ class JobFailed(AgentError):
                    node_id=data.get("node_id"), node_type=data.get("node_type"))
 
 
+def node_launcher_for(config_path, config, devices):
+    config_path = Path(config_path).resolve()
+    configured = config.get("node_launcher")
+    if configured:
+        launcher = Path(configured)
+        return launcher if launcher.is_absolute() else (config_path.parent / launcher).resolve()
+    profiles = set()
+    for device in devices:
+        name = str(device.get("name") or "").casefold() if isinstance(device, dict) else ""
+        if "rtx 4090" in name:
+            profiles.add("4090")
+        elif "rtx a6000" in name:
+            profiles.add("A6000")
+        elif "rtx pro 6000" in name:
+            profiles.add("PRO6000_96GB")
+        elif "rtx 5090" in name:
+            profiles.add("generic")
+    if len(profiles) > 1:
+        raise AgentError("检测到多个 GPU 启动配置，请在 node_launcher 中明确指定")
+    repo = Path(config.get("code_repo", ".."))
+    root = repo if repo.is_absolute() else (config_path.parent / repo).resolve()
+    profile = next(iter(profiles), "generic")
+    suffix = "" if profile == "generic" else "_" + profile
+    return root / f"启动Windows节点{suffix}.bat"
+
+
 def worker_mutex_name(config_path):
     normalized = str(Path(config_path).resolve()).replace("/", "\\").casefold()
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -752,27 +778,10 @@ class WorkerAgent:
         return self.configured_path("code_repo", "..")
 
     def node_launcher_path(self):
-        configured = self.config.get("node_launcher")
-        if configured:
-            return self.configured_path("node_launcher", configured)
-        devices = self.capabilities.get("devices") or self._nvidia_gpus()
-        gpu_names = [
-            str(item.get("name") or "").casefold()
-            for item in devices if isinstance(item, dict)
-        ]
-        profiles = set()
-        if any("rtx 4090" in name for name in gpu_names):
-            profiles.add("4090")
-        if any("rtx a6000" in name for name in gpu_names):
-            profiles.add("A6000")
-        if len(profiles) > 1:
-            raise AgentError("检测到多个 GPU 启动配置，请在 node_launcher 中明确指定")
-        root = self.code_repo_path()
-        if profiles == {"4090"}:
-            return root / "启动Windows节点_4090.bat"
-        if profiles == {"A6000"}:
-            return root / "启动Windows节点_A6000.bat"
-        return root / "启动Windows节点.bat"
+        devices = [] if self.config.get("node_launcher") else (
+            self.capabilities.get("devices") or self._nvidia_gpus()
+        )
+        return node_launcher_for(self.config_path, self.config, devices)
 
     @staticmethod
     def batch_command_name(path):

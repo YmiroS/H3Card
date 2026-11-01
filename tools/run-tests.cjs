@@ -8,7 +8,8 @@ const ROOT = path.resolve(__dirname, '..');
 const SOURCE_DIRS = new Set(['server', 'web', 'web_dist', 'worker', 'tests', 'tools', 'manifests', 'graphs', 'desktop', 'extension']);
 const ROOT_FILES = new Set(['package.json', 'package-lock.json', 'pricing.json', 'requirements-controller.txt',
   'Dockerfile.controller', 'compose.controller.yml', 'start-controller.sh', 'llm.json.例子',
-  '启动Windows节点.bat', '启动Windows节点_4090.bat', '启动Windows节点_A6000.bat']);
+  '启动Windows节点.bat', '启动Windows节点_4090.bat', '启动Windows节点_A6000.bat',
+  '启动Windows节点_PRO6000_96GB.bat', '管理Windows节点自启.bat']);
 
 function sourceFile(relative) {
   const parts = relative.replaceAll('\\', '/').split('/');

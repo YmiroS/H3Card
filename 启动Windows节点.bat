@@ -77,7 +77,7 @@ echo Starting H3Card Worker... Log: %WORKER_LOG%
 start "H3Card Worker" "%PY%" -u "%WORKER%" --config "%WORKER_CONFIG%" 1>>"%WORKER_LOG%" 2>&1
 set /a WORKER_WAIT=0
 :wait_worker_start
- timeout /t 1 /nobreak >nul
+"%PY%" -c "import time; time.sleep(1)"
 "%PY%" -u "%WORKER%" --config "%WORKER_CONFIG%" --instance-status >nul 2>&1
 if not errorlevel 1 goto worker_started
 set /a WORKER_WAIT+=1
@@ -85,7 +85,7 @@ if %WORKER_WAIT% LSS 15 goto wait_worker_start
 echo H3Card Worker failed to start. See %WORKER_LOG%.
 exit /b 5
 :worker_started
- timeout /t 2 /nobreak >nul
+"%PY%" -c "import time; time.sleep(2)"
 "%PY%" -u "%WORKER%" --config "%WORKER_CONFIG%" --instance-status >nul 2>&1
 if errorlevel 1 (
   echo H3Card Worker exited during startup. See %WORKER_LOG%.

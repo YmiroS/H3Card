@@ -2552,8 +2552,9 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             )
             try:
                 time.sleep(0.5)
-                self.assertTrue(worker_instance_status(ROOT / "worker/config.json"))
-                self.assertFalse(worker_instance_status(config_path))
+                with mock.patch("agent.restart_in_progress", return_value=False):
+                    self.assertTrue(worker_instance_status(ROOT / "worker/config.json"))
+                    self.assertFalse(worker_instance_status(config_path))
             finally:
                 process.terminate()
                 process.wait(timeout=10)
@@ -2717,7 +2718,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
 
     def test_windows_launchers_wait_for_comfy_and_deduplicate_worker(self):
         for name in ("启动Windows节点.bat", "启动Windows节点_4090.bat",
-                     "启动Windows节点_A6000.bat"):
+                     "启动Windows节点_A6000.bat", "启动Windows节点_PRO6000_96GB.bat"):
             with self.subTest(name=name):
                 content = (ROOT / name).read_text(encoding="utf-8")
                 self.assertIn('--wait-comfy --config "%WORKER_CONFIG%"', content)
@@ -2725,6 +2726,9 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 self.assertGreaterEqual(content.count('--instance-status'), 3)
                 self.assertIn('No duplicate was started', content)
                 self.assertNotIn('START_DELAY', content)
+                self.assertNotIn('timeout /t', content)
+                self.assertIn('time.sleep(1)', content)
+                self.assertIn('time.sleep(2)', content)
                 self.assertLess(
                     content.index('--comfy-start-only'), content.index('--wait-comfy')
                 )

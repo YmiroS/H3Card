@@ -28,7 +28,9 @@ test('test snapshots exclude runtime files, credentials and path escapes', () =>
   }
   for (const file of ['web/features/task-panel.js', 'server/projects.py', 'tests/test_project.py',
     'tools/run-tests.cjs', 'manifests/cards.json', 'package-lock.json', 'web_dist/index.html',
-    'web_dist/assets/index-ABC12345.js', 'web_dist/release.json']) assert.equal(sourceFile(file), true, file);
+    'web_dist/assets/index-ABC12345.js', 'web_dist/release.json', '启动Windows节点.bat',
+    '启动Windows节点_4090.bat', '启动Windows节点_A6000.bat', '启动Windows节点_PRO6000_96GB.bat',
+    '管理Windows节点自启.bat', 'worker/autostart.py', 'worker/autostart.ps1']) assert.equal(sourceFile(file), true, file);
 });
 
 test('snapshot includes uncommitted source but never copies local runtime data', t => {
