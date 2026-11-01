@@ -25,7 +25,8 @@ GPU_NUMBERS = ("index", "memory_total_bytes", "memory_used_bytes",
                "utilization_percent", "temperature_c")
 DEVICE_NUMBERS = ("index", "vram_total", "vram_free", "torch_vram_total", "torch_vram_free")
 SYSTEM_NUMBERS = ("ram_total", "ram_free")
-SYSTEM_VERSIONS = ("os", "python_version", "pytorch_version", "comfyui_version")
+COMFY_VERSIONS = ("comfyui_version", "comfyui_build_version")
+SYSTEM_VERSIONS = ("os", "python_version", "pytorch_version")
 
 
 def _mapping(value):
@@ -118,7 +119,8 @@ def safe_capabilities(value, *, detail=False):
             "memory": {key: _number(memory.get(key)) for key in ("total_bytes", "used_bytes")},
         },
         "devices": _devices(caps.get("devices")),
-        "system": {key: _number(system.get(key)) for key in SYSTEM_NUMBERS},
+        "system": {**{key: _number(system.get(key)) for key in SYSTEM_NUMBERS},
+                   **{key: _label(system.get(key)) for key in COMFY_VERSIONS}},
     }
     if not detail:
         return result

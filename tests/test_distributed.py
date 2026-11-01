@@ -1987,6 +1987,17 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             self.assertIs(caps["supports_service_restart"], name == "nt")
             self.assertIs(caps["supports_host_reboot"], name == "nt")
 
+    async def test_comfy_build_version_comes_from_running_service_capabilities(self):
+        self.agent.scan_telemetry = mock.AsyncMock()
+        for system in ({"comfyui_version": "0.37.0", "comfyui_build_version": "0.37.0+chouka.1"},
+                       {"comfyui_version": "0.37.0"}, {}):
+            self.agent._json_request = mock.AsyncMock(side_effect=lambda _method, url:
+                {"KSampler": {}} if url.endswith("object_info") else {"system": system, "devices": []})
+            caps = await self.agent.scan_capabilities()
+            self.assertEqual(caps["system"], system)
+            self.assertEqual(caps["agent_version"], 8)
+            self.assertIs(self.agent.comfy_online, True)
+
     async def test_manual_service_restart_does_not_wait_for_task_queue_release_or_comfy(self):
         agent = self.agent
         agent.schedule_node_restart = mock.AsyncMock()

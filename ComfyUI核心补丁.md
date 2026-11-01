@@ -22,6 +22,14 @@ python_embeded\python.exe -B -m pytest -p no:cacheprovider -q ComfyUI/tests-unit
 python_embeded\python.exe -B ComfyUI/custom_nodes/ComfyUI_MiniMaxH3_Director/tests/test_h3_context_core_037.py
 ```
 
+## 定制 ComfyUI 版本
+
+定制版本从 `0.37.0+chouka.1` 开始，保留官方 `comfyui_version=0.37.0`，另在 `/system_stats` 的 `system.comfyui_build_version` 中返回完整定制版本。`chouka.1` 对应本页记录的现有定制基线及 H3 参考视频保尾修复；以后改变定制运行行为时递增定制版本。
+
+该值由 ComfyUI 启动时导入并由运行进程返回，不读取磁盘 Git HEAD。更新文件但不重启，不会被显示成已运行新版本。现有 Worker v8 会随能力扫描原样上报该字段，无需升级 Worker；运行面板和只读监控分别展示 Worker 与 ComfyUI 版本。未上报定制字段的节点显示“定制版本未记录”，不推断它是否含补丁；离线节点显示的是最后一次上报，不代表实时验证。
+
+其他节点须按顺序应用本页的保尾补丁及版本上报补丁 `worker/0001-Report-custom-ComfyUI-build-version-from-running-ser.patch`，通过检查后再重启 ComfyUI。仅同步主应用不会自动应用这些核心补丁；不要只改版本常量便宣称已具备对应修复。
+
 ## 2026-11-01：H3 参考视频保尾补帧
 
 本次 ComfyUI 定制提交为 `8aafce8a089f88e64d1cbc01ba65ce8e184c6e38`，补丁随主应用保存在 `worker/0001-Preserve-H3-reference-video-endings-with-repeated-fr.patch`，包含节点修改和 CPU 回归测试。它不会通过前端打包或 Worker 的主应用代码同步自动应用到 ComfyUI。

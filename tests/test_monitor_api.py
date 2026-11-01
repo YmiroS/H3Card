@@ -43,7 +43,9 @@ class MonitorAPITests(AuthFixture, unittest.IsolatedAsyncioTestCase):
             "input_types": {"Loader": {"ckpt_name": "COMBO"}},
             "input_choices": {"Loader": {"ckpt_name": ["base.safetensors"], "prompt": [LEAK], "password": [LEAK]}},
             "token": LEAK, "user_config": {"key": LEAK},
-            "system": {"ram_total": 1024, "ram_free": 256, "python_version": "3.12.1", "argv": [LEAK], "base_url": BAD_LOG},
+            "system": {"ram_total": 1024, "ram_free": 256, "python_version": "3.12.1",
+                       "comfyui_version": "0.37.0", "comfyui_build_version": "0.37.0+chouka.1",
+                       "argv": [LEAK], "base_url": BAD_LOG},
             "devices": [{"index": 0, "type": "cuda", "name": "GPU 4090", "vram_total": 24000, "vram_free": 12000, "token": LEAK}],
             "hardware": {"cpu": {"model": "CPU", "logical_cores": 16, "password": LEAK},
                          "os": {"name": "Windows", "release": "11"}, "environment_id": LEAK},
@@ -166,6 +168,10 @@ class MonitorAPITests(AuthFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(worker), {"id", "name", "state", "enabled", "last_seen", "comfy_online", "busy", "current_job_id", "is_primary_node", "sync_status", "sync_request_id", "sync_requested_at", "sync_finished_at", "capabilities", "sync_message"})
         self.assertEqual(set(worker["capabilities"]), {"agent_version", "telemetry", "devices", "system"})
         self.assertEqual(worker["capabilities"]["devices"][0]["vram_total"], 24000)
+        self.assertEqual(worker["capabilities"]["system"], {
+            "ram_total": 1024, "ram_free": 256,
+            "comfyui_version": "0.37.0", "comfyui_build_version": "0.37.0+chouka.1",
+        })
 
     async def test_recent_60_and_global_status_counts(self):
         self.jobs = [dict(self.jobs[0], id=f"j{i}", created=i, status="running" if i % 2 else "queued") for i in range(80)]
@@ -209,12 +215,28 @@ class MonitorAPITests(AuthFixture, unittest.IsolatedAsyncioTestCase):
         caps["node_classes"].append(BAD_LOG)
         caps["agent_version"] = BAD_LOG
         caps["system"]["python_version"] = BAD_LOG
+        caps["system"]["comfyui_version"] = BAD_LOG
+        caps["system"]["comfyui_build_version"] = BAD_LOG
         self.store.heartbeat(self.worker, capabilities=caps, comfy_online=True)
         data = await self.get_json(self.detail_path())
         names = [item["name"] for item in data["capabilities"]["model_inventory"]]
         self.assertEqual(set(names), {"a.safetensors", "b.safetensors", "c.safetensors"})
         for forbidden in (LEAK, "private", "https://", "Bearer", "password", "C:\\"):
             self.assertNotIn(forbidden, json.dumps(data))
+
+    async def test_comfy_build_version_is_unknown_until_reported_and_refreshes(self):
+        await self.login("screen")
+        for system in ({"comfyui_version": "0.37.0"}, {},
+                       {"comfyui_version": "0.37.0", "comfyui_build_version": "0.37.0+chouka.1"}):
+            caps = copy.deepcopy(self.caps)
+            caps["system"] = system
+            self.store.heartbeat(self.worker, capabilities=caps, comfy_online=True)
+            summary = await self.get_json("/api/monitor/summary")
+            worker = next(w for w in summary["workers"] if w["id"] == self.worker)
+            detail = await self.get_json(self.detail_path())
+            for projected in (worker["capabilities"], detail["capabilities"]):
+                self.assertEqual(projected["system"]["comfyui_version"], system.get("comfyui_version"))
+                self.assertEqual(projected["system"]["comfyui_build_version"], system.get("comfyui_build_version"))
 
     async def test_telemetry_strict_numeric_or_null(self):
         caps = copy.deepcopy(self.caps)
