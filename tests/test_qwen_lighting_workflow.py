@@ -52,10 +52,13 @@ class QwenLightingWorkflowTest(unittest.TestCase):
         self.assertEqual(card["id"], "card_image")
         self.assertEqual(mode, {
             "id": "qwen_lighting", "name": "灯光模式", "slots": "img1+aud0+vid0",
+            "modelSwitch": {"light": "qwen_lighting", "multiLight": "qwen_lighting_multi"},
         })
         for key in ("id", "name", "slots"):
             self.assertEqual(self.cap[key], mode[key])
-        self.assertEqual(self.cap["card"], card["id"])
+        # 能力清单的 card 是扫描器的分组名（image），画布卡 id 是 card_image。
+        self.assertEqual(self.cap["card"], "image")
+        self.assertEqual(card["id"], "card_image")
         self.assertEqual(self.cap["kind"], "gen")
         toolbox = next(card for card in cards if card["id"] == "card_tools")
         self.assertNotIn("qwen_lighting", [mode["id"] for mode in toolbox["modes"]])

@@ -122,11 +122,17 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
                 scan_workflows.main()
             cards = json.loads((root / "manifests/_cards.json").read_text(encoding="utf-8"))
             image_card = next(c for c in cards if c["id"] == "card_image")
+            bundled = {wid for wid in scan_workflows.BUNDLED_CAPABILITIES
+                       if json.loads((root / "manifests" / f"{wid}.json").read_text(
+                           encoding="utf-8"))["card"] == "image"}
+            # _hiddenMode 只留给历史项目；MODEL_SWITCHES 的候选能力挂在基准模式的
+            # modelSwitch 上，也不再单独占一个模式。合成重扫里 ALIASES 为空，只有
+            # bundled 的基准能力可用，所以只扣掉基准也在 bundled 里的候选。
+            switched = {wid for base, choices in scan_workflows.MODEL_SWITCHES.items()
+                        if base in bundled
+                        for wid in choices.values() if wid in bundled and wid != base}
             self.assertEqual({m["id"] for m in image_card["modes"]},
-                             {wid for wid in scan_workflows.BUNDLED_CAPABILITIES
-                              if json.loads((root / "manifests" / f"{wid}.json").read_text(
-                                  encoding="utf-8"))["card"] == "image"}
-                             - {"qwen_image_21_i2i"})
+                             bundled - {"qwen_image_21_i2i"} - switched)
             self.assertEqual(json.loads(manifest_path.read_text(encoding="utf-8")), self.cap)
             self.assertEqual(graph_path.read_bytes(), (ROOT / self.cap["graph"]).read_bytes())
 
