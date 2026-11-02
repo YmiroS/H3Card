@@ -69,6 +69,7 @@ from server.director_bridge import import_director, link_director, project_direc
 from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
+from server.texture_api import register_texture_routes
 from server.project_repository import ProjectRepository, InvalidProjectId
 from server.project_service import ProjectService, ProjectError
 from server.routes import (register_page_routes, register_project_routes, register_media_routes,
@@ -4104,6 +4105,10 @@ def make_app(auth_path=None, *, project_repository=None):
         require_project=require_project, require_user=require_user, require_resource=require_resource,
         broadcast_collaboration=broadcast_collaboration, sync_card=sync_edit_card,
         kind_of=kind_of, duration_pattern=DUR_RE, audio_pattern=AUDIO_STREAM_RE)
+    register_texture_routes(
+        app, root=ROOT, comfy_http=COMFY_HTTP,
+        require_project=require_project, require_resource=require_resource,
+        resource_call=resource_call)
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
     )

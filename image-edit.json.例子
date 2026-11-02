@@ -1,0 +1,9 @@
+{
+  "enabled": true,
+  "base_url": "http://30.245.124.125:8000/v1",
+  "model": "gpt-image-2.5-sunburst",
+  "api_key": "",
+  "size": "1024x1024",
+  "quality": "medium",
+  "output_format": "png"
+}

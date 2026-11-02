@@ -35,7 +35,7 @@ def validate_runtime(root, auth_path):
     for path in root.rglob('*'):
         if path.is_symlink():
             raise RuntimeError('本地隔离运行树不能包含符号链接')
-    if (root / 'llm.json').exists() or (root / '.env.controller').exists():
+    if any((root / name).exists() for name in ('llm.json', 'image-edit.json', '.env.controller')):
         raise RuntimeError('本地隔离环境不能带入正式服务配置')
 
 

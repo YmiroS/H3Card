@@ -31,7 +31,7 @@ class SandboxBoundaryTests(unittest.TestCase):
             self.assertTrue(allowed(method, path), (method, path))
         for method, path in [('POST', '/agent/v1/heartbeat'), ('POST', '/api/generate'),
                              ('POST', '/api/admin/workers/sync-all'), ('POST', '/api/text'),
-                             ('POST', '/api/rewrite'), ('GET', '/api/file'),
+                             ('POST', '/api/rewrite'), ('POST', '/api/texture/edit'), ('GET', '/api/file'),
                              ('GET', '/api/media'), ('POST', '/api/projects'),
                              ('DELETE', '/api/workers/example')]:
             self.assertFalse(allowed(method, path), (method, path))
@@ -95,6 +95,17 @@ class SandboxBoundaryTests(unittest.TestCase):
                 validate_runtime(root, root / 'other.db')
             (root / 'outside').symlink_to(ROOT)
             with self.assertRaises(RuntimeError):
+                validate_runtime(root, data / 'auth.db')
+
+    def test_runtime_rejects_cloud_image_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            data = root / 'data'
+            data.mkdir()
+            (data / '.admin-sandbox.json').write_text(json.dumps({
+                'runtime_root': str(root), 'prepared': True}))
+            (root / 'image-edit.json').write_text('{"api_key":"test-secret"}')
+            with self.assertRaisesRegex(RuntimeError, '正式服务配置'):
                 validate_runtime(root, data / 'auth.db')
 
     def test_archive_rejects_links_traversal_and_unexpected_files(self):
