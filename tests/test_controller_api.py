@@ -3923,6 +3923,19 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
             await controller_app.generation_assets(request, assets, "p")
             comfy.assert_awaited_once()
 
+    def test_private_file_declares_media_type_without_relying_on_mimetypes(self):
+        with tempfile.TemporaryDirectory() as root:
+            for filename, expected in (("a.png", "image/png"), ("a.webp", "image/webp"),
+                                       ("a.mkv", "video/x-matroska"), ("a.flac", "audio/flac"),
+                                       ("a.txt", "application/octet-stream")):
+                with self.subTest(filename=filename):
+                    path = Path(root) / filename
+                    path.write_bytes(b"x")
+                    response = controller_app.private_file(path)
+                    self.assertEqual(response.headers["Content-Type"], expected)
+                    self.assertEqual("Content-Disposition" in response.headers,
+                                     expected == "application/octet-stream")
+
     async def test_ordinary_upload_behavior_is_unchanged(self):
         cases = ((False, None, "image.png"), (False, "0", "image.png"),
                  (False, None, "sound.wav"), (True, None, "image.png"),

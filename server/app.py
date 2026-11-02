@@ -291,6 +291,16 @@ def controller_maintenance_active(app, workers=None):
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VID_EXT = {".mp4", ".webm", ".mkv", ".mov", ".avi"}
 AUD_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
+# Windows 的 mimetypes 不认 .webp/.mkv 等扩展，FileResponse 会发成
+# application/octet-stream，前端按 Content-Type 校验的媒体读取会直接拒绝。
+MEDIA_TYPES = {
+    ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp",
+    ".gif": "image/gif", ".bmp": "image/bmp",
+    ".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska",
+    ".mov": "video/quicktime", ".avi": "video/x-msvideo",
+    ".mp3": "audio/mpeg", ".wav": "audio/wav", ".flac": "audio/flac",
+    ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+}
 
 
 # =====================================================================
@@ -3430,12 +3440,13 @@ async def api_file(request):
 
 
 def private_file(path):
-    response = web.FileResponse(path, headers={
-        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff"})
-    if path.suffix.lower() not in IMG_EXT | VID_EXT | AUD_EXT:
-        response.content_type = "application/octet-stream"
-        response.headers["Content-Disposition"] = "attachment"
-    return response
+    media_type = MEDIA_TYPES.get(path.suffix.lower())
+    headers = {
+        "Cache-Control": "private, no-store", "X-Content-Type-Options": "nosniff",
+        "Content-Type": media_type or "application/octet-stream"}
+    if not media_type:
+        headers["Content-Disposition"] = "attachment"
+    return web.FileResponse(path, headers=headers)
 
 
 async def api_upload_file(request):
