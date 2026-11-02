@@ -2624,6 +2624,16 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 restart_node.wait_for_process_exit(321, terminate=True)
         kernel32.CloseHandle.assert_called_once_with(123)
 
+    def test_restart_helper_imports_sibling_module_with_embedded_python(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, "-s", str(ROOT / "worker/restart_node.py"), "--help"],
+                cwd=directory, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--worker-pid", result.stdout)
+
     def test_restart_supervisor_forces_worker_exit_only_for_manual_service_restart(self):
         for action in ("restart_services", "sync_files"):
             with self.subTest(action=action), tempfile.TemporaryDirectory() as directory:
@@ -2640,14 +2650,95 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                         "--worker-pid", "321", "--launcher", str(launcher)]), \
                      mock.patch.object(restart_node, "configure_logging", return_value=root / "log"), \
                      mock.patch.object(restart_node, "wait_for_process_exit") as wait, \
+                     mock.patch.object(restart_node, "ensure_dependencies", return_value=["RTXTrueHDR"]) as dependencies, \
                      mock.patch.object(restart_node, "stop_comfy") as stop, \
                      mock.patch.object(restart_node, "start_launcher"), \
-                     mock.patch.object(restart_node, "wait_for_comfy_ready"), \
+                     mock.patch.object(restart_node, "wait_for_comfy_ready") as ready, \
                      mock.patch.object(restart_node, "start_worker"), \
                      mock.patch.object(restart_node, "wait_for_restart_result"):
                     restart_node.main()
                 wait.assert_called_once_with(321, terminate=action == "restart_services")
                 stop.assert_called_once_with("http://127.0.0.1:8188")
+                if action == "sync_files":
+                    dependencies.assert_called_once()
+                    self.assertEqual(ready.call_args.kwargs["required_nodes"], ["RTXTrueHDR"])
+                else:
+                    dependencies.assert_not_called()
+                    self.assertEqual(ready.call_args.kwargs["required_nodes"], [])
+
+    def test_sync_dependency_failure_preserves_comfy_and_recovers_worker_as_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.json"
+            comfy_input = root / "ComfyUI/input"
+            config.write_text(json.dumps({"state_file": "state.json",
+                                         "comfy_input_dir": str(comfy_input)}), encoding="utf-8")
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps({"maintenance": {
+                "request_id": "sync", "action": "sync_files", "restart_token": "token",
+                "deadline": time.time() + 300,
+            }}), encoding="utf-8")
+            launcher = root / "start.bat"
+            launcher.write_text("", encoding="utf-8")
+            calls = []
+            with mock.patch.object(sys, "argv", ["restart_node.py", "--config", str(config),
+                    "--worker-pid", "321", "--launcher", str(launcher)]), \
+                 mock.patch.object(restart_node, "configure_logging", return_value=root / "log"), \
+                 mock.patch.object(restart_node, "wait_for_process_exit",
+                                   side_effect=lambda *a, **k: calls.append("old_worker_exited")), \
+                 mock.patch.object(restart_node, "ensure_dependencies",
+                                   side_effect=RuntimeError("nvvfx import failed")) as dependencies, \
+                 mock.patch.object(restart_node, "stop_comfy") as stop, \
+                 mock.patch.object(restart_node, "start_launcher") as launch, \
+                 mock.patch.object(restart_node, "start_worker") as recovery, \
+                 mock.patch.object(restart_node, "wait_for_restart_result") as ready:
+                with self.assertRaisesRegex(SystemExit, "nvvfx import failed"):
+                    restart_node.main()
+            self.assertEqual(calls, ["old_worker_exited"])
+            self.assertEqual(dependencies.call_args.args[0], comfy_input.parent.resolve())
+            stop.assert_not_called()
+            launch.assert_not_called()
+            recovery.assert_called_once()
+            ready.assert_not_called()
+            result = json.loads(state_path.read_text(encoding="utf-8"))["maintenance"]
+            self.assertEqual(result["status"], "error")
+            self.assertIn("nvvfx import failed", result["message"])
+
+    def test_sync_missing_node_after_restart_never_starts_a_ready_worker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = root / "config.json"
+            config.write_text(json.dumps({"state_file": "state.json"}), encoding="utf-8")
+            state_path = root / "state.json"
+            state_path.write_text(json.dumps({"maintenance": {
+                "request_id": "sync", "action": "sync_files", "restart_token": "token",
+                "deadline": time.time() + 300,
+            }}), encoding="utf-8")
+            launcher = root / "start.bat"
+            launcher.write_text("", encoding="utf-8")
+            calls = []
+            with mock.patch.object(sys, "argv", ["restart_node.py", "--config", str(config),
+                    "--worker-pid", "321", "--launcher", str(launcher)]), \
+                 mock.patch.object(restart_node, "configure_logging", return_value=root / "log"), \
+                 mock.patch.object(restart_node, "wait_for_process_exit",
+                                   side_effect=lambda *a, **k: calls.append("old_worker_exited")), \
+                 mock.patch.object(restart_node, "ensure_dependencies",
+                                   side_effect=lambda *a, **k: calls.append("dependencies") or ["RTXTrueHDR"]), \
+                 mock.patch.object(restart_node, "stop_comfy",
+                                   side_effect=lambda *a: calls.append("stop_comfy")), \
+                 mock.patch.object(restart_node, "start_launcher",
+                                   side_effect=lambda *a: calls.append("start_comfy")), \
+                 mock.patch.object(restart_node, "wait_for_comfy_ready",
+                                   side_effect=RuntimeError("插件节点未加载：RTXTrueHDR")) as check, \
+                 mock.patch.object(restart_node, "start_worker") as recovery, \
+                 mock.patch.object(restart_node, "wait_for_restart_result") as ready:
+                with self.assertRaisesRegex(SystemExit, "RTXTrueHDR"):
+                    restart_node.main()
+            self.assertEqual(calls, ["old_worker_exited", "dependencies", "stop_comfy", "start_comfy"])
+            self.assertEqual(check.call_args.kwargs["required_nodes"], ["RTXTrueHDR"])
+            recovery.assert_called_once()
+            ready.assert_not_called()
+            self.assertEqual(json.loads(state_path.read_text())["maintenance"]["status"], "error")
 
     def test_restart_result_requires_matching_token_and_propagates_error(self):
         worker = mock.Mock()
@@ -2703,6 +2794,44 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
              mock.patch.object(restart_node.time, "sleep"):
             with self.assertRaisesRegex(RuntimeError, "返回内容无效"):
                 restart_node.wait_for_comfy_ready("http://127.0.0.1:8188", 1)
+
+    def test_comfy_readiness_checks_managed_nodes_after_system_stats(self):
+        responses = []
+        for payload in ({"system": {}, "devices": []}, {"KSampler": {}, "RTXTrueHDR": {}}):
+            response = mock.MagicMock()
+            response.status = 200
+            response.read.return_value = json.dumps(payload).encode()
+            response.__enter__.return_value = response
+            responses.append(response)
+        opener = mock.Mock()
+        opener.open.side_effect = responses
+        with mock.patch.object(restart_node, "build_opener", return_value=opener):
+            restart_node.wait_for_comfy_ready(
+                "http://127.0.0.1:8188", time.time() + 10, required_nodes=["RTXTrueHDR"]
+            )
+        self.assertEqual([call.args[0] for call in opener.open.call_args_list], [
+            "http://127.0.0.1:8188/system_stats", "http://127.0.0.1:8188/object_info",
+        ])
+
+    def test_system_stats_ready_but_managed_node_missing_cannot_pass(self):
+        for payload in ({"KSampler": {}}, []):
+            with self.subTest(payload=payload):
+                responses = []
+                for value in ({"system": {}, "devices": []}, payload):
+                    response = mock.MagicMock()
+                    response.status = 200
+                    response.read.return_value = json.dumps(value).encode()
+                    response.__enter__.return_value = response
+                    responses.append(response)
+                opener = mock.Mock()
+                opener.open.side_effect = responses
+                with mock.patch.object(restart_node, "build_opener", return_value=opener), \
+                     mock.patch.object(restart_node.time, "time", side_effect=[0, 2]), \
+                     mock.patch.object(restart_node.time, "sleep"):
+                    with self.assertRaisesRegex(RuntimeError, "未加载.*RTXTrueHDR|返回内容无效"):
+                        restart_node.wait_for_comfy_ready(
+                            "http://127.0.0.1:8188", 1, required_nodes=["RTXTrueHDR"]
+                        )
 
     def test_start_worker_passes_restart_token_and_persists_output(self):
         process = mock.Mock(pid=321)

@@ -9,7 +9,7 @@ const SOURCE_DIRS = new Set(['server', 'web', 'web_dist', 'worker', 'tests', 'to
 const ROOT_FILES = new Set(['package.json', 'package-lock.json', 'pricing.json', 'requirements-controller.txt',
   'Dockerfile.controller', 'compose.controller.yml', 'start-controller.sh', 'llm.json.例子',
   '启动Windows节点.bat', '启动Windows节点_4090.bat', '启动Windows节点_A6000.bat',
-  '启动Windows节点_PRO6000_96GB.bat', '管理Windows节点自启.bat']);
+  '启动Windows节点_PRO6000_96GB.bat', '管理Windows节点自启.bat', '同步主节点模型和用户.bat']);
 
 function sourceFile(relative) {
   const parts = relative.replaceAll('\\', '/').split('/');

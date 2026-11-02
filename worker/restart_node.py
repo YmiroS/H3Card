@@ -14,6 +14,9 @@ from urllib.error import URLError
 from urllib.parse import urlparse
 from urllib.request import ProxyHandler, build_opener
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from sync_dependencies import ensure_dependencies
+
 
 def configured_path(config_path, config, key, default):
     value = Path(config.get(key, default))
@@ -157,7 +160,7 @@ def stop_comfy(comfy_url):
     raise RuntimeError(detail.strip() or f"ComfyUI PID {pid} 未能退出")
 
 
-def wait_for_comfy_ready(comfy_url, deadline):
+def wait_for_comfy_ready(comfy_url, deadline, *, required_nodes=()):
     parsed = urlparse(comfy_url)
     if parsed.hostname not in {"127.0.0.1", "localhost", "::1"}:
         raise RuntimeError("自动重启只支持本机 ComfyUI 地址")
@@ -174,6 +177,17 @@ def wait_for_comfy_ready(comfy_url, deadline):
                     or not isinstance(payload.get("system"), dict)
                     or not isinstance(payload.get("devices"), list)):
                 raise RuntimeError(f"{endpoint} 返回内容无效")
+            if required_nodes:
+                with opener.open(comfy_url.rstrip("/") + "/object_info", timeout=10) as response:
+                    if response.status != 200:
+                        raise RuntimeError(f"/object_info 返回 HTTP {response.status}")
+                    nodes = json.load(response)
+                if not isinstance(nodes, dict):
+                    raise RuntimeError("/object_info 返回内容无效")
+                missing = sorted(set(required_nodes) - nodes.keys())
+                if missing:
+                    raise RuntimeError("插件节点未加载：" + ", ".join(missing))
+                log_event("受管插件节点已加载：" + ", ".join(required_nodes))
             log_event("ComfyUI 已通过 /system_stats 就绪检查")
             return
         except (OSError, ValueError, RuntimeError, URLError) as exc:
@@ -317,9 +331,23 @@ def main():
             args.worker_pid, terminate=maintenance.get("action") == "restart_services",
         )
         old_worker_exited = True
+        required_nodes = []
+        if maintenance.get("action") == "sync_files":
+            update_maintenance(
+                state_path, request_id=request_id,
+                expected_restart_token=restart_token, phase="installing_dependencies",
+                message="正在安装并验证受管插件依赖，尚未重启 ComfyUI",
+            )
+            comfy_root = configured_path(
+                config_path, config, "comfy_input_dir", "../../ComfyUI/input"
+            ).resolve().parent
+            # 监督器来自刚拉取的代码，旧 Worker 首次同步也会执行最新依赖规则。
+            required_nodes = ensure_dependencies(comfy_root, deadline=deadline)
+            log_event("受管插件依赖已验证")
         update_maintenance(
             state_path, request_id=request_id,
             expected_restart_token=restart_token, phase="stopping_comfy",
+            message="正在重启 ComfyUI 并验证节点加载",
         )
         stop_comfy(comfy_url)
         update_maintenance(
@@ -327,7 +355,7 @@ def main():
             expected_restart_token=restart_token, phase="starting_comfy",
         )
         start_launcher(launcher, max(deadline - time.time() + 10, 60))
-        wait_for_comfy_ready(comfy_url, deadline)
+        wait_for_comfy_ready(comfy_url, deadline, required_nodes=required_nodes)
         update_maintenance(
             state_path, request_id=request_id,
             expected_restart_token=restart_token, phase="waiting_for_worker",
