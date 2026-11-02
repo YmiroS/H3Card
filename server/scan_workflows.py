@@ -109,7 +109,7 @@ SOLO = set()
 # card_enhance（画质增强）走 ROUTE_CARDS，是"放图/放视频切到对应那一路"，这里一并收进来当模式。
 TOOLS = {
     "grid4_stitch", "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "gimmvfi_interp",
-    "depth_image", "depth_video", "alphagen",
+    "depth_image", "depth_video", "alphagen", "rtx_video_hdr",
 }
 TOOLS_CARD = {"id": "card_tools", "name": "工具箱", "icon": "🧩"}
 
@@ -150,7 +150,7 @@ MODEL_SWITCHES = {
 # Qwen 2.1 的图生图模型直接使用16图编辑能力；旧单图能力只保留给历史任务和项目迁移。
 BUNDLED_CAPABILITIES = {
     "minimax_h3_ref_2pass_bf16",
-    "alphagen", "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
+    "alphagen", "rtx_video_hdr", "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
     "qwen_lighting", "qwen_lighting_multi",
@@ -1851,7 +1851,7 @@ def build_tools_card(ms, by_id):
     """
     order = [
         "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "grid4_stitch", "gimmvfi_interp",
-        "depth_image", "depth_video", "alphagen",
+        "depth_image", "depth_video", "alphagen", "rtx_video_hdr",
     ]
     modes = []
     for wid in order:

@@ -1,0 +1,54 @@
+{
+ "id": "rtx_video_hdr",
+ "name": "HDR增强",
+ "file": "rtx_video_hdr",
+ "source": "C:\\Users\\admin\\Downloads\\hdr\\rtx_video_hdr.json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "tool",
+ "card": "card_tools",
+ "slots": "img0+aud0+vid1",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 1, "max": 1}},
+ "graph": "graphs/rtx_video_hdr.api.json",
+ "output": {"node": "9"},
+ "note": "使用 NVIDIA RTX Video HDR 将 SDR 视频转换为 BT.2020/HLG HDR，保持输入处理视频的画面尺寸、帧率和音轨，自动以 10-bit 编码。上传时的浏览器兼容转码可能调整原片尺寸与编码。需要 NVIDIA RTX 显卡及 nvidia-vfx 依赖。原工作流整段解码，长视频占用较多内存，建议先用短片段测试。HDR 效果请下载原文件，在支持 HDR 的屏幕和播放器上查看；普通 SDR 预览不代表实际 HDR 效果。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "video[0]", "label": "源视频", "type": "video", "required": true,
+   "target": {"node": "6", "input": "file", "kind": "upload_video"}
+  },
+  {
+   "key": "contrast", "label": "对比度", "type": "slider", "min": 0, "max": 200, "step": 1, "default": 100,
+   "target": {"node": "11", "input": "contrast", "vtype": "INT"}
+  },
+  {
+   "key": "saturation", "label": "饱和度", "type": "slider", "min": 0, "max": 200, "step": 1, "default": 100,
+   "target": {"node": "11", "input": "saturation", "vtype": "INT"}
+  },
+  {
+   "key": "middle_gray", "label": "中间灰", "type": "slider", "min": 10, "max": 100, "step": 1, "default": 50,
+   "target": {"node": "11", "input": "middle_gray", "vtype": "INT"}
+  },
+  {
+   "key": "luminance", "label": "峰值亮度（nits）", "type": "slider", "min": 400, "max": 2000, "step": 1, "default": 650,
+   "hint": "目标 HDR 显示峰值亮度，原工作流默认 650 nits。",
+   "target": {"node": "11", "input": "luminance", "vtype": "INT"}
+  },
+  {
+   "key": "debanding_mode", "label": "去色带", "type": "select", "appearance": "switch", "default": "on",
+   "options": [{"value": "off", "label": "关闭"}, {"value": "on", "label": "开启"}],
+   "presets": {"off": {"debanding": false}, "on": {"debanding": true}},
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "debanding", "label": "去色带开关", "type": "boolean", "default": true, "mirror": true, "advanced": true,
+   "target": {"node": "11", "input": "debanding", "vtype": "BOOLEAN"}
+  }
+ ],
+ "warnings": []
+}

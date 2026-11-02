@@ -1,0 +1,47 @@
+{
+ "6": {
+  "class_type": "LoadVideo",
+  "inputs": {"file": ""},
+  "_meta": {"title": "加载源视频"}
+ },
+ "7": {
+  "class_type": "GetVideoComponents",
+  "inputs": {"video": ["6", 0]},
+  "_meta": {"title": "提取视频帧与音频"}
+ },
+ "11": {
+  "class_type": "RTXTrueHDR",
+  "inputs": {
+   "images": ["7", 0],
+   "contrast": 100,
+   "saturation": 100,
+   "middle_gray": 50,
+   "luminance": 650,
+   "debanding": true,
+   "output_colorspace": "HDR"
+  },
+  "_meta": {"title": "RTX HDR增强"}
+ },
+ "8": {
+  "class_type": "CreateVideo",
+  "inputs": {
+   "images": ["11", 0],
+   "audio": ["7", 1],
+   "fps": ["7", 2],
+   "bit_depth": "auto",
+   "color_space": "HDR",
+   "codec": "none"
+  },
+  "_meta": {"title": "合成HDR视频"}
+ },
+ "9": {
+  "class_type": "SaveVideo",
+  "inputs": {
+   "video": ["8", 0],
+   "filename_prefix": "video/Chouka_HDR",
+   "format": "auto",
+   "format.codec": "auto"
+  },
+  "_meta": {"title": "保存HDR视频"}
+ }
+}
