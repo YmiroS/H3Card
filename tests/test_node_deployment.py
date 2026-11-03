@@ -164,7 +164,8 @@ $Source=$env:TEST_SOURCE; $Target=$env:TEST_TARGET; $Control=$env:TEST_CONTROL
     def test_inventory_excludes_all_worker_state_variants_and_custom_state(self):
         excluded = ["chouka/worker/worker_state.json", "chouka/worker/worker-state.json",
                     "chouka/worker/worker_state.json.tmp.5", "chouka/worker/worker-state-old.json",
-                    "chouka/worker/identity/custom.json", "chouka/worker/config.json",
+                    "chouka/worker/identity/custom.json", "chouka/worker/identity/custom.json.tmp.12345",
+                    "chouka/worker/identity/custom.json.bak", "chouka/worker/config.json",
                     "ComfyUI/output/result.png", "ComfyUI/user/default/comfy.settings.json",
                     "ComfyUI/user/manager/config.ini", "ComfyUI/.git/config", "ComfyUI/.env",
                     "ComfyUI/models/.cache/token.json", "python_embeded/__pycache__/a.pyc"]
@@ -217,7 +218,10 @@ Restore-Transaction
         self.ps(r'''
 function nvidia-smi.exe { 'NVIDIA GeForce RTX 4090'; $global:LASTEXITCODE=0 }
 $Node=[pscustomobject]@{name='用户输入的节点名'}
+Write-Json (Join-Path $Control 'node.json') $Node
 Initialize-Worker
+Initialize-Worker
+if ((Read-Json (Join-Path $Control 'node.json')).name -ne '用户输入的节点名') { throw 'Node name lost' }
 ''')
         config = json.loads((self.target / "chouka/worker/config.json").read_text(encoding="utf-8"))
         self.assertEqual(config["worker_name"], "用户输入的节点名")
@@ -247,6 +251,106 @@ Initialize-Worker
         self.file("chouka/worker/config.json", json.dumps({"state_file": str(identity)}))
         inventory = json.loads(self.ps("ConvertTo-Json -InputObject @(Get-Inventory $Source) -Depth 5"))
         self.assertNotIn("chouka/worker/private-identity.json", {x["Relative"].replace("\\", "/") for x in inventory})
+
+    def test_json_overwrite_is_atomic_and_works_on_powershell_51(self):
+        self.ps(r'''
+$path=Join-Path $Control 'repeat.json'
+Write-Json $path @{attempt=1;name='首次写入'}
+Write-Json $path @{attempt=2;name='覆盖写入'}
+Write-Json $path @{attempt=3;name='再次覆盖'}
+$result=Read-Json $path
+if ($result.attempt -ne 3 -or $result.name -ne '再次覆盖') { throw 'JSON overwrite failed' }
+if (@(Get-ChildItem -LiteralPath $Control -Filter '*.tmp.*').Count) { throw 'Temporary JSON left behind' }
+''')
+
+    def test_existing_processes_without_heartbeat_do_not_bypass_readiness(self):
+        self.ps(r'''
+Write-Json (Join-Path $Target 'chouka\worker\config.json') @{node_launcher=(Join-Path $Target 'chouka\启动Windows节点.bat')}
+function Get-ComfyProcess { [pscustomobject]@{ProcessId=991} }
+function Get-NodeWorkers { @([pscustomobject]@{ProcessId=992}) }
+function Start-Process { throw 'Unexpected process launch' }
+function Start-Sleep { throw 'HEALTH_NOT_READY' }
+$failed=$false
+try { Start-Node } catch { if ($_.Exception.Message -ne 'HEALTH_NOT_READY') { throw }; $failed=$true }
+if (-not $failed) { throw 'Existing processes incorrectly counted as healthy' }
+''')
+
+    def test_existing_services_require_matching_heartbeat_pid_and_api(self):
+        self.ps(r'''
+Write-Json (Join-Path $Target 'chouka\worker\config.json') @{node_launcher=(Join-Path $Target 'chouka\启动Windows节点.bat')}
+function Get-ComfyProcess { [pscustomobject]@{ProcessId=991} }
+function Get-NodeWorkers { @([pscustomobject]@{ProcessId=992}) }
+function Start-Process { throw 'Unexpected process launch' }
+function Start-Sleep { throw 'HEALTH_NOT_READY' }
+$script:requests=0
+function Invoke-RestMethod { $script:requests++; [pscustomobject]@{system=@{ready=$true};devices=@('GPU')} }
+$heartbeat=Join-Path $Control 'heartbeat.json'
+Write-Json $heartbeat @{pid=992;time=[DateTimeOffset]::UtcNow.AddSeconds(2).ToUnixTimeSeconds();worker_id='local-worker';comfy_online=$true}
+Start-Node
+if ($script:requests -ne 1) { throw 'Readiness API not checked' }
+Write-Json $heartbeat @{pid=999;time=[DateTimeOffset]::UtcNow.AddSeconds(2).ToUnixTimeSeconds();worker_id='old-worker';comfy_online=$true}
+$failed=$false
+try { Start-Node } catch { if ($_.Exception.Message -ne 'HEALTH_NOT_READY') { throw }; $failed=$true }
+if (-not $failed -or $script:requests -ne 1) { throw 'Wrong Worker heartbeat accepted' }
+''')
+
+    def test_temporary_readiness_api_failure_is_retried(self):
+        self.ps(r'''
+Write-Json (Join-Path $Target 'chouka\worker\config.json') @{node_launcher=(Join-Path $Target 'chouka\启动Windows节点.bat')}
+function Get-ComfyProcess { [pscustomobject]@{ProcessId=991} }
+function Get-NodeWorkers { @([pscustomobject]@{ProcessId=992}) }
+function Start-Process { throw 'Unexpected process launch' }
+function Start-Sleep {}
+$script:requests=0
+function Invoke-RestMethod {
+    $script:requests++
+    if ($script:requests -eq 1) { throw 'Still warming up' }
+    [pscustomobject]@{system=@{ready=$true};devices=@('GPU')}
+}
+Write-Json (Join-Path $Control 'heartbeat.json') @{pid=992;time=[DateTimeOffset]::UtcNow.AddSeconds(2).ToUnixTimeSeconds();worker_id='local-worker';comfy_online=$true}
+Start-Node
+if ($script:requests -ne 2) { throw 'Transient API failure not retried' }
+''')
+
+    def test_partial_stop_failure_attempts_service_recovery(self):
+        worker = self.target / 'chouka/worker/agent.py'
+        worker.parent.mkdir(parents=True)
+        worker.write_text('old worker runtime')
+        self.ps(r'''
+Write-Json (Join-Path $Target 'chouka\worker\config.json') @{node_launcher='test'}
+function Copy-Delta {}
+function Wait-Drain { Write-Json (Join-Path $Control 'drain.json') @{token='test'} }
+$script:running=$true; $script:restarts=0
+function Stop-Node { $script:running=$false; throw 'Injected partial stop failure' }
+function Start-Node { $script:restarts++; $script:running=$true }
+$failed=$false
+try { Invoke-Update } catch { if ($_.Exception.Message -ne 'Injected partial stop failure') { throw }; $failed=$true }
+if (-not $failed -or -not $script:running -or $script:restarts -ne 1) { throw 'Partially stopped Worker not recovered' }
+if (Test-Path -LiteralPath (Join-Path $Control 'drain.json')) { throw 'Drain gate not released after recovery' }
+''')
+        self.assertEqual(worker.read_text(), 'old worker runtime')
+
+    def test_no_delta_reports_error_if_service_readiness_fails(self):
+        self.ps(r'''
+Write-Json (Join-Path $Control 'update-request.json') @{request_id='request-1';status='running';message='pending'}
+function Get-Inventory { @() }
+function Start-Node { throw 'Injected readiness failure' }
+$failed=$false
+try { Invoke-Update } catch { if ($_.Exception.Message -ne 'Injected readiness failure') { throw }; $failed=$true }
+if (-not $failed) { throw 'Readiness failure swallowed' }
+if ((Read-Json (Join-Path $Control 'update-request.json')).status -ne 'error') { throw 'Readiness failure reported as done' }
+''')
+
+    def test_no_delta_reports_success_only_after_service_readiness(self):
+        self.ps(r'''
+Write-Json (Join-Path $Control 'update-request.json') @{request_id='request-1';status='running';message='pending'}
+function Get-Inventory { @() }
+function Start-Node {
+    if ((Read-Json (Join-Path $Control 'update-request.json')).status -ne 'running') { throw 'Premature success report' }
+}
+Invoke-Update
+if ((Read-Json (Join-Path $Control 'update-request.json')).status -ne 'done') { throw 'Successful readiness not reported' }
+''')
 
     def test_rejects_parent_traversal(self):
         self.ps("Join-Safe $Target '..\\escape.txt'", succeeds=False)
