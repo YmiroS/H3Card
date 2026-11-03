@@ -47,7 +47,8 @@ def expected_dimensions(ratio, pixels):
     w, h = map(int, ratio.split(":"))
     # Integer half-up arithmetic provides an independent rounding oracle.
     long = ((2 * pixels * max(w, h) + 16 * min(w, h)) // (32 * min(w, h))) * 16
-    return (long, pixels) if w >= h else (pixels, long)
+    short = ((pixels + 8) // 16) * 16
+    return (long, short) if w >= h else (short, long)
 
 
 def depends_on(graph, value, source):
@@ -132,13 +133,18 @@ class ImageControlsTest(unittest.TestCase):
                         inputs = graph[node]["inputs"]
                         if cid in LATENTS:
                             self.assertEqual((inputs["width"], inputs["height"]), (w, h))
+                            actual_width, actual_height = inputs["width"], inputs["height"]
                             self.assertNotIn(SIZE_NODE, graph)
                         else:
                             self.assertEqual({k: inputs[k] for k in SCALE_FIELDS}, {
                                 "aspect_ratio": "custom", "proportional_width": w,
                                 "proportional_height": h, "fit": "crop",
                                 "scale_to_side": "width", "scale_to_length": w,
-                                "round_to_multiple": "8"})
+                                "round_to_multiple": "16"})
+                            actual_width = inputs["proportional_width"]
+                            actual_height = inputs["proportional_height"]
+                        self.assertEqual(actual_width % 16, 0)
+                        self.assertEqual(actual_height % 16, 0)
                         self.assert_only_sizing_changed(baseline, graph, cid)
 
     def test_half_up_ties_and_transpose(self):
@@ -146,7 +152,10 @@ class ImageControlsTest(unittest.TestCase):
             graph = template(cid)
             patch_image_controls(graph, cid, {"image_ratio": "1:1", "image_clarity": "1080P"})
             self.assertEqual(graph[LATENTS[cid]]["inputs"]["width"], 1088)
-            self.assertEqual(graph[LATENTS[cid]]["inputs"]["height"], 1080)
+            self.assertEqual(graph[LATENTS[cid]]["inputs"]["height"], 1088)
+            patch_image_controls(graph, cid, {"image_ratio": "16:9", "image_clarity": "1080P"})
+            self.assertEqual((graph[LATENTS[cid]]["inputs"]["width"],
+                              graph[LATENTS[cid]]["inputs"]["height"]), (1920, 1088))
         for ratio in RATIOS:
             if ratio == "1:1":
                 continue
@@ -160,6 +169,7 @@ class ImageControlsTest(unittest.TestCase):
             baseline = app.patch_graph(capability(cid), {"seed": 123}, ASSETS)
             for clarity, pixels in CLARITIES.items():
                 with self.subTest(cid=cid, clarity=clarity):
+                    aligned_pixels = ((pixels + 8) // 16) * 16
                     graph = copy.deepcopy(baseline)
                     patch_image_controls(graph, cid, {"image_ratio": "original", "image_clarity": clarity})
                     if cid in LOADERS:
@@ -167,8 +177,8 @@ class ImageControlsTest(unittest.TestCase):
                             "class_type": "LayerUtility: ImageScaleByAspectRatio V2",
                             "inputs": {"image": [LOADERS[cid], 0], "aspect_ratio": "original",
                                        "proportional_width": 1, "proportional_height": 1,
-                                       "fit": "crop", "method": "lanczos", "round_to_multiple": "8",
-                                       "scale_to_side": "shortest", "scale_to_length": pixels,
+                                       "fit": "crop", "method": "lanczos", "round_to_multiple": "16",
+                                       "scale_to_side": "shortest", "scale_to_length": aligned_pixels,
                                        "background_color": "#000000"},
                             "_meta": {"title": "按原图比例设置输出尺寸"}})
                         self.assertEqual(graph[LATENTS[cid]]["inputs"]["width"], [SIZE_NODE, 3])
@@ -176,7 +186,7 @@ class ImageControlsTest(unittest.TestCase):
                     else:
                         inputs = graph[SCALES[cid]]["inputs"]
                         for key, value in {"aspect_ratio": "original", "scale_to_side": "shortest",
-                                           "scale_to_length": pixels, "round_to_multiple": "8"}.items():
+                                           "scale_to_length": aligned_pixels, "round_to_multiple": "16"}.items():
                             self.assertEqual(inputs[key], value)
                         self.assertNotIn(SIZE_NODE, graph)
                     self.assert_only_sizing_changed(baseline, graph, cid)
@@ -280,8 +290,13 @@ class ImageControlsRuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
         response = await self.client.get("/api/cards")
         self.assertEqual(response.status, 200)
         caps = (await response.json())["capabilities"]
-        self.assertEqual({cid for cid, cap in caps.items() if "imageControls" in cap}, set(CAP_IDS))
-        for cid, published in caps.items():
+        native_caps = {cid: cap for cid, cap in caps.items()
+                       if cap.get("execution") != "if_studio"}
+        self.assertEqual({cid for cid, cap in native_caps.items() if "imageControls" in cap},
+                         set(CAP_IDS))
+        self.assertEqual(caps["if_image"]["execution"], "if_studio")
+        self.assertIn("imageControls", caps["if_image"])
+        for cid, published in native_caps.items():
             original = capability(cid)
             if cid in CAP_IDS:
                 self.assertEqual(published.pop("imageControls"), image_controls(cid))

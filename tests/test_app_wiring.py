@@ -1,5 +1,6 @@
 """真实 make_app 装配冒烟：中间件、页面路由、静态兜底与基本权限闭环。"""
 import asyncio
+import json
 import shutil
 import socket
 import ssl
@@ -22,6 +23,34 @@ from aiohttp import ClientSession, CookieJar, ServerDisconnectedError, WSMsgType
 from aiohttp.test_utils import TestClient, TestServer
 
 PASSWORD = auth_support.PASSWORD
+
+
+class ResolutionAlignmentTest(unittest.TestCase):
+    def test_fixed_resolution_presets_align_consumers_without_changing_node_enums(self):
+        cap = json.loads((ROOT / 'manifests/krea2_t2i.json').read_text(encoding='utf-8'))
+        spec = next(spec for spec in cap['inputs'] if spec['key'] == 'resolution')
+        baseline = controller_app.patch_graph(cap, {'seed': 42}, {})
+        for value in spec['options']:
+            with self.subTest(value=value):
+                graph = controller_app.patch_graph(cap, {'resolution': value, 'seed': 42}, {})
+                dimensions = tuple(((int(side) + 8) // 16) * 16
+                                   for side in value.split()[0].split('x'))
+                self.assertEqual((graph['2']['inputs']['width'], graph['2']['inputs']['height']), dimensions)
+                self.assertTrue(all(side % 16 == 0 for side in dimensions))
+                self.assertEqual(graph['49']['inputs']['resolution'], value)
+                self.assertEqual(graph['9'], baseline['9'])
+
+    def test_numeric_size_parameters_align_at_submission(self):
+        graph = {'1': {'class_type': 'Size', 'inputs': {}}}
+        for key in ('width', 'height', 'scale_to_length', 'resolution'):
+            cap = {'id': 'size_test', 'graph': 'unused.json', 'inputs': [
+                {'key': key, 'label': key, 'type': 'number',
+                 'target': {'node': '1', 'input': key}}]}
+            with self.subTest(key=key), mock.patch.object(Path, 'read_text', return_value=json.dumps(graph)):
+                params = {key: 1080}
+                patched = controller_app.patch_graph(cap, params, {})
+                self.assertEqual(patched['1']['inputs'][key], 1088)
+                self.assertEqual(params[key], 1088)
 
 
 class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):

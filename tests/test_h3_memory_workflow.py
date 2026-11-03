@@ -1,4 +1,5 @@
 import json
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -189,7 +190,7 @@ class H3HalfBF16WorkflowTest(unittest.TestCase):
             base = expected[ratio.split()[0]]
             generation = tuple(round(v / 32) * 32 for v in base)
             for scale in (.01, .25, .75, 1, 1.25, 1.5, 2, 3.14159, 6):
-                final = tuple(round(v * scale / 2) * 2 for v in base)
+                final = tuple(math.floor(v * scale / 16 + .5) * 16 for v in base)
                 for reference in (False, True):
                     with self.subTest(ratio=ratio, scale=scale, reference=reference):
                         params, graph = self.patch_1080p({"aspect_ratio": ratio, "scale_by": scale,
@@ -198,9 +199,12 @@ class H3HalfBF16WorkflowTest(unittest.TestCase):
                                           graph["186"]["inputs"]["height"]), generation)
                         self.assertEqual(graph["199"]["inputs"]["scale_by"], scale)
                         self.assertEqual(params["megapixels"], generation[0] * generation[1] / 1024 ** 2)
-                        self.assertTrue(all(abs(v * scale - f) <= 1
+                        self.assertTrue(all(abs(v * scale - f) <= 8
                                             for v, f in zip(base, final)))
                         self.assertEqual((params["output_width"], params["output_height"]), final)
+                        for side in (params["output_width"], params["output_height"]):
+                            self.assertEqual(side % 16, 0)
+                            self.assertTrue(16 <= side <= 16384)
                         scales = [n for n in graph.values() if n["class_type"] == "ImageScale"]
                         self.assertEqual(len(scales), 1, "follow and 1080P must share one resize")
                         output = graph["225"]["inputs"]
@@ -224,9 +228,9 @@ class H3HalfBF16WorkflowTest(unittest.TestCase):
 
     def test_1080p_default_multiplier_landscape_portrait_and_ultrawide(self):
         for ratio, generation, final in (
-                ("16:9 (Widescreen)", (1920, 1088), (2880, 1620)),
-                ("9:16 (Portrait Widescreen)", (1088, 1920), (1620, 2880)),
-                ("21:9 (Ultrawide)", (2528, 1088), (3780, 1620))):
+                ("16:9 (Widescreen)", (1920, 1088), (2880, 1616)),
+                ("9:16 (Portrait Widescreen)", (1088, 1920), (1616, 2880)),
+                ("21:9 (Ultrawide)", (2528, 1088), (3776, 1616))):
             for reference in (False, True):
                 with self.subTest(ratio=ratio, reference=reference):
                     params, graph = self.patch_1080p({"aspect_ratio": ratio}, reference)
@@ -295,25 +299,47 @@ class H3HalfBF16WorkflowTest(unittest.TestCase):
                     self.assertEqual((graph["186"]["inputs"]["width"],
                                       graph["186"]["inputs"]["height"]), (1920, 1088))
                     self.assertEqual((params["output_width"], params["output_height"]),
-                                     tuple(round(v * scale / 2) * 2 for v in (1920, 1080)))
-            for width in (16384, 16386):
-                params = {"aspect_ratio": "21:9 (Ultrawide)", "scale_by": width / 2520}
-                if width == 16384:
-                    resolved, _ = self.patch_1080p(params, reference)
-                    self.assertEqual(resolved["output_width"], 16384)
-                else:
-                    with self.assertRaises(app.web.HTTPBadRequest):
-                        self.patch_1080p(params, reference)
+                                     tuple(math.floor(v * scale / 16 + .5) * 16 for v in (1920, 1080)))
+                    for side in (params["output_width"], params["output_height"]):
+                        self.assertEqual(side % 16, 0)
+                        self.assertTrue(16 <= side <= 16384)
+            # 16385 still rounds down; the first half-up overflow is 16392.
+            for width in (16384, 16385, 16391, 16392, 16400):
+                with self.subTest(width=width, reference=reference):
+                    params = {"aspect_ratio": "21:9 (Ultrawide)", "scale_by": width / 2520}
+                    if width < 16392:
+                        resolved, _ = self.patch_1080p(params, reference)
+                        self.assertEqual(resolved["output_width"], 16384)
+                        self.assertEqual(resolved["output_width"] % 16, 0)
+                    else:
+                        with self.assertRaises(app.web.HTTPBadRequest):
+                            self.patch_1080p(params, reference)
             with self.assertRaises(app.web.HTTPBadRequest):
                 self.patch_1080p({"aspect_ratio": "21:9 (Ultrawide)", "scale_by": 8}, reference)
+
+    def test_1080p_final_dimensions_round_half_up_to_sixteen(self):
+        for ideal, expected in ((23.999, 16), (24, 32), (39.999, 32), (40, 48)):
+            for reference in (False, True):
+                with self.subTest(ideal=ideal, reference=reference):
+                    params, graph = self.patch_1080p({
+                        "aspect_ratio": "1:1 (Square)", "scale_by": ideal / 1080,
+                    }, reference)
+                    self.assertEqual((graph["186"]["inputs"]["width"],
+                                      graph["186"]["inputs"]["height"]), (1088, 1088))
+                    final = (params["output_width"], params["output_height"])
+                    self.assertEqual(final, (expected, expected))
+                    for side in final:
+                        self.assertEqual(side % 16, 0)
+                        self.assertTrue(16 <= side <= 16384)
+                        self.assertLessEqual(abs(side - ideal), 8)
 
     def test_1080p_generation_boundaries_and_transposed_ultrawide(self):
         # Exercise the validator independently of the current finite aspect menu.
         aspect = next(s for s in self.cap["inputs"] if s["key"] == "aspect_ratio")
         for ratio, generation, final in (
-                ("9:21", (1088, 2528), (1620, 3780)),
-                ("2048:135", (16384, 1088), (8192, 540)),
-                ("135:2048", (1088, 16384), (540, 8192))):
+                ("9:21", (1088, 2528), (1616, 3776)),
+                ("2048:135", (16384, 1088), (8192, 544)),
+                ("135:2048", (1088, 16384), (544, 8192))):
             aspect["options"].append(ratio)
             for reference in (False, True):
                 with self.subTest(ratio=ratio, reference=reference):
@@ -362,14 +388,14 @@ class H3HalfBF16WorkflowTest(unittest.TestCase):
             dims = app.CostLedger.dimensions(None, self.cid, params, assets, graph)
             recovered = app.CostLedger.dimensions(None, self.cid, {}, assets, graph)
             for recorded in (dims, recovered):
-                for key, expected in (("width", 2880), ("height", 1620),
-                                      ("output_width", 2880), ("output_height", 1620), ("output_count", 1)):
+                for key, expected in (("width", 2880), ("height", 1616),
+                                      ("output_width", 2880), ("output_height", 1616), ("output_count", 1)):
                     self.assertEqual(recorded[key], expected)
                 self.assertEqual(recorded["megapixels"], 1920 * 1088 / 1024 ** 2)
             for supplied, dimensions in ((params, {}), (params, dims), ({}, recovered)):
                 spec = app.make_spec(self.cid, supplied, graph, dimensions)
                 self.assertEqual(spec["expected"]["width"], 2880)
-                self.assertEqual(spec["expected"]["height"], 1620)
+                self.assertEqual(spec["expected"]["height"], 1616)
                 self.assertEqual(spec["expected"]["count"], 1)
                 self.assertEqual(spec["expected"]["kind"], "video")
                 if reference:
