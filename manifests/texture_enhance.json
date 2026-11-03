@@ -1,0 +1,34 @@
+{
+ "id": "texture_enhance",
+ "name": "质感提升",
+ "execution": "browser",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "image",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slots": "img1+aud0+vid0",
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": false
+  }
+ ]
+}

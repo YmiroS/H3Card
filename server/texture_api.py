@@ -41,7 +41,6 @@ class TextureApi:
         self.require_project = require_project
         self.require_resource = require_resource
         self.resource_call = resource_call
-        self.active = set()
 
     async def card(self, request, project_id, card_id):
         await self.require_project(request, project_id, operate=True)
@@ -84,8 +83,25 @@ class TextureApi:
         return data, ref, info
 
     async def generate(self, request):
+        temporary_base = None
+        reader = None
         try:
-            body = await request.json()
+            if request.content_type == "multipart/form-data":
+                reader = await request.multipart()
+                part = await reader.next()
+                if part is None or part.name != "metadata":
+                    raise web.HTTPBadRequest(text="缺少编辑请求元数据")
+                metadata = bytearray()
+                while True:
+                    chunk = await part.read_chunk()
+                    if not chunk:
+                        break
+                    metadata.extend(chunk)
+                    if len(metadata) > 65536:
+                        raise web.HTTPBadRequest(text="编辑请求元数据过大")
+                body = json.loads(metadata)
+            else:
+                body = await request.json()
         except (ValueError, UnicodeError):
             raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
         if (not isinstance(body, dict) or set(body) != {"project", "card", "prompt"}
@@ -95,19 +111,40 @@ class TextureApi:
             raise web.HTTPBadRequest(text="必须提供画布、卡片和编辑提示词，不接受外部图片地址或凭据")
         project_id, card_id = body["project"], body["card"]
         card = await self.card(request, project_id, card_id)
-        key = (project_id, card_id)
-        if key in self.active:
-            raise web.HTTPConflict(text="当前卡片已有图片编辑请求，请等待结果，不要重复提交")
-        self.active.add(key)
+        # A canceled client may retry while its previous upstream call is still running.
+        # Each request returns only a private preview; applying it remains explicit.
         try:
             version = source_version(card)
             image, source_kind = selected_image(card)
             data, ref, info = await self.source(request, project_id, image)
+            if reader is not None:
+                part = await reader.next()
+                if part is None or part.name != "base":
+                    raise web.HTTPBadRequest(text="缺少临时底图")
+                temporary_base = bytearray()
+                while True:
+                    chunk = await part.read_chunk(1024 * 1024)
+                    if not chunk:
+                        break
+                    temporary_base.extend(chunk)
+                    if len(temporary_base) > cloud_images.MAX_IMAGE_BYTES:
+                        raise web.HTTPRequestEntityTooLarge(
+                            max_size=cloud_images.MAX_IMAGE_BYTES, actual_size=len(temporary_base))
+                if await reader.next() is not None:
+                    raise web.HTTPBadRequest(text="不接受额外的编辑请求字段")
+                data = bytes(temporary_base)
+                info = await asyncio.to_thread(cloud_images.inspect_image, data)
             cloud_images.load()  # Fail before uploading any image when credentials are missing.
             latest = await self.card(request, project_id, card_id)
             if source_version(latest) != version:
                 raise web.HTTPConflict(text="编辑底图已变化，未提交生成")
-            result = await cloud_images.edit(self.app["session"], [data], body["prompt"])
+            result = await cloud_images.edit(self.app["session"], [data], body["prompt"],
+                                             size=f"{info['width']}x{info['height']}")
+            if "image_bytes" in result and (result["width"], result["height"]) != (info["width"], info["height"]):
+                raise cloud_images.ImageEditError(
+                    f"云端返回图片尺寸 {result['width']}x{result['height']} 与本轮底图 "
+                    f"{info['width']}x{info['height']} 不一致，未保存结果，也未缩放。请联系管理员核对，不要重复生成或自动重试。",
+                    request_id=result["request_id"])
             # Do not lock the whole project while a cloud request is in flight.
             async with self.app["project_locks"][project_id]:
                 latest = await self.card(request, project_id, card_id)
@@ -146,8 +183,6 @@ class TextureApi:
                 return web.json_response(response)
         except cloud_images.ImageEditError as error:
             return web.json_response(error.response(), status=error.status)
-        finally:
-            self.active.discard(key)
 
 
 def register_texture_routes(app, **dependencies):

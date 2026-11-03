@@ -2,8 +2,9 @@
   "enabled": true,
   "base_url": "http://30.245.124.125:8000/v1",
   "model": "gpt-image-2.5-sunburst",
+  "chat_model": "gpt-4o",
   "api_key": "",
-  "size": "1024x1024",
+  "size": "original",
   "quality": "medium",
   "output_format": "png"
 }

@@ -217,6 +217,11 @@
     "id": "image_composite",
     "name": "图片合成",
     "slots": "img8+aud0+vid0"
+   },
+   {
+    "id": "texture_enhance",
+    "name": "质感提升",
+    "slots": "img1+aud0+vid0"
    }
   ]
  },

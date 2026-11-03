@@ -104,7 +104,7 @@ class SandboxBoundaryTests(unittest.TestCase):
             data.mkdir()
             (data / '.admin-sandbox.json').write_text(json.dumps({
                 'runtime_root': str(root), 'prepared': True}))
-            (root / 'image-edit.json').write_text('{"api_key":"test-secret"}')
+            (root / 'cloud-ai-config.json').write_text('{"api_key":"test-secret"}')
             with self.assertRaisesRegex(RuntimeError, '正式服务配置'):
                 validate_runtime(root, data / 'auth.db')
 

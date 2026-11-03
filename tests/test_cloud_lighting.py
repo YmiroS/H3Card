@@ -123,7 +123,7 @@ class CloudLightingFixture:
         self.enterContext(mock.patch.object(app, "ws_loop", idle_ws))
         self.enterContext(mock.patch.object(app, "setup_dingtalk"))
         self.enterContext(mock.patch.object(app, "lan_ips", return_value=[]))
-        self.config = self.root / "image-edit.json"
+        self.config = self.root / "cloud-ai-config.json"
         self.enterContext(mock.patch.object(cloud_images, "CONF", self.config))
         self.received = []
         self.comfy_requests = []
