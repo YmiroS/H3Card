@@ -121,6 +121,8 @@ if "%SYNC_CORE%"=="1" (
   ) else (
     call :remove_obsolete_files "%DEST_ROOT%\ComfyUI"
     if errorlevel 1 goto failure
+    call :sync_plugin_dependencies
+    if errorlevel 1 goto failure
   )
 )
 
@@ -128,13 +130,28 @@ echo.
 if "%DRY_RUN%"=="1" (
   echo Dry-run inspection completed successfully. No files were changed.
 ) else (
-  echo Synchronization completed successfully.
+  echo File synchronization completed successfully.
   echo Files that exist only on this node were not deleted.
   if "%SYNC_CORE%"=="1" (
+    echo Managed plugin dependencies verified. Node loading still requires a ComfyUI restart.
     echo IMPORTANT: Update Python packages from ComfyUI\requirements.txt, then restart ComfyUI.
   )
 )
 goto success
+
+:sync_plugin_dependencies
+set "COMFY_PYTHON=%DEST_ROOT%\python_embeded\python.exe"
+set "DEPENDENCY_HELPER=%~dp0worker\sync_dependencies.py"
+if not exist "%COMFY_PYTHON%" (
+  echo ERROR: Cannot find ComfyUI Python: %COMFY_PYTHON%
+  exit /b 1
+)
+if not exist "%DEPENDENCY_HELPER%" (
+  echo ERROR: Cannot find managed dependency helper: %DEPENDENCY_HELPER%
+  exit /b 1
+)
+"%COMFY_PYTHON%" -s "%DEPENDENCY_HELPER%" --comfy-root "%DEST_ROOT%\ComfyUI"
+exit /b %ERRORLEVEL%
 
 :sync_comfy_core
 set "SYNC_NAME=%~1"
