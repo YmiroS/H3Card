@@ -274,6 +274,42 @@ class WorkerAgent:
         finally:
             tmp.unlink(missing_ok=True)
 
+    def deployment_blocks_jobs(self):
+        return bool(self.config.get("deployment_drain_file") and
+                    self.configured_path("deployment_drain_file", "").exists())
+
+    def write_deployment_json(self, key, value):
+        path = self.configured_path(key, "")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(path.name + f".tmp.{os.getpid()}")
+        try:
+            temporary.write_text(json.dumps(value), encoding="utf-8")
+            os.replace(temporary, path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+    def acknowledge_deployment(self):
+        if (not self.deployment_blocks_jobs() or self.current or self.local_busy
+                or self.release_failed or not self.comfy_online or self.pending_sync):
+            return
+        request = json.loads(self.configured_path("deployment_drain_file", "").read_text(encoding="utf-8"))
+        # Only the serial acquire/execute loop may acknowledge: an acquire request
+        # already in flight must finish its assignment before the updater can stop us.
+        self.write_deployment_json("deployment_ack_file", {
+            "token": request["token"], "pid": os.getpid(), "time": time.time(),
+        })
+
+    def refresh_deployment_report(self):
+        if not self.config.get("deployment_signal_file"):
+            return
+        path = self.configured_path("deployment_signal_file", "")
+        if not path.exists():
+            return
+        result = json.loads(path.read_text(encoding="utf-8"))
+        if (result.get("status") in {"done", "error"}
+                and result.get("request_id") != self.state.get("last_maintenance_request_id")):
+            self.sync_report = {key: result[key] for key in ("request_id", "status", "message")}
+
     def _ssl_context(self):
         ca_file = self.config.get("ca_file")
         return ssl.create_default_context(cafile=ca_file) if ca_file else ssl.create_default_context()
@@ -1100,6 +1136,25 @@ class WorkerAgent:
             if self.current or self.local_busy or self.release_failed:
                 return
         request_id = command["request_id"]
+        if action == "sync_files" and self.config.get("deployment_script"):
+            if os.name != "nt":
+                raise AgentError("共享部署更新只能在 Windows 上运行")
+            script = self.configured_path("deployment_script", "")
+            if script.name != "deploy.cmd" or not script.is_file():
+                raise AgentError("找不到本机共享部署入口 deploy.cmd")
+            self.write_deployment_json("deployment_signal_file", {
+                "request_id": request_id, "status": "running", "message": "等待共享部署更新",
+            })
+            subprocess.Popen(
+                ["cmd.exe", "/d", "/c", ".\\deploy.cmd", "--update"], cwd=str(script.parent),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=(getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                               | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)),
+            )
+            self.sync_report = {"request_id": request_id, "status": "running",
+                                "message": "正在使用主节点共享更新，不执行 Git 拉取"}
+            self.pending_sync = None
+            return
         self.sync_report = {
             "request_id": request_id,
             "status": "running",
@@ -1187,7 +1242,9 @@ class WorkerAgent:
                         self.queue_diagnostics(observed_assignment)
                 self.refresh_restart_report()
                 await self.refresh_host_reboot_report()
-                sync_running = bool(self.pending_sync) or self.maintenance_blocks_jobs()
+                self.refresh_deployment_report()
+                sync_running = (bool(self.pending_sync) or self.maintenance_blocks_jobs()
+                                or self.deployment_blocks_jobs())
                 body = {
                     "comfy_online": self.comfy_online,
                     "busy": (bool(self.current) or self.local_busy
@@ -1215,6 +1272,14 @@ class WorkerAgent:
                     self.current["_lease_deadline"] = (
                         time.monotonic() + float(reply["lease_ttl_seconds"])
                     )
+                if self.config.get("deployment_heartbeat_file"):
+                    try:
+                        self.write_deployment_json("deployment_heartbeat_file", {
+                            "pid": os.getpid(), "time": time.time(),
+                            "worker_id": self.state.get("worker_id"), "comfy_online": self.comfy_online,
+                        })
+                    except OSError as exc:
+                        print(f"[Worker] 无法写入本机部署心跳：{exc}", flush=True)
                 acknowledgement = (reply or {}).get("maintenance_ack") or {}
                 if (self.sync_report
                         and self.sync_report.get("status") in {"done", "error"}
@@ -1309,7 +1374,7 @@ class WorkerAgent:
 
     async def acquire(self):
         if (self.release_failed or not self.comfy_online or self.local_busy or self.current
-                or self.pending_sync or self.maintenance_blocks_jobs()):
+                or self.pending_sync or self.maintenance_blocks_jobs() or self.deployment_blocks_jobs()):
             return None
         return await self._json_request(
             "POST", self.server + "/agent/v1/jobs/acquire",
@@ -1723,6 +1788,7 @@ class WorkerAgent:
                 while not self.stop_event.is_set():
                     try:
                         await self.local_status()
+                        self.acknowledge_deployment()
                         if self.pending_sync and not self.local_busy and not self.release_failed:
                             await self.execute_pending_sync()
                             continue
