@@ -2992,6 +2992,62 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             self.assertTrue(page["has_more"])
             self.assertTrue(all(job["nodeName"] == "本机" for job in page["jobs"]))
 
+    async def test_generate_response_persists_job_and_binds_only_director_cards(self):
+        capability = {"id": "response-test", "name": "响应回归", "kind": "gen",
+                      "outputType": "image", "_graph_ok": True, "inputs": []}
+        graph = {"1": {"class_type": "KSampler", "inputs": {}}}
+        jobs_file = self.root / "data" / "response-jobs.json"
+        for controller_mode in (False, True):
+            for linked in (False, True):
+                with self.subTest(controller_mode=controller_mode, linked=linked):
+                    project_id = f"response-{controller_mode}-{linked}"
+                    self.own_project(project_id)
+                    project = self.projects.read(project_id)
+                    card = {"id": "c1", "cap": "response-test", "params": {}}
+                    if linked:
+                        card.update(director_shot="shot-1", director_stage="image",
+                                    director_selected={"job": "old", "index": 0})
+                    project["cards"] = [card]
+                    self.projects.write(project_id, project)
+
+                    async def submit(_app, _graph, **kwargs):
+                        return kwargs["prompt_id"]
+
+                    with mock.patch.object(controller_app, "CONTROLLER_MODE", controller_mode), \
+                         mock.patch.dict(controller_app.CAPS, {"response-test": capability}), \
+                         mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+                         mock.patch.object(controller_app, "cost_ledger", return_value=None), \
+                         mock.patch.object(controller_app, "JOBS_FILE", jobs_file), \
+                         mock.patch.object(controller_app, "save_jobs", self.old_save_jobs), \
+                         mock.patch.object(controller_app, "local_submit", side_effect=submit) as local, \
+                         mock.patch.object(controller_app, "broadcast_collaboration") as broadcast, \
+                         mock.patch.object(self.store, "enqueue", wraps=self.store.enqueue) as enqueue:
+                        response = await self.client.post("/api/generate", json={
+                            "capability": "response-test", "project": project_id, "card": "c1",
+                        })
+                    self.assertEqual(response.status, 200, await response.text())
+                    job = await response.json()
+                    self.assertEqual(job["status"], "queued")
+                    self.assertEqual(job["project"], project_id)
+                    self.assertEqual(job["card"], "c1")
+                    persisted = {row["id"]: row for row in json.loads(
+                        jobs_file.read_text(encoding="utf-8"))}
+                    self.assertEqual(persisted[job["id"]], controller_app.JOBS[job["id"]])
+                    self.assertEqual(local.await_count, int(not controller_mode))
+                    self.assertEqual(enqueue.call_count, int(controller_mode))
+                    saved = self.projects.read(project_id)
+                    if linked:
+                        self.assertEqual(job["project_rev"], 1)
+                        self.assertEqual(saved["rev"], job["project_rev"])
+                        self.assertEqual(saved["cards"][0]["job"], job["id"])
+                        self.assertEqual(saved["cards"][0]["status"], "queued")
+                        self.assertNotIn("director_selected", saved["cards"][0])
+                        broadcast.assert_awaited_once()
+                    else:
+                        self.assertNotIn("project_rev", job)
+                        self.assertEqual(saved, project)
+                        broadcast.assert_not_awaited()
+
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
         self.own_project("project-1")
         self.register_asset("test.png", "project-1")

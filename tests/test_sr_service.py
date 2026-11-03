@@ -389,6 +389,9 @@ class RemoteSRGenerateTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFi
         self.assertEqual(inputs["video"].resolve(), self.video.resolve())
         self.assertEqual([path.resolve() for path in inputs["refs"]], [self.face.resolve()])
         self.assertEqual(params, {"output_height": "1080"})
+        persisted = json.loads(chouka_app.JOBS_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(persisted, [job])
+        self.runner.start.assert_called_once()
         jobs = (await (await self.client.get("/api/jobs")).json())["jobs"]
         self.assertEqual(jobs[0]["nodeName"], "远程超分服务")
         self.assertNotIn("task_id", json.dumps(jobs))

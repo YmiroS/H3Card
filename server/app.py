@@ -1539,7 +1539,7 @@ async def api_generate(request):
         if body.get("dry_run"):
             return web.json_response({"dry_run": True, "changed": {}})
         pid = await submit_remote_sr(request, body, cap)
-        return await generation_response(request, body, pid, project, linked_card)
+        return await generation_job_response(request, body, pid, project, linked_card)
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
@@ -1681,10 +1681,10 @@ async def api_generate(request):
         distributed_store(request.app).enqueue(pid, dispatch_payload, required_nodes)
         if ledger:
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
-    return await generation_response(request, body, pid, project, linked_card)
+    return await generation_job_response(request, body, pid, project, linked_card)
 
 
-async def generation_response(request, body, pid, project, linked_card):
+async def generation_job_response(request, body, pid, project, linked_card):
     save_jobs()
     return await generation_response(request, body, project, linked_card, JOBS[pid])
 
