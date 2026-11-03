@@ -37,6 +37,7 @@ from functools import partial
 
 import aiohttp
 from aiohttp import web
+from PIL import Image
 
 # 整合包那个 python_embeded 带 python312._pth，有这个文件 Python 就**不会**把脚本
 # 自己的目录塞进 sys.path，于是同目录的 rewrite.py 直接 import 不到（报
@@ -939,6 +940,33 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
         if absent:
             raise web.HTTPBadRequest(reason="引用素材未提供：" + "、".join(sorted(absent)))
         g["238"]["inputs"]["value"] = re.sub(pattern, lambda match: references[match[0]], prompt)
+    if cap["id"] in {"qwen_lighting", "qwen_lighting_multi"}:
+        ref = uploaded["images[0]"]
+        local = ROOT / "data" / "uploads" / Path(ref).name
+        source = local if local.exists() else COMFY_INPUT / ref
+        with Image.open(source) as image:
+            source_width, source_height = image.size
+            if image.getexif().get(274) in (5, 6, 7, 8):
+                source_width, source_height = source_height, source_width
+        scale_node = g["84"]
+        budget = float(scale_node["inputs"]["megapixels"]) * 1024 * 1024
+        if not math.isfinite(budget) or not 256 <= budget <= 16 * 1024 * 1024:
+            raise web.HTTPBadRequest(reason="处理像素预算必须在 256 像素至 16MP 之间")
+        scale = math.sqrt(budget / (source_width * source_height))
+        width = max(16, math.floor(source_width * scale / 16) * 16)
+        height = max(16, math.floor(source_height * scale / 16) * 16)
+        if width * height > budget:
+            if width >= height:
+                width = math.floor(budget / height / 16) * 16
+            else:
+                height = math.floor(budget / width / 16) * 16
+        # 采样前锁定尺寸：16 对齐后的总像素绝不超过所选预算。
+        scale_node["class_type"] = "ImageScale"
+        scale_node["inputs"] = {
+            "image": scale_node["inputs"]["image"],
+            "upscale_method": scale_node["inputs"]["upscale_method"],
+            "width": width, "height": height, "crop": "disabled",
+        }
     patch_h3_character_transfer(g, cap, params, uploaded, video_metadata)
     patch_follow_reference_video(g, cap, follow)
     for spec in cap["inputs"]:
