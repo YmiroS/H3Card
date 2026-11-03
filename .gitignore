@@ -4,6 +4,7 @@ data/
 # 改写用的 API key。模板 llm.json.例子 要入库，填好的这份绝不能
 /llm.json
 /image-edit.json
+/sr-service.json
 
 # Python
 __pycache__/

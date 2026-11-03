@@ -940,6 +940,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_get("/controller", controller_app.controller_index)
         application.router.add_get("/controller/costs", controller_app.controller_costs)
         application.router.add_get("/api/health", controller_app.api_health)
+        application.router.add_get("/api/status", controller_app.api_status)
         application.router.add_get("/api/cards", controller_app.api_cards)
         application.router.add_post("/api/reload", controller_app.api_reload)
         application.router.add_get("/api/jobs", controller_app.api_jobs)
@@ -2402,6 +2403,82 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn("server_time", health)
         self.assertIn("started_at", health)
 
+    async def test_metadata_reads_leave_public_files_responsive(self):
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        for path, target, method in (("/api/health", self.store, "list_workers"),
+                                     ("/api/status", self.store, "list_workers"),
+                                     ("/api/projects", self.projects, "read"),
+                                     ("/api/workers", controller_app, "worker_capability_comparisons")):
+            with self.subTest(path=path):
+                started, release = asyncio.Event(), threading.Event()
+                original = getattr(target, method)
+
+                def blocked(*args, **kwargs):
+                    self.assertNotEqual(threading.get_ident(), loop_thread)
+                    if method == "list_workers":
+                        self.assertTrue(kwargs.get("summary"))
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(5):
+                        raise AssertionError("metadata read was not released")
+                    return original(*args, **kwargs)
+
+                with mock.patch.object(target, method, side_effect=blocked):
+                    pending = asyncio.ensure_future(self.client.get(path))
+                    try:
+                        await asyncio.wait_for(started.wait(), timeout=2)
+                        response = await asyncio.wait_for(
+                            self.client.get("/auth-logo.png"), timeout=2)
+                        self.assertEqual(response.status, 200)
+                        await response.read()
+                    finally:
+                        release.set()
+                        response = await pending
+                    self.assertEqual(response.status, 200, await response.text())
+                    payload = await response.json()
+                    if path == "/api/health":
+                        self.assertEqual(payload["workers"], 0)
+                        self.assertFalse(payload["comfy_online"])
+                    elif path == "/api/status":
+                        self.assertFalse(payload["comfy_online"])
+                        self.assertEqual(payload["active_count"], 0)
+                    elif path == "/api/workers":
+                        self.assertEqual(payload["workers"], [])
+                    else:
+                        self.assertEqual([item["id"] for item in payload["projects"]], ["p"])
+
+    async def test_worker_response_encoding_is_off_loop_and_preserves_payload(self):
+        self.store.register_worker("编码回归", {"node_classes": ["KSampler"]})
+        baseline, workers = controller_app.worker_capability_comparisons(self.store.list_workers())
+        expected = json.dumps({"comparison_baseline": baseline, "workers": workers}).encode("utf-8")
+        loop_thread = threading.get_ident()
+        original = json.dumps
+        encoded = []
+
+        def checked(value, *args, **kwargs):
+            if isinstance(value, dict) and "comparison_baseline" in value and "workers" in value:
+                self.assertNotEqual(threading.get_ident(), loop_thread)
+                encoded.append(True)
+            return original(value, *args, **kwargs)
+
+        with mock.patch.object(controller_app.json, "dumps", side_effect=checked):
+            response = await self.client.get("/api/workers")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), expected)
+        self.assertEqual(encoded, [True])
+        self.assertEqual(response.content_type, "application/json")
+        self.assertEqual(response.charset, "utf-8")
+
+    async def test_status_local_mode_does_not_query_worker_registry(self):
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+                mock.patch.dict(controller_app.STATE, {"comfy_online": True}), \
+                mock.patch.object(self.store, "list_workers", side_effect=AssertionError("local registry query")):
+            response = await self.client.get("/api/status")
+            self.assertEqual(response.status, 200)
+            self.assertTrue((await response.json())["comfy_online"])
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
+
     async def test_restart_contract_and_targeted_heartbeat(self):
         for action in ("reboot_host", "restart_services"):
             credentials = self.store.register_worker(action, {"supports_service_restart": True, "supports_host_reboot": True,
@@ -2991,6 +3068,62 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             self.assertEqual(page["total"], 3)
             self.assertTrue(page["has_more"])
             self.assertTrue(all(job["nodeName"] == "本机" for job in page["jobs"]))
+
+    async def test_generate_response_persists_job_and_binds_only_director_cards(self):
+        capability = {"id": "response-test", "name": "响应回归", "kind": "gen",
+                      "outputType": "image", "_graph_ok": True, "inputs": []}
+        graph = {"1": {"class_type": "KSampler", "inputs": {}}}
+        jobs_file = self.root / "data" / "response-jobs.json"
+        for controller_mode in (False, True):
+            for linked in (False, True):
+                with self.subTest(controller_mode=controller_mode, linked=linked):
+                    project_id = f"response-{controller_mode}-{linked}"
+                    self.own_project(project_id)
+                    project = self.projects.read(project_id)
+                    card = {"id": "c1", "cap": "response-test", "params": {}}
+                    if linked:
+                        card.update(director_shot="shot-1", director_stage="image",
+                                    director_selected={"job": "old", "index": 0})
+                    project["cards"] = [card]
+                    self.projects.write(project_id, project)
+
+                    async def submit(_app, _graph, **kwargs):
+                        return kwargs["prompt_id"]
+
+                    with mock.patch.object(controller_app, "CONTROLLER_MODE", controller_mode), \
+                         mock.patch.dict(controller_app.CAPS, {"response-test": capability}), \
+                         mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+                         mock.patch.object(controller_app, "cost_ledger", return_value=None), \
+                         mock.patch.object(controller_app, "JOBS_FILE", jobs_file), \
+                         mock.patch.object(controller_app, "save_jobs", self.old_save_jobs), \
+                         mock.patch.object(controller_app, "local_submit", side_effect=submit) as local, \
+                         mock.patch.object(controller_app, "broadcast_collaboration") as broadcast, \
+                         mock.patch.object(self.store, "enqueue", wraps=self.store.enqueue) as enqueue:
+                        response = await self.client.post("/api/generate", json={
+                            "capability": "response-test", "project": project_id, "card": "c1",
+                        })
+                    self.assertEqual(response.status, 200, await response.text())
+                    job = await response.json()
+                    self.assertEqual(job["status"], "queued")
+                    self.assertEqual(job["project"], project_id)
+                    self.assertEqual(job["card"], "c1")
+                    persisted = {row["id"]: row for row in json.loads(
+                        jobs_file.read_text(encoding="utf-8"))}
+                    self.assertEqual(persisted[job["id"]], controller_app.JOBS[job["id"]])
+                    self.assertEqual(local.await_count, int(not controller_mode))
+                    self.assertEqual(enqueue.call_count, int(controller_mode))
+                    saved = self.projects.read(project_id)
+                    if linked:
+                        self.assertEqual(job["project_rev"], 1)
+                        self.assertEqual(saved["rev"], job["project_rev"])
+                        self.assertEqual(saved["cards"][0]["job"], job["id"])
+                        self.assertEqual(saved["cards"][0]["status"], "queued")
+                        self.assertNotIn("director_selected", saved["cards"][0])
+                        broadcast.assert_awaited_once()
+                    else:
+                        self.assertNotIn("project_rev", job)
+                        self.assertEqual(saved, project)
+                        broadcast.assert_not_awaited()
 
     async def test_generate_persists_every_submitted_prompt_before_completion(self):
         self.own_project("project-1")
