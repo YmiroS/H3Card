@@ -2223,6 +2223,8 @@ JOBS_FILE = ROOT / "data" / "jobs.json"
 
 async def api_status(request):
     """给局域网内其他软件读取的轻量占用状态。"""
+    workers = (await asyncio.to_thread(distributed_store(request.app).list_workers, summary=True)
+               if CONTROLLER_MODE else [])
     running_count = sum(j.get("status") == "running" for j in JOBS.values())
     queued_count = sum(j.get("status") == "queued" for j in JOBS.values())
     active_count = running_count + queued_count
@@ -2237,7 +2239,7 @@ async def api_status(request):
         "running_count": running_count,
         "queued_count": queued_count,
         "active_count": active_count,
-        "comfy_online": controller_comfy_online(request.app),
+        "comfy_online": controller_comfy_online(request.app, workers),
     })
     # 状态不能被浏览器或中间代理缓存；只读 GET 允许局域网页面跨域查询。
     response.headers["Cache-Control"] = "no-store"
@@ -2644,10 +2646,14 @@ async def api_generation_workers(request):
 
 
 async def api_workers(request):
-    baseline, workers = worker_capability_comparisons(
-        distributed_store(request.app).list_workers()
-    )
-    return web.json_response({"comparison_baseline": baseline, "workers": workers})
+    store = distributed_store(request.app)
+
+    def encode_workers():
+        baseline, workers = worker_capability_comparisons(store.list_workers())
+        return json.dumps({"comparison_baseline": baseline, "workers": workers}).encode("utf-8")
+
+    body = await asyncio.to_thread(encode_workers)
+    return web.Response(body=body, content_type="application/json", charset="utf-8")
 
 
 async def api_worker_temperature(request):

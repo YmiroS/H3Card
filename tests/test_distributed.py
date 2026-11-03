@@ -920,6 +920,109 @@ class DistributedStoreTest(unittest.TestCase):
         self.store.close()
         self.temp.cleanup()
 
+    def _lazy_decode_peer(self):
+        caps = {
+            "node_classes": ["KSampler", "SaveImage", "UNETLoader"],
+            "input_choices": {"UNETLoader": {"unet_name": []}},
+            "devices": [{"type": "cuda", "name": "RTX 5090", "vram_total": 32 * 1024 ** 3}],
+        }
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        peer_caps = copy.deepcopy(caps)
+        peer_caps["node_classes"].append("MissingNode")
+        peer_caps["input_choices"]["UNETLoader"]["unet_name"] = ["missing.safetensors"]
+        peer_caps["devices"][0].update(name="RTX A6000", vram_total=48 * 1024 ** 3)
+        peer = self.store.register_worker("lazy-decode-peer", peer_caps)["worker_id"]
+        self.store.heartbeat(peer, comfy_online=True)
+        peer_json = self.store.db.execute(
+            "SELECT capabilities_json FROM workers WHERE id=?", (peer,),
+        ).fetchone()[0]
+        return peer, peer_json
+
+    def test_acquire_lazy_early_returns(self):
+        peer, _ = self._lazy_decode_peer()
+        for state in ("empty", "busy", "offline", "stale"):
+            with self.subTest(state=state):
+                self.store.heartbeat(self.worker_id, comfy_online=True, busy=False)
+                job_id = "expired-" + state
+                self.store.enqueue(job_id, {"graph": {}})
+                assignment = self.store.acquire(peer)
+                self.assertEqual(assignment["job_id"], job_id)
+                # Cancellation leaves no queued rows after reclamation in the empty case.
+                if state == "empty":
+                    self.store.request_cancel(job_id)
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE dispatch_jobs SET lease_expires_at=0 WHERE job_id=?", (job_id,),
+                    )
+                    self.store.db.execute(
+                        "UPDATE workers SET busy=?, comfy_online=?, last_seen=? WHERE id=?",
+                        (int(state == "busy"), int(state != "offline"),
+                         0 if state == "stale" else time.time(), self.worker_id),
+                    )
+                with mock.patch("distributed.json.loads", wraps=json.loads) as loads:
+                    self.assertIsNone(self.store.acquire(self.worker_id))
+                    loads.assert_not_called()
+                row = self.store.db.execute(
+                    "SELECT status, worker_id, lease_expires_at FROM dispatch_jobs WHERE job_id=?",
+                    (job_id,),
+                ).fetchone()
+                self.assertEqual(tuple(row), (
+                    "canceled" if state == "empty" else "queued", None, None,
+                ))
+                worker = self.store.db.execute(
+                    "SELECT busy, current_job_id FROM workers WHERE id=?", (peer,),
+                ).fetchone()
+                self.assertEqual(tuple(worker), (0, None))
+                attempt = self.store.db.execute(
+                    "SELECT status FROM capacity_attempts WHERE id=?", (assignment["attempt_id"],),
+                ).fetchone()
+                self.assertEqual(attempt[0], "expired")
+                self.store.remove_job(job_id)
+
+    def test_acquire_lazy_skips_peer_decode(self):
+        peer, peer_json = self._lazy_decode_peer()
+        high_vram = {"capability": "minimax_h3_ref_2pass", "graph": {}}
+        cases = (
+            ("ordinary", {"capability": "zimage_t2i"}, ["KSampler"], True),
+            ("targeted", {**high_vram, "target_worker_id": self.worker_id}, ["KSampler"], True),
+            ("other-target", {**high_vram, "target_worker_id": peer}, ["KSampler"], False),
+            ("nodes", high_vram, ["MissingNode"], False),
+            ("models", {**high_vram, "graph": {
+                "1": {"class_type": "UNETLoader", "inputs": {"unet_name": "missing.safetensors"}},
+            }}, ["UNETLoader"], False),
+            ("vram", {"capability": BF16_TWO_PASS_CAPABILITY}, ["KSampler"], False),
+        )
+        for name, payload, required_nodes, runnable in cases:
+            with self.subTest(case=name):
+                self.store.enqueue(name, payload, required_nodes)
+                with mock.patch("distributed.json.loads", wraps=json.loads) as loads:
+                    assignment = self.store.acquire(self.worker_id)
+                # capacity.assigned also decodes this worker; count only the peer JSON.
+                self.assertNotIn(mock.call(peer_json), loads.call_args_list)
+                if runnable:
+                    self.assertEqual(assignment["job_id"], name)
+                    self.store.finish(name, self.worker_id, assignment["lease_token"], "done",
+                                      capacity_released=True)
+                else:
+                    self.assertIsNone(assignment)
+                    self.assertEqual(self.store.dispatch_status(name), "queued")
+                self.store.remove_job(name)
+
+    def test_acquire_lazy_high_vram_peer_once(self):
+        peer, peer_json = self._lazy_decode_peer()
+        for job_id in ("hq-first", "hq-second"):
+            self.store.enqueue(job_id, {"capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+        # Both queued jobs defer to the larger idle GPU, sharing one decode per acquire.
+        for _ in range(2):
+            with mock.patch("distributed.json.loads", wraps=json.loads) as loads:
+                self.assertIsNone(self.store.acquire(self.worker_id))
+            self.assertEqual(loads.call_args_list.count(mock.call(peer_json)), 1)
+        for job_id in ("hq-first", "hq-second"):
+            self.assertEqual(self.store.dispatch_status(job_id), "queued")
+        assignment = self.store.acquire(peer)
+        self.assertEqual(assignment["job_id"], "hq-first")
+        self.assertEqual(self.store.dispatch_status("hq-second"), "queued")
+
     def test_capacity_assignment_shares_dispatch_transaction(self):
         self.store.enqueue("atomic-job", {"graph": {}, "capability": "test"})
         with mock.patch.object(self.store.capacity, "assigned", side_effect=RuntimeError("write failed")):

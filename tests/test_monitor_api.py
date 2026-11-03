@@ -14,12 +14,14 @@ from unittest.mock import patch
 
 from aiohttp import web
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "server"))
 
 from auth_support import AuthFixture, PASSWORD
 from distributed import DistributedStore, TEMPERATURE_MAX_GPU_INDEX, worker_capability_comparisons
 from server.auth import COOKIE
-from server.monitor import register_monitor_routes, safe_capabilities, safe_error
+from server.monitor import register_monitor_routes, safe_capabilities, safe_error, safe_worker
 from server.routes import STATIC_ASSETS, register_page_routes
 
 
@@ -173,6 +175,52 @@ class MonitorAPITests(AuthFixture, unittest.IsolatedAsyncioTestCase):
             "comfyui_version": "0.37.0", "comfyui_build_version": "0.37.0+chouka.1",
         })
 
+    async def test_telemetry_only_summary_matches_full_safe_workers(self):
+        await self.login("screen")
+        # 复用主节点、同步错误及隐私哨兵；非空同步字段不能在 SQL 精简中丢失。
+        with self.store.lock, self.store.db:
+            self.store.db.execute(
+                """UPDATE workers SET sync_request_id=?, sync_requested_at=?,
+                   sync_finished_at=? WHERE id=?""",
+                ("monitor-sync", self.now - 5, self.now - 1, self.worker))
+        for version_fields, projected_version in (
+            ({"agent_version": True}, None),
+            ({"agent_version": False}, None),
+            ({"agent_version": "5.1.0"}, "5.1.0"),
+            ({"agent_version": "5"}, "5"),
+            ({"agent_version": 5}, 5),
+            ({"agent_version": 5.25}, 5.25),
+            ({"agent_version": None}, None),
+            ({}, None),
+        ):
+            with self.subTest(version_fields=version_fields):
+                caps = copy.deepcopy(self.caps)
+                caps.pop("agent_version")
+                caps.update(version_fields)
+                self.store.heartbeat(self.worker, capabilities=caps, comfy_online=True)
+                full = self.store.list_workers()
+                expected = [safe_worker(worker) for worker in full]
+                with patch.object(self.store, "list_workers", wraps=self.store.list_workers) as listing, \
+                     patch("server.monitor.safe_worker", wraps=safe_worker) as projection:
+                    data = await self.get_json("/api/monitor/summary")
+                listing.assert_called_once_with(telemetry_only=True)
+                telemetry_only = [call.args[0] for call in projection.call_args_list]
+                self.assertEqual([safe_worker(worker) for worker in telemetry_only], expected)
+                self.assertEqual(data["workers"], expected)
+                self.assertEqual(len(telemetry_only), 2)
+                for worker in telemetry_only:
+                    self.assertEqual(set(worker["capabilities"]), {"agent_version", "telemetry", "devices", "system"})
+                raw = next(worker for worker in telemetry_only if worker["id"] == self.worker)
+                # bool 与 int 的相等比较会掩盖 SQLite true/false -> 1/0 的类型退化。
+                self.assertIs(type(raw["capabilities"]["agent_version"]),
+                              type(version_fields.get("agent_version")))
+                worker = next(worker for worker in data["workers"] if worker["id"] == self.worker)
+                self.assertEqual(worker["capabilities"]["agent_version"], projected_version)
+                self.assertIs(type(worker["capabilities"]["agent_version"]), type(projected_version))
+                self.assertNotIn(LEAK, json.dumps(data))
+                self.assertNotIn("Bearer", json.dumps(data))
+                self.assertNotIn("https://", json.dumps(data))
+
     async def test_recent_60_and_global_status_counts(self):
         self.jobs = [dict(self.jobs[0], id=f"j{i}", created=i, status="running" if i % 2 else "queued") for i in range(80)]
         data = await self.get_json("/api/monitor/summary")
@@ -280,19 +328,50 @@ class MonitorAPITests(AuthFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get(self.detail_path() + "/temperature")).status, 404)
 
     async def test_large_detail_is_complete_only_on_demand(self):
+        await self.login("screen")
         caps = copy.deepcopy(self.caps)
-        nodes = [f"Node{i:05d}" for i in range(5000)]
+        nodes = ["Loader"] + [f"Node{i:05d}" for i in range(5000)]
         models = [f"model{i:05d}.safetensors" for i in range(3000)]
         caps["node_classes"] = nodes
         caps["input_choices"]["Loader"]["ckpt_name"] = models
         self.store.heartbeat(self.worker, capabilities=caps, comfy_online=True)
-        summary = await self.get_json("/api/monitor/summary")
-        self.assertNotIn("Node04999", json.dumps(summary))
+        # 检查真实路由的解码输入和内部投影入参，不只检查最终响应够小。
+        with patch("distributed.json.loads", wraps=json.loads) as decoding, \
+             patch.object(self.store, "list_workers", wraps=self.store.list_workers) as listing, \
+             patch("server.monitor.safe_worker", wraps=safe_worker) as projection:
+            summary = await self.get_json("/api/monitor/summary")
+        listing.assert_called_once_with(telemetry_only=True)
+        decoded_inputs = [call.args[0] for call in decoding.call_args_list]
+        self.assertTrue(decoded_inputs)
+        self.assertTrue(any('"agent_version"' in value for value in decoded_inputs))
+        internal = [call.args[0] for call in projection.call_args_list]
+        self.assertEqual({worker["id"] for worker in internal}, {self.primary, self.worker})
+        for worker in internal:
+            self.assertEqual(set(worker["capabilities"]), {"agent_version", "telemetry", "devices", "system"})
+        for value in [*decoded_inputs, json.dumps(internal), json.dumps(summary)]:
+            for forbidden in ("node_classes", "input_choices", "input_types", "model_inventory",
+                              "Node04999", "model02999.safetensors"):
+                self.assertNotIn(forbidden, value)
         self.assertLess(len(json.dumps(summary)), 16000)
-        detail = await self.get_json(self.detail_path())
+        with patch.object(self.store, "list_workers", wraps=self.store.list_workers) as listing:
+            detail = await self.get_json(self.detail_path())
+        listing.assert_called_once_with()
         self.assertEqual(detail["capabilities"]["node_classes"], nodes)
         self.assertEqual([item["name"] for item in detail["capabilities"]["model_inventory"]], models)
         self.assertGreater(len(json.dumps(detail["capabilities"])), 16000)
+        self.assertEqual(detail["comparison_baseline"], {
+            "status": "ready", "worker_id": self.primary, "agent_version": self.caps["agent_version"]})
+        comparison = detail["capability_comparison"]
+        self.assertEqual(comparison["status"], "missing")
+        self.assertEqual(comparison["model_inventory_status"], "missing")
+        self.assertEqual(comparison["missing_node_classes"], ["KSampler", "PrimaryOnly"])
+        self.assertEqual(comparison["extra_node_classes"], nodes[1:])
+        self.assertEqual(comparison["missing_models"], [
+            {"node_class": "Loader", "input": "ckpt_name", "name": name}
+            for name in ("base.safetensors", "required.safetensors")])
+        self.assertEqual(comparison["extra_models"], [
+            {"node_class": "Loader", "input": "ckpt_name", "name": name} for name in models])
+        self.assertNotIn(LEAK, json.dumps(detail))
 
     async def test_ambiguous_and_missing_baseline_match_existing_comparison(self):
         caps = copy.deepcopy(self.caps)

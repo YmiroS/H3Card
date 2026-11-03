@@ -168,7 +168,7 @@ def safe_worker(worker):
 
 def _summary(app, jobs, get_health):
     store = app.get("distributed")
-    workers = store.list_workers() if store is not None else []
+    workers = store.list_workers(telemetry_only=True) if store is not None else []
     raw_health = get_health(app, workers)
     health = {key: _scalar(raw_health.get(key)) for key in (
         "ok", "mode", "server_time", "started_at", "sandbox", "capabilities", "jobs", "comfy_online")}

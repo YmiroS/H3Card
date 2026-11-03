@@ -999,15 +999,23 @@ class DistributedStore:
             ).fetchall()
         return {row["job_id"]: row["name"] for row in rows}
 
-    def list_workers(self, *, summary=False):
+    def list_workers(self, *, summary=False, telemetry_only=False):
         now = time.time()
         columns = "*"
-        if summary:
-            # 健康轮询只取状态，避免把每台数 MB 的节点/模型清单解码成 Python 对象。
+        if summary or telemetry_only:
+            # 轮询只取所需字段，避免把每台数 MB 的节点/模型清单解码成 Python 对象。
             columns = """id, name, enabled, comfy_online, busy, current_job_id,
                          last_seen, sync_status,
                          json_type(COALESCE(NULLIF(capabilities_json, ''), '{}'),
                                    '$.is_primary_node') = 'true' AS is_primary_node"""
+            if telemetry_only and not summary:
+                columns += """, sync_request_id, sync_requested_at, sync_finished_at, sync_message,
+                    json_object(
+                        'agent_version', json(COALESCE(COALESCE(NULLIF(capabilities_json, ''), '{}') -> '$.agent_version', 'null')),
+                        'telemetry', json_extract(COALESCE(NULLIF(capabilities_json, ''), '{}'), '$.telemetry'),
+                        'devices', json_extract(COALESCE(NULLIF(capabilities_json, ''), '{}'), '$.devices'),
+                        'system', json_extract(COALESCE(NULLIF(capabilities_json, ''), '{}'), '$.system')
+                    ) AS capabilities_json"""
         with self.lock, self.db:
             self._expire_service_restarts_locked(now)
             rows = self.db.execute(
@@ -1027,10 +1035,11 @@ class DistributedStore:
             item["enabled"] = bool(item["enabled"])
             item["comfy_online"] = bool(item["comfy_online"])
             item["busy"] = bool(item["busy"])
-            if summary:
+            if not summary:
+                item["capabilities"] = json.loads(item.pop("capabilities_json") or "{}")
+            if summary or telemetry_only:
                 item["is_primary_node"] = bool(item["is_primary_node"])
             else:
-                item["capabilities"] = json.loads(item.pop("capabilities_json") or "{}")
                 item["is_primary_node"] = _primary_node(item["capabilities"])
             online = now - item["last_seen"] <= self.offline_seconds
             if not online:
@@ -1094,6 +1103,15 @@ class DistributedStore:
             ).fetchone()
             if not worker or not worker["enabled"] or not worker["comfy_online"]:
                 return None
+            if now - worker["last_seen"] > self.offline_seconds:
+                return None
+            if worker["busy"] or worker["current_job_id"]:
+                return None
+            rows = self.db.execute(
+                "SELECT * FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
+            ).fetchall()
+            if not rows:
+                return None
             capabilities = json.loads(worker["capabilities_json"] or "{}")
             host_id = _worker_host_id(capabilities)
             if host_id and host_id in self._service_maintenance_hosts_locked():
@@ -1101,28 +1119,9 @@ class DistributedStore:
             if (not _primary_node(capabilities)
                     and worker["sync_status"] in ("pending", "running", "error")):
                 return None
-            if now - worker["last_seen"] > self.offline_seconds:
-                return None
-            if worker["busy"] or worker["current_job_id"]:
-                return None
             available_nodes = set(capabilities.get("node_classes") or [])
             current_vram = primary_gpu_vram_bytes(capabilities.get("devices"))
-            idle_workers = self.db.execute(
-                """SELECT id, capabilities_json, sync_status FROM workers
-                   WHERE id != ? AND retired = 0 AND enabled = 1 AND comfy_online = 1
-                     AND busy = 0 AND current_job_id IS NULL
-                     AND last_seen >= ?""",
-                (worker_id, now - self.offline_seconds),
-            ).fetchall()
-            idle_capabilities = []
-            for item in idle_workers:
-                other_capabilities = json.loads(item["capabilities_json"] or "{}")
-                if (_primary_node(other_capabilities)
-                        or item["sync_status"] not in ("pending", "running", "error")):
-                    idle_capabilities.append(other_capabilities)
-            rows = self.db.execute(
-                "SELECT * FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
-            ).fetchall()
+            idle_capabilities = None
             eligible = []
             for row in rows:
                 payload = json.loads(row["payload_json"])
@@ -1148,17 +1147,33 @@ class DistributedStore:
                             payload.get("duration_seconds"), targeted_video=targeted_video,
                         )):
                     continue
-                if target_worker_id is None and requires_high_vram(capability, gpu_policy) and any(
-                    primary_gpu_vram_bytes(other.get("devices")) > current_vram
-                    and required.issubset(set(other.get("node_classes") or []))
-                    and has_required_models(payload.get("graph") or {}, other)
-                    and can_run_capability(
-                        capability, other.get("devices"), gpu_policy,
-                        payload.get("duration_seconds"),
-                    )
-                    for other in idle_capabilities
-                ):
-                    continue
+                if target_worker_id is None and requires_high_vram(capability, gpu_policy):
+                    if idle_capabilities is None:
+                        # 只有本机可执行的非指定高显存任务才需要比较其他空闲节点。
+                        idle_workers = self.db.execute(
+                            """SELECT id, capabilities_json, sync_status FROM workers
+                               WHERE id != ? AND retired = 0 AND enabled = 1 AND comfy_online = 1
+                                 AND busy = 0 AND current_job_id IS NULL
+                                 AND last_seen >= ?""",
+                            (worker_id, now - self.offline_seconds),
+                        ).fetchall()
+                        idle_capabilities = []
+                        for item in idle_workers:
+                            other_capabilities = json.loads(item["capabilities_json"] or "{}")
+                            if (_primary_node(other_capabilities)
+                                    or item["sync_status"] not in ("pending", "running", "error")):
+                                idle_capabilities.append(other_capabilities)
+                    if any(
+                        primary_gpu_vram_bytes(other.get("devices")) > current_vram
+                        and required.issubset(set(other.get("node_classes") or []))
+                        and has_required_models(payload.get("graph") or {}, other)
+                        and can_run_capability(
+                            capability, other.get("devices"), gpu_policy,
+                            payload.get("duration_seconds"),
+                        )
+                        for other in idle_capabilities
+                    ):
+                        continue
                 eligible.append((row, payload))
             if not eligible:
                 return None

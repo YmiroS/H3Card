@@ -940,6 +940,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_get("/controller", controller_app.controller_index)
         application.router.add_get("/controller/costs", controller_app.controller_costs)
         application.router.add_get("/api/health", controller_app.api_health)
+        application.router.add_get("/api/status", controller_app.api_status)
         application.router.add_get("/api/cards", controller_app.api_cards)
         application.router.add_post("/api/reload", controller_app.api_reload)
         application.router.add_get("/api/jobs", controller_app.api_jobs)
@@ -2406,7 +2407,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         loop = asyncio.get_running_loop()
         loop_thread = threading.get_ident()
         for path, target, method in (("/api/health", self.store, "list_workers"),
-                                     ("/api/projects", self.projects, "read")):
+                                     ("/api/status", self.store, "list_workers"),
+                                     ("/api/projects", self.projects, "read"),
+                                     ("/api/workers", controller_app, "worker_capability_comparisons")):
             with self.subTest(path=path):
                 started, release = asyncio.Event(), threading.Event()
                 original = getattr(target, method)
@@ -2436,8 +2439,45 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                     if path == "/api/health":
                         self.assertEqual(payload["workers"], 0)
                         self.assertFalse(payload["comfy_online"])
+                    elif path == "/api/status":
+                        self.assertFalse(payload["comfy_online"])
+                        self.assertEqual(payload["active_count"], 0)
+                    elif path == "/api/workers":
+                        self.assertEqual(payload["workers"], [])
                     else:
                         self.assertEqual([item["id"] for item in payload["projects"]], ["p"])
+
+    async def test_worker_response_encoding_is_off_loop_and_preserves_payload(self):
+        self.store.register_worker("编码回归", {"node_classes": ["KSampler"]})
+        baseline, workers = controller_app.worker_capability_comparisons(self.store.list_workers())
+        expected = json.dumps({"comparison_baseline": baseline, "workers": workers}).encode("utf-8")
+        loop_thread = threading.get_ident()
+        original = json.dumps
+        encoded = []
+
+        def checked(value, *args, **kwargs):
+            if isinstance(value, dict) and "comparison_baseline" in value and "workers" in value:
+                self.assertNotEqual(threading.get_ident(), loop_thread)
+                encoded.append(True)
+            return original(value, *args, **kwargs)
+
+        with mock.patch.object(controller_app.json, "dumps", side_effect=checked):
+            response = await self.client.get("/api/workers")
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.read(), expected)
+        self.assertEqual(encoded, [True])
+        self.assertEqual(response.content_type, "application/json")
+        self.assertEqual(response.charset, "utf-8")
+
+    async def test_status_local_mode_does_not_query_worker_registry(self):
+        with mock.patch.object(controller_app, "CONTROLLER_MODE", False), \
+                mock.patch.dict(controller_app.STATE, {"comfy_online": True}), \
+                mock.patch.object(self.store, "list_workers", side_effect=AssertionError("local registry query")):
+            response = await self.client.get("/api/status")
+            self.assertEqual(response.status, 200)
+            self.assertTrue((await response.json())["comfy_online"])
+        self.assertEqual(response.headers["Access-Control-Allow-Origin"], "*")
+        self.assertEqual(response.headers["Cache-Control"], "private, no-store")
 
     async def test_restart_contract_and_targeted_heartbeat(self):
         for action in ("reboot_host", "restart_services"):
