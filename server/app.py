@@ -73,6 +73,7 @@ from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
 from server.texture_api import register_texture_routes
+from server.chat_api import register_chat_routes
 from server.cloud_lighting import CloudLighting
 from server.cloud_images import ImageEditError
 from server.project_repository import ProjectRepository, InvalidProjectId
@@ -4150,7 +4151,7 @@ async def on_start(app):
         trace_configs.append(trace)
     app["session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
-        trace_configs=trace_configs)
+        trace_configs=trace_configs, trust_env=False)
     if app["local_test"]:
         await setup_local_test_auth(app)
     elif not app.get("admin_sandbox"):
@@ -4303,6 +4304,7 @@ def make_app(auth_path=None, *, project_repository=None):
         require_project=require_project, require_user=require_user, require_resource=require_resource,
         broadcast_collaboration=broadcast_collaboration, sync_card=sync_edit_card,
         kind_of=kind_of, duration_pattern=DUR_RE, audio_pattern=AUDIO_STREAM_RE)
+    register_chat_routes(app)
     register_texture_routes(
         app, root=ROOT, comfy_http=COMFY_HTTP,
         require_project=require_project, require_resource=require_resource,

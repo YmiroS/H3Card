@@ -1,0 +1,154 @@
+import asyncio
+import base64
+from io import BytesIO
+import json
+import os
+from pathlib import Path
+import tempfile
+import unittest
+from unittest import mock
+
+import aiohttp
+from aiohttp import web
+from aiohttp.test_utils import TestClient, TestServer
+from PIL import Image
+
+from server import cloud_chat, cloud_images
+from server.chat_api import register_chat_routes
+
+
+class ChatTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.config = Path(temporary.name) / 'config.json'
+        self.enterContext(mock.patch.object(cloud_images, 'CONF', self.config))
+        self.enterContext(mock.patch.dict(os.environ, {'CHOUKA_IMAGE_API_KEY': ''}))
+        self.calls = []
+        self.status = 200
+        self.payload = {'choices': [{'message': {'content': 'hello'}}], 'usage': {'total_tokens': 10}, 'cost': 99}
+        async def gateway(request):
+            self.calls.append((await request.json(), request.headers.get('Authorization')))
+            return web.json_response(self.payload, status=self.status, headers={'X-Request-ID': 'req-1'})
+        upstream = web.Application()
+        upstream.router.add_post('/v1/chat/completions', gateway)
+        self.server = TestServer(upstream)
+        await self.server.start_server()
+        self.addAsyncCleanup(self.server.close)
+        self.config.write_text(json.dumps({'base_url': str(self.server.make_url('/v1')), 'api_key': 'fake-secret', 'model': 'image-only'}))
+        self.session = aiohttp.ClientSession(trust_env=False)
+        self.addAsyncCleanup(self.session.close)
+        self.authenticated = True
+        @web.middleware
+        async def auth(request, handler):
+            if self.authenticated:
+                request['user'] = {'enabled': True}
+            return await handler(request)
+        app = web.Application(middlewares=[auth])
+        app['session'] = self.session
+        register_chat_routes(app)
+        self.client = TestClient(TestServer(app))
+        await self.client.start_server()
+        self.addAsyncCleanup(self.client.close)
+
+    async def post(self, body):
+        return await self.client.post('/api/chat/completions', json=body)
+
+    async def test_text_and_history_whitelist(self):
+        messages = [{'role': 'system', 'content': 'be helpful'}, {'role': 'user', 'content': 'hi'},
+                    {'role': 'assistant', 'content': 'hello'}, {'role': 'user', 'content': 'again'}]
+        response = await self.post({'messages': messages})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {'content': 'hello', 'model': 'gpt-4o', 'request_id': 'req-1'})
+        self.assertEqual(self.calls, [({'messages': messages, 'model': 'gpt-4o', 'stream': False}, 'Bearer fake-secret')])
+
+    async def test_image(self):
+        output = BytesIO()
+        Image.new('RGB', (2, 2)).save(output, format='PNG')
+        url = 'data:image/png;base64,' + base64.b64encode(output.getvalue()).decode()
+        response = await self.post({'messages': [{'role': 'user', 'content': [
+            {'type': 'text', 'text': 'describe'}, {'type': 'image_url', 'image_url': {'url': url}}]}]})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_validation_and_auth_before_gateway(self):
+        invalid = [None, {}, {'messages': []}, {'messages': [{'role': [], 'content': 'hi'}]},
+                   {'messages': [{'role': 'tool', 'content': 'hi'}]},
+                   {'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'https://example.com/a.png'}}]}]},
+                   {'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,YQ=='}}]}]},
+                   {'messages': [{'role': 'user', 'content': 'hi'}], 'model': 'external'}]
+        for body in invalid:
+            with self.subTest(body=body):
+                response = await self.post(body)
+                self.assertEqual(response.status, 400)
+        self.authenticated = False
+        response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(self.calls, [])
+
+    async def test_limits(self):
+        response = await self.post({'messages': [{'role': 'user', 'content': 'a' * 100001}]})
+        self.assertEqual(response.status, 413)
+        with mock.patch.object(cloud_chat, 'MAX_REQUEST_BYTES', 100):
+            response = await self.post({'messages': [{'role': 'user', 'content': 'a' * 101}]})
+            self.assertEqual(response.status, 413)
+        self.assertEqual(self.calls, [])
+
+    async def test_config_override(self):
+        self.config.write_text(json.dumps({'base_url': str(self.server.make_url('/v1')), 'api_key': 'unused', 'chat_model': 'chat-custom'}))
+        with mock.patch.dict(os.environ, {'CHOUKA_IMAGE_API_KEY': 'override'}):
+            response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual((await response.json())['model'], 'chat-custom')
+        self.assertEqual(self.calls[0][1], 'Bearer override')
+
+    async def test_errors_no_retry_or_leak(self):
+        self.payload = {'error': 'fake-secret data:image/png;base64,private private-message'}
+        for status in (302, 400, 429, 500):
+            self.status = status
+            response = await self.post({'messages': [{'role': 'user', 'content': 'private-message'}]})
+            self.assertEqual(response.status, 502)
+            text = await response.text()
+            for secret in ('fake-secret', 'base64', 'private-message'):
+                self.assertNotIn(secret, text)
+        self.assertEqual(len(self.calls), 4)
+        self.status = 200
+        response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(response.status, 502)
+
+    async def test_config_and_response_limits(self):
+        with mock.patch.object(cloud_chat, 'MAX_RESPONSE_BYTES', 10):
+            response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}]})
+            self.assertEqual(response.status, 502)
+        for config in ([], {'api_key': 'fake', 'base_url': 'https://user:pass@example.com'},
+                       {'api_key': 'fake', 'chat_model': None}, {'enabled': False}):
+            self.config.write_text(json.dumps(config))
+            response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}]})
+            self.assertEqual(response.status, 503)
+        self.assertEqual(len(self.calls), 1)
+
+    async def test_image_count_and_bytes(self):
+        output = BytesIO()
+        Image.new('RGB', (2, 2)).save(output, format='PNG')
+        data = output.getvalue()
+        part = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(data).decode()}}
+        body = {'messages': [{'role': 'user', 'content': [part] * 9}]}
+        response = await self.post(body)
+        self.assertEqual(response.status, 413)
+        with mock.patch.object(cloud_chat, 'MAX_TOTAL_IMAGE_BYTES', len(data) - 1):
+            response = await self.post({'messages': [{'role': 'user', 'content': [part]}]})
+            self.assertEqual(response.status, 413)
+        self.assertEqual(self.calls, [])
+
+    async def test_timeout_settings(self):
+        session = mock.Mock()
+        session.post.side_effect = asyncio.TimeoutError()
+        with self.assertRaises(cloud_chat.ChatError) as caught:
+            await cloud_chat.complete(session, [{'role': 'user', 'content': 'secret'}])
+        self.assertTrue(caught.exception.answer_unknown)
+        self.assertEqual(caught.exception.status, 504)
+        self.assertEqual(session.post.call_count, 1)
+        args = session.post.call_args.kwargs
+        self.assertFalse(args['allow_redirects'])
+        self.assertIsNone(args['proxy'])
+        self.assertEqual(args['timeout'].connect, 10)
+        self.assertEqual(args['timeout'].sock_read, 300)

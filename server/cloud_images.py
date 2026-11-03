@@ -15,7 +15,7 @@ import aiohttp
 from PIL import Image
 
 
-CONF = Path(__file__).resolve().parent.parent / "image-edit.json"
+CONF = Path(__file__).resolve().parent.parent / "cloud-ai-config.json"
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
 MAX_PIXELS = 32_000_000
 MAX_RESPONSE_BYTES = (MAX_IMAGE_BYTES + 2) // 3 * 4 + 1024 * 1024
@@ -39,15 +39,15 @@ def load():
     try:
         config = json.loads(CONF.read_text(encoding="utf-8-sig")) if CONF.exists() else {}
     except (OSError, ValueError):
-        raise ImageEditError("image-edit.json 读取失败，请管理员检查配置", status=503)
+        raise ImageEditError("cloud-ai-config.json 读取失败，请管理员检查配置", status=503)
     if not isinstance(config, dict):
-        raise ImageEditError("image-edit.json 必须是 JSON 对象", status=503)
+        raise ImageEditError("cloud-ai-config.json 必须是 JSON 对象", status=503)
     config = {"base_url": "http://30.245.124.125:8000/v1",
               "model": "gpt-image-2.5-sunburst", "size": "original",
               "quality": "medium", "output_format": "png", **config}
     config["api_key"] = os.environ.get("CHOUKA_IMAGE_API_KEY") or config.get("api_key")
     if config.get("enabled", True) is not True or not config.get("api_key"):
-        raise ImageEditError("云端图片编辑未配置，请管理员设置 image-edit.json 或 CHOUKA_IMAGE_API_KEY", status=503)
+        raise ImageEditError("云端图片编辑未配置，请管理员设置 cloud-ai-config.json 或 CHOUKA_IMAGE_API_KEY", status=503)
     if not all(isinstance(config.get(key), str) and config[key].strip()
                for key in ("base_url", "model", "api_key", "size", "quality", "output_format")):
         raise ImageEditError("云端图片编辑配置不完整", status=503)

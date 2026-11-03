@@ -48,7 +48,7 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(app, "JOBS", {}))
         self.enterContext(mock.patch.object(app, "ws_loop", idle_ws))
         self.enterContext(mock.patch.object(app, "setup_dingtalk"))
-        self.config = self.root / "image-edit.json"
+        self.config = self.root / "cloud-ai-config.json"
         self.enterContext(mock.patch.object(cloud_images, "CONF", self.config))
         self.received = []
         self.received_fields = []

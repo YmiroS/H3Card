@@ -26,7 +26,7 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.config = Path(self.temp.name) / "image-edit.json"
+        self.config = Path(self.temp.name) / "cloud-ai-config.json"
         self.enterContext(mock.patch.object(cloud_images, "CONF", self.config))
         self.enterContext(mock.patch.dict(os.environ, {"CHOUKA_IMAGE_API_KEY": ""}))
         self.received = []
