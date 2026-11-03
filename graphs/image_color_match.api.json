@@ -1,0 +1,31 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {"image": ""},
+  "_meta": {"title": "加载待校色图片"}
+ },
+ "2": {
+  "class_type": "LoadImage",
+  "inputs": {"image": ""},
+  "_meta": {"title": "加载参考图"}
+ },
+ "3": {
+  "class_type": "ColorMatch",
+  "inputs": {
+   "image_ref": ["2", 0],
+   "image_target": ["1", 0],
+   "method": "mkl",
+   "strength": 0.7,
+   "multithread": true
+  },
+  "_meta": {"title": "按参考图校色"}
+ },
+ "4": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": ["3", 0],
+   "filename_prefix": "Chouka_ColorMatch"
+  },
+  "_meta": {"title": "保存校色图片"}
+ }
+}

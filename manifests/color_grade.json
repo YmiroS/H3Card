@@ -1,0 +1,35 @@
+{
+ "id": "color_grade",
+ "name": "调色",
+ "execution": "browser",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "image",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slots": "img1+aud0+vid0",
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "note": "在浏览器中对一张图片调色（曝光、对比度、高光阴影、白平衡、饱和度、曲线），实时预览，导出原尺寸 PNG。GPU 不参与，不走生成工作流。",
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "图片",
+   "type": "image",
+   "required": true
+  }
+ ]
+}

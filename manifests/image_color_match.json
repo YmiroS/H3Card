@@ -1,0 +1,58 @@
+{
+ "id": "image_color_match",
+ "name": "参考图校色（图片）",
+ "file": "image_color_match",
+ "source": "graphs/image_color_match.api.json",
+ "group": "图片",
+ "outputType": "image",
+ "kind": "tool",
+ "card": "card_tools",
+ "slots": "img2+aud0+vid0",
+ "images": 2,
+ "audios": 0,
+ "videos": 0,
+ "slotLimits": {"image": {"min": 2, "max": 2}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+ "graph": "graphs/image_color_match.api.json",
+ "output": {"node": "4"},
+ "note": "顺序：第一张「待校色图」= 要被改色的那张；第二张「参考图」= 目标色调，不会被改。把待校色图的颜色往参考图上对齐。多个分镜统一调色时，每个待校色素材各放一张卡，同一张参考图连到每一张的参考图槽。\n参考图挑跟原图同一场景、光线相近的效果最好：算法对齐的是整张画面的颜色分布，参考图里大片天空、大片纯色背景会把原图也往那个颜色拉。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "images[0]", "label": "待校色图", "type": "image", "required": true,
+   "hint": "要被改色的那张图（输出也是改这张）",
+   "target": {"node": "1", "input": "image", "kind": "upload_image"}
+  },
+  {
+   "key": "images[1]", "label": "参考图", "type": "image", "required": true,
+   "hint": "目标色调，只作参考，不会被改",
+   "target": {"node": "2", "input": "image", "kind": "upload_image"}
+  },
+  {
+   "key": "strength", "label": "校色强度", "type": "slider", "min": 0, "max": 1, "step": 0.05, "default": 0.7,
+   "hint": "默认 0.7。1 = 完全对齐到参考图，0 = 原样不动。原图和参考图场景差别大时，往下调到 0.4～0.6",
+   "target": {"node": "3", "input": "strength", "vtype": "FLOAT"}
+  },
+  {
+   "key": "match_method", "label": "校色方式", "type": "select", "default": "mkl",
+   "options": [
+    {"value": "mkl", "label": "标准（推荐）"},
+    {"value": "reinhard", "label": "柔和（只对齐亮度和色偏）"},
+    {"value": "hm-mkl-hm", "label": "强力（最贴近参考）"}
+   ],
+   "presets": {
+    "mkl": {"method": "mkl"},
+    "reinhard": {"method": "reinhard"},
+    "hm-mkl-hm": {"method": "hm-mkl-hm"}
+   },
+   "hint": "标准：整体色调和色彩倾向都往参考图对齐，大多数情况用它。柔和：只对齐平均亮度和色偏，最不容易被画面内容带偏。强力：连明暗层次也照参考图重排，最像参考，但最容易过猛",
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "method", "label": "校色算法", "type": "select", "default": "mkl", "mirror": true, "advanced": true,
+   "options": ["mkl", "reinhard", "hm-mkl-hm"],
+   "target": {"node": "3", "input": "method"}
+  }
+ ],
+ "warnings": []
+}

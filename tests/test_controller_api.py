@@ -4003,6 +4003,21 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
         self.assertFalse(controller_app.mode_ok({
             "id": "route", "route": {"image": {"cap": "image_composite"}}}))
 
+    async def test_cards_expose_color_grade_as_single_image_browser_mode(self):
+        payload = await (await self.client.get("/api/cards")).json()
+        cap = payload["capabilities"]["color_grade"]
+        self.assertEqual((cap["execution"], cap["card"], cap["outputType"], cap["slots"]),
+                         ("browser", "card_tools", "image", "img1+aud0+vid0"))
+        self.assertEqual(cap["inputs"], [
+            {"key": "images[0]", "label": "图片", "type": "image", "required": True}])
+        self.assertNotIn("graph", cap)
+        card = next(item for item in payload["cards"] if item["id"] == "card_tools")
+        self.assertEqual(card["modes"][-2], {
+            "id": "color_grade", "name": "调色", "slots": "img1+aud0+vid0"})
+        response = await self.client.post("/api/generate", json={
+            "project": "p", "capability": "color_grade", "dry_run": True})
+        self.assertEqual(response.status, 400)
+
     async def test_generate_rejects_browser_in_local_and_controller_even_dry_run(self):
         with mock.patch.object(controller_app, "generation_assets", new=mock.AsyncMock()) as assets, \
              mock.patch.object(controller_app, "patch_graph") as graph, \

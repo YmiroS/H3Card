@@ -1,6 +1,6 @@
 {
  "id": "video_color_match",
- "name": "参考图校色",
+ "name": "参考图校色（视频）",
  "file": "video_color_match",
  "source": "graphs/video_color_match.api.json",
  "group": "视频",
@@ -19,11 +19,13 @@
  "compare": false,
  "inputs": [
   {
-   "key": "video[0]", "label": "镜头", "type": "video", "required": true,
+   "key": "video[0]", "label": "待校色视频", "type": "video", "required": true,
+   "hint": "要被改色的镜头（输出也是改这个视频）",
    "target": {"node": "1", "input": "file", "kind": "upload_video"}
   },
   {
    "key": "images[0]", "label": "参考图", "type": "image", "required": true,
+   "hint": "目标色调，只作参考，不会被改",
    "target": {"node": "3", "input": "image", "kind": "upload_image"}
   },
   {

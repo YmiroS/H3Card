@@ -188,8 +188,13 @@
     "slots": "img3+aud0+vid1"
    },
    {
+    "id": "image_color_match",
+    "name": "参考图校色（图片）",
+    "slots": "img2+aud0+vid0"
+   },
+   {
     "id": "video_color_match",
-    "name": "参考图校色",
+    "name": "参考图校色（视频）",
     "slots": "img1+aud0+vid1"
    },
    {
@@ -212,6 +217,11 @@
      "label": "素材",
      "hint": "图片和视频都收，放进来就照着原样重画一遍、画得更清楚。参数会自动换成对应的那一套。想让视频更顺滑（补中间帧）请用「视频补帧插针」那张卡。"
     }
+   },
+   {
+    "id": "color_grade",
+    "name": "调色",
+    "slots": "img1+aud0+vid0"
    },
    {
     "id": "image_composite",

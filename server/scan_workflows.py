@@ -107,9 +107,12 @@ SOLO = set()
 # 这些工作流的输入形态各不相同（有的吃 4 张图、有的吃 1 张、补帧吃视频），参数也对不上，
 # 画不出"并集"面板 —— 所以是模式切换，不是张数阶梯 / 素材路由。
 # card_enhance（画质增强）走 ROUTE_CARDS，是"放图/放视频切到对应那一路"，这里一并收进来当模式。
+# 参考图校色不走路由：它除了待校色素材还要一张参考图，路由卡前端写死「素材 1 个」，
+# 第二张参考图接不进去；所以图片 / 视频拆成两个工具箱模式（同 depth_image / depth_video）。
 TOOLS = {
     "grid4_stitch", "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "gimmvfi_interp",
-    "depth_image", "depth_video", "alphagen", "rtx_video_hdr", "video_color_match",
+    "depth_image", "depth_video", "alphagen", "rtx_video_hdr",
+    "image_color_match", "video_color_match",
 }
 TOOLS_CARD = {"id": "card_tools", "name": "工具箱", "icon": "🧩"}
 
@@ -150,7 +153,8 @@ MODEL_SWITCHES = {
 # Qwen 2.1 的图生图模型直接使用16图编辑能力；旧单图能力只保留给历史任务和项目迁移。
 BUNDLED_CAPABILITIES = {
     "minimax_h3_ref_2pass_bf16",
-    "alphagen", "rtx_video_hdr", "video_color_match", "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
+    "alphagen", "rtx_video_hdr", "image_color_match", "video_color_match",
+    "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
     "qwen_lighting", "qwen_lighting_multi",
@@ -1851,7 +1855,8 @@ def build_tools_card(ms, by_id):
     """
     order = [
         "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "grid4_stitch", "gimmvfi_interp",
-        "depth_image", "depth_video", "alphagen", "rtx_video_hdr", "video_color_match",
+        "depth_image", "depth_video", "alphagen", "rtx_video_hdr",
+        "image_color_match", "video_color_match",
     ]
     modes = []
     for wid in order:
@@ -2181,11 +2186,15 @@ def main():
     }
     by_id = {m["id"]: m for m in manifests}
     cards = []
+    tools_emitted = False
     for key, ms in groups.items():
         # 工具统一收进「工具箱」卡：模式是各个工具玩法（见 build_tools_card）。
         # ROUTE_CARDS 的 card_enhance 也作为其中一个模式收进来，所以这里不再单独成卡。
         if key == TOOLS_CARD["id"]:
-            cards.append(build_tools_card(ms, by_id))
+            card = build_tools_card(ms, by_id)
+            if card:
+                cards.append(card)
+                tools_emitted = True
             continue
         # card_enhance 自己被归进 card_tools（它的组还在，作为模式复用了），跳过，
         # 否则它会在「工具箱」之外再冒出一张单独的「画质增强」卡。
@@ -2203,6 +2212,12 @@ def main():
             "kind": kind,                       # 前端菜单按它分「工具」一组
             "modes": build_modes(ms),
         })
+    # 只有 ROUTE_CARDS 工具（画质增强）、没有其它 TOOLS 成员时，上面的循环
+    # 碰不到 card_tools 组，这里补建一张，避免菜单里整张工具箱消失。
+    if not tools_emitted:
+        card = build_tools_card([], by_id)
+        if card:
+            cards.append(card)
     # 素材卡、文本卡、风格卡排最后：它们都不出产物，是给别的卡送料的
     # （见 ASSET_CARD / TEXT_CARD / STYLE_CARD）
     cards.append(dict(ASSET_CARD))
