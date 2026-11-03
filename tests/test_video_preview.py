@@ -394,10 +394,13 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                 scale = scale["inputs"]
                 factor = 1.5 if cid.endswith("ref_2pass") else 1
                 self.assertEqual((scale["width"], scale["height"]),
-                                 (round(ideal_width * factor / 2) * 2,
-                                  round(ideal_height * factor / 2) * 2))
-                self.assertLessEqual(abs(scale["width"] - ideal_width * factor), 1)
-                self.assertLessEqual(abs(scale["height"] - ideal_height * factor), 1)
+                                 (math.floor(ideal_width * factor / 16 + .5) * 16,
+                                  math.floor(ideal_height * factor / 16 + .5) * 16))
+                self.assertLessEqual(abs(scale["width"] - ideal_width * factor), 8)
+                self.assertLessEqual(abs(scale["height"] - ideal_height * factor), 8)
+                for side in (scale["width"], scale["height"]):
+                    self.assertEqual(side % 16, 0)
+                    self.assertTrue(16 <= side <= 16384)
                 self.assertEqual((scale["upscale_method"], scale["crop"]), ("bicubic", "disabled"))
                 for nid, node in original.items():
                     if any(part in node["class_type"] for part in
@@ -553,7 +556,7 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                     mp = defaults["megapixels"]
                     factor = defaults.get("scale_by", 1)
                     self.assertEqual(params["output_width"],
-                                     round(math.sqrt(mp * 1024**2 * float(ratio[0]) / float(ratio[1])) * factor / 2) * 2)
+                                     math.floor(math.sqrt(mp * 1024**2 * float(ratio[0]) / float(ratio[1])) * factor / 16 + .5) * 16)
                     self.assertEqual(params["output_duration"], defaults["duration"])
                     self.assertIn("follow_reference_scale_" + cap["output"]["node"], graph)
 
@@ -568,8 +571,11 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                 self.assertEqual(params["duration"], 4.1)
                 mp = next(spec["default"] for spec in cap["inputs"] if spec["key"] == "megapixels")
                 factor = 1.5 if cid.endswith("ref_2pass") else 1
-                self.assertEqual(params["output_width"], round(math.sqrt(mp * 1024**2 * 21 / 9) * factor / 2) * 2)
-                self.assertEqual(params["output_height"], round(math.sqrt(mp * 1024**2 * 9 / 21) * factor / 2) * 2)
+                self.assertEqual(params["output_width"], math.floor(math.sqrt(mp * 1024**2 * 21 / 9) * factor / 16 + .5) * 16)
+                self.assertEqual(params["output_height"], math.floor(math.sqrt(mp * 1024**2 * 9 / 21) * factor / 16 + .5) * 16)
+                for side in (params["output_width"], params["output_height"]):
+                    self.assertEqual(side % 16, 0)
+                    self.assertTrue(16 <= side <= 16384)
                 self.assertEqual(params["output_count"], 1)
                 self.assertEqual(params["output_duration"], 4.1)
                 self.assertEqual(params["output_fps"], round(4.1 * 24) / 4.1)
@@ -676,8 +682,11 @@ class ReferenceVideoOutputTest(unittest.TestCase):
             "aspect_ratio": "9:16 (Portrait Widescreen)", "megapixels": 2.5, "scale_by": 2})
         output = self.output(graph)
         scale = graph[output["images"][0]]["inputs"]
-        self.assertEqual(scale["width"], round(math.sqrt(2.5 * 1024 * 1024 * 9 / 16) * 2 / 2) * 2)
-        self.assertEqual(scale["height"], round(math.sqrt(2.5 * 1024 * 1024 * 16 / 9) * 2 / 2) * 2)
+        self.assertEqual(scale["width"], math.floor(math.sqrt(2.5 * 1024 * 1024 * 9 / 16) * 2 / 16 + .5) * 16)
+        self.assertEqual(scale["height"], math.floor(math.sqrt(2.5 * 1024 * 1024 * 16 / 9) * 2 / 16 + .5) * 16)
+        for side in (scale["width"], scale["height"]):
+            self.assertEqual(side % 16, 0)
+            self.assertTrue(16 <= side <= 16384)
         self.assertEqual(graph["199"]["inputs"]["scale_by"], 2)
 
     def test_megapixels_accepts_above_manifest_but_rejects_above_actual_sixteen_mp(self):
@@ -687,10 +696,40 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                     "aspect_ratio": "1:1 (Square)", "megapixels": mp})
                 output = self.output(graph)
                 scale = graph[output["images"][0]]["inputs"]
-                self.assertEqual(scale["width"], round(math.sqrt(mp) * 1024 / 2) * 2)
+                self.assertEqual(scale["width"], math.floor(math.sqrt(mp) * 1024 / 16 + .5) * 16)
+                self.assertEqual(scale["width"] % 16, 0)
+                self.assertTrue(16 <= scale["width"] <= 16384)
         for mp in (16.000001, 17, float("inf"), float("nan"), 0, -1):
             with self.subTest(mp=mp), self.assertRaises(web.HTTPBadRequest):
                 self.patch(self.capabilities[0], params={"megapixels": mp})
+
+    def test_final_size_half_up_sixteen_alignment_and_inclusive_boundaries(self):
+        # Keep generation valid independently of delivery's lower/upper limits.
+        for generation, ideal, expected in (
+                (32, 7.999, None), (32, 8, 16),
+                (32, 23.999, 16), (32, 24, 32),
+                (32, 39.999, 32), (32, 40, 48),
+                (4096, 16384, 16384), (4096, 16385, 16384),
+                (4096, 16391, 16384), (4096, 16392, None),
+                (4096, 16400, None)):
+            with self.subTest(generation=generation, ideal=ideal):
+                params = {"aspect_ratio": "1:1 (Square)",
+                          "megapixels": (generation / 1024) ** 2,
+                          "scale_by": ideal / generation}
+                if expected is None:
+                    with self.assertRaises(web.HTTPBadRequest):
+                        self.patch(self.capabilities[1], params=params)
+                    continue
+                _, resolved, graph = self.patch(self.capabilities[1], params=params)
+                reference = graph["186"]["inputs"]
+                self.assertEqual((reference["width"], reference["height"]),
+                                 (generation, generation))
+                final = (resolved["output_width"], resolved["output_height"])
+                self.assertEqual(final, (expected, expected))
+                for side in final:
+                    self.assertEqual(side % 16, 0)
+                    self.assertTrue(16 <= side <= 16384)
+                    self.assertLessEqual(abs(side - ideal), 8)
 
     def test_generation_width_height_actual_inclusive_node_boundaries(self):
         for width, height in ((16384, 32), (32, 16384), (32, 32)):
@@ -716,7 +755,10 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                 planner = graph["11"]["inputs"]
                 self.assertEqual(planner["generation_seconds"], 7)
                 self.assertEqual((planner["width"], planner["height"]), (960, 544))
-                self.assertEqual((params["output_width"], params["output_height"]), (970, 550))
+                self.assertEqual((params["output_width"], params["output_height"]), (976, 544))
+                for side in (params["output_width"], params["output_height"]):
+                    self.assertEqual(side % 16, 0)
+                    self.assertTrue(16 <= side <= 16384)
                 self.assertEqual(params["output_duration"], seconds)
                 dims = controller_app.CostLedger.dimensions(
                     None, self.capabilities[3], params, {"video[0]": self.ref}, graph,
@@ -729,7 +771,7 @@ class ReferenceVideoOutputTest(unittest.TestCase):
                 for recorded in (dims, backfilled_dims, {}):
                     spec = controller_app.make_spec(self.capabilities[3], params, graph, recorded)
                     self.assertEqual((spec["expected"]["width"], spec["expected"]["height"],
-                                      spec["expected"]["duration"]), (970, 550, seconds))
+                                      spec["expected"]["duration"]), (976, 544, seconds))
                 timeline = json.loads(planner["timeline_data"])
                 self.assertEqual(timeline["selection"]["duration"], 7)
                 clip = timeline["videoClips"][0]
@@ -1044,7 +1086,7 @@ class FollowReferenceGenerateTest(unittest.IsolatedAsyncioTestCase):
             self.body["assets"] = {"video[0]": self.ref} if reference else {}
             controller_app.generation_assets.return_value = self.body["assets"]
             for scale in (1, 1.25, 1.5, 2):
-                final = tuple(round(v * scale / 2) * 2 for v in (1080, 1920))
+                final = tuple(math.floor(v * scale / 16 + .5) * 16 for v in (1080, 1920))
                 for dry_run in (True, False):
                     with self.subTest(reference=reference, scale=scale, dry_run=dry_run):
                         self.store.reset_mock()
@@ -1065,6 +1107,9 @@ class FollowReferenceGenerateTest(unittest.IsolatedAsyncioTestCase):
                         self.assertEqual(payload["duration_seconds"], 4.1)
                         expected = payload["capacity_spec"]["expected"]
                         self.assertEqual((expected["width"], expected["height"]), final)
+                        for side in (expected["width"], expected["height"]):
+                            self.assertEqual(side % 16, 0)
+                            self.assertTrue(16 <= side <= 16384)
                         self.assertEqual(expected["count"], 1)
                         dims = payload["capacity_spec"]["dimensions"]
                         self.assertEqual((dims["width"], dims["height"]), final)

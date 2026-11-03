@@ -26,10 +26,11 @@ def image_controls(capability_id):
 
 def _dimensions(ratio, pixels):
     width, height = map(int, ratio.split(":"))
-    # Match JS Math.round, including .5 ties (not Python's round-to-even).
+    # Align each side independently from the nominal short edge, matching JS Math.round.
+    short = math.floor(pixels / 16 + .5) * 16
     if width >= height:
-        return math.floor(pixels * width / height / 16 + .5) * 16, pixels
-    return pixels, math.floor(pixels * height / width / 16 + .5) * 16
+        return math.floor(pixels * width / height / 16 + .5) * 16, short
+    return short, math.floor(pixels * height / width / 16 + .5) * 16
 
 
 def patch_image_controls(graph, capability_id, params):
@@ -48,11 +49,12 @@ def patch_image_controls(graph, capability_id, params):
     pixels = CLARITIES[clarity]
     if ratio != "original":
         width, height = _dimensions(ratio, pixels)
+    aligned_pixels = math.floor(pixels / 16 + .5) * 16
 
     if capability_id in _I2I_SCALES:
         inputs = graph[_I2I_SCALES[capability_id]]["inputs"]
         inputs.update(aspect_ratio="original", scale_to_side="shortest",
-                      scale_to_length=pixels, round_to_multiple="8")
+                      scale_to_length=aligned_pixels, round_to_multiple="16")
         if ratio != "original":
             inputs.update(aspect_ratio="custom", proportional_width=width,
                           proportional_height=height, scale_to_side="width",
@@ -70,8 +72,8 @@ def patch_image_controls(graph, capability_id, params):
                 "inputs": {
                     "image": [loader, 0], "aspect_ratio": "original",
                     "proportional_width": 1, "proportional_height": 1,
-                    "fit": "crop", "method": "lanczos", "round_to_multiple": "8",
-                    "scale_to_side": "shortest", "scale_to_length": pixels,
+                    "fit": "crop", "method": "lanczos", "round_to_multiple": "16",
+                    "scale_to_side": "shortest", "scale_to_length": aligned_pixels,
                     "background_color": "#000000",
                 },
                 "_meta": {"title": "按原图比例设置输出尺寸"},

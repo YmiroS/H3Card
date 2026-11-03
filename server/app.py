@@ -679,8 +679,8 @@ def resolve_h3_1080p_settings(cap, params):
     generation = tuple(round(side / 32) * 32 for side in base)
     if any(side < 32 or side > 16384 for side in generation):
         raise web.HTTPBadRequest(reason="1080P：基础生成尺寸超出节点支持范围")
-    final = tuple(round(side * scale / 2) * 2 for side in base)
-    if any(side < 2 or side > 16384 for side in final):
+    final = tuple(math.floor(side * scale / 16 + .5) * 16 for side in base)
+    if any(side < 16 or side > 16384 for side in final):
         raise web.HTTPBadRequest(reason="1080P：输出尺寸超出节点支持范围")
     # 不采信外部 output_*，也不把动态尺寸存入静态 preset 或模板。
     for key in ("width", "height", "duration", "fps", "count"):
@@ -742,7 +742,7 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
         params["aspect_ratio"] = selected
         duration = value("duration")
         if resolution:
-            # 复用未量化首采尺寸；偶数输出再除倍率在小倍率时会丢失精度。
+            # 复用未量化首采尺寸；量化输出再除倍率在小倍率时会丢失精度。
             ideal_width, ideal_height = resolution["base"]
         else:
             megapixels = value("megapixels")
@@ -756,14 +756,14 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
     if any(side < 32 or side > 16384 for side in generation):
         raise web.HTTPBadRequest(reason="视频参考输出：32 对齐后的宽高必须在 32..16384，画面比例过于极端或分辨率越界")
     scale = value("scale_by") if cap["id"] in {"minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16"} else 1
-    # 按未对齐的理想尺寸取最近偶数，每个边的量化误差不超过 1px；
+    # 按理想尺寸独立对齐到 16，每边量化误差不超过 8px；
     # 不从 32 对齐的生成尺寸反推比例，也不丢掉二采工作流的放大倍率。
     final_sides = (ideal_width * scale, ideal_height * scale)
-    if not all(math.isfinite(side) and 1 <= side <= 16385 for side in final_sides):
+    if not all(math.isfinite(side) and 1 <= side < 16392 for side in final_sides):
         raise web.HTTPBadRequest(reason="视频参考输出：最终输出尺寸超出节点支持范围")
-    final = tuple(round(side / 2) * 2 for side in final_sides)
-    if any(side < 2 or side > 16384 for side in final):
-        raise web.HTTPBadRequest(reason="视频参考输出：最终偶数宽高必须在 2..16384")
+    final = tuple(math.floor(side / 16 + .5) * 16 for side in final_sides)
+    if any(side < 16 or side > 16384 for side in final):
+        raise web.HTTPBadRequest(reason="视频参考输出：16 对齐后的宽高必须在 16..16384")
     if not math.isfinite(duration * 24):
         raise web.HTTPBadRequest(reason="视频参考输出：时长超出节点支持范围")
     frames = max(1, round(duration * 24))
@@ -904,7 +904,20 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
                 # 否则模板里作者自带的演示提示词会悄悄生效（出片跑偏）
         if tgt.get("kind") in ("timeline_asset", "timeline_option"):
             continue
+        if key in {"width", "height", "scale_to_length", "resolution"} and spec["type"] in ("slider", "number"):
+            val = max(16, math.floor(float(val) / 16 + .5) * 16)
+            params[key] = val
         g[node]["inputs"][field] = val
+        if key == "resolution" and g[node]["class_type"] == "TTResolutionSelector":
+            if val not in spec.get("options", []):
+                raise web.HTTPBadRequest(reason=f"画面尺寸无效：{val}")
+            match = re.match(r"^(\d+)x(\d+)\s", val)
+            dimensions = tuple(math.floor(int(side) / 16 + .5) * 16 for side in match.groups())
+            # 保留节点枚举值，仅将输出尺寸写入消费端，避免依赖自定义节点新增档位。
+            for consumer in g.values():
+                for name, link in list(consumer["inputs"].items()):
+                    if isinstance(link, list) and len(link) == 2 and str(link[0]) == node and link[1] in (0, 1):
+                        consumer["inputs"][name] = dimensions[link[1]]
     if missing:
         raise web.HTTPBadRequest(reason="必填素材未提供：" + "、".join(missing))
     if blank:
