@@ -2402,6 +2402,43 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertIn("server_time", health)
         self.assertIn("started_at", health)
 
+    async def test_metadata_reads_leave_public_files_responsive(self):
+        loop = asyncio.get_running_loop()
+        loop_thread = threading.get_ident()
+        for path, target, method in (("/api/health", self.store, "list_workers"),
+                                     ("/api/projects", self.projects, "read")):
+            with self.subTest(path=path):
+                started, release = asyncio.Event(), threading.Event()
+                original = getattr(target, method)
+
+                def blocked(*args, **kwargs):
+                    self.assertNotEqual(threading.get_ident(), loop_thread)
+                    if method == "list_workers":
+                        self.assertTrue(kwargs.get("summary"))
+                    loop.call_soon_threadsafe(started.set)
+                    if not release.wait(5):
+                        raise AssertionError("metadata read was not released")
+                    return original(*args, **kwargs)
+
+                with mock.patch.object(target, method, side_effect=blocked):
+                    pending = asyncio.ensure_future(self.client.get(path))
+                    try:
+                        await asyncio.wait_for(started.wait(), timeout=2)
+                        response = await asyncio.wait_for(
+                            self.client.get("/auth-logo.png"), timeout=2)
+                        self.assertEqual(response.status, 200)
+                        await response.read()
+                    finally:
+                        release.set()
+                        response = await pending
+                    self.assertEqual(response.status, 200, await response.text())
+                    payload = await response.json()
+                    if path == "/api/health":
+                        self.assertEqual(payload["workers"], 0)
+                        self.assertFalse(payload["comfy_online"])
+                    else:
+                        self.assertEqual([item["id"] for item in payload["projects"]], ["p"])
+
     async def test_restart_contract_and_targeted_heartbeat(self):
         for action in ("reboot_host", "restart_services"):
             credentials = self.store.register_worker(action, {"supports_service_restart": True, "supports_host_reboot": True,

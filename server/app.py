@@ -279,14 +279,14 @@ def record_api_cost(app, capability, result, elapsed_ms, body):
 def controller_comfy_online(app, workers=None):
     if not CONTROLLER_MODE:
         return STATE["comfy_online"]
-    workers = distributed_store(app).list_workers() if workers is None else workers
+    workers = distributed_store(app).list_workers(summary=True) if workers is None else workers
     return any(w["state"] in ("idle", "busy") for w in workers)
 
 
 def controller_maintenance_active(app, workers=None):
     if not CONTROLLER_MODE:
         return False
-    workers = distributed_store(app).list_workers() if workers is None else workers
+    workers = distributed_store(app).list_workers(summary=True) if workers is None else workers
     return any(
         w.get("state") != "offline"
         and not w.get("is_primary_node")
@@ -2944,27 +2944,31 @@ def sync_project_name(app, project_id, project_name):
 async def api_projects(request):
     user = require_user(request)
     accessible = await call_store(request.app, "list_projects", user["id"])
-    out = []
-    for acl in accessible:
-        path = project_path(request.app, acl["project_id"])
-        if not path.is_file():
-            continue
-        try:
-            d = request.app["project_repository"].read(acl["project_id"])
-        except (OSError, ValueError):
-            continue
-        out.append({"id": acl["project_id"], "name": d.get("name", "未命名"),
-                    "updated": d.get("updated", 0), "cards": len(d.get("cards", [])),
-                    "locked": bool(d.get("locked")), "has_director": "director" in d,
-                    "owner_id": acl["owner_id"],
-                    "owner_username": acl.get("owner_username", ""),
-                    "owner_display_name": acl.get("owner_display_name", ""),
-                    "team_id": acl.get("team_id"), "team_name": acl.get("team_name"),
-                    "share_count": acl.get("share_count", 0),
-                    "shared_team_ids": acl.get("shared_team_ids", []),
-                    "shared_personally": bool(acl.get("shared_personally")),
-                    "permission": acl["permission"]})
-    out.sort(key=lambda p: p["updated"], reverse=True)
+    def read_projects():
+        out = []
+        for acl in accessible:
+            path = project_path(request.app, acl["project_id"])
+            if not path.is_file():
+                continue
+            try:
+                d = request.app["project_repository"].read(acl["project_id"])
+            except (OSError, ValueError):
+                continue
+            out.append({"id": acl["project_id"], "name": d.get("name", "未命名"),
+                        "updated": d.get("updated", 0), "cards": len(d.get("cards", [])),
+                        "locked": bool(d.get("locked")), "has_director": "director" in d,
+                        "owner_id": acl["owner_id"],
+                        "owner_username": acl.get("owner_username", ""),
+                        "owner_display_name": acl.get("owner_display_name", ""),
+                        "team_id": acl.get("team_id"), "team_name": acl.get("team_name"),
+                        "share_count": acl.get("share_count", 0),
+                        "shared_team_ids": acl.get("shared_team_ids", []),
+                        "shared_personally": bool(acl.get("shared_personally")),
+                        "permission": acl["permission"]})
+        out.sort(key=lambda p: p["updated"], reverse=True)
+        return out
+
+    out = await asyncio.to_thread(read_projects)
     teams = await call_store(request.app, "list_teams", user["id"])
     return web.json_response({"projects": out, "teams": teams})
 
@@ -4104,7 +4108,8 @@ def monitor_health_snapshot(app, workers):
 
 async def api_health(request):
     user = require_user(request)
-    workers = distributed_store(request.app).list_workers() if CONTROLLER_MODE else []
+    workers = (await asyncio.to_thread(distributed_store(request.app).list_workers, summary=True)
+               if CONTROLLER_MODE else [])
     comfy_online = controller_comfy_online(request.app, workers)
     maintenance_active = controller_maintenance_active(request.app, workers)
     if user["role"] != "admin":

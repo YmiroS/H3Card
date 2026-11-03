@@ -994,6 +994,52 @@ class DistributedStoreTest(unittest.TestCase):
         )
         self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
 
+    def test_worker_summary_matches_full_states_without_loading_capabilities(self):
+        for index, primary in enumerate((True, False, 1, "true", None)):
+            self.store.register_worker(f"summary-{index}", {
+                "is_primary_node": primary, "input_choices": {"model": ["x" * 10000]},
+            })
+        newest = self.store.register_worker(" GPU-01 ", {"is_primary_node": True})
+        now = time.time()
+        for online, enabled, comfy, busy, job, sync_status in (
+            (True, True, True, False, None, "idle"),
+            (True, True, True, True, None, "idle"),
+            (True, True, True, False, "job", "idle"),
+            (True, False, True, False, None, "idle"),
+            (True, True, False, False, None, "idle"),
+            (True, True, True, False, None, "pending"),
+            (True, True, True, False, None, "running"),
+            (True, True, True, False, None, "error"),
+            (False, True, True, False, None, "pending"),
+        ):
+            with self.subTest(online=online, enabled=enabled, comfy=comfy,
+                              busy=busy, job=job, sync_status=sync_status):
+                with self.store.db:
+                    self.store.db.execute(
+                        """UPDATE workers SET last_seen=?, enabled=?, comfy_online=?,
+                           busy=?, current_job_id=?, sync_status=?""",
+                        (now if online else now - 11, enabled, comfy, busy, job, sync_status))
+                full = self.store.list_workers()
+                with mock.patch("distributed.json.loads", side_effect=AssertionError("full capability decode")):
+                    summary = self.store.list_workers(summary=True)
+                self.assertEqual(summary, [{key: worker[key] for key in item}
+                                           for worker, item in zip(full, summary)])
+                self.assertEqual(len(summary), len(full))
+                self.assertEqual(len(summary), 6)
+                self.assertIn(newest["worker_id"], [item["id"] for item in summary])
+                for item in summary:
+                    self.assertNotIn("capabilities", item)
+                    self.assertNotIn("capabilities_json", item)
+                    self.assertNotIn("token_hash", item)
+
+    def test_worker_summary_expires_stale_service_restart(self):
+        with self.store.db:
+            self.store.db.execute(
+                """UPDATE workers SET sync_action='restart_services', sync_status='running',
+                   sync_started_at=? WHERE id=?""", (time.time() - 901, self.worker_id))
+        self.assertEqual(self.store.list_workers(summary=True)[0]["sync_status"], "error")
+        self.assertEqual(self.store.list_workers()[0]["state"], "error")
+
     def test_retire_worker_hides_all_same_name_registrations_and_preserves_history(self):
         newest = self.store.register_worker(
             "GPU-01", {"node_classes": ["KSampler", "SaveImage"]}

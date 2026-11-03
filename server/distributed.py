@@ -999,13 +999,20 @@ class DistributedStore:
             ).fetchall()
         return {row["job_id"]: row["name"] for row in rows}
 
-    def list_workers(self):
+    def list_workers(self, *, summary=False):
         now = time.time()
+        columns = "*"
+        if summary:
+            # 健康轮询只取状态，避免把每台数 MB 的节点/模型清单解码成 Python 对象。
+            columns = """id, name, enabled, comfy_online, busy, current_job_id,
+                         last_seen, sync_status,
+                         json_type(COALESCE(NULLIF(capabilities_json, ''), '{}'),
+                                   '$.is_primary_node') = 'true' AS is_primary_node"""
         with self.lock, self.db:
             self._expire_service_restarts_locked(now)
             rows = self.db.execute(
-                """SELECT * FROM workers WHERE retired = 0
-                   ORDER BY created_at DESC, id DESC"""
+                f"""SELECT {columns} FROM workers WHERE retired = 0
+                    ORDER BY created_at DESC, id DESC"""
             ).fetchall()
         workers = []
         seen_names = set()
@@ -1020,8 +1027,11 @@ class DistributedStore:
             item["enabled"] = bool(item["enabled"])
             item["comfy_online"] = bool(item["comfy_online"])
             item["busy"] = bool(item["busy"])
-            item["capabilities"] = json.loads(item.pop("capabilities_json") or "{}")
-            item["is_primary_node"] = _primary_node(item["capabilities"])
+            if summary:
+                item["is_primary_node"] = bool(item["is_primary_node"])
+            else:
+                item["capabilities"] = json.loads(item.pop("capabilities_json") or "{}")
+                item["is_primary_node"] = _primary_node(item["capabilities"])
             online = now - item["last_seen"] <= self.offline_seconds
             if not online:
                 item["state"] = "offline"
