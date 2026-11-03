@@ -975,6 +975,9 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_post(
             "/api/admin/workers/{worker_id}/restart", controller_app.api_worker_restart
         )
+        application.router.add_post(
+            "/api/admin/workers/{worker_id}/sync", controller_app.api_worker_sync
+        )
         application.router.add_get("/api/costs", controller_app.api_costs)
         application.router.add_get("/controller/capacity", controller_app.controller_capacity)
         application.router.add_get("/api/capacity", controller_app.api_capacity)
@@ -2561,6 +2564,120 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(response.status, 403)
         self.client.session.cookie_jar.clear()
         response = await self.client.post(url, json={"action": "restart_services"})
+        self.assertEqual(response.status, 401)
+        self.assertEqual(self.store.list_workers()[0]["sync_status"], "idle")
+
+    async def test_worker_sync_contract_busy_queue_and_targeted_heartbeat(self):
+        caps = {"node_classes": ["KSampler"], "supports_code_restart": True}
+        credentials = self.store.register_worker("single-sync", caps)
+        worker_id = credentials["worker_id"]
+        other = self.store.register_worker("other-sync", caps)["worker_id"]
+        self.store.heartbeat(worker_id, comfy_online=True, busy=True)
+        before = dict(self.store.db.execute("SELECT * FROM workers WHERE id=?", (other,)).fetchone())
+        url = f"/api/admin/workers/{worker_id}/sync"
+        with mock.patch.object(self.store, "request_sync_all", side_effect=AssertionError("not targeted")), \
+             mock.patch.object(self.store, "request_worker_restart", side_effect=AssertionError("not restart")):
+            response = await self.client.post(url, json={})
+        self.assertEqual(response.status, 202, await response.text())
+        payload = await response.json()
+        self.assertEqual(payload, {"ok": True, "worker_id": worker_id,
+                                   "request_id": payload["request_id"], "action": "sync_files"})
+        self.assertTrue(payload["request_id"])
+        self.assertEqual(dict(self.store.db.execute("SELECT * FROM workers WHERE id=?", (other,)).fetchone()), before)
+        headers = {"X-Worker-ID": worker_id, "Authorization": f"Bearer {credentials['worker_token']}"}
+        for busy in (True, False):
+            response = await self.client.post("/agent/v1/heartbeat", headers=headers,
+                                               json={"comfy_online": True, "busy": busy})
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual((await response.json())["commands"], [
+                {"type": "sync_files", "request_id": payload["request_id"]}])
+        self.assertEqual(self.store.heartbeat(other)["commands"], [])
+        self.assertEqual((await self.client.post(url, json={})).status, 409)
+        for status in ("running", "error", "done"):
+            response = await self.client.post("/agent/v1/heartbeat", headers=headers, json={
+                "comfy_online": True, "busy": False,
+                "maintenance": {"request_id": payload["request_id"], "status": status, "message": status},
+            })
+            self.assertEqual(response.status, 200, await response.text())
+            heartbeat = await response.json()
+            self.assertEqual(heartbeat["commands"], [])
+            self.assertEqual(heartbeat["maintenance_ack"], {"request_id": payload["request_id"], "status": status})
+            worker = next(item for item in self.store.list_workers() if item["id"] == worker_id)
+            self.assertEqual(worker["sync_status"], status)
+            self.assertEqual(worker["sync_message"], status)
+        response = await self.client.post(url, json={})
+        self.assertEqual(response.status, 202, await response.text())
+        self.assertNotEqual((await response.json())["request_id"], payload["request_id"])
+
+    async def test_worker_sync_rejects_invalid_body_without_queueing(self):
+        worker_id = self.store.register_worker("body-sync", {"supports_code_restart": True})["worker_id"]
+        url = f"/api/admin/workers/{worker_id}/sync"
+        for body in (None, [], "sync_files", 1, True, {"action": "sync_files"},
+                     {"worker_id": worker_id}, {"force": True}):
+            with self.subTest(body=body):
+                response = await self.client.post(url, data=json.dumps(body),
+                                                   headers={"Content-Type": "application/json"})
+                self.assertEqual(response.status, 400, await response.text())
+        for body in (b"", b"{", b"\xff"):
+            response = await self.client.post(url, data=body, headers={"Content-Type": "application/json"})
+            self.assertEqual(response.status, 400, await response.text())
+        self.assertEqual(self.store.list_workers()[0]["sync_status"], "idle")
+
+    async def test_worker_sync_missing_retired_and_conflicts(self):
+        response = await self.client.post("/api/admin/workers/missing/sync", json={})
+        self.assertEqual(response.status, 404)
+        for kind in ("retired", "offline", "unsupported", "truthy", "primary", "old", "shared-host"):
+            with self.subTest(kind=kind):
+                caps = {"supports_code_restart": True, "hardware": {"host_id": "sync-" + kind}}
+                if kind == "unsupported":
+                    caps = {"supports_service_restart": True, "supports_file_sync": True}
+                elif kind == "truthy":
+                    caps["supports_code_restart"] = 1
+                elif kind == "primary":
+                    caps["is_primary_node"] = True
+                worker_id = self.store.register_worker(kind, caps)["worker_id"]
+                if kind == "retired":
+                    self.store.retire_worker(worker_id)
+                elif kind == "offline":
+                    with self.store.db:
+                        self.store.db.execute("UPDATE workers SET last_seen=0 WHERE id=?", (worker_id,))
+                elif kind == "old":
+                    self.store.register_worker(" OLD ", caps)
+                    with self.store.db:
+                        self.store.db.execute("UPDATE workers SET created_at=0 WHERE id=?", (worker_id,))
+                elif kind == "shared-host":
+                    self.store.register_worker("host-peer", caps)
+                response = await self.client.post(f"/api/admin/workers/{worker_id}/sync", json={})
+                self.assertEqual(response.status, 404 if kind == "retired" else 409, await response.text())
+        worker_id = self.store.register_worker("maintained", {"supports_code_restart": True})["worker_id"]
+        for action in ("sync_files", "restart_services", "reboot_host"):
+            for status in ("pending", "running"):
+                with self.subTest(action=action, status=status):
+                    with self.store.db:
+                        self.store.db.execute(
+                            "UPDATE workers SET sync_request_id='existing', sync_action=?, sync_status=? WHERE id=?",
+                            (action, status, worker_id))
+                    response = await self.client.post(f"/api/admin/workers/{worker_id}/sync", json={})
+                    self.assertEqual(response.status, 409, await response.text())
+                    row = self.store.db.execute(
+                        "SELECT sync_request_id, sync_action, sync_status FROM workers WHERE id=?", (worker_id,)).fetchone()
+                    self.assertEqual(tuple(row), ("existing", action, status))
+
+    async def test_worker_sync_requires_admin_session_and_csrf(self):
+        worker_id = self.store.register_worker("protected-sync", {"supports_code_restart": True})["worker_id"]
+        url = f"/api/admin/workers/{worker_id}/sync"
+        self.client.session.headers.clear()
+        for headers in ({"Origin": self.origin}, {**self.headers, "X-CSRF-Token": "wrong"},
+                        {**self.headers, "Origin": "https://evil.example"}):
+            response = await self.client.post(url, headers=headers, json={})
+            self.assertEqual(response.status, 403)
+        for username, role in (("sync-reader", "user"), ("sync-monitor", "monitor")):
+            self.auth.create_user(username, auth_support.PASSWORD, role=role)
+            self.client.session.headers.update(await self.login(username))
+            response = await self.client.post(url, json={})
+            self.assertEqual(response.status, 403)
+        self.client.session.cookie_jar.clear()
+        response = await self.client.post(url, json={})
         self.assertEqual(response.status, 401)
         self.assertEqual(self.store.list_workers()[0]["sync_status"], "idle")
 

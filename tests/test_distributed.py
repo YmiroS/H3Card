@@ -1349,6 +1349,241 @@ class DistributedStoreTest(unittest.TestCase):
         with self.assertRaises(WorkerBusyError):
             self.store.request_worker_restart(self.worker_id, "restart_services")
 
+    def test_worker_sync_only_changes_target_and_resets_previous_maintenance(self):
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"], "supports_code_restart": True,
+        })
+        self.store.register_worker("other", {"supports_code_restart": True})
+        with self.store.db:
+            self.store.db.execute(
+                """UPDATE workers SET sync_request_id='old', sync_action='restart_services',
+                   sync_status='error', sync_message='failed', sync_requested_at=1,
+                   sync_started_at=2, sync_finished_at=3 WHERE id=?""", (self.worker_id,))
+        before = {row["id"]: dict(row) for row in self.store.db.execute("SELECT * FROM workers")}
+        with mock.patch.object(self.store, "request_sync_all", side_effect=AssertionError("not targeted")), \
+             mock.patch.object(self.store, "request_worker_restart", side_effect=AssertionError("not restart")):
+            request = self.store.request_worker_sync(self.worker_id)
+        after = {row["id"]: dict(row) for row in self.store.db.execute("SELECT * FROM workers")}
+        self.assertEqual(request, {"worker_id": self.worker_id,
+                                  "request_id": request["request_id"], "action": "sync_files"})
+        self.assertTrue(request["request_id"])
+        worker = after.pop(self.worker_id)
+        previous = before.pop(self.worker_id)
+        self.assertEqual(after, before)
+        self.assertEqual(worker["sync_request_id"], request["request_id"])
+        self.assertEqual(worker["sync_action"], "sync_files")
+        self.assertEqual(worker["sync_status"], "pending")
+        self.assertEqual(worker["sync_message"], "等待节点空闲")
+        self.assertGreater(worker["sync_requested_at"], 3)
+        self.assertIsNone(worker["sync_started_at"])
+        self.assertIsNone(worker["sync_finished_at"])
+        changed = {key for key in worker if worker[key] != previous[key]}
+        self.assertEqual(changed, {"sync_request_id", "sync_action", "sync_status", "sync_message",
+                                   "sync_requested_at", "sync_started_at", "sync_finished_at", "updated_at"})
+
+    def test_worker_sync_busy_job_keeps_lease_and_uses_existing_lifecycle(self):
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"], "supports_code_restart": True,
+        })
+        self.store.enqueue("current", {"graph": {}})
+        assigned = self.store.acquire(self.worker_id)
+        self.store.heartbeat(self.worker_id, comfy_online=True, current_job_id="current", busy=True)
+        request = self.store.request_worker_sync(self.worker_id)
+        command = {"type": "sync_files", "request_id": request["request_id"]}
+        for _ in range(2):
+            reply = self.store.heartbeat(self.worker_id, comfy_online=True, current_job_id="current", busy=True)
+            self.assertEqual(reply["commands"], [command])
+            self.assertEqual(reply["lease_ttl_seconds"], self.store.lease_seconds)
+            self.assertEqual(self.store.list_workers()[0]["sync_status"], "pending")
+        self.assertTrue(self.store.finish("current", self.worker_id, assigned["lease_token"], "done"))
+        self.store.enqueue("next", {"graph": {}})
+        for status in ("running", "error", "done"):
+            report = {"request_id": request["request_id"], "status": status, "message": status}
+            reply = self.store.heartbeat(self.worker_id, comfy_online=True, busy=False, maintenance=report)
+            self.assertEqual(reply["commands"], [])
+            self.assertEqual(reply["maintenance_ack"], {"request_id": request["request_id"], "status": status})
+            worker = self.store.list_workers()[0]
+            self.assertEqual(worker["sync_status"], status)
+            self.assertEqual(worker["sync_message"], status)
+            self.assertIsNotNone(worker["sync_started_at"])
+            if status != "done":
+                self.assertIsNone(self.store.acquire(self.worker_id))
+            if status == "running":
+                self.assertIsNone(worker["sync_finished_at"])
+            else:
+                self.assertIsNotNone(worker["sync_finished_at"])
+            if status == "error":
+                self.store.heartbeat(self.worker_id, comfy_online=True, maintenance={
+                    **report, "request_id": "unrelated", "status": "done"})
+                self.store.heartbeat(self.worker_id, comfy_online=True)
+                self.assertEqual(self.store.list_workers()[0]["sync_status"], "error")
+                self.assertIsNone(self.store.acquire(self.worker_id))
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "next")
+
+    def test_worker_sync_validation_rejects_without_changing_any_rows(self):
+        caps = {"supports_code_restart": True}
+        missing = "missing"
+        retired = self.store.register_worker("retired", caps)["worker_id"]
+        self.store.retire_worker(retired)
+        for worker_id in (missing, retired):
+            with self.subTest(worker_id=worker_id), self.assertRaises(KeyError):
+                self.store.request_worker_sync(worker_id)
+        cases = [("unsupported-" + str(index), {"supports_code_restart": value})
+                 for index, value in enumerate((None, False, 1, "true", [], {}))]
+        cases.extend((kind, caps) for kind in ("primary", "offline", "old", "pending", "running"))
+        cases.append(("non-object", ["supports_code_restart"]))
+        for kind, capabilities in cases:
+            with self.subTest(kind=kind):
+                worker_id = self.store.register_worker(kind, capabilities)["worker_id"]
+                if kind == "primary":
+                    self.store.heartbeat(worker_id, capabilities={**caps, "is_primary_node": True})
+                elif kind == "offline":
+                    with self.store.db:
+                        self.store.db.execute("UPDATE workers SET last_seen=0 WHERE id=?", (worker_id,))
+                elif kind == "old":
+                    newer = self.store.register_worker(" OLD ", caps)["worker_id"]
+                    with self.store.db:
+                        self.store.db.execute("UPDATE workers SET created_at=0 WHERE id=?", (worker_id,))
+                        self.store.db.execute("UPDATE workers SET created_at=1 WHERE id=?", (newer,))
+                elif kind in ("pending", "running"):
+                    with self.store.db:
+                        self.store.db.execute("UPDATE workers SET sync_status=? WHERE id=?", (kind, worker_id))
+                before = [tuple(row) for row in self.store.db.execute("SELECT * FROM workers ORDER BY id")]
+                with self.assertRaises(WorkerBusyError):
+                    self.store.request_worker_sync(worker_id)
+                self.assertEqual(before, [tuple(row) for row in self.store.db.execute(
+                    "SELECT * FROM workers ORDER BY id")])
+
+    def test_worker_sync_latest_tiebreak_and_shared_host_guard(self):
+        caps = {"supports_code_restart": True, "hardware": {"host_id": "shared-sync"}}
+        registrations = [self.store.register_worker(name, caps)["worker_id"] for name in ("same", " SAME ")]
+        latest, stale = sorted(registrations, reverse=True)
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET created_at=1 WHERE id IN (?, ?)", registrations)
+        with self.assertRaisesRegex(WorkerBusyError, "最新"):
+            self.store.request_worker_sync(stale)
+        with self.assertRaisesRegex(WorkerBusyError, "host_id"):
+            self.store.request_worker_sync(latest)
+        # 同名离线旧注册仍有维护或任务时不可忽略。
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET last_seen=0 WHERE id=?", (stale,))
+        for field, value in (("sync_status", "pending"), ("sync_status", "running"),
+                             ("busy", 1), ("current_job_id", "active")):
+            with self.subTest(field=field, value=value), self.store.db:
+                self.store.db.execute(f"UPDATE workers SET {field}=? WHERE id=?", (value, stale))
+                with self.assertRaisesRegex(WorkerBusyError, "host_id"):
+                    self.store.request_worker_sync(latest)
+                self.store.db.execute(
+                    "UPDATE workers SET sync_status='idle', busy=0, current_job_id=NULL WHERE id=?", (stale,))
+        peer = self.store.register_worker("different-name", caps)["worker_id"]
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET last_seen=0 WHERE id=?", (peer,))
+        with self.assertRaisesRegex(WorkerBusyError, "host_id"):
+            self.store.request_worker_sync(latest)
+        self.store.retire_worker(peer)
+        request = self.store.request_worker_sync(latest)
+        self.assertEqual(self.store.heartbeat(latest)["commands"], [
+            {"type": "sync_files", "request_id": request["request_id"]}])
+        # 离线旧实例重新上线后，原先安全的同步目标也必须重新检查。
+        self.assertEqual(self.store.heartbeat(stale)["commands"], [])
+        self.assertEqual(self.store.heartbeat(latest)["commands"], [])
+        self.assertEqual(next(w for w in self.store.list_workers() if w["id"] == latest)["sync_status"], "error")
+
+    def test_worker_sync_late_shared_host_blocks_dispatch_and_command(self):
+        for index, peer_name in enumerate(("peer", " SAME ")):
+            with self.subTest(peer_name=peer_name):
+                store = DistributedStore(Path(self.temp.name) / f"late-sync-{index}.db")
+                try:
+                    caps = {"supports_code_restart": True, "hardware": {"host_id": "shared-host"}}
+                    target = store.register_worker("same", caps)["worker_id"]
+                    request = store.request_worker_sync(target)
+                    peer = store.register_worker(peer_name, caps)["worker_id"]
+                    with store.db:
+                        store.db.execute("UPDATE workers SET created_at=1 WHERE id=?", (target,))
+                        store.db.execute("UPDATE workers SET created_at=2 WHERE id=?", (peer,))
+                    store.heartbeat(peer, comfy_online=True)
+                    store.enqueue("blocked", {"graph": {}})
+                    self.assertIsNone(store.acquire(peer))
+                    self.assertEqual(store.heartbeat(target, comfy_online=True)["commands"], [])
+                    row = store.db.execute("SELECT * FROM workers WHERE id=?", (target,)).fetchone()
+                    self.assertEqual(row["sync_status"], "error")
+                    self.assertIn("host_id" if peer_name == "peer" else "最新", row["sync_message"])
+                    self.assertIsNotNone(row["sync_finished_at"])
+                    self.assertIsNone(row["sync_started_at"])
+                    reply = store.heartbeat(target, comfy_online=True, maintenance={
+                        "request_id": request["request_id"], "status": "running"})
+                    self.assertNotEqual(reply["maintenance_ack"], {
+                        "request_id": request["request_id"], "status": "running"})
+                    self.assertEqual(reply["commands"], [])
+                    self.assertIsNone(store.acquire(peer))
+                    self.assertEqual(store.dispatch_status("blocked"), "queued")
+                finally:
+                    store.close()
+
+    def test_worker_sync_running_report_rechecks_late_registration(self):
+        for index, (peer_name, host_id) in enumerate((
+            ("peer", "shared-host"), (" SAME ", "shared-host"), (" SAME ", None),
+        )):
+            with self.subTest(peer_name=peer_name, host_id=host_id):
+                store = DistributedStore(Path(self.temp.name) / f"running-sync-{index}.db")
+                try:
+                    caps = {"supports_code_restart": True}
+                    if host_id:
+                        caps["hardware"] = {"host_id": host_id}
+                    target = store.register_worker("same", caps)["worker_id"]
+                    request = store.request_worker_sync(target)
+                    self.assertEqual(store.heartbeat(target)["commands"], [
+                        {"type": "sync_files", "request_id": request["request_id"]}])
+                    peer = store.register_worker(peer_name, caps)["worker_id"]
+                    with store.db:
+                        store.db.execute("UPDATE workers SET created_at=1 WHERE id=?", (target,))
+                        store.db.execute("UPDATE workers SET created_at=2 WHERE id=?", (peer,))
+                    reply = store.heartbeat(target, maintenance={
+                        "request_id": request["request_id"], "status": "running"})
+                    self.assertEqual(reply["maintenance_ack"], {
+                        "request_id": request["request_id"], "status": "error"})
+                    self.assertEqual(reply["commands"], [])
+                    row = store.db.execute("SELECT * FROM workers WHERE id=?", (target,)).fetchone()
+                    self.assertEqual(row["sync_status"], "error")
+                    self.assertIn("host_id" if peer_name == "peer" else "最新", row["sync_message"])
+                    self.assertIsNotNone(row["sync_finished_at"])
+                finally:
+                    store.close()
+
+    def test_worker_sync_host_reservation_tracks_maintenance_state(self):
+        caps = {"supports_code_restart": True, "hardware": {"host_id": "reserved-sync"}}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        self.store.request_worker_sync(self.worker_id)
+        peer = self.store.register_worker("peer", caps)["worker_id"]
+        self.store.heartbeat(peer, comfy_online=True)
+        self.store.enqueue("reserved-job", {"graph": {}, "target_worker_id": peer})
+        for status in ("pending", "running", "error", "done"):
+            with self.subTest(status=status), self.store.db:
+                self.store.db.execute("UPDATE workers SET sync_status=? WHERE id=?", (status, self.worker_id))
+                peer_state = next(w for w in self.store.list_generation_workers() if w["id"] == peer)["state"]
+                self.assertEqual(peer_state, "idle" if status == "done" else "error" if status == "error" else "syncing")
+                if status == "done":
+                    self.assertEqual(self.store.acquire(peer)["job_id"], "reserved-job")
+                else:
+                    self.assertIsNone(self.store.acquire(peer))
+
+    def test_primary_stale_sync_does_not_reserve_shared_host(self):
+        caps = {"is_primary_node": True, "hardware": {"host_id": "primary-host"}}
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        peer = self.store.register_worker("peer", {"hardware": caps["hardware"]})["worker_id"]
+        self.store.heartbeat(peer, comfy_online=True)
+        for status in ("pending", "running", "error"):
+            with self.subTest(status=status), self.store.db:
+                self.store.db.execute(
+                    "UPDATE workers SET sync_action='sync_files', sync_status=? WHERE id=?",
+                    (status, self.worker_id),
+                )
+                self.assertEqual(self.store._service_maintenance_hosts_locked(), {})
+                self.assertEqual(next(w for w in self.store.list_generation_workers()
+                                      if w["id"] == peer)["state"], "idle")
+        self.store.enqueue("primary-stale-sync", {"graph": {}, "target_worker_id": peer})
+        self.assertEqual(self.store.acquire(peer)["job_id"], "primary-stale-sync")
+
     def test_sync_all_skips_workers_without_sync_support(self):
         request = self.store.request_sync_all()
         self.assertEqual(request["worker_count"], 0)

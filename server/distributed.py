@@ -694,6 +694,44 @@ class DistributedStore:
             )
         return {"worker_id": worker_id, "request_id": request_id, "action": action}
 
+    def _check_sync_target_locked(self, worker_id, capabilities, now):
+        target = self.db.execute("SELECT name FROM workers WHERE id = ?", (worker_id,)).fetchone()
+        latest = next((item for item in self.db.execute(
+            "SELECT id, name FROM workers WHERE retired = 0 ORDER BY created_at DESC, id DESC"
+        ) if _worker_name_key(item["name"]) == _worker_name_key(target["name"])), None)
+        if latest is None or latest["id"] != worker_id:
+            raise WorkerBusyError("只能同步同名最新注册的 Worker")
+        self._check_restart_host_locked(worker_id, capabilities, "sync_files", now)
+
+    def request_worker_sync(self, worker_id):
+        now = time.time()
+        with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT * FROM workers WHERE id = ? AND retired = 0", (worker_id,)
+            ).fetchone()
+            if not row:
+                raise KeyError("Worker 不存在")
+            capabilities = json.loads(row["capabilities_json"] or "{}")
+            if _primary_node(capabilities):
+                raise WorkerBusyError("主节点不支持远程同步")
+            if now - row["last_seen"] > self.offline_seconds:
+                raise WorkerBusyError("Worker 已离线")
+            if not isinstance(capabilities, dict) or capabilities.get("supports_code_restart") is not True:
+                raise WorkerBusyError("Worker 不支持文件同步，请先升级 Worker")
+            if row["sync_status"] in ("pending", "running"):
+                raise WorkerBusyError("Worker 已有等待中或执行中的维护请求")
+            # 同步会使用现有 agent 维护流程；不能让已知的同宿主实例并发维护共享目录。
+            self._check_sync_target_locked(worker_id, capabilities, now)
+            request_id = str(uuid.uuid4())
+            self.db.execute(
+                """UPDATE workers SET sync_request_id = ?, sync_action = 'sync_files',
+                       sync_status = 'pending', sync_message = ?, sync_requested_at = ?,
+                       sync_started_at = NULL, sync_finished_at = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (request_id, "等待节点空闲", now, now, worker_id),
+            )
+        return {"worker_id": worker_id, "request_id": request_id, "action": "sync_files"}
+
     def request_sync_all(self):
         now = time.time()
         request_id = str(uuid.uuid4())
@@ -874,9 +912,12 @@ class DistributedStore:
                         and (sync_status in {"pending", "running"} or report_status == sync_status
                              or sync_status == "error" and report_status == "done")):
                     message = str(maintenance.get("message") or "")[:1000]
-                    if row["sync_action"] in ("reboot_host", "restart_services") and report_status == "running":
+                    if report_status == "running":
                         try:
-                            self._check_restart_host_locked(worker_id, effective_capabilities, row["sync_action"], now)
+                            if row["sync_action"] == "sync_files":
+                                self._check_sync_target_locked(worker_id, effective_capabilities, now)
+                            elif row["sync_action"] in ("reboot_host", "restart_services"):
+                                self._check_restart_host_locked(worker_id, effective_capabilities, row["sync_action"], now)
                         except WorkerBusyError as exc:
                             report_status, message = "error", str(exc)
                     if row["sync_action"] == "reboot_host" and report_status == "done":
@@ -927,10 +968,21 @@ class DistributedStore:
                     commands.append({"type": "abort_job", "job_id": current_job_id})
 
             if sync_request_id and sync_status == "pending":
-                commands.append({
-                    "type": row["sync_action"],
-                    "request_id": sync_request_id,
-                })
+                if row["sync_action"] == "sync_files":
+                    try:
+                        self._check_sync_target_locked(worker_id, effective_capabilities, now)
+                    except WorkerBusyError as exc:
+                        sync_status = "error"
+                        self.db.execute(
+                            """UPDATE workers SET sync_status = 'error', sync_message = ?,
+                                   sync_finished_at = ?, updated_at = ? WHERE id = ?""",
+                            (str(exc), now, now, worker_id),
+                        )
+                if sync_status == "pending":
+                    commands.append({
+                        "type": row["sync_action"],
+                        "request_id": sync_request_id,
+                    })
 
             reported_local_busy = bool(busy) if local_busy is None else bool(local_busy)
             effective_busy = reported_local_busy or active_job_id is not None
@@ -1062,11 +1114,14 @@ class DistributedStore:
     def _service_maintenance_hosts_locked(self):
         hosts = {}
         for row in self.db.execute(
-            """SELECT capabilities_json, sync_status FROM workers WHERE retired = 0
-               AND sync_action IN ('reboot_host', 'restart_services')
+            """SELECT capabilities_json, sync_action, sync_status FROM workers WHERE retired = 0
+               AND sync_action IN ('reboot_host', 'restart_services', 'sync_files')
                AND sync_status IN ('pending', 'running', 'error')"""
         ):
-            host_id = _worker_host_id(json.loads(row["capabilities_json"] or "{}"))
+            capabilities = json.loads(row["capabilities_json"] or "{}")
+            if row["sync_action"] == "sync_files" and _primary_node(capabilities):
+                continue
+            host_id = _worker_host_id(capabilities)
             if host_id:
                 state = "error" if row["sync_status"] == "error" else "syncing"
                 if hosts.get(host_id) != "error":
