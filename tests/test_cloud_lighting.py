@@ -43,14 +43,32 @@ async def idle_ws(application):
 class LightingSizeTests(unittest.TestCase):
     def test_clarity_tiers_keep_input_ratio_and_align_request_size(self):
         for width, height, pixels, expected in (
-                (1920, 1080, 1920 * 1080, "1920x1088"),
-                (1080, 1920, 1920 * 1080, "1088x1920"),
+                (1920, 1080, 1920 * 1080, "1920x1072"),
+                (1080, 1920, 1920 * 1080, "1072x1920"),
                 (1920, 1080, 2560 * 1440, "2560x1440"),
                 (1920, 1080, 3840 * 2160, "3840x2160"),
+                (3392, 5056, 3840 * 2160, "2352x3504"),
+                (5056, 3392, 3840 * 2160, "3504x2352"),
                 (1440, 1440, 1920 * 1080, "1440x1440")):
             with self.subTest(width=width, height=height, pixels=pixels):
                 self.assertEqual(lighting_size({"width": width, "height": height},
                                                pixels / (1024 * 1024)), expected)
+
+    def test_aligned_dimensions_never_exceed_pixel_budget(self):
+        for source in ((3392, 5056), (5056, 3392), (1920, 1080), (1080, 1920),
+                       (1440, 1440), (4, 3), (1, 32_000_000), (32_000_000, 1)):
+            for megapixels in (0.25, 1.5, 16, *(width * height / (1024 * 1024)
+                    for width, height in ((832, 480), (960, 544), (1152, 640),
+                                          (1344, 768), (1920, 1080), (2560, 1440),
+                                          (3840, 2160)))):
+                with self.subTest(source=source, megapixels=megapixels):
+                    size = lighting_size({"width": source[0], "height": source[1]}, megapixels)
+                    width, height = map(int, size.split("x"))
+                    self.assertGreaterEqual(width, 16)
+                    self.assertGreaterEqual(height, 16)
+                    self.assertEqual(width % 16, 0)
+                    self.assertEqual(height % 16, 0)
+                    self.assertLessEqual(width * height, megapixels * 1024 * 1024)
 
     def test_invalid_megapixels_are_rejected(self):
         for value in (True, False, None, "2", [], {}, 0, -1, 0.24, 16.01,
@@ -444,7 +462,7 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(len(self.received), 1)
         self.assertEqual(self.received[0]["images"], [png("red")])
         self.assertEqual(self.received[0]["fields"]["prompt"], PROMPT)
-        self.assertEqual(self.received[0]["fields"]["size"], "1456x1088")
+        self.assertEqual(self.received[0]["fields"]["size"], "1440x1072")
         self.assertEqual(self.received[0]["fields"]["model"], "fake-lighting-model")
         self.assertEqual(self.received[0]["authorization"], "Bearer fake-lighting-secret")
         self.assertEqual(done["request_id"], "lighting-request-1")
@@ -454,7 +472,7 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
     async def test_selected_clarity_controls_cloud_size_without_resizing_input(self):
         image = png("red", (1920, 1080))
         upstream = self.add_upload("landscape.png", image)
-        for pixels, expected in ((1920 * 1080, "1920x1088"),
+        for pixels, expected in ((1920 * 1080, "1920x1072"),
                                  (2560 * 1440, "2560x1440"),
                                  (3840 * 2160, "3840x2160")):
             with self.subTest(size=expected):
@@ -470,6 +488,29 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
                 self.assertEqual(self.received[-1]["images"], [image])
         self.assertEqual((self.root / "data/uploads/landscape.png").read_bytes(), image)
         self.assertEqual(len(self.received), 3)
+
+    async def test_portrait_4k_budget_applies_to_dry_run_and_cloud_request(self):
+        image = png("red", (3392, 5056))
+        upstream = self.add_upload("portrait.png", image)
+        pixels = 3840 * 2160
+        params = {"prompt": PROMPT, "megapixels": pixels / (1024 * 1024)}
+        assets = {"images[0]": upstream["ref"]}
+        response = await self.generate(params=params, assets=assets, dry_run=True)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())["size"], "2352x3504")
+        self.assert_no_submission()
+        submitted = await self.start_job(params=params, assets=assets)
+        self.assertEqual(submitted["requested_size"], "2352x3504")
+        self.assertEqual(submitted["megapixels"], params["megapixels"])
+        done = await self.finish_job(submitted)
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["requested_size"], "2352x3504")
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(self.received[0]["fields"]["size"], "2352x3504")
+        width, height = map(int, self.received[0]["fields"]["size"].split("x"))
+        self.assertLessEqual(width * height, pixels)
+        self.assertEqual(self.received[0]["images"], [image])
+        self.assertEqual((self.root / "data/uploads/portrait.png").read_bytes(), image)
 
     async def test_invalid_clarity_rejects_before_creating_cloud_task(self):
         for value in (True, "2", None, 0, 16.1):
@@ -577,7 +618,7 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.result_size = (6, 5)
         done = await self.finish_job(await self.start_job())
         self.assertEqual(done["status"], "done")
-        self.assertEqual(self.received[0]["fields"]["size"], "1456x1088")
+        self.assertEqual(self.received[0]["fields"]["size"], "1440x1072")
         output = done["outputs"][0]
         self.assertEqual((output["width"], output["height"]), (6, 5))
         response = await self.client.get(output["url"])
@@ -597,6 +638,23 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(len(self.received), 1)
         self.assertEqual(self.saved_card(), before)
         self.assertEqual(list((self.root / "data").glob("artifacts/*/*")), [])
+
+    async def test_gateway_400_logs_diagnostics_but_keeps_task_error_private(self):
+        self.gateway_status = 400
+        self.result_payload = {"error": {"message": "Unsupported size: fake-lighting-secret",
+                                         "param": "size", "code": "invalid_size"}}
+        with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+            done = await self.finish_job(await self.start_job())
+        self.assertEqual(done["status"], "error")
+        self.assertIn("HTTP 400", done["error"])
+        self.assertFalse(done["retryable"])
+        self.assertEqual(done["request_id"], "lighting-request-1")
+        self.assertNotIn("Unsupported size", done["error"])
+        self.assertNotIn("fake-lighting-secret", " ".join(logs.output))
+        self.assertIn("Unsupported size: [redacted]", " ".join(logs.output))
+        self.assertIn("param=size", " ".join(logs.output))
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(done["outputs"], [])
 
     async def test_invalid_gateway_image_sets_error_without_retry(self):
         self.result_payload = {"data": [{"b64_json": "not valid base64"}]}
@@ -623,7 +681,7 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         response = await self.generate(dry_run=True)
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(await response.json(), {"dry_run": True, "execution": "cloud_image",
-                                                 "changed": {}, "prompt": PROMPT, "size": "1456x1088"})
+                                                 "changed": {}, "prompt": PROMPT, "size": "1440x1072"})
         self.assert_no_submission()
 
     async def test_missing_cloud_credentials_rejects_before_job_creation(self):

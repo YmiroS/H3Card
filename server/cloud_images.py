@@ -4,8 +4,10 @@ import base64
 import binascii
 from io import BytesIO
 import json
+import logging
 import os
 from pathlib import Path
+import re
 from urllib.parse import urlsplit
 import warnings
 
@@ -155,6 +157,22 @@ async def edit(session, images, prompt, *, size=None):
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=450)) as response:
             request_id = response.headers.get("X-Request-ID", "")[:200] or None
             if not 200 <= response.status < 300:
+                detail = "无可用结构化错误详情"
+                try:
+                    payload = json.loads(await read_limited(response, 16 * 1024))
+                    error = payload.get("error", payload.get("detail", payload.get("message"))) if isinstance(payload, dict) else None
+                    if isinstance(error, dict):
+                        error = "; ".join(f"{key}={error[key]}" for key in ("message", "type", "param", "code")
+                                          if isinstance(error.get(key), str))
+                    if isinstance(error, str) and error.strip():
+                        detail = error.replace(config["api_key"], "[redacted]").replace(prompt.strip(), "[prompt redacted]")
+                        detail = re.sub(r"(?i)\bBearer\s+[^\s\"'<>;,]+|\bsk-[A-Za-z0-9_-]+", "[credential redacted]", detail)
+                        detail = re.sub(r"data:[^\s\"'<>]+|[A-Za-z0-9+/=_-]{80,}", "[data redacted]", detail)
+                        detail = re.sub(r"[\x00-\x1f\x7f]", " ", detail)[:512]
+                except (ImageEditError, ValueError, UnicodeError, aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+                logging.getLogger(__name__).warning(
+                    "Cloud image edit HTTP %s request_id=%r detail=%s", response.status, request_id, detail)
                 raise ImageEditError(f"云端图片编辑返回 HTTP {response.status}，请联系管理员核对，不要自动重试",
                                      request_id=request_id)
             body = await read_limited(response, MAX_RESPONSE_BYTES)

@@ -17,9 +17,15 @@ def lighting_size(info, megapixels):
             or not math.isfinite(megapixels) or not 0.25 <= megapixels <= 16):
         raise web.HTTPBadRequest(text="多灯处理像素必须为 0.25–16 MP 之间的数值")
     pixels = megapixels * 1024 * 1024
-    ratio = info["width"] / info["height"]
-    width = max(16, (round(math.sqrt(pixels * ratio)) + 15) // 16 * 16)
-    height = max(16, (round(math.sqrt(pixels / ratio)) + 15) // 16 * 16)
+    scale = math.sqrt(pixels / (info["width"] * info["height"]))
+    width = max(16, math.floor(info["width"] * scale / 16) * 16)
+    height = max(16, math.floor(info["height"] * scale / 16) * 16)
+    # A minimum 16px short edge can exceed the budget for extreme aspect ratios.
+    if width * height > pixels:
+        if width >= height:
+            width = math.floor(pixels / height / 16) * 16
+        else:
+            height = math.floor(pixels / width / 16) * 16
     return f"{width}x{height}"
 
 
