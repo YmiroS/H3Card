@@ -34,6 +34,7 @@ from pathlib import Path
 from urllib.parse import quote, urlencode
 from collections import defaultdict
 from functools import partial
+from types import SimpleNamespace
 
 import aiohttp
 from aiohttp import web
@@ -57,6 +58,7 @@ from video_preview import MediaThumbnails, VideoPreviews, preview_status, previe
 from if_reference import IFReferenceCopies
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.auth_store import AuthStore
+from server import sr_service
 from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
 from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_user, require_admin,
                          require_team_leader, require_project, require_job, call_store,
@@ -141,6 +143,7 @@ MODEL_NAMES = {
     "depthcrafter": "DepthCrafter",
     "gimmvfi_interp": "GIMM-VFI",
     "grid4_stitch": "无需模型（拼图工具）",
+    "youku_sr_video": "优酷视频超分（远程服务）",
     "rmbg_erase": "RMBG 2.0 + FLUX.2 Klein",
     "text": "Qwen3.5 27B",
 }
@@ -289,6 +292,9 @@ def controller_maintenance_active(app, workers=None):
     )
 
 
+# 不提交 ComfyUI 工作流、不占 GPU 执行端的能力。
+EXTERNAL_EXECUTIONS = {"browser", "if_studio", sr_service.EXECUTION}
+
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VID_EXT = {".mp4", ".webm", ".mkv", ".mov", ".avi"}
 AUD_EXT = {".mp3", ".wav", ".flac", ".ogg", ".m4a"}
@@ -333,7 +339,9 @@ def load_caps():
         controls = image_controls(m["id"])
         if controls is not None:
             m["imageControls"] = controls
-        if m.get("execution") in ("browser", "if_studio"):
+        if m.get("execution") == sr_service.EXECUTION:
+            m["_graph_ok"] = sr_service.configured()
+        elif m.get("execution") in ("browser", "if_studio"):
             m["_graph_ok"] = False
         else:
             gp = ROOT / m["graph"]
@@ -1471,13 +1479,18 @@ async def api_generate(request):
         if (not isinstance(target_worker_id, str) or not target_worker_id.strip()
                 or len(target_worker_id) > 128):
             raise web.HTTPBadRequest(text="target_worker_id 必须为非空执行端 ID")
-        if (not CONTROLLER_MODE or cap.get("execution") in {"browser", "if_studio"}
+        if (not CONTROLLER_MODE or cap.get("execution") in EXTERNAL_EXECUTIONS
                 or cap.get("outputType") != "video"):
             raise web.HTTPBadRequest(text="仅控制器模式的非 IF 视频能力支持指定执行端")
     if cap.get("execution") == "browser":
         raise web.HTTPBadRequest(text="此能力在浏览器中执行，请在图片合成编辑器中合成输出")
     if cap.get("execution") == "if_studio":
         raise web.HTTPBadRequest(text="IF 任务须通过用户本机桥接程序提交")
+    if cap.get("execution") == sr_service.EXECUTION:
+        if body.get("dry_run"):
+            return web.json_response({"dry_run": True, "changed": {}})
+        pid = await submit_remote_sr(request, body, cap)
+        return await generation_response(request, body, pid, project, linked_card)
     if not cap.get("_graph_ok"):
         raise web.HTTPBadRequest(reason=f"{cid} 缺 API 工作流文件：{cap['graph']}")
     params = body.get("params") or {}
@@ -1619,6 +1632,10 @@ async def api_generate(request):
         distributed_store(request.app).enqueue(pid, dispatch_payload, required_nodes)
         if ledger:
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
+    return await generation_response(request, body, pid, project, linked_card)
+
+
+async def generation_response(request, body, pid, project, linked_card):
     save_jobs()
     result = JOBS[pid]
     if linked_card:
@@ -1633,6 +1650,86 @@ async def api_generate(request):
         }, authorize=True)
         result = result | {"project_rev": project["rev"]}
     return web.json_response(result)
+
+
+SR_REF_SLOTS = 4
+
+
+async def sr_input_path(request, value, project_id):
+    """Local file behind a canvas asset; videos use the same compatible MP4 as Comfy jobs."""
+    ref = await resource_call(request.app, "reference", value)
+    if not ref:
+        raise web.HTTPBadRequest(text="无法识别超分输入素材")
+    await require_resource(request, *ref, project_id=project_id)
+    if ref[0] == "comfy":
+        await cache_comfy_outputs(request, {"outputs": [{"url": value}]})
+    if ref[0] == "upload" and kind_of(ref[1]) == "video":
+        previews = request.app["video_previews"]
+        if ref[1].endswith(".browser.mp4"):
+            return previews.source(ref[1])
+        state = previews.ensure(ref[1])
+        if state["status"] == "error":
+            raise web.HTTPUnprocessableEntity(text=state["error"])
+        if state["status"] != "ready":
+            raise web.HTTPConflict(text="视频正在转码为 MP4，请等待预览就绪后再生成；不会使用原片执行。")
+        return previews.target(ref[1])
+    path = await resource_call(request.app, "local_path", *ref)
+    if not path.is_file():
+        raise web.HTTPNotFound(text="超分输入素材不存在")
+    return path
+
+
+async def submit_remote_sr(request, body, cap):
+    if not sr_service.configured():
+        raise web.HTTPServiceUnavailable(text="视频超分服务未配置，请管理员填写 sr-service.json")
+    assets = body.get("assets") or {}
+    project_id = body["project"]
+    if not assets.get("video[0]"):
+        raise web.HTTPBadRequest(text="请先连接原始视频")
+    video = await sr_input_path(request, assets["video[0]"], project_id)
+    if kind_of(video.name) != "video":
+        raise web.HTTPBadRequest(text="原始视频槽位只接受视频")
+    refs = []
+    for index in range(SR_REF_SLOTS):
+        value = assets.get(f"images[{index}]")
+        if not value:
+            continue
+        path = await sr_input_path(request, value, project_id)
+        if path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+            raise web.HTTPBadRequest(text="参考图只支持 PNG、JPEG 或 WebP")
+        refs.append(path)
+    params = body.get("params") or {}
+    try:
+        sr_service.build_payload(params, "", [], "")
+    except sr_service.SRError as exc:
+        raise web.HTTPBadRequest(text=str(exc))
+    await require_project(request, project_id, operate=True)
+    pid = str(uuid.uuid4())
+    await call_store(request.app, "register_job", pid, project_id, require_user(request)["id"])
+    await resource_call(request.app, "register_job_inputs", pid,
+                        [v for v in assets.values() if isinstance(v, str) and v.startswith("chouka/")])
+    JOBS[pid] = {"id": pid, "capability": cap["id"], "name": cap["name"],
+                 "modelName": model_name(cap["id"]), "outputType": cap["outputType"],
+                 "executor": sr_service.EXECUTION, "status": "queued", "progress": 0.0,
+                 "created": time.time(), "seed": None, "step": "", "outputs": [],
+                 "error": None, "prompts": [],
+                 "project": project_id, "projectName": body.get("projectName"),
+                 "card": body.get("card"), "cardName": body.get("cardName")}
+    request.app["sr_runner"].start(request.app["session"], JOBS[pid],
+                                   {"video": video, "refs": refs}, params)
+    return pid
+
+
+def sr_runner_hooks(app):
+    async def register_output(locator, ready):
+        if ready:
+            await resource_call(app, "publish", "artifact", locator)
+            return
+        pid = locator.split("/", 1)[0]
+        project_id = (JOBS.get(pid) or {}).get("project")
+        await resource_call(app, "register", project_id, "artifact", locator, state="pending")
+
+    return SimpleNamespace(save=save_jobs, register_output=register_output)
 
 
 REWRITE_TIMEOUT = 900      # 27B 在 CPU/低显存上第一次加载就要好几分钟，别掐太早
@@ -1912,14 +2009,16 @@ def job_display_info(job, node_name):
 
 
 def job_node_names(app, jobs):
+    remote = {job["id"]: "远程超分服务" for job in jobs
+              if job.get("executor") == sr_service.EXECUTION}
     if CONTROLLER_MODE:
         names = {}
         # 全量历史可能超过 SQLite 单条 IN 查询的参数上限。
         for start in range(0, len(jobs), 500):
             names.update(distributed_store(app).job_worker_names(
                 job["id"] for job in jobs[start:start + 500]))
-        return names
-    return {job["id"]: "本机" for job in jobs}
+        return names | remote
+    return {job["id"]: "本机" for job in jobs} | remote
 
 
 async def job_submitter_info(request, jobs):
@@ -2459,7 +2558,7 @@ async def api_generation_workers(request):
     require_user(request)
     cid = request.query.get("capability")
     cap = CAPS.get(cid)
-    if (not cap or cap.get("execution") in {"browser", "if_studio"}
+    if (not cap or cap.get("execution") in EXTERNAL_EXECUTIONS
             or cap.get("outputType") != "video"):
         raise web.HTTPBadRequest(text="请选择非 IF 的视频能力")
     if not CONTROLLER_MODE:
@@ -2610,7 +2709,10 @@ def load_jobs():
         return
     cut = 0
     for j in rows:
-        if j.get("cleanup_pending") and not CONTROLLER_MODE:
+        if j.get("executor") == sr_service.EXECUTION and j.get("status") in LIVE:
+            # on_start 按远端状态决定续查还是落为失败，绝不重新提交。
+            j.update(step="后端重启，正在恢复超分任务")
+        elif j.get("cleanup_pending") and not CONTROLLER_MODE:
             j.update(step="显存释放未确认，请重试取消")
         elif local_completion_waiting(j):
             j.update(completion_pending=True, step="正在取回产物")
@@ -2628,6 +2730,11 @@ async def stop_job(app, pid):
     job = JOBS.get(pid)
     if job and job["status"] not in LIVE and not job.get("cleanup_pending"):
         return "finished"
+    if job and job.get("executor") == sr_service.EXECUTION:
+        if not await app["sr_runner"].cancel(pid):
+            job.update(status="canceled", step="", ended=time.time())
+            save_jobs()
+        return "canceled"
     if CONTROLLER_MODE:
         state = distributed_store(app).request_cancel(pid)
         if state == "canceled":
@@ -2691,6 +2798,7 @@ async def check_task_mutation(request, pid):
     if pid not in JOBS:
         raise web.HTTPForbidden(text="归档历史任务为只读")
     if (not CONTROLLER_MODE and JOBS.get(pid, {}).get("status") == "running"
+            and JOBS[pid].get("executor") != sr_service.EXECUTION
             and require_user(request)["role"] != "admin"):
         raise web.HTTPConflict(text="本地执行器仅支持全局中断，请由管理员取消运行中的任务")
 
@@ -3973,6 +4081,10 @@ async def on_start(app):
         await setup_local_test_auth(app)
     elif not app.get("admin_sandbox"):
         setup_dingtalk(app, app["auth_store"])
+    if not app.get("admin_sandbox"):
+        for job in list(JOBS.values()):
+            if job.get("executor") == sr_service.EXECUTION and job.get("status") in LIVE:
+                app["sr_runner"].resume(app["session"], job)
     if not CONTROLLER_MODE and not app.get("admin_sandbox"):
         for pid, job in JOBS.items():
             if local_completion_waiting(job):
@@ -3996,6 +4108,9 @@ async def close_presence_connections(app):
 
 async def on_stop(app):
     await close_presence_connections(app)
+    sr_runner = app.get("sr_runner")
+    if sr_runner:
+        await sr_runner.shutdown()
     probe_task = app.get("capacity_probe_state", {}).get("task")
     if probe_task:
         await asyncio.gather(asyncio.shield(probe_task), return_exceptions=True)
@@ -4082,6 +4197,8 @@ def make_app(auth_path=None, *, project_repository=None):
     app["local_output_tasks"] = {}
     app["local_gpu_state"] = {}
     app["capacity_probe_state"] = {"task": None}
+    app["sr_runner"] = sr_service.Runner(ROOT / "data" / "sr_tasks.json", ARTIFACT_DIR,
+                                         sr_runner_hooks(app))
     app["lifecycle"] = {"shutting_down": False}
     app["local_test"] = local_test
     app["admin_sandbox"] = admin_sandbox

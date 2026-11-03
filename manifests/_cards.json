@@ -183,6 +183,16 @@
     "slots": "img0+aud0+vid1"
    },
    {
+    "id": "youku_sr_video",
+    "name": "参考图视频超分",
+    "slots": "img4+aud0+vid1"
+   },
+   {
+    "id": "video_color_match",
+    "name": "参考图校色",
+    "slots": "img1+aud0+vid1"
+   },
+   {
     "id": "card_enhance",
     "name": "画质增强",
     "slots": "image/video",

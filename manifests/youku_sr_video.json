@@ -1,0 +1,101 @@
+{
+ "id": "youku_sr_video",
+ "name": "参考图视频超分",
+ "execution": "remote_sr",
+ "group": "视频",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "video",
+ "images": 4,
+ "audios": 0,
+ "videos": 1,
+ "slots": "img4+aud0+vid1",
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 4
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 1,
+   "max": 1
+  }
+ },
+ "note": "把视频送到远程超分服务放大到指定高度，不占本地显卡。接上参考图（人物、服装、场景的清晰照片）可以让放大后的细节更贴近参考，不接就是普通超分。服务按任务计费且没有取消接口：点停止只是不再等结果，远端仍会跑完。先把「只处理前几帧」填一个小数试一版，满意了再改回 0 跑整段。",
+ "inputs": [
+  {
+   "key": "video[0]",
+   "label": "原始视频",
+   "type": "video",
+   "required": true
+  },
+  {
+   "key": "images[0]",
+   "label": "参考图1",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[1]",
+   "label": "参考图2",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[2]",
+   "label": "参考图3",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "images[3]",
+   "label": "参考图4",
+   "type": "image",
+   "required": false
+  },
+  {
+   "key": "output_height",
+   "label": "输出高度",
+   "type": "select",
+   "default": "2160",
+   "options": [
+    {"value": "720", "label": "720p"},
+    {"value": "1080", "label": "1080p"},
+    {"value": "1440", "label": "1440p (2K)"},
+    {"value": "2160", "label": "2160p (4K)"}
+   ],
+   "hint": "成片的高度，宽度按原视频比例跟着放。越高越慢、文件越大",
+   "advanced": false,
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "num_frames",
+   "label": "只处理前几帧",
+   "type": "slider",
+   "min": 0,
+   "max": 600,
+   "step": 15,
+   "default": 0,
+   "hint": "0 = 整段都处理。想先看效果就填 60 左右试一版，满意了再改回 0",
+   "advanced": false,
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "lf_anchor",
+   "label": "低频颜色锚定",
+   "type": "select",
+   "appearance": "switch",
+   "default": "on",
+   "options": [
+    {"value": "on", "label": "开启"},
+    {"value": "off", "label": "关闭"}
+   ],
+   "hint": "开启时成片的整体颜色、亮度跟原视频保持一致；关掉后颜色可能被参考图带偏",
+   "advanced": true,
+   "target": {"kind": "preset"}
+  }
+ ]
+}
