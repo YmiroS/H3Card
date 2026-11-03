@@ -70,6 +70,8 @@ from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
 from server.texture_api import register_texture_routes
+from server.cloud_lighting import CloudLighting
+from server.cloud_images import ImageEditError
 from server.project_repository import ProjectRepository, InvalidProjectId
 from server.project_service import ProjectService, ProjectError
 from server.routes import (register_page_routes, register_project_routes, register_media_routes,
@@ -333,7 +335,7 @@ def load_caps():
         controls = image_controls(m["id"])
         if controls is not None:
             m["imageControls"] = controls
-        if m.get("execution") in ("browser", "if_studio"):
+        if m.get("execution") in ("browser", "if_studio", "cloud_image"):
             m["_graph_ok"] = False
         else:
             gp = ROOT / m["graph"]
@@ -365,7 +367,7 @@ def mode_ok(md):
     if md.get("route"):
         md["route"] = {k: r for k, r in md["route"].items() if graph_ok(r["cap"])}
         return bool(md["route"])
-    if CAPS.get(md["id"], {}).get("execution") in ("browser", "if_studio"):
+    if CAPS.get(md["id"], {}).get("execution") in ("browser", "if_studio", "cloud_image"):
         return True
     return graph_ok(md["id"])
 
@@ -1190,7 +1192,7 @@ async def handle_event(session, ev, remote=False, app=None):
     pid = d.get("prompt_id")
     job = JOBS.get(pid) if pid else None
 
-    if job and job.get("cleanup_pending"):
+    if job and (job.get("cleanup_pending") or job.get("execution") == "cloud_image"):
         return
 
     # 失败 / 取消 / 完成都是终局。ComfyUI 报错之后还会补发 executing(node=None)、
@@ -1281,7 +1283,7 @@ async def handle_event(session, ev, remote=False, app=None):
         q = (d.get("status") or {}).get("exec_info", {}).get("queue_remaining")
         if q is not None:
             for j in JOBS.values():
-                if j["status"] == "queued":
+                if j["status"] == "queued" and j.get("execution") != "cloud_image":
                     j["queue_remaining"] = q
 
 
@@ -1460,8 +1462,6 @@ async def api_generate(request):
         sync_card_job(linked_card, JOBS, CAPS, body["project"])
     if linked_card and not body.get("dry_run") and JOBS.get(linked_card.get("job"), {}).get("status") in LIVE:
         raise web.HTTPConflict(text="此镜头已有生成任务，请等待完成或取消后再提交")
-    if not CONTROLLER_MODE and not body.get("dry_run"):
-        check_local_cleanup(request.app)
     cid = body.get("capability")
     cap = CAPS.get(cid)
     if not cap:
@@ -1471,9 +1471,17 @@ async def api_generate(request):
         if (not isinstance(target_worker_id, str) or not target_worker_id.strip()
                 or len(target_worker_id) > 128):
             raise web.HTTPBadRequest(text="target_worker_id 必须为非空执行端 ID")
-        if (not CONTROLLER_MODE or cap.get("execution") in {"browser", "if_studio"}
+        if (not CONTROLLER_MODE or cap.get("execution") in {"browser", "if_studio", "cloud_image"}
                 or cap.get("outputType") != "video"):
             raise web.HTTPBadRequest(text="仅控制器模式的非 IF 视频能力支持指定执行端")
+    if cap.get("execution") == "cloud_image":
+        try:
+            result = await request.app["cloud_lighting"].submit(request, body, cap)
+        except ImageEditError as error:
+            return web.json_response(error.response(), status=error.status)
+        return await generation_response(request, body, project, linked_card, result)
+    if not CONTROLLER_MODE and not body.get("dry_run"):
+        check_local_cleanup(request.app)
     if cap.get("execution") == "browser":
         raise web.HTTPBadRequest(text="此能力在浏览器中执行，请在图片合成编辑器中合成输出")
     if cap.get("execution") == "if_studio":
@@ -1620,9 +1628,12 @@ async def api_generate(request):
         if ledger:
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
     save_jobs()
-    result = JOBS[pid]
-    if linked_card:
-        linked_card["job"] = pid
+    return await generation_response(request, body, project, linked_card, JOBS[pid])
+
+
+async def generation_response(request, body, project, linked_card, result):
+    if linked_card and not body.get("dry_run"):
+        linked_card["job"] = result["id"]
         linked_card.pop("director_selected", None)
         sync_card_job(linked_card, JOBS, CAPS, body["project"])
         project["rev"] = project.get("rev", 0) + 1
@@ -1918,8 +1929,10 @@ def job_node_names(app, jobs):
         for start in range(0, len(jobs), 500):
             names.update(distributed_store(app).job_worker_names(
                 job["id"] for job in jobs[start:start + 500]))
-        return names
-    return {job["id"]: "本机" for job in jobs}
+    else:
+        names = {job["id"]: "本机" for job in jobs}
+    names.update({job["id"]: "云端 API" for job in jobs if job.get("execution") == "cloud_image"})
+    return names
 
 
 async def job_submitter_info(request, jobs):
@@ -2459,7 +2472,7 @@ async def api_generation_workers(request):
     require_user(request)
     cid = request.query.get("capability")
     cap = CAPS.get(cid)
-    if (not cap or cap.get("execution") in {"browser", "if_studio"}
+    if (not cap or cap.get("execution") in {"browser", "if_studio", "cloud_image"}
             or cap.get("outputType") != "video"):
         raise web.HTTPBadRequest(text="请选择非 IF 的视频能力")
     if not CONTROLLER_MODE:
@@ -2610,7 +2623,12 @@ def load_jobs():
         return
     cut = 0
     for j in rows:
-        if j.get("cleanup_pending") and not CONTROLLER_MODE:
+        if j.get("execution") == "cloud_image" and j.get("status") in LIVE:
+            j.update(status="error", step="", ended=time.time(), retryable=False,
+                     generation_unknown=True,
+                     error="服务重启，云端生成状态可能未知，请联系管理员确认，不要自动重试。")
+            cut += 1
+        elif j.get("cleanup_pending") and not CONTROLLER_MODE:
             j.update(step="显存释放未确认，请重试取消")
         elif local_completion_waiting(j):
             j.update(completion_pending=True, step="正在取回产物")
@@ -2628,6 +2646,8 @@ async def stop_job(app, pid):
     job = JOBS.get(pid)
     if job and job["status"] not in LIVE and not job.get("cleanup_pending"):
         return "finished"
+    if job and job.get("execution") == "cloud_image":
+        raise web.HTTPConflict(text="云端图片编辑不支持中途取消，请等待结果，不要重复生成。")
     if CONTROLLER_MODE:
         state = distributed_store(app).request_cancel(pid)
         if state == "canceled":
@@ -2691,6 +2711,7 @@ async def check_task_mutation(request, pid):
     if pid not in JOBS:
         raise web.HTTPForbidden(text="归档历史任务为只读")
     if (not CONTROLLER_MODE and JOBS.get(pid, {}).get("status") == "running"
+            and JOBS.get(pid, {}).get("execution") != "cloud_image"
             and require_user(request)["role"] != "admin"):
         raise web.HTTPConflict(text="本地执行器仅支持全局中断，请由管理员取消运行中的任务")
 
@@ -3392,7 +3413,8 @@ async def api_project_delete(request):
         close_presence=partial(close_presence_room, request.app, pid, code=1000, message=b"canvas deleted"),
         cancel_exports=request.app["edit_exports"].cancel_project,
         cancel_job=partial(stop_job, request.app),
-        should_cancel=lambda jid: CONTROLLER_MODE or JOBS.get(jid, {}).get("status") == "queued")
+        should_cancel=lambda jid: JOBS.get(jid, {}).get("execution") != "cloud_image"
+        and (CONTROLLER_MODE or JOBS.get(jid, {}).get("status") == "queued"))
     return web.json_response({"ok": True})
 
 
@@ -3996,6 +4018,9 @@ async def close_presence_connections(app):
 
 async def on_stop(app):
     await close_presence_connections(app)
+    cloud_lighting = app.get("cloud_lighting")
+    if cloud_lighting:
+        await cloud_lighting.close()
     probe_task = app.get("capacity_probe_state", {}).get("task")
     if probe_task:
         await asyncio.gather(asyncio.shield(probe_task), return_exceptions=True)
@@ -4080,6 +4105,10 @@ def make_app(auth_path=None, *, project_repository=None):
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
     app["local_output_tasks"] = {}
+    app["cloud_lighting"] = CloudLighting(
+        app, root=ROOT, comfy_http=COMFY_HTTP, jobs=JOBS, save_jobs=save_jobs,
+        require_project=require_project, require_resource=require_resource,
+        require_user=require_user, resource_call=resource_call, call_store=call_store)
     app["local_gpu_state"] = {}
     app["capacity_probe_state"] = {"task": None}
     app["lifecycle"] = {"shutting_down": False}

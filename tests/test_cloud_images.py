@@ -73,17 +73,44 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["authorization"], "Bearer test-secret")
         fields = {p["name"]: p["data"].decode() for p in sent["parts"] if not p["filename"]}
         self.assertEqual(fields, {"model": "gpt-image-2.5-sunburst", "prompt": "保持构图，调整质感",
-                                  "size": "1024x1024", "quality": "medium", "output_format": "png"})
+                                  "size": "3x2", "quality": "medium", "output_format": "png"})
         files = [p for p in sent["parts"] if p["filename"]]
         self.assertEqual(files, [{"name": "image[]", "filename": "image_1.jpg", "mime": "image/jpeg", "data": original}])
 
+    async def test_size_defaults_to_original(self):
+        self.assertEqual(cloud_images.load()["size"], "original")
+        self.config.unlink()
+        with mock.patch.dict(os.environ, {"CHOUKA_IMAGE_API_KEY": "environment-secret"}):
+            self.assertEqual(cloud_images.load()["size"], "original")
+
+    async def test_configured_size_and_call_override_priority(self):
+        for configured, override, expected in (
+                ("original", None, "3x2"),
+                ("1024x1024", None, "1024x1024"),
+                ("1024x1024", "4x3", "4x3"),
+                ("1024x1024", "original", "3x2")):
+            with self.subTest(configured=configured, override=override):
+                self.write_config(size=configured)
+                await cloud_images.edit(self.session, [png()], "编辑", size=override)
+                fields = {p["name"]: p["data"].decode() for p in self.received[-1]["parts"] if not p["filename"]}
+                self.assertEqual(fields["size"], expected)
+
     async def test_multiple_images_keep_repeated_field_and_order(self):
-        originals = [png("red"), png("blue")]
+        originals = [png("red"), png("blue", size=(4, 3))]
         await cloud_images.edit(self.session, originals, "图1主图，图2参考")
         files = [p for p in self.received[0]["parts"] if p["filename"]]
         self.assertEqual([p["name"] for p in files], ["image[]", "image[]"])
         self.assertEqual([p["data"] for p in files], originals)
         self.assertEqual([p["filename"] for p in files], ["image_1.png", "image_2.png"])
+        fields = {p["name"]: p["data"].decode() for p in self.received[0]["parts"] if not p["filename"]}
+        self.assertEqual(fields["size"], "3x2")
+
+    async def test_all_images_are_inspected_before_building_form(self):
+        with mock.patch.object(cloud_images.aiohttp, "FormData") as form:
+            with self.assertRaises(cloud_images.ImageEditError):
+                await cloud_images.edit(self.session, [png(), b"invalid second image"], "编辑")
+            form.assert_not_called()
+        self.assertEqual(self.received, [])
 
     async def test_url_result_is_returned_without_download_or_key_forwarding(self):
         url = str(self.server.make_url("/download"))
