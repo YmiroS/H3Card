@@ -9,7 +9,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from aiohttp import web
+from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 from PIL import Image
 
@@ -20,9 +20,9 @@ import app
 from server import cloud_images
 
 
-def png(color):
+def png(color, size=(4, 3)):
     output = BytesIO()
-    Image.new("RGB", (4, 3), color).save(output, format="PNG")
+    Image.new("RGB", size, color).save(output, format="PNG")
     return output.getvalue()
 
 
@@ -51,6 +51,9 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.config = self.root / "image-edit.json"
         self.enterContext(mock.patch.object(cloud_images, "CONF", self.config))
         self.received = []
+        self.received_fields = []
+        self.result_size = (4, 3)
+        self.result_url = "https://results.example.invalid/generated.png"
         self.gateway_status = 200
         self.url_only = False
         self.wait_at_gateway = False
@@ -83,17 +86,21 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def gateway(self, request):
         files = []
+        fields = {}
         reader = await request.multipart()
         async for part in reader:
             data = bytes(await part.read())
             if part.name == "image[]":
                 files.append(data)
+            else:
+                fields[part.name] = data.decode()
         self.received.append(files)
+        self.received_fields.append(fields)
         self.gateway_reached.set()
         if self.wait_at_gateway:
             await self.gateway_release.wait()
-        payload = {"data": [{"url": "https://results.example.invalid/generated.png"}]} if self.url_only else {
-            "data": [{"b64_json": base64.b64encode(png("blue")).decode()}]}
+        payload = {"data": [{"url": self.result_url}]} if self.url_only else {
+            "data": [{"b64_json": base64.b64encode(png("blue", size=self.result_size)).decode()}]}
         return web.json_response(payload, status=self.gateway_status, headers={"X-Request-ID": "texture-request-1"})
 
     async def comfy_image(self, request):
@@ -120,6 +127,50 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         return await self.client.post("/api/texture/edit", headers=self.headers,
                                       json={"project": self.project, "card": "texture", "prompt": "保持构图，调整质感", **extra})
 
+    async def temporary_generate(self, data, **extra):
+        form = FormData()
+        form.add_field("metadata", json.dumps({"project": self.project, "card": "texture",
+                                               "prompt": "调整质感", **extra}))
+        form.add_field("base", data, filename="../../untrusted.png", content_type="image/png")
+        return await self.client.post("/api/texture/edit", headers=self.headers, data=form)
+
+    async def test_temporary_base_is_not_saved_or_added_to_history(self):
+        before = self.saved_card()
+        self.result_size = (2, 3)
+        data = png("green", size=(2, 3))
+        response = await self.temporary_generate(data)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.received, [[data]])
+        self.assertEqual(self.received_fields[0]["size"], "2x3")
+        self.assertEqual(self.saved_card(), before)
+        files = list((self.root / "data" / "uploads").iterdir())
+        self.assertEqual(len(files), 2)  # Original and generated preview only; no temporary base.
+        self.assertTrue(all(path.read_bytes() != data for path in files))
+
+    async def test_temporary_base_requires_valid_image_and_authorized_card_source(self):
+        before = self.saved_card()
+        response = await self.temporary_generate(b"not an image")
+        self.assertEqual(response.status, 422, await response.text())
+        store = self.application["auth_store"]
+        owner = store.create_user("foreign-owner", "Other-password-123")["id"]
+        store.create_project("other-project", owner)
+        foreign = self.add_image("foreign.png", png("black"), project="other-project")
+        self.update_card(outputs=[foreign])
+        response = await self.temporary_generate(png("green"))
+        self.assertEqual(response.status, 404, await response.text())
+        self.assertEqual(self.received, [])
+        self.update_card(outputs=before["outputs"])
+        self.assertEqual(list((self.root / "data" / "uploads").glob("texture_*")), [])
+
+    async def test_temporary_base_enforces_byte_limit_without_saving(self):
+        before = self.saved_card()
+        with mock.patch.object(cloud_images, "MAX_IMAGE_BYTES", len(png("red")) + 1):
+            response = await self.temporary_generate(b"x" * 1024)
+        self.assertEqual(response.status, 413, await response.text())
+        self.assertEqual(self.received, [])
+        self.assertEqual(self.saved_card(), before)
+        self.assertEqual(list((self.root / "data" / "uploads").glob("texture_*")), [])
+
     async def test_first_round_uses_upstream_and_only_registers_private_preview(self):
         before = self.saved_card()
         response = await self.generate()
@@ -128,8 +179,9 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.received, [[png("red")]])
         self.assertEqual(result["source_kind"], "upstream")
         self.assertEqual(result["request_id"], "texture-request-1")
-        self.assertEqual(result["source"]["width"], 4)
-        self.assertEqual(result["image"]["width"], 4)
+        self.assertEqual(self.received_fields[0]["size"], "4x3")
+        self.assertEqual((result["source"]["width"], result["source"]["height"]), (4, 3))
+        self.assertEqual((result["image"]["width"], result["image"]["height"]), (4, 3))
         self.assertEqual(self.saved_card(), before)
         image_response = await self.client.get(result["image"]["url"])
         self.assertEqual(image_response.status, 200)
@@ -159,9 +211,55 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.received[-1], [png("green")])
         self.assertEqual(self.saved_card()["outputs"], [applied])
 
+    async def test_source_dimensions_override_configured_square_size(self):
+        config = json.loads(self.config.read_text())
+        self.config.write_text(json.dumps({**config, "size": "1024x1024"}))
+        applied = self.add_image("applied-portrait.png", png("green", size=(3, 4)))
+        self.update_card(outputs=[applied])
+        self.result_size = (3, 4)
+        response = await self.generate()
+        self.assertEqual(response.status, 200, await response.text())
+        result = await response.json()
+        self.assertEqual(self.received, [[png("green", size=(3, 4))]])
+        self.assertEqual(self.received_fields[0]["size"], "3x4")
+        self.assertEqual(result["source_kind"], "applied")
+        self.assertEqual((result["source"]["width"], result["source"]["height"]), (3, 4))
+        self.assertEqual((result["image"]["width"], result["image"]["height"]), (3, 4))
+        preview = await self.client.get(result["image"]["url"])
+        self.assertEqual(await preview.read(), png("blue", size=(3, 4)))
+        self.assertEqual(self.saved_card()["outputs"], [applied])
+
+    async def test_mismatched_result_dimensions_fail_without_saving_or_retry(self):
+        applied = self.add_image("applied.png", png("green"))
+        self.update_card(outputs=[applied])
+        before = self.saved_card()
+        resources = self.application["resource_access"]
+        for size in ((3, 2), (5, 3), (4, 4), (1024, 1024)):
+            with self.subTest(size=size), mock.patch.object(resources, "register", wraps=resources.register) as register:
+                self.result_size = size
+                response = await self.generate()
+                self.assertEqual(response.status, 502)
+                body = await response.json()
+                self.assertEqual(body["request_id"], "texture-request-1")
+                self.assertFalse(body["retryable"])
+                self.assertFalse(body["generation_unknown"])
+                self.assertIn(f"{size[0]}x{size[1]}", body["error"])
+                self.assertIn("4x3", body["error"])
+                self.assertIn("不一致", body["error"])
+                self.assertIn("不要重复生成或自动重试", body["error"])
+                self.assertEqual(self.saved_card(), before)
+                self.assertEqual(list((self.root / "data" / "uploads").glob("texture_*")), [])
+                register.assert_not_called()
+        self.assertEqual(len(self.received), 4)
+        self.assertTrue(all(fields["size"] == "4x3" for fields in self.received_fields))
+        self.result_size = (4, 3)
+        self.assertEqual((await self.generate()).status, 200)
+
     async def test_client_cannot_supply_arbitrary_url_key_or_image(self):
         for extra in ({"image": "file:///C:/secret.png"}, {"url": "http://127.0.0.1/private"},
-                      {"api_key": "client-key"}, {"images": [self.upstream]}):
+                      {"api_key": "client-key"}, {"images": [self.upstream]},
+                      {"size": "1024x1024"}, {"body": {"size": "1024x1024"}},
+                      {"base_url": "http://127.0.0.1/private"}):
             response = await self.generate(**extra)
             self.assertEqual(response.status, 400)
         self.assertEqual(self.received, [])
@@ -203,13 +301,32 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         self.assertEqual(self.received, [])
 
-    async def test_source_change_discards_generated_result_and_duplicate_is_rejected(self):
+    async def test_same_card_can_generate_while_previous_request_is_still_running(self):
+        before = self.saved_card()
         self.wait_at_gateway = True
         pending = asyncio.create_task(self.generate())
         try:
             await asyncio.wait_for(self.gateway_reached.wait(), 5)
-            duplicate = await self.generate()
-            self.assertEqual(duplicate.status, 409)
+            # Keep the first upstream call blocked while a replacement completes.
+            self.wait_at_gateway = False
+            replacement = await asyncio.wait_for(self.generate(), 5)
+            self.assertEqual(replacement.status, 200, await replacement.text())
+            self.assertFalse(pending.done())
+            replacement_body = await replacement.json()
+            self.assertNotIn("error", replacement_body)
+        finally:
+            self.gateway_release.set()
+        response = await asyncio.wait_for(pending, 5)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertNotEqual((await response.json())["image"]["url"], replacement_body["image"]["url"])
+        self.assertEqual(len(self.received), 2)
+        self.assertEqual(self.saved_card(), before)
+
+    async def test_source_change_discards_generated_result(self):
+        self.wait_at_gateway = True
+        pending = asyncio.create_task(self.generate())
+        try:
+            await asyncio.wait_for(self.gateway_reached.wait(), 5)
             changed = self.add_image("changed.png", png("yellow"))
             self.update_card(assets={"images[0]": changed})
         finally:
@@ -224,12 +341,15 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_url_only_response_is_not_downloaded_or_applied(self):
         self.url_only = True
+        self.result_url = str(self.remote.make_url("/view"))
         before = self.saved_card()
         response = await self.generate()
         self.assertEqual(response.status, 200)
         body = await response.json()
         self.assertIsNone(body["image"])
-        self.assertEqual(body["result_url"], "https://results.example.invalid/generated.png")
+        self.assertEqual(body["result_url"], self.result_url)
+        self.assertEqual(body["request_id"], "texture-request-1")
+        self.assertEqual(self.comfy_requests, [])
         self.assertEqual(self.saved_card(), before)
         self.assertEqual(list((self.root / "data" / "uploads").glob("texture_*.png")), [])
 
