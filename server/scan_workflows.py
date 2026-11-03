@@ -2169,7 +2169,7 @@ def main():
 
     for wid in sorted(BUNDLED_CAPABILITIES):
         m = json.loads((ROOT / "manifests" / f"{wid}.json").read_text(encoding="utf-8"))
-        if not (ROOT / m["graph"]).exists():
+        if m.get("execution") != "cloud_image" and not (ROOT / m["graph"]).exists():
             raise FileNotFoundError(m["graph"])
         manifests.append(m)
         groups.setdefault(m["card"], []).append(m)

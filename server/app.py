@@ -38,6 +38,7 @@ from types import SimpleNamespace
 
 import aiohttp
 from aiohttp import web
+from PIL import Image
 
 # 整合包那个 python_embeded 带 python312._pth，有这个文件 Python 就**不会**把脚本
 # 自己的目录塞进 sys.path，于是同目录的 rewrite.py 直接 import 不到（报
@@ -72,6 +73,8 @@ from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
 from server.texture_api import register_texture_routes
+from server.cloud_lighting import CloudLighting
+from server.cloud_images import ImageEditError
 from server.project_repository import ProjectRepository, InvalidProjectId
 from server.project_service import ProjectService, ProjectError
 from server.routes import (register_page_routes, register_project_routes, register_media_routes,
@@ -293,7 +296,7 @@ def controller_maintenance_active(app, workers=None):
 
 
 # 不提交 ComfyUI 工作流、不占 GPU 执行端的能力。
-EXTERNAL_EXECUTIONS = {"browser", "if_studio", sr_service.EXECUTION}
+EXTERNAL_EXECUTIONS = {"browser", "if_studio", "cloud_image", sr_service.EXECUTION}
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"}
 VID_EXT = {".mp4", ".webm", ".mkv", ".mov", ".avi"}
@@ -341,7 +344,7 @@ def load_caps():
             m["imageControls"] = controls
         if m.get("execution") == sr_service.EXECUTION:
             m["_graph_ok"] = sr_service.configured()
-        elif m.get("execution") in ("browser", "if_studio"):
+        elif m.get("execution") in ("browser", "if_studio", "cloud_image"):
             m["_graph_ok"] = False
         else:
             gp = ROOT / m["graph"]
@@ -373,7 +376,7 @@ def mode_ok(md):
     if md.get("route"):
         md["route"] = {k: r for k, r in md["route"].items() if graph_ok(r["cap"])}
         return bool(md["route"])
-    if CAPS.get(md["id"], {}).get("execution") in ("browser", "if_studio"):
+    if CAPS.get(md["id"], {}).get("execution") in ("browser", "if_studio", "cloud_image"):
         return True
     return graph_ok(md["id"])
 
@@ -687,8 +690,8 @@ def resolve_h3_1080p_settings(cap, params):
     generation = tuple(round(side / 32) * 32 for side in base)
     if any(side < 32 or side > 16384 for side in generation):
         raise web.HTTPBadRequest(reason="1080P：基础生成尺寸超出节点支持范围")
-    final = tuple(round(side * scale / 2) * 2 for side in base)
-    if any(side < 2 or side > 16384 for side in final):
+    final = tuple(math.floor(side * scale / 16 + .5) * 16 for side in base)
+    if any(side < 16 or side > 16384 for side in final):
         raise web.HTTPBadRequest(reason="1080P：输出尺寸超出节点支持范围")
     # 不采信外部 output_*，也不把动态尺寸存入静态 preset 或模板。
     for key in ("width", "height", "duration", "fps", "count"):
@@ -750,7 +753,7 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
         params["aspect_ratio"] = selected
         duration = value("duration")
         if resolution:
-            # 复用未量化首采尺寸；偶数输出再除倍率在小倍率时会丢失精度。
+            # 复用未量化首采尺寸；量化输出再除倍率在小倍率时会丢失精度。
             ideal_width, ideal_height = resolution["base"]
         else:
             megapixels = value("megapixels")
@@ -764,14 +767,14 @@ def resolve_reference_video_output_settings(cap, params, uploaded, video_metadat
     if any(side < 32 or side > 16384 for side in generation):
         raise web.HTTPBadRequest(reason="视频参考输出：32 对齐后的宽高必须在 32..16384，画面比例过于极端或分辨率越界")
     scale = value("scale_by") if cap["id"] in {"minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16"} else 1
-    # 按未对齐的理想尺寸取最近偶数，每个边的量化误差不超过 1px；
+    # 按理想尺寸独立对齐到 16，每边量化误差不超过 8px；
     # 不从 32 对齐的生成尺寸反推比例，也不丢掉二采工作流的放大倍率。
     final_sides = (ideal_width * scale, ideal_height * scale)
-    if not all(math.isfinite(side) and 1 <= side <= 16385 for side in final_sides):
+    if not all(math.isfinite(side) and 1 <= side < 16392 for side in final_sides):
         raise web.HTTPBadRequest(reason="视频参考输出：最终输出尺寸超出节点支持范围")
-    final = tuple(round(side / 2) * 2 for side in final_sides)
-    if any(side < 2 or side > 16384 for side in final):
-        raise web.HTTPBadRequest(reason="视频参考输出：最终偶数宽高必须在 2..16384")
+    final = tuple(math.floor(side / 16 + .5) * 16 for side in final_sides)
+    if any(side < 16 or side > 16384 for side in final):
+        raise web.HTTPBadRequest(reason="视频参考输出：16 对齐后的宽高必须在 16..16384")
     if not math.isfinite(duration * 24):
         raise web.HTTPBadRequest(reason="视频参考输出：时长超出节点支持范围")
     frames = max(1, round(duration * 24))
@@ -912,7 +915,20 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
                 # 否则模板里作者自带的演示提示词会悄悄生效（出片跑偏）
         if tgt.get("kind") in ("timeline_asset", "timeline_option"):
             continue
+        if key in {"width", "height", "scale_to_length", "resolution"} and spec["type"] in ("slider", "number"):
+            val = max(16, math.floor(float(val) / 16 + .5) * 16)
+            params[key] = val
         g[node]["inputs"][field] = val
+        if key == "resolution" and g[node]["class_type"] == "TTResolutionSelector":
+            if val not in spec.get("options", []):
+                raise web.HTTPBadRequest(reason=f"画面尺寸无效：{val}")
+            match = re.match(r"^(\d+)x(\d+)\s", val)
+            dimensions = tuple(math.floor(int(side) / 16 + .5) * 16 for side in match.groups())
+            # 保留节点枚举值，仅将输出尺寸写入消费端，避免依赖自定义节点新增档位。
+            for consumer in g.values():
+                for name, link in list(consumer["inputs"].items()):
+                    if isinstance(link, list) and len(link) == 2 and str(link[0]) == node and link[1] in (0, 1):
+                        consumer["inputs"][name] = dimensions[link[1]]
     if missing:
         raise web.HTTPBadRequest(reason="必填素材未提供：" + "、".join(missing))
     if blank:
@@ -934,6 +950,33 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
         if absent:
             raise web.HTTPBadRequest(reason="引用素材未提供：" + "、".join(sorted(absent)))
         g["238"]["inputs"]["value"] = re.sub(pattern, lambda match: references[match[0]], prompt)
+    if cap["id"] in {"qwen_lighting", "qwen_lighting_multi"}:
+        ref = uploaded["images[0]"]
+        local = ROOT / "data" / "uploads" / Path(ref).name
+        source = local if local.exists() else COMFY_INPUT / ref
+        with Image.open(source) as image:
+            source_width, source_height = image.size
+            if image.getexif().get(274) in (5, 6, 7, 8):
+                source_width, source_height = source_height, source_width
+        scale_node = g["84"]
+        budget = float(scale_node["inputs"]["megapixels"]) * 1024 * 1024
+        if not math.isfinite(budget) or not 256 <= budget <= 16 * 1024 * 1024:
+            raise web.HTTPBadRequest(reason="处理像素预算必须在 256 像素至 16MP 之间")
+        scale = math.sqrt(budget / (source_width * source_height))
+        width = max(16, math.floor(source_width * scale / 16) * 16)
+        height = max(16, math.floor(source_height * scale / 16) * 16)
+        if width * height > budget:
+            if width >= height:
+                width = math.floor(budget / height / 16) * 16
+            else:
+                height = math.floor(budget / width / 16) * 16
+        # 采样前锁定尺寸：16 对齐后的总像素绝不超过所选预算。
+        scale_node["class_type"] = "ImageScale"
+        scale_node["inputs"] = {
+            "image": scale_node["inputs"]["image"],
+            "upscale_method": scale_node["inputs"]["upscale_method"],
+            "width": width, "height": height, "crop": "disabled",
+        }
     patch_h3_character_transfer(g, cap, params, uploaded, video_metadata)
     patch_follow_reference_video(g, cap, follow)
     for spec in cap["inputs"]:
@@ -1198,7 +1241,7 @@ async def handle_event(session, ev, remote=False, app=None):
     pid = d.get("prompt_id")
     job = JOBS.get(pid) if pid else None
 
-    if job and job.get("cleanup_pending"):
+    if job and (job.get("cleanup_pending") or job.get("execution") == "cloud_image"):
         return
 
     # 失败 / 取消 / 完成都是终局。ComfyUI 报错之后还会补发 executing(node=None)、
@@ -1289,7 +1332,7 @@ async def handle_event(session, ev, remote=False, app=None):
         q = (d.get("status") or {}).get("exec_info", {}).get("queue_remaining")
         if q is not None:
             for j in JOBS.values():
-                if j["status"] == "queued":
+                if j["status"] == "queued" and j.get("execution") != "cloud_image":
                     j["queue_remaining"] = q
 
 
@@ -1468,8 +1511,6 @@ async def api_generate(request):
         sync_card_job(linked_card, JOBS, CAPS, body["project"])
     if linked_card and not body.get("dry_run") and JOBS.get(linked_card.get("job"), {}).get("status") in LIVE:
         raise web.HTTPConflict(text="此镜头已有生成任务，请等待完成或取消后再提交")
-    if not CONTROLLER_MODE and not body.get("dry_run"):
-        check_local_cleanup(request.app)
     cid = body.get("capability")
     cap = CAPS.get(cid)
     if not cap:
@@ -1482,6 +1523,14 @@ async def api_generate(request):
         if (not CONTROLLER_MODE or cap.get("execution") in EXTERNAL_EXECUTIONS
                 or cap.get("outputType") != "video"):
             raise web.HTTPBadRequest(text="仅控制器模式的非 IF 视频能力支持指定执行端")
+    if cap.get("execution") == "cloud_image":
+        try:
+            result = await request.app["cloud_lighting"].submit(request, body, cap)
+        except ImageEditError as error:
+            return web.json_response(error.response(), status=error.status)
+        return await generation_response(request, body, project, linked_card, result)
+    if not CONTROLLER_MODE and not body.get("dry_run"):
+        check_local_cleanup(request.app)
     if cap.get("execution") == "browser":
         raise web.HTTPBadRequest(text="此能力在浏览器中执行，请在图片合成编辑器中合成输出")
     if cap.get("execution") == "if_studio":
@@ -1637,9 +1686,12 @@ async def api_generate(request):
 
 async def generation_response(request, body, pid, project, linked_card):
     save_jobs()
-    result = JOBS[pid]
-    if linked_card:
-        linked_card["job"] = pid
+    return await generation_response(request, body, project, linked_card, JOBS[pid])
+
+
+async def generation_response(request, body, project, linked_card, result):
+    if linked_card and not body.get("dry_run"):
+        linked_card["job"] = result["id"]
         linked_card.pop("director_selected", None)
         sync_card_job(linked_card, JOBS, CAPS, body["project"])
         project["rev"] = project.get("rev", 0) + 1
@@ -1652,7 +1704,7 @@ async def generation_response(request, body, pid, project, linked_card):
     return web.json_response(result)
 
 
-SR_REF_SLOTS = 4
+SR_REF_SLOTS = 3
 
 
 async def sr_input_path(request, value, project_id):
@@ -2017,8 +2069,10 @@ def job_node_names(app, jobs):
         for start in range(0, len(jobs), 500):
             names.update(distributed_store(app).job_worker_names(
                 job["id"] for job in jobs[start:start + 500]))
-        return names | remote
-    return {job["id"]: "本机" for job in jobs} | remote
+    else:
+        names = {job["id"]: "本机" for job in jobs}
+    names.update({job["id"]: "云端 API" for job in jobs if job.get("execution") == "cloud_image"})
+    return names | remote
 
 
 async def job_submitter_info(request, jobs):
@@ -2712,6 +2766,11 @@ def load_jobs():
         if j.get("executor") == sr_service.EXECUTION and j.get("status") in LIVE:
             # on_start 按远端状态决定续查还是落为失败，绝不重新提交。
             j.update(step="后端重启，正在恢复超分任务")
+        elif j.get("execution") == "cloud_image" and j.get("status") in LIVE:
+            j.update(status="error", step="", ended=time.time(), retryable=False,
+                     generation_unknown=True,
+                     error="服务重启，云端生成状态可能未知，请联系管理员确认，不要自动重试。")
+            cut += 1
         elif j.get("cleanup_pending") and not CONTROLLER_MODE:
             j.update(step="显存释放未确认，请重试取消")
         elif local_completion_waiting(j):
@@ -2735,6 +2794,8 @@ async def stop_job(app, pid):
             job.update(status="canceled", step="", ended=time.time())
             save_jobs()
         return "canceled"
+    if job and job.get("execution") == "cloud_image":
+        raise web.HTTPConflict(text="云端图片编辑不支持中途取消，请等待结果，不要重复生成。")
     if CONTROLLER_MODE:
         state = distributed_store(app).request_cancel(pid)
         if state == "canceled":
@@ -2799,6 +2860,7 @@ async def check_task_mutation(request, pid):
         raise web.HTTPForbidden(text="归档历史任务为只读")
     if (not CONTROLLER_MODE and JOBS.get(pid, {}).get("status") == "running"
             and JOBS[pid].get("executor") != sr_service.EXECUTION
+            and JOBS.get(pid, {}).get("execution") != "cloud_image"
             and require_user(request)["role"] != "admin"):
         raise web.HTTPConflict(text="本地执行器仅支持全局中断，请由管理员取消运行中的任务")
 
@@ -3500,7 +3562,8 @@ async def api_project_delete(request):
         close_presence=partial(close_presence_room, request.app, pid, code=1000, message=b"canvas deleted"),
         cancel_exports=request.app["edit_exports"].cancel_project,
         cancel_job=partial(stop_job, request.app),
-        should_cancel=lambda jid: CONTROLLER_MODE or JOBS.get(jid, {}).get("status") == "queued")
+        should_cancel=lambda jid: JOBS.get(jid, {}).get("execution") != "cloud_image"
+        and (CONTROLLER_MODE or JOBS.get(jid, {}).get("status") == "queued"))
     return web.json_response({"ok": True})
 
 
@@ -4111,6 +4174,9 @@ async def on_stop(app):
     sr_runner = app.get("sr_runner")
     if sr_runner:
         await sr_runner.shutdown()
+    cloud_lighting = app.get("cloud_lighting")
+    if cloud_lighting:
+        await cloud_lighting.close()
     probe_task = app.get("capacity_probe_state", {}).get("task")
     if probe_task:
         await asyncio.gather(asyncio.shield(probe_task), return_exceptions=True)
@@ -4195,6 +4261,10 @@ def make_app(auth_path=None, *, project_repository=None):
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
     app["local_output_tasks"] = {}
+    app["cloud_lighting"] = CloudLighting(
+        app, root=ROOT, comfy_http=COMFY_HTTP, jobs=JOBS, save_jobs=save_jobs,
+        require_project=require_project, require_resource=require_resource,
+        require_user=require_user, resource_call=resource_call, call_store=call_store)
     app["local_gpu_state"] = {}
     app["capacity_probe_state"] = {"task": None}
     app["sr_runner"] = sr_service.Runner(ROOT / "data" / "sr_tasks.json", ARTIFACT_DIR,

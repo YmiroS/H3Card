@@ -1,8 +1,7 @@
 {
  "id": "qwen_lighting_multi",
- "name": "多灯打光",
- "file": "多灯打光-qwen_image_edit_2511",
- "source": "graphs/qwen_lighting.api.json",
+ "name": "多灯打光(API)",
+ "execution": "cloud_image",
  "group": "图片",
  "outputType": "image",
  "kind": "gen",
@@ -16,45 +15,29 @@
   "audio": {"min": 0, "max": 0},
   "video": {"min": 0, "max": 0}
  },
- "graph": "graphs/qwen_lighting.api.json",
- "output": {"node": "115"},
- "note": "多灯打光：与 qwen_lighting 共用同一套 ComfyUI 工作流和模型链，区别是正向条件不再由节点 114 生成，改由前端按 1–6 盏灯拼成一段完整布光提示词写入节点 68。节点 114 仍留在图里但不参与出图。这一版只改前端交互与提示词，接内网 GPT 的执行通路另行接入；出图仍走本机 ComfyUI。原图比例缩放到约 1.5MP，输出不保证与输入像素尺寸一致。",
+ "note": "多灯打光通过云端图片编辑 API 执行，不使用本机 ComfyUI 或 GPU。按 1–6 盏灯生成完整布光提示词，基于当前输入原图重新打光；在参数弹窗选择清晰度，按原图比例计算请求尺寸并向下对齐到 16 像素，确保请求总像素不超过所选预算，实际输出尺寸以云端返回为准。不支持中途取消，失败或超时请确认生成状态，不要自动重试。",
  "rewrite": null,
  "compare": true,
  "parameterPanel": "lighting-multi",
  "inputs": [
   {
    "key": "images[0]", "label": "原图", "type": "image", "required": true,
-   "hint": "单张待重打光图片；保留主体、构图与材质。",
-   "target": {"node": "41", "input": "image", "kind": "upload_image"}
+   "hint": "单张待重打光图片；保留主体、构图与材质。"
   },
   {
    "key": "prompt", "label": "布光提示词", "type": "textarea", "advanced": true,
    "default": "",
-   "hint": "由多灯面板按当前灯位生成，覆盖节点 68 的正向条件。",
-   "target": {"node": "68", "input": "prompt"}
+   "hint": "由多灯面板按当前灯位生成，作为云端图片编辑提示词。"
   },
   {
    "key": "negative_prompt", "label": "负向提示词", "type": "textarea", "advanced": true,
    "default": "泛黄，AI感，不真实，丑陋，油腻的皮肤，异常的肢体，不协调的肢体",
-   "target": {"node": "69", "input": "prompt"}
+   "hint": "由多灯面板合并进布光提示词。"
   },
   {
    "key": "megapixels", "label": "处理像素（MP）", "type": "slider", "advanced": false,
    "default": 1.5, "min": 0.25, "max": 16, "step": 0.01,
-   "hint": "保持原图比例；1080P/2K/4K 按 16:9 等效总像素设置，非固定宽高。默认约 1.5MP，4K 显著增加显存占用。",
-   "target": {"node": "84", "input": "megapixels", "vtype": "FLOAT"}
-  },
-  {
-   "key": "steps", "label": "采样步数", "type": "slider", "advanced": false,
-   "default": 4, "min": 1, "max": 40, "step": 1,
-   "hint": "原版 Lightning 模型 + LightningRemap Alpha0.2 LoRA，建议保持 4 步。",
-   "target": {"node": "65", "input": "steps", "vtype": "INT"}
-  },
-  {
-   "key": "seed", "label": "种子", "type": "seed", "advanced": false, "default": 1002,
-   "max": 18446744073709551615,
-   "target": {"node": "65", "input": "seed", "vtype": "INT"}
+   "hint": "按原图比例和所选总像素计算云端请求尺寸，并向下对齐到 16 像素，确保不超过像素预算；输入原图不缩放，实际输出尺寸以云端返回为准。"
   }
  ],
  "warnings": []

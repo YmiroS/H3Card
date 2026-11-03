@@ -4,8 +4,10 @@ import base64
 import binascii
 from io import BytesIO
 import json
+import logging
 import os
 from pathlib import Path
+import re
 from urllib.parse import urlsplit
 import warnings
 
@@ -41,7 +43,7 @@ def load():
     if not isinstance(config, dict):
         raise ImageEditError("image-edit.json 必须是 JSON 对象", status=503)
     config = {"base_url": "http://30.245.124.125:8000/v1",
-              "model": "gpt-image-2.5-sunburst", "size": "1024x1024",
+              "model": "gpt-image-2.5-sunburst", "size": "original",
               "quality": "medium", "output_format": "png", **config}
     config["api_key"] = os.environ.get("CHOUKA_IMAGE_API_KEY") or config.get("api_key")
     if config.get("enabled", True) is not True or not config.get("api_key"):
@@ -128,18 +130,22 @@ def decode_result(payload, request_id, model):
     raise ImageEditError("云端结果缺少 b64_json 或 url", request_id=request_id)
 
 
-async def edit(session, images, prompt):
+async def edit(session, images, prompt, *, size=None):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise ImageEditError("图片编辑提示词不能为空，且不得超过 20000 字符", status=400)
     if not isinstance(images, (list, tuple)) or not 1 <= len(images) <= 8:
         raise ImageEditError("图片编辑需要 1 到 8 张有序输入图片", status=400)
+    infos = [await asyncio.to_thread(inspect_image, data) for data in images]
+    size = config["size"] if size is None else size
+    if size == "original":
+        size = f"{infos[0]['width']}x{infos[0]['height']}"
     form = aiohttp.FormData()
-    for key in ("model", "size", "quality", "output_format"):
+    for key in ("model", "quality", "output_format"):
         form.add_field(key, config[key])
+    form.add_field("size", size)
     form.add_field("prompt", prompt.strip())
-    for index, data in enumerate(images, 1):
-        info = await asyncio.to_thread(inspect_image, data)
+    for index, (data, info) in enumerate(zip(images, infos), 1):
         form.add_field("image[]", data, filename=f"image_{index}{info['extension']}",
                        content_type=info["mime"])
     request_id = None
@@ -151,6 +157,22 @@ async def edit(session, images, prompt):
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=450)) as response:
             request_id = response.headers.get("X-Request-ID", "")[:200] or None
             if not 200 <= response.status < 300:
+                detail = "无可用结构化错误详情"
+                try:
+                    payload = json.loads(await read_limited(response, 16 * 1024))
+                    error = payload.get("error", payload.get("detail", payload.get("message"))) if isinstance(payload, dict) else None
+                    if isinstance(error, dict):
+                        error = "; ".join(f"{key}={error[key]}" for key in ("message", "type", "param", "code")
+                                          if isinstance(error.get(key), str))
+                    if isinstance(error, str) and error.strip():
+                        detail = error.replace(config["api_key"], "[redacted]").replace(prompt.strip(), "[prompt redacted]")
+                        detail = re.sub(r"(?i)\bBearer\s+[^\s\"'<>;,]+|\bsk-[A-Za-z0-9_-]+", "[credential redacted]", detail)
+                        detail = re.sub(r"data:[^\s\"'<>]+|[A-Za-z0-9+/=_-]{80,}", "[data redacted]", detail)
+                        detail = re.sub(r"[\x00-\x1f\x7f]", " ", detail)[:512]
+                except (ImageEditError, ValueError, UnicodeError, aiohttp.ClientError, asyncio.TimeoutError):
+                    pass
+                logging.getLogger(__name__).warning(
+                    "Cloud image edit HTTP %s request_id=%r detail=%s", response.status, request_id, detail)
                 raise ImageEditError(f"云端图片编辑返回 HTTP {response.status}，请联系管理员核对，不要自动重试",
                                      request_id=request_id)
             body = await read_limited(response, MAX_RESPONSE_BYTES)

@@ -201,7 +201,7 @@ def project_director(project, caps, jobs):
 def _capability(caps, capability, stage):
     cap = (caps or {}).get(capability)
     if (not cap or cap.get("kind") != "gen" or cap.get("outputType") != stage
-            or not cap.get("_graph_ok")):
+            or not (cap.get("_graph_ok") or cap.get("execution") == "cloud_image")):
         raise web.HTTPBadRequest(text="生成能力不存在或与镜头阶段不匹配")
     return cap
 

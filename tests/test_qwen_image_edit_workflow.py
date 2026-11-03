@@ -110,7 +110,8 @@ class QwenImageEditWorkflowTest(unittest.TestCase):
                 source = ROOT / "manifests" / f"{wid}.json"
                 cap = json.loads(source.read_text(encoding="utf-8"))
                 (root / "manifests" / source.name).write_bytes(source.read_bytes())
-                (root / cap["graph"]).write_bytes((ROOT / cap["graph"]).read_bytes())
+                if cap.get("graph"):
+                    (root / cap["graph"]).write_bytes((ROOT / cap["graph"]).read_bytes())
             manifest_path = root / "manifests" / f"{self.cap['id']}.json"
             graph_path = root / self.cap["graph"]
             with mock.patch.object(scan_workflows, "ROOT", root), \

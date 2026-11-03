@@ -6,14 +6,14 @@
  "kind": "tool",
  "card": "card_tools",
  "outputType": "video",
- "images": 4,
+ "images": 3,
  "audios": 0,
  "videos": 1,
- "slots": "img4+aud0+vid1",
+ "slots": "img3+aud0+vid1",
  "slotLimits": {
   "image": {
    "min": 0,
-   "max": 4
+   "max": 3
   },
   "audio": {
    "min": 0,
@@ -47,12 +47,6 @@
   {
    "key": "images[2]",
    "label": "参考图3",
-   "type": "image",
-   "required": false
-  },
-  {
-   "key": "images[3]",
-   "label": "参考图4",
    "type": "image",
    "required": false
   },

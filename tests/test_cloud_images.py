@@ -33,6 +33,7 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.response_headers = {"X-Request-ID": "image-request-1"}
         self.payload = {"data": [{"b64_json": base64.b64encode(png()).decode()}]}
         self.status = 200
+        self.raw_body = None
         self.redirect_hits = 0
         application = web.Application()
         application.router.add_post("/v1/images/edits", self.gateway)
@@ -56,6 +57,8 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
             parts.append({"name": part.name, "filename": part.filename,
                           "mime": part.headers.get("Content-Type"), "data": bytes(await part.read())})
         self.received.append({"authorization": request.headers.get("Authorization"), "parts": parts})
+        if self.raw_body is not None:
+            return web.Response(body=self.raw_body, status=self.status, headers=self.response_headers)
         return web.json_response(self.payload, status=self.status, headers=self.response_headers)
 
     async def download(self, request):
@@ -73,17 +76,44 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(sent["authorization"], "Bearer test-secret")
         fields = {p["name"]: p["data"].decode() for p in sent["parts"] if not p["filename"]}
         self.assertEqual(fields, {"model": "gpt-image-2.5-sunburst", "prompt": "保持构图，调整质感",
-                                  "size": "1024x1024", "quality": "medium", "output_format": "png"})
+                                  "size": "3x2", "quality": "medium", "output_format": "png"})
         files = [p for p in sent["parts"] if p["filename"]]
         self.assertEqual(files, [{"name": "image[]", "filename": "image_1.jpg", "mime": "image/jpeg", "data": original}])
 
+    async def test_size_defaults_to_original(self):
+        self.assertEqual(cloud_images.load()["size"], "original")
+        self.config.unlink()
+        with mock.patch.dict(os.environ, {"CHOUKA_IMAGE_API_KEY": "environment-secret"}):
+            self.assertEqual(cloud_images.load()["size"], "original")
+
+    async def test_configured_size_and_call_override_priority(self):
+        for configured, override, expected in (
+                ("original", None, "3x2"),
+                ("1024x1024", None, "1024x1024"),
+                ("1024x1024", "4x3", "4x3"),
+                ("1024x1024", "original", "3x2")):
+            with self.subTest(configured=configured, override=override):
+                self.write_config(size=configured)
+                await cloud_images.edit(self.session, [png()], "编辑", size=override)
+                fields = {p["name"]: p["data"].decode() for p in self.received[-1]["parts"] if not p["filename"]}
+                self.assertEqual(fields["size"], expected)
+
     async def test_multiple_images_keep_repeated_field_and_order(self):
-        originals = [png("red"), png("blue")]
+        originals = [png("red"), png("blue", size=(4, 3))]
         await cloud_images.edit(self.session, originals, "图1主图，图2参考")
         files = [p for p in self.received[0]["parts"] if p["filename"]]
         self.assertEqual([p["name"] for p in files], ["image[]", "image[]"])
         self.assertEqual([p["data"] for p in files], originals)
         self.assertEqual([p["filename"] for p in files], ["image_1.png", "image_2.png"])
+        fields = {p["name"]: p["data"].decode() for p in self.received[0]["parts"] if not p["filename"]}
+        self.assertEqual(fields["size"], "3x2")
+
+    async def test_all_images_are_inspected_before_building_form(self):
+        with mock.patch.object(cloud_images.aiohttp, "FormData") as form:
+            with self.assertRaises(cloud_images.ImageEditError):
+                await cloud_images.edit(self.session, [png(), b"invalid second image"], "编辑")
+            form.assert_not_called()
+        self.assertEqual(self.received, [])
 
     async def test_url_result_is_returned_without_download_or_key_forwarding(self):
         url = str(self.server.make_url("/download"))
@@ -111,6 +141,80 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(raised.exception.response()["retryable"])
         self.assertNotIn("test-secret", json.dumps(raised.exception.response()))
         self.assertEqual(raised.exception.request_id, "image-request-1")
+
+    async def test_http_error_logs_structured_diagnostics_only_on_server(self):
+        self.status = 400
+        self.payload = {"error": {"message": "Unsupported output size", "type": "invalid_request_error",
+                                  "param": "size", "code": "invalid_size"},
+                        "api_key": "unrelated-private-field"}
+        with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+            with self.assertRaises(cloud_images.ImageEditError) as raised:
+                await cloud_images.edit(self.session, [png()], "编辑")
+        logged = " ".join(logs.output)
+        for text in ("HTTP 400", "image-request-1", "Unsupported output size", "param=size", "code=invalid_size"):
+            self.assertIn(text, logged)
+        self.assertNotIn("unrelated-private-field", logged)
+        self.assertNotIn("Unsupported output size", json.dumps(raised.exception.response()))
+        self.assertEqual(raised.exception.request_id, "image-request-1")
+        self.assertFalse(raised.exception.generation_unknown)
+        self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), 1)
+
+    async def test_http_error_log_redacts_credentials_prompt_and_image_data(self):
+        self.status = 400
+        prompt = "private prompt content"
+        self.payload = {"error": {"message": "test-secret Bearer another-secret sk-vendor-secret "
+                                  + prompt + "\nnew line data:image/png;base64,aGVsbG8= " + "A" * 100}}
+        with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+            with self.assertRaises(cloud_images.ImageEditError):
+                await cloud_images.edit(self.session, [png()], prompt)
+        logged = " ".join(logs.output)
+        for secret in ("test-secret", "another-secret", "sk-vendor-secret", prompt, "aGVsbG8=", "A" * 100):
+            self.assertNotIn(secret, logged)
+        self.assertNotIn("\n", logs.output[0])
+        self.assertIn("[redacted]", logged)
+        self.assertIn("[data redacted]", logged)
+        self.assertEqual(len(self.received), 1)
+
+    async def test_http_error_diagnostic_limits_and_unstructured_bodies(self):
+        self.status = 400
+        for payload in ({"detail": "Invalid size"}, {"message": "Invalid format"},
+                        {"error": {"message": "x " * 1000}}):
+            with self.subTest(payload_type=next(iter(payload))):
+                self.payload = payload
+                with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                    with self.assertRaises(cloud_images.ImageEditError):
+                        await cloud_images.edit(self.session, [png()], "编辑")
+                self.assertLessEqual(len(logs.output[0].split("detail=", 1)[1]), 512)
+                self.assertNotIn("无可用结构化错误详情", logs.output[0])
+        for body in (b"<html>private proxy error</html>", b"{invalid json", b"x" * 17000):
+            self.raw_body = body
+            with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                with self.assertRaises(cloud_images.ImageEditError) as raised:
+                    await cloud_images.edit(self.session, [png()], "编辑")
+            self.assertIn("无可用结构化错误详情", logs.output[0])
+            self.assertNotIn("private proxy error", logs.output[0])
+            self.assertIn("HTTP 400", str(raised.exception))
+            self.assertEqual(raised.exception.request_id, "image-request-1")
+        self.assertEqual(len(self.received), 6)
+
+    async def test_failed_diagnostic_read_preserves_known_http_error(self):
+        async def broken_stream():
+            yield b'{"error":'
+            raise aiohttp.ClientPayloadError("interrupted")
+        response = mock.Mock(status=400, headers={"X-Request-ID": "interrupted-id"})
+        response.content.iter_chunked.return_value = broken_stream()
+        context = mock.AsyncMock()
+        context.__aenter__.return_value = response
+        session = mock.Mock()
+        session.post.return_value = context
+        with self.assertLogs(cloud_images.__name__, level="WARNING"):
+            with self.assertRaises(cloud_images.ImageEditError) as raised:
+                await cloud_images.edit(session, [png()], "编辑")
+        self.assertIn("HTTP 400", str(raised.exception))
+        self.assertFalse(raised.exception.generation_unknown)
+        self.assertEqual(raised.exception.request_id, "interrupted-id")
+        self.assertEqual(session.post.call_count, 1)
 
     async def test_timeout_has_unknown_state_and_no_retry(self):
         session = mock.Mock()

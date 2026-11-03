@@ -185,7 +185,7 @@
    {
     "id": "youku_sr_video",
     "name": "参考图视频超分",
-    "slots": "img4+aud0+vid1"
+    "slots": "img3+aud0+vid1"
    },
    {
     "id": "video_color_match",
