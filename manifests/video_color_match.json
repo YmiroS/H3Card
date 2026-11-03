@@ -1,0 +1,56 @@
+{
+ "id": "video_color_match",
+ "name": "参考图校色",
+ "file": "video_color_match",
+ "source": "graphs/video_color_match.api.json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "tool",
+ "card": "card_tools",
+ "slots": "img1+aud0+vid1",
+ "images": 1,
+ "audios": 0,
+ "videos": 1,
+ "slotLimits": {"image": {"min": 1, "max": 1}, "audio": {"min": 0, "max": 0}, "video": {"min": 1, "max": 1}},
+ "graph": "graphs/video_color_match.api.json",
+ "output": {"node": "6"},
+ "note": "把一个镜头的颜色往参考图上调：镜头里每一帧都对齐到同一张参考图的整体色调，所以镜头和镜头之间会一致，同一个镜头前后帧的色偏也一起被拉平。帧数、时长、帧率和音轨都不变。\n多个镜头统一调色：每个镜头各放一张这样的卡，把同一张参考图（素材节点或生图节点）连到每一张卡上。换参考图后重跑这些卡，所有镜头就一起换成新的色调。\n参考图挑跟镜头同一场景、光线相近的一帧效果最好：算法对齐的是整张画面的颜色分布，参考图里大片天空、大片纯色背景会把镜头也往那个颜色拉。\n镜头里画面变化大（转场、大幅运镜、人物进出）时，逐帧对齐可能带来轻微的颜色跳动：先把「校色强度」降到 0.4～0.6，还不行就把「校色方式」换成「柔和」。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "video[0]", "label": "镜头", "type": "video", "required": true,
+   "target": {"node": "1", "input": "file", "kind": "upload_video"}
+  },
+  {
+   "key": "images[0]", "label": "参考图", "type": "image", "required": true,
+   "target": {"node": "3", "input": "image", "kind": "upload_image"}
+  },
+  {
+   "key": "strength", "label": "校色强度", "type": "slider", "min": 0, "max": 1, "step": 0.05, "default": 0.7,
+   "hint": "默认 0.7。1 = 完全对齐到参考图，0 = 原样不动。镜头和参考图场景差别大、或者对齐后颜色有跳动，就往下调到 0.4～0.6",
+   "target": {"node": "4", "input": "strength", "vtype": "FLOAT"}
+  },
+  {
+   "key": "match_method", "label": "校色方式", "type": "select", "default": "mkl",
+   "options": [
+    {"value": "mkl", "label": "标准（推荐）"},
+    {"value": "reinhard", "label": "柔和（只对齐亮度和色偏）"},
+    {"value": "hm-mkl-hm", "label": "强力（最贴近参考）"}
+   ],
+   "presets": {
+    "mkl": {"method": "mkl"},
+    "reinhard": {"method": "reinhard"},
+    "hm-mkl-hm": {"method": "hm-mkl-hm"}
+   },
+   "hint": "标准：整体色调和色彩倾向都往参考图对齐，大多数镜头用它。柔和：只对齐平均亮度和色偏，最不容易被画面内容带偏，画面变化大的镜头用它。强力：连明暗层次也照参考图重排，最像参考，但最容易出现颜色跳动",
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "method", "label": "校色算法", "type": "select", "default": "mkl", "mirror": true, "advanced": true,
+   "options": ["mkl", "reinhard", "hm-mkl-hm"],
+   "target": {"node": "4", "input": "method"}
+  }
+ ],
+ "warnings": []
+}
