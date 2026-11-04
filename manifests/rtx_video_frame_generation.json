@@ -14,7 +14,7 @@
  "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 1, "max": 1}},
  "graph": "graphs/rtx_video_frame_generation.api.json",
  "output": {"node": "9"},
- "note": "NVidia 使用 NVIDIA RTX Video Frame Generation 在相邻画面间补帧。输出帧率 = 原帧率 × 补帧倍数，例如 24 fps × 2 = 48 fps；保留原音轨、色彩空间和位深，不通过降低播放速度制作慢动作。末帧后不补帧，片尾可能有不足源视频一帧的时长差。与 GIMM-VFI 不同，本模型不提供任意目标帧率、前几帧截取或种子。需要 NVIDIA RTX 显卡及 nvidia-vfx 依赖；原工作流整段解码，高倍数和长视频占用较多内存，建议先用短视频、2 倍测试。",
+ "note": "输入目标帧率（FPS），系统根据源视频自动计算 NVidia 补帧倍率，并按时间轴对齐到指定帧率。例如 24 → 60 fps：自动以 3 倍补帧，再对齐为 60 fps，不会变成 72 fps 或改变播放速度。保留原音轨、色彩空间和位深；片尾不足的画面用末帧补齐，时长误差不超过目标帧率的半帧。需要 NVIDIA RTX 显卡及 nvidia-vfx、Video Helper Suite 依赖；整段解码和较高目标帧率占用较多内存，建议先用短视频测试。",
  "rewrite": null,
  "compare": false,
  "inputs": [
@@ -23,10 +23,15 @@
    "target": {"node": "6", "input": "file", "kind": "upload_video"}
   },
   {
-   "key": "frame_multiplier", "label": "补帧倍数", "type": "slider",
-   "min": 2, "max": 16, "step": 1, "default": 2,
-   "hint": "原视频帧率乘以此倍数作为输出帧率。倍数越高，输出帧数、处理时间和内存占用越大。",
-   "target": {"node": "12", "input": "value", "vtype": "INT"}
+   "key": "target_fps", "label": "目标帧率（FPS）", "type": "number",
+   "min": 1, "max": 120, "step": 1, "default": 60,
+   "hint": "输入成片每秒帧数，例如 60。自动计算整数倍率并对齐到此帧率，保持正常播放速度；最高支持源帧率的 16 倍。",
+   "target": {"node": "8", "input": "fps", "vtype": "FLOAT"},
+   "derive": {
+    "kind": "rtx_target_fps", "source": "video[0]",
+    "factor": {"node": "12", "input": "value", "min": 2, "max": 16},
+    "frames": {"node": "13", "input": "indexes"}
+   }
   },
   {
    "key": "rtx_mode", "label": "补帧质量", "type": "select", "default": "HIGH",

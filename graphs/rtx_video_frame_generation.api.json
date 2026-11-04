@@ -27,17 +27,17 @@
   },
   "_meta": {"title": "NVidia 视频补帧"}
  },
- "11": {
-  "class_type": "ComfyMathExpression",
-  "inputs": {"values.a": ["7", 2], "values.b": ["12", 0], "expression": "a * b"},
-  "_meta": {"title": "计算补帧后帧率"}
+ "13": {
+  "class_type": "VHS_SelectImages",
+  "inputs": {"image": ["10", 0], "indexes": "0:", "err_if_missing": true, "err_if_empty": true},
+  "_meta": {"title": "按目标帧率对齐画面"}
  },
  "8": {
   "class_type": "CreateVideo",
   "inputs": {
-   "images": ["10", 0],
+   "images": ["13", 0],
    "audio": ["7", 1],
-   "fps": ["11", 0],
+   "fps": 60,
    "bit_depth": ["7", 3],
    "color_space": ["7", 4],
    "codec": "none"

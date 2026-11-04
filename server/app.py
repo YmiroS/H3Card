@@ -588,6 +588,32 @@ def derive_target_fps(g, spec, tgt, uploaded):
     return tgt
 
 
+def derive_rtx_target_fps(g, spec, tgt, uploaded):
+    if not math.isfinite(tgt) or not spec["min"] <= tgt <= spec["max"]:
+        raise web.HTTPBadRequest(reason=f"目标帧率须在 {spec['min']}–{spec['max']} FPS 之间")
+    d = spec["derive"]
+    ref = uploaded.get(d["source"])
+    if not ref:
+        return tgt  # 必填素材统一由 patch_graph 汇总提示。
+    info = probe_video(ref, count_frames=True)
+    src, count = float(info.get("fps") or 0), int(info.get("frames") or 0)
+    if not math.isfinite(src) or src <= 0 or count < 1:
+        raise web.HTTPBadRequest(reason="无法读取源视频帧率或帧数，请重新上传视频")
+    fac = d["factor"]
+    if tgt > src * fac["max"] + 1e-6:
+        raise web.HTTPBadRequest(reason=f"目标帧率超过 NVidia 最大 {fac['max']} 倍补帧范围")
+    factor = max(fac["min"], math.ceil(tgt / src - 1e-9))
+    generated = (count - 1) * factor + 1
+    output_count = max(1, math.floor(count * tgt / src + 0.5))
+    # RTX 只补相邻帧；按时间位置选帧，片尾复用末帧以保持原视频时长。
+    indexes = (min(generated - 1, math.floor(i * src * factor / tgt + 0.5))
+               for i in range(output_count))
+    g[str(fac["node"])]["inputs"][fac["input"]] = factor
+    selection = d["frames"]
+    g[str(selection["node"])]["inputs"][selection["input"]] = ",".join(map(str, indexes))
+    return tgt
+
+
 def patch_h3_character_transfer(g, cap, params, uploaded, video_metadata=None):
     """把抽卡面板里的动作视频和人物图封装成 TimelineDirector 素材时间线。"""
     spec = cap.get("patch") or {}
@@ -893,10 +919,15 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
             if val in (None, "", -1, "-1"):
                 val = params.setdefault("_seed_used", random.randint(0, hi))
             val = min(int(val), hi)
-        elif spec.get("derive", {}).get("kind") == "target_fps":
+        elif spec.get("derive", {}).get("kind") in ("target_fps", "rtx_target_fps"):
             v = params.get(spec["key"])
-            val = derive_target_fps(g, spec, float(spec["default"] if v in (None, "") else v),
-                                    uploaded)
+            try:
+                fps = float(spec["default"] if v in (None, "") else v)
+            except (TypeError, ValueError):
+                raise web.HTTPBadRequest(reason="目标帧率须为有效数字")
+            derive = (derive_rtx_target_fps if spec["derive"]["kind"] == "rtx_target_fps"
+                      else derive_target_fps)
+            val = derive(g, spec, fps, uploaded)
         else:
             pair = spec.get("pairWith")
             if pair and not uploaded.get(pair):
