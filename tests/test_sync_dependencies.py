@@ -17,6 +17,7 @@ import tempfile
 import time
 import unittest
 from contextlib import nullcontext, redirect_stdout
+from copy import deepcopy
 from unittest import mock
 
 
@@ -29,10 +30,24 @@ SPEC.loader.exec_module(dependencies)
 PLUGIN = "ComfyUI_Nvidia_VFX_Nodes"
 VERSION = "0.2.0.0"
 NODES = ["RTXVideoSuperResolution", "RTXTrueHDR", "RTXVideoFrameGeneration"]
+GIMM_PLUGIN = "ComfyUI-GIMM-VFI"
+GIMM_PACKAGES = {
+    "cupy-cuda12x": "13.6.0",
+    "fastrlock": "0.8.3",
+    "nvidia-cuda-runtime-cu12": "12.9.79",
+    "nvidia-cuda-nvrtc-cu12": "12.9.86",
+}
+GIMM_IMPORTS = ("cupy", "nvidia.cuda_runtime", "nvidia.cuda_nvrtc")
+GIMM_NODES = ["DownloadAndLoadGIMMVFIModel", "GIMMVFI_interpolate"]
+GIMM_PROBE = "gimmvfi/generalizable_INR/modules/softsplat.py"
+ORIGINAL_REGISTRY = deepcopy(dependencies.PLUGIN_DEPENDENCIES)
 
 
 class DependencyExecutorTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(dependencies, "PLUGIN_DEPENDENCIES", {
+            PLUGIN: deepcopy(ORIGINAL_REGISTRY[PLUGIN]),
+        }))
         temporary = tempfile.TemporaryDirectory(prefix="dependency-test-")
         self.addCleanup(temporary.cleanup)
         self.comfy = Path(temporary.name) / "ComfyUI"
@@ -67,10 +82,12 @@ class DependencyExecutorTests(unittest.TestCase):
         self.assertEqual(call.kwargs["stderr"], subprocess.STDOUT)
         self.assertFalse(call.kwargs.get("shell", False))
 
-    def test_registry_is_exactly_the_single_approved_plugin(self):
-        self.assertEqual(dependencies.PLUGIN_DEPENDENCIES, {
+    def test_registry_is_exactly_the_two_approved_plugins(self):
+        self.assertEqual(ORIGINAL_REGISTRY, {
             PLUGIN: {"packages": {"nvidia-vfx": VERSION}, "imports": ("nvvfx",),
                      "nodes": tuple(NODES)},
+            GIMM_PLUGIN: {"packages": GIMM_PACKAGES, "imports": GIMM_IMPORTS,
+                          "nodes": tuple(GIMM_NODES), "cuda_probe": GIMM_PROBE},
         })
 
     def test_plugin_requires_an_init_file_not_just_a_directory(self):
@@ -263,6 +280,271 @@ class DependencyExecutorTests(unittest.TestCase):
         self.assertFalse(missing_root.exists())
 
 
+class GIMMDependencyExecutorTests(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(dependencies, "PLUGIN_DEPENDENCIES", {
+            GIMM_PLUGIN: deepcopy(ORIGINAL_REGISTRY[GIMM_PLUGIN]),
+        }))
+        temporary = tempfile.TemporaryDirectory(prefix="gimm-dependency-test-")
+        self.addCleanup(temporary.cleanup)
+        self.comfy = (Path(temporary.name) / "ComfyUI").resolve()
+        self.plugin = self.comfy / "custom_nodes" / GIMM_PLUGIN
+        self.plugin.mkdir(parents=True)
+        (self.plugin / "__init__.py").write_text(
+            "raise AssertionError('Do not import the GIMM plugin initializer')\n",
+            encoding="utf-8",
+        )
+        self.probe = self.plugin / GIMM_PROBE
+        self.probe.parent.mkdir(parents=True)
+        self.probe.write_text("# GPU probe subprocess is mocked in these tests.\n", encoding="utf-8")
+        self.enterContext(redirect_stdout(io.StringIO()))
+        self.enterContext(mock.patch.object(
+            dependencies, "dependency_lock", side_effect=lambda *a, **k: nullcontext()))
+        self.clock = self.enterContext(mock.patch.object(dependencies.time, "time", return_value=1000))
+        self.installed = dict(GIMM_PACKAGES)
+        self.version = self.enterContext(mock.patch.object(
+            dependencies.importlib.metadata, "version", side_effect=self.package_version))
+        self.run = self.enterContext(mock.patch.object(
+            dependencies.subprocess, "run", side_effect=self.complete_command))
+        self.calls = mock.Mock()
+        self.calls.attach_mock(self.version, "version")
+        self.calls.attach_mock(self.run, "run")
+
+    def package_version(self, package):
+        self.assertIn(package, GIMM_PACKAGES)
+        if package not in self.installed:
+            raise importlib.metadata.PackageNotFoundError(package)
+        return self.installed[package]
+
+    def complete_command(self, command, **kwargs):
+        if command[2:4] == ["-m", "pip"]:
+            for requirement in command:
+                if "==" in requirement:
+                    package, version = requirement.split("==", 1)
+                    self.assertEqual(version, GIMM_PACKAGES[package])
+                    self.installed[package] = version
+        return subprocess.CompletedProcess(command, 0, stdout="OK\n")
+
+    def ensure(self):
+        return dependencies.ensure_dependencies(self.comfy, deadline=1030)
+
+    def assert_fresh_subprocess(self, call, timeout=30):
+        self.assertEqual(call.args[0][:3], [sys.executable, "-s", "-c"])
+        self.assertEqual(call.kwargs["timeout"], timeout)
+        self.assertEqual(call.kwargs["stdout"], subprocess.PIPE)
+        self.assertEqual(call.kwargs["stderr"], subprocess.STDOUT)
+        self.assertFalse(call.kwargs.get("shell", False))
+
+    def assert_import_command(self, call, timeout=30):
+        self.assert_fresh_subprocess(call, timeout)
+        self.assertIn("importlib.import_module(name)", call.args[0][3])
+        self.assertEqual(call.args[0][4:], list(GIMM_IMPORTS))
+
+    def assert_probe_command(self, call, timeout=30):
+        self.assert_fresh_subprocess(call, timeout)
+        command = call.args[0]
+        self.assertEqual(command[4:], [str(self.probe)])
+        self.assertTrue(Path(command[4]).is_absolute())
+        for statement in (
+            "cache = tempfile.TemporaryDirectory(prefix='chouka-gimm-cuda-')",
+            "os.environ['CUPY_CACHE_DIR'] = cache.name",
+            "import importlib.util, sys, torch",
+            "importlib.util.spec_from_file_location('gimm_cuda_probe', sys.argv[1])",
+            "importlib.util.module_from_spec(s)", "s.loader.exec_module(m)",
+            "torch.arange(768, device='cuda', dtype=torch.float32).reshape(1, 3, 16, 16)",
+            "torch.zeros(1, 2, 16, 16, device='cuda')",
+            "m.softsplat(x, flow, None, 'sum')", "torch.cuda.synchronize()",
+            "torch.testing.assert_close(y, x, rtol=0, atol=0)",
+        ):
+            self.assertIn(statement, command[3])
+        self.assertNotIn("__init__", command[3])
+
+    def test_pinned_packages_only_import_then_probe_without_installing(self):
+        self.assertEqual(self.ensure(), GIMM_NODES)
+        self.assertEqual(self.run.call_count, 2)
+        imports, probe = self.run.call_args_list
+        self.assert_import_command(imports)
+        self.assert_probe_command(probe)
+        metadata = [mock.call.version(package) for package in GIMM_PACKAGES]
+        self.assertEqual(self.calls.mock_calls, [
+            *metadata, mock.call.run(*imports.args, **imports.kwargs),
+            *metadata, mock.call.run(*probe.args, **probe.kwargs),
+        ])
+
+    def test_every_missing_package_combination_installs_only_missing_pinned_wheels(self):
+        packages = list(GIMM_PACKAGES)
+        for mask in range(1, 1 << len(packages)):
+            missing = [package for index, package in enumerate(packages) if mask & (1 << index)]
+            with self.subTest(missing=missing):
+                self.installed = {p: v for p, v in GIMM_PACKAGES.items() if p not in missing}
+                self.version.reset_mock()
+                self.run.reset_mock()
+                self.calls.reset_mock()
+                self.assertEqual(self.ensure(), GIMM_NODES)
+                self.assertEqual(self.run.call_count, 3)
+                install, imports, probe = self.run.call_args_list
+                self.assertEqual(install.args[0], [
+                    sys.executable, "-s", "-m", "pip", "--isolated", "install",
+                    "--disable-pip-version-check", "--no-input", "--no-deps",
+                    "--only-binary=:all:", "--retries", "1", "--timeout", "30",
+                    "--index-url", "https://pypi.org/simple",
+                    "--extra-index-url", "https://pypi.nvidia.com",
+                    *[f"{package}=={GIMM_PACKAGES[package]}" for package in missing],
+                ])
+                self.assertEqual(install.kwargs["timeout"], 30)
+                self.assertEqual(install.kwargs["env"]["PIP_CONFIG_FILE"], os.devnull)
+                self.assertFalse(install.kwargs.get("shell", False))
+                self.assert_import_command(imports)
+                self.assert_probe_command(probe)
+                metadata = [mock.call.version(package) for package in GIMM_PACKAGES]
+                self.assertEqual(self.calls.mock_calls, [
+                    *metadata, mock.call.run(*install.args, **install.kwargs),
+                    mock.call.run(*imports.args, **imports.kwargs),
+                    *metadata, mock.call.run(*probe.args, **probe.kwargs),
+                ])
+                self.assertEqual(self.installed, GIMM_PACKAGES)
+
+    def test_other_installed_versions_are_never_replaced(self):
+        for package, expected in GIMM_PACKAGES.items():
+            for installed in ("0.0.0", "99.0.0", expected + "+local"):
+                with self.subTest(package=package, installed=installed):
+                    self.installed = dict(GIMM_PACKAGES, **{package: installed})
+                    with self.assertRaisesRegex(RuntimeError, package + ".*未自动升级或降级"):
+                        self.ensure()
+                    self.run.assert_not_called()
+                    self.assertEqual(self.installed[package], installed)
+
+    def test_pip_failure_stops_before_imports_metadata_confirmation_or_probe(self):
+        self.installed.clear()
+        self.run.side_effect = [subprocess.CompletedProcess([], 1, stdout="GIMM pip failed")]
+        with self.assertRaisesRegex(RuntimeError, "GIMM pip failed"):
+            self.ensure()
+        self.run.assert_called_once()
+        self.assertIn("pip", self.run.call_args.args[0])
+        self.assertEqual(self.version.call_args_list, [mock.call(p) for p in GIMM_PACKAGES])
+
+    def test_import_failure_never_probes_or_returns_nodes(self):
+        for missing in (False, True):
+            with self.subTest(after_install=missing):
+                self.installed = {} if missing else dict(GIMM_PACKAGES)
+                self.version.reset_mock()
+                self.run.reset_mock()
+
+                def run(command, **kwargs):
+                    if command[2:4] == ["-m", "pip"]:
+                        return self.complete_command(command, **kwargs)
+                    return subprocess.CompletedProcess(command, 7, stdout="GIMM imports failed")
+
+                self.run.side_effect = run
+                with self.assertRaisesRegex(RuntimeError, "GIMM imports failed"):
+                    self.ensure()
+                self.assertEqual(self.run.call_count, 2 if missing else 1)
+                self.assert_import_command(self.run.call_args)
+                self.assertEqual(self.version.call_args_list, [mock.call(p) for p in GIMM_PACKAGES])
+
+    def test_metadata_must_confirm_every_pin_before_gpu_probe(self):
+        for package in GIMM_PACKAGES:
+            for final in ("0.0.0", importlib.metadata.PackageNotFoundError(package)):
+                with self.subTest(package=package, final=final):
+                    counts = dict.fromkeys(GIMM_PACKAGES, 0)
+                    self.run.reset_mock()
+
+                    def version(name):
+                        counts[name] += 1
+                        if name == package and counts[name] == 2:
+                            if isinstance(final, Exception):
+                                raise final
+                            return final
+                        return self.package_version(name)
+
+                    self.version.side_effect = version
+                    with self.assertRaises((RuntimeError, importlib.metadata.PackageNotFoundError)):
+                        self.ensure()
+                    self.run.assert_called_once()
+                    self.assert_import_command(self.run.call_args)
+                    self.assertEqual(counts[package], 2)
+
+    def test_gpu_probe_failure_or_timeout_never_returns_nodes(self):
+        for missing in (False, True):
+            for timeout in (False, True):
+                with self.subTest(after_install=missing, timeout=timeout):
+                    self.installed = {} if missing else dict(GIMM_PACKAGES)
+                    self.run.reset_mock()
+
+                    def run(command, **kwargs):
+                        if command[4:] == [str(self.probe)]:
+                            if timeout:
+                                raise subprocess.TimeoutExpired(command, kwargs["timeout"])
+                            return subprocess.CompletedProcess(command, 1, stdout="softsplat CUDA failed")
+                        return self.complete_command(command, **kwargs)
+
+                    self.run.side_effect = run
+                    with self.assertRaisesRegex(RuntimeError, "超时" if timeout else "softsplat CUDA failed"):
+                        self.ensure()
+                    self.assertEqual(self.run.call_count, 3 if missing else 2)
+                    self.assert_import_command(self.run.call_args_list[-2])
+                    self.assert_probe_command(self.run.call_args)
+
+    def test_shared_deadline_expiring_after_imports_prevents_gpu_probe(self):
+        for missing in (False, True):
+            with self.subTest(after_install=missing):
+                self.installed = {} if missing else dict(GIMM_PACKAGES)
+                self.run.reset_mock()
+                self.version.reset_mock()
+                self.clock.side_effect = [1000, 1010, 1030] if missing else [1000, 1030]
+                with self.assertRaisesRegex(RuntimeError, "超时"):
+                    self.ensure()
+                self.assertEqual(self.run.call_count, 2 if missing else 1)
+                self.assert_import_command(self.run.call_args, timeout=20 if missing else 30)
+                self.assertEqual(self.version.call_args_list, [mock.call(p) for p in GIMM_PACKAGES] * 2)
+
+    def test_install_imports_and_probe_use_remaining_shared_budget(self):
+        self.installed.clear()
+        self.clock.side_effect = [1000, 1007, 1019]
+        self.assertEqual(self.ensure(), GIMM_NODES)
+        self.assertEqual(self.run.call_count, 3)
+        install, imports, probe = self.run.call_args_list
+        self.assertEqual(install.kwargs["timeout"], 30)
+        self.assert_import_command(imports, timeout=23)
+        self.assert_probe_command(probe, timeout=11)
+
+    def test_requirements_are_never_read_and_torch_is_never_installed(self):
+        unknown = self.comfy / "custom_nodes" / "UnapprovedPlugin"
+        unknown.mkdir()
+        for directory in (self.plugin, unknown):
+            (directory / "requirements.txt").write_text(
+                "torch==0.0.0\ncupy-cuda12x==0.0.0\n"
+                "--extra-index-url https://untrusted.invalid/simple\n", encoding="utf-8")
+        self.installed.clear()
+        with mock.patch.object(Path, "iterdir", side_effect=AssertionError("No enumeration")), \
+             mock.patch.object(Path, "glob", side_effect=AssertionError("No glob")), \
+             mock.patch.object(Path, "rglob", side_effect=AssertionError("No recursive glob")), \
+             mock.patch.object(Path, "open", side_effect=AssertionError("No requirements reads")):
+            self.assertEqual(self.ensure(), GIMM_NODES)
+        self.assertEqual(self.run.call_count, 3)
+        install, imports, probe = self.run.call_args_list
+        self.assertEqual(install.args[0][0], sys.executable)
+        self.assertIn("--no-deps", install.args[0])
+        self.assertEqual([argument for argument in install.args[0] if "==" in argument],
+                         [f"{p}=={v}" for p, v in GIMM_PACKAGES.items()])
+        for call in self.run.call_args_list:
+            self.assertEqual(call.args[0][0], sys.executable)
+            self.assertNotIn("-r", call.args[0])
+            self.assertNotIn("requirements", " ".join(call.args[0]).lower())
+            self.assertNotIn("untrusted.invalid", " ".join(call.args[0]))
+        self.assertNotIn("torch", " ".join(install.args[0]).lower())
+        self.assertEqual(self.version.call_args_list, [mock.call(p) for p in GIMM_PACKAGES] * 2)
+        self.assert_import_command(imports)
+        self.assert_probe_command(probe)
+
+    def test_plugin_requires_initializer_before_metadata_or_subprocess(self):
+        self.plugin.joinpath("__init__.py").unlink()
+        with self.assertRaisesRegex(RuntimeError, GIMM_PLUGIN):
+            self.ensure()
+        self.version.assert_not_called()
+        self.run.assert_not_called()
+
+
 # Keep real subprocess entry point separate from the executor's subprocess mock.
 _REAL_RUN = subprocess.run
 
@@ -299,6 +581,9 @@ import time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import sync_dependencies as d
+d.PLUGIN_DEPENDENCIES = {
+    'ComfyUI_Nvidia_VFX_Nodes': d.PLUGIN_DEPENDENCIES['ComfyUI_Nvidia_VFX_Nodes'],
+}
 root = Path(sys.argv[2])
 original_lock = d.dependency_lock
 d.dependency_lock = lambda python, deadline: original_lock(root / 'python.exe', deadline)

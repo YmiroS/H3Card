@@ -714,7 +714,7 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 8,
+            "agent_version": 9,
             "supports_task_diagnostics": 1,
             "supports_service_restart": os.name == "nt",
             "supports_host_reboot": os.name == "nt",

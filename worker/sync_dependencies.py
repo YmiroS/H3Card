@@ -22,6 +22,17 @@ PLUGIN_DEPENDENCIES = {
         "imports": ("nvvfx",),
         "nodes": ("RTXVideoSuperResolution", "RTXTrueHDR", "RTXVideoFrameGeneration"),
     },
+    "ComfyUI-GIMM-VFI": {
+        "packages": {
+            "cupy-cuda12x": "13.6.0",
+            "fastrlock": "0.8.3",
+            "nvidia-cuda-runtime-cu12": "12.9.79",
+            "nvidia-cuda-nvrtc-cu12": "12.9.86",
+        },
+        "imports": ("cupy", "nvidia.cuda_runtime", "nvidia.cuda_nvrtc"),
+        "nodes": ("DownloadAndLoadGIMMVFIModel", "GIMMVFI_interpolate"),
+        "cuda_probe": "gimmvfi/generalizable_INR/modules/softsplat.py",
+    },
 }
 
 
@@ -120,6 +131,22 @@ def _install_and_check(comfy_root, deadline):
         for package, expected in spec["packages"].items():
             if importlib.metadata.version(package) != expected:
                 raise RuntimeError(f"{package} 安装后版本检查失败")
+        if "cuda_probe" in spec:
+            run_checked([
+                sys.executable, "-s", "-c",
+                "import os, tempfile; "
+                "cache = tempfile.TemporaryDirectory(prefix='chouka-gimm-cuda-'); "
+                "os.environ['CUPY_CACHE_DIR'] = cache.name; "
+                "import importlib.util, sys, torch; "
+                "s = importlib.util.spec_from_file_location('gimm_cuda_probe', sys.argv[1]); "
+                "m = importlib.util.module_from_spec(s); s.loader.exec_module(m); "
+                "x = torch.arange(768, device='cuda', dtype=torch.float32).reshape(1, 3, 16, 16); "
+                "flow = torch.zeros(1, 2, 16, 16, device='cuda'); "
+                "y = m.softsplat(x, flow, None, 'sum'); "
+                "torch.cuda.synchronize(); torch.testing.assert_close(y, x, rtol=0, atol=0); "
+                "print('GIMM-VFI CUDA kernel OK')",
+                str(plugin / spec["cuda_probe"]),
+            ], deadline)
         required_nodes.extend(spec["nodes"])
     return required_nodes
 
