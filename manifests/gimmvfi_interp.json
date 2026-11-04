@@ -1,6 +1,6 @@
 {
  "id": "gimmvfi_interp",
- "name": "视频补帧插针(GIMM-VFI)",
+ "name": "视频补帧",
  "file": "视频补帧插针(GIMM-VFI)",
  "source": "E:\\ComfyUI_Mie_V33\\ComfyUI\\user\\default\\workflows\\SeedVR2图片视频高清\\视频补帧插针(GIMM-VFI).json",
  "group": "视频",

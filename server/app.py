@@ -146,6 +146,7 @@ MODEL_NAMES = {
     "depth_anything3": "Depth Anything 3",
     "depthcrafter": "DepthCrafter",
     "gimmvfi_interp": "GIMM-VFI",
+    "rtx_video_frame_generation": "NVidia",
     "grid4_stitch": "无需模型（拼图工具）",
     "youku_sr_video": "优酷视频超分（远程服务）",
     "rmbg_erase": "RMBG 2.0 + FLUX.2 Klein",

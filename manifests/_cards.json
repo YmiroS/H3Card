@@ -155,8 +155,12 @@
    },
    {
     "id": "gimmvfi_interp",
-    "name": "视频补帧插针(GIMM-VFI)",
-    "slots": "img0+aud0+vid1"
+    "name": "视频补帧",
+    "slots": "img0+aud0+vid1",
+    "modelSwitch": {
+     "gimmvfi": "gimmvfi_interp",
+     "nvidia": "rtx_video_frame_generation"
+    }
    },
    {
     "id": "depth_image",
@@ -215,7 +219,7 @@
     },
     "entry": {
      "label": "素材",
-     "hint": "图片和视频都收，放进来就照着原样重画一遍、画得更清楚。参数会自动换成对应的那一套。想让视频更顺滑（补中间帧）请用「视频补帧插针」那张卡。"
+     "hint": "图片和视频都收，放进来就照着原样重画一遍、画得更清楚。参数会自动换成对应的那一套。想让视频更顺滑（补中间帧）请用工具卡中的「视频补帧」模式。"
     }
    },
    {

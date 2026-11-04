@@ -1,4 +1,4 @@
-import{reactExports as D,jsxRuntimeExports as L}from"./http-DOrwCtZg.js";import{usePageRuntime as Q}from"./usePageRuntime-CU9NlNnB.js";import"./main-BLhRt60i.js";import"./monitor-alerts-SRWMPPW3.js";const Z=`<main>\r
+import{reactExports as D,jsxRuntimeExports as L}from"./http-DOrwCtZg.js";import{usePageRuntime as Q}from"./usePageRuntime-Byxeoxwj.js";import"./main-D-c512ei.js";import"./monitor-alerts-SRWMPPW3.js";const Z=`<main>\r
   <header class="toolbar">\r
     <div class="heading"><h1>IF Studio</h1><p>使用本机 IF 账号生成图片或视频，并加入 Chouka 画布。</p></div>\r
     <div class="import">\r

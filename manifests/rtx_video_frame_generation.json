@@ -1,0 +1,66 @@
+{
+ "id": "rtx_video_frame_generation",
+ "name": "视频补帧",
+ "file": "rtx_video_frame_generation",
+ "source": "C:\\Users\\admin\\Downloads\\rtx_video_frame_generation.json",
+ "group": "视频",
+ "outputType": "video",
+ "kind": "tool",
+ "card": "card_tools",
+ "slots": "img0+aud0+vid1",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 1, "max": 1}},
+ "graph": "graphs/rtx_video_frame_generation.api.json",
+ "output": {"node": "9"},
+ "note": "NVidia 使用 NVIDIA RTX Video Frame Generation 在相邻画面间补帧。输出帧率 = 原帧率 × 补帧倍数，例如 24 fps × 2 = 48 fps；保留原音轨、色彩空间和位深，不通过降低播放速度制作慢动作。末帧后不补帧，片尾可能有不足源视频一帧的时长差。与 GIMM-VFI 不同，本模型不提供任意目标帧率、前几帧截取或种子。需要 NVIDIA RTX 显卡及 nvidia-vfx 依赖；原工作流整段解码，高倍数和长视频占用较多内存，建议先用短视频、2 倍测试。",
+ "rewrite": null,
+ "compare": false,
+ "inputs": [
+  {
+   "key": "video[0]", "label": "源视频", "type": "video", "required": true,
+   "target": {"node": "6", "input": "file", "kind": "upload_video"}
+  },
+  {
+   "key": "frame_multiplier", "label": "补帧倍数", "type": "slider",
+   "min": 2, "max": 16, "step": 1, "default": 2,
+   "hint": "原视频帧率乘以此倍数作为输出帧率。倍数越高，输出帧数、处理时间和内存占用越大。",
+   "target": {"node": "12", "input": "value", "vtype": "INT"}
+  },
+  {
+   "key": "rtx_mode", "label": "补帧质量", "type": "select", "default": "HIGH",
+   "options": [{"value": "LOW", "label": "低（速度优先）"}, {"value": "MEDIUM", "label": "中（均衡）"}, {"value": "HIGH", "label": "高（质量优先）"}],
+   "target": {"node": "10", "input": "mode"}
+  },
+  {
+   "key": "rtx_auto_shot", "label": "自动检测镜头切换", "type": "select", "appearance": "switch", "default": "on",
+   "options": [{"value": "off", "label": "关闭"}, {"value": "on", "label": "开启"}],
+   "hint": "检测切镜，避免在不同镜头之间生成不自然的过渡帧。",
+   "presets": {"off": {"automatic_shot_change_detection": false}, "on": {"automatic_shot_change_detection": true}},
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "automatic_shot_change_detection", "label": "自动切镜检测开关", "type": "boolean", "default": true, "mirror": true, "advanced": true,
+   "target": {"node": "10", "input": "automatic_shot_change_detection", "vtype": "BOOLEAN"}
+  },
+  {
+   "key": "image_encoding", "label": "图像编码", "type": "select", "default": "8-bit RGB",
+   "options": ["8-bit RGB", "10-bit RGB (RGB10A2)"],
+   "hint": "补帧计算使用的像素编码，不会把 SDR 自动转换为 HDR；输出视频仍沿用源视频位深与色彩空间。",
+   "target": {"node": "10", "input": "image_encoding"}
+  },
+  {
+   "key": "rtx_shot_change", "label": "强制镜头切换", "type": "select", "appearance": "switch", "default": "off", "advanced": true,
+   "options": [{"value": "off", "label": "关闭"}, {"value": "on", "label": "开启"}],
+   "hint": "对应原节点 shot_change，对每对相邻帧标记镜头切换。普通整段视频请保持关闭，优先使用自动检测。",
+   "presets": {"off": {"shot_change": false}, "on": {"shot_change": true}},
+   "target": {"kind": "preset"}
+  },
+  {
+   "key": "shot_change", "label": "强制切镜开关", "type": "boolean", "default": false, "mirror": true, "advanced": true,
+   "target": {"node": "10", "input": "shot_change", "vtype": "BOOLEAN"}
+  }
+ ],
+ "warnings": []
+}

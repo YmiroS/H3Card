@@ -85,7 +85,8 @@ DISPLAY = {
     "rmbg_cutout": "人物提取",
     "rmbg_bgonly": "抠出背景",
     "rmbg_erase": "人物擦除",
-    "gimmvfi_interp": "视频补帧插针(GIMM-VFI)",
+    "gimmvfi_interp": "视频补帧",
+    "rtx_video_frame_generation": "视频补帧",
     "seedvr2_image_up": "SeedVR2 图片高清放大",
     "seedvr2_video_up": "SeedVR2 视频高清放大",
     "depth_image": "深度图片",
@@ -111,7 +112,7 @@ SOLO = set()
 # 第二张参考图接不进去；所以图片 / 视频拆成两个工具箱模式（同 depth_image / depth_video）。
 TOOLS = {
     "grid4_stitch", "rmbg_cutout", "rmbg_bgonly", "rmbg_erase", "gimmvfi_interp",
-    "depth_image", "depth_video", "alphagen", "rtx_video_hdr",
+    "depth_image", "depth_video", "alphagen", "rtx_video_hdr", "rtx_video_frame_generation",
     "image_color_match", "video_color_match",
 }
 TOOLS_CARD = {"id": "card_tools", "name": "工具箱", "icon": "🧩"}
@@ -133,7 +134,7 @@ ROUTE_CARDS = {
         "entry": {"label": "素材",
                   "hint": "图片和视频都收，放进来就照着原样重画一遍、画得更清楚。"
                           "参数会自动换成对应的那一套。"
-                          "想让视频更顺滑（补中间帧）请用「视频补帧插针」那张卡。"},
+                          "想让视频更顺滑（补中间帧）请用工具卡中的「视频补帧」模式。"},
     },
 }
 
@@ -145,6 +146,7 @@ MODEL_SWITCHES = {
     "zimage_i2i": {"zimage": "zimage_i2i", "krea2": "krea2_i2i",
                    "qwen2511": "qwen_image_edit_2511_i2i", "qwen21": "qwen_image_21_multi"},
     "depth_video": {"da3": "depth_video", "depthcrafter": "depthcrafter_video"},
+    "gimmvfi_interp": {"gimmvfi": "gimmvfi_interp", "nvidia": "rtx_video_frame_generation"},
     "qwen_lighting": {"light": "qwen_lighting", "multiLight": "qwen_lighting_multi"},
 }
 
@@ -153,7 +155,7 @@ MODEL_SWITCHES = {
 # Qwen 2.1 的图生图模型直接使用16图编辑能力；旧单图能力只保留给历史任务和项目迁移。
 BUNDLED_CAPABILITIES = {
     "minimax_h3_ref_2pass_bf16",
-    "alphagen", "rtx_video_hdr", "image_color_match", "video_color_match",
+    "alphagen", "rtx_video_hdr", "rtx_video_frame_generation", "image_color_match", "video_color_match",
     "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
