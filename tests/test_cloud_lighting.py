@@ -469,6 +469,55 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assertNotIn("fake-lighting-secret", json.dumps(done))
         self.assertGreaterEqual(self.save_jobs.call_count, 3)
 
+    async def test_direct_mode_sends_two_images_in_order_and_indexes_both_inputs(self):
+        reference = self.add_upload("reference.png", png("green", (5, 4)))
+        submitted = await self.start_job(params={
+            "prompt": PROMPT, "reference_mode": "direct", "reference_image": reference["url"]})
+        self.assertEqual(submitted["referenceMode"], "direct")
+        done = await self.finish_job(submitted)
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(self.received[0]["images"], [png("red"), png("green", (5, 4))])
+        self.assertEqual([asset["ref"] for asset in await self.indexed_assets(submitted)],
+                         ["chouka/original.png", "chouka/reference.png"])
+        artifact = self.resources.lookup("artifact", f"{submitted['id']}/relight.png")
+        self.assertEqual(artifact["parent_id"],
+                         self.resources.lookup("upload", "original.png")["resource_id"])
+
+    async def test_direct_mode_requires_a_reference_value(self):
+        for reference in (None, "", "   ", 42):
+            with self.subTest(reference=reference):
+                response = await self.generate(params={
+                    "prompt": PROMPT, "reference_mode": "direct", "reference_image": reference})
+                self.assertEqual(response.status, 400, await response.text())
+        self.assert_no_submission()
+
+    async def test_direct_mode_reference_must_be_a_visible_project_image(self):
+        owner = self.store.create_user("reference-owner", PASSWORD)["id"]
+        self.store.create_project("reference-project", owner)
+        foreign = self.add_upload("foreign.png", png("black"), project="reference-project")
+        for reference, status in (("https://example.invalid/ref.png", 400),
+                                  ("chouka/unregistered.png", 404), (foreign["ref"], 404)):
+            with self.subTest(reference=reference):
+                response = await self.generate(params={
+                    "prompt": PROMPT, "reference_mode": "direct", "reference_image": reference})
+                self.assertEqual(response.status, status, await response.text())
+        self.assert_no_submission()
+
+    async def test_direct_mode_rejects_unknown_reference_mode(self):
+        response = await self.generate(params={"prompt": PROMPT, "reference_mode": "lightmap"})
+        self.assertEqual(response.status, 400, await response.text())
+        self.assert_no_submission()
+
+    async def test_analyze_mode_ignores_reference_image_and_sends_one(self):
+        reference = self.add_upload("ignored.png", png("green"))
+        submitted = await self.start_job(params={
+            "prompt": PROMPT, "reference_mode": "analyze", "reference_image": reference["ref"]})
+        self.assertEqual(submitted["referenceMode"], "analyze")
+        done = await self.finish_job(submitted)
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(self.received[0]["images"], [png("red")])
+
     async def test_selected_clarity_controls_cloud_size_without_resizing_input(self):
         image = png("red", (1920, 1080))
         upstream = self.add_upload("landscape.png", image)

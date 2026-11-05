@@ -69,6 +69,23 @@ class CloudLighting:
         await self.require_resource(request, *ref, project_id=project_id)
         return data, ref, info
 
+    async def snapshot_input(self, project_id, ref, data, info):
+        """把非上传来源复制成任务输入；上传来源直接沿用原引用。"""
+        if ref[0] == "upload":
+            return "chouka/" + ref[1]
+        parent = await self.resource_call(self.app, "lookup", *ref)
+        name = f"lighting_input_{uuid.uuid4().hex}{info['extension']}"
+        path = self.root / "data" / "uploads" / name
+        await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
+        await asyncio.to_thread(path.write_bytes, data)
+        try:
+            await self.resource_call(self.app, "register", project_id, "upload", name,
+                                     parent_id=parent["resource_id"], external=True)
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
+        return "chouka/" + name
+
     async def submit(self, request, body, cap):
         params, assets = body.get("params") or {}, body.get("assets") or {}
         if (not isinstance(params, dict) or not isinstance(assets, dict)
@@ -77,6 +94,13 @@ class CloudLighting:
         prompt = params.get("prompt")
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
             raise web.HTTPBadRequest(text="多灯布光提示词不能为空，且不得超过 20000 字符")
+        reference_mode = params.get("reference_mode", "analyze")
+        if reference_mode not in ("analyze", "direct"):
+            raise web.HTTPBadRequest(text="参考图方式只支持 analyze 或 direct")
+        reference_image = params.get("reference_image")
+        if reference_mode == "direct" and (
+                not isinstance(reference_image, str) or not reference_image.strip()):
+            raise web.HTTPBadRequest(text="双图直传缺少参考图，请重新选择参考图后再试")
         project_id, card_id = body["project"], body.get("card")
         if card_id and not body.get("dry_run") and any(job.get("execution") == "cloud_image"
                            and job.get("project") == project_id and job.get("card") == card_id
@@ -84,6 +108,10 @@ class CloudLighting:
                            for job in self.jobs.values()):
             raise web.HTTPConflict(text="当前卡片已有云端打光任务，请等待结果，不要重复提交")
         data, ref, info = await self.source(request, project_id, assets["images[0]"])
+        reference = None
+        if reference_mode == "direct":
+            # 参考图按项目素材登记后通过同一套权限校验，不信任前端给的任意地址。
+            reference = await self.source(request, project_id, reference_image)
         megapixels = params.get("megapixels", 1.5)
         size = lighting_size(info, megapixels)
         if body.get("dry_run"):
@@ -91,24 +119,15 @@ class CloudLighting:
                     "prompt": prompt.strip(), "size": size}
         config = cloud_images.load()
         await self.require_project(request, project_id, operate=True)
-        parent = await self.resource_call(self.app, "lookup", *ref)
-        # The existing task-input index uses uploads; snapshot other trusted resource types.
-        input_ref = assets["images[0]"]
-        if ref[0] != "upload":
-            name = f"lighting_input_{uuid.uuid4().hex}{info['extension']}"
-            path = self.root / "data" / "uploads" / name
-            await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
-            await asyncio.to_thread(path.write_bytes, data)
-            try:
-                await self.resource_call(self.app, "register", project_id, "upload", name,
-                                         parent_id=parent["resource_id"], external=True)
-            except BaseException:
-                path.unlink(missing_ok=True)
-                raise
-            input_ref = "chouka/" + name
+        input_ref = await self.snapshot_input(project_id, ref, data, info)
+        reference_ref = (await self.snapshot_input(project_id, reference[1], reference[0],
+                                                   reference[2])) if reference else None
         pid, user_id = str(uuid.uuid4()), self.require_user(request)["id"]
         await self.call_store(self.app, "register_job", pid, project_id, user_id)
-        await self.resource_call(self.app, "register_job_inputs", pid, {"images[0]": input_ref})
+        inputs = {"images[0]": input_ref}
+        if reference_ref:
+            inputs["reference_image"] = reference_ref
+        await self.resource_call(self.app, "register_job_inputs", pid, inputs)
         job = {"id": pid, "capability": cap["id"], "name": cap["name"],
                "modelName": config["model"], "execution": "cloud_image", "outputType": "image",
                "status": "queued", "progress": 0.0, "created": time.time(), "seed": None,
@@ -116,10 +135,14 @@ class CloudLighting:
                "step": "等待云端打光", "outputs": [], "error": None, "retryable": False,
                "project": project_id, "projectName": body.get("projectName"),
                "card": card_id, "cardName": body.get("cardName"),
+               "referenceMode": reference_mode,
                "prompts": [{"key": "prompt", "label": "布光提示词", "text": prompt.strip()}]}
         self.jobs[pid] = job
         self.save_jobs()
-        task = asyncio.create_task(self.run(job, user_id, data, ref, size, prompt.strip()))
+        images = [data] if reference is None else [data, reference[0]]
+        refs = [ref] if reference is None else [ref, reference[1]]
+        task = asyncio.create_task(
+            self.run(job, user_id, images, refs, size, prompt.strip()))
         self.tasks[pid] = task
         task.add_done_callback(lambda finished: self.tasks.pop(pid, None))
         return dict(job)
@@ -130,30 +153,34 @@ class CloudLighting:
         if permission != "operate" or not allowed:
             raise web.HTTPForbidden(text="画布或输入图片已不可用，未采用云端结果；请联系管理员确认，不要重复生成")
 
-    async def run(self, job, user_id, data, ref, size, prompt):
+    async def authorize_all(self, user_id, project_id, refs):
+        for ref in refs:
+            await self.authorize(user_id, project_id, ref)
+
+    async def run(self, job, user_id, images, refs, size, prompt):
         path = temporary = None
         try:
-            await self.authorize(user_id, job["project"], ref)
+            await self.authorize_all(user_id, job["project"], refs)
             job.update(status="running", started=time.time(), step="云端多灯打光中")
             self.save_jobs()
-            result = await cloud_images.edit(self.app["session"], [data], prompt, size=size)
+            result = await cloud_images.edit(self.app["session"], images, prompt, size=size)
             job.update(request_id=result["request_id"], modelName=result["model"])
             if "image_bytes" not in result:
                 raise cloud_images.ImageEditError(
                     "云端已返回图片链接，但未自动下载。请联系管理员确认结果，不要重复生成。",
                     request_id=result["request_id"])
             async with self.app["project_locks"][job["project"]]:
-                await self.authorize(user_id, job["project"], ref)
+                await self.authorize_all(user_id, job["project"], refs)
                 name = "relight" + result["extension"]
                 locator = f"{job['id']}/{name}"
                 path = self.root / "data" / "artifacts" / locator
                 temporary = path.with_suffix(path.suffix + ".part")
-                parent = await self.resource_call(self.app, "lookup", *ref)
+                parent = await self.resource_call(self.app, "lookup", *refs[0])
                 await self.resource_call(self.app, "register", job["project"], "artifact", locator,
                                          parent_id=parent["resource_id"], state="pending")
                 await asyncio.to_thread(path.parent.mkdir, parents=True, exist_ok=True)
                 await asyncio.to_thread(temporary.write_bytes, result["image_bytes"])
-                await self.authorize(user_id, job["project"], ref)
+                await self.authorize_all(user_id, job["project"], refs)
                 os.replace(temporary, path)
                 await self.resource_call(self.app, "publish", "artifact", locator)
                 job.update(status="done", progress=1.0, error=None, outputs=[{

@@ -304,7 +304,7 @@ class ResourceAccess:
                 "SELECT r.locator FROM job_inputs i "
                 "JOIN resources r ON i.resource_id=r.resource_id "
                 "WHERE i.job_id=? AND r.kind='upload' AND r.state='ready' "
-                "ORDER BY i.name", (jid,)).fetchall()
+                "ORDER BY i.rowid", (jid,)).fetchall()
             return [row['locator'] for row in rows
                     if self.authorize(user_id, 'upload', row['locator'],
                                       project_id=job['project_id'])]

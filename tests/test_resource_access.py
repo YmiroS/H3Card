@@ -231,6 +231,16 @@ class ResourceAccessTests(unittest.TestCase):
         self.store.set_project_state('a', 'deleted')
         self.assertFalse(self.access.job_input_allowed('job1', 'source.png'))
 
+    def test_list_job_inputs_preserves_registration_order(self):
+        self.store.register_job('job1', 'a', self.a)
+        for name in ('zzz-original.png', 'aaa-reference.png'):
+            (self.uploads / name).write_bytes(b'image')
+            self.access.register('a', 'upload', name)
+        self.access.register_job_inputs('job1', {'images[0]': 'chouka/zzz-original.png',
+                                                 'reference_image': 'chouka/aaa-reference.png'})
+        self.assertEqual(self.access.list_job_inputs(self.a, 'job1'),
+                         ['zzz-original.png', 'aaa-reference.png'])
+
     def test_list_job_inputs_rechecks_current_user_and_project_permissions(self):
         self.store.register_job('job1', 'a', self.a)
         self.access.register_job_inputs('job1', ['chouka/source.png'])
