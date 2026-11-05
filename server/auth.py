@@ -92,7 +92,9 @@ def require_monitor(request):
 
 def require_team_leader(request):
     user = require_user(request)
-    if user['role'] == 'monitor' or (user['role'] != 'admin' and not user.get('team_leader')):
+    if user['role'] == 'monitor' or (user['role'] != 'admin'
+                                    and not user.get('team_leader')
+                                    and not user.get('can_manage_teams')):
         raise web.HTTPForbidden(text='需要组长权限')
     return user
 
@@ -477,6 +479,12 @@ async def team_members_batch(request):
     return web.json_response({'members': result}, status=201)
 
 
+async def set_team_leader(request):
+    await _body(request)
+    result = await team_call(request, 'set_team_leader', request.match_info['tid'], request.match_info['uid'])
+    return web.json_response(result)
+
+
 async def delete_team_member(request):
     await team_call(request, 'remove_team_member', request.match_info['tid'], request.match_info['uid'])
     await notify_access_changed(request, user_ids=[request.match_info['uid']])
@@ -606,6 +614,7 @@ def register_auth_routes(app, web_root, *, frontend=None):
     app.router.add_delete('/api/teams/{tid}/members/{uid}', delete_team_member)
     app.router.add_get('/api/admin/dispatch-priority', dispatch_priority_settings)
     app.router.add_put('/api/admin/dispatch-priority', dispatch_priority_settings)
+    app.router.add_put('/api/teams/{tid}/leaders/{uid}', set_team_leader)
     app.router.add_get('/api/admin/registrations', registrations)
     app.router.add_post('/api/admin/projects/assign', assign_projects)
     app.router.add_get('/api/admin/users', users)

@@ -155,6 +155,38 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             self.assertEqual((await self.client.get(route)).status, 200)
         self.assertEqual((await self.client.get('/api/projects')).status, 403)
 
+    async def test_local_team_leader_existing_session_and_account_creation_boundary(self):
+        founder = self.auth.create_user('founder', PASSWORD, team_leader=True)['id']
+        local = self.auth.create_user('local-leader', PASSWORD)['id']
+        team = self.auth.create_team('多人组长装配测试', founder)['id']
+        self.auth.add_team_member(team, local, founder)
+        self.client.session.cookie_jar.clear()
+        headers = await self.login('local-leader')
+        self.assertEqual((await self.client.get('/teams')).status, 403)
+        self.assertFalse((await (await self.client.get('/api/auth/me')).json())['user']['can_manage_teams'])
+        # 使用独立真实连接授予，验证 make_app 持有的存储及旧会话即时读取新身份。
+        self.auth.set_team_leader(team, local, founder)
+        response = await self.client.get('/api/auth/me')
+        user = (await response.json())['user']
+        self.assertTrue(user['can_manage_teams'])
+        self.assertFalse(user['team_leader'])
+        response = await self.client.get('/teams')
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), self.client.app['frontend'].index.read_bytes())
+        self.assertEqual((await self.client.get('/api/team-candidates')).status, 200)
+        self.assertEqual((await self.client.post('/api/teams', json={'name': '不允许创建'}, headers=headers)).status, 403)
+        self.assertEqual((await self.client.get('/api/admin/users')).status, 403)
+        # 撤回账号级创建权限不隐式取消创始人的组内身份。
+        self.auth.set_user(founder, team_leader=False)
+        self.client.session.cookie_jar.clear()
+        headers = await self.login('founder')
+        self.assertEqual((await self.client.get('/teams')).status, 200)
+        self.assertEqual((await self.client.post('/api/teams', json={'name': '创建权限已撤回'}, headers=headers)).status, 403)
+        response = await self.client.put(f'/api/teams/{team}/leaders/{local}', json={}, headers=headers)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.json(), {'ok': True})
+        self.assertEqual(self.auth._team(team)['leader_id'], founder)
+
     async def test_compiled_admin_and_monitor_pages_are_specific_documents_not_spa_or_old_web(self):
         frontend = self.client.app['frontend']
         # Changing the business root must not affect the immutable frontend code root.

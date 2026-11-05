@@ -383,6 +383,27 @@ class SandboxApplicationTests(unittest.IsolatedAsyncioTestCase):
             response = await self.client.get(path)
             self.assertEqual(response.status, 403, path)
 
+    async def test_catalogued_frontend_assets_are_read_only_and_keep_sandbox_boundaries(self):
+        frontend = self.application['frontend']
+        path, file = next((path, file) for path, file in frontend.assets.items()
+                          if path.startswith('/assets/') and path.endswith('.js'))
+        for method in ('GET', 'HEAD'):
+            response = await self.client.request(method, path)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers['X-H3Card-Sandbox'], 'local-copy')
+            self.assertIn("connect-src 'self'", response.headers['Content-Security-Policy'])
+            if method == 'GET':
+                self.assertEqual(await response.read(), file.read_bytes())
+        for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+            response = await self.client.request(method, path)
+            self.assertEqual(response.status, 403)
+        for denied in ('/assets/unknown-12345678.js', '/assets/../local-login.json',
+                       '/local-login.json', '/server.log', '/api/generate'):
+            response = await self.client.get(denied)
+            self.assertEqual(response.status, 403, denied)
+        response = await self.client.get(path, headers={'Host': 'remote.invalid'})
+        self.assertEqual(response.status, 403)
+
     async def test_local_management_writes_still_need_csrf(self):
         headers = await self.login()
         body = {'username': 'created-here', 'password': 'Local-Created-74!', 'role': 'user'}

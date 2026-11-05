@@ -4,6 +4,8 @@ from pathlib import Path
 
 from aiohttp import web
 
+from server.frontend import is_frontend_asset
+
 
 PAGES = {'/', '/login', '/login.html', '/director', '/controller', '/controller/costs',
          '/controller/capacity', '/admin/permissions', '/teams'}
@@ -72,7 +74,7 @@ async def sandbox_guard(request, handler):
         permitted_hosts.update({'127.0.0.1', 'localhost'})
     if host not in permitted_hosts or request.remote not in {'127.0.0.1', '::1'}:
         return web.json_response({'error': '本地验收仅接受本机地址'}, status=403)
-    if not allowed(request.method, request.path):
+    if not allowed(request.method, request.path) and not is_frontend_asset(request):
         response = web.json_response({'error': '本地隔离环境禁用此操作，不会执行任务或访问正式服务'}, status=403)
     else:
         response = await handler(request)
