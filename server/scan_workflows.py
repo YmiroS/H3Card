@@ -150,6 +150,9 @@ MODEL_SWITCHES = {
     "qwen_lighting": {"light": "qwen_lighting", "multiLight": "qwen_lighting_multi"},
 }
 
+# 新建节点进入该模式时先跑哪条模型；没写就用基准能力。
+MODEL_SWITCH_DEFAULTS = {"qwen_lighting": "multiLight"}
+
 # API 图和输入槽随项目维护，不依赖原作者本机的界面工作流路径。
 # Qwen 图生图固定编辑分支；文生图保留双阶段和独立负向输入，防止重扫合并两阶段步数。
 # Qwen 2.1 的图生图模型直接使用16图编辑能力；旧单图能力只保留给历史任务和项目迁移。
@@ -1938,6 +1941,9 @@ def build_modes(ms):
             continue
         base = next(md for md in modes if md["id"] == base_id)
         base["modelSwitch"] = choices
+        default = MODEL_SWITCH_DEFAULTS.get(base_id)
+        if default in choices:
+            base["defaultModel"] = default
         alternatives = set(choices.values()) - {base_id}
         modes = [md for md in modes if md["id"] not in alternatives]
     return modes

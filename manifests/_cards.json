@@ -35,7 +35,8 @@
     "modelSwitch": {
      "light": "qwen_lighting",
      "multiLight": "qwen_lighting_multi"
-    }
+    },
+    "defaultModel": "multiLight"
    },
    {
     "id": "flux2_klein_storyboard9",
