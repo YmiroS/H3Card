@@ -505,14 +505,13 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
             graph = app.patch_graph(self.cap, params, assets, metadata)
         return params, graph
 
-    def test_raw_graph_changes_exact_model_only(self):
-        old_text = (ROOT / self.old["graph"]).read_text(encoding="utf-8")
-        old = json.loads(old_text)
-        original_model = old["127"]["inputs"]["unet_name"]
+    def test_raw_graph_preserves_model_and_single_video_variant(self):
+        old = json.loads((ROOT / self.old["graph"]).read_text(encoding="utf-8"))
+        for nid, slot in (("186", 1), ("187", 2)):
+            old.pop(nid)
+            old["136"]["inputs"].pop(f"ref_videos.ref_video_{slot}")
         old["127"]["inputs"]["unet_name"] = self.model
         self.assertEqual(self.raw, old)
-        self.assertEqual((ROOT / self.cap["graph"]).read_text(encoding="utf-8"),
-                         old_text.replace(original_model, self.model))
         self.assertEqual([nid for nid, node in self.raw.items()
                           if node["class_type"] == "SamplerCustomAdvanced"], ["125"])
         self.assertFalse(any("scale_by" in n["inputs"] or "LatentUpscale" in n["class_type"]
@@ -522,9 +521,16 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
         self.assertEqual(self.cap["name"], self.name)
         self.assertEqual(self.cap["source"], "graphs/" + self.cid + ".api.json")
         self.assertEqual(self.cap["graph"], self.cap["source"])
-        for key in self.old.keys() - {"id", "name", "source", "graph", "note", "inputs"}:
+        for key in self.old.keys() - {"id", "name", "source", "graph", "note", "inputs",
+                                      "slots", "videos", "slotLimits"}:
             self.assertEqual(self.cap[key], self.old[key], key)
-        self.assertEqual(self.cap["inputs"], self.old["inputs"])
+        self.assertEqual(self.cap["slots"], "img6+aud3+vid1")
+        self.assertEqual(self.cap["videos"], 1)
+        self.assertEqual(self.cap["slotLimits"]["video"], {"min": 0, "max": 1})
+        self.assertEqual(self.cap["slotLimits"]["image"], self.old["slotLimits"]["image"])
+        self.assertEqual(self.cap["slotLimits"]["audio"], self.old["slotLimits"]["audio"])
+        self.assertEqual(self.cap["inputs"], [s for s in self.old["inputs"]
+                                             if s["key"] not in {"video[1]", "video[2]"}])
         keys = {s["key"] for s in self.cap["inputs"]}
         self.assertNotIn("output_1080p", keys)
         self.assertNotIn("scale_by", keys)
@@ -557,6 +563,8 @@ class H3FusionV2BF16WorkflowTest(unittest.TestCase):
                 with self.subTest(reference=reference, options=options):
                     assets = {"video[0]": "chouka/reference.mp4"} if reference else {}
                     expected = app.patch_graph(self.old, {"seed": 42, **options}, assets)
+                    for nid in ("186", "187"):
+                        expected.pop(nid)
                     expected["127"]["inputs"]["unet_name"] = self.model
                     for extra in ({}, {"output_1080p": "off"}):
                         params, graph = self.patch({**options, **extra}, reference)

@@ -589,13 +589,15 @@ class ReferenceVideoOutputTest(unittest.TestCase):
             with self.subTest(cid=cid):
                 cap, _, graph = self.patch(cid, params={"sound": "on"})
                 original = self.graph(cap)
+                reference_node = next(spec['target']['node'] for spec in cap['inputs']
+                                      if spec['key'] == 'video[0]')
                 for nid, node in graph.items():
                     if node["class_type"] == "MiniMaxH3ReferenceToVideo":
                         self.assertEqual(node["inputs"]["length"], 158)
                     elif node["class_type"].startswith("VHS_LoadVideo"):
                         self.assertEqual(node["inputs"]["force_rate"], 24)
                         self.assertEqual(node["inputs"]["frame_load_cap"], 158)
-                        self.assertEqual(node["inputs"]["video"], self.ref)
+                        self.assertEqual(node["inputs"]["video"], self.ref if nid == reference_node else "")
                 output = self.output(graph)
                 scale = graph[output["images"][0]]["inputs"]
                 trim = graph[scale["image"][0]]

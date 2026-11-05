@@ -97,7 +97,7 @@
    {
     "id": "minimax_h3_fusion_v2",
     "name": "H3无损融合单采V2",
-    "slots": "img6+aud3+vid1"
+    "slots": "img6+aud3+vid3"
    },
    {
     "id": "minimax_h3_fusion_v2_bf16",

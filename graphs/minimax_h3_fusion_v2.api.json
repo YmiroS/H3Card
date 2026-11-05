@@ -72,6 +72,16 @@
   "inputs": {"video": "", "force_rate": 24, "force_size": "Disabled", "custom_width": 0, "custom_height": 0, "frame_load_cap": ["224", 1], "skip_first_frames": 0, "select_every_nth": 1, "format": "AnimateDiff"},
   "_meta": {"title": "视频1"}
  },
+ "186": {
+  "class_type": "VHS_LoadVideo",
+  "inputs": {"video": "", "force_rate": 24, "force_size": "Disabled", "custom_width": 0, "custom_height": 0, "frame_load_cap": ["224", 1], "skip_first_frames": 0, "select_every_nth": 1, "format": "AnimateDiff"},
+  "_meta": {"title": "视频2"}
+ },
+ "187": {
+  "class_type": "VHS_LoadVideo",
+  "inputs": {"video": "", "force_rate": 24, "force_size": "Disabled", "custom_width": 0, "custom_height": 0, "frame_load_cap": ["224", 1], "skip_first_frames": 0, "select_every_nth": 1, "format": "AnimateDiff"},
+  "_meta": {"title": "视频3"}
+ },
  "136": {
   "class_type": "MiniMaxH3ReferenceToVideo",
   "inputs": {
@@ -79,7 +89,7 @@
    "ref_images.ref_image_0": ["199", 0], "ref_images.ref_image_1": ["188", 0],
    "ref_images.ref_image_2": ["189", 0], "ref_images.ref_image_3": ["190", 0],
    "ref_images.ref_image_4": ["191", 0], "ref_images.ref_image_5": ["192", 0],
-   "ref_videos.ref_video_0": ["185", 0],
+   "ref_videos.ref_video_0": ["185", 0], "ref_videos.ref_video_1": ["186", 0], "ref_videos.ref_video_2": ["187", 0],
    "ref_audios.ref_audio_0": ["182", 0], "ref_audios.ref_audio_1": ["183", 0], "ref_audios.ref_audio_2": ["184", 0],
    "prompt": ["238", 0], "width": ["228", 0], "height": ["228", 1], "length": ["224", 1], "ref_image_size": "max"
   },

@@ -441,9 +441,12 @@ class ModelDispatchTest(unittest.TestCase):
         ]
         return caps
 
-    def test_fusion_bf16_raw_graph_changes_only_node_127_model(self):
+    def test_fusion_bf16_raw_graph_preserves_model_and_single_video_variant(self):
         original = copy.deepcopy(self.graph)
         caps = self.fusion_bf16_caps()
+        for nid, slot in (("186", 1), ("187", 2)):
+            original.pop(nid)
+            original["136"]["inputs"].pop(f"ref_videos.ref_video_{slot}")
         original["127"]["inputs"]["unet_name"] = (
             "Cobijada_H3_Hybrid_Uncensored_pruned_hybrid_BF16_pruned.safetensors"
         )

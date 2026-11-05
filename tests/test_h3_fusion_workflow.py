@@ -18,6 +18,7 @@ import scan_workflows
 
 CAP_ID = 'minimax_h3_fusion_v2'
 IMAGE_NODES = ['199', '188', '189', '190', '191', '192']
+VIDEO_NODES = ['185', '186', '187']
 
 
 def capability():
@@ -64,19 +65,19 @@ class H3FusionWorkflowTest(unittest.TestCase):
         cap = capability()
         self.assertEqual(cap['slotLimits'], {
             'image': {'min': 0, 'max': 6}, 'audio': {'min': 0, 'max': 3},
-            'video': {'min': 0, 'max': 1},
+            'video': {'min': 0, 'max': 3},
         })
         graph = app.patch_graph(cap, {}, {})
         self.assertFalse(any(k.startswith('ref_') and k != 'ref_image_size' for k in graph['136']['inputs']))
         live = scan_workflows.upstream(graph, '148')
-        self.assertTrue(live.isdisjoint(set(IMAGE_NODES) | {'182', '183', '184', '185'}))
+        self.assertTrue(live.isdisjoint(set(IMAGE_NODES + VIDEO_NODES) | {'182', '183', '184'}))
         self.assertEqual(graph['238']['inputs']['value'], '')
 
     def test_all_asset_slots_keep_reference_order_and_disconnect_independently(self):
         cap = capability()
         assets = {f'images[{i}]': f'chouka/image{i}.png' for i in range(6)}
         assets.update({f'audio[{i}]': f'chouka/audio{i}.wav' for i in range(3)})
-        assets['video[0]'] = 'chouka/video.mp4'
+        assets.update({f'video[{i}]': f'chouka/video{i}.mp4' for i in range(3)})
         graph = app.patch_graph(cap, {}, assets)
         for i, node in enumerate(IMAGE_NODES):
             self.assertEqual(graph[node]['inputs']['image'], assets[f'images[{i}]'])
@@ -84,16 +85,64 @@ class H3FusionWorkflowTest(unittest.TestCase):
         for i, node in enumerate(['182', '183', '184']):
             self.assertEqual(graph[node]['inputs']['audio'], assets[f'audio[{i}]'])
             self.assertEqual(graph['136']['inputs'][f'ref_audios.ref_audio_{i}'], [node, 0])
-        self.assertEqual(graph['185']['inputs']['video'], assets['video[0]'])
-        self.assertEqual(graph['185']['inputs']['force_rate'], 24)
-        self.assertEqual(graph['185']['inputs']['frame_load_cap'], graph['136']['inputs']['length'])
-        self.assertEqual(graph['136']['inputs']['ref_videos.ref_video_0'], ['185', 0])
+        for i, node in enumerate(VIDEO_NODES):
+            self.assertEqual(graph[node]['inputs']['video'], assets[f'video[{i}]'])
+            self.assertEqual(graph[node]['inputs']['force_rate'], 24)
+            self.assertEqual(graph[node]['inputs']['frame_load_cap'], graph['136']['inputs']['length'])
+            self.assertEqual(graph['136']['inputs'][f'ref_videos.ref_video_{i}'], [node, 0])
         self.assertFalse(any(k.startswith('ref_video_audios.') for k in graph['136']['inputs']))
         sparse = app.patch_graph(cap, {}, {'images[0]': 'chouka/first.png', 'images[5]': 'chouka/last.png'})
         self.assertEqual(sparse['136']['inputs']['ref_images.ref_image_0'], ['199', 0])
         self.assertEqual(sparse['136']['inputs']['ref_images.ref_image_5'], ['192', 0])
         for i in range(1, 5):
             self.assertNotIn(f'ref_images.ref_image_{i}', sparse['136']['inputs'])
+
+    def test_every_video_slot_combination_preserves_order_and_remaps_prompt(self):
+        cap = capability()
+        self.assertEqual((cap['slots'], cap['videos']), ('img6+aud3+vid3', 3))
+        for mask in range(8):
+            selected = [i for i in range(3) if mask & (1 << i)]
+            assets = {f'video[{i}]': f'chouka/video{i}.mp4' for i in reversed(selected)}
+            prompt = ' / '.join(f'<Video {i + 1}>' for i in reversed(selected))
+            params = {'prompt': prompt, 'duration': 5, 'seed': 42}
+            with self.subTest(slots=selected):
+                graph = app.patch_graph(cap, params, assets)
+                inputs = graph['136']['inputs']
+                live = scan_workflows.upstream(graph, '148')
+                self.assertEqual([k for k in inputs if k.startswith('ref_videos.')],
+                                 [f'ref_videos.ref_video_{i}' for i in selected])
+                for i, node in enumerate(VIDEO_NODES):
+                    self.assertEqual(node in live, i in selected)
+                    if i in selected:
+                        self.assertEqual(inputs[f'ref_videos.ref_video_{i}'], [node, 0])
+                        self.assertEqual(graph[node]['inputs']['video'], assets[f'video[{i}]'])
+                        self.assertEqual(graph[node]['inputs']['force_rate'], 24)
+                        self.assertEqual(graph[node]['inputs']['frame_load_cap'], 124)
+                    else:
+                        with self.assertRaises(app.web.HTTPBadRequest) as error:
+                            app.patch_graph(cap, {'prompt': f'<Video {i + 1}>'}, assets)
+                        self.assertIn(f'<Video {i + 1}>', error.exception.reason)
+                self.assertEqual(graph['238']['inputs']['value'],
+                                 ' / '.join(f'<Video {i + 1}>' for i in reversed(range(len(selected)))))
+                self.assertEqual(params['prompt'], prompt)
+                self.assertFalse(any(k.startswith('ref_video_audios.') for k in inputs))
+                self.assertEqual(sum(n['class_type'] == 'SamplerCustomAdvanced'
+                                     for n in graph.values()), 1)
+
+    def test_reference_load_counts_all_three_videos(self):
+        from reference_load import make_reference_load
+        assets = {f'video[{i}]': f'chouka/video{i}.mp4' for i in range(3)}
+        graph = app.patch_graph(capability(), {'duration': 5}, assets)
+        probe = mock.Mock(return_value={'width': 640, 'height': 360,
+                                        'frames': 240, 'fps': 24, 'duration': 10})
+        load = make_reference_load(graph, probe)
+        self.assertTrue(load['complete'])
+        group, = load['groups']
+        self.assertEqual(group['video_count'], 3)
+        self.assertEqual([r['input'] for r in group['references']],
+                         [f'ref_videos.ref_video_{i}' for i in range(3)])
+        self.assertEqual(probe.call_count, 3)
+        self.assertGreater(group['video_pixel_frames'], 0)
 
     def test_sparse_slot_references_are_remapped_once_without_changing_user_prompt(self):
         params = {'prompt': '<Picture 6> 看 <Picture 2>，<Audio 3> 配 <Video 1>；<Picture 6>。'}
@@ -314,7 +363,12 @@ class H3FusionRuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFix
                 self.assertEqual(data['capabilities'][CAP_ID]['graph'], f'graphs/{CAP_ID}.api.json')
                 self.assertTrue(app.graph_ok(CAP_ID))
                 card = next(c for c in data['cards'] if c['id'] == 'card_video')
-                self.assertIn(CAP_ID, {m['id'] for m in card['modes']})
+                mode = next(m for m in card['modes'] if m['id'] == CAP_ID)
+                self.assertEqual(mode['slots'], 'img6+aud3+vid3')
+                cap = data['capabilities'][CAP_ID]
+                self.assertEqual(cap['slotLimits']['video'], {'min': 0, 'max': 3})
+                self.assertEqual([s['key'] for s in cap['inputs'] if s['type'] == 'video'],
+                                 ['video[0]', 'video[1]', 'video[2]'])
                 response = await client.post('/api/generate', json={
                     'capability': CAP_ID, 'project': 'p', 'dry_run': True,
                     'assets': {'images[0]': 'chouka/cat.png'},
