@@ -23,7 +23,7 @@
    "max": 0
   }
  },
- "note": "在浏览器中对一张图片调色（曝光、对比度、高光阴影、白平衡、饱和度、曲线），实时预览，导出原尺寸 PNG。GPU 不参与，不走生成工作流。",
+ "note": "在浏览器中对一张图片调色（Resolve 式 Primaries 色轮 + 曲线 + Parade 示波器；含白平衡、曝光对比、Lift/Gamma/Gain/Offset、饱和度等），实时预览，导出原尺寸 PNG。GPU 不参与，不走生成工作流。",
  "inputs": [
   {
    "key": "images[0]",
