@@ -126,6 +126,10 @@ class CloudLightingFixture:
         self.config = self.root / "cloud-ai-config.json"
         self.enterContext(mock.patch.object(cloud_images, "CONF", self.config))
         self.received = []
+        self.chat_received = []
+        self.chat_payload = None
+        self.chat_status = 200
+        self.chat_result_image = None
         self.comfy_requests = []
         self.unexpected_requests = []
         self.gateway_reached = asyncio.Event()
@@ -135,6 +139,7 @@ class CloudLightingFixture:
         self.result_payload = None
         gateway = web.Application()
         gateway.router.add_post("/v1/images/edits", self.gateway)
+        gateway.router.add_post("/v1/chat/completions", self.chat_gateway)
         gateway.router.add_get("/view", self.comfy_image)
         gateway.router.add_route("*", "/{path:.*}", self.unexpected_request)
         self.remote = TestServer(gateway)
@@ -142,7 +147,8 @@ class CloudLightingFixture:
         self.addAsyncCleanup(self.remote.close)
         self.config.write_text(json.dumps({
             "base_url": str(self.remote.make_url("/v1")), "api_key": "fake-lighting-secret",
-            "model": "fake-lighting-model", "size": "1024x1024",
+            "model": "fake-lighting-model", "banana_model": "fake-banana-model",
+            "size": "1024x1024",
         }), encoding="utf-8")
         self.enterContext(mock.patch.object(app, "COMFY_HTTP", str(self.remote.make_url("/")).rstrip("/")))
         self.application = app.make_app(auth_path=self.root / "auth.db")
@@ -222,6 +228,18 @@ class CloudLightingFixture:
         return web.json_response(payload, status=self.gateway_status,
                                  headers={"X-Request-ID": "lighting-request-1"})
 
+    async def chat_gateway(self, request):
+        self.chat_received.append({"authorization": request.headers.get("Authorization"),
+                                   "body": await request.json()})
+        image = self.chat_result_image if self.chat_result_image is not None \
+            else png("blue", self.result_size)
+        encoded = base64.b64encode(image).decode()
+        payload = self.chat_payload if self.chat_payload is not None else {
+            "choices": [{"message": {"content": f"![image](data:image/png;base64,{encoded})"}}],
+            "usage": {"cost": 0.019}}
+        return web.json_response(payload, status=self.chat_status,
+                                 headers={"X-Request-ID": "banana-request-1"})
+
     async def comfy_image(self, request):
         self.comfy_requests.append({"query": dict(request.query),
                                     "authorization": request.headers.get("Authorization")})
@@ -283,9 +301,19 @@ class CloudLightingFixture:
 
     def assert_no_submission(self):
         self.assertEqual(self.received, [])
+        self.assertEqual(self.chat_received, [])
         self.assertEqual(app.JOBS, {})
         self.assertEqual(self.application["cloud_lighting"].tasks, {})
         self.save_jobs.assert_not_called()
+
+    async def banana_job(self, **extra):
+        """Banana 任务立即返回，不需要阻塞网关；提交后直接把任务跑到终态。"""
+        response = await asyncio.wait_for(self.generate(**extra), 5)
+        self.assertEqual(response.status, 200, await response.text())
+        submitted = await response.json()
+        self.assertIn(submitted["status"], ("queued", "running"))
+        done = await self.finish_job(submitted)
+        return submitted, done
 
     async def assert_running_cloud_project_deletion(self):
         submitted = await self.start_job()
@@ -730,8 +758,83 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         response = await self.generate(dry_run=True)
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(await response.json(), {"dry_run": True, "execution": "cloud_image",
-                                                 "changed": {}, "prompt": PROMPT, "size": "1440x1072"})
+                                                 "changed": {}, "prompt": PROMPT,
+                                                 "provider": "gpt_image", "size": "1440x1072"})
         self.assert_no_submission()
+
+    async def test_dry_run_reports_banana_provider_without_size(self):
+        self.config.write_text('{"api_key":""}', encoding="utf-8")
+        response = await self.generate(dry_run=True,
+                                       params={"prompt": PROMPT, "image_provider": "banana"})
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(await response.json(), {"dry_run": True, "execution": "cloud_image",
+                                                 "changed": {}, "prompt": PROMPT,
+                                                 "provider": "banana", "size": None})
+        self.assert_no_submission()
+
+    async def test_unknown_image_provider_is_rejected_before_any_submission(self):
+        response = await self.generate(params={"prompt": PROMPT, "image_provider": "claude"})
+        self.assertEqual(response.status, 400, await response.text())
+        self.assertIn("gpt_image", await response.text())
+        self.assert_no_submission()
+
+    async def test_banana_provider_uses_chat_endpoint_and_records_model(self):
+        submitted, done = await self.banana_job(
+            params={"prompt": PROMPT, "image_provider": "banana"})
+        self.assertEqual(submitted["provider"], "banana")
+        self.assertIsNone(submitted["requested_size"])
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["provider"], "banana")
+        self.assertEqual(done["modelName"], "fake-banana-model")
+        self.assertEqual(done["request_id"], "banana-request-1")
+        self.assertEqual(len(done["outputs"]), 1)
+        # Banana 走 chat 接口，multipart 编辑端点必须一次都没收到请求。
+        self.assertEqual(self.received, [])
+        self.assertEqual(len(self.chat_received), 1)
+        chat = self.chat_received[0]
+        self.assertEqual(chat["authorization"], "Bearer fake-lighting-secret")
+        body = chat["body"]
+        self.assertEqual(body["model"], "fake-banana-model")
+        self.assertEqual(body["modalities"], ["IMAGE"])
+        self.assertFalse(body["stream"])
+        self.assertNotIn("google", body)
+        self.assertNotIn("extra_body", body)
+        message = body["messages"][0]
+        self.assertEqual(message["role"], "user")
+        content = message["content"]
+        self.assertEqual(content[0], {"type": "text", "text": PROMPT})
+        self.assertEqual(len(content), 2)
+        self.assertEqual(content[1]["type"], "image_url")
+        self.assertTrue(content[1]["image_url"]["url"].startswith("data:image/png;base64,"))
+        self.assertEqual(base64.b64decode(content[1]["image_url"]["url"].split(",", 1)[1]),
+                         png("red"))
+
+    async def test_banana_provider_ignores_megapixels_and_accepts_direct_reference(self):
+        reference = self.add_upload("green-reference.png", png("green"))
+        submitted, done = await self.banana_job(params={
+            "prompt": PROMPT, "image_provider": "banana", "megapixels": 16,
+            "reference_mode": "direct", "reference_image": reference["ref"]})
+        self.assertEqual(submitted["megapixels"], 16)
+        self.assertIsNone(submitted["requested_size"])
+        self.assertEqual(done["status"], "done")
+        body = self.chat_received[0]["body"]
+        content = body["messages"][0]["content"]
+        self.assertEqual(content[0]["text"], PROMPT)
+        self.assertEqual(len(content), 3)
+        self.assertEqual(base64.b64decode(content[1]["image_url"]["url"].split(",", 1)[1]),
+                         png("red"))
+        self.assertEqual(base64.b64decode(content[2]["image_url"]["url"].split(",", 1)[1]),
+                         png("green"))
+
+    async def test_banana_provider_is_covered_by_duplicate_card_conflict(self):
+        response = await self.generate(params={"prompt": PROMPT, "image_provider": "banana"})
+        self.assertEqual(response.status, 200, await response.text())
+        duplicate = await self.generate(params={"prompt": PROMPT, "image_provider": "banana"})
+        self.assertEqual(duplicate.status, 409, await response.text())
+        self.assertEqual(len(self.chat_received), 1)
+        tasks = list(self.application["cloud_lighting"].tasks.values())
+        await asyncio.wait_for(asyncio.gather(*tasks), 10)
+
 
     async def test_missing_cloud_credentials_rejects_before_job_creation(self):
         self.config.write_text('{"api_key":""}', encoding="utf-8")

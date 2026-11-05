@@ -3,6 +3,8 @@
   "base_url": "http://30.245.124.125:8000/v1",
   "model": "gpt-image-2.5-sunburst",
   "chat_model": "gpt-4o",
+  "banana_model": "gemini-3-pro-image",
+  "banana_timeout_seconds": 450,
   "api_key": "",
   "size": "original",
   "quality": "medium",

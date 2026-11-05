@@ -9,6 +9,7 @@ import uuid
 import aiohttp
 from aiohttp import web
 
+from . import cloud_banana
 from . import cloud_images
 
 
@@ -101,6 +102,9 @@ class CloudLighting:
         if reference_mode == "direct" and (
                 not isinstance(reference_image, str) or not reference_image.strip()):
             raise web.HTTPBadRequest(text="双图直传缺少参考图，请重新选择参考图后再试")
+        provider = params.get("image_provider", "gpt_image")
+        if provider not in ("gpt_image", "banana"):
+            raise web.HTTPBadRequest(text="出图模型只支持 gpt_image 或 banana")
         project_id, card_id = body["project"], body.get("card")
         if card_id and not body.get("dry_run") and any(job.get("execution") == "cloud_image"
                            and job.get("project") == project_id and job.get("card") == card_id
@@ -116,8 +120,10 @@ class CloudLighting:
         size = lighting_size(info, megapixels)
         if body.get("dry_run"):
             return {"dry_run": True, "execution": "cloud_image", "changed": {},
-                    "prompt": prompt.strip(), "size": size}
-        config = cloud_images.load()
+                    "prompt": prompt.strip(), "provider": provider,
+                    "size": None if provider == "banana" else size}
+        config = (cloud_banana.load() if provider == "banana"
+                  else cloud_images.load())
         await self.require_project(request, project_id, operate=True)
         input_ref = await self.snapshot_input(project_id, ref, data, info)
         reference_ref = (await self.snapshot_input(project_id, reference[1], reference[0],
@@ -131,18 +137,19 @@ class CloudLighting:
         job = {"id": pid, "capability": cap["id"], "name": cap["name"],
                "modelName": config["model"], "execution": "cloud_image", "outputType": "image",
                "status": "queued", "progress": 0.0, "created": time.time(), "seed": None,
-               "megapixels": megapixels, "requested_size": size,
+               "megapixels": megapixels,
+               "requested_size": None if provider == "banana" else size,
                "step": "等待云端打光", "outputs": [], "error": None, "retryable": False,
                "project": project_id, "projectName": body.get("projectName"),
                "card": card_id, "cardName": body.get("cardName"),
-               "referenceMode": reference_mode,
+               "referenceMode": reference_mode, "provider": provider,
                "prompts": [{"key": "prompt", "label": "布光提示词", "text": prompt.strip()}]}
         self.jobs[pid] = job
         self.save_jobs()
         images = [data] if reference is None else [data, reference[0]]
         refs = [ref] if reference is None else [ref, reference[1]]
         task = asyncio.create_task(
-            self.run(job, user_id, images, refs, size, prompt.strip()))
+            self.run(job, user_id, images, refs, size, prompt.strip(), provider))
         self.tasks[pid] = task
         task.add_done_callback(lambda finished: self.tasks.pop(pid, None))
         return dict(job)
@@ -157,13 +164,16 @@ class CloudLighting:
         for ref in refs:
             await self.authorize(user_id, project_id, ref)
 
-    async def run(self, job, user_id, images, refs, size, prompt):
+    async def run(self, job, user_id, images, refs, size, prompt, provider="gpt_image"):
         path = temporary = None
         try:
             await self.authorize_all(user_id, job["project"], refs)
             job.update(status="running", started=time.time(), step="云端多灯打光中")
             self.save_jobs()
-            result = await cloud_images.edit(self.app["session"], images, prompt, size=size)
+            if provider == "banana":
+                result = await cloud_banana.generate(self.app["session"], images, prompt)
+            else:
+                result = await cloud_images.edit(self.app["session"], images, prompt, size=size)
             job.update(request_id=result["request_id"], modelName=result["model"])
             if "image_bytes" not in result:
                 raise cloud_images.ImageEditError(
