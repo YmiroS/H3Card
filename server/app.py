@@ -73,6 +73,7 @@ from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
 from server.texture_api import register_texture_routes
+from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
 from server.cloud_lighting import CloudLighting
 from server.cloud_images import ImageEditError
@@ -4358,6 +4359,10 @@ def make_app(auth_path=None, *, project_repository=None):
         app, root=ROOT, comfy_http=COMFY_HTTP,
         require_project=require_project, require_resource=require_resource,
         resource_call=resource_call)
+    register_color_grade_routes(
+        app, root=ROOT, ffmpeg_bin=ffmpeg_bin,
+        require_project=require_project, require_resource=require_resource,
+        resource_call=resource_call, kind_of=kind_of, vid_ext=VID_EXT)
     app["video_previews"] = VideoPreviews(
         ROOT / "data" / "uploads", ffmpeg_bin, VID_EXT,
     )

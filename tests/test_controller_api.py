@@ -4129,10 +4129,27 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
             {"key": "images[0]", "label": "图片", "type": "image", "required": True}])
         self.assertNotIn("graph", cap)
         card = next(item for item in payload["cards"] if item["id"] == "card_tools")
-        self.assertEqual(card["modes"][-2], {
-            "id": "color_grade", "name": "调色", "slots": "img1+aud0+vid0"})
+        modes = {mode["id"]: mode for mode in card["modes"]}
+        self.assertEqual(modes["color_grade"], {
+            "id": "color_grade", "name": "图片调色", "slots": "img1+aud0+vid0"})
         response = await self.client.post("/api/generate", json={
             "project": "p", "capability": "color_grade", "dry_run": True})
+        self.assertEqual(response.status, 400)
+
+    async def test_cards_expose_video_color_grade_as_browser_video_mode(self):
+        payload = await (await self.client.get("/api/cards")).json()
+        cap = payload["capabilities"]["video_color_grade"]
+        self.assertEqual((cap["execution"], cap["card"], cap["outputType"], cap["slots"]),
+                         ("browser", "card_tools", "video", "img0+aud0+vid1"))
+        self.assertEqual(cap["inputs"], [
+            {"key": "video[0]", "label": "视频", "type": "video", "required": True}])
+        self.assertNotIn("graph", cap)
+        card = next(item for item in payload["cards"] if item["id"] == "card_tools")
+        modes = {mode["id"]: mode for mode in card["modes"]}
+        self.assertEqual(modes["video_color_grade"], {
+            "id": "video_color_grade", "name": "视频调色", "slots": "img0+aud0+vid1"})
+        response = await self.client.post("/api/generate", json={
+            "project": "p", "capability": "video_color_grade", "dry_run": True})
         self.assertEqual(response.status, 400)
 
     async def test_generate_rejects_browser_in_local_and_controller_even_dry_run(self):
