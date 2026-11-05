@@ -174,6 +174,11 @@ class CloudLightingFixture:
         self.user = self.store.create_user("lighting-owner", PASSWORD)["id"]
         self.store.set_ready()
         await self.login("lighting-owner")
+        token = self.client.session.cookie_jar.filter_cookies(self.client.make_url("/"))[app.COOKIE].value
+        self.store.set_phone(self.user, "13800138000", session_token=token)
+        with self.store._tx():
+            self.store.db.execute("UPDATE users SET display_name=? WHERE id=?",
+                                  ("Lighting Display Only", self.user))
         response = await self.client.post("/api/projects", json={"name": "lighting-test"}, headers=self.headers)
         self.assertEqual(response.status, 200, await response.text())
         self.project = (await response.json())["id"]
@@ -219,6 +224,8 @@ class CloudLightingFixture:
             else:
                 fields[part.name] = value.decode()
         self.received.append({"images": files, "fields": fields,
+                              "end_user_name": request.headers.get("X-End-User-Name"),
+                              "end_user_phone": request.headers.get("X-End-User-Phone"),
                               "authorization": request.headers.get("Authorization")})
         release = self.gateway_release
         self.gateway_reached.set()
@@ -230,6 +237,8 @@ class CloudLightingFixture:
 
     async def chat_gateway(self, request):
         self.chat_received.append({"authorization": request.headers.get("Authorization"),
+                                   "end_user_name": request.headers.get("X-End-User-Name"),
+                                   "end_user_phone": request.headers.get("X-End-User-Phone"),
                                    "body": await request.json()})
         image = self.chat_result_image if self.chat_result_image is not None \
             else png("blue", self.result_size)
@@ -480,6 +489,7 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assert_no_submission()
 
     async def test_submit_returns_before_gateway_finishes_and_sends_original_once(self):
+        self.headers.update({"X-End-User-Name": "forged-user", "X-End-User-Phone": "13900139000"})
         submitted = await self.start_job()
         self.assertFalse(self.gateway_release.is_set())
         self.assertEqual(submitted["execution"], "cloud_image")
@@ -493,6 +503,11 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(self.received[0]["fields"]["size"], "1440x1072")
         self.assertEqual(self.received[0]["fields"]["model"], "fake-lighting-model")
         self.assertEqual(self.received[0]["authorization"], "Bearer fake-lighting-secret")
+        self.assertEqual(self.received[0]["end_user_name"], "lighting-owner")
+        self.assertEqual(self.received[0]["end_user_phone"], "13800138000")
+        for job in (submitted, done, app.JOBS[submitted["id"]], self.store.get_job(submitted["id"])):
+            self.assertNotIn("phone", json.dumps(job))
+            self.assertNotIn("13800138000", json.dumps(job))
         self.assertEqual(done["request_id"], "lighting-request-1")
         self.assertNotIn("fake-lighting-secret", json.dumps(done))
         self.assertGreaterEqual(self.save_jobs.call_count, 3)
@@ -779,6 +794,7 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assert_no_submission()
 
     async def test_banana_provider_uses_chat_endpoint_and_records_model(self):
+        self.headers.update({"X-End-User-Name": "forged-user", "X-End-User-Phone": "13900139000"})
         submitted, done = await self.banana_job(
             params={"prompt": PROMPT, "image_provider": "banana"})
         self.assertEqual(submitted["provider"], "banana")
@@ -793,6 +809,11 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(len(self.chat_received), 1)
         chat = self.chat_received[0]
         self.assertEqual(chat["authorization"], "Bearer fake-lighting-secret")
+        self.assertEqual(chat["end_user_name"], "lighting-owner")
+        self.assertEqual(chat["end_user_phone"], "13800138000")
+        for job in (submitted, done, app.JOBS[submitted["id"]], self.store.get_job(submitted["id"])):
+            self.assertNotIn("phone", json.dumps(job))
+            self.assertNotIn("13800138000", json.dumps(job))
         body = chat["body"]
         self.assertEqual(body["model"], "fake-banana-model")
         self.assertEqual(body["modalities"], ["IMAGE"])

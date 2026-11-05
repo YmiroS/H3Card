@@ -52,6 +52,7 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(cloud_images, "CONF", self.config))
         self.received = []
         self.received_fields = []
+        self.received_headers = []
         self.result_size = (4, 3)
         self.result_url = "https://results.example.invalid/generated.png"
         self.gateway_status = 200
@@ -74,6 +75,12 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.addAsyncCleanup(self.client.close)
         identity = await (await self.client.get("/api/auth/me")).json()
         self.user = identity["user"]["id"]
+        store = self.application["auth_store"]
+        store.reset_password(self.user, "Texture-test-password-123")
+        session = store.login(identity["user"]["username"], "Texture-test-password-123")
+        self.auth_user = store.set_phone(self.user, "13800138000", session_token=session["token"])
+        self.auth_user["display_name"] = "Texture Display Only"
+        self.application["local_test_session"]["user"] = self.auth_user
         self.headers = {"Origin": str(self.client.make_url("/")).rstrip("/"), "X-CSRF-Token": identity["csrf_token"]}
         response = await self.client.post("/api/projects", json={"name": "texture-test"}, headers=self.headers)
         self.assertEqual(response.status, 200)
@@ -96,6 +103,8 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
                 fields[part.name] = data.decode()
         self.received.append(files)
         self.received_fields.append(fields)
+        self.received_headers.append((request.headers.get("X-End-User-Name"),
+                                      request.headers.get("X-End-User-Phone")))
         self.gateway_reached.set()
         if self.wait_at_gateway:
             await self.gateway_release.wait()
@@ -141,6 +150,7 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.temporary_generate(data)
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(self.received, [[data]])
+        self.assertEqual(self.received_headers, [(self.auth_user["username"], "13800138000")])
         self.assertEqual(self.received_fields[0]["size"], "2x3")
         self.assertEqual(self.saved_card(), before)
         files = list((self.root / "data" / "uploads").iterdir())
@@ -172,11 +182,14 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list((self.root / "data" / "uploads").glob("texture_*")), [])
 
     async def test_first_round_uses_upstream_and_only_registers_private_preview(self):
+        self.headers.update({"X-End-User-Name": "forged-user", "X-End-User-Phone": "13900139000"})
         before = self.saved_card()
         response = await self.generate()
         self.assertEqual(response.status, 200, await response.text())
         result = await response.json()
         self.assertEqual(self.received, [[png("red")]])
+        self.assertEqual(self.received_headers, [(self.auth_user["username"], "13800138000")])
+        self.assertNotEqual(self.auth_user["username"], self.auth_user["display_name"])
         self.assertEqual(result["source_kind"], "upstream")
         self.assertEqual(result["request_id"], "texture-request-1")
         self.assertEqual(self.received_fields[0]["size"], "4x3")

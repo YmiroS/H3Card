@@ -58,6 +58,8 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
 
     async def gateway(self, request):
         self.received.append({"authorization": request.headers.get("Authorization"),
+                              "end_user_name": request.headers.get("X-End-User-Name"),
+                              "end_user_phone": request.headers.get("X-End-User-Phone"),
                               "body": await request.json()})
         headers = {"X-Request-ID": "banana-request-1"}
         if self.raw_body is not None:
@@ -65,7 +67,8 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         return web.json_response(self.payload, status=self.status, headers=headers)
 
     async def test_single_image_builds_chat_request_and_extracts_first_candidate(self):
-        result = await cloud_banana.generate(self.session, [png()], "  保持构图，调整质感  ")
+        result = await cloud_banana.generate(self.session, [png()], "  保持构图，调整质感  ",
+                                             end_user_name="中文香蕉用户", end_user_phone="13800138000")
         self.assertEqual(result["image_bytes"], png("blue"))
         self.assertEqual((result["width"], result["height"]), (3, 2))
         self.assertEqual(result["request_id"], "banana-request-1")
@@ -73,6 +76,8 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.received), 1)
         sent = self.received[0]
         self.assertEqual(sent["authorization"], "Bearer banana-secret")
+        self.assertEqual(sent["end_user_name"], "中文香蕉用户")
+        self.assertEqual(sent["end_user_phone"], "13800138000")
         body = sent["body"]
         self.assertEqual(body["model"], "gemini-3-pro-image")
         self.assertEqual(body["modalities"], ["IMAGE"])
@@ -89,7 +94,8 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_multiple_images_keep_order_and_detected_mime(self):
         originals = [png("red"), png("blue", size=(4, 3), format="JPEG")]
-        result = await cloud_banana.generate(self.session, originals, "图1主图，图2参考")
+        result = await cloud_banana.generate(self.session, originals, "图1主图，图2参考",
+                                             end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertEqual(result["image_bytes"], png("blue"))
         parts = self.received[0]["body"]["messages"][0]["content"]
         self.assertEqual([part["type"] for part in parts], ["text", "image_url", "image_url"])
@@ -100,7 +106,7 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
     async def test_text_only_response_is_error_without_retry(self):
         self.payload = {"choices": [{"message": {"content": "抱歉，无法生成这张图片。"}}]}
         with self.assertRaises(cloud_banana.BananaError) as caught:
-            await cloud_banana.generate(self.session, [png()], "编辑")
+            await cloud_banana.generate(self.session, [png()], "编辑", end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertIn("没有图片", str(caught.exception))
         self.assertEqual(caught.exception.status, 502)
         self.assertFalse(caught.exception.generation_unknown)
@@ -109,7 +115,7 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
     async def test_non_string_content_is_invalid_response(self):
         self.payload = {"choices": [{"message": {"content": [{"type": "image_url"}]}}]}
         with self.assertRaises(cloud_banana.BananaError) as caught:
-            await cloud_banana.generate(self.session, [png()], "编辑")
+            await cloud_banana.generate(self.session, [png()], "编辑", end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertIn("响应格式无效", str(caught.exception))
 
     async def test_http_error_redacts_key_and_prompt_from_logs_and_message(self):
@@ -118,7 +124,8 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
                                   "param": "model", "code": "invalid_model"}}
         with self.assertLogs(cloud_banana.__name__, level="WARNING") as logs:
             with self.assertRaises(cloud_banana.BananaError) as caught:
-                await cloud_banana.generate(self.session, [png()], "保持构图")
+                await cloud_banana.generate(self.session, [png()], "保持构图",
+                                            end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertIn("HTTP 400", str(caught.exception))
         self.assertEqual(caught.exception.request_id, "banana-request-1")
         joined = " ".join(logs.output)
@@ -131,7 +138,7 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         self.status = 503
         self.raw_body = b"upstream unavailable"
         with self.assertRaises(cloud_banana.BananaError) as caught:
-            await cloud_banana.generate(self.session, [png()], "编辑")
+            await cloud_banana.generate(self.session, [png()], "编辑", end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertIn("HTTP 503", str(caught.exception))
         self.assertFalse(caught.exception.response()["retryable"])
 
@@ -139,7 +146,7 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         self.payload = {"choices": [{"message": {
             "content": "![image](data:image/png;base64,not valid base64!!)"}}]}
         with self.assertRaises(cloud_banana.BananaError) as caught:
-            await cloud_banana.generate(self.session, [png()], "编辑")
+            await cloud_banana.generate(self.session, [png()], "编辑", end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertIn("Base64", str(caught.exception))
 
     async def test_data_uri_with_whitespace_is_compacted_before_matching(self):
@@ -147,19 +154,19 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         spaced = "\n".join(encoded[index:index + 76] for index in range(0, len(encoded), 76))
         self.payload = {"choices": [{"message": {
             "content": f"说明文字\n![image](\ndata:image/png;base64,{spaced}\n)\n完毕"}}]}
-        result = await cloud_banana.generate(self.session, [png()], "编辑")
+        result = await cloud_banana.generate(self.session, [png()], "编辑", end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertEqual(result["image_bytes"], png("blue"))
 
     async def test_oversized_response_is_error(self):
         self.raw_body = b'{"choices":[{"message":{"content":"' + b"x" * (cloud_banana.MAX_RESPONSE_BYTES + 1) + b'"}}]}'
         with self.assertRaises(cloud_banana.BananaError) as caught:
-            await cloud_banana.generate(self.session, [png()], "编辑")
+            await cloud_banana.generate(self.session, [png()], "编辑", end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertIn("超过大小限制", str(caught.exception))
 
     async def test_network_error_marks_generation_unknown(self):
         await self.server.close()
         with self.assertRaises(cloud_banana.BananaError) as caught:
-            await cloud_banana.generate(self.session, [png()], "编辑")
+            await cloud_banana.generate(self.session, [png()], "编辑", end_user_name="banana-test-user", end_user_phone="13800138000")
         self.assertTrue(caught.exception.generation_unknown)
         self.assertEqual(caught.exception.status, 504)
 
@@ -167,7 +174,8 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         for images, prompt in (([], "编辑"), ([png()], ""), ([png()], "x" * 20001)):
             with self.subTest(prompt=prompt[:10], count=len(images)):
                 with self.assertRaises(cloud_banana.BananaError) as caught:
-                    await cloud_banana.generate(self.session, images, prompt)
+                    await cloud_banana.generate(self.session, images, prompt,
+                                                end_user_name="banana-test-user", end_user_phone="13800138000")
                 self.assertEqual(caught.exception.status, 400)
         self.assertEqual(self.received, [])
 

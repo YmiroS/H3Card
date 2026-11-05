@@ -9,6 +9,7 @@ import aiohttp
 from aiohttp import web
 
 from . import cloud_images
+from .auth import require_user
 from .project_repository import InvalidProjectId
 
 
@@ -138,7 +139,9 @@ class TextureApi:
             latest = await self.card(request, project_id, card_id)
             if source_version(latest) != version:
                 raise web.HTTPConflict(text="编辑底图已变化，未提交生成")
+            user = require_user(request)
             result = await cloud_images.edit(self.app["session"], [data], body["prompt"],
+                                             end_user_name=user["username"], end_user_phone=user["phone"],
                                              size=f"{info['width']}x{info['height']}")
             if "image_bytes" in result and (result["width"], result["height"]) != (info["width"], info["height"]):
                 raise cloud_images.ImageEditError(

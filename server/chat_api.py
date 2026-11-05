@@ -9,7 +9,7 @@ from .auth import require_user
 
 
 async def completions(request):
-    require_user(request)
+    user = require_user(request)
     try:
         if request.content_type != "application/json":
             raise cloud_chat.ChatError("请求必须为 JSON 对象", status=400)
@@ -23,7 +23,8 @@ async def completions(request):
         except (ValueError, UnicodeError):
             raise cloud_chat.ChatError("请求必须为有效 JSON 对象", status=400)
         messages = await asyncio.to_thread(cloud_chat.validate, body)
-        result = await cloud_chat.complete(request.app["session"], messages)
+        result = await cloud_chat.complete(request.app["session"], messages,
+                                           end_user_name=user["username"], end_user_phone=user["phone"])
         return web.json_response(result)
     except cloud_chat.ChatError as error:
         return web.json_response(error.response(), status=error.status)

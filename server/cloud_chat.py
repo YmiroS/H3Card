@@ -115,13 +115,15 @@ def validate(body):
     return messages
 
 
-async def complete(session, messages):
+async def complete(session, messages, *, end_user_name, end_user_phone):
     config = load()
     try:
         async with session.post(
                 config["base_url"].rstrip("/") + "/chat/completions",
                 json={"model": config["chat_model"], "messages": messages, "stream": False},
-                headers={"Authorization": f"Bearer {config['api_key']}"},
+                headers={"Authorization": f"Bearer {config['api_key']}",
+                         "X-End-User-Name": end_user_name,
+                         "X-End-User-Phone": end_user_phone},
                 proxy=None, allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=300)) as response:
             if not 200 <= response.status < 300:
