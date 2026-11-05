@@ -1,0 +1,35 @@
+{
+ "id": "video_color_grade",
+ "name": "视频调色",
+ "execution": "browser",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "video",
+ "images": 0,
+ "audios": 0,
+ "videos": 1,
+ "slots": "img0+aud0+vid1",
+ "slotLimits": {
+  "image": {
+   "min": 0,
+   "max": 0
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 1,
+   "max": 1
+  }
+ },
+ "note": "在浏览器中对一段视频调色（与图片调色同一套 Resolve 式 Primaries / Curves / Parade）。预览按当前帧实时套色；导出时把参数烘成 3D LUT，由服务端 FFmpeg lut3d 出片，音轨与帧率保留。不走 ComfyUI。",
+ "inputs": [
+  {
+   "key": "video[0]",
+   "label": "视频",
+   "type": "video",
+   "required": true
+  }
+ ]
+}

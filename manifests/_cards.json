@@ -225,8 +225,13 @@
    },
    {
     "id": "color_grade",
-    "name": "调色",
+    "name": "图片调色",
     "slots": "img1+aud0+vid0"
+   },
+   {
+    "id": "video_color_grade",
+    "name": "视频调色",
+    "slots": "img0+aud0+vid1"
    },
    {
     "id": "image_composite",
