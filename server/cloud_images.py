@@ -130,7 +130,7 @@ def decode_result(payload, request_id, model):
     raise ImageEditError("云端结果缺少 b64_json 或 url", request_id=request_id)
 
 
-async def edit(session, images, prompt, *, size=None):
+async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=None):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise ImageEditError("图片编辑提示词不能为空，且不得超过 20000 字符", status=400)
@@ -152,7 +152,9 @@ async def edit(session, images, prompt, *, size=None):
     try:
         async with session.post(
                 config["base_url"].rstrip("/") + "/images/edits", data=form,
-                headers={"Authorization": f"Bearer {config['api_key']}"},
+                headers={"Authorization": f"Bearer {config['api_key']}",
+                         "X-End-User-Name": end_user_name,
+                         "X-End-User-Phone": end_user_phone},
                 allow_redirects=False, proxy=None,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=450)) as response:
             request_id = response.headers.get("X-Request-ID", "")[:200] or None

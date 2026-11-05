@@ -86,7 +86,7 @@ def extract_image(text, request_id):
     return {**info, "image_bytes": data}
 
 
-async def generate(session, images, prompt):
+async def generate(session, images, prompt, *, end_user_name, end_user_phone):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise BananaError("图片编辑提示词不能为空，且不得超过 20000 字符", status=400)
@@ -101,7 +101,9 @@ async def generate(session, images, prompt):
     try:
         async with session.post(
                 config["base_url"].rstrip("/") + "/chat/completions", json=body,
-                headers={"Authorization": f"Bearer {config['api_key']}"},
+                headers={"Authorization": f"Bearer {config['api_key']}",
+                         "X-End-User-Name": end_user_name,
+                         "X-End-User-Phone": end_user_phone},
                 allow_redirects=False, proxy=None,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10,
                                               sock_read=config["banana_timeout_seconds"])) as response:

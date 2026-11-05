@@ -128,7 +128,9 @@ class CloudLighting:
         input_ref = await self.snapshot_input(project_id, ref, data, info)
         reference_ref = (await self.snapshot_input(project_id, reference[1], reference[0],
                                                    reference[2])) if reference else None
-        pid, user_id = str(uuid.uuid4()), self.require_user(request)["id"]
+        user = self.require_user(request)
+        end_user_name, end_user_phone = user["username"], user["phone"]
+        pid, user_id = str(uuid.uuid4()), user["id"]
         await self.call_store(self.app, "register_job", pid, project_id, user_id)
         inputs = {"images[0]": input_ref}
         if reference_ref:
@@ -149,7 +151,8 @@ class CloudLighting:
         images = [data] if reference is None else [data, reference[0]]
         refs = [ref] if reference is None else [ref, reference[1]]
         task = asyncio.create_task(
-            self.run(job, user_id, images, refs, size, prompt.strip(), provider))
+            self.run(job, user_id, images, refs, size, prompt.strip(), provider,
+                     end_user_name=end_user_name, end_user_phone=end_user_phone))
         self.tasks[pid] = task
         task.add_done_callback(lambda finished: self.tasks.pop(pid, None))
         return dict(job)
@@ -164,16 +167,19 @@ class CloudLighting:
         for ref in refs:
             await self.authorize(user_id, project_id, ref)
 
-    async def run(self, job, user_id, images, refs, size, prompt, provider="gpt_image"):
+    async def run(self, job, user_id, images, refs, size, prompt, provider="gpt_image", *,
+                  end_user_name, end_user_phone):
         path = temporary = None
         try:
             await self.authorize_all(user_id, job["project"], refs)
             job.update(status="running", started=time.time(), step="云端多灯打光中")
             self.save_jobs()
             if provider == "banana":
-                result = await cloud_banana.generate(self.app["session"], images, prompt)
+                result = await cloud_banana.generate(self.app["session"], images, prompt,
+                                                     end_user_name=end_user_name, end_user_phone=end_user_phone)
             else:
-                result = await cloud_images.edit(self.app["session"], images, prompt, size=size)
+                result = await cloud_images.edit(self.app["session"], images, prompt, size=size,
+                                                 end_user_name=end_user_name, end_user_phone=end_user_phone)
             job.update(request_id=result["request_id"], modelName=result["model"])
             if "image_bytes" not in result:
                 raise cloud_images.ImageEditError(

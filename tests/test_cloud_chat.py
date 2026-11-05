@@ -25,10 +25,15 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(cloud_images, 'CONF', self.config))
         self.enterContext(mock.patch.dict(os.environ, {'CHOUKA_IMAGE_API_KEY': ''}))
         self.calls = []
+        self.end_user_headers = []
+        self.user = {'enabled': True, 'username': 'chat-test-user',
+                     'display_name': 'Chat Display Only', 'phone': '13800138000'}
         self.status = 200
         self.payload = {'choices': [{'message': {'content': 'hello'}}], 'usage': {'total_tokens': 10}, 'cost': 99}
         async def gateway(request):
             self.calls.append((await request.json(), request.headers.get('Authorization')))
+            self.end_user_headers.append((request.headers.get('X-End-User-Name'),
+                                          request.headers.get('X-End-User-Phone')))
             return web.json_response(self.payload, status=self.status, headers={'X-Request-ID': 'req-1'})
         upstream = web.Application()
         upstream.router.add_post('/v1/chat/completions', gateway)
@@ -42,7 +47,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         @web.middleware
         async def auth(request, handler):
             if self.authenticated:
-                request['user'] = {'enabled': True}
+                request['user'] = self.user
             return await handler(request)
         app = web.Application(middlewares=[auth])
         app['session'] = self.session
@@ -51,8 +56,8 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server()
         self.addAsyncCleanup(self.client.close)
 
-    async def post(self, body):
-        return await self.client.post('/api/chat/completions', json=body)
+    async def post(self, body, **kwargs):
+        return await self.client.post('/api/chat/completions', json=body, **kwargs)
 
     async def test_text_and_history_whitelist(self):
         messages = [{'role': 'system', 'content': 'be helpful'}, {'role': 'user', 'content': 'hi'},
@@ -61,6 +66,23 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(await response.json(), {'content': 'hello', 'model': 'gpt-4o', 'request_id': 'req-1'})
         self.assertEqual(self.calls, [({'messages': messages, 'model': 'gpt-4o', 'stream': False}, 'Bearer fake-secret')])
+        self.assertEqual(self.end_user_headers, [('chat-test-user', '13800138000')])
+
+    async def test_identity_is_per_authenticated_user_not_client_headers_or_display_name(self):
+        body = {'messages': [{'role': 'user', 'content': 'hi'}]}
+        forged = {'X-End-User-Name': 'forged-user', 'X-End-User-Phone': '13900139000'}
+        for username, phone in (('chat-test-user', '13800138000'), ('中文测试用户', '13700137000')):
+            with self.subTest(username=username):
+                self.user = {**self.user, 'username': username, 'phone': phone}
+                response = await self.post(body, headers=forged)
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertEqual(self.end_user_headers[-1], (username, phone))
+
+    async def test_legacy_user_empty_phone_is_sent_as_empty_header(self):
+        self.user['phone'] = ''
+        response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}]})
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.end_user_headers, [('chat-test-user', '')])
 
     async def test_image(self):
         output = BytesIO()
@@ -143,7 +165,8 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         session = mock.Mock()
         session.post.side_effect = asyncio.TimeoutError()
         with self.assertRaises(cloud_chat.ChatError) as caught:
-            await cloud_chat.complete(session, [{'role': 'user', 'content': 'secret'}])
+            await cloud_chat.complete(session, [{'role': 'user', 'content': 'secret'}],
+                                      end_user_name='chat-test-user', end_user_phone='13800138000')
         self.assertTrue(caught.exception.answer_unknown)
         self.assertEqual(caught.exception.status, 504)
         self.assertEqual(session.post.call_count, 1)
