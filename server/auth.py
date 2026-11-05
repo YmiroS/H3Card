@@ -535,6 +535,16 @@ async def assign_projects(request):
     return web.json_response({'ok': True, 'count': count})
 
 
+async def dispatch_priority_settings(request):
+    require_admin(request)
+    if request.method == 'GET':
+        result = await admin_call(request, 'dispatch_priority_settings')
+    else:
+        body = await _body(request, ('enabled',))
+        result = await admin_call(request, 'set_dispatch_priority', body['enabled'])
+    return web.json_response(result)
+
+
 def register_auth_routes(app, web_root, *, frontend=None):
     redirect_origin = os.environ.get('CHOUKA_HTTPS_REDIRECT_ORIGIN', '')
     if not redirect_origin and os.environ.get('CHOUKA_TLS_CERT') and os.environ.get('CHOUKA_TLS_KEY'):
@@ -594,6 +604,8 @@ def register_auth_routes(app, web_root, *, frontend=None):
     app.router.add_post('/api/teams/{tid}/members', team_members)
     app.router.add_post('/api/teams/{tid}/members/batch', team_members_batch)
     app.router.add_delete('/api/teams/{tid}/members/{uid}', delete_team_member)
+    app.router.add_get('/api/admin/dispatch-priority', dispatch_priority_settings)
+    app.router.add_put('/api/admin/dispatch-priority', dispatch_priority_settings)
     app.router.add_get('/api/admin/registrations', registrations)
     app.router.add_post('/api/admin/projects/assign', assign_projects)
     app.router.add_get('/api/admin/users', users)

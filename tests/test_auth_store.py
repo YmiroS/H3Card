@@ -66,6 +66,67 @@ class StoreTests(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
+    def test_dispatch_priority_persistence_and_live_membership(self):
+        self.assertEqual(self.store.dispatch_priority_settings(), {'enabled': False})
+        team = self.store.create_team('管理员组', self.admin)
+        self.store.add_team_members(team['id'], [self.owner], self.admin)
+        normal = self.store.create_user('leader', PASSWORD, team_leader=True)['id']
+        ordinary = self.store.create_team('普通组', normal)
+        self.store.add_team_members(ordinary['id'], [self.viewer], normal)
+        for job, user in [('priority', self.owner), ('normal', self.viewer)]:
+            self.store.create_project(job, user)
+            self.store.register_job(job, job, user)
+        ids = ['priority', 'normal', 'forged']
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+        self.store.set_dispatch_priority(True)
+        self.assertEqual(self.store.priority_job_ids(ids), {'priority'})
+        other = AuthStore(self.path)
+        try:
+            self.assertEqual(other.dispatch_priority_settings(), {'enabled': True})
+        finally:
+            other.close()
+        self.store.remove_team_member(team['id'], self.owner, self.admin)
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+        self.store.add_team_members(team['id'], [self.owner], self.admin)
+        self.store.create_user('second-admin', PASSWORD, 'admin')
+        self.store.set_user(self.admin, role='user')
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+        self.store.set_user(self.admin, role='admin')
+        self.assertEqual(self.store.priority_job_ids(ids), {'priority'})
+        self.store.set_dispatch_priority(False)
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+        for invalid in ('true', 1, None):
+            with self.assertRaises(AuthError):
+                self.store.set_dispatch_priority(invalid)
+
+    def test_dispatch_priority_real_store_integration(self):
+        from server.distributed import DistributedStore
+        dispatch = DistributedStore(Path(self.tmp.name) / 'control.sqlite',
+                                    priority_resolver=self.store.priority_job_ids)
+        try:
+            team = self.store.create_team('优先组', self.admin)
+            self.store.add_team_members(team['id'], [self.owner], self.admin)
+            worker = dispatch.register_worker('test-worker', {'node_classes': []})['worker_id']
+            dispatch.heartbeat(worker, comfy_online=True)
+            for job, user in [('old', self.viewer), ('priority', self.owner)]:
+                self.store.create_project(job, user)
+                self.store.register_job(job, job, user)
+                dispatch.enqueue(job, {'role': 'admin', 'priority': True})
+            self.assertEqual(dispatch.queue_ahead_snapshot(), {'old': 0, 'priority': 1})
+            self.store.set_dispatch_priority(True)
+            self.assertEqual(dispatch.queue_ahead_snapshot(), {'priority': 0, 'old': 1})
+            self.store.set_dispatch_priority(False)
+            self.assertEqual(dispatch.queue_ahead_snapshot(), {'old': 0, 'priority': 1})
+            self.store.set_dispatch_priority(True)
+            claim = dispatch.acquire(worker)
+            self.assertEqual(claim['job_id'], 'priority')
+            self.store.remove_team_member(team['id'], self.owner, self.admin)
+            self.assertIsNone(dispatch.acquire(worker))  # Never preempt the live lease.
+            dispatch.finish(claim['job_id'], worker, claim['lease_token'], 'done')
+            self.assertEqual(dispatch.acquire(worker)['job_id'], 'old')
+        finally:
+            dispatch.close()
+
     def test_password_policy_applies_to_all_writes_without_side_effects(self):
         session = self.store.login('owner', PASSWORD)
         for value in ('riverpa', '12345678', 'Password', '111111111111'):
@@ -1167,6 +1228,28 @@ class HTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertIn('HttpOnly', response.headers['Set-Cookie'])
         return await response.json()
+
+    async def test_dispatch_priority_api_permissions_and_validation(self):
+        path = '/api/admin/dispatch-priority'
+        self.assertEqual((await self.client.get(path)).status, 401)
+        session = await self.login('user')
+        headers = {'Origin': self.origin, 'X-CSRF-Token': session['csrf_token']}
+        self.assertEqual((await self.client.get(path)).status, 403)
+        self.assertEqual((await self.client.put(path, json={'enabled': True}, headers=headers)).status, 403)
+        session = await self.login()
+        headers['X-CSRF-Token'] = session['csrf_token']
+        self.assertEqual(await (await self.client.get(path)).json(), {'enabled': False})
+        self.assertEqual((await self.client.put(path, json={'enabled': True})).status, 403)
+        for body in ({'enabled': 'true'}, {'enabled': 1}, {}, {'enabled': True, 'role': 'admin'}):
+            self.assertEqual((await self.client.put(path, json=body, headers=headers)).status, 400)
+        for enabled in (True, False):
+            response = await self.client.put(path, json={'enabled': enabled}, headers=headers)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {'enabled': enabled})
+            self.assertEqual(await (await self.client.get(path)).json(), {'enabled': enabled})
+        self.store.create_user('monitor', PASSWORD, 'monitor')
+        await self.login('monitor')
+        self.assertEqual((await self.client.get(path)).status, 403)
 
     async def test_failclosed_and_ready(self):
         response = await self.client.get('/api/unknown')

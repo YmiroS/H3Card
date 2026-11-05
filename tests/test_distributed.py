@@ -152,6 +152,72 @@ class ModelDispatchTest(unittest.TestCase):
             "graph": self.graph, "capability": "minimax_h3_fusion_v2", **payload,
         }, self.caps["node_classes"])
 
+    def test_priority_compatible_fifo_beats_affinity_without_preemption(self):
+        priority = {'priority-old', 'priority-cache', 'incompatible'}
+        self.store.priority_resolver = lambda ids: priority.intersection(ids)
+        self.store.enqueue('normal', {'capability': 'cached', 'role': 'admin'})
+        self.store.enqueue('incompatible', {}, ['missing-node'])
+        self.store.enqueue('priority-old', {'capability': 'other'})
+        self.store.enqueue('priority-cache', {'capability': 'cached'})
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE workers SET last_capability_id=?, last_model_family=? WHERE id=?',
+                                  ('cached', 'cached', self.worker_id))
+        self.assertEqual(self.store.queue_ahead_snapshot(), {
+            'incompatible': 0, 'priority-old': 1, 'priority-cache': 2, 'normal': 3})
+        claim = self.store.acquire(self.worker_id)
+        self.assertEqual(claim['job_id'], 'priority-old')
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.store.finish(claim['job_id'], self.worker_id, claim['lease_token'], 'done')
+        claim = self.store.acquire(self.worker_id)
+        self.assertEqual(claim['job_id'], 'priority-cache')
+        self.store.finish(claim['job_id'], self.worker_id, claim['lease_token'], 'done')
+        self.assertEqual(self.store.acquire(self.worker_id)['job_id'], 'normal')
+
+    def test_priority_toggle_restores_existing_affinity_for_queued_jobs(self):
+        enabled = False
+        self.store.priority_resolver = lambda ids: {'priority'} & set(ids) if enabled else set()
+        self.store.enqueue('old', {'capability': 'other'})
+        self.store.enqueue('cached', {'capability': 'cached'})
+        self.store.enqueue('priority', {'capability': 'other'})
+        with self.store.lock, self.store.db:
+            self.store.db.execute('UPDATE workers SET last_capability_id=? WHERE id=?',
+                                  ('cached', self.worker_id))
+        self.assertEqual(self.store.queue_ahead_snapshot(), {'old': 0, 'cached': 1, 'priority': 2})
+        enabled = True
+        self.assertEqual(self.store.queue_ahead_snapshot()['priority'], 0)
+        enabled = False
+        claim = self.store.acquire(self.worker_id)
+        self.assertEqual(claim['job_id'], 'cached')
+        self.store.finish(claim['job_id'], self.worker_id, claim['lease_token'], 'done')
+        enabled = True
+        self.assertEqual(self.store.acquire(self.worker_id)['job_id'], 'priority')
+
+    def test_priority_queue_change_during_resolution_retries_safely(self):
+        self.store.enqueue('normal', {})
+        changed = False
+        def resolve(ids):
+            nonlocal changed
+            if not changed:
+                changed = True
+                self.store.enqueue('priority', {})
+            return {'priority'}.intersection(ids)
+        self.store.priority_resolver = resolve
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.assertEqual(self.store.acquire(self.worker_id)['job_id'], 'priority')
+
+    def test_priority_resolver_is_called_without_dispatch_lock(self):
+        def resolve(ids):
+            completed = []
+            import threading
+            thread = threading.Thread(target=lambda: completed.append(self.store.list_workers()))
+            thread.start()
+            thread.join(timeout=2)
+            self.assertFalse(thread.is_alive(), 'resolver held dispatch lock')
+            return set()
+        self.store.priority_resolver = resolve
+        self.store.enqueue('job', {})
+        self.assertEqual(self.store.acquire(self.worker_id)['job_id'], 'job')
+
     def test_target_binding_skips_other_workers_and_survives_expired_lease(self):
         other = self.store.register_worker("other", self.caps)["worker_id"]
         self.store.heartbeat(other, comfy_online=True)

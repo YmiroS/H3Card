@@ -382,12 +382,13 @@ def _json(value):
 
 class DistributedStore:
     def __init__(self, path, lease_seconds=45, offline_seconds=30,
-                 affinity_max_wait_seconds=60):
+                 affinity_max_wait_seconds=60, priority_resolver=None):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lease_seconds = lease_seconds
         self.offline_seconds = offline_seconds
         self.affinity_max_wait_seconds = affinity_max_wait_seconds
+        self.priority_resolver = priority_resolver
         self.lock = threading.RLock()
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
@@ -1029,11 +1030,13 @@ class DistributedStore:
             }
 
     def queue_ahead_snapshot(self):
-        """Submission-order counts, not worker-specific execution positions."""
+        """Priority/FIFO counts, not worker-specific execution positions or affinity."""
         with self.lock:
             rows = self.db.execute(
                 "SELECT job_id FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
             ).fetchall()
+        priority = self.priority_resolver([row['job_id'] for row in rows]) if self.priority_resolver else set()
+        rows = sorted(rows, key=lambda row: row['job_id'] not in priority)
         return {row["job_id"]: index for index, row in enumerate(rows)}
 
     def job_worker_names(self, job_ids):
@@ -1150,6 +1153,16 @@ class DistributedStore:
             self.capacity.enqueue(job_id, payload, now)
 
     def acquire(self, worker_id):
+        # Never hold the dispatch lock while entering AuthStore. New submissions
+        # after this snapshot are considered on the next poll; statuses are rechecked.
+        candidate_ids = None
+        priority = set()
+        if self.priority_resolver:
+            with self.lock, self.db:
+                self._requeue_expired_locked(time.time())
+                candidate_ids = {row[0] for row in self.db.execute(
+                    "SELECT job_id FROM dispatch_jobs WHERE status = 'queued'")}
+            priority = self.priority_resolver(candidate_ids)
         now = time.time()
         with self.lock, self.db:
             self._requeue_expired_locked(now)
@@ -1166,6 +1179,10 @@ class DistributedStore:
                 "SELECT * FROM dispatch_jobs WHERE status = 'queued' ORDER BY created_at, job_id"
             ).fetchall()
             if not rows:
+                return None
+            if candidate_ids is not None and {row['job_id'] for row in rows} != candidate_ids:
+                # Queue changed while resolving auth: retry on the next worker poll
+                # rather than assign a newly queued job at an unverified priority.
                 return None
             capabilities = json.loads(worker["capabilities_json"] or "{}")
             host_id = _worker_host_id(capabilities)
@@ -1233,10 +1250,14 @@ class DistributedStore:
             if not eligible:
                 return None
 
+            preferred = [item for item in eligible if item[0]['job_id'] in priority]
+            if preferred:
+                eligible = preferred
             selected, selected_payload = eligible[0]
             oldest_wait = now - selected["created_at"]
             can_prefer_cache = (
-                self.affinity_max_wait_seconds > 0
+                not preferred
+                and self.affinity_max_wait_seconds > 0
                 and oldest_wait < self.affinity_max_wait_seconds
             )
             matched_exact = False

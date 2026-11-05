@@ -4192,6 +4192,8 @@ async def api_health(request):
 async def on_start(app):
     app["lifecycle"]["shutting_down"] = False
     app["auth_store"] = await asyncio.to_thread(AuthStore, app["auth_path"])
+    if app.get('distributed') is not None:
+        app['distributed'].priority_resolver = app['auth_store'].priority_job_ids
     app["resource_access"] = await asyncio.to_thread(
         ResourceAccess, app["auth_store"], ROOT, COMFY_INPUT)
     trace_configs = []

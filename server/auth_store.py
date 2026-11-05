@@ -956,6 +956,44 @@ class AuthStore:
             row = self.db.execute('SELECT * FROM job_acl WHERE job_id=?', (job_id,)).fetchone()
             return dict(row) if row else None
 
+    def dispatch_priority_settings(self, *, actor_id=None, session_token=None):
+        with self.lock:
+            if actor_id is not None:
+                self._check_actor(actor_id, session_token)
+            row = self.db.execute(
+                "SELECT value FROM auth_meta WHERE key='admin_team_priority'").fetchone()
+            return {'enabled': bool(row and row[0] == '1')}
+
+    def set_dispatch_priority(self, enabled, *, actor_id=None, session_token=None):
+        if not isinstance(enabled, bool):
+            raise AuthError('enabled 必须为布尔值')
+        with self._tx():
+            self._check_actor(actor_id, session_token)
+            self.db.execute(
+                "INSERT INTO auth_meta(key,value) VALUES('admin_team_priority',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ('1' if enabled else '0',))
+            return {'enabled': enabled}
+
+    def priority_job_ids(self, job_ids):
+        """Resolve trusted submitters live; never consult dispatch payload fields."""
+        job_ids = list(job_ids)
+        with self.lock:
+            if not self.dispatch_priority_settings()['enabled']:
+                return set()
+            result = set()
+            for offset in range(0, len(job_ids), 500):
+                batch = job_ids[offset:offset + 500]
+                rows = self.db.execute(
+                    'SELECT DISTINCT j.job_id FROM job_acl j '
+                    'JOIN team_members m ON m.user_id=j.user_id '
+                    'JOIN teams t ON t.id=m.team_id '
+                    'JOIN users leader ON leader.id=t.leader_id '
+                    "WHERE t.state='active' AND leader.role='admin' AND j.job_id IN ("
+                    + ','.join('?' for _ in batch) + ')', batch)
+                result.update(row[0] for row in rows)
+            return result
+
     def job_submitters(self, job_ids):
         if not job_ids:
             return {}
