@@ -181,7 +181,8 @@ class DinghaiHttpTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server()
         self.origin = str(self.client.make_url('/')).rstrip('/')
         self.headers = {'Origin': self.origin}
-        self.auth = AsyncMock(return_value={'subject': '42', 'display_name': '定海用户'})
+        self.auth = AsyncMock(return_value={'subject': '42', 'display_name': '定海用户',
+                                           'token': 'fixture-upstream-token'})
         self.patcher = patch('server.dinghai_auth.authenticate', self.auth)
         self.patcher.start()
 
@@ -319,7 +320,8 @@ class DinghaiUpstreamTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_existing_protocol_current_identity_and_no_phone_dependency(self):
         identity = await authenticate(self.origin, 'dinghai', 'password')
-        self.assertEqual(identity, {'subject': '9223372036854775806', 'display_name': '定海姓名'})
+        self.assertEqual(identity, {'subject': '9223372036854775806', 'display_name': '定海姓名',
+                                    'token': 'fixture-token'})
         self.assertEqual(self.calls[0][1], {'account': 'dinghai', 'password': '5f4dcc3b5aa765d61d8327deb882cf99', 'device': 'WEB'})
         self.assertNotIn('satoken', self.calls[0][2])
         self.assertEqual(self.calls[1][2]['satoken'], 'fixture-token')

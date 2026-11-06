@@ -279,6 +279,9 @@ async def _browser_request(request, handler):
     path = request.path
     token = request.cookies.get(COOKIE, '')
     session = await call_store(request.app, 'get_session', token) if token else None
+    if token and session is None:
+        from .dinghai_sessions import clear_request_credentials
+        clear_request_credentials(request)
     # 必须在公开资源、登录/注册的提前返回之前执行，监控角色默认无业务访问权。
     if session is not None and session['user']['role'] == 'monitor' and not _monitor_allowed(request):
         raise web.HTTPForbidden(text='监控展示员仅可访问只读监控页面')
@@ -363,7 +366,10 @@ async def login(request):
         await call_store(request.app, 'logout', previous)
         if previous_user:
             await notify_access_changed(request, user_ids=[previous_user['id']])
+    from .dinghai_sessions import clear_request_credentials
+    clear_request_credentials(request)
     token = result.pop('token')
+    result['dinghai_authenticated'] = False
     response = web.json_response(result)
     response.set_cookie(COOKIE, token, httponly=True, secure=_secure_cookie(request), samesite='Lax', path='/')
     from .dinghai_auth import PENDING_COOKIE, PENDING_PATH
@@ -389,7 +395,9 @@ async def registrations(request):
 
 async def me(request):
     require_user(request)
-    return web.json_response(request['auth_session'])
+    from .dinghai_sessions import current_context
+    return web.json_response(dict(request['auth_session'],
+                                  dinghai_authenticated=current_context(request) is not None))
 
 
 async def phone(request):
@@ -415,6 +423,10 @@ async def online_presence(request):
 async def logout(request):
     user = require_user(request)
     await call_store(request.app, 'logout', request.cookies.get(COOKIE, ''))
+    from .dinghai_sessions import clear_request_credentials
+    from .dinghai_auth import PENDING_COOKIE
+    clear_request_credentials(request)
+    await call_store(request.app, 'dinghai_discard_pending', request.cookies.get(PENDING_COOKIE, ''))
     await notify_access_changed(request, user_ids=[user['id']])
     response = web.json_response({'ok': True})
     response.del_cookie(COOKIE, path='/')

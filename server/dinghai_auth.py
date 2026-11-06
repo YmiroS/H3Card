@@ -3,6 +3,7 @@ import asyncio
 import hashlib
 import json
 import os
+import time
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -11,6 +12,8 @@ from aiohttp import web
 from .auth import (COOKIE, _body, _rate_limit, _secure_cookie, call_store,
                    notify_access_changed)
 from .auth_store import AuthError
+from .dinghai_sessions import (DinghaiContext, PENDING_TTL, SESSION_TTL,
+                               register_credentials)
 
 PENDING_COOKIE = 'chouka_dinghai_binding'
 PENDING_PATH = '/api/auth'
@@ -91,7 +94,7 @@ async def authenticate(origin, account, password):
                  if isinstance(value, str) and value.strip()), '定海用户')
     if any(ord(char) < 32 for char in name):
         raise AuthError('定海用户信息格式不正确', 502)
-    return {'subject': str(int(uid)), 'display_name': name[:64]}
+    return {'subject': str(int(uid)), 'display_name': name[:64], 'token': token}
 
 
 async def login_config(request):
@@ -105,8 +108,10 @@ def _require_enabled(request):
     return origin
 
 
-async def _replace_session(request, result):
+async def _replace_session(request, result, context=None, *, started=None):
+    vault = request.app['dinghai_credentials']
     previous = request.cookies.get(COOKIE)
+    vault.discard('sessions', previous)
     if previous:
         old = await call_store(request.app, 'get_session', previous)
         await call_store(request.app, 'logout', previous)
@@ -115,6 +120,15 @@ async def _replace_session(request, result):
     data = dict(result)
     token = data.pop('token', None)
     pending = data.pop('binding_token', None)
+    data['dinghai_authenticated'] = False
+    if context is not None:
+        started = started if started is not None else time.monotonic()
+        if token and data['user']['role'] != 'monitor':
+            ttl = min(SESSION_TTL, request.app['auth_store'].session_ttl)
+            data['dinghai_authenticated'] = vault.put(
+                'sessions', token, context, started + ttl, data['user']['id'])
+        elif pending:
+            vault.put('pending', pending, context, started + PENDING_TTL)
     response = web.json_response(data)
     if token:
         response.set_cookie(COOKIE, token, httponly=True, secure=_secure_cookie(request),
@@ -135,11 +149,16 @@ async def login(request):
     if not account or len(account) > 128 or not password or len(password) > 1024:
         raise web.HTTPBadRequest(text='请输入有效的定海账号和密码')
     _rate_limit(request, 'dinghai:' + account)
-    await call_store(request.app, 'dinghai_discard_pending', request.cookies.get(PENDING_COOKIE, ''))
+    pending = request.cookies.get(PENDING_COOKIE, '')
+    request.app['dinghai_credentials'].discard('pending', pending)
+    await call_store(request.app, 'dinghai_discard_pending', pending)
     async with request.app['_dinghai_login_slots']:
-        identity = await authenticate(origin, account, password)
+        identity = dict(await authenticate(origin, account, password))
+    upstream_token = identity.pop('token', None)
+    context = DinghaiContext(origin, identity['subject'], upstream_token) if upstream_token else None
+    started = time.monotonic()
     result = await call_store(request.app, 'dinghai_login', origin, **identity)
-    return await _replace_session(request, result)
+    return await _replace_session(request, result, context, started=started)
 
 
 async def bind(request):
@@ -147,9 +166,18 @@ async def bind(request):
     body = await _body(request, ('username', 'password'))
     _rate_limit(request, body['username'])
     pending = request.cookies.get(PENDING_COOKIE, '')
+    vault = request.app['dinghai_credentials']
+    entry = vault.get('pending', pending)
+    started = time.monotonic()
     result = await call_store(request.app, 'dinghai_bind', pending,
                               request.headers.get('X-Binding-CSRF', ''), origin, **body)
-    return await _replace_session(request, result)
+    # Consume only after the store validates password + binding CSRF. A concurrent
+    # cancel/expiry/eviction must not resurrect a credential captured before await.
+    live = vault.get('pending', pending)
+    vault.discard('pending', pending)
+    context = entry.context if (entry is not None and live is entry
+                                and entry.context.issuer == origin) else None
+    return await _replace_session(request, result, context, started=started)
 
 
 async def cancel(request):
@@ -163,6 +191,7 @@ async def cancel(request):
         # 过期或已经消费的待绑定状态可以安全取消，但不接受错误的 CSRF。
         if exc.status != 410:
             raise
+    request.app['dinghai_credentials'].discard('pending', request.cookies.get(PENDING_COOKIE, ''))
     response = web.json_response({'ok': True})
     response.del_cookie(PENDING_COOKIE, path=PENDING_PATH)
     return response
@@ -172,6 +201,11 @@ def register_dinghai_auth_routes(app):
     value = '' if app.get('local_test') or app.get('admin_sandbox') else os.environ.get('CHOUKA_DINGHAI_API_BASE', '').strip()
     app['dinghai_auth_origin'] = validate_origin(value)
     app['_dinghai_login_slots'] = asyncio.Semaphore(4)
+    register_credentials(app)
+    from .dinghai_api import register_dinghai_api_routes
+    from .dinghai_media import register_dinghai_media_routes
+    register_dinghai_api_routes(app)
+    register_dinghai_media_routes(app)
     app.router.add_get(LOGIN_CONFIG_PATH, login_config)
     app.router.add_post('/api/auth/dinghai/login', login)
     app.router.add_post('/api/auth/dinghai/bind', bind)
