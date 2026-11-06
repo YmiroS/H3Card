@@ -99,13 +99,39 @@ class StoreTests(unittest.TestCase):
             with self.assertRaises(AuthError):
                 self.store.set_dispatch_priority(invalid)
 
+    def test_dispatch_priority_recognizes_additional_admin_team_leaders(self):
+        leader = self.store.create_user('original-leader', PASSWORD, team_leader=True)['id']
+        team = self.store.create_team('多组长项目组', leader)
+        self.store.add_team_members(team['id'], [self.owner, self.admin], leader)
+        for job, user in [('member-job', self.owner), ('outsider-job', self.viewer)]:
+            self.store.create_project(job, user)
+            self.store.register_job(job, job, user)
+        ids = ['member-job', 'outsider-job']
+        self.store.set_dispatch_priority(True)
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+        self.store.set_team_leader(team['id'], self.admin, leader)
+        self.assertEqual(self.store.list_teams(self.admin)[0]['leader_id'], leader)
+        self.assertEqual(self.store.priority_job_ids(ids), {'member-job'})
+        self.store.create_user('backup-admin', PASSWORD, 'admin')
+        self.store.set_user(self.admin, role='user')
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+        self.store.set_user(self.admin, role='admin')
+        self.assertEqual(self.store.priority_job_ids(ids), {'member-job'})
+        self.store.remove_team_member(team['id'], self.owner, leader)
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+        self.store.add_team_members(team['id'], [self.owner], leader)
+        self.assertEqual(self.store.priority_job_ids(ids), {'member-job'})
+        self.store.set_dispatch_priority(False)
+        self.assertEqual(self.store.priority_job_ids(ids), set())
+
     def test_dispatch_priority_real_store_integration(self):
         from server.distributed import DistributedStore
         dispatch = DistributedStore(Path(self.tmp.name) / 'control.sqlite',
                                     priority_resolver=self.store.priority_job_ids)
         try:
-            team = self.store.create_team('优先组', self.admin)
-            self.store.add_team_members(team['id'], [self.owner], self.admin)
+            leader = self.store.create_user('original-leader', PASSWORD, team_leader=True)['id']
+            team = self.store.create_team('优先组', leader)
+            self.store.add_team_members(team['id'], [self.owner, self.admin], leader)
             worker = dispatch.register_worker('test-worker', {'node_classes': []})['worker_id']
             dispatch.heartbeat(worker, comfy_online=True)
             for job, user in [('old', self.viewer), ('priority', self.owner)]:
@@ -114,6 +140,8 @@ class StoreTests(unittest.TestCase):
                 dispatch.enqueue(job, {'role': 'admin', 'priority': True})
             self.assertEqual(dispatch.queue_ahead_snapshot(), {'old': 0, 'priority': 1})
             self.store.set_dispatch_priority(True)
+            self.assertEqual(dispatch.queue_ahead_snapshot(), {'old': 0, 'priority': 1})
+            self.store.set_team_leader(team['id'], self.admin, leader)
             self.assertEqual(dispatch.queue_ahead_snapshot(), {'priority': 0, 'old': 1})
             self.store.set_dispatch_priority(False)
             self.assertEqual(dispatch.queue_ahead_snapshot(), {'old': 0, 'priority': 1})

@@ -1031,7 +1031,8 @@ class AuthStore:
                     'SELECT DISTINCT j.job_id FROM job_acl j '
                     'JOIN team_members m ON m.user_id=j.user_id '
                     'JOIN teams t ON t.id=m.team_id '
-                    'JOIN users leader ON leader.id=t.leader_id '
+                    'JOIN team_members leaders ON leaders.team_id=t.id AND leaders.is_leader=1 '
+                    'JOIN users leader ON leader.id=leaders.user_id '
                     "WHERE t.state='active' AND leader.role='admin' AND j.job_id IN ("
                     + ','.join('?' for _ in batch) + ')', batch)
                 result.update(row[0] for row in rows)
