@@ -1113,29 +1113,51 @@ class HTTPSRedirectConfigTests(unittest.TestCase):
                     register_auth_routes(app, '.')
                 self.assertEqual(app['https_redirect_origin'], expected)
 
-    def test_direct_tls_defaults_to_intranet_https_without_redirect_setting(self):
+    def test_direct_tls_defaults_to_intranet_http_without_redirect_setting(self):
         tls = {'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key'}
-        for settings, expected in (
-                ({'CHOUKA_TLS_CERT': 'server.crt'}, ''),
-                (tls, 'https://dinghaichouka.youku.com:8443'),
-                (tls | {'CHOUKA_HTTPS_REDIRECT_ORIGIN': ''}, 'https://dinghaichouka.youku.com:8443'),
-                (tls | {'CHOUKA_HTTPS_PORT': '9443'}, 'https://dinghaichouka.youku.com:9443'),
-                (tls | {'CHOUKA_HTTPS_REDIRECT_ORIGIN': 'https://example.test/'}, 'https://example.test')):
+        for settings, http, https in (
+                ({'CHOUKA_TLS_CERT': 'server.crt'}, '', ''),
+                (tls, 'http://dinghaichouka.youku.com:8199', ''),
+                (tls | {'CHOUKA_HTTPS_REDIRECT_ORIGIN': ''}, 'http://dinghaichouka.youku.com:8199', ''),
+                (tls | {'CHOUKA_PORT': '9199'}, 'http://dinghaichouka.youku.com:9199', ''),
+                (tls | {'CHOUKA_HTTP_REDIRECT_ORIGIN': 'http://example.test/'}, 'http://example.test', ''),
+                (tls | {'CHOUKA_HTTPS_REDIRECT_ORIGIN': 'https://example.test/'}, '', 'https://example.test')):
             with self.subTest(settings=settings), patch.dict(os.environ, settings, clear=True):
                 app = web.Application()
                 register_auth_routes(app, '.')
-                self.assertEqual(app['https_redirect_origin'], expected)
+                self.assertEqual(app['http_redirect_origin'], http)
+                self.assertEqual(app['https_redirect_origin'], https)
+
+    def test_reject_invalid_http_redirect_origins_and_conflicting_directions(self):
+        for origin in ('https://example.test', 'http://', 'http://user:pass@example.test',
+                       'http://example.test/path', 'http://example.test?next=elsewhere',
+                       'http://example.test#fragment', 'http://example.test:0',
+                       'http://example.test:99999', 'http://example.test\n'):
+            with self.subTest(origin=origin), patch.dict(os.environ, {
+                    'CHOUKA_HTTP_REDIRECT_ORIGIN': origin,
+            }, clear=True):
+                with self.assertRaisesRegex(RuntimeError, 'CHOUKA_HTTP_REDIRECT_ORIGIN'):
+                    register_auth_routes(web.Application(), '.')
+        with patch.dict(os.environ, {
+                'CHOUKA_HTTP_REDIRECT_ORIGIN': 'http://example.test',
+                'CHOUKA_HTTPS_REDIRECT_ORIGIN': 'https://example.test',
+        }, clear=True):
+            with self.assertRaisesRegex(RuntimeError, '不能同时启用'):
+                register_auth_routes(web.Application(), '.')
 
     def test_local_and_admin_sandboxes_ignore_tls_redirect(self):
         for mode in ('local_test', 'admin_sandbox'):
-            with self.subTest(mode=mode), patch.dict(os.environ, {
-                    'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key',
-                    'CHOUKA_HTTPS_REDIRECT_ORIGIN': 'https://example.test',
-            }, clear=True):
-                app = web.Application()
-                app[mode] = True
-                register_auth_routes(app, '.')
-                self.assertEqual(app['https_redirect_origin'], '')
+            for overrides in ({}, {'CHOUKA_HTTP_REDIRECT_ORIGIN': 'http://example.test'},
+                              {'CHOUKA_HTTPS_REDIRECT_ORIGIN': 'https://example.test'}):
+                with self.subTest(mode=mode, overrides=overrides), patch.dict(os.environ, {
+                        'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key',
+                        **overrides,
+                }, clear=True):
+                    app = web.Application()
+                    app[mode] = True
+                    register_auth_routes(app, '.')
+                    self.assertEqual(app['https_redirect_origin'], '')
+                    self.assertEqual(app['http_redirect_origin'], '')
 
 
 class HTTPSRedirectTests(unittest.IsolatedAsyncioTestCase):
@@ -1150,6 +1172,7 @@ class HTTPSRedirectTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {
                 'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key',
                 'CHOUKA_HTTPS_PORT': '8443',
+                'CHOUKA_HTTPS_REDIRECT_ORIGIN': self.target,
         }, clear=True):
             register_auth_routes(app, Path(__file__).resolve().parents[1] / 'web')
 
@@ -1218,6 +1241,83 @@ class HTTPSRedirectTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(response.text, 'HTTPS page')
         self.assertNotIn('Location', response.headers)
+
+
+class HTTPPreferredTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = AuthStore(Path(self.tmp.name) / 'auth.sqlite')
+        self.store.create_user('admin', PASSWORD, 'admin')
+        self.store.set_ready()
+        self.app = web.Application(middlewares=[auth_middleware])
+        self.app['auth_store'] = self.store
+        with patch.dict(os.environ, {
+                'CHOUKA_TLS_CERT': 'server.crt', 'CHOUKA_TLS_KEY': 'server.key',
+        }, clear=True):
+            register_auth_routes(self.app, Path(__file__).resolve().parents[1] / 'web')
+        self.client = TestClient(TestServer(self.app))
+        await self.client.start_server()
+
+    async def asyncTearDown(self):
+        await self.client.close()
+        self.store.close()
+        self.tmp.cleanup()
+
+    async def test_https_pages_redirect_to_http_preserving_encoded_path_and_query(self):
+        for path in ('/', '/login', '/director?project=a%2Fb&x=1&x=2',
+                     '/if-studio', '/controller/costs', '/assets/app.js'):
+            for method in ('GET', 'HEAD'):
+                with self.subTest(path=path, method=method):
+                    request = make_mocked_request(method, path, headers={
+                        'Host': 'evil.test', 'X-Forwarded-Proto': 'http',
+                    }, app=self.app).clone(scheme='https', rel_url=URL(path, encoded=True))
+                    response = await auth_middleware(request, None)
+                    self.assertEqual(response.status, 302)
+                    self.assertEqual(response.headers['Location'],
+                                     'http://dinghaichouka.youku.com:8199' + path)
+                    self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+
+    async def test_https_redirect_clears_secure_cookie_before_http_login(self):
+        request = make_mocked_request('GET', '/login', headers={
+            'Cookie': 'h3card_session=old-https-session',
+        }, app=self.app).clone(scheme='https')
+        response = await auth_middleware(request, None)
+        self.assertEqual(response.status, 302)
+        cookie = response.cookies['h3card_session']
+        self.assertEqual(cookie.value, '')
+        self.assertEqual(cookie['max-age'], '0')
+        self.assertEqual(cookie['path'], '/')
+        self.assertTrue(cookie['secure'])
+        self.assertTrue(cookie['httponly'])
+        self.assertEqual(cookie['samesite'], 'Lax')
+
+    async def test_http_login_is_served_without_https_redirect(self):
+        response = await self.client.get('/login', allow_redirects=False)
+        self.assertEqual(response.status, 200)
+        self.assertNotIn('Location', response.headers)
+        origin = str(self.client.make_url('/')).rstrip('/')
+        response = await self.client.post('/api/auth/login', json={
+            'username': 'admin', 'password': PASSWORD,
+        }, headers={'Origin': origin}, allow_redirects=False)
+        self.assertEqual(response.status, 200)
+        self.assertNotIn('Secure', response.headers['Set-Cookie'])
+        self.assertEqual((await self.client.get('/api/auth/me')).status, 200)
+
+    async def test_https_api_worker_post_and_websocket_are_not_downgraded(self):
+        async def ok(request):
+            return web.Response(text='unchanged')
+
+        for method, path, headers, status in (
+                ('GET', '/api/auth/me', {}, 401),
+                ('GET', '/agent/v1/input', {}, 200),
+                ('GET', '/login', {'Upgrade': 'websocket'}, 200),
+                ('POST', '/login', {}, 401)):
+            with self.subTest(method=method, path=path):
+                request = make_mocked_request(method, path, headers=headers,
+                                              app=self.app).clone(scheme='https')
+                response = await auth_middleware(request, ok)
+                self.assertEqual(response.status, status)
+                self.assertNotIn('Location', response.headers)
 
 
 class HTTPTests(unittest.IsolatedAsyncioTestCase):

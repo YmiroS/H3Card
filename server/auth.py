@@ -237,12 +237,18 @@ async def _local_test_request(request, handler):
 @web.middleware
 async def auth_middleware(request, handler):
     try:
-        redirect_origin = request.app.get('https_redirect_origin')
-        if (redirect_origin and not request.secure
-                and request.method in ('GET', 'HEAD')
+        redirect_origin = request.app.get('http_redirect_origin' if request.secure else 'https_redirect_origin')
+        if (redirect_origin and request.method in ('GET', 'HEAD')
                 and not request.path.startswith(('/api/', '/agent/'))
                 and request.headers.get('Upgrade', '').lower() != 'websocket'):
-            raise web.HTTPPermanentRedirect(URL(redirect_origin + request.rel_url.raw_path_qs, encoded=True))
+            target = URL(redirect_origin + request.rel_url.raw_path_qs, encoded=True)
+            if request.secure:
+                response = web.HTTPFound(target)
+                # 旧 HTTPS Secure Cookie 会阻止 HTTP 登录写入同名 Cookie。
+                if request.cookies.get(COOKIE):
+                    response.del_cookie(COOKIE, path='/', secure=True, httponly=True, samesite='Lax')
+                raise response
+            raise web.HTTPPermanentRedirect(target)
         if request.app.get('auth_store') is None:
             raise web.HTTPServiceUnavailable(text='认证服务尚未配置')
         if request.app.get('local_test'):
@@ -554,22 +560,29 @@ async def dispatch_priority_settings(request):
 
 
 def register_auth_routes(app, web_root, *, frontend=None):
-    redirect_origin = os.environ.get('CHOUKA_HTTPS_REDIRECT_ORIGIN', '')
-    if not redirect_origin and os.environ.get('CHOUKA_TLS_CERT') and os.environ.get('CHOUKA_TLS_KEY'):
-        redirect_origin = f"https://dinghaichouka.youku.com:{os.environ.get('CHOUKA_HTTPS_PORT', '8443')}"
+    https_origin = os.environ.get('CHOUKA_HTTPS_REDIRECT_ORIGIN', '')
+    http_origin = os.environ.get('CHOUKA_HTTP_REDIRECT_ORIGIN', '')
+    if not http_origin and not https_origin and os.environ.get('CHOUKA_TLS_CERT') and os.environ.get('CHOUKA_TLS_KEY'):
+        http_origin = f"http://dinghaichouka.youku.com:{os.environ.get('CHOUKA_PORT', '8199')}"
     if app.get('local_test') or app.get('admin_sandbox'):
-        redirect_origin = ''
-    if redirect_origin:
+        http_origin = https_origin = ''
+    if http_origin and https_origin:
+        raise RuntimeError('CHOUKA_HTTP_REDIRECT_ORIGIN 和 CHOUKA_HTTPS_REDIRECT_ORIGIN 不能同时启用')
+    for scheme, redirect_origin in (('http', http_origin), ('https', https_origin)):
+        if not redirect_origin:
+            continue
+        setting = f'CHOUKA_{scheme.upper()}_REDIRECT_ORIGIN'
         try:
             target = urlsplit(redirect_origin)
-            if (target.scheme != 'https' or not target.hostname
+            if (target.scheme != scheme or not target.hostname
                     or target.username is not None or target.password is not None
                     or target.path not in ('', '/') or target.query or target.fragment
                     or target.port == 0 or any(char.isspace() for char in redirect_origin)):
-                raise ValueError('invalid HTTPS origin')
+                raise ValueError('invalid redirect origin')
         except ValueError as exc:
-            raise RuntimeError('CHOUKA_HTTPS_REDIRECT_ORIGIN 必须是完整 HTTPS 来源，不能带路径、凭据、查询或片段') from exc
-    app['https_redirect_origin'] = redirect_origin.rstrip('/')
+            raise RuntimeError(f'{setting} 必须是完整 {scheme.upper()} 来源，不能带路径、凭据、查询或片段') from exc
+    app['https_redirect_origin'] = https_origin.rstrip('/')
+    app['http_redirect_origin'] = http_origin.rstrip('/')
     app['_auth_login_limits'] = OrderedDict()
     app['_auth_register_limits'] = OrderedDict()
     app['_auth_hash_slots'] = asyncio.Semaphore(2)
