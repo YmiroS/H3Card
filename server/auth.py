@@ -44,7 +44,7 @@ async def call_store(app, method, *args, **kwargs):
     if store is None:
         raise web.HTTPServiceUnavailable(text='认证服务尚未配置')
     slots = app.get('_auth_hash_slots')
-    if slots and method in ('login', 'create_user', 'create_registration',
+    if slots and method in ('login', 'dinghai_bind', 'create_user', 'create_registration',
                             'reset_password', 'change_password'):
         # Argon2 哈希约几十毫秒；限制并发避免大量登录把事件循环线程池占满。
         async with slots:
@@ -293,6 +293,12 @@ async def _browser_request(request, handler):
         raise web.HTTPNotFound()
     if not await call_store(request.app, 'has_admin'):
         raise web.HTTPServiceUnavailable(text='请先初始化管理员账号')
+    from .dinghai_auth import LOGIN_CONFIG_PATH, PUBLIC_POST_PATHS
+    if path == LOGIN_CONFIG_PATH and request.method in ('GET', 'HEAD'):
+        return await handler(request)
+    if path in PUBLIC_POST_PATHS and request.method == 'POST':
+        _check_source(request)
+        return await handler(request)
     if path == '/api/auth/login' and request.method == 'POST':
         _check_source(request)
         return await handler(request)
@@ -360,6 +366,9 @@ async def login(request):
     token = result.pop('token')
     response = web.json_response(result)
     response.set_cookie(COOKIE, token, httponly=True, secure=_secure_cookie(request), samesite='Lax', path='/')
+    from .dinghai_auth import PENDING_COOKIE, PENDING_PATH
+    await call_store(request.app, 'dinghai_discard_pending', request.cookies.get(PENDING_COOKIE, ''))
+    response.del_cookie(PENDING_COOKIE, path=PENDING_PATH)
     return response
 
 
@@ -613,6 +622,8 @@ def register_auth_routes(app, web_root, *, frontend=None):
             app.router.add_get(asset, public_asset)
     else:
         register_frontend_assets(app, frontend)
+    from .dinghai_auth import register_dinghai_auth_routes
+    register_dinghai_auth_routes(app)
     app.router.add_get('/api/auth/me', me)
     app.router.add_post('/api/auth/presence', online_presence)
     app.router.add_post('/api/auth/login', login)

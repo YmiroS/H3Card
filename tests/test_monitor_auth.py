@@ -77,12 +77,16 @@ class MonitorMigrationTests(unittest.TestCase):
             with self.subTest(opening=opening):
                 store = AuthStore(self.path)
                 try:
-                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 9)
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
                     self.assertEqual(store.db.execute('PRAGMA foreign_keys').fetchone()[0], 1)
                     self.assertEqual(snapshot(store.db), before | {
+                        'external_identities': [], 'dinghai_binding_challenges': [],
                         'team_members': [row + (int(row[1] == 'a'),) for row in before['team_members']]})
                     self.assertEqual(list(map(tuple, store.db.execute('PRAGMA table_info(users)'))), columns)
-                    self.assertEqual(list(map(tuple, store.db.execute("SELECT type,name,sql FROM sqlite_master WHERE type IN ('index','trigger') ORDER BY type,name"))), objects)
+                    self.assertEqual(list(map(tuple, store.db.execute(
+                        "SELECT type,name,sql FROM sqlite_master WHERE type IN ('index','trigger') "
+                        "AND tbl_name NOT IN ('external_identities','dinghai_binding_challenges') "
+                        "ORDER BY type,name"))), objects)
                     for table, foreign_keys in fks.items():
                         self.assertEqual(list(map(tuple, store.db.execute(f'PRAGMA foreign_key_list("{table}")'))), foreign_keys)
                     self.assertEqual(store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
@@ -130,7 +134,7 @@ class MonitorMigrationTests(unittest.TestCase):
 
         store = AuthStore(self.path)
         try:
-            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 9)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
             store.create_user('after-release-screen', PASSWORD, 'monitor')
             store.set_user('u', enabled=False)
             self.assertIsNone(store.get_session('old-token'))
@@ -162,6 +166,7 @@ class MonitorMigrationTests(unittest.TestCase):
             self.assertEqual(store.project_permission('u', 'personal'), 'operate')
             self.assertFalse(any(user['username'] == 'after-release-screen' for user in store.list_users()))
             self.assertEqual(snapshot(store.db), before | {
+                'external_identities': [], 'dinghai_binding_challenges': [],
                 'team_members': [row + (int(row[1] == 'a'),) for row in before['team_members']]})
         finally:
             store.close()

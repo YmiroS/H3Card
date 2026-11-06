@@ -67,11 +67,16 @@ class AuthStore:
             if version == 8:
                 self.db.executescript(migrations.joinpath('009_team_leaders.sql').read_text(encoding='utf-8'))
                 version = 9
-            if version != 9:
+            if version == 9:
+                self.db.executescript(migrations.joinpath('010_dinghai_identities.sql').read_text(encoding='utf-8'))
+                version = 10
+            if version != 10:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
                 'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader,phone',
                 'sessions': 'token_hash,user_id,csrf_token,expires_at,created_at',
+                'external_identities': 'issuer,subject,user_id,created_at',
+                'dinghai_binding_challenges': 'token_hash,csrf_token,issuer,subject,expires_at,created_at',
                 'user_grants': 'viewer_id,owner_id,permission',
                 'global_canvas_grants': 'viewer_id,permission',
                 'project_acl': 'project_id,owner_id,state,created_at,team_id',
@@ -523,6 +528,91 @@ class AuthStore:
             self.db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',
                             (self._digest(token), old['id'], csrf, now + self.session_ttl, now))
             return {'user': self._session_user(current), 'csrf_token': csrf, 'token': token}
+
+    def _dinghai_session(self, user):
+        if not user['enabled'] or user['approval_status'] != 'approved':
+            raise AuthError('本地账户不可用，请联系管理员', 403)
+        token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+        now = time.time()
+        self.db.execute('DELETE FROM sessions WHERE expires_at<=?', (now,))
+        self.db.execute('INSERT INTO sessions VALUES(?,?,?,?,?)',
+                        (self._digest(token), user['id'], csrf, now + self.session_ttl, now))
+        return {'status': 'authenticated', 'user': self._session_user(user),
+                'csrf_token': csrf, 'token': token}
+
+    def dinghai_login(self, issuer, subject, display_name):
+        """后端验证定海身份后，已有绑定登录；否则只能取得短时绑定凭证。"""
+        self._identifier(issuer, '定海来源')
+        self._identifier(subject, '定海用户 ID')
+        with self._tx():
+            linked = self.db.execute(
+                'SELECT user_id FROM external_identities WHERE issuer=? AND subject=?',
+                (issuer, subject)).fetchone()
+            if linked:
+                return self._dinghai_session(self._user(linked['user_id']))
+            display_name = self._display_name(display_name)
+            now = time.time()
+            self.db.execute('DELETE FROM dinghai_binding_challenges WHERE expires_at<=?', (now,))
+            token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
+            self.db.execute('INSERT INTO dinghai_binding_challenges VALUES(?,?,?,?,?,?)',
+                            (self._digest(token), csrf, issuer, subject, now + 300, now))
+            return {'status': 'binding_required', 'binding_token': token,
+                    'binding_csrf': csrf, 'binding': {'dinghai_name': display_name}}
+
+    def _dinghai_challenge(self, token, csrf):
+        if not isinstance(token, str) or not token or len(token) > 256:
+            raise AuthError('绑定请求已失效，请重新使用定海登录', 410)
+        row = self.db.execute('SELECT * FROM dinghai_binding_challenges WHERE token_hash=?',
+                              (self._digest(token),)).fetchone()
+        if row is None or row['expires_at'] <= time.time():
+            raise AuthError('绑定请求已失效，请重新使用定海登录', 410)
+        if not isinstance(csrf, str) or not secrets.compare_digest(csrf.encode('utf-8'), row['csrf_token'].encode('utf-8')):
+            raise AuthError('绑定确认校验失败，请重新登录', 403)
+        return row
+
+    def dinghai_bind(self, token, csrf, issuer, username, password):
+        try:
+            _, username_key = self._username(username)
+        except AuthError:
+            username_key = None
+        with self.lock:
+            pending = self._dinghai_challenge(token, csrf)
+            if pending['issuer'] != issuer:
+                raise AuthError('定海登录环境已变化，请重新登录', 409)
+            row = self.db.execute('SELECT * FROM users WHERE username_key=?',
+                                  (username_key,)).fetchone() if username_key else None
+            old = dict(row) if row else None
+        valid = self._verify(old['password_hash'] if old else self._dummy_hash, password)
+        if not valid or not old or not old['enabled']:
+            raise AuthError('抽卡用户名或密码错误', 401)
+        with self._tx():
+            pending = self._dinghai_challenge(token, csrf)
+            user = self._user(old['id'])
+            if not user['enabled'] or user['approval_status'] != 'approved':
+                raise AuthError('本地账户不可用，请联系管理员', 403)
+            if user['version'] != old['version']:
+                raise AuthError('本地账户信息已变化，请重新验证', 409)
+            if self.db.execute(
+                'SELECT 1 FROM external_identities WHERE user_id=? OR (issuer=? AND subject=?)',
+                (user['id'], pending['issuer'], pending['subject'])).fetchone():
+                raise AuthError('账户已有其他绑定，请联系管理员', 409)
+            self.db.execute('INSERT INTO external_identities VALUES(?,?,?,?)',
+                            (pending['issuer'], pending['subject'], user['id'], time.time()))
+            self.db.execute('DELETE FROM dinghai_binding_challenges WHERE issuer=? AND subject=?',
+                            (pending['issuer'], pending['subject']))
+            return self._dinghai_session(user)
+
+    def dinghai_cancel(self, token, csrf):
+        with self._tx():
+            self._dinghai_challenge(token, csrf)
+            self.db.execute('DELETE FROM dinghai_binding_challenges WHERE token_hash=?',
+                            (self._digest(token),))
+
+    def dinghai_discard_pending(self, token):
+        if isinstance(token, str) and token and len(token) <= 256:
+            with self._tx():
+                self.db.execute('DELETE FROM dinghai_binding_challenges WHERE token_hash=?',
+                                (self._digest(token),))
 
     def get_session(self, token):
         if not isinstance(token, str) or not token or len(token) > 256:

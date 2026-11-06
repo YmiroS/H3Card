@@ -745,7 +745,7 @@ class StoreTests(unittest.TestCase):
             db.close()
         migrated = AuthStore(legacy)
         try:
-            self.assertEqual(migrated.db.execute('PRAGMA user_version').fetchone()[0], 9)
+            self.assertEqual(migrated.db.execute('PRAGMA user_version').fetchone()[0], 10)
             for table, (columns, rows) in before.items():
                 with self.subTest(table=table):
                     self.assertEqual([tuple(row) for row in migrated.db.execute(
@@ -813,7 +813,7 @@ class StoreTests(unittest.TestCase):
             with self.subTest(opening=opening):
                 store = AuthStore(legacy)
                 try:
-                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 9)
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
                     info = [row for row in store.db.execute('PRAGMA table_info(users)') if row['name'] == 'phone']
                     self.assertEqual(len(info), 1)
                     self.assertEqual((info[0]['type'], info[0]['notnull'], info[0]['dflt_value']),
@@ -855,7 +855,7 @@ class StoreTests(unittest.TestCase):
             with self.subTest(opening=opening):
                 store = AuthStore(legacy)
                 try:
-                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 9)
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
                     self.assertEqual(tuple(store.db.execute('SELECT * FROM users').fetchone()), before + ('',))
                     self.assertEqual(tuple(store.db.execute('SELECT * FROM global_canvas_grants').fetchone()),
                                      ('v6-user', 'operate'))
@@ -866,7 +866,7 @@ class StoreTests(unittest.TestCase):
     def test_unknown_schema_rejected(self):
         path = Path(self.tmp.name) / 'future.sqlite'
         db = sqlite3.connect(path)
-        db.execute('PRAGMA user_version=10')
+        db.execute('PRAGMA user_version=11')
         db.close()
         with self.assertRaises(AuthError):
             AuthStore(path)
@@ -962,7 +962,7 @@ class RegistrationStoreTests(unittest.TestCase):
             self.assertFalse(users[0]['team_leader'])
             self.assertEqual(store._user('u1')['enabled'], 1)
             self.assertTrue(store.is_ready())
-            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 9)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
             self.assertEqual(users[0]['phone'], '')
             self.assertIsNone(store.get_project('legacy-project')['team_id'])
             self.assertEqual(store.list_project_shares('legacy-project', 'u1')['user_ids'], [])

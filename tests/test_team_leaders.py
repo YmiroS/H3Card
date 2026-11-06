@@ -5,6 +5,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import closing
 from pathlib import Path
 from unittest.mock import patch
 
@@ -73,7 +74,7 @@ class TeamLeaderMigrationTests(unittest.TestCase):
             with self.subTest(opening=opening):
                 store = AuthStore(self.path)
                 try:
-                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 9)
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
                     self.assertEqual(store.db.execute('PRAGMA foreign_keys').fetchone()[0], 1)
                     self.assertEqual(store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
                     for table, rows in before.items():
@@ -539,7 +540,7 @@ class TeamLeaderHTTPTests(TeamFixture, unittest.IsolatedAsyncioTestCase):
                 async def interpose(app, method, *method_args, **kwargs):
                     nonlocal before_write
                     if method == 'set_team_leader':
-                        with sqlite3.connect(self.path) as second:
+                        with closing(sqlite3.connect(self.path)) as second, second:
                             second.execute('PRAGMA foreign_keys=ON')
                             second.execute(sql, args)
                         before_write = snapshot(self.store.db)
