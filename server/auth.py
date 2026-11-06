@@ -18,7 +18,8 @@ from .auth_store import AuthError
 from .frontend import (is_frontend_asset, is_missing_frontend_asset,
                        register_frontend_assets)
 
-COOKIE = 'h3card_session'
+# 更换旧 HTTPS Cookie 名，避免浏览器拒绝直接 HTTP 登录写入会话。
+COOKIE = 'h3card_session_v2'
 AUTH_ASSETS = {
     '/favicon.png': 'image/png',
     '/icon.png': 'image/png',

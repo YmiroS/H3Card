@@ -1,7 +1,10 @@
 import asyncio
 import hashlib
+import json
 import os
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import threading
 import time
@@ -1279,17 +1282,41 @@ class HTTPPreferredTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_https_redirect_clears_secure_cookie_before_http_login(self):
         request = make_mocked_request('GET', '/login', headers={
-            'Cookie': 'h3card_session=old-https-session',
+            'Cookie': f'{COOKIE}=old-https-session',
         }, app=self.app).clone(scheme='https')
         response = await auth_middleware(request, None)
         self.assertEqual(response.status, 302)
-        cookie = response.cookies['h3card_session']
+        cookie = response.cookies[COOKIE]
         self.assertEqual(cookie.value, '')
         self.assertEqual(cookie['max-age'], '0')
         self.assertEqual(cookie['path'], '/')
         self.assertTrue(cookie['secure'])
         self.assertTrue(cookie['httponly'])
         self.assertEqual(cookie['samesite'], 'Lax')
+
+    @unittest.skipUnless(shutil.which('curl'), 'curl is required for Secure cookie migration coverage')
+    async def test_direct_http_login_with_old_secure_cookie(self):
+        jar = Path(self.tmp.name) / 'cookies.txt'
+        jar.write_text('# Netscape HTTP Cookie File\n'
+                       'chouka-cookie.test\tFALSE\t/\tTRUE\t2147483647\th3card_session\told-https-session\n',
+                       encoding='utf-8')
+        port = self.client.server.port
+        origin = f'http://chouka-cookie.test:{port}'
+        command = [shutil.which('curl'), '--silent', '--show-error', '--fail-with-body',
+                   '--max-time', '10', '--noproxy', '*',
+                   '--resolve', f'chouka-cookie.test:{port}:127.0.0.1',
+                   '--cookie', str(jar), '--cookie-jar', str(jar)]
+        await asyncio.to_thread(subprocess.check_output, [
+            *command, origin + '/api/auth/login', '-H', 'Origin: ' + origin,
+            '-H', 'Content-Type: application/json', '--data-binary',
+            json.dumps({'username': 'admin', 'password': PASSWORD}),
+        ])
+        result = await asyncio.to_thread(subprocess.check_output, [
+            *command, origin + '/api/auth/me',
+        ])
+        self.assertEqual(json.loads(result)['user']['username'], 'admin')
+        self.assertIn('\th3card_session\told-https-session', jar.read_text())
+        self.assertIn('\t' + COOKIE + '\t', jar.read_text())
 
     async def test_http_login_is_served_without_https_redirect(self):
         response = await self.client.get('/login', allow_redirects=False)
