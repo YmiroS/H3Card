@@ -39,6 +39,7 @@
     "minimax_h3_ref4": {"category": "video_generation", "estimated_min": 0.24, "estimated_max": 0.71, "retail_min": 3.0, "retail_max": 5.0, "retail_basis": "per_segment", "retail_unit_seconds": 10},
     "minimax_h3_ref9": {"category": "video_generation", "estimated_min": 0.24, "estimated_max": 0.71, "retail_min": 3.0, "retail_max": 5.0, "retail_basis": "per_segment", "retail_unit_seconds": 10},
     "minimax_h3_fusion_v2": {"category": "video_generation", "retail_min": 3.0, "retail_max": 5.0, "retail_basis": "per_segment", "retail_unit_seconds": 10},
+    "minimax_h3_fusion_v3": {"category": "video_generation", "retail_min": 3.0, "retail_max": 5.0, "retail_basis": "per_segment", "retail_unit_seconds": 10},
     "minimax_h3_ref_2pass": {"category": "video_generation", "estimated_min": 0.20, "estimated_max": 0.70, "retail_min": 4.0, "retail_max": 6.0, "retail_basis": "per_segment", "retail_unit_seconds": 10},
     "minimax_h3_fusion_v2_bf16": {"category": "video_generation", "retail_min": 16.0, "retail_max": 24.0, "retail_basis": "per_segment", "retail_unit_seconds": 10},
     "minimax_h3_ref_2pass_bf16": {"category": "video_generation", "retail_min": 16.0, "retail_max": 24.0, "retail_basis": "per_segment", "retail_unit_seconds": 10},

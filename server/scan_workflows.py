@@ -159,7 +159,7 @@ MODEL_SWITCH_DEFAULTS = {"qwen_lighting": "multiLight"}
 BUNDLED_CAPABILITIES = {
     "minimax_h3_ref_2pass_bf16",
     "alphagen", "rtx_video_hdr", "rtx_video_frame_generation", "image_color_match", "video_color_match",
-    "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
+    "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16", "minimax_h3_fusion_v3",
     "qwen_image_edit_2511_i2i", "qwen_image_2512_t2i",
     "qwen_image_21_t2i", "qwen_image_21_i2i", "qwen_image_21_multi",
     "qwen_lighting", "qwen_lighting_multi",
@@ -593,6 +593,7 @@ CAP_INPUT_PRESETS.update({
         "minimax_h3_ref_2pass": [("225", "audio"), ("210", "any_input")],
         "minimax_h3_ref_2pass_bf16": [("225", "audio"), ("210", "any_input")],
         "minimax_h3_fusion_v2": [("148", "audio")],
+        "minimax_h3_fusion_v3": [("148", "audio")],
         "minimax_h3_fusion_v2_bf16": [("148", "audio")],
         "minimax_h3_comic20": [("79", "audio"), ("207", "initial_value2")],
         "minimax_h3_talk1": [("142", "audio")],

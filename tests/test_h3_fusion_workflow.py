@@ -225,6 +225,98 @@ class H3FusionWorkflowTest(unittest.TestCase):
                 self.assertNotEqual(label, '处理中')
 
 
+class H3FusionV3WorkflowTest(unittest.TestCase):
+    cid = 'minimax_h3_fusion_v3'
+
+    def setUp(self):
+        self.cap = json.loads((ROOT / 'manifests' / f'{self.cid}.json').read_text(encoding='utf-8'))
+
+    def test_v3_models_fifteen_step_sampling_and_defaults_without_preview(self):
+        graph = app.patch_graph(self.cap, {}, {})
+        self.assertEqual(graph['127']['inputs']['unet_name'],
+                         'Cobijada_H3_Hybrid_Uncensored_pruned_hybrid_int8_convrot_pruned.safetensors')
+        self.assertEqual(graph['232']['inputs']['clip_name'], 'qwen3vl_32b_minimax_h3_bf16.safetensors')
+        self.assertEqual(graph['234']['inputs']['vae_name'], 'minimax_h3_video_vae_fp16.safetensors')
+        self.assertEqual(graph['235']['inputs']['vae_name'], 'minimax_h3_audio_vae_fp32.safetensors')
+        self.assertEqual(graph['156']['inputs']['model'], ['127', 0])
+        self.assertEqual(graph['126']['inputs']['model'], ['165', 0])
+        self.assertEqual(graph['123']['inputs']['sampler_name'], 'er_sde')
+        self.assertEqual(graph['125']['inputs']['sigmas'], ['255', 0])
+        self.assertEqual(graph['255']['inputs']['sigmas'],
+                         '1, 0.992, 0.99, 0.975, 0.95, 0.91, 0.85, 0.76, 0.64, 0.5, 0.36, 0.24, 0.14, 0.07, 0.02, 0')
+        self.assertEqual(len(graph['255']['inputs']['sigmas'].split(',')) - 1, 15)
+        self.assertEqual(graph['136']['inputs']['ref_image_size'], 'match')
+        self.assertEqual(graph['227']['inputs']['value'], 4)
+        self.assertEqual(graph['228']['inputs'], {'aspect_ratio': '21:9 (Ultrawide)', 'megapixels': 2, 'multiple': 32})
+        types = [node['class_type'] for node in graph.values()]
+        self.assertEqual(types.count('SamplerCustomAdvanced'), 1)
+        self.assertFalse(set(types) & {'ModelPreviewOverrideKJ', 'LoraLoaderModelOnly', 'SetNode', 'GetNode'})
+        self.assertNotIn('taeh3', json.dumps(graph))
+        self.assertNotIn('strength_model', {s['key'] for s in self.cap['inputs']})
+
+    def test_all_fifteen_optional_slots_are_wired_and_empty_slots_are_disconnected(self):
+        self.assertEqual(self.cap['slotLimits'], {'image': {'min': 0, 'max': 9},
+                         'audio': {'min': 0, 'max': 3}, 'video': {'min': 0, 'max': 3}})
+        assets = {s['key']: f"chouka/{s['type']}{i}.{'png' if s['type'] == 'image' else 'wav' if s['type'] == 'audio' else 'mp4'}"
+                  for i, s in enumerate(self.cap['inputs']) if s['type'] in ('image', 'audio', 'video')}
+        self.assertEqual(len(assets), 15)
+        full = app.patch_graph(self.cap, {}, assets)
+        empty = app.patch_graph(self.cap, {}, {})
+        live = scan_workflows.upstream(empty, '148')
+        for spec in self.cap['inputs']:
+            target = spec['target']
+            if target.get('kind') == 'preset':
+                continue
+            self.assertIn(target['input'], full[target['node']]['inputs'])
+            if spec['key'] in assets:
+                self.assertEqual(full[target['node']]['inputs'][target['input']], assets[spec['key']])
+                self.assertNotIn(target['node'], live)
+                cut, = spec['dropIfEmpty']
+                self.assertNotIn(cut['input'], empty[cut['node']]['inputs'])
+                self.assertEqual(full[cut['node']]['inputs'][cut['input']], [target['node'], 0])
+                if spec['type'] == 'video':
+                    self.assertEqual(full[target['node']]['inputs']['force_rate'], 24)
+                    self.assertEqual(full[target['node']]['inputs']['frame_load_cap'], full['136']['inputs']['length'])
+        self.assertEqual(empty['238']['inputs']['value'], '')
+
+    def test_sparse_ninth_image_audio_and_video_references_and_controls(self):
+        params = {'prompt': '<Picture 9> / <Picture 2> / <Audio 3> / <Video 3>',
+                  'seed': 42, 'duration': 5, 'megapixels': 0.6,
+                  'aspect_ratio': '9:16 (Portrait Widescreen)', 'sigmas': '1, .5, 0'}
+        assets = {'images[1]': 'chouka/a.png', 'images[8]': 'chouka/b.png',
+                  'audio[2]': 'chouka/c.wav', 'video[2]': 'chouka/d.mp4'}
+        graph = app.patch_graph(self.cap, dict(params), assets)
+        self.assertEqual(graph['238']['inputs']['value'], '<Picture 2> / <Picture 1> / <Audio 1> / <Video 1>')
+        self.assertEqual(graph['281']['inputs']['image'], 'chouka/b.png')
+        self.assertEqual(graph['269']['inputs']['video'], 'chouka/d.mp4')
+        self.assertEqual(graph['227']['inputs']['value'], 5)
+        self.assertEqual(graph['228']['inputs']['megapixels'], 0.6)
+        self.assertEqual(graph['228']['inputs']['aspect_ratio'], params['aspect_ratio'])
+        self.assertEqual(graph['255']['inputs']['sigmas'], params['sigmas'])
+        self.assertEqual(graph['129']['inputs']['noise_seed'], 42)
+        for token in ('<Picture 8>', '<Audio 1>', '<Video 2>'):
+            with self.subTest(token=token), self.assertRaises(app.web.HTTPBadRequest):
+                app.patch_graph(self.cap, {'prompt': token}, assets)
+        self.assertEqual(app.reference_video_input(self.cap, assets), 'chouka/d.mp4')
+
+    def test_registration_rescan_and_chinese_progress(self):
+        app.load_caps()
+        self.assertEqual(app.CAPS[self.cid]['name'], 'H3无损融合单采V3')
+        self.assertEqual(app.model_family(self.cid), 'minimax_h3')
+        self.assertIn(self.cid, scan_workflows.BUNDLED_CAPABILITIES)
+        modes = next(c['modes'] for c in app.CARDS if c['id'] == 'card_video')
+        self.assertEqual([m for m in modes if m['id'] == self.cid],
+                         [{'id': self.cid, 'name': self.cap['name'], 'slots': 'img9+aud3+vid3'}])
+        self.assertIn(self.cid, {m['id'] for m in scan_workflows.build_modes(
+            [c for c in app.CAPS.values() if c['card'] == 'video' and c.get('graph')])})
+        graph = json.loads((ROOT / self.cap['graph']).read_text(encoding='utf-8'))
+        self.assertEqual(set(graph), scan_workflows.upstream(graph, '148') | {'148'})
+        with mock.patch.object(app, 'ZH_NODES', {}):
+            for label in app.step_labels(graph).values():
+                self.assertRegex(label, r'[\u4e00-\u9fff]')
+                self.assertNotEqual(label, '处理中')
+
+
 class H3SoundWorkflowTest(unittest.TestCase):
     def setUp(self):
         self.caps = [json.loads(path.read_text(encoding='utf-8'))
@@ -409,6 +501,21 @@ class H3FusionRuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFix
                 changed = (await response.json())['changed']
                 self.assertEqual(changed['#238.value'][1], '<Picture 1> 转头')
                 self.assertEqual(changed['#192.image'][1], 'chouka/cat.png')
+                v3_id = 'minimax_h3_fusion_v3'
+                self.assertEqual(data['capabilities'][v3_id]['name'], 'H3无损融合单采V3')
+                self.assertTrue(app.graph_ok(v3_id))
+                self.assertEqual(next(m for m in card['modes'] if m['id'] == v3_id)['slots'],
+                                 'img9+aud3+vid3')
+                response = await client.post('/api/generate', json={
+                    'capability': v3_id, 'project': 'p', 'dry_run': True,
+                    'assets': {'images[8]': 'chouka/cat.png'},
+                    'params': {'prompt': '<Picture 9> 转头', 'seed': 123},
+                })
+                self.assertEqual(response.status, 200, await response.text())
+                changed = (await response.json())['changed']
+                self.assertEqual(changed['#238.value'][1], '<Picture 1> 转头')
+                self.assertEqual(changed['#281.image'][1], 'chouka/cat.png')
+                self.assertEqual(changed['#148.audio'][1], '<断开>')
 
 
 if __name__ == '__main__':

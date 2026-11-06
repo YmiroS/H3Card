@@ -104,6 +104,7 @@ MODEL_FAMILY = {
         "minimax_h3_talk2", "minimax_h3_ref4", "minimax_h3_ref9",
         "minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16", "minimax_h3_comic20",
         "minimax_h3_character_transfer", "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
+        "minimax_h3_fusion_v3",
     )},
     "flux2_klein_edit": "flux2_klein",
     "flux2_klein_storyboard9": "flux2_klein",
@@ -680,7 +681,7 @@ def apply_input_presets(cap, params):
 def reference_video_input(cap, uploaded):
     """仅已登记的 H3 视频参考能力的已填视频槽参与最终输出契约。"""
     if (cap.get("id") not in {"minimax_h3_ref9", "minimax_h3_ref_2pass", "minimax_h3_ref_2pass_bf16",
-                              "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
+                              "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16", "minimax_h3_fusion_v3",
                               "minimax_h3_character_transfer"}
             or cap.get("kind") != "gen" or cap.get("outputType") != "video"):
         return None
@@ -968,7 +969,7 @@ def patch_graph(cap, params, uploaded, video_metadata=None):
     if blank:
         raise web.HTTPBadRequest(
             reason="这几张图没写提示词：" + "、".join(blank) + "（空提示词会让图和提示词错位）")
-    if cap["id"] in {"minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16"}:
+    if cap["id"] in {"minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16", "minimax_h3_fusion_v3"}:
         # H3 会跳过空槽并连续编号；界面里的槽号在提交时一次性换算，避免连锁替换。
         references = {}
         for prefix, label in (("ref_images.ref_image_", "Picture"),
