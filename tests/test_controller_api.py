@@ -2450,6 +2450,35 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                     else:
                         self.assertEqual([item["id"] for item in payload["projects"]], ["p"])
 
+    async def test_worker_ip_registration_and_heartbeat_reach_admin_workers(self):
+        telemetry = {"hostname": "ip-test-node", "ip_address": "192.0.2.24",
+                     "collected_at": time.time(), "memory": {"total_bytes": 1024}}
+        response = await self.client.post("/agent/v1/register", json={
+            "name": "IP 上报测试节点",
+            "enrollment_token": controller_app.ENROLLMENT_TOKEN,
+            "capabilities": {"telemetry": telemetry},
+        })
+        self.assertEqual(response.status, 201, await response.text())
+        credentials = await response.json()
+        worker_id = credentials["worker_id"]
+        headers = {"X-Worker-ID": worker_id,
+                   "Authorization": f"Bearer {credentials['worker_token']}"}
+
+        async def reported_telemetry():
+            response = await self.client.get("/api/workers")
+            self.assertEqual(response.status, 200, await response.text())
+            workers = (await response.json())["workers"]
+            worker = next(item for item in workers if item["id"] == worker_id)
+            return worker["capabilities"]["telemetry"]
+
+        self.assertEqual(await reported_telemetry(), telemetry)
+        for address in ("192.0.2.25", "192.0.2.26", None):
+            telemetry = {**telemetry, "ip_address": address, "collected_at": time.time()}
+            response = await self.client.post("/agent/v1/heartbeat", headers=headers,
+                                              json={"comfy_online": True, "telemetry": telemetry})
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual(await reported_telemetry(), telemetry)
+
     async def test_worker_response_encoding_is_off_loop_and_preserves_payload(self):
         self.store.register_worker("编码回归", {"node_classes": ["KSampler"]})
         baseline, workers = controller_app.worker_capability_comparisons(self.store.list_workers())

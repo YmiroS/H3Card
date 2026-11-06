@@ -2,6 +2,7 @@ import asyncio
 import copy
 import json
 import os
+import socket
 import sys
 import tempfile
 import time
@@ -15,7 +16,9 @@ import aiohttp
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "worker"))
+sys.path.insert(0, str(ROOT / "server"))
 from agent import JobFailed, WorkerAgent
+from distributed import DistributedStore
 
 
 class WorkerFixture:
@@ -110,6 +113,7 @@ class WorkerCapacityIdentityTest(WorkerFixture, unittest.TestCase):
         worker.state["worker_token"] = "private-worker"
         with mock.patch.object(worker, "_nvidia_gpus", return_value=[]), \
              mock.patch.object(worker, "_system_memory", return_value={"total_bytes": 123}), \
+             mock.patch.object(worker, "_ip_address", return_value=None), \
              mock.patch("agent.platform.processor", return_value="test CPU"), \
              mock.patch("agent.platform.system", return_value="test OS"):
             telemetry = worker.collect_telemetry()
@@ -130,8 +134,283 @@ class WorkerCapacityIdentityTest(WorkerFixture, unittest.TestCase):
              mock.patch.object(worker, "_save_state") as save:
             telemetry = worker.collect_telemetry()
         self.assertIsNone(telemetry["host_id"])
+        self.assertIsNone(telemetry["ip_address"])
         save.assert_not_called()
         self.assertFalse(hasattr(worker, "state"))
+
+
+class WorkerIPAddressTest(unittest.TestCase):
+    def setUp(self):
+        self.worker = WorkerAgent.__new__(WorkerAgent)
+        self.worker.config = {}
+        self.worker.server = "https://controller.invalid:8443/control"
+        self.probe = mock.MagicMock(spec=socket.socket)
+        self.probe.__enter__.return_value = self.probe
+        self.probe.getsockname.return_value = ("10.20.0.7", 54321)
+        resolver = mock.patch("agent.socket.getaddrinfo", return_value=[self.candidate()])
+        factory = mock.patch("agent.socket.socket", return_value=self.probe)
+        self.resolve = resolver.start()
+        self.factory = factory.start()
+        self.addCleanup(resolver.stop)
+        self.addCleanup(factory.stop)
+
+    @staticmethod
+    def candidate(host="10.20.0.1", port=8443, family=socket.AF_INET):
+        destination = (host, port, 0, 0) if family == socket.AF_INET6 else (host, port)
+        return family, socket.SOCK_DGRAM, socket.IPPROTO_UDP, "", destination
+
+    def assert_probe_closed_without_data(self):
+        self.probe.__exit__.assert_called_once()
+        for method in ("send", "sendall", "sendto"):
+            getattr(self.probe, method).assert_not_called()
+
+    def test_ipv4_uses_controller_host_port_and_route_source(self):
+        self.assertEqual(self.worker._ip_address(), "10.20.0.7")
+        self.resolve.assert_called_once_with(
+            "controller.invalid", 8443, socket.AF_INET, socket.SOCK_DGRAM)
+        self.factory.assert_called_once_with(
+            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.probe.connect.assert_called_once_with(("10.20.0.1", 8443))
+        self.assert_probe_closed_without_data()
+
+    def test_ipv6_only_controller_does_not_fall_back_to_ipv6(self):
+        self.worker.server = "https://[fd12:3456::1]:9443/control"
+        self.resolve.side_effect = socket.gaierror("No IPv4 address")
+        self.assertIsNone(self.worker._ip_address())
+        self.resolve.assert_called_once_with(
+            "fd12:3456::1", 9443, socket.AF_INET, socket.SOCK_DGRAM)
+        self.factory.assert_not_called()
+
+    def test_ipv6_candidates_are_skipped_without_opening_ipv6_sockets(self):
+        ipv6 = self.candidate("fd12:3456::1", family=socket.AF_INET6)
+        self.resolve.return_value = [ipv6, self.candidate()]
+        self.assertEqual(self.worker._ip_address(), "10.20.0.7")
+        self.factory.assert_called_once_with(
+            socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+        self.assert_probe_closed_without_data()
+        self.factory.reset_mock()
+        self.resolve.return_value = [ipv6]
+        self.assertIsNone(self.worker._ip_address())
+        self.factory.assert_not_called()
+
+    def test_default_http_https_ports(self):
+        for scheme, port in (("http", 80), ("https", 443)):
+            with self.subTest(scheme=scheme):
+                self.worker.server = scheme + "://controller.invalid/api"
+                self.assertEqual(self.worker._ip_address(), "10.20.0.7")
+                self.resolve.assert_called_with(
+                    "controller.invalid", port, socket.AF_INET, socket.SOCK_DGRAM)
+
+    def test_multihomed_source_changes_with_controller_not_hostname(self):
+        routes = {
+            "control-a.invalid": ("10.20.0.1", "10.20.0.7"),
+            "control-b.invalid": ("192.168.30.1", "192.168.30.9"),
+        }
+        self.resolve.side_effect = lambda host, port, *_: [
+            self.candidate(routes[host][0], port)]
+        self.probe.connect.side_effect = lambda destination: setattr(
+            self.probe.getsockname, "return_value",
+            (next(source for target, source in routes.values() if target == destination[0]), 54321))
+        with mock.patch("agent.socket.gethostname") as hostname, \
+             mock.patch("agent.socket.gethostbyname") as host_address:
+            for controller, (_, source) in routes.items():
+                with self.subTest(controller=controller):
+                    self.worker.server = "https://" + controller
+                    self.assertEqual(self.worker._ip_address(), source)
+            hostname.assert_not_called()
+            host_address.assert_not_called()
+        self.assertEqual(self.probe.__exit__.call_count, 2)
+
+    def test_missing_controller_probe_never_resolves_or_opens_socket(self):
+        del self.worker.server
+        self.assertIsNone(self.worker._ip_address())
+        self.resolve.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_invalid_controller_never_resolves_or_opens_socket(self):
+        for server in (None, "", "  ", 123, {}, "controller.invalid", "//controller.invalid",
+                       "http:///path", "https://", "ftp://controller.invalid",
+                       "http://bad host", "http://[broken", "http://controller.invalid:nope",
+                       "http://controller.invalid:65536", "http://controller.invalid:0"):
+            with self.subTest(server=server):
+                self.worker.server = server
+                self.assertIsNone(self.worker._ip_address())
+        self.resolve.assert_not_called()
+        self.factory.assert_not_called()
+
+    def test_dns_failure_and_no_candidates_return_none(self):
+        for error in (socket.gaierror("DNS unavailable"), OSError("resolver failed"),
+                      UnicodeError("invalid host encoding")):
+            with self.subTest(error=error):
+                self.resolve.side_effect = error
+                self.assertIsNone(self.worker._ip_address())
+        self.resolve.side_effect = None
+        self.resolve.return_value = []
+        self.assertIsNone(self.worker._ip_address())
+        self.factory.assert_not_called()
+
+    def test_socket_creation_failure_tries_next_ipv4(self):
+        self.resolve.return_value = [self.candidate("10.10.0.1"), self.candidate()]
+        self.factory.side_effect = [OSError("route unavailable"), self.probe]
+        self.assertEqual(self.worker._ip_address(), "10.20.0.7")
+        self.assertEqual(self.factory.call_count, 2)
+        self.assert_probe_closed_without_data()
+
+    def test_connect_and_getsockname_failure_close_socket_and_try_next_candidate(self):
+        for stage in ("connect", "getsockname"):
+            with self.subTest(stage=stage):
+                self.probe.reset_mock()
+                self.resolve.return_value = [self.candidate("10.10.0.1"), self.candidate()]
+                method = getattr(self.probe, stage)
+                method.side_effect = [OSError("route unavailable"),
+                                      None if stage == "connect" else ("10.20.0.7", 54321)]
+                self.assertEqual(self.worker._ip_address(), "10.20.0.7")
+                self.assertEqual(self.probe.__exit__.call_count, 2)
+                method.side_effect = None
+
+    def test_all_socket_candidates_fail_without_raising(self):
+        for stage in ("connect", "getsockname"):
+            with self.subTest(stage=stage):
+                self.probe.reset_mock()
+                self.resolve.return_value = [self.candidate(), self.candidate("10.30.0.1")]
+                getattr(self.probe, stage).side_effect = OSError("network down")
+                self.assertIsNone(self.worker._ip_address())
+                self.assertEqual(self.probe.__exit__.call_count, 2)
+                getattr(self.probe, stage).side_effect = None
+
+    def test_unusable_source_addresses_are_not_reported_and_next_candidate_is_tried(self):
+        for source in ("127.0.0.1", "0.0.0.0", "224.0.0.1", "169.254.1.2",
+                       "255.255.255.255", "::1", "::", "ff02::1", "fe80::1%7",
+                       "::ffff:127.0.0.1", "::ffff:0.0.0.0", "::ffff:224.0.0.1",
+                       "fd12:3456::7", "::ffff:10.20.0.7", "not-an-ip", ""):
+            with self.subTest(source=source):
+                self.probe.reset_mock()
+                self.resolve.return_value = [self.candidate(), self.candidate("10.30.0.1")]
+                self.probe.getsockname.side_effect = [(source, 54321), ("10.30.0.7", 54321)]
+                self.assertEqual(self.worker._ip_address(), "10.30.0.7")
+                self.assertEqual(self.probe.__exit__.call_count, 2)
+                self.resolve.return_value = [self.candidate()]
+                self.probe.getsockname.side_effect = [(source, 54321)]
+                self.assertIsNone(self.worker._ip_address())
+
+    def test_ip_failure_does_not_discard_gpu_or_memory(self):
+        gpus = [{"index": 0, "memory_total_bytes": 1234}]
+        memory = {"total_bytes": 5678}
+        with mock.patch.object(self.worker, "_nvidia_gpus", return_value=gpus), \
+             mock.patch.object(self.worker, "_system_memory", return_value=memory):
+            self.resolve.side_effect = socket.gaierror("DNS unavailable")
+            telemetry = self.worker.collect_telemetry()
+            self.assertIsNone(telemetry["ip_address"])
+            self.assertEqual(telemetry["gpus"], gpus)
+            self.assertEqual(telemetry["memory"], memory)
+            self.assertEqual(telemetry["memory_total_bytes"], 5678)
+            with mock.patch.object(self.worker, "_ip_address", side_effect=RuntimeError("probe failed")):
+                self.assertIsNone(self.worker.collect_telemetry()["ip_address"])
+
+
+class WorkerIPTransmissionTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_scan_registration_heartbeat_and_sqlite_reopen_preserve_ip(self):
+        worker = self.make_worker(server_url="https://controller.invalid:8443")
+        database = worker.config_path.parent / "control.db"
+        self.store = DistributedStore(database)
+        self.addCleanup(lambda: self.store.close())
+        requests = []
+
+        async def request(method, url, **kwargs):
+            body = copy.deepcopy(kwargs.get("json"))
+            requests.append((url, body))
+            if url.endswith("/system_stats"):
+                return {"devices": [], "system": {}}
+            if url.endswith("/object_info"):
+                return {"KSampler": {}}
+            if url.endswith("/register"):
+                return self.store.register_worker(body["name"], body["capabilities"])
+            if url.endswith("/heartbeat"):
+                return self.store.heartbeat(worker.state["worker_id"], **body)
+            self.fail("非预期请求：" + url)
+
+        worker._json_request = mock.AsyncMock(side_effect=request)
+        worker.local_status = mock.AsyncMock()
+        worker.confirm_release_recovery = mock.AsyncMock()
+        probe = mock.MagicMock(spec=socket.socket)
+        probe.__enter__.return_value = probe
+
+        def assert_stored(expected):
+            worker_id = worker.state["worker_id"]
+            full = self.store.list_workers()[0]
+            self.assertEqual(full["id"], worker_id)
+            self.assertEqual(full["capabilities"]["telemetry"]["ip_address"], expected)
+            self.assertEqual(self.store.list_workers(telemetry_only=True)[0][
+                "capabilities"]["telemetry"]["ip_address"], expected)
+            summary = self.store.list_workers(summary=True)[0]
+            self.assertEqual(summary["id"], worker_id)
+            self.assertNotIn("capabilities", summary)
+            self.assertNotIn("ip_address", summary)
+            self.store.close()
+            self.store = DistributedStore(database)
+            self.assertEqual(self.store.list_workers()[0][
+                "capabilities"]["telemetry"]["ip_address"], expected)
+            self.assertTrue(self.store.authenticate(worker_id, worker.state["worker_token"]))
+
+        async def heartbeat():
+            worker.last_telemetry_scan = 0
+            worker.stop_event = mock.Mock()
+            worker.stop_event.is_set.side_effect = [False, True]
+            worker.stop_event.wait = mock.AsyncMock(return_value=True)
+            await worker.heartbeat_loop()
+            self.assertTrue(requests[-1][0].endswith("/heartbeat"))
+            return requests[-1][1]
+
+        with mock.patch("agent.socket.getaddrinfo", return_value=[
+                WorkerIPAddressTest.candidate()]) as resolve, \
+             mock.patch("agent.socket.socket", return_value=probe), \
+             mock.patch.object(worker, "_nvidia_gpus", return_value=[{"index": 0}]), \
+             mock.patch.object(worker, "_system_memory", return_value={"total_bytes": 1234}):
+            probe.getsockname.return_value = ("10.20.0.7", 54321)
+            telemetry = await worker.scan_telemetry()
+            self.assertEqual(telemetry["ip_address"], "10.20.0.7")
+            self.assertIs(worker.capabilities["telemetry"], telemetry)
+            await worker.ensure_registered()
+            self.assertEqual(requests[-1][1]["capabilities"]["telemetry"]["ip_address"], "10.20.0.7")
+            self.assertEqual(worker.capabilities["agent_version"], 9)
+            assert_stored("10.20.0.7")
+
+            probe.getsockname.return_value = ("10.20.0.8", 54321)
+            body = await heartbeat()
+            self.assertEqual(body["telemetry"]["ip_address"], "10.20.0.8")
+            self.assertNotIn("capabilities", body)
+            assert_stored("10.20.0.8")
+
+            resolve.return_value = [WorkerIPAddressTest.candidate(
+                "fd12:3456::1", family=socket.AF_INET6)]
+            body = await heartbeat()
+            self.assertIsNone(body["telemetry"]["ip_address"])
+            assert_stored(None)
+
+            worker.last_capability_scan = 0
+            resolve.side_effect = socket.gaierror("DNS unavailable")
+            body = await heartbeat()
+            self.assertIsNone(body["telemetry"]["ip_address"])
+            self.assertIsNone(body["capabilities"]["telemetry"]["ip_address"])
+            self.assertEqual(body["telemetry"]["memory"], {"total_bytes": 1234})
+            self.assertEqual(body["telemetry"]["gpus"], [{"index": 0}])
+            assert_stored(None)
+
+    async def test_ip_lookup_failure_does_not_prevent_first_registration(self):
+        worker = self.make_worker()
+        worker._json_request = mock.AsyncMock(side_effect=[
+            {"devices": []}, {"KSampler": {}},
+            {"worker_id": "synthetic-worker", "worker_token": "synthetic-token"},
+        ])
+        with mock.patch("agent.socket.getaddrinfo", side_effect=socket.gaierror("DNS unavailable")), \
+             mock.patch("agent.socket.socket") as factory, \
+             mock.patch.object(worker, "_nvidia_gpus", return_value=[]), \
+             mock.patch.object(worker, "_system_memory", return_value=None):
+            await worker.ensure_registered()
+        body = worker._json_request.await_args.kwargs["json"]
+        self.assertIsNone(body["capabilities"]["telemetry"]["ip_address"])
+        self.assertEqual(worker.state["worker_id"], "synthetic-worker")
+        factory.assert_not_called()
 
 
 class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
@@ -749,7 +1028,8 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             {"devices": [device], "system": {}}, {"KSampler": {}},
         ])
         with mock.patch.object(self.worker, "_nvidia_gpus", return_value=[{"name": "other GPU"}]), \
-             mock.patch.object(self.worker, "_system_memory", return_value=None):
+             mock.patch.object(self.worker, "_system_memory", return_value=None), \
+             mock.patch.object(self.worker, "_ip_address", return_value=None):
             caps = await self.worker.scan_capabilities()
         hardware = caps["hardware"]
         self.assertEqual(hardware["environment_id"], "env-verified")

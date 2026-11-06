@@ -6,12 +6,14 @@ import copy
 import csv
 import ctypes
 import hashlib
+import ipaddress
 import json
 import math
 import mimetypes
 import os
 import platform
 import re
+import socket
 import ssl
 import subprocess
 import sys
@@ -19,6 +21,7 @@ import tempfile
 import time
 import uuid
 from pathlib import Path, PurePosixPath
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -449,6 +452,44 @@ class WorkerAgent:
             ] or None,
         }
 
+    def _ip_address(self):
+        # 仅按控制端 IPv4 目标路由选源地址；缺少控制端时不猜测网卡。
+        server = getattr(self, "server", None)
+        if not isinstance(server, str) or not server.strip():
+            return None
+        try:
+            target = urlsplit(server)
+            host = target.hostname
+            if (target.scheme not in {"http", "https"} or not host
+                    or any(char.isspace() for char in host)):
+                return None
+            port = target.port if target.port is not None else (
+                443 if target.scheme == "https" else 80)
+            if not 0 < port <= 65535:
+                return None
+            candidates = socket.getaddrinfo(
+                host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        except (OSError, ValueError):
+            return None
+
+        for family, socktype, proto, _, destination in candidates:
+            if family != socket.AF_INET:
+                continue
+            try:
+                # UDP connect 只查询内核路由，不发送业务数据；每个候选都独立关闭。
+                with socket.socket(family, socktype, proto) as probe:
+                    probe.connect(destination)
+                    source = probe.getsockname()[0]
+                    address = ipaddress.IPv4Address(source)
+                    if (address.is_loopback or address.is_unspecified
+                            or address.is_multicast or address.is_link_local
+                            or address.is_reserved):
+                        continue
+                    return str(address)
+            except (OSError, ValueError):
+                continue
+        return None
+
     def collect_telemetry(self):
         try:
             gpus = self._nvidia_gpus()
@@ -458,11 +499,16 @@ class WorkerAgent:
             memory = self._system_memory()
         except Exception:
             memory = None
+        try:
+            ip_address = self._ip_address()
+        except Exception:
+            ip_address = None
         hardware = self.capacity_hardware(
             memory, (getattr(self, "capabilities", None) or {}).get("devices"),
         )
         return {
             **hardware,
+            "ip_address": ip_address,
             "hostname": os.environ.get("COMPUTERNAME") or platform.node()
                         or self.config.get("worker_name") or "windows-worker",
             "gpus": gpus,
