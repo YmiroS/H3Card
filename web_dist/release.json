@@ -1,5 +1,5 @@
 {
-  "source_commit": "2dcdcb0925d4567cf383c94d7ae2275133fe3a7c",
+  "source_commit": "aec7e4f6663afb620cec47c424f113f89a7ab6d9",
   "source_directory": "frontend",
   "environment": {
     "VITE_IF_BRIDGE_URL": "http://127.0.0.1:8278"
