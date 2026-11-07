@@ -6,7 +6,7 @@ import unittest
 from types import SimpleNamespace
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, urlsplit, urlencode
 
 import aiohttp
 from aiohttp import web
@@ -460,6 +460,74 @@ class MediaHTTPTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 403)
             self.assertEqual(converter.await_count, 1)
             self.assertNotIn('test-ak', str(response.headers))
+
+    async def test_preview_stream_timeout_closes_connection_without_second_response(self):
+        candidate = resource(key='clip.mp4')
+        candidate['type'] = 'VIDEO'
+        self.tree = tree(candidate)
+        self.response_headers['Content-Type'] = 'video/mp4'
+        self.app['video_previews'] = SimpleNamespace(ffmpeg_bin=lambda: 'ffmpeg')
+        previews = self.app[media._PREVIEWS]
+        original_write = web.StreamResponse.write
+
+        async def convert(executable, source, target):
+            target.write_bytes(b'compatible-mp4')
+
+        async def timeout_after_headers(response, data):
+            await original_write(response, data[:1])
+            raise asyncio.TimeoutError()
+
+        url = self.client.make_url('/api/dinghai/media')
+        reader, writer = await asyncio.open_connection(url.host, url.port)
+        try:
+            with patch.object(previews, 'convert', AsyncMock(side_effect=convert)), \
+                    patch.object(web.StreamResponse, 'write', timeout_after_headers):
+                query = urlencode({**QUERY, 'preview': '1'})
+                writer.write(f'GET /api/dinghai/media?{query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n'.encode())
+                await writer.drain()
+                raw = await asyncio.wait_for(reader.read(), 5)
+            self.assertEqual(raw.count(b'HTTP/1.'), 1)
+            headers, body = raw.split(b'\r\n\r\n', 1)
+            self.assertIn(b'200 OK', headers)
+            self.assertEqual(body, b'c')
+            self.assertNotIn(b'json', raw)
+        finally:
+            writer.close()
+            await writer.wait_closed()
+        await self.assert_slots_released()
+        self.assertFalse(previews.lock.locked())
+
+    async def test_preview_file_is_closed_before_cache_lock_is_released(self):
+        candidate = resource(key='clip.mp4')
+        candidate['type'] = 'VIDEO'
+        self.tree = tree(candidate)
+        self.response_headers['Content-Type'] = 'video/mp4'
+        self.app['video_previews'] = SimpleNamespace(ffmpeg_bin=lambda: 'ffmpeg')
+        previews = self.app[media._PREVIEWS]
+        original_open = Path.open
+        opened = []
+
+        async def convert(executable, source, target):
+            target.write_bytes(b'compatible-mp4')
+
+        def track_open(path, *args, **kwargs):
+            file = original_open(path, *args, **kwargs)
+            if path.suffix == '.mp4' and args == ('rb',):
+                opened.append(file)
+            return file
+
+        with patch.object(previews, 'convert', AsyncMock(side_effect=convert)), \
+                patch.object(Path, 'open', track_open):
+            response = await self.get(preview='1', headers={'Range': 'bytes=-3'})
+            self.assertEqual(response.status, 206)
+            self.assertEqual(await response.read(), b'mp4')
+            response = await self.get(preview='1', headers={'Range': 'bytes=14-'})
+            self.assertEqual(response.status, 416)
+            await response.read()
+        await self.assert_slots_released()
+        self.assertFalse(previews.lock.locked())
+        self.assertTrue(opened)
+        self.assertTrue(all(file.closed for file in opened))
 
     async def test_preview_rejects_wrong_kind_and_invalid_options(self):
         for changes in ({'preview': '1'}, {'preview': '0'}, {'preview': 'true'},

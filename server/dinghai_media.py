@@ -376,13 +376,49 @@ async def _stream(request, url, requested_range):
         return downstream
 
 
-class _PreviewFileResponse(web.FileResponse):
-    async def prepare(self, request):
-        # The handler prepares while holding the cache lease; aiohttp calls again on return.
-        if hasattr(self, '_preview_writer'):
-            return self._preview_writer
-        self._preview_writer = await super().prepare(request)
-        return self._preview_writer
+async def _stream_preview(request, target):
+    size = target.stat().st_size
+    start, stop, status = 0, size, 200
+    if 'Range' in request.headers and 'If-Range' not in request.headers:
+        requested = request.http_range
+        if requested.start is not None:
+            start = max(0, size + requested.start) if requested.start < 0 else requested.start
+            stop = min(size, requested.stop) if requested.stop is not None else size
+            if start >= size or stop <= start:
+                raise _error(416, 'dinghai_media_invalid_range', '媒体字节范围不可用')
+            status = 206
+    headers = {
+        'Content-Type': 'video/mp4', 'Content-Length': str(stop - start),
+        'Accept-Ranges': 'bytes', 'Cache-Control': 'private, no-store',
+        'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+        'Content-Security-Policy': "default-src 'none'; sandbox",
+    }
+    if status == 206:
+        headers['Content-Range'] = f'bytes {start}-{stop - 1}/{size}'
+    downstream = web.StreamResponse(status=status, headers=headers)
+    try:
+        # Own the handle through the whole transfer; close synchronously before releasing the cache lock.
+        with target.open('rb') as source:
+            source.seek(start)
+            await downstream.prepare(request)
+            if request.method != 'HEAD':
+                remaining = stop - start
+                while remaining:
+                    chunk = source.read(min(64 * 1024, remaining))
+                    if not chunk:
+                        raise OSError('Incomplete compatibility preview')
+                    await downstream.write(chunk)
+                    remaining -= len(chunk)
+            await downstream.write_eof()
+        return downstream
+    except (Exception, asyncio.CancelledError):
+        if not downstream.prepared:
+            raise
+        # A timeout after headers must not append a second HTTP/JSON response to the MP4.
+        downstream.force_close()
+        if request.transport:
+            request.transport.close()
+        return downstream
 
 
 class DinghaiVideoPreviews:
@@ -483,14 +519,7 @@ class DinghaiVideoPreviews:
                     if key not in self.entries:
                         target.unlink(missing_ok=True)
             await require_dinghai(request)
-            response = _PreviewFileResponse(target, headers={
-                'Content-Type': 'video/mp4', 'Cache-Control': 'private, no-store',
-                'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
-                'Content-Security-Policy': "default-src 'none'; sandbox",
-            })
-            # prepare streams the file while locked, so eviction cannot race a Range response.
-            await response.prepare(request)
-            return response
+            return await _stream_preview(request, target)
         finally:
             self.lock.release()
 
