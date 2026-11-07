@@ -1,6 +1,7 @@
 """Exact, read-only Dinghai proxy. Local authorization remains in auth_middleware."""
 import asyncio
 import json
+import logging
 
 import aiohttp
 from aiohttp import web
@@ -128,9 +129,9 @@ async def require_dinghai(request: web.Request) -> DinghaiContext:
     return context
 
 
-def _sanitize_result(result, token, *, server_only=False):
-    # Java UserDTO includes an empty authToken even outside login responses.
-    # Remove empty credential metadata, but still reject any populated secret or echo.
+def _sanitize_result(result, token, *, server_only=False, redacted=None):
+    # Native DTOs contain NAS passwords as well as login metadata. Strip those
+    # fields server-side; never reject unrelated business data or expose secrets.
     if isinstance(result, dict):
         for key, value in list(result.items()):
             name = key.lower().replace('_', '').replace('-', '')
@@ -138,15 +139,15 @@ def _sanitize_result(result, token, *, server_only=False):
                              'password', 'passwordhash'}
             secret = secret or (not server_only and name in {'accesskeyid', 'accesskeysecret', 'securitytoken'})
             if secret:
-                if value is None or value == '':
-                    del result[key]
-                    continue
-                return False
-            if (not _sanitize_result(key, token, server_only=server_only)
-                    or not _sanitize_result(value, token, server_only=server_only)):
+                del result[key]
+                if redacted is not None:
+                    redacted.add(name)
+                continue
+            if (not _sanitize_result(key, token, server_only=server_only, redacted=redacted)
+                    or not _sanitize_result(value, token, server_only=server_only, redacted=redacted)):
                 return False
     elif isinstance(result, list):
-        return all(_sanitize_result(value, token, server_only=server_only) for value in result)
+        return all(_sanitize_result(value, token, server_only=server_only, redacted=redacted) for value in result)
     elif isinstance(result, str) and token in result:
         return False
     return True
@@ -172,8 +173,10 @@ async def _send(request, path, body):
                     raw.extend(chunk)
                     if len(raw) > MAX_RESPONSE:
                         raise _error(502, 'dinghai_invalid_response', '定海响应超出大小限制')
+                reason = 'json'
                 try:
                     data = json.loads(raw)
+                    reason = 'envelope'
                     if response.status == 403:
                         if (isinstance(data, dict) and data.get('success') is False
                                 and str(data.get('code')) in AUTH_CODES):
@@ -185,16 +188,27 @@ async def _send(request, path, body):
                         if str(data.get('code')) in AUTH_CODES:
                             _invalidate(request)
                         raise _error(403, 'dinghai_business_denied', '定海拒绝该业务请求')
+                    reason = 'result_type'
                     result = data['result']
                     if (result is not None and not isinstance(result, (dict, list))):
                         raise ValueError()
-                    if not _sanitize_result(result, context.token, server_only=path == '/api/file/oss/file'):
+                    reason = 'credential_echo'
+                    redacted = set()
+                    if not _sanitize_result(result, context.token, server_only=path == '/api/file/oss/file',
+                                            redacted=redacted):
                         raise ValueError()
+                    if redacted:
+                        logging.getLogger(__name__).info(
+                            'Dinghai response credential fields removed endpoint=%s fields=%s',
+                            path, ','.join(sorted(redacted)))
+                    reason = 'json_values'
                     # Reject NaN/Infinity even though Python's JSON decoder accepts them.
                     json.dumps(result, allow_nan=False)
                 except (ValueError, KeyError, UnicodeError, RecursionError):
                     if response.status == 403:
                         raise _error(403, 'dinghai_business_denied', '定海拒绝访问该资源') from None
+                    logging.getLogger(__name__).warning(
+                        'Dinghai invalid response endpoint=%s reason=%s', path, reason)
                     raise _error(502, 'dinghai_invalid_response', '定海响应格式不正确') from None
         await require_dinghai(request)
         return result

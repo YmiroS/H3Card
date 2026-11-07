@@ -453,13 +453,41 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         for value in (False, 0, [], {}, 'not-empty'):
             self.response = FakeResponse({'success': True, 'result': {'id': 42, 'authToken': value}})
             response = await self.post()
-            self.assertEqual(response.status, 502)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), {'id': 42})
         self.assertEqual(await self.status(), {'authenticated': True})
+
+    async def test_nested_nas_passwords_are_redacted_and_logs_never_include_values(self):
+        await self.activate()
+        secret = 'nas-password-must-not-escape'
+        for path, body, result, expected in (
+            ('/api/dinghai/user/current', {},
+             {'id': 42, 'nas': {'config': {'username': 'artist', 'password': secret}},
+              'satoken': 'another-secret'},
+             {'id': 42, 'nas': {'config': {'username': 'artist'}}}),
+            ('/api/dinghai/project/pageQuery', {'pageNum': 1, 'pageSize': 2000},
+             {'list': [{'id': 1, 'nas': {'config': {'password': secret}},
+                        'owner': {'id': 42, 'authToken': UPSTREAM_TOKEN}}]},
+             {'list': [{'id': 1, 'nas': {'config': {}}, 'owner': {'id': 42}}]}),
+        ):
+            self.response = FakeResponse({'success': True, 'result': result})
+            with self.assertLogs('server.dinghai_api', level='INFO') as logs:
+                response = await self.post(path, body)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(await response.json(), expected)
+            self.assertIn('password', '\n'.join(logs.output))
+            for value in (secret, UPSTREAM_TOKEN, 'another-secret'):
+                self.assertNotIn(value, '\n'.join(logs.output))
+        self.response = FakeResponse({'success': True, 'result': {'echo': UPSTREAM_TOKEN}})
+        with self.assertLogs('server.dinghai_api', level='WARNING') as logs:
+            response = await self.post()
+        self.assertEqual(response.status, 502)
+        self.assertIn('reason=credential_echo', '\n'.join(logs.output))
+        self.assertNotIn(UPSTREAM_TOKEN, '\n'.join(logs.output))
 
     async def test_malformed_sensitive_and_oversized_upstream_responses(self):
         await self.activate()
-        for payload in ({'success': True, 'result': {'satoken': 'another-secret'}},
-                        {'success': True, 'result': {'echo': UPSTREAM_TOKEN}},
+        for payload in ({'success': True, 'result': {'echo': UPSTREAM_TOKEN}},
                         {'success': True, 'result': 42}, {'success': True}, [],
                         {'success': True, 'result': {'x': float('nan')}}):
             self.response = FakeResponse(payload)
