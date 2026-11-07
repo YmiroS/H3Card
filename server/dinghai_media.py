@@ -8,6 +8,8 @@ import json
 import re
 import socket
 import time
+import tempfile
+from pathlib import Path
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import aiohttp
@@ -26,6 +28,7 @@ THUMB_PROCESSES = {
     'video': 'video/snapshot,t_0,f_jpg,w_240',
 }
 _SLOTS = web.AppKey('dinghai_media_slots', asyncio.Semaphore)
+_PREVIEWS = web.AppKey('dinghai_video_previews', object)
 _BASE = '/api/processNode/file/'
 
 
@@ -50,7 +53,7 @@ def _invalid_response():
 
 def parse_query(query):
     required = {'processNodeId', 'groupId', 'fileId', 'camera', 'history'}
-    allowed = required | {'versionId', 'thumbnail'}
+    allowed = required | {'versionId', 'thumbnail', 'preview'}
     if not required <= query.keys() or set(query) - allowed:
         raise _error(400, 'dinghai_media_invalid_request', '定海媒体参数不正确')
     result = {}
@@ -62,6 +65,10 @@ def parse_query(query):
             if value not in ('0', '1'):
                 raise _error(400, 'dinghai_media_invalid_request', '开关参数必须为 0 或 1')
             result[key] = value == '1'
+        elif key == 'preview':
+            if value != '1' or 'thumbnail' in query:
+                raise _error(400, 'dinghai_media_invalid_request', '视频预览参数不正确')
+            result[key] = True
         elif key == 'thumbnail':
             if value not in THUMB_PROCESSES:
                 raise _error(400, 'dinghai_media_invalid_request', '缩略图类型不正确')
@@ -313,6 +320,8 @@ async def _authorized_url(request, params):
         raise _error(413, 'dinghai_media_too_large', '媒体超出大小限制')
     key = normalize_object_key(attributes.get('ossPath'))
     thumbnail = params.get('thumbnail')
+    if params.get('preview') and resource.get('type', '').upper() != 'VIDEO':
+        raise _error(400, 'dinghai_media_invalid_request', '仅视频支持兼容预览')
     if thumbnail and resource.get('type', '').upper() != thumbnail.upper():
         raise _error(400, 'dinghai_media_invalid_request', '缩略图类型与文件类型不匹配')
     result = await upstream_post(request, '/api/file/oss/file', {'projectCode': '', 'ossFileList': []})
@@ -367,6 +376,137 @@ async def _stream(request, url, requested_range):
         return downstream
 
 
+class _PreviewFileResponse(web.FileResponse):
+    async def prepare(self, request):
+        # The handler prepares while holding the cache lease; aiohttp calls again on return.
+        if hasattr(self, '_preview_writer'):
+            return self._preview_writer
+        self._preview_writer = await super().prepare(request)
+        return self._preview_writer
+
+
+class DinghaiVideoPreviews:
+    """Private, bounded process-lifetime cache; authorization is checked before every use."""
+
+    def __init__(self):
+        self.directory = None
+        self.entries = {}
+        self.lock = asyncio.Lock()
+
+    async def download(self, url, target):
+        connector = aiohttp.TCPConnector(resolver=PublicOSSResolver(), limit=1, use_dns_cache=False)
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT, connect=10, sock_read=30)
+        async with aiohttp.ClientSession(connector=connector, timeout=timeout,
+                                         cookie_jar=aiohttp.DummyCookieJar(), trust_env=False,
+                                         auto_decompress=False) as session:
+            async with session.get(url, headers={'Accept-Encoding': 'identity'},
+                                   allow_redirects=False, ssl=True) as response:
+                headers = response_headers(response, None)
+                if response.status != 200 or not headers['Content-Type'].startswith('video/'):
+                    raise _invalid_response()
+                received = 0
+                with target.open('wb') as output:
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        received += len(chunk)
+                        if received > MAX_BYTES:
+                            raise _error(413, 'dinghai_media_too_large', '媒体超出大小限制')
+                        output.write(chunk)
+                if not received or ('Content-Length' in headers and received != int(headers['Content-Length'])):
+                    raise _invalid_response()
+
+    async def convert(self, executable, source, target):
+        process = None
+        spawn = asyncio.create_task(asyncio.create_subprocess_exec(
+            str(executable), '-nostdin', '-hide_banner', '-loglevel', 'error', '-y',
+            '-protocol_whitelist', 'file,pipe', '-format_whitelist', 'mov,matroska,webm,avi',
+            '-threads', '2', '-i', str(source), '-map', '0:v:0', '-map', '0:a:0?',
+            '-sn', '-dn', '-map_metadata', '-1', '-c:v', 'libx264', '-preset', 'veryfast',
+            '-crf', '18', '-vf', 'pad=ceil(iw/2)*2:ceil(ih/2)*2', '-pix_fmt', 'yuv420p',
+            '-filter_threads', '1', '-threads', '2', '-c:a', 'aac', '-b:a', '128k',
+            '-movflags', '+faststart', '-f', 'mp4', str(target),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL,
+        ))
+        try:
+            try:
+                process = await asyncio.shield(spawn)
+            except asyncio.CancelledError:
+                process = await spawn
+                raise
+            while process.returncode is None:
+                try:
+                    await asyncio.wait_for(process.wait(), 0.25)
+                except asyncio.TimeoutError:
+                    if target.exists() and target.stat().st_size >= MAX_BYTES:
+                        raise _error(413, 'dinghai_media_too_large', '兼容预览超出大小限制')
+            if process.returncode or not target.is_file() or not 0 < target.stat().st_size < MAX_BYTES:
+                raise _error(502, 'dinghai_preview_failed', '视频兼容预览生成失败，原片未修改')
+        finally:
+            if process is not None and process.returncode is None:
+                process.kill()
+                await process.wait()
+
+    async def respond(self, request, url):
+        try:
+            await asyncio.wait_for(self.lock.acquire(), QUEUE_TIMEOUT)
+        except asyncio.TimeoutError:
+            raise _error(429, 'dinghai_media_busy', '视频兼容预览正在处理中，请稍后重试') from None
+        try:
+            if self.directory is None:
+                self.directory = tempfile.TemporaryDirectory(prefix='chouka-dinghai-preview-')
+            # Signed query strings contain credentials and must never be cache keys or filenames.
+            identity = str(url.with_query(None)) + '\n' + str(sorted(request.query.items()))
+            key = hashlib.sha256(identity.encode()).hexdigest()
+            target = Path(self.directory.name) / (key + '.mp4')
+            if key in self.entries:
+                self.entries[key] = (self.entries[key][0], time.monotonic())
+            else:
+                while self.entries and (len(self.entries) >= 4 or sum(v[0] for v in self.entries.values()) > MAX_BYTES // 2):
+                    oldest = min(self.entries, key=lambda k: self.entries[k][1])
+                    (Path(self.directory.name) / (oldest + '.mp4')).unlink(missing_ok=True)
+                    del self.entries[oldest]
+                previews = request.app.get('video_previews')
+                executable = await asyncio.to_thread(previews.ffmpeg_bin) if previews else None
+                if executable is None:
+                    raise _error(502, 'dinghai_preview_unavailable', '服务器未找到 FFmpeg，无法生成兼容预览')
+                source = target.with_suffix('.source')
+                try:
+                    await self.download(url, source)
+                    await self.convert(executable, source, target)
+                    # Keep all cached derivatives under the same total byte limit.
+                    while self.entries and sum(v[0] for v in self.entries.values()) + target.stat().st_size > MAX_BYTES:
+                        oldest = min(self.entries, key=lambda k: self.entries[k][1])
+                        (Path(self.directory.name) / (oldest + '.mp4')).unlink(missing_ok=True)
+                        del self.entries[oldest]
+                    self.entries[key] = (target.stat().st_size, time.monotonic())
+                finally:
+                    source.unlink(missing_ok=True)
+                    if key not in self.entries:
+                        target.unlink(missing_ok=True)
+            await require_dinghai(request)
+            response = _PreviewFileResponse(target, headers={
+                'Content-Type': 'video/mp4', 'Cache-Control': 'private, no-store',
+                'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer',
+                'Content-Security-Policy': "default-src 'none'; sandbox",
+            })
+            # prepare streams the file while locked, so eviction cannot race a Range response.
+            await response.prepare(request)
+            return response
+        finally:
+            self.lock.release()
+
+    async def close(self):
+        async with self.lock:
+            if self.directory is not None:
+                self.directory.cleanup()
+                self.directory = None
+            self.entries.clear()
+
+
+async def _preview_cleanup(app):
+    yield
+    await app[_PREVIEWS].close()
+
+
 async def _watch_disconnect(request, task):
     # aiohttp does not always cancel handlers on peer disconnect (runner setting).
     while not task.done():
@@ -396,6 +536,8 @@ async def dinghai_media(request):
         watcher = asyncio.create_task(_watch_disconnect(request, asyncio.current_task()))
         async with asyncio.timeout(REQUEST_TIMEOUT):
             url = await _authorized_url(request, params)
+            if params.get('preview'):
+                return await request.app[_PREVIEWS].respond(request, url)
             return await _stream(request, url, requested_range)
     except web.HTTPException as exc:
         # Helpers may return 401/403; never expose cookies or trigger local logout.
@@ -428,4 +570,6 @@ async def dinghai_media(request):
 
 def register_dinghai_media_routes(app):
     app[_SLOTS] = asyncio.Semaphore(MAX_CONCURRENT)
+    app[_PREVIEWS] = DinghaiVideoPreviews()
+    app.cleanup_ctx.append(_preview_cleanup)
     app.router.add_get('/api/dinghai/media', dinghai_media)

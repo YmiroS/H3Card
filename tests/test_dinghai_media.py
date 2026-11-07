@@ -4,6 +4,7 @@ import copy
 import socket
 import unittest
 from types import SimpleNamespace
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlsplit
 
@@ -426,6 +427,68 @@ class MediaHTTPTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await response.read(), b'')
         response = await self.get(headers={'Range': 'bytes=0-1,3-4'})
         self.assertEqual(response.status, 416)
+
+    async def test_compatibility_preview_ranges_cache_and_reauthorization(self):
+        candidate = resource(key='clip.mp4')
+        candidate['type'] = 'VIDEO'
+        self.tree = tree(candidate)
+        self.response_headers['Content-Type'] = 'video/mp4'
+        self.app['video_previews'] = SimpleNamespace(ffmpeg_bin=lambda: 'ffmpeg')
+        previews = self.app[media._PREVIEWS]
+
+        async def convert(executable, source, target):
+            self.assertEqual(source.read_bytes(), self.payload)
+            target.write_bytes(b'compatible-mp4')
+
+        with patch.object(previews, 'convert', AsyncMock(side_effect=convert)) as converter:
+            response = await self.get(preview='1', versionId='40', headers={'Range': 'bytes=2-5'})
+            self.assertEqual(response.status, 206)
+            self.assertEqual(await response.read(), b'mpat')
+            self.assertEqual(response.headers['Content-Range'], 'bytes 2-5/14')
+            self.assertEqual(len(self.oss_calls), 1)
+            self.assertNotIn('Range', self.oss_calls[0][1])
+            response = await self.get(preview='1', versionId='40', method='HEAD')
+            self.assertEqual(response.status, 200)
+            self.assertEqual(response.headers['Content-Length'], '14')
+            self.assertEqual(await response.read(), b'')
+            self.assertEqual(converter.await_count, 1)
+            self.assertEqual(len(self.oss_calls), 1)
+            self.assertEqual(len(self.api_calls), 6)
+            self.assertEqual(len(list(Path(previews.directory.name).iterdir())), 1)
+            self.groups[0]['canDownload'] = False
+            response = await self.get(preview='1', versionId='40')
+            self.assertEqual(response.status, 403)
+            self.assertEqual(converter.await_count, 1)
+            self.assertNotIn('test-ak', str(response.headers))
+
+    async def test_preview_rejects_wrong_kind_and_invalid_options(self):
+        for changes in ({'preview': '1'}, {'preview': '0'}, {'preview': 'true'},
+                        {'preview': '1', 'thumbnail': 'image'}):
+            response = await self.get(**changes)
+            self.assertEqual(response.status, 400)
+            await response.read()
+        self.assertFalse(self.oss_calls)
+
+    async def test_preview_conversion_failure_removes_original_and_partial_copy(self):
+        candidate = resource(key='clip.mp4')
+        candidate['type'] = 'VIDEO'
+        self.tree = tree(candidate)
+        self.response_headers['Content-Type'] = 'video/mp4'
+        self.app['video_previews'] = SimpleNamespace(ffmpeg_bin=lambda: 'ffmpeg')
+        previews = self.app[media._PREVIEWS]
+
+        async def fail(executable, source, target):
+            target.write_bytes(b'partial')
+            raise RuntimeError('secret-signed-url')
+
+        with patch.object(previews, 'convert', AsyncMock(side_effect=fail)):
+            response = await self.get(preview='1')
+            self.assertEqual(response.status, 502)
+            self.assertNotIn('secret', await response.text())
+            self.assertEqual(list(Path(previews.directory.name).iterdir()), [])
+            self.assertFalse(previews.lock.locked())
+        response = await self.get()
+        self.assertEqual(await response.read(), self.payload)
 
     async def test_thumbnail_processes_match_source_core(self):
         for kind, expected in media.THUMB_PROCESSES.items():
