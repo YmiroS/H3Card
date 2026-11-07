@@ -69,7 +69,8 @@ def validate_body(path, body):
     if valid:
         for key, value in body.items():
             if key in ('pageNum', 'pageSize'):
-                valid = type(value) is int and 1 <= value <= (100 if key == 'pageSize' else 100000)
+                maximum = (2000 if path == '/api/project/pageQuery' else 100) if key == 'pageSize' else 100000
+                valid = type(value) is int and 1 <= value <= maximum
             elif key in ('projectId', 'processNodeId', 'groupId'):
                 valid = _id(value)
             elif key == 'sourceType':
@@ -127,22 +128,25 @@ async def require_dinghai(request: web.Request) -> DinghaiContext:
     return context
 
 
-def _safe_result(result, token, *, server_only=False):
-    # Native result shapes are preserved, but credentials must never escape even
-    # if an upstream endpoint accidentally returns login metadata or echoes a token.
+def _sanitize_result(result, token, *, server_only=False):
+    # Java UserDTO includes an empty authToken even outside login responses.
+    # Remove empty credential metadata, but still reject any populated secret or echo.
     if isinstance(result, dict):
-        for key, value in result.items():
+        for key, value in list(result.items()):
             name = key.lower().replace('_', '').replace('-', '')
-            if name in {'token', 'satoken', 'authtoken', 'accesstoken', 'refreshtoken',
-                        'password', 'passwordhash'}:
+            secret = name in {'token', 'satoken', 'authtoken', 'accesstoken', 'refreshtoken',
+                             'password', 'passwordhash'}
+            secret = secret or (not server_only and name in {'accesskeyid', 'accesskeysecret', 'securitytoken'})
+            if secret:
+                if value is None or value == '':
+                    del result[key]
+                    continue
                 return False
-            if not server_only and name in {'accesskeyid', 'accesskeysecret', 'securitytoken'}:
-                return False
-            if (not _safe_result(key, token, server_only=server_only)
-                    or not _safe_result(value, token, server_only=server_only)):
+            if (not _sanitize_result(key, token, server_only=server_only)
+                    or not _sanitize_result(value, token, server_only=server_only)):
                 return False
     elif isinstance(result, list):
-        return all(_safe_result(value, token, server_only=server_only) for value in result)
+        return all(_sanitize_result(value, token, server_only=server_only) for value in result)
     elif isinstance(result, str) and token in result:
         return False
     return True
@@ -184,7 +188,7 @@ async def _send(request, path, body):
                     result = data['result']
                     if (result is not None and not isinstance(result, (dict, list))):
                         raise ValueError()
-                    if not _safe_result(result, context.token, server_only=path == '/api/file/oss/file'):
+                    if not _sanitize_result(result, context.token, server_only=path == '/api/file/oss/file'):
                         raise ValueError()
                     # Reject NaN/Infinity even though Python's JSON decoder accepts them.
                     json.dumps(result, allow_nan=False)

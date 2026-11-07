@@ -330,7 +330,9 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         await self.activate()
         cases = [('/user/current', []), ('/user/current', {'url': 'https://evil.test'}),
                  ('/project/pageQuery', {'pageNum': 0, 'pageSize': 20}),
-                 ('/project/pageQuery', {'pageNum': 1, 'pageSize': 101}),
+                 ('/project/pageQuery', {'pageNum': 1, 'pageSize': 2001}),
+                 ('/task/queryTaskForZhaiXing', {'projectId': 1, 'sourceType': 'CAMERA',
+                                               'pageNum': 1, 'pageSize': 101}),
                  ('/project/pageQuery', {'pageNum': True, 'pageSize': 20}),
                  ('/processNode/queryProcessNodeInfo', {'processNodeId': -1}),
                  ('/processNode/queryProcessNodeInfo', {'processNodeId': '1/../../x'}),
@@ -424,6 +426,35 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         request['auth_session'] = self.store.get_session(self.cookie())
         request['user'] = request['auth_session']['user']
         return request
+
+    async def test_native_project_page_size_matches_frontend_contract(self):
+        await self.activate()
+        body = {'pageNum': 1, 'pageSize': 2000, 'status': 'DEFAULT'}
+        self.response = FakeResponse({'success': True, 'result': {'list': []}})
+        response = await self.post('/api/dinghai/project/pageQuery', body)
+        self.assertEqual(response.status, 200)
+        self.assertEqual(self.calls[-1][1]['json'], body)
+
+    async def test_empty_java_credential_metadata_is_removed_without_losing_business_fields(self):
+        await self.activate()
+        for path, body, result, expected in (
+            ('/api/dinghai/user/current', {},
+             {'id': 42, 'name': '定海用户', 'authToken': None, 'password': '', 'passwordChanged': False},
+             {'id': 42, 'name': '定海用户', 'passwordChanged': False}),
+            ('/api/dinghai/project/pageQuery', {'pageNum': 1, 'pageSize': 2000},
+             {'list': [{'id': 1, 'owner': {'id': 42, 'authToken': None}}], 'total': 1},
+             {'list': [{'id': 1, 'owner': {'id': 42}}], 'total': 1}),
+        ):
+            with self.subTest(path=path):
+                self.response = FakeResponse({'success': True, 'result': result})
+                response = await self.post(path, body)
+                self.assertEqual(response.status, 200, await response.text())
+                self.assertEqual(await response.json(), expected)
+        for value in (False, 0, [], {}, 'not-empty'):
+            self.response = FakeResponse({'success': True, 'result': {'id': 42, 'authToken': value}})
+            response = await self.post()
+            self.assertEqual(response.status, 502)
+        self.assertEqual(await self.status(), {'authenticated': True})
 
     async def test_malformed_sensitive_and_oversized_upstream_responses(self):
         await self.activate()
