@@ -12,16 +12,18 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer, make_mocked_request
 from yarl import URL
 
-from server.auth import COOKIE, auth_middleware, register_auth_routes
+from server.auth import COOKIE, auth_middleware, me, register_auth_routes
 from server.dinghai_api import READ_CONTRACTS, require_dinghai, upstream_post, validate_body
 from server.dinghai_auth import PENDING_COOKIE
 from server.auth_store import AuthStore
-from server.dinghai_sessions import DinghaiContext, DinghaiCredentials
+from server.dinghai_sessions import (DinghaiContext, DinghaiCredentials, attach_profile,
+                                     current_context, current_profile)
 
 ROOT = Path(__file__).resolve().parents[1]
 ISSUER = 'https://dinghai.example.test'
 PASSWORD = 'test-local-password'
 UPSTREAM_TOKEN = 'fixture-upstream-secret-token'
+PROFILE = {'id': '42', 'username': 'upstream-account', 'display_name': '定海用户', 'phone': ''}
 
 
 class FakeResponse:
@@ -86,7 +88,7 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         await self.client.start_server()
         self.headers = {'Origin': str(self.client.make_url('/')).rstrip('/')}
         self.auth = AsyncMock(return_value={'subject': '42', 'display_name': '定海用户',
-                                           'token': UPSTREAM_TOKEN})
+                                           'token': UPSTREAM_TOKEN, 'profile': dict(PROFILE)})
         self.auth_patch = patch('server.dinghai_auth.authenticate', self.auth)
         self.auth_patch.start()
         self.calls = []
@@ -181,6 +183,8 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         self.csrf = data['csrf_token']
         self.assertFalse(data['dinghai_authenticated'])
         self.assertIsNone(self.vault.get('sessions', previous))
+        self.assertIsNone(self.vault.get_profile(previous))
+        self.assertNotIn('dinghai_profile', data['user'])
         self.assertEqual(await self.status(), {'authenticated': False})
         denied = await self.post()
         self.assertEqual(denied.status, 403)
@@ -259,7 +263,10 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/auth/dinghai/bind',
             json={'username': 'local-user', 'password': PASSWORD},
             headers=self.headers | {'X-Binding-CSRF': data['binding_csrf']})
-        self.assertFalse((await response.json())['dinghai_authenticated'])
+        data = await response.json()
+        self.assertFalse(data['dinghai_authenticated'])
+        self.assertNotIn('dinghai_profile', data['user'])
+        self.assertEqual(len(self.vault.profiles), 0)
         self.assertEqual(await self.status(), {'authenticated': False})
 
     async def test_authentication_failures_remove_only_dinghai_capability(self):
@@ -345,6 +352,13 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         # set_user revokes old sessions; a new Dinghai login preserves monitor role
         data = await self.login()
         self.assertFalse(data['dinghai_authenticated'])
+        self.assertEqual(data['user']['role'], 'monitor')
+        self.assertEqual(data['user']['dinghai_profile'], PROFILE)
+        me_data = await (await self.client.get('/api/auth/me')).json()
+        self.assertEqual(me_data['user']['dinghai_profile'], PROFILE)
+        self.assertFalse(me_data['dinghai_authenticated'])
+        self.assertIsNone(current_context(self.request_context()))
+        self.assertIsNotNone(current_profile(self.request_context()))
         self.csrf = data['csrf_token']
         self.assertEqual((await self.post()).status, 403)
         self.assertEqual((await self.client.get('/api/dinghai/session')).status, 403)
@@ -519,6 +533,109 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.post()).status, 403)
         self.assertEqual((await self.client.get('/api/auth/me')).status, 200)
 
+    async def test_profile_outlives_business_token_but_not_local_session(self):
+        self.store.session_ttl = 7200
+        data = await self.activate()
+        cookie = self.cookie()
+        key = self.vault._key(cookie)
+        self.assertEqual(data['user']['dinghai_profile'], PROFILE)
+        self.assertGreater(self.vault.profiles[key].expires, self.vault.sessions[key].expires + 3500)
+        later = time.monotonic() + 3601
+        with patch('server.dinghai_sessions.time.monotonic', return_value=later):
+            data = await (await self.client.get('/api/auth/me')).json()
+            self.assertFalse(data['dinghai_authenticated'])
+            self.assertEqual(data['user']['dinghai_profile'], PROFILE)
+            self.assertIsNone(self.vault.get('sessions', cookie))
+            self.assertEqual((await self.post()).status, 403)
+        with patch('server.auth_store.time.time', return_value=time.time() + 7201):
+            self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
+        self.assertIsNone(self.vault.get_profile(cookie))
+
+    async def test_profile_relogin_logout_cleanup_and_no_cross_browser_inheritance(self):
+        await self.activate()
+        old = self.cookie()
+        self.auth.return_value = dict(self.auth.return_value, profile=dict(PROFILE, phone='13800138000'))
+        updated = await self.activate()
+        self.assertEqual(updated['user']['dinghai_profile']['phone'], '13800138000')
+        self.assertIsNone(self.vault.get_profile(old))
+        dinghai_cookie = self.cookie()
+        self.client.session.cookie_jar.clear()
+        local = await self.client.post('/api/auth/login',
+            json={'username': 'local-user', 'password': PASSWORD}, headers=self.headers)
+        self.assertNotIn('dinghai_profile', (await local.json())['user'])
+        self.assertNotIn('dinghai_profile', (await (await self.client.get('/api/auth/me')).json())['user'])
+        self.assertIsNotNone(self.vault.get_profile(dinghai_cookie))
+        self.client.session.cookie_jar.clear()
+        self.client.session.cookie_jar.update_cookies({COOKIE: dinghai_cookie}, self.client.make_url('/'))
+        response = await self.post('/api/auth/logout')
+        self.assertEqual(response.status, 200)
+        self.assertIsNone(self.vault.get_profile(dinghai_cookie))
+        self.assertIsNone(self.vault.get('sessions', dinghai_cookie))
+
+    async def test_profile_me_and_context_return_copies_without_polluting_session(self):
+        await self.activate()
+        request = self.request_context()
+        session = request['auth_session']
+        user = request['user']
+        profile = current_profile(request)
+        profile['username'] = 'changed'
+        self.assertEqual(current_profile(request), PROFILE)
+        for _ in range(2):
+            response = await me(request)
+            self.assertEqual(json.loads(response.text)['user']['dinghai_profile'], PROFILE)
+        self.assertIs(request['auth_session'], session)
+        self.assertIs(request['user'], user)
+        self.assertNotIn('dinghai_profile', user)
+        self.assertNotIn('dinghai_profile', session['user'])
+        decorated = attach_profile(session, PROFILE | {'role': 'admin', 'token': UPSTREAM_TOKEN})
+        self.assertEqual(decorated['user']['dinghai_profile'], PROFILE)
+        self.assertIsNot(decorated['user'], user)
+
+    async def test_profile_rejects_user_issuer_session_and_isolated_modes(self):
+        await self.activate()
+        cookie = self.cookie()
+        key = self.vault._key(cookie)
+        entry = self.vault.profiles[key]
+        for invalid in (replace(entry, user_id='wrong'), replace(entry, issuer='https://wrong.test')):
+            self.vault.profiles[key] = invalid
+            self.assertIsNone(current_profile(self.request_context()))
+            self.assertIsNone(self.vault.get_profile(cookie))
+        for case in ('no_session', 'other_session_user', 'disabled', 'local_test', 'admin_sandbox'):
+            self.vault.profiles[key] = entry
+            request = self.request_context()
+            if case == 'no_session':
+                del request['auth_session']
+            elif case == 'other_session_user':
+                request['auth_session'] = {'user': {'id': 'other'}}
+            elif case == 'disabled':
+                request['user'] = dict(request['user'], enabled=False)
+            else:
+                self.app[case] = True
+            self.assertIsNone(current_profile(request), case)
+            self.assertIsNone(self.vault.get_profile(cookie))
+            if case in ('local_test', 'admin_sandbox'):
+                self.app[case] = False
+
+    async def test_binding_race_cannot_restore_profile_after_pending_discard(self):
+        from server.dinghai_auth import call_store
+        pending = await self.login()
+        token = self.cookie(PENDING_COOKIE)
+        async def discard_during_bind(app, method, *args, **kwargs):
+            result = await call_store(app, method, *args, **kwargs)
+            if method == 'dinghai_bind':
+                self.vault.discard('pending', token)
+            return result
+        with patch('server.dinghai_auth.call_store', side_effect=discard_during_bind):
+            response = await self.client.post('/api/auth/dinghai/bind',
+                json={'username': 'local-user', 'password': PASSWORD},
+                headers=self.headers | {'X-Binding-CSRF': pending['binding_csrf']})
+        data = await response.json()
+        self.assertEqual(response.status, 200)
+        self.assertFalse(data['dinghai_authenticated'])
+        self.assertNotIn('dinghai_profile', data['user'])
+        self.assertEqual(len(self.vault.profiles), 0)
+        self.assertNotIn('dinghai_profile', (await (await self.client.get('/api/auth/me')).json())['user'])
+
     async def test_short_local_session_ttl_caps_credential_lifetime(self):
         self.store.session_ttl = 30
         before = time.monotonic()
@@ -526,9 +643,48 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         entry = self.vault.get('sessions', self.cookie())
         self.assertLessEqual(entry.expires, time.monotonic() + 30)
         self.assertGreater(entry.expires, before)
+        self.assertEqual(self.vault.get_profile(self.cookie()).expires, entry.expires)
 
 
 class CredentialContainerTests(unittest.TestCase):
+    def test_profiles_are_separately_bounded_token_free_hashed_and_copied(self):
+        vault = DinghaiCredentials(maximum=2)
+        other = DinghaiCredentials(maximum=2)
+        context = DinghaiContext(ISSUER, '42', UPSTREAM_TOKEN, dict(PROFILE))
+        expires = time.monotonic() + 7200
+        for token in ('one', 'two', 'three'):
+            vault.put_profile(token, ISSUER, 'local-id', PROFILE | {
+                'token': UPSTREAM_TOKEN, 'password': PASSWORD, 'role': 'admin'}, expires)
+        self.assertEqual(len(vault.profiles), 2)
+        self.assertIsNone(vault.get_profile('one'))
+        self.assertEqual(list(vault.profiles), [vault._key(token) for token in ('two', 'three')])
+        entry = vault.get_profile('three')
+        self.assertEqual(set(vars(entry)), {'issuer', 'user_id', 'profile', 'expires'})
+        self.assertEqual(entry.profile, PROFILE)
+        self.assertNotIn(UPSTREAM_TOKEN, repr(vault.profiles))
+        self.assertNotIn(PASSWORD, repr(vault.profiles))
+        self.assertIsNone(other.get_profile('three'))
+        for token in ('a', 'b', 'c'):
+            vault.put('pending', token, context, time.monotonic() + 300)
+            vault.put('sessions', token, context, time.monotonic() + 3600, 'local-id')
+        self.assertIs(vault.get_profile('three'), entry)
+        for token in ('four', 'five'):
+            vault.put_profile(token, ISSUER, 'local-id', PROFILE, expires)
+        self.assertEqual(len(vault.pending), 2)
+        self.assertEqual(len(vault.sessions), 2)
+        profile = dict(PROFILE)
+        vault.put_profile('five', ISSUER, 'local-id', profile, expires)
+        profile['phone'] = 'changed'
+        self.assertEqual(vault.get_profile('five').profile, PROFILE)
+        vault.profiles[vault._key('five')] = replace(vault.get_profile('five'), expires=0)
+        self.assertIsNone(vault.get_profile('five'))
+        vault.discard_profile('four')
+        self.assertEqual(len(vault.profiles), 0)
+        self.assertFalse(vault.put_profile('expired', ISSUER, 'local-id', PROFILE, 0))
+        vault.put_profile('live', ISSUER, 'local-id', PROFILE, expires)
+        vault.clear()
+        self.assertEqual(len(vault.pending) + len(vault.sessions) + len(vault.profiles), 0)
+
     def test_bounded_hashed_namespaces_expiry_and_app_isolation(self):
         first, second = DinghaiCredentials(maximum=2), DinghaiCredentials(maximum=2)
         context = DinghaiContext(ISSUER, '42', UPSTREAM_TOKEN)

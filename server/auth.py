@@ -395,9 +395,9 @@ async def registrations(request):
 
 async def me(request):
     require_user(request)
-    from .dinghai_sessions import current_context
-    return web.json_response(dict(request['auth_session'],
-                                  dinghai_authenticated=current_context(request) is not None))
+    from .dinghai_sessions import attach_profile, current_context, current_profile
+    data = dict(request['auth_session'], dinghai_authenticated=current_context(request) is not None)
+    return web.json_response(attach_profile(data, current_profile(request)))
 
 
 async def phone(request):
@@ -405,7 +405,8 @@ async def phone(request):
     body = await _body(request, ('phone',))
     updated = await call_store(request.app, 'set_phone', user['id'], body['phone'],
                                session_token=request.cookies.get(COOKIE, ''))
-    return web.json_response({'user': updated})
+    from .dinghai_sessions import attach_profile, current_profile
+    return web.json_response(attach_profile({'user': updated}, current_profile(request)))
 
 
 async def online_presence(request):

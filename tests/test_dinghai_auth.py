@@ -16,6 +16,7 @@ from server.dinghai_auth import authenticate, validate_origin
 PASSWORD = 'test-local-password'
 ISSUER = 'https://dinghai.example.test'
 ROOT = Path(__file__).resolve().parents[1]
+PROFILE = {'id': '42', 'username': 'upstream-account', 'display_name': '定海用户', 'phone': ''}
 
 
 class DinghaiStoreTests(unittest.TestCase):
@@ -182,7 +183,7 @@ class DinghaiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.origin = str(self.client.make_url('/')).rstrip('/')
         self.headers = {'Origin': self.origin}
         self.auth = AsyncMock(return_value={'subject': '42', 'display_name': '定海用户',
-                                           'token': 'fixture-upstream-token'})
+                                           'token': 'fixture-upstream-token', 'profile': dict(PROFILE)})
         self.patcher = patch('server.dinghai_auth.authenticate', self.auth)
         self.patcher.start()
 
@@ -245,6 +246,77 @@ class DinghaiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.confirm(data)).status, 410)
         self.assertEqual((await self.client.post('/api/auth/dinghai/cancel', json={}, headers=headers)).status, 200)
         self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
+
+    async def test_login_bind_me_profile_preserves_canonical_local_identity(self):
+        local = self.store.login('local-user', PASSWORD)
+        self.store.set_phone(self.user['id'], '13900139000', session_token=local['token'])
+        before = self.store.get_user(self.user['id'])
+        pending = await (await self.login()).json()
+        self.assertNotIn('dinghai_profile', json.dumps(pending))
+        bound = await (await self.confirm(pending)).json()
+        me = await (await self.client.get('/api/auth/me')).json()
+        again = await (await self.login()).json()
+        for data in (bound, me, again):
+            self.assertEqual(data['user']['dinghai_profile'], PROFILE)
+            for key in ('id', 'username', 'display_name', 'phone', 'role'):
+                self.assertEqual(data['user'][key], before[key])
+        self.assertEqual(self.store.get_user(self.user['id']), before)
+        session = self.store.get_session(local['token'])
+        self.assertNotIn('dinghai_profile', session['user'])
+        self.assertNotIn('upstream-account', '\n'.join(self.store.db.iterdump()))
+        response = await self.client.post('/api/auth/login',
+            json={'username': 'local-user', 'password': PASSWORD}, headers=self.headers)
+        self.assertNotIn('dinghai_profile', (await response.json())['user'])
+        self.assertNotIn('dinghai_profile', (await (await self.client.get('/api/auth/me')).json())['user'])
+
+    async def test_monitor_binding_shows_profile_without_business_capability(self):
+        self.store.set_user(self.user['id'], role='monitor')
+        pending = await (await self.login()).json()
+        bound = await (await self.confirm(pending)).json()
+        self.assertEqual(bound['user']['id'], self.user['id'])
+        self.assertEqual(bound['user']['role'], 'monitor')
+        self.assertEqual(bound['user']['dinghai_profile'], PROFILE)
+        self.assertFalse(bound['dinghai_authenticated'])
+        self.assertEqual((await (await self.client.get('/api/auth/me')).json())['user'], bound['user'])
+        self.assertEqual(len(self.app['dinghai_credentials'].sessions), 0)
+        self.assertEqual((await self.client.get('/api/dinghai/session')).status, 403)
+
+    async def test_phone_update_keeps_profile_without_changing_upstream_phone(self):
+        pending = await (await self.login()).json()
+        bound = await (await self.confirm(pending)).json()
+        response = await self.client.post('/api/auth/phone', json={'phone': '13900139000'},
+            headers=self.headers | {'X-CSRF-Token': bound['csrf_token']})
+        self.assertEqual(response.status, 200)
+        data = await response.json()
+        self.assertEqual(data['user']['phone'], '13900139000')
+        self.assertEqual(data['user']['id'], self.user['id'])
+        self.assertEqual(data['user']['role'], self.user['role'])
+        self.assertEqual(data['user']['dinghai_profile'], PROFILE)
+        me_data = await (await self.client.get('/api/auth/me')).json()
+        self.assertEqual(me_data['user']['dinghai_profile'], PROFILE)
+        local = await self.client.post('/api/auth/login',
+            json={'username': 'local-user', 'password': PASSWORD}, headers=self.headers)
+        csrf = (await local.json())['csrf_token']
+        response = await self.client.post('/api/auth/phone', json={'phone': '13800138000'},
+            headers=self.headers | {'X-CSRF-Token': csrf})
+        self.assertEqual(response.status, 200)
+        self.assertNotIn('dinghai_profile', (await response.json())['user'])
+
+    async def test_failed_or_cancelled_binding_never_exposes_profile(self):
+        pending = await (await self.login()).json()
+        for headers, password, status in ((self.headers, PASSWORD, 403),
+                (self.headers | {'X-Binding-CSRF': pending['binding_csrf']}, 'wrong', 401)):
+            response = await self.client.post('/api/auth/dinghai/bind',
+                json={'username': 'local-user', 'password': password}, headers=headers)
+            self.assertEqual(response.status, status)
+            self.assertNotIn('upstream-account', await response.text())
+            self.assertEqual(len(self.app['dinghai_credentials'].profiles), 0)
+        response = await self.client.post('/api/auth/dinghai/cancel', json={},
+            headers=self.headers | {'X-Binding-CSRF': pending['binding_csrf']})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(len(self.app['dinghai_credentials'].pending), 0)
+        self.assertEqual((await self.confirm(pending)).status, 410)
+        self.assertEqual(len(self.app['dinghai_credentials'].profiles), 0)
 
     async def test_second_login_uses_binding_without_creating_user(self):
         data = await (await self.login()).json()
@@ -321,11 +393,46 @@ class DinghaiUpstreamTests(unittest.IsolatedAsyncioTestCase):
     async def test_existing_protocol_current_identity_and_no_phone_dependency(self):
         identity = await authenticate(self.origin, 'dinghai', 'password')
         self.assertEqual(identity, {'subject': '9223372036854775806', 'display_name': '定海姓名',
-                                    'token': 'fixture-token'})
+                                    'token': 'fixture-token',
+                                    'profile': {'id': '9223372036854775806', 'username': '',
+                                                'display_name': '定海姓名', 'phone': ''}})
         self.assertEqual(self.calls[0][1], {'account': 'dinghai', 'password': '5f4dcc3b5aa765d61d8327deb882cf99', 'device': 'WEB'})
         self.assertNotIn('satoken', self.calls[0][2])
         self.assertEqual(self.calls[1][2]['satoken'], 'fixture-token')
         self.assertEqual(self.calls[1][3], {})
+
+    async def test_profile_uses_only_current_allowlisted_normalized_fields(self):
+        self.current_payload['result'] = {
+            'id': '00042', 'account': ' actual-account ', 'name': ' 定海姓名 ',
+            'nickName': '不优先', 'phone': ' 13800138000 ', 'role': 'admin',
+            'password': 'must-not-escape', 'token': 'must-not-escape', 'extra': {'private': True},
+        }
+        identity = await authenticate(self.origin, 'untrusted-login-account', 'password')
+        self.assertEqual(identity['subject'], '42')
+        self.assertEqual(identity['profile'], {
+            'id': '42', 'username': 'actual-account', 'display_name': '定海姓名', 'phone': '13800138000'})
+        self.assertNotIn('must-not-escape', json.dumps(identity))
+
+    async def test_profile_missing_null_fields_and_existing_name_precedence(self):
+        for fields, expected_name in (({}, '定海用户'),
+                                      ({'name': None, 'nickName': ' 昵称 '}, '昵称'),
+                                      ({'name': '', 'nickName': None, 'account': ' 账号 '}, '账号')):
+            self.current_payload['result'] = {'id': 42, 'phone': None, **fields}
+            identity = await authenticate(self.origin, 'not-a-fallback', 'password')
+            self.assertEqual(identity['profile'], {
+                'id': '42', 'username': fields.get('account', '').strip(),
+                'display_name': expected_name, 'phone': ''})
+            self.assertEqual(identity['display_name'], expected_name)
+
+    async def test_profile_invalid_types_controls_and_lengths_fail_closed(self):
+        for key, maximum in (('name', 256), ('nickName', 256), ('account', 128), ('phone', 64)):
+            for value in (123, False, [], {}, 'bad\nvalue', 'bad\x7fvalue', 'bad\x85value',
+                          'bad\u202evalue', '\ud800', 'x' * (maximum + 1)):
+                self.current_payload['result'] = {'id': 42, key: value}
+                with self.subTest(key=key, value=repr(value)), self.assertRaisesRegex(AuthError, '用户信息格式'):
+                    await authenticate(self.origin, 'dinghai', 'password')
+        self.current_payload['result'] = {'id': 42, 'name': '名' * 100}
+        self.assertEqual((await authenticate(self.origin, 'dinghai', 'password'))['profile']['display_name'], '名' * 64)
 
     async def test_false_success_is_rejected_without_reading_current_user(self):
         self.login_payload = {'success': False, 'code': '0', 'message': 'sensitive upstream detail'}

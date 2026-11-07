@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import time
+import unicodedata
 from urllib.parse import urlsplit
 
 import aiohttp
@@ -13,7 +14,7 @@ from .auth import (COOKIE, _body, _rate_limit, _secure_cookie, call_store,
                    notify_access_changed)
 from .auth_store import AuthError
 from .dinghai_sessions import (DinghaiContext, PENDING_TTL, SESSION_TTL,
-                               register_credentials)
+                               attach_profile, register_credentials)
 
 PENDING_COOKIE = 'chouka_dinghai_binding'
 PENDING_PATH = '/api/auth'
@@ -89,12 +90,20 @@ async def authenticate(origin, account, password):
             or not str(uid).isascii() or not str(uid).isdigit()
             or len(str(uid)) > 20 or int(uid) <= 0):
         raise AuthError('定海未返回有效用户身份', 502)
-    name = next((value.strip() for value in (current.get('name'), current.get('nickName'),
-                                           current.get('account'))
-                 if isinstance(value, str) and value.strip()), '定海用户')
-    if any(ord(char) < 32 for char in name):
-        raise AuthError('定海用户信息格式不正确', 502)
-    return {'subject': str(int(uid)), 'display_name': name[:64], 'token': token}
+    fields = {}
+    for key, maximum in (('name', 256), ('nickName', 256), ('account', 128), ('phone', 64)):
+        value = current.get(key)
+        if value is None:
+            value = ''
+        if (not isinstance(value, str) or len(value) > maximum
+                or any(unicodedata.category(char) in ('Cc', 'Cf', 'Cs') for char in value)):
+            raise AuthError('定海用户信息格式不正确', 502)
+        fields[key] = value.strip()
+    name = next((fields[key] for key in ('name', 'nickName', 'account') if fields[key]), '定海用户')[:64]
+    subject = str(int(uid))
+    profile = {'id': subject, 'username': fields['account'],
+               'display_name': name, 'phone': fields['phone']}
+    return {'subject': subject, 'display_name': name, 'token': token, 'profile': profile}
 
 
 async def login_config(request):
@@ -112,6 +121,7 @@ async def _replace_session(request, result, context=None, *, started=None):
     vault = request.app['dinghai_credentials']
     previous = request.cookies.get(COOKIE)
     vault.discard('sessions', previous)
+    vault.discard_profile(previous)
     if previous:
         old = await call_store(request.app, 'get_session', previous)
         await call_store(request.app, 'logout', previous)
@@ -123,10 +133,15 @@ async def _replace_session(request, result, context=None, *, started=None):
     data['dinghai_authenticated'] = False
     if context is not None:
         started = started if started is not None else time.monotonic()
-        if token and data['user']['role'] != 'monitor':
-            ttl = min(SESSION_TTL, request.app['auth_store'].session_ttl)
-            data['dinghai_authenticated'] = vault.put(
-                'sessions', token, context, started + ttl, data['user']['id'])
+        if token:
+            session_ttl = request.app['auth_store'].session_ttl
+            if vault.put_profile(token, context.issuer, data['user']['id'], context.profile,
+                                 started + session_ttl):
+                data = attach_profile(data, context.profile)
+            if data['user']['role'] != 'monitor':
+                data['dinghai_authenticated'] = vault.put(
+                    'sessions', token, context, started + min(SESSION_TTL, session_ttl),
+                    data['user']['id'])
         elif pending:
             vault.put('pending', pending, context, started + PENDING_TTL)
     response = web.json_response(data)
@@ -155,7 +170,8 @@ async def login(request):
     async with request.app['_dinghai_login_slots']:
         identity = dict(await authenticate(origin, account, password))
     upstream_token = identity.pop('token', None)
-    context = DinghaiContext(origin, identity['subject'], upstream_token) if upstream_token else None
+    profile = identity.pop('profile', None)
+    context = DinghaiContext(origin, identity['subject'], upstream_token, profile) if upstream_token else None
     started = time.monotonic()
     result = await call_store(request.app, 'dinghai_login', origin, **identity)
     return await _replace_session(request, result, context, started=started)
