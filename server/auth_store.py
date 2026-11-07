@@ -21,7 +21,7 @@ class AuthError(ValueError):
 
 
 class AuthStore:
-    def __init__(self, path, session_ttl=86400):
+    def __init__(self, path, session_ttl=3 * 24 * 60 * 60):
         self.lock = threading.RLock()
         self.session_ttl = session_ttl
         self.hasher = PasswordHasher()

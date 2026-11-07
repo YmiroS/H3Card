@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from aiohttp import web
 
 PENDING_TTL = 300
-SESSION_TTL = 3600
+SESSION_TTL = 3 * 24 * 60 * 60
 MAX_CREDENTIALS = 2048
 
 

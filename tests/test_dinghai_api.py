@@ -593,20 +593,20 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((await self.client.get('/api/auth/me')).status, 200)
 
     async def test_profile_outlives_business_token_but_not_local_session(self):
-        self.store.session_ttl = 7200
+        self.store.session_ttl = 6 * 24 * 60 * 60
         data = await self.activate()
         cookie = self.cookie()
         key = self.vault._key(cookie)
         self.assertEqual(data['user']['dinghai_profile'], PROFILE)
-        self.assertGreater(self.vault.profiles[key].expires, self.vault.sessions[key].expires + 3500)
-        later = time.monotonic() + 3601
+        self.assertEqual(self.vault.profiles[key].expires - self.vault.sessions[key].expires, 259200)
+        later = self.vault.sessions[key].expires + 1
         with patch('server.dinghai_sessions.time.monotonic', return_value=later):
             data = await (await self.client.get('/api/auth/me')).json()
             self.assertFalse(data['dinghai_authenticated'])
             self.assertEqual(data['user']['dinghai_profile'], PROFILE)
             self.assertIsNone(self.vault.get('sessions', cookie))
             self.assertEqual((await self.post()).status, 403)
-        with patch('server.auth_store.time.time', return_value=time.time() + 7201):
+        with patch('server.auth_store.time.time', return_value=time.time() + 6 * 24 * 60 * 60 + 1):
             self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
         self.assertIsNone(self.vault.get_profile(cookie))
 
@@ -694,6 +694,36 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('dinghai_profile', data['user'])
         self.assertEqual(len(self.vault.profiles), 0)
         self.assertNotIn('dinghai_profile', (await (await self.client.get('/api/auth/me')).json())['user'])
+
+    async def test_default_authorization_survives_reload_until_72_hours(self):
+        before = time.monotonic()
+        await self.activate()
+        cookie = self.cookie()
+        entry = self.vault.get('sessions', cookie)
+        self.assertGreaterEqual(entry.expires, before + 259200)
+        self.assertLessEqual(entry.expires, time.monotonic() + 259200)
+        self.assertEqual(self.vault.get_profile(cookie).expires, entry.expires)
+        wall = time.time()
+        for elapsed in (3601, 86401, 172801, 71 * 60 * 60):
+            later = entry.expires - 259200 + elapsed
+            with (patch('server.dinghai_sessions.time.monotonic', return_value=later),
+                  patch('server.auth_store.time.time', return_value=wall + elapsed)):
+                for _ in range(2):
+                    response = await self.client.get('/api/auth/me')
+                    self.assertEqual(response.status, 200)
+                    data = await response.json()
+                    self.assertTrue(data['dinghai_authenticated'])
+                    self.assertEqual(data['user']['dinghai_profile'], PROFILE)
+                    status = await self.client.get('/api/dinghai/session')
+                    self.assertEqual(await status.json(), {'authenticated': True})
+                self.assertEqual((await self.post()).status, 200)
+                self.assertIs(self.vault.get('sessions', cookie), entry)
+        with (patch('server.dinghai_sessions.time.monotonic', return_value=entry.expires + 1),
+              patch('server.auth_store.time.time', return_value=wall + 259201)):
+            self.assertEqual((await self.client.get('/api/auth/me')).status, 401)
+            self.assertEqual((await self.client.get('/api/dinghai/session')).status, 401)
+            self.assertIsNone(self.vault.get('sessions', cookie))
+            self.assertIsNone(self.vault.get_profile(cookie))
 
     async def test_short_local_session_ttl_caps_credential_lifetime(self):
         self.store.session_ttl = 30

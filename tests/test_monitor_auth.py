@@ -237,18 +237,22 @@ class MonitorStoreTests(unittest.TestCase):
         with self.assertRaises(web.HTTPUnauthorized):
             require_monitor(request)
 
-    def test_default_ttl_is_24h_fixed_for_all_roles(self):
+    def test_default_ttl_is_72h_fixed_for_all_roles(self):
         self.store.create_user('user', PASSWORD)
-        self.assertEqual(self.store.session_ttl, 86400)
+        self.assertEqual(self.store.session_ttl, 259200)
         for name in ('admin', 'screen', 'user'):
             with self.subTest(name=name), patch('server.auth_store.time.time', return_value=1000):
                 session = self.store.login(name, PASSWORD)
                 row = tuple(self.store.db.execute('SELECT expires_at,created_at FROM sessions WHERE token_hash=?',
                                                   (self.store._digest(session['token']),)).fetchone())
-                self.assertEqual(row, (87400, 1000))
-            with patch('server.auth_store.time.time', return_value=87399):
-                self.assertIsNotNone(self.store.get_session(session['token']))
-            with patch('server.auth_store.time.time', return_value=87400):
+                self.assertEqual(row, (260200, 1000))
+            for elapsed in (86401, 172801, 259199):
+                with patch('server.auth_store.time.time', return_value=1000 + elapsed):
+                    self.assertIsNotNone(self.store.get_session(session['token']))
+                    expiry = self.store.db.execute('SELECT expires_at FROM sessions WHERE token_hash=?',
+                                                   (self.store._digest(session['token']),)).fetchone()[0]
+                    self.assertEqual(expiry, 260200)
+            with patch('server.auth_store.time.time', return_value=260200):
                 self.assertIsNone(self.store.get_session(session['token']))
 
     def test_revoke_on_disable_role_password_and_logout(self):

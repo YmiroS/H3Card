@@ -213,7 +213,9 @@ class StoreTests(unittest.TestCase):
         self.store = AuthStore(self.path)
         self.assertTrue(self.store.is_ready())
         self.assertEqual(self.store.get_session(session['token'])['user']['id'], self.admin)
-        with patch('server.auth_store.time.time', return_value=time.time() + 90000):
+        with patch('server.auth_store.time.time', return_value=time.time() + 172801):
+            self.assertEqual(self.store.get_session(session['token'])['user']['id'], self.admin)
+        with patch('server.auth_store.time.time', return_value=time.time() + 259201):
             self.assertIsNone(self.store.get_session(session['token']))
         self.store.reset_password(self.admin, PASSWORD + '!')
         self.assertIsNone(self.store.get_session(session['token']))
