@@ -9,6 +9,8 @@ const DOCUMENTS = ['index.html', ...['controller', 'permissions', 'costs', 'capa
 const REQUIRED_STATIC_FILES = ['favicon.png', 'icon.png', 'auth-art.webp', 'auth-logo.png', 'vendor/fabric.min.js'];
 const PRODUCTION_ENV = {
   VITE_IF_BRIDGE_URL:'http://127.0.0.1:8278',
+  VITE_CREATION_AGENT_ENABLED:'true',
+  VITE_CREATION_AGENT_TRANSPORT:'chat_api',
 };
 
 function frontendCommit(root, runCommand) {

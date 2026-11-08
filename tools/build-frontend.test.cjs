@@ -71,6 +71,17 @@ function preserved(root) {
 
 test('clean indexed frontend builds through Node/npm CLI with production overrides and valid artifacts', t => {
   const {root, frontend, commit} = fixture(t), stub = npmStub();
+  const production = {VITE_IF_BRIDGE_URL:'http://127.0.0.1:8278',
+    VITE_CREATION_AGENT_ENABLED:'true', VITE_CREATION_AGENT_TRANSPORT:'chat_api'};
+  for (const [key, value] of Object.entries({VITE_IF_BRIDGE_URL:'http://localhost:9999',
+    VITE_CREATION_AGENT_ENABLED:'false', VITE_CREATION_AGENT_TRANSPORT:'web'})) {
+    const previous = process.env[key];
+    t.after(() => {
+      if (previous === undefined) delete process.env[key];
+      else process.env[key] = previous;
+    });
+    process.env[key] = value;
+  }
   const result = build(root, stub);
   assert.equal(result.source_commit, commit);
   assert.equal(result.destination, path.join(root, 'web_dist'));
@@ -79,7 +90,7 @@ test('clean indexed frontend builds through Node/npm CLI with production overrid
     assert.equal(call.command, process.execPath);
     assert.equal(call.execution.cwd, frontend);
     assert.equal(call.execution.shell, undefined);
-    assert.equal(call.execution.env.VITE_IF_BRIDGE_URL, 'http://127.0.0.1:8278');
+    for (const [key, value] of Object.entries(production)) assert.equal(call.execution.env[key], value);
   }
   const buildCall = stub.calls[2];
   assert.equal(buildCall.execution.env.NODE_ENV, 'production');
@@ -88,7 +99,7 @@ test('clean indexed frontend builds through Node/npm CLI with production overrid
   assert.deepEqual(validateDistribution(result.destination), ['assets/index-ABC12345.css', 'assets/index-ABC12345.js']);
   const release = JSON.parse(fs.readFileSync(path.join(result.destination, 'release.json'), 'utf8'));
   assert.equal(release.source_commit, commit);
-  assert.deepEqual(release.environment, {VITE_IF_BRIDGE_URL:'http://127.0.0.1:8278'});
+  assert.deepEqual(release.environment, production);
   assert.doesNotMatch(fs.readFileSync(path.join(result.destination, 'index.html'), 'utf8'), /release\.json/);
   assert.equal(fs.existsSync(path.join(result.destination, 'assets/old.js')), false);
   assert.equal(git(frontend, 'status', '--porcelain'), '');
