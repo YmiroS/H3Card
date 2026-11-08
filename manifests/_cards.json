@@ -51,6 +51,7 @@
    {
     "id": "if_image",
     "name": "IFS",
+    "hidden": true,
     "slots": "img0+aud0+vid0"
    }
   ]
@@ -70,6 +71,7 @@
    {
     "id": "minimax_h3_flf2v",
     "name": "H3 图生视频",
+    "hidden": true,
     "slots": "img2+aud0+vid0",
     "ladder": {
      "1": "minimax_h3_i2v",
@@ -79,6 +81,7 @@
    {
     "id": "minimax_h3_talk2",
     "name": "H3 说话唱歌",
+    "hidden": true,
     "slots": "img2+aud1+vid0",
     "ladder": {
      "1": "minimax_h3_talk1",
@@ -88,11 +91,13 @@
    {
     "id": "minimax_h3_ref4",
     "name": "H3图片参考",
+    "hidden": true,
     "slots": "img4+aud0+vid0"
    },
    {
     "id": "minimax_h3_comic20",
     "name": "漫剧4宫格",
+    "hidden": true,
     "slots": "img5+aud0+vid0"
    },
    {
@@ -128,6 +133,7 @@
    {
     "id": "if_video",
     "name": "IFS",
+    "hidden": true,
     "slots": "img0+aud0+vid0"
    }
   ]

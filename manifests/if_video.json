@@ -6,6 +6,7 @@
   "kind": "gen",
   "card": "video",
   "execution": "if_studio",
+  "hidden": true,
   "slots": "img0+aud0+vid0",
   "inputs": [
     {"key": "prompt", "label": "生成需求", "type": "textarea", "default": ""},

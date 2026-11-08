@@ -6,6 +6,7 @@
   "kind": "gen",
   "card": "image",
   "execution": "if_studio",
+  "hidden": true,
   "imageControls": {"mode": "t2i", "defaultRatio": "3:4", "defaultClarity": "720P"},
   "slots": "img0+aud0+vid0",
   "inputs": [
