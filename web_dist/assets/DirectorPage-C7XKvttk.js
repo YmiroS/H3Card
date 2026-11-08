@@ -1,4 +1,4 @@
-import{reactExports as Gt,jsxRuntimeExports as Pt}from"./http-BHgZKsmB.js";import{usePageRuntime as pi}from"./usePageRuntime-CtGlHsKk.js";import"./main-D4sr4C2f.js";import"./monitor-alerts-Fb5_jGG5.js";const ui=`<aside class="sidebar">\r
+import{reactExports as Gt,jsxRuntimeExports as Pt}from"./http-BHgZKsmB.js";import{usePageRuntime as pi}from"./usePageRuntime-CVdUbwL1.js";import"./main-KUlzYZhG.js";import"./monitor-alerts-Fb5_jGG5.js";const ui=`<aside class="sidebar">\r
   <div class="workspace-label">创作空间</div>\r
   <select id="projects" aria-label="选择导演项目"><option value="">选择项目</option></select>\r
   <button id="new-project" class="new-project">＋ 新建导演项目</button>\r
