@@ -71,7 +71,8 @@ def load_dingtalk_config():
     values = {key: os.environ.get(key, '').strip() for key in
               ('DINGTALK_APP_KEY', 'DINGTALK_APP_SECRET', 'DINGTALK_CORP_ID',
                'DINGTALK_APPROVERS', 'DINGTALK_GROUP_CONVERSATION_ID',
-               'DINGTALK_CARD_TEMPLATE_ID', 'DINGTALK_ROBOT_CODE')}
+               'DINGTALK_CARD_TEMPLATE_ID', 'DINGTALK_ROBOT_CODE',
+               'DINGTALK_TASK_ALERT_TEMPLATE_ID')}
     supplied = [key for key, value in values.items() if value]
     if not supplied:
         return None
@@ -115,6 +116,78 @@ def build_card_params(request_row):
     }
 
 
+TASK_RESTART_ACTION = 'restart_task_services'
+TASK_ALERT_STATUSES = frozenset({
+    'alerting', 'expired', 'restart_pending', 'restart_running',
+    'restart_done', 'restart_error',
+})
+
+
+def build_task_alert_params(row):
+    """只投影告警模板字段；不转发任务输入、联系方式或节点连接信息。"""
+    status = row['status']
+    if status not in TASK_ALERT_STATUSES:
+        raise ValueError('未知任务告警状态')
+    try:
+        elapsed = max(0, int(float(row.get('elapsed_seconds') or 0)))
+    except (ValueError, TypeError, OverflowError):
+        elapsed = 0
+    hours, remainder = divmod(elapsed, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    elapsed_text = f'{hours}小时{minutes}分{seconds}秒' if hours else f'{minutes}分{seconds}秒'
+    started_at = row.get('started_at')
+    if isinstance(started_at, (int, float)):
+        try:
+            started_at = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(started_at))
+        except (ValueError, OverflowError, OSError):
+            started_at = ''
+    enabled = status == 'alerting' and (
+        row.get('restart_enabled') is True or row.get('restart_enabled') == 'true')
+    reasons = {
+        'alerting': '当前节点不支持受约束重启或任务已不可重启',
+        'expired': '告警已过期，当前任务不可重启',
+        'restart_pending': '已申请重启，请勿重复操作',
+        'restart_running': '正在重启该节点服务，请勿重复操作',
+        'restart_done': '该节点服务已重启，本卡不可再次操作',
+        'restart_error': '重启失败，本卡不可再次操作，请人工检查节点',
+    }
+    result = ('重启该节点服务（中断当前任务） · 仅指定审批人可操作'
+              if enabled else f'不可重启：{reasons[status]}')
+    return {
+        'title': '生成任务运行超过 35 分钟',
+        'workerName': str(row.get('worker_name') or ''),
+        'workerId': str(row.get('worker_id') or ''),
+        'taskName': str(row.get('task_name') or ''),
+        'jobId': str(row.get('job_id') or ''),
+        'projectName': str(row.get('project_name') or ''),
+        'cardId': str(row.get('card_id') or ''),
+        'submitter': str(row.get('submitter') or ''),
+        'startTime': str(started_at or ''),
+        'elapsedText': elapsed_text,
+        'status': status,
+        'resultText': result,
+        'restartEnabled': 'true' if enabled else 'false',
+        'lastMessage': str(row.get('message') or ''),
+    }
+
+
+def _api_failed(body):
+    """仅识别明确失败标记，不把可能含凭据的原始响应拼进异常。"""
+    if not isinstance(body, dict):
+        return True
+    markers = [body]
+    if isinstance(body.get('result'), dict):
+        markers.append(body['result'])
+    for marker in markers:
+        if marker.get('success') in (False, 'false', 'False'):
+            return True
+        for key in ('code', 'errcode', 'errorCode'):
+            if key in marker and marker[key] not in (
+                    None, '', 0, '0', 200, '200', 'OK', 'ok', 'Success', 'success'):
+                return True
+    return False
+
+
 class DingTalkClient:
     """OpenAPI 直连客户端：token 缓存 + 发卡/更新（不走环境代理）。"""
 
@@ -130,42 +203,73 @@ class DingTalkClient:
             'appKey': self.config['DINGTALK_APP_KEY'],
             'appSecret': self.config['DINGTALK_APP_SECRET'],
         }) as response:
-            body = await response.json(content_type=None)
-            if response.status != 200 or not body.get('accessToken'):
-                raise RuntimeError(f"获取钉钉 token 失败 HTTP {response.status}")
+            if response.status != 200:
+                raise RuntimeError(f'获取钉钉 token 失败 HTTP {response.status}')
+            try:
+                body = await response.json(content_type=None)
+            except (ValueError, aiohttp.ClientError):
+                raise RuntimeError('获取钉钉 token 响应不是有效 JSON') from None
+            if _api_failed(body) or not body.get('accessToken'):
+                raise RuntimeError('获取钉钉 token 返回逻辑失败')
             self._token = body['accessToken']
             # expireIn 秒，提前 5 分钟失效
             self._token_expires = time.time() + max(body.get('expireIn', 7200) - 300, 60)
             return self._token
 
-    async def deliver_card(self, session, request_row):
+    async def _card_request(self, session, method, path, body, *, check_result=False):
         token = await self._get_token(session)
+        async with getattr(session, method)(
+                f'{OPENAPI}{path}', headers={'x-acs-dingtalk-access-token': token},
+                json=body) as response:
+            if response.status != 200:
+                raise RuntimeError(f'钉钉卡片请求失败 HTTP {response.status}')
+            if check_result:
+                try:
+                    result = await response.json(content_type=None)
+                except (ValueError, aiohttp.ClientError):
+                    raise RuntimeError('钉钉卡片响应不是有效 JSON') from None
+                if _api_failed(result):
+                    raise RuntimeError('钉钉卡片请求返回逻辑失败')
+
+    async def _deliver(self, session, template_id, out_track_id, params, *, check_result=False):
         body = {
-            'cardTemplateId': self.config['DINGTALK_CARD_TEMPLATE_ID'],
-            'outTrackId': request_row['out_track_id'],
-            'cardData': {'cardParamMap': build_card_params(request_row)},
+            'cardTemplateId': template_id,
+            'outTrackId': out_track_id,
+            'cardData': {'cardParamMap': params},
             'callbackType': 'STREAM',
             'openSpaceId': f"dtv1.card//IM_GROUP.{self.config['DINGTALK_GROUP_CONVERSATION_ID']}",
             'imGroupOpenSpaceModel': {'supportForward': False},
             'imGroupOpenDeliverModel': {'robotCode': self.config['DINGTALK_ROBOT_CODE']},
         }
-        async with session.post(f'{OPENAPI}/v1.0/card/instances/createAndDeliver',
-                                headers={'x-acs-dingtalk-access-token': token},
-                                json=body) as response:
-            if response.status != 200:
-                raise RuntimeError(f"发卡失败 HTTP {response.status}: {(await response.text())[:200]}")
+        await self._card_request(session, 'post', '/v1.0/card/instances/createAndDeliver',
+                                 body, check_result=check_result)
+
+    async def _update(self, session, out_track_id, params, *, check_result=False):
+        body = {'outTrackId': out_track_id, 'cardData': {'cardParamMap': params}}
+        await self._card_request(session, 'put', '/v1.0/card/instances', body,
+                                 check_result=check_result)
+
+    async def deliver_card(self, session, request_row):
+        await self._deliver(session, self.config['DINGTALK_CARD_TEMPLATE_ID'],
+                            request_row['out_track_id'], build_card_params(request_row))
 
     async def update_card(self, session, request_row):
-        token = await self._get_token(session)
-        body = {
-            'outTrackId': request_row['out_track_id'],
-            'cardData': {'cardParamMap': build_card_params(request_row)},
-        }
-        async with session.put(f'{OPENAPI}/v1.0/card/instances',
-                               headers={'x-acs-dingtalk-access-token': token},
-                               json=body) as response:
-            if response.status != 200:
-                raise RuntimeError(f"更新卡片失败 HTTP {response.status}: {(await response.text())[:200]}")
+        await self._update(session, request_row['out_track_id'], build_card_params(request_row))
+
+    def _task_alert_template(self):
+        template = self.config.get('DINGTALK_TASK_ALERT_TEMPLATE_ID', '').strip()
+        if not template:
+            raise RuntimeError('未配置 DINGTALK_TASK_ALERT_TEMPLATE_ID，任务告警未启用')
+        return template
+
+    async def deliver_task_alert(self, session, row):
+        await self._deliver(session, self._task_alert_template(), row['out_track_id'],
+                            build_task_alert_params(row), check_result=True)
+
+    async def update_task_alert(self, session, row):
+        self._task_alert_template()
+        await self._update(session, row['out_track_id'], build_task_alert_params(row),
+                           check_result=True)
 
 
 async def process_outbox_task(client, session, store, task):
@@ -262,7 +366,78 @@ class ApprovalCardHandler:
         return ''
 
 
-def _run_stream_listener(config, store):
+class CardCallbackDispatcher:
+    """单一 topic 分流；任务服务始终在装配时的主事件循环执行。"""
+
+    def __init__(self, approval_handler, task_alerts, main_loop, timeout=20):
+        self.approval_handler = approval_handler
+        self.task_alerts = task_alerts
+        self.main_loop = main_loop
+        self.timeout = timeout
+        self._closing = False
+        self._lock = threading.Lock()
+        self._pending = set()
+
+    async def _process_task_callback(self, data):
+        # 此处已经回到主循环；具体身份、卡片与任务绑定、幂等均由主服务复验。
+        with self._lock:
+            closing = self._closing
+        if closing:
+            return 503, {'error': 'task alerts stopping'}
+        return await self.task_alerts.process_callback(data)
+
+    def _forget(self, future):
+        with self._lock:
+            self._pending.discard(future)
+
+    def close(self):
+        """拒绝新任务回调并取消桥接等待，不等待或 join SDK 监听线程。"""
+        with self._lock:
+            self._closing = True
+            pending = tuple(self._pending)
+        for future in pending:
+            future.cancel()
+
+    async def process_data(self, data):
+        try:
+            card = _parse_card_callback(data)
+            actions = (card['content'].get('cardPrivateData') or {}).get('actionIds', [])
+        except (ValueError, TypeError, AttributeError):
+            return 400, {'error': 'bad payload'}
+        if (not isinstance(actions, list) or TASK_RESTART_ACTION not in actions
+                or self.task_alerts is None):
+            return await self.approval_handler.process_data(data)
+        with self._lock:
+            if (self._closing or self.main_loop.is_closed()
+                    or not self.main_loop.is_running()):
+                return 503, {'error': 'task alerts stopping'}
+            coroutine = self._process_task_callback(data)
+            try:
+                future = asyncio.run_coroutine_threadsafe(coroutine, self.main_loop)
+            except RuntimeError:
+                coroutine.close()
+                return 503, {'error': 'task alerts unavailable'}
+            self._pending.add(future)
+        future.add_done_callback(self._forget)
+        try:
+            return await asyncio.wait_for(asyncio.wrap_future(future), timeout=self.timeout)
+        except asyncio.TimeoutError:
+            # 不自行重试危险操作；返回已确认响应，后续状态由主服务的幂等记录决定。
+            future.cancel()
+            return 200, {'error': 'task callback timed out; do not retry automatically'}
+        except asyncio.CancelledError:
+            future.cancel()
+            with self._lock:
+                closing = self._closing
+            if closing:
+                return 503, {'error': 'task alerts stopping'}
+            raise
+        except Exception:
+            # 服务异常不携带回调载荷或原始异常，防止泄露节点与凭据数据。
+            return 500, {'error': 'task callback failed'}
+
+
+def _run_stream_listener(config, store, handler=None):
     """独立线程运行 SDK 的阻塞循环；进程退出时随 daemon 线程终止。"""
     try:
         import dingtalk_stream
@@ -271,7 +446,7 @@ def _run_stream_listener(config, store):
         return
     install_logging_redaction()
 
-    handler = ApprovalCardHandler(config, store)
+    handler = handler if handler is not None else ApprovalCardHandler(config, store)
 
     class _Bridge(dingtalk_stream.CallbackHandler):
         async def process(self, callback):
@@ -297,9 +472,12 @@ def setup_dingtalk(app, store: AuthStore):
         LOGGER.info('未配置 DINGTALK_*，自主注册审批不启用')
         return
     install_logging_redaction()
-    app['dingtalk'] = {'config': config, 'client': DingTalkClient(config)}
+    dispatcher = CardCallbackDispatcher(
+        ApprovalCardHandler(config, store), app.get('task_alerts'), asyncio.get_running_loop())
+    app['dingtalk'] = {'config': config, 'client': DingTalkClient(config),
+                       'callback_handler': dispatcher}
     app['dingtalk']['listener'] = threading.Thread(
-        target=_run_stream_listener, args=(config, store),
+        target=_run_stream_listener, args=(config, store, dispatcher),
         name='dingtalk-stream', daemon=True)
     app['dingtalk']['listener'].start()
     app['dingtalk']['worker'] = asyncio.create_task(outbox_worker(app))
@@ -309,6 +487,9 @@ async def stop_dingtalk(app):
     module = app.get('dingtalk')
     if not module:
         return
+    handler = module.get('callback_handler')
+    if handler:
+        handler.close()
     worker = module.get('worker')
     if worker:
         worker.cancel()

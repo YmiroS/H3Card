@@ -235,6 +235,8 @@ class WorkerAgent:
         self.comfy_online = False
         self.local_busy = False
         self.pending_sync = None
+        self._maintenance_executing = False
+        self._guarded_restart = None
         maintenance = self.state.get("maintenance")
         self.boot_identity = None
         if isinstance(maintenance, dict) and maintenance.get("request_id"):
@@ -763,6 +765,7 @@ class WorkerAgent:
             "agent_version": 9,
             "supports_task_diagnostics": 1,
             "supports_service_restart": os.name == "nt",
+            "supports_guarded_service_restart": os.name == "nt",
             "supports_host_reboot": os.name == "nt",
             "supports_capacity_telemetry": 1,
             "supports_file_sync": True,
@@ -841,7 +844,8 @@ class WorkerAgent:
         if self.sync_report and (self.sync_report.get("request_id") == request_id
                                  or self.sync_report.get("status") == "running"):
             return
-        if request_id in self.state.get("attempted_host_reboots", []):
+        if (request_id in self.state.get("attempted_host_reboots", [])
+                or request_id in self.state.get("attempted_guarded_restarts", [])):
             return
         if request_id == (self.state.get("maintenance") or {}).get("request_id"):
             return
@@ -850,6 +854,10 @@ class WorkerAgent:
         if request_id == (self.state.get("last_restart_result") or {}).get("request_id"):
             return
         self.pending_sync = {"request_id": request_id, "type": action}
+        # 即使只收到一半约束也必须保留并拒绝，不能降级为旧网页无约束重启。
+        for key in ("expected_job_id", "expected_attempt_id"):
+            if key in command:
+                self.pending_sync[key] = command[key]
         timing = "等待空闲" if action == "sync_files" else "立即执行，将中断当前任务"
         print(f"[Worker] 已收到维护请求 {action}：{request_id}，{timing}", flush=True)
 
@@ -950,7 +958,28 @@ class WorkerAgent:
             cwd=repo, timeout=timeout * 2 + 120,
         )
 
+    def _check_guarded_assignment(self, command, assignment=None):
+        current = self.current
+        if (self.is_primary_node or command.get("type") != "restart_services"
+                or not command.get("expected_job_id") or not command.get("expected_attempt_id")
+                or current is None or assignment is not None and current is not assignment
+                or current.get("job_id") != command["expected_job_id"]
+                or current.get("attempt_id") != command["expected_attempt_id"]
+                or any(current.get(key) for key in (
+                    "cancel_requested", "_cleanup_task", "_execution_finished", "_finished", "finished"))
+                or current.get("status") in {"done", "error", "canceled"}
+                or (current.get("_lease_deadline") is not None
+                    and time.monotonic() >= current["_lease_deadline"])):
+            raise AgentError("原任务已结束、取消、清理或更换执行批次，拒绝重启节点服务")
+        return current
+
+    def _check_active_guarded_restart(self):
+        guard = getattr(self, "_guarded_restart", None)
+        if guard is not None:
+            self._check_guarded_assignment(*guard)
+
     async def schedule_node_restart(self, request_id, commit):
+        self._check_active_guarded_restart()
         if os.name != "nt":
             raise AgentError("节点重启只能在 Windows Worker 上运行")
         repo = self.code_repo_path().resolve()
@@ -965,6 +994,8 @@ class WorkerAgent:
             cwd=launcher.parent, timeout=30,
         )
 
+        # 启动脚本检查含 await；恢复执行后先复验，再写状态或启动监督器。
+        self._check_active_guarded_restart()
         timeout = max(float(self.config.get("restart_timeout_seconds", 300)), 60.0) if commit else 900.0
         restart_token = uuid.uuid4().hex
         log_path = self.configured_path("restart_log", "logs/restart-node.log")
@@ -1165,12 +1196,13 @@ class WorkerAgent:
 
     def maintenance_blocks_jobs(self):
         maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
-        return (maintenance.get("status") in {"running", "restarting", "error"}
+        return (getattr(self, "_maintenance_executing", False)
+                or maintenance.get("status") in {"running", "restarting", "error"}
                 or bool(self.sync_report and self.sync_report.get("status") in {"running", "error"}))
 
     async def execute_pending_sync(self):
         command = self.pending_sync
-        if (not command
+        if (not command or getattr(self, "_maintenance_executing", False)
                 or self.sync_report and self.sync_report.get("status") == "running"):
             return
         action = command["type"]
@@ -1208,7 +1240,20 @@ class WorkerAgent:
                         else "正在重启节点服务，未更新代码"),
         }
         print(f"[Worker] 开始维护 {action}：{request_id}", flush=True)
+        self._maintenance_executing = True
+        guarded = any(key in command for key in ("expected_job_id", "expected_attempt_id"))
+        guarded_assignment = None
         try:
+            if guarded:
+                # 在首次网络 await 前持久化去重，网络结果不确定也绝不重新启动第二次。
+                guarded_assignment = self._check_guarded_assignment(command)
+                self.state.setdefault("attempted_guarded_restarts", []).append(request_id)
+                self.state["maintenance"] = {
+                    **self.sync_report, "action": action, "phase": "awaiting_running_ack",
+                    "deadline": time.time() + 900,
+                }
+                self._save_state()
+                self._guarded_restart = (command, guarded_assignment)
             if action in ("reboot_host", "restart_services"):
                 if action == "reboot_host":
                     await self.schedule_host_reboot(request_id)
@@ -1217,11 +1262,15 @@ class WorkerAgent:
                     reply = await self._json_request(
                         "POST", self.server + "/agent/v1/heartbeat", headers=self._agent_headers(),
                         json={"comfy_online": self.comfy_online, "busy": True, "local_busy": True,
-                              "current_job_id": None, "maintenance": dict(self.sync_report)},
+                              "current_job_id": (guarded_assignment["job_id"]
+                                                 if guarded_assignment is not None else None),
+                              "maintenance": dict(self.sync_report)},
                     )
                     ack = (reply or {}).get("maintenance_ack") or {}
                     if ack.get("request_id") != request_id or ack.get("status") != "running":
                         raise AgentError("服务端未确认服务重启维护状态，未执行重启")
+                    if guarded:
+                        self._check_guarded_assignment(command, guarded_assignment)
                     await self.schedule_node_restart(request_id, "")
                 return
             if os.name != "nt":
@@ -1239,13 +1288,17 @@ class WorkerAgent:
             commit, _ = await self.pull_code()
             print(f"[Worker] chouka 已更新至 {commit[:12]}，准备重启节点", flush=True)
             await self.schedule_node_restart(request_id, commit)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             self.sync_report = {
                 "request_id": request_id,
                 "status": "error",
-                "message": str(exc)[:1000],
+                "message": str(exc)[:1000] or "维护流程被取消，未确认重启完成",
             }
-            if action in ("reboot_host", "restart_services"):
+            if guarded:
+                attempted = self.state.setdefault("attempted_guarded_restarts", [])
+                if request_id not in attempted:
+                    attempted.append(request_id)
+            if guarded or action in ("reboot_host", "restart_services"):
                 previous = self.state.get("maintenance") or {}
                 self.state["maintenance"] = {
                     **(previous if previous.get("request_id") == request_id else {}),
@@ -1254,8 +1307,12 @@ class WorkerAgent:
                 self.fresh_capabilities_ready = False
                 self._save_state()
             print(f"[Worker] 节点维护失败：{exc}", flush=True)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
         finally:
             self.pending_sync = None
+            self._maintenance_executing = False
+            self._guarded_restart = None
 
     async def heartbeat_loop(self):
         interval = max(float(self.config.get("heartbeat_seconds", 10)), 2.0)
@@ -1608,6 +1665,9 @@ class WorkerAgent:
                         pass
                 if event is not None and event["data"].get("prompt_id") == job_id:
                     event_type, data = event.get("type"), event["data"]
+                    if event_type == "execution_success" or (
+                            event_type == "executing" and data.get("node") is None):
+                        assignment["_execution_finished"] = True
                     self.observe_diagnostic_progress(assignment, event_type, data)
                     if event_type == "execution_error":
                         self.start_cleanup(assignment)
@@ -1618,6 +1678,7 @@ class WorkerAgent:
                     next_history_check = time.monotonic() + 5
                     try:
                         if await self.history_finished(job_id):
+                            assignment["_execution_finished"] = True
                             return
                     except JobFailed:
                         raise
@@ -1734,6 +1795,10 @@ class WorkerAgent:
         return "file"
 
     async def execute(self, assignment):
+        # acquire 的网络请求可能早于维护封锁发出；迟到的接单结果不能启动新任务。
+        if (self.maintenance_blocks_jobs()
+                or getattr(self, "stop_event", None) is not None and self.stop_event.is_set()):
+            return
         started = time.monotonic()
         ttl = max(float(assignment.get("lease_expires_at", 0)) - time.time(), 1.0)
         assignment["_lease_deadline"] = started + ttl
@@ -1762,6 +1827,7 @@ class WorkerAgent:
             measurements["prepare_seconds"] = prepared - started
             stage = "execute"
             await self.execute_comfy(assignment)
+            assignment["_execution_finished"] = True
             executed = time.monotonic()
             measurements["execute_seconds"] = executed - prepared
             if assignment.get("cancel_requested"):

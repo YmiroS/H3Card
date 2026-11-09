@@ -61,6 +61,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from server.auth_store import AuthStore
 from server import sr_service
 from server.dingtalk_approval import setup_dingtalk, stop_dingtalk
+from server.task_alerts import TaskAlertService
 from server.auth import (COOKIE, auth_middleware, register_auth_routes, require_user, require_admin,
                          require_team_leader, require_project, require_job, call_store,
                          setup_local_test_auth)
@@ -2345,7 +2346,7 @@ async def api_agent_heartbeat(request):
         worker_id,
         capabilities=body.get("capabilities") if isinstance(body.get("capabilities"), dict) else None,
         telemetry=body.get("telemetry") if isinstance(body.get("telemetry"), dict) else None,
-        comfy_online=bool(body.get("comfy_online")),
+        comfy_online=body.get("comfy_online") is True,
         busy=bool(body.get("busy")),
         local_busy=body.get("local_busy") if "local_busy" in body else None,
         current_job_id=body.get("current_job_id"),
@@ -4208,7 +4209,10 @@ async def on_start(app):
     if app["local_test"]:
         await setup_local_test_auth(app)
     elif not app.get("admin_sandbox"):
+        app["task_alerts"] = TaskAlertService(
+            app, monitor_jobs_snapshot, Path(app["auth_path"]).parent / "task-alerts.db")
         setup_dingtalk(app, app["auth_store"])
+        await app["task_alerts"].start()
     if not app.get("admin_sandbox"):
         for job in list(JOBS.values()):
             if job.get("executor") == sr_service.EXECUTION and job.get("status") in LIVE:
@@ -4236,6 +4240,9 @@ async def close_presence_connections(app):
 
 async def on_stop(app):
     await close_presence_connections(app)
+    task_alerts = app.get("task_alerts")
+    if task_alerts:
+        await task_alerts.stop()
     sr_runner = app.get("sr_runner")
     if sr_runner:
         await sr_runner.shutdown()
