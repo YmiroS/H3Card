@@ -77,7 +77,7 @@ class MonitorMigrationTests(unittest.TestCase):
             with self.subTest(opening=opening):
                 store = AuthStore(self.path)
                 try:
-                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 11)
                     self.assertEqual(store.db.execute('PRAGMA foreign_keys').fetchone()[0], 1)
                     self.assertEqual(snapshot(store.db), before | {
                         'external_identities': [], 'dinghai_binding_challenges': [],
@@ -134,7 +134,7 @@ class MonitorMigrationTests(unittest.TestCase):
 
         store = AuthStore(self.path)
         try:
-            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
+            self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 11)
             store.create_user('after-release-screen', PASSWORD, 'monitor')
             store.set_user('u', enabled=False)
             self.assertIsNone(store.get_session('old-token'))

@@ -117,7 +117,7 @@ class DinghaiApiTests(unittest.IsolatedAsyncioTestCase):
 
     async def login(self):
         response = await self.client.post('/api/auth/dinghai/login',
-            json={'account': 'dinghai', 'password': PASSWORD}, headers=self.headers)
+            json={'account': 'dinghai', 'password': PASSWORD, 'bind_existing': True}, headers=self.headers)
         self.assertEqual(response.status, 200, await response.text())
         return await response.json()
 

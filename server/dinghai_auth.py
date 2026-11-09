@@ -158,7 +158,7 @@ async def _replace_session(request, result, context=None, *, started=None):
 
 async def login(request):
     origin = _require_enabled(request)
-    body = await _body(request, ('account', 'password'))
+    body = await _body(request, ('account', 'password'), ('bind_existing',))
     account = body['account'].strip()
     password = body['password']
     if not account or len(account) > 128 or not password or len(password) > 1024:
@@ -173,7 +173,8 @@ async def login(request):
     profile = identity.pop('profile', None)
     context = DinghaiContext(origin, identity['subject'], upstream_token, profile) if upstream_token else None
     started = time.monotonic()
-    result = await call_store(request.app, 'dinghai_login', origin, **identity)
+    result = await call_store(request.app, 'dinghai_login', origin, **identity,
+                              profile=profile, bind_existing=body.get('bind_existing', False))
     return await _replace_session(request, result, context, started=started)
 
 
@@ -186,7 +187,8 @@ async def bind(request):
     entry = vault.get('pending', pending)
     started = time.monotonic()
     result = await call_store(request.app, 'dinghai_bind', pending,
-                              request.headers.get('X-Binding-CSRF', ''), origin, **body)
+                              request.headers.get('X-Binding-CSRF', ''), origin, **body,
+                              profile=entry.context.profile if entry is not None else None)
     # Consume only after the store validates password + binding CSRF. A concurrent
     # cancel/expiry/eviction must not resurrect a credential captured before await.
     live = vault.get('pending', pending)

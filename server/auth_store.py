@@ -1,5 +1,6 @@
 """SQLite 账号、会话及归属存储；所有公开方法均可在线程池调用。"""
 import hashlib
+import json
 import os
 import re
 import secrets
@@ -70,12 +71,15 @@ class AuthStore:
             if version == 9:
                 self.db.executescript(migrations.joinpath('010_dinghai_identities.sql').read_text(encoding='utf-8'))
                 version = 10
-            if version != 10:
+            if version == 10:
+                self.db.executescript(migrations.joinpath('011_dinghai_profiles.sql').read_text(encoding='utf-8'))
+                version = 11
+            if version != 11:
                 raise AuthError('不支持的认证数据库版本')
             expected = {
                 'users': 'id,username,username_key,password_hash,role,enabled,version,created_at,display_name,approval_status,team_leader,phone',
                 'sessions': 'token_hash,user_id,csrf_token,expires_at,created_at',
-                'external_identities': 'issuer,subject,user_id,created_at',
+                'external_identities': 'issuer,subject,user_id,created_at,profile_json',
                 'dinghai_binding_challenges': 'token_hash,csrf_token,issuer,subject,expires_at,created_at',
                 'user_grants': 'viewer_id,owner_id,permission',
                 'global_canvas_grants': 'viewer_id,permission',
@@ -157,7 +161,8 @@ class AuthStore:
                 'role': row['role'], 'enabled': bool(row['enabled']),
                 'display_name': row['display_name'],
                 'approval_status': row['approval_status'],
-                'team_leader': bool(row['team_leader'])}
+                'team_leader': bool(row['team_leader']),
+                'local_login_enabled': bool(row['password_hash'])}
         if include_phone:
             user['phone'] = row['phone']
         return user
@@ -276,18 +281,32 @@ class AuthStore:
 
     def list_users(self):
         with self.lock:
-            return [self._safe(row) for row in self.db.execute('SELECT * FROM users ORDER BY created_at,id')]
+            identities = {row['user_id']: {'id': row['subject'], **json.loads(row['profile_json'])}
+                          for row in self.db.execute('SELECT * FROM external_identities')}
+            users = [self._safe(row) for row in self.db.execute('SELECT * FROM users ORDER BY created_at,id')]
+            for user in users:
+                if user['id'] in identities:
+                    user['dinghai_identity'] = {'username': '', 'display_name': '定海用户', 'phone': '',
+                                               **identities[user['id']]}
+            return users
 
-    def set_user(self, uid, role=None, enabled=None, team_leader=None, *, actor_id=None, session_token=None):
+    def set_user(self, uid, role=None, enabled=None, team_leader=None, *, display_name=None,
+                 phone=None, actor_id=None, session_token=None):
         if role is not None:
             self._role(role)
         if enabled is not None and not isinstance(enabled, bool):
             raise AuthError('enabled 必须为布尔值')
         if team_leader is not None and not isinstance(team_leader, bool):
             raise AuthError('team_leader 必须为布尔值')
+        if display_name is not None:
+            display_name = self._display_name(display_name)
+        if phone is not None:
+            phone = '' if phone == '' else self._phone(phone)
         with self._tx():
             self._check_actor(actor_id, session_token)
             old = self._user(uid)
+            if (display_name is not None or phone is not None) and not old['password_hash']:
+                raise AuthError('定海账号资料请在定海修改', 409)
             if role == 'admin' and old['approval_status'] != 'approved':
                 raise AuthError('未通过审批的账号不能提升为管理员', 409)
             role = old['role'] if role is None else role
@@ -298,8 +317,10 @@ class AuthStore:
             if old['role'] == 'admin' and old['enabled'] and (role != 'admin' or not enabled):
                 if self.db.execute("SELECT COUNT(*) FROM users WHERE enabled=1 AND role='admin'").fetchone()[0] <= 1:
                     raise AuthError('不能停用或降级最后一个管理员', 409)
-            self.db.execute('UPDATE users SET role=?,enabled=?,team_leader=?,version=version+1 WHERE id=?',
-                            (role, int(enabled), int(team_leader), uid))
+            self.db.execute('UPDATE users SET role=?,enabled=?,team_leader=?,display_name=?,phone=?,version=version+1 WHERE id=?',
+                            (role, int(enabled), int(team_leader),
+                             old['display_name'] if display_name is None else display_name,
+                             old['phone'] if phone is None else phone, uid))
             self.db.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
             return self._safe(self._user(uid))
 
@@ -319,6 +340,8 @@ class AuthStore:
             session = self.get_session(session_token)
             if session is None or session['user']['id'] != uid:
                 raise AuthError('会话已失效，请重新登录', 401)
+            if not self._user(uid)['password_hash']:
+                raise AuthError('定海账号资料请在定海修改', 409)
             self.db.execute('UPDATE users SET phone=? WHERE id=?', (phone, uid))
             return self._safe(self._user(uid))
 
@@ -333,7 +356,8 @@ class AuthStore:
         hashed = self.hasher.hash(password)
         with self._tx():
             self._check_actor(actor_id, session_token)
-            self._user(uid)
+            if not self._user(uid)['password_hash']:
+                raise AuthError('定海账号密码请在定海修改', 409)
             self.db.execute('UPDATE users SET password_hash=?,version=version+1 WHERE id=?', (hashed, uid))
             self.db.execute('DELETE FROM sessions WHERE user_id=?', (uid,))
 
@@ -341,6 +365,8 @@ class AuthStore:
         self._password(new_password)
         with self.lock:
             old = dict(self._user(uid))
+        if not old['password_hash']:
+            raise AuthError('定海账号密码请在定海修改', 409)
         if not self._verify(old['password_hash'], current_password):
             raise AuthError('当前密码错误', 403)
         hashed = self.hasher.hash(new_password)
@@ -510,7 +536,7 @@ class AuthStore:
         with self.lock:
             row = self.db.execute('SELECT * FROM users WHERE username_key=?', (username_key,)).fetchone() if username_key else None
             old = dict(row) if row else None
-        valid = self._verify(old['password_hash'] if old else self._dummy_hash, password)
+        valid = self._verify(old['password_hash'] if old and old['password_hash'] else self._dummy_hash, password)
         if not valid or not old or not old['enabled']:
             raise AuthError('用户名或密码错误', 401)
         # 密码正确后才反馈本人审批状态；不存在/密码错误统一为同一响应，不泄露状态。
@@ -531,7 +557,7 @@ class AuthStore:
 
     def _dinghai_session(self, user):
         if not user['enabled'] or user['approval_status'] != 'approved':
-            raise AuthError('本地账户不可用，请联系管理员', 403)
+            raise AuthError('账户不可用，请联系管理员', 403)
         token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
         now = time.time()
         self.db.execute('DELETE FROM sessions WHERE expires_at<=?', (now,))
@@ -540,19 +566,41 @@ class AuthStore:
         return {'status': 'authenticated', 'user': self._session_user(user),
                 'csrf_token': csrf, 'token': token}
 
-    def dinghai_login(self, issuer, subject, display_name):
-        """后端验证定海身份后，已有绑定登录；否则只能取得短时绑定凭证。"""
+    def dinghai_login(self, issuer, subject, display_name, *, profile=None, bind_existing=False):
+        """已验证的定海身份默认建档；仅主动绑定时验证已有本地账号。"""
         self._identifier(issuer, '定海来源')
         self._identifier(subject, '定海用户 ID')
+        display_name = self._display_name(display_name)
+        profile_json = json.dumps(profile or {'id': subject, 'username': '',
+                                              'display_name': display_name, 'phone': ''}, ensure_ascii=False)
         with self._tx():
             linked = self.db.execute(
                 'SELECT user_id FROM external_identities WHERE issuer=? AND subject=?',
                 (issuer, subject)).fetchone()
             if linked:
-                return self._dinghai_session(self._user(linked['user_id']))
-            display_name = self._display_name(display_name)
+                user = self._user(linked['user_id'])
+                result = self._dinghai_session(user)
+                self.db.execute('UPDATE external_identities SET profile_json=? WHERE issuer=? AND subject=?',
+                                (profile_json, issuer, subject))
+                if not user['password_hash']:
+                    self.db.execute('UPDATE users SET display_name=? WHERE id=?', (display_name, user['id']))
+                    result['user'] = self._session_user(self._user(user['id']))
+                return result
             now = time.time()
             self.db.execute('DELETE FROM dinghai_binding_challenges WHERE expires_at<=?', (now,))
+            if not bind_existing:
+                uid = uuid.uuid4().hex
+                username = f'dinghai:{uid}'
+                # 空哈希标记仅外部登录的权限主体；本地登录及密码重置均不可将其转成本地账号。
+                self.db.execute(
+                    'INSERT INTO users(id,username,username_key,password_hash,role,created_at,display_name,approval_status) '
+                    'VALUES(?,?,?,?,?,?,?,?)',
+                    (uid, username, username, '', 'user', now, display_name, 'approved'))
+                self.db.execute('INSERT INTO external_identities(issuer,subject,user_id,created_at,profile_json) '
+                                'VALUES(?,?,?,?,?)', (issuer, subject, uid, now, profile_json))
+                self.db.execute('DELETE FROM dinghai_binding_challenges WHERE issuer=? AND subject=?',
+                                (issuer, subject))
+                return self._dinghai_session(self._user(uid))
             token, csrf = secrets.token_urlsafe(32), secrets.token_urlsafe(32)
             self.db.execute('INSERT INTO dinghai_binding_challenges VALUES(?,?,?,?,?,?)',
                             (self._digest(token), csrf, issuer, subject, now + 300, now))
@@ -570,7 +618,7 @@ class AuthStore:
             raise AuthError('绑定确认校验失败，请重新登录', 403)
         return row
 
-    def dinghai_bind(self, token, csrf, issuer, username, password):
+    def dinghai_bind(self, token, csrf, issuer, username, password, *, profile=None):
         try:
             _, username_key = self._username(username)
         except AuthError:
@@ -582,7 +630,7 @@ class AuthStore:
             row = self.db.execute('SELECT * FROM users WHERE username_key=?',
                                   (username_key,)).fetchone() if username_key else None
             old = dict(row) if row else None
-        valid = self._verify(old['password_hash'] if old else self._dummy_hash, password)
+        valid = self._verify(old['password_hash'] if old and old['password_hash'] else self._dummy_hash, password)
         if not valid or not old or not old['enabled']:
             raise AuthError('抽卡用户名或密码错误', 401)
         with self._tx():
@@ -596,8 +644,10 @@ class AuthStore:
                 'SELECT 1 FROM external_identities WHERE user_id=? OR (issuer=? AND subject=?)',
                 (user['id'], pending['issuer'], pending['subject'])).fetchone():
                 raise AuthError('账户已有其他绑定，请联系管理员', 409)
-            self.db.execute('INSERT INTO external_identities VALUES(?,?,?,?)',
-                            (pending['issuer'], pending['subject'], user['id'], time.time()))
+            self.db.execute('INSERT INTO external_identities(issuer,subject,user_id,created_at,profile_json) '
+                            'VALUES(?,?,?,?,?)',
+                            (pending['issuer'], pending['subject'], user['id'], time.time(),
+                             json.dumps(profile or {}, ensure_ascii=False)))
             self.db.execute('DELETE FROM dinghai_binding_challenges WHERE issuer=? AND subject=?',
                             (pending['issuer'], pending['subject']))
             return self._dinghai_session(user)

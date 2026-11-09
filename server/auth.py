@@ -344,7 +344,7 @@ async def _body(request, required=(), optional=()):
     if not isinstance(body, dict) or set(body) - set(required) - set(optional) or any(k not in body for k in required):
         raise web.HTTPBadRequest(text='请求字段不正确')
     for key, value in body.items():
-        if key in ('enabled', 'team_leader'):
+        if key in ('enabled', 'team_leader', 'bind_existing'):
             if not isinstance(value, bool):
                 raise web.HTTPBadRequest(text=f'{key} 必须为布尔值')
         elif not isinstance(value, str):
@@ -455,7 +455,7 @@ async def users(request):
 
 async def update_user(request):
     require_admin(request)
-    body = await _body(request, optional=('role', 'enabled', 'team_leader'))
+    body = await _body(request, optional=('role', 'enabled', 'team_leader', 'display_name', 'phone'))
     if not body:
         raise web.HTTPBadRequest(text='至少提供一个修改字段')
     user = await admin_call(request, 'set_user', request.match_info['uid'], **body)

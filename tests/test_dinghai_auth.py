@@ -32,7 +32,7 @@ class DinghaiStoreTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def pending(self, subject='42'):
-        return self.store.dinghai_login(ISSUER, subject, '定海用户')
+        return self.store.dinghai_login(ISSUER, subject, '定海用户', bind_existing=True)
 
     def bind(self, pending, username='local-user', password=PASSWORD):
         return self.store.dinghai_bind(pending['binding_token'], pending['binding_csrf'],
@@ -71,11 +71,80 @@ class DinghaiStoreTests(unittest.TestCase):
             self.assertEqual(result['user']['role'], role)
             self.assertEqual(result['user']['id'], user['id'])
 
-    def test_unbound_user_does_not_auto_register_or_require_phone(self):
+    def test_explicit_binding_does_not_auto_register_or_require_phone(self):
         for subject in ('one', 'two'):
             self.assertEqual(self.pending(subject)['status'], 'binding_required')
         self.assertEqual(len(self.store.list_users()), 2)
         self.assertEqual(self.store.db.execute('SELECT COUNT(*) FROM external_identities').fetchone()[0], 0)
+
+    def test_first_login_provisions_passwordless_user_and_reuses_identity(self):
+        first = self.store.dinghai_login(ISSUER, '42', '定海用户', profile=PROFILE)
+        user = first['user']
+        self.assertEqual(first['status'], 'authenticated')
+        self.assertEqual(user['role'], 'user')
+        self.assertFalse(user['team_leader'])
+        self.assertFalse(user['local_login_enabled'])
+        self.assertEqual(self.store._user(user['id'])['password_hash'], '')
+        self.assertEqual(self.store.get_session(first['token'])['user']['id'], user['id'])
+        again = self.store.dinghai_login(ISSUER, '42', '新姓名', profile={**PROFILE, 'display_name': '新姓名'})
+        self.assertEqual(again['user']['id'], user['id'])
+        self.assertEqual(len(self.store.list_users()), 3)
+        self.assertEqual(self.store.list_users()[-1]['dinghai_identity']['display_name'], '新姓名')
+        with self.assertRaisesRegex(AuthError, '用户名或密码错误'):
+            self.store.login(user['username'], PASSWORD)
+        with self.assertRaisesRegex(AuthError, '定海账号密码'):
+            self.store.reset_password(user['id'], 'reset-new-password')
+        with self.assertRaisesRegex(AuthError, '定海账号密码'):
+            self.store.change_password(user['id'], PASSWORD, 'change-new-password')
+        with self.assertRaisesRegex(AuthError, '定海账号资料'):
+            self.store.set_user(user['id'], display_name='覆盖姓名')
+        self.store.set_user(user['id'], role='monitor', team_leader=True)
+        self.assertIsNone(self.store.get_session(first['token']))
+        self.assertEqual(self.store.dinghai_login(ISSUER, '42', '定海用户')['user']['role'], 'monitor')
+        self.store.set_user(user['id'], enabled=False)
+        with self.assertRaisesRegex(AuthError, '不可用'):
+            self.store.dinghai_login(ISSUER, '42', '定海用户')
+        self.assertEqual(len(self.store.list_users()), 3)
+
+    def test_same_name_never_claims_local_account_or_other_issuer(self):
+        first = self.store.dinghai_login(ISSUER, '42', 'local-user',
+                                         profile={**PROFILE, 'username': 'local-user'})
+        self.assertNotEqual(first['user']['id'], self.user['id'])
+        self.assertEqual(first['user']['role'], 'user')
+        second = self.store.dinghai_login('https://other.example.test', '42', 'local-user')
+        self.assertNotEqual(first['user']['id'], second['user']['id'])
+
+    def test_concurrent_first_logins_create_one_user_and_clear_old_challenges(self):
+        pending = self.pending()
+        second = AuthStore(self.path)
+        try:
+            def login(store):
+                return store.dinghai_login(ISSUER, '42', '定海用户')['user']['id']
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                ids = list(pool.map(login, [self.store, second]))
+            self.assertEqual(ids[0], ids[1])
+            self.assertEqual(len(self.store.list_users()), 3)
+            with self.assertRaisesRegex(AuthError, '失效'):
+                self.bind(pending)
+        finally:
+            second.close()
+
+    def test_admin_edits_local_profile_without_changing_identity_or_permissions(self):
+        uid = self.user['id']
+        self.store.create_project('keep-project', uid)
+        result = self.bind(self.pending())
+        updated = self.store.set_user(uid, display_name='新花名', phone='13800138000')
+        self.assertEqual(updated['display_name'], '新花名')
+        self.assertEqual(updated['phone'], '13800138000')
+        self.assertEqual(updated['username'], 'local-user')
+        self.assertEqual(updated['role'], 'user')
+        self.assertEqual(self.store.project_permission(uid, 'keep-project'), 'operate')
+        self.assertIsNone(self.store.get_session(result['token']))
+        self.assertEqual(self.pending()['user']['id'], uid)
+        self.assertEqual(self.store.set_user(uid, phone='')['phone'], '')
+        for fields in ({'display_name': ''}, {'display_name': 'a' * 65}, {'phone': '123'}):
+            with self.assertRaises(AuthError):
+                self.store.set_user(uid, **fields)
 
     def test_missing_account_wrong_password_same_error_and_retry_works(self):
         pending = self.pending()
@@ -157,13 +226,30 @@ class DinghaiStoreTests(unittest.TestCase):
         finally:
             second.close()
 
+    def test_v10_profile_migration_preserves_binding_permissions_and_sessions(self):
+        bound = self.bind(self.pending())
+        uid = self.user['id']
+        self.store.create_project('before-upgrade', uid)
+        self.store.db.executescript('ALTER TABLE external_identities DROP COLUMN profile_json; PRAGMA user_version=10;')
+        self.store.close()
+        self.store = AuthStore(self.path)
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 11)
+        self.assertEqual(self.store.get_session(bound['token'])['user']['id'], uid)
+        self.assertEqual(self.store.project_permission(uid, 'before-upgrade'), 'operate')
+        self.assertEqual(self.pending()['user']['id'], uid)
+        self.assertTrue(self.store.get_user(uid)['local_login_enabled'])
+        self.assertEqual(len(self.store.list_users()), 2)
+        self.store.close()
+        self.store = AuthStore(self.path)
+        self.assertEqual(self.pending()['user']['id'], uid)
+
     def test_migration_preserves_existing_v9_accounts_and_sessions(self):
         session = self.store.login('local-user', PASSWORD)
         self.store.db.executescript('DROP TABLE dinghai_binding_challenges; '
                                    'DROP TABLE external_identities; PRAGMA user_version=9;')
         self.store.close()
         self.store = AuthStore(self.path)
-        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 10)
+        self.assertEqual(self.store.db.execute('PRAGMA user_version').fetchone()[0], 11)
         self.assertEqual(self.store.get_session(session['token'])['user']['id'], self.user['id'])
 
 
@@ -193,14 +279,71 @@ class DinghaiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    async def login(self):
-        return await self.client.post('/api/auth/dinghai/login',
-                                      json={'account': 'dinghai', 'password': PASSWORD}, headers=self.headers)
+    async def login(self, *, bind_existing=True):
+        body = {'account': 'dinghai', 'password': PASSWORD}
+        if bind_existing:
+            body['bind_existing'] = True
+        return await self.client.post('/api/auth/dinghai/login', json=body, headers=self.headers)
 
     async def confirm(self, data, password=PASSWORD):
         return await self.client.post('/api/auth/dinghai/bind',
             json={'username': 'local-user', 'password': password},
             headers=self.headers | {'X-Binding-CSRF': data['binding_csrf']})
+
+    async def test_default_login_creates_managed_user_and_admin_can_change_access(self):
+        response = await self.login(bind_existing=False)
+        self.assertEqual(response.status, 200)
+        data = await response.json()
+        self.assertEqual(data['status'], 'authenticated')
+        uid = data['user']['id']
+        self.assertEqual(data['user']['dinghai_profile'], PROFILE)
+        self.assertFalse(data['user']['local_login_enabled'])
+        self.assertNotIn('token', data)
+        self.assertTrue(response.cookies[COOKIE]['httponly'])
+        self.assertEqual((await self.client.get('/api/auth/me')).status, 200)
+        self.assertEqual((await self.client.get('/api/admin/users')).status, 403)
+        self.assertEqual((await self.client.post('/api/auth/phone', json={'phone': '13800138000'},
+            headers=self.headers | {'X-CSRF-Token': data['csrf_token']})).status, 409)
+        self.assertEqual((await self.client.post('/api/auth/password',
+            json={'current_password': PASSWORD, 'new_password': 'new-local-password'},
+            headers=self.headers | {'X-CSRF-Token': data['csrf_token']})).status, 409)
+        admin = await self.client.post('/api/auth/login',
+            json={'username': 'admin', 'password': PASSWORD}, headers=self.headers)
+        csrf = (await admin.json())['csrf_token']
+        headers = self.headers | {'X-CSRF-Token': csrf}
+        users = (await (await self.client.get('/api/admin/users')).json())['users']
+        managed = next(user for user in users if user['id'] == uid)
+        self.assertEqual(managed['dinghai_identity'], PROFILE)
+        url = f'/api/admin/users/{uid}'
+        self.assertEqual((await self.client.patch(url, json={'role': 'monitor'}, headers=self.headers)).status, 403)
+        self.assertEqual((await self.client.patch(url, json={'role': 'monitor'}, headers=headers)).status, 200)
+        self.assertEqual((await self.client.patch(url, json={'display_name': '禁止覆盖'}, headers=headers)).status, 409)
+        self.assertEqual((await self.client.post(url + '/password',
+            json={'password': 'new-local-password'}, headers=headers)).status, 409)
+        self.assertEqual((await self.client.patch(url, json={'enabled': False}, headers=headers)).status, 200)
+        self.assertEqual((await self.login(bind_existing=False)).status, 403)
+
+    async def test_admin_profile_edit_validates_fields_and_requires_admin_csrf(self):
+        response = await self.client.post('/api/auth/login',
+            json={'username': 'admin', 'password': PASSWORD}, headers=self.headers)
+        headers = self.headers | {'X-CSRF-Token': (await response.json())['csrf_token']}
+        url = f"/api/admin/users/{self.user['id']}"
+        body = {'display_name': '新花名', 'phone': '13800138000'}
+        self.assertEqual((await self.client.patch(url, json=body, headers=self.headers)).status, 403)
+        edited = await self.client.patch(url, json=body, headers=headers)
+        self.assertEqual(edited.status, 200)
+        self.assertEqual((await edited.json())['user']['display_name'], '新花名')
+        for fields in ({'username': 'rename'}, {'phone': None}, {'phone': '123'}, {'display_name': ''}):
+            self.assertEqual((await self.client.patch(url, json=fields, headers=headers)).status, 400)
+        await self.client.post('/api/auth/login',
+            json={'username': 'local-user', 'password': PASSWORD}, headers=self.headers)
+        self.assertEqual((await self.client.patch(url, json=body, headers=headers)).status, 403)
+
+    async def test_invalid_binding_choice_is_rejected_before_upstream(self):
+        response = await self.client.post('/api/auth/dinghai/login',
+            json={'account': 'dinghai', 'password': PASSWORD, 'bind_existing': 'true'}, headers=self.headers)
+        self.assertEqual(response.status, 400)
+        self.auth.assert_not_awaited()
 
     async def test_config_and_pending_are_public_but_not_a_business_session(self):
         response = await self.client.get('/api/auth/login-config')
@@ -263,7 +406,10 @@ class DinghaiHttpTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.get_user(self.user['id']), before)
         session = self.store.get_session(local['token'])
         self.assertNotIn('dinghai_profile', session['user'])
-        self.assertNotIn('upstream-account', '\n'.join(self.store.db.iterdump()))
+        listed = next(user for user in self.store.list_users() if user['id'] == self.user['id'])
+        self.assertEqual(listed['dinghai_identity'], PROFILE)
+        self.assertEqual(listed['username'], 'local-user')
+        self.assertNotIn('fixture-upstream-token', '\n'.join(self.store.db.iterdump()))
         response = await self.client.post('/api/auth/login',
             json={'username': 'local-user', 'password': PASSWORD}, headers=self.headers)
         self.assertNotIn('dinghai_profile', (await response.json())['user'])
