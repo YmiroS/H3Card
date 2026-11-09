@@ -16,6 +16,17 @@ from model_inventory import scan_inventory
 from remote_commands import MAX_PENDING, OUTPUT_LIMIT, RemoteCommands, execute_command
 
 
+class StartupTests(unittest.TestCase):
+    def test_isolated_python_can_start_worker_script(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run(
+                [sys.executable, "-I", "-B", str(ROOT / "worker" / "agent.py"), "--help"],
+                cwd=directory, capture_output=True, text=True, encoding="utf-8", timeout=30,
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("--instance-status", result.stdout)
+
+
 class Fixture:
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()

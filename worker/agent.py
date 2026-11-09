@@ -25,6 +25,8 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+# Embedded Python's isolated mode omits the script directory from sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from remote_commands import RemoteCommands, capabilities as remote_command_capabilities
 
 
