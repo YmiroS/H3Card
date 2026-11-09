@@ -33,6 +33,53 @@ async function startService() {
   }};
 }
 
+test('compiled video comparison opens and reloads through authenticated Python page routing',
+  {timeout:60000}, async () => {
+    const service = await startService();
+    let browser;
+    try {
+      browser = await chromium.launch(process.env.CHOUKA_TEST_BROWSER && process.env.CHOUKA_TEST_BROWSER !== 'chromium'
+        ? {channel:process.env.CHOUKA_TEST_BROWSER} : {});
+      const page = await browser.newPage();
+      const errors = [], writes = [];
+      page.on('pageerror', error => errors.push(error.message));
+      await page.route('**/*', route => new URL(route.request().url()).origin === service.origin
+        ? route.continue() : route.abort('blockedbyclient'));
+      const login = await page.request.post(service.origin + '/api/auth/login', {
+        data:{username:'artist', password}, headers:{Origin:service.origin},
+      });
+      assert.equal(login.status(), 200);
+      page.on('request', request => {
+        if (!['GET', 'HEAD'].includes(request.method()) &&
+          /^\/api\/(generate|upload|text|rewrite|projects)(\/|$)/.test(new URL(request.url()).pathname)) {
+          writes.push(request.url());
+        }
+      });
+      const response = await page.goto(service.origin + '/video-comparison');
+      assert.equal(response.status(), 200);
+      await page.getByRole('alert').filter({hasText:'暂无对比数据'}).waitFor();
+      assert.equal(await page.locator('#world, #workspace-nav').count(), 0);
+      const route = '/video-comparison?source=00000000-0000-4000-8000-000000000001'
+        + '&transfer=00000000-0000-4000-8000-000000000002';
+      const opened = await page.goto(service.origin + route);
+      assert.equal(opened.status(), 200);
+      await page.getByRole('dialog', {name:'视频对比', exact:true}).waitFor();
+      await page.getByText('暂无对比视频，请在来源画布中右键加入对比。', {exact:true}).waitFor();
+      const refreshed = await page.reload();
+      assert.equal(refreshed.status(), 200);
+      await page.getByRole('dialog', {name:'视频对比', exact:true}).waitFor();
+      await page.getByText('暂无对比视频，请在来源画布中右键加入对比。', {exact:true}).waitFor();
+      assert.equal(await page.title(), '视频对比');
+      assert.equal(await page.locator('#world, #workspace-nav').count(), 0);
+      assert.equal(await page.getByRole('button', {name:/Agent|抽卡助手/}).count(), 0);
+      assert.deepEqual(errors, []);
+      assert.deepEqual(writes, []);
+    } finally {
+      if (browser) await browser.close();
+      await service.close();
+    }
+  });
+
 test('compiled React and management pages share Python auth without any old web runtime',
   {timeout:90000}, async () => {
     const service = await startService();

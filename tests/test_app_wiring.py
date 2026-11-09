@@ -264,6 +264,31 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             self.assertEqual(response.status, 302)
             self.assertTrue(response.headers['Location'].startswith('/login'))
 
+    async def test_video_comparison_page_uses_authenticated_react_shell(self):
+        route = ('/video-comparison?source=00000000-0000-4000-8000-000000000001'
+                 '&transfer=00000000-0000-4000-8000-000000000002')
+        shell = (ROOT / 'web_dist' / 'index.html').read_bytes()
+        self.auth.create_user('comparison-viewer', PASSWORD)
+        await self.login('comparison-viewer')
+        for method in ('GET', 'HEAD'):
+            with self.subTest(method=method):
+                response = await self.client.request(method, route, allow_redirects=False)
+                self.assertEqual(response.status, 200)
+                self.assertEqual(response.content_type, 'text/html')
+                self.assertEqual(response.headers['Cache-Control'], 'private, no-store')
+                self.assertEqual(await response.read(), shell if method == 'GET' else b'')
+        for path in ('/unknown-page', '/api/unknown', '/video-comparison/private'):
+            with self.subTest(unlisted=path):
+                self.assertEqual((await self.client.get(path)).status, 404)
+        self.auth.create_user('comparison-monitor', PASSWORD, role='monitor')
+        await self.login('comparison-monitor')
+        self.assertEqual((await self.client.get(route, allow_redirects=False)).status, 403)
+        self.client.session.cookie_jar.clear()
+        for method in ('GET', 'HEAD'):
+            response = await self.client.request(method, route, allow_redirects=False)
+            self.assertEqual(response.status, 302)
+            self.assertEqual(response.headers['Location'], '/login')
+
     async def test_online_presence_requires_login_and_counts_active_user(self):
         response = await self.client.post('/api/auth/presence', headers=self.headers)
         self.assertEqual(response.status, 200)
