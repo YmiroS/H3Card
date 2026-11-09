@@ -14,6 +14,7 @@ from contextlib import nullcontext
 from pathlib import Path
 
 from capacity import CapacityStore
+from worker_commands import WorkerCommands
 
 
 LIVE_DISPATCH = ("assigned", "running", "cancel_requested")
@@ -418,6 +419,7 @@ class DistributedStore:
         self.db.execute("PRAGMA foreign_keys=ON")
         self._create_schema()
         self.capacity = CapacityStore(self)
+        self.commands = WorkerCommands(self, host_id=_worker_host_id, name_key=_worker_name_key)
 
     def close(self):
         with self.lock:
@@ -741,6 +743,7 @@ class DistributedStore:
     def retire_worker(self, worker_id):
         now = time.time()
         with self.lock, self.db:
+            self._begin_guarded_transaction_locked()
             self._requeue_expired_locked(now)
             target = self.db.execute(
                 "SELECT name FROM workers WHERE id = ? AND retired = 0", (worker_id,)
@@ -756,6 +759,10 @@ class DistributedStore:
             ]
             worker_ids = [row["id"] for row in registrations]
             placeholders = ",".join("?" for _ in worker_ids)
+            if self.db.execute(
+                    f"SELECT 1 FROM worker_command_executions WHERE worker_id IN ({placeholders}) "
+                    "AND status IN ('pending','running','unknown') LIMIT 1", worker_ids).fetchone():
+                raise WorkerBusyError("Worker 有远程命令或状态未知，不能删除注册")
             active = any(row["current_job_id"] for row in registrations)
             if not active:
                 active = self.db.execute(
@@ -941,6 +948,8 @@ class DistributedStore:
 
     def _check_restart_host_locked(self, worker_id, capabilities, action, now):
         host_id = _worker_host_id(capabilities)
+        if self.commands.blocks_worker_locked(worker_id, host_id):
+            raise WorkerBusyError("同一宿主有远程命令等待中、执行中或状态未知，不能同时维护")
         if not host_id:
             if action == "reboot_host":
                 raise WorkerBusyError("缺少稳定 host_id，无法确认整机重启范围")
@@ -976,6 +985,7 @@ class DistributedStore:
             raise ValueError("action 必须为 restart_services 或 reboot_host")
         now = time.time()
         with self.lock, self.db:
+            self._begin_guarded_transaction_locked()
             self._check_worker_restart_locked(worker_id, action, now)
             request_id = str(uuid.uuid4())
             scope = ("重启 Windows 整机，自动恢复取决于现有启动配置，可手动恢复 Worker"
@@ -1001,6 +1011,7 @@ class DistributedStore:
     def request_worker_sync(self, worker_id):
         now = time.time()
         with self.lock, self.db:
+            self._begin_guarded_transaction_locked()
             row = self.db.execute(
                 "SELECT * FROM workers WHERE id = ? AND retired = 0", (worker_id,)
             ).fetchone()
@@ -1031,6 +1042,7 @@ class DistributedStore:
         now = time.time()
         request_id = str(uuid.uuid4())
         with self.lock, self.db:
+            self._begin_guarded_transaction_locked()
             rows = self.db.execute(
                 """SELECT id, name, capabilities_json, sync_action, sync_status FROM workers
                    WHERE retired = 0
@@ -1046,6 +1058,9 @@ class DistributedStore:
                     continue
                 seen_names.add(name_key)
                 capabilities = json.loads(row["capabilities_json"] or "{}")
+                if self.commands.blocks_worker_locked(row["id"], _worker_host_id(capabilities)):
+                    skipped_count += 1
+                    continue
                 if _primary_node(capabilities):
                     primary_count += 1
                     continue
@@ -1158,6 +1173,7 @@ class DistributedStore:
         now = time.time()
         with self.lock, self.db:
             self._begin_guarded_transaction_locked()
+            self.commands.expire_locked(now)
             self._expire_service_restarts_locked(now)
             self._requeue_expired_locked(now)
             row = self.db.execute(
@@ -1284,7 +1300,7 @@ class DistributedStore:
                         "status": report_status,
                     }
 
-            commands = []
+            commands = self.commands.offer_locked(worker_id)
             lease_ttl_seconds = None
             active_job_id = None
             if current_job_id:
@@ -1342,6 +1358,14 @@ class DistributedStore:
                     merged_capabilities = {}
                 if telemetry is not None:
                     merged_capabilities["telemetry"] = telemetry
+                previous_host = _worker_host_id({
+                    "hardware": {"host_id": row["hardware_host_id"]},
+                    "telemetry": {"host_id": row["telemetry_host_id"]},
+                    "host_id": row["reported_host_id"],
+                })
+                if (previous_host != _worker_host_id(merged_capabilities)
+                        and self.commands.blocks_worker_locked(worker_id, previous_host)):
+                    raise WorkerBusyError("远程命令尚未确认停止，不能更换宿主身份")
                 fields.append("capabilities_json = ?")
                 values.append(_json(merged_capabilities))
             values.append(worker_id)
@@ -1540,6 +1564,8 @@ class DistributedStore:
         access = self.access_resolver(candidate_ids) if self.access_resolver else {}
         now = time.time()
         with self.lock, self.db:
+            self._begin_guarded_transaction_locked()
+            self.commands.expire_locked(now)
             self._requeue_expired_locked(now)
             worker = self.db.execute(
                 "SELECT * FROM workers WHERE id = ? AND retired = 0", (worker_id,)
@@ -1561,6 +1587,8 @@ class DistributedStore:
             worker = dict(worker)
             capabilities = json.loads(worker["capabilities_json"] or "{}")
             host_id = _worker_host_id(capabilities)
+            if self.commands.blocks_worker_locked(worker_id, host_id):
+                return None
             maintenance_hosts = self._service_maintenance_hosts_locked()
             if host_id and host_id in maintenance_hosts:
                 return None

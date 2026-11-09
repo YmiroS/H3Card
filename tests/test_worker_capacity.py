@@ -468,7 +468,7 @@ class WorkerIPTransmissionTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             self.assertIs(worker.capabilities["telemetry"], telemetry)
             await worker.ensure_registered()
             self.assertEqual(requests[-1][1]["capabilities"]["telemetry"]["ip_address"], "10.20.0.7")
-            self.assertEqual(worker.capabilities["agent_version"], 10)
+            self.assertEqual(worker.capabilities["agent_version"], 11)
             assert_stored("10.20.0.7")
 
             probe.getsockname.return_value = ("10.20.0.8", 54321)
@@ -1253,7 +1253,7 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             "name": "actual CUDA device", "type": "cuda", "index": 2, "vram_total": 1234,
         }])
         self.assertEqual(caps["telemetry"]["execution_device"], hardware["execution_device"])
-        self.assertEqual(caps["agent_version"], 10)
+        self.assertEqual(caps["agent_version"], 11)
         self.assertEqual(caps["supports_task_diagnostics"], 1)
         self.assertIs(caps["supports_service_restart"], os.name == "nt")
         self.assertIs(caps["supports_host_reboot"], os.name == "nt")

@@ -2441,7 +2441,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         for name in ("nt", "posix"):
             with mock.patch("agent.os.name", name):
                 caps = await self.agent.scan_capabilities()
-            self.assertEqual(caps["agent_version"], 10)
+            self.assertEqual(caps["agent_version"], 11)
             self.assertEqual(caps["supports_task_diagnostics"], 1)
             self.assertIs(caps["supports_service_restart"], name == "nt")
             self.assertIs(caps["supports_host_reboot"], name == "nt")
@@ -2454,7 +2454,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 {"KSampler": {}} if url.endswith("object_info") else {"system": system, "devices": []})
             caps = await self.agent.scan_capabilities()
             self.assertEqual(caps["system"], system)
-            self.assertEqual(caps["agent_version"], 10)
+            self.assertEqual(caps["agent_version"], 11)
             self.assertIs(self.agent.comfy_online, True)
 
     async def test_manual_service_restart_does_not_wait_for_task_queue_release_or_comfy(self):

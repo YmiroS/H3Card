@@ -25,6 +25,9 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from remote_commands import RemoteCommands, capabilities as remote_command_capabilities
+
+
 CANCEL_GRACE_SECONDS = 60
 
 
@@ -227,8 +230,15 @@ class WorkerAgent:
         self.current = None
         self.comfy_lock = asyncio.Lock()
         self.release_failed = None
+        self.remote_commands = RemoteCommands(
+            host_id, comfy_root=self.comfy_input.parent,
+            worker_root=Path(__file__).resolve().parent,
+            app_root=Path(__file__).resolve().parent.parent,
+        )
         self.capabilities = {
             "is_primary_node": self.is_primary_node,
+            "agent_version": 11,
+            "remote_commands": remote_command_capabilities(),
         }
         self.telemetry = {}
         self.last_capability_scan = 0.0
@@ -281,6 +291,22 @@ class WorkerAgent:
         finally:
             tmp.unlink(missing_ok=True)
 
+    def remote_commands_busy(self):
+        remote = getattr(self, "remote_commands", None)
+        return bool(remote and remote.busy)
+
+    def remote_command_can_start(self):
+        return not (self.current or self.local_busy or self.release_failed
+                    or not self.comfy_online or self.pending_sync
+                    or self.maintenance_blocks_jobs() or self.deployment_blocks_jobs()
+                    or self.stop_event.is_set())
+
+    async def remote_command_request(self, method, path, **kwargs):
+        return await self._json_request(
+            method, self.server + path, headers=self._agent_headers(),
+            timeout=aiohttp.ClientTimeout(total=15, sock_connect=5), **kwargs,
+        )
+
     def deployment_blocks_jobs(self):
         return bool(self.config.get("deployment_drain_file") and
                     self.configured_path("deployment_drain_file", "").exists())
@@ -297,7 +323,8 @@ class WorkerAgent:
 
     def acknowledge_deployment(self):
         if (not self.deployment_blocks_jobs() or self.current or self.local_busy
-                or self.release_failed or not self.comfy_online or self.pending_sync):
+                or self.release_failed or not self.comfy_online or self.pending_sync
+                or self.remote_commands_busy()):
             return
         request = json.loads(self.configured_path("deployment_drain_file", "").read_text(encoding="utf-8"))
         # Only the serial acquire/execute loop may acknowledge: an acquire request
@@ -764,7 +791,8 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 10,
+            "agent_version": 11,
+            "remote_commands": remote_command_capabilities(),
             "supports_task_diagnostics": 1,
             "supports_service_restart": os.name == "nt",
             "supports_guarded_service_restart": os.name == "nt",
@@ -1204,7 +1232,8 @@ class WorkerAgent:
 
     async def execute_pending_sync(self):
         command = self.pending_sync
-        if (not command or getattr(self, "_maintenance_executing", False)
+        if (not command or self.remote_commands_busy()
+                or getattr(self, "_maintenance_executing", False)
                 or self.sync_report and self.sync_report.get("status") == "running"):
             return
         action = command["type"]
@@ -1350,17 +1379,20 @@ class WorkerAgent:
                 self.refresh_deployment_report()
                 sync_running = (bool(self.pending_sync) or self.maintenance_blocks_jobs()
                                 or self.deployment_blocks_jobs())
+                # Remote occupancy is host-command scheduling state, not native
+                # ComfyUI busy: advertising it as local_busy can deadlock peer claims.
+                remote_running = self.remote_commands_busy()
                 body = {
                     "comfy_online": self.comfy_online,
                     "busy": (bool(self.current) or self.local_busy
-                             or bool(self.release_failed) or sync_running),
+                             or bool(self.release_failed) or sync_running or remote_running),
                     "local_busy": (self.local_busy or bool(self.release_failed)
                                    or bool(self.current and self.current.get("_cleanup_task"))
                                    or sync_running),
                     "current_job_id": self.current["job_id"] if self.current else None,
                     "capacity_released": bool(
                         self.current is None and not self.release_failed
-                        and self.comfy_online and not self.local_busy and not sync_running
+                        and self.comfy_online and not self.local_busy and not sync_running and not remote_running
                     ),
                 }
                 if self.telemetry:
@@ -1401,6 +1433,13 @@ class WorkerAgent:
                 for command in (reply or {}).get("commands", []):
                     if command.get("type") in ("cancel_job", "abort_job"):
                         await self.cancel_current(command.get("job_id"))
+                    elif command.get("type") == "remote_command":
+                        try:
+                            self.remote_commands.receive(command)
+                        except ValueError as exc:
+                            print(f"[Worker] 远程命令无效：{exc}", flush=True)
+                    elif command.get("type") == "cancel_remote_command":
+                        self.remote_commands.cancel(command.get("execution_id"))
                     elif command.get("type") in ("sync_files", "reboot_host", "restart_services"):
                         self.queue_sync(command)
                 # 主循环可能正阻塞在长任务上；人工重启由心跳直接执行。
@@ -1520,7 +1559,8 @@ class WorkerAgent:
 
     async def acquire(self):
         if (self.release_failed or not self.comfy_online or self.local_busy or self.current
-                or self.pending_sync or self.maintenance_blocks_jobs() or self.deployment_blocks_jobs()):
+                or self.pending_sync or self.maintenance_blocks_jobs() or self.deployment_blocks_jobs()
+                or self.remote_commands_busy()):
             return None
         return await self._json_request(
             "POST", self.server + "/agent/v1/jobs/acquire",
@@ -1839,7 +1879,7 @@ class WorkerAgent:
 
     async def execute(self, assignment):
         # acquire 的网络请求可能早于维护封锁发出；迟到的接单结果不能启动新任务。
-        if (self.maintenance_blocks_jobs()
+        if (self.maintenance_blocks_jobs() or self.remote_commands_busy()
                 or getattr(self, "stop_event", None) is not None and self.stop_event.is_set()):
             return
         started = time.monotonic()
@@ -1958,7 +1998,11 @@ class WorkerAgent:
                     try:
                         await self.local_status()
                         self.acknowledge_deployment()
-                        if self.pending_sync and not self.local_busy and not self.release_failed:
+                        if await self.remote_commands.pump(
+                                self.remote_command_request, self.remote_command_can_start):
+                            continue
+                        if (self.pending_sync and not self.local_busy and not self.release_failed
+                                and not self.remote_commands_busy()):
                             await self.execute_pending_sync()
                             continue
                         assignment = await self.acquire()

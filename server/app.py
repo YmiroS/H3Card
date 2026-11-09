@@ -74,6 +74,7 @@ from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
 from server.texture_api import register_texture_routes
+from server.worker_command_api import register_worker_command_routes
 from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
 from server.cloud_lighting import CloudLighting
@@ -2388,17 +2389,20 @@ async def api_agent_register(request):
 async def api_agent_heartbeat(request):
     worker_id = require_agent(request)
     body = await request.json()
-    result = distributed_store(request.app).heartbeat(
-        worker_id,
-        capabilities=body.get("capabilities") if isinstance(body.get("capabilities"), dict) else None,
-        telemetry=body.get("telemetry") if isinstance(body.get("telemetry"), dict) else None,
-        comfy_online=body.get("comfy_online") is True,
-        busy=bool(body.get("busy")),
-        local_busy=body.get("local_busy") if "local_busy" in body else None,
-        current_job_id=body.get("current_job_id"),
-        maintenance=body.get("maintenance") if isinstance(body.get("maintenance"), dict) else None,
-        capacity_released=body.get("capacity_released") is True,
-    )
+    try:
+        result = distributed_store(request.app).heartbeat(
+            worker_id,
+            capabilities=body.get("capabilities") if isinstance(body.get("capabilities"), dict) else None,
+            telemetry=body.get("telemetry") if isinstance(body.get("telemetry"), dict) else None,
+            comfy_online=body.get("comfy_online") is True,
+            busy=bool(body.get("busy")),
+            local_busy=body.get("local_busy") if "local_busy" in body else None,
+            current_job_id=body.get("current_job_id"),
+            maintenance=body.get("maintenance") if isinstance(body.get("maintenance"), dict) else None,
+            capacity_released=body.get("capacity_released") is True,
+        )
+    except WorkerBusyError as exc:
+        raise web.HTTPConflict(text=str(exc)) from exc
     if result is None:
         raise web.HTTPNotFound(reason="Worker 不存在")
     return web.json_response(result)
@@ -4529,6 +4533,9 @@ def make_app(auth_path=None, *, project_repository=None):
             api_worker_enabled=api_worker_enabled, api_worker_delete=api_worker_delete,
             api_worker_restart=api_worker_restart, api_worker_sync=api_worker_sync,
             api_workers_sync_all=api_workers_sync_all, api_worker_access=api_worker_access)
+        register_worker_command_routes(
+            app, get_store=distributed_store, require_agent=require_agent,
+            agent_enabled=not admin_sandbox)
         if not admin_sandbox:
             register_worker_routes(
                 app, api_agent_register=api_agent_register, api_agent_heartbeat=api_agent_heartbeat,
