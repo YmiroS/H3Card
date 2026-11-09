@@ -62,6 +62,8 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.gateway_release = asyncio.Event()
         gateway_app = web.Application()
         gateway_app.router.add_post("/v1/images/edits", self.gateway)
+        if hasattr(self, "chat_gateway"):
+            gateway_app.router.add_post("/v1/chat/completions", self.chat_gateway)
         gateway_app.router.add_get("/view", self.comfy_image)
         self.comfy_requests = []
         self.remote = TestServer(gateway_app)
@@ -142,6 +144,53 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
                                                "prompt": "调整质感", **extra}))
         form.add_field("base", data, filename="../../untrusted.png", content_type="image/png")
         return await self.client.post("/api/texture/edit", headers=self.headers, data=form)
+
+    def explicit_source(self, image):
+        from server.texture_api import source_version
+        return {"working_base_ref": image["ref"], "expected_source": json.loads(source_version(self.saved_card()))}
+
+    async def test_explicit_working_base_not_card_old_image_and_parent(self):
+        working = self.add_image("working.png", png("green"))
+        before = self.saved_card()
+        response = await self.generate(**self.explicit_source(working))
+        self.assertEqual(response.status, 200, await response.text())
+        result = await response.json()
+        self.assertEqual(self.received, [[png("green")]])
+        self.assertEqual(result["source_kind"], "working")
+        record = self.application["resource_access"].lookup("upload", result["image"]["ref"][7:])
+        parent = self.application["resource_access"].lookup("upload", "working.png")
+        self.assertEqual(record["parent_id"], parent["resource_id"])
+        self.assertEqual(self.saved_card(), before)
+
+    async def test_explicit_base_then_multipart_override_preserves_parent_and_size(self):
+        working = self.add_image("working.png", png("green"))
+        self.result_size = (2, 3)
+        response = await self.temporary_generate(png("yellow", (2, 3)), **self.explicit_source(working))
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.received, [[png("yellow", (2, 3))]])
+        result = await response.json()
+        parent = self.application["resource_access"].lookup("upload", "working.png")
+        record = self.application["resource_access"].lookup("upload", result["image"]["ref"][7:])
+        self.assertEqual(record["parent_id"], parent["resource_id"])
+
+    async def test_explicit_source_pair_snapshot_and_acl_are_required(self):
+        explicit = self.explicit_source(self.upstream)
+        cases = [(400, {"working_base_ref": self.upstream["ref"]}),
+                 (400, {"expected_source": explicit["expected_source"]}),
+                 (409, {**explicit, "expected_source": {**explicit["expected_source"], "input": None}}),
+                 (400, {**explicit, "working_base_ref": "https://example.invalid/x.png"}),
+                 (404, {**explicit, "working_base_ref": "chouka/unknown.png"})]
+        for status, extra in cases:
+            with self.subTest(extra=extra):
+                response = await self.generate(**extra)
+                self.assertEqual(response.status, status, await response.text())
+        store = self.application["auth_store"]
+        owner = store.create_user("working-owner", "Other-password-123")["id"]
+        store.create_project("foreign-working", owner)
+        foreign = self.add_image("foreign-working.png", png("black"), project="foreign-working")
+        response = await self.generate(**{**explicit, "working_base_ref": foreign["ref"]})
+        self.assertEqual(response.status, 404)
+        self.assertEqual(self.received, [])
 
     async def test_temporary_base_is_not_saved_or_added_to_history(self):
         before = self.saved_card()
