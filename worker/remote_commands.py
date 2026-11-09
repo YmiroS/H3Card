@@ -455,7 +455,8 @@ class RemoteCommands:
             # Persist consumed BEFORE any spawn. Even a crash between here and spawn
             # produces unknown, never an automatic second attempt.
             with self._db() as db:
-                db.execute("UPDATE commands SET phase='consumed' WHERE id=?", (row["id"],))
+                db.execute("UPDATE commands SET phase='consumed',cancel=CASE WHEN ? THEN 1 ELSE cancel END WHERE id=?",
+                           (reply.get("cancel_requested") is True, row["id"]))
                 canceled = db.execute("SELECT cancel FROM commands WHERE id=?", (row["id"],)).fetchone()[0]
             if canceled:
                 self.cancel_event.set()

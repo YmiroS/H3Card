@@ -421,6 +421,36 @@ class JournalTests(Fixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.reports[-1]["status"], "canceled")
         self.assertEqual(self.reports[-1]["stdout"], "")
 
+    async def test_lost_claim_ack_then_server_cancel_never_spawns(self):
+        remote = self.remote()
+        marker = self.root / "must-not-run.txt"
+        remote.receive(self.command(f"from pathlib import Path; Path({str(marker)!r}).write_text('ran')"))
+        first_claim = True
+
+        async def request(method, path, **kwargs):
+            nonlocal first_claim
+            reply = await self.request(method, path, **kwargs)
+            if path.endswith("/claim"):
+                if first_claim:
+                    first_claim = False
+                    raise OSError("claim committed but response lost")
+                reply["cancel_requested"] = True
+            return reply
+
+        with mock.patch("remote_commands.asyncio.create_subprocess_exec", new_callable=mock.AsyncMock) as spawn:
+            self.assertFalse(await remote.pump(request, lambda: True))
+            remote.next_attempt = 0
+            self.assertTrue(await remote.pump(request, lambda: True))
+            spawn.assert_not_awaited()
+        self.assertEqual(len(self.claims), 2)
+        self.assertEqual(self.claims[0]["claim_key"], self.claims[1]["claim_key"])
+        self.assertEqual(self.reports[-1]["status"], "canceled")
+        self.assertTrue(self.reports[-1]["process_stopped"])
+        self.assertFalse(marker.exists())
+        self.assertFalse(remote.busy)
+        with remote._db() as db:
+            self.assertEqual(db.execute("SELECT cancel FROM commands").fetchone()[0], 1)
+
 
 class IntegrationTests(Fixture, unittest.IsolatedAsyncioTestCase):
     async def test_request_uses_existing_authenticated_headers(self):
