@@ -53,7 +53,7 @@ from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError,
     BF16_HIGH_VRAM_CAPABILITIES, can_run_capability, is_pro_6000_worker, worker_capability_comparisons,
-    is_windows_worker, generation_worker_reason,
+    is_windows_worker, generation_worker_reason, worker_access_allowed,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 from if_reference import IFReferenceCopies
@@ -1559,6 +1559,12 @@ async def api_generate(request):
         if (not CONTROLLER_MODE or cap.get("execution") in EXTERNAL_EXECUTIONS
                 or cap.get("outputType") != "video"):
             raise web.HTTPBadRequest(text="仅控制器模式的非 IF 视频能力支持指定执行端")
+        team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
+        target = next((worker for worker in distributed_store(request.app).list_generation_workers()
+                       if worker["id"] == target_worker_id
+                       and worker_access_allowed(worker, team_ids)), None)
+        if target is None:
+            raise web.HTTPBadRequest(text="指定执行端不存在或不可访问")
     if cap.get("execution") == "cloud_image":
         try:
             result = await request.app["cloud_lighting"].submit(request, body, cap)
@@ -1624,10 +1630,12 @@ async def api_generate(request):
     if target_worker_id is not None:
         # Validate the final patched graph and effective GPU policy before any job ACL,
         # public job record or queue entry is created. Busy targets may queue normally.
+        team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
         worker = next((item for item in distributed_store(request.app).list_generation_workers()
-                       if item["id"] == target_worker_id), None)
+                       if item["id"] == target_worker_id
+                       and worker_access_allowed(item, team_ids)), None)
         if worker is None:
-            raise web.HTTPBadRequest(text="指定执行端不存在、已退役或不是同名最新注册")
+            raise web.HTTPBadRequest(text="指定执行端不存在或不可访问")
         reason = generation_worker_reason(
             worker, graph, cid, gpu_policy, duration_seconds,
             targeted_video=cap.get("outputType") == "video",
@@ -2134,6 +2142,42 @@ def job_queue_snapshot(app, jobs):
     }
 
 
+async def project_job_workers(request, jobs):
+    """Hide restricted machine identities in responses, never rewrite job/billing history."""
+    if not CONTROLLER_MODE or require_user(request)["role"] == "admin":
+        return jobs
+    team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
+    store = distributed_store(request.app)
+    job_ids = [job["id"] for job in jobs]
+
+    def identities():
+        # Dispatch is authoritative before api_agent_acquire finishes its awaits.
+        # Read IDs, labels and restrictions together so reassignment cannot mix them.
+        with store.lock:
+            return (store.job_worker_ids(job_ids), store.job_worker_names(job_ids),
+                    store.inaccessible_worker_ids(team_ids))
+
+    assigned, names, hidden = await asyncio.to_thread(identities)
+    projected = []
+    for job in jobs:
+        item = dict(job)
+        if job["id"] in assigned:
+            item["worker_id"] = assigned[job["id"]]
+            item["nodeName"] = names.get(job["id"])
+        else:
+            item.pop("worker_id", None)
+            if (item.get("executor") != sr_service.EXECUTION
+                    and item.get("execution") != "cloud_image"):
+                item["nodeName"] = None
+        if item.get("worker_id") in hidden:
+            item.pop("worker_id", None)
+            item["nodeName"] = None
+        if item.get("target_worker_id") in hidden:
+            item.pop("target_worker_id", None)
+        projected.append(item)
+    return projected
+
+
 async def api_job(request):
     pid = request.match_info["pid"]
     permission = await authorized_job(request, pid)
@@ -2142,10 +2186,11 @@ async def api_job(request):
         raise web.HTTPNotFound(reason="没有这个任务")
     node_name = job_node_names(request.app, [job]).get(pid)
     submitters = await job_submitter_info(request, [job])
-    return web.json_response(
+    projected = await project_job_workers(request, [
         job | job_display_info(job, node_name) | submitters.get(pid, {})
         | job_queue_snapshot(request.app, [job])[pid] | {"permission": permission}
-    )
+    ])
+    return web.json_response(projected[0])
 
 
 async def api_job_inputs(request):
@@ -2177,11 +2222,12 @@ async def api_jobs(request):
     node_names = job_node_names(request.app, jobs)
     queue_snapshot = job_queue_snapshot(request.app, jobs)
     submitters = await job_submitter_info(request, jobs)
-    return web.json_response({"jobs": [
+    projected = await project_job_workers(request, [
         job | job_display_info(job, node_names.get(job["id"]))
         | submitters.get(job['id'], {}) | queue_snapshot[job['id']] | {"permission": permission}
         for job, permission in visible
-    ]})
+    ])
+    return web.json_response({"jobs": projected})
 
 
 async def api_jobs_history(request):
@@ -2417,6 +2463,22 @@ async def api_agent_event(request):
             pid, worker_id, lease_token, data.get("diagnostics"),
         )
         return web.json_response({"ok": True, "recorded": recorded})
+    if event_type == "cleanup_status":
+        steps = {"stopping": "正在停止并释放显存",
+                 "recovering": "停止未完成，正在恢复 ComfyUI"}
+        state = data.get("state")
+        step = steps.get(state) if isinstance(state, str) else None
+        if step is None:
+            raise web.HTTPBadRequest(reason="无效清理状态")
+        # 读取请求体时任务可能已结束或更换租约，迟到状态不能复活清理门禁。
+        if not distributed_store(request.app).validate_lease(pid, worker_id, lease_token):
+            raise web.HTTPConflict(reason="任务租约已失效")
+        job = JOBS.get(pid)
+        if job and job.get("status") in LIVE:
+            if state != "stopping" or job.get("step") != steps["recovering"]:
+                job.update(cleanup_pending=True, step=step)
+                save_jobs()
+        return web.json_response({"ok": True, "cleanup_pending": True})
     if event_type == "execution_cached":
         nodes = data.get("nodes")
         if isinstance(nodes, list):
@@ -2435,10 +2497,13 @@ async def api_agent_event(request):
     # 新 Worker 在显存清理确认后才补报 /failed；旧 Worker 保留即时终态语义。
     if event_type in ("execution_error", "execution_interrupted"):
         if data.get("cleanup_pending") is True:
+            if not distributed_store(request.app).validate_lease(pid, worker_id, lease_token):
+                raise web.HTTPConflict(reason="任务租约已失效")
             job = JOBS.get(pid)
-            if job:
-                job.update(cleanup_pending=True, step="正在释放显存")
-                save_jobs()
+            if job and job.get("status") in LIVE:
+                if not job.get("cleanup_pending"):
+                    job.update(cleanup_pending=True, step="正在释放显存")
+                    save_jobs()
             return web.json_response({"ok": True, "cleanup_pending": True})
         terminal = "error" if event_type == "execution_error" else "canceled"
         store = distributed_store(request.app)
@@ -2633,8 +2698,10 @@ async def api_agent_failed(request):
     ended_at = (job or {}).get("ended") or time.time()
     if not already_terminal:
         if job:
-            job.update(status=dispatch_status, step="", ended=ended_at,
-                       cleanup_pending=False,
+            recovered = body.get("comfy_recovered") is True and body.get("capacity_released") is True
+            job.update(status=dispatch_status,
+                       step="已停止，ComfyUI 已恢复" if canceled and recovered else "",
+                       ended=ended_at, cleanup_pending=False,
                        worker_id=worker_id, error=None if canceled else str(body.get("error") or "Worker 执行失败")[:2000])
             STEPS.pop(pid, None)
             WEIGHTS.pop(pid, None)
@@ -2665,9 +2732,10 @@ async def api_generation_workers(request):
     # final graph, imported-video policy and user-selected duration again.
     gpu_policy = HIGH_VRAM_GPU_POLICY if cid in HIGH_VRAM_CAPABILITIES else None
     duration_seconds = rw.duration(cap, {}) if cid in HIGH_VRAM_CAPABILITIES else None
+    team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
     workers = []
     for worker in distributed_store(request.app).list_generation_workers():
-        if not is_windows_worker(worker):
+        if not worker_access_allowed(worker, team_ids) or not is_windows_worker(worker):
             continue
         reason = generation_worker_reason(
             worker, graph, cid, gpu_policy, duration_seconds,
@@ -2707,6 +2775,35 @@ async def api_worker_temperature(request):
     except KeyError:
         raise web.HTTPNotFound(reason="Worker 不存在")
     return web.json_response(result)
+
+
+async def api_worker_access(request):
+    user = require_admin(request)
+    try:
+        body = await request.json()
+    except (ValueError, UnicodeError) as exc:
+        raise web.HTTPBadRequest(text="请求体必须为 JSON 对象") from exc
+    if not isinstance(body, dict) or set(body) != {"team_id", "expires_at"}:
+        raise web.HTTPBadRequest(text="请求体只能包含 team_id 和 expires_at")
+    team_id, expires_at = body["team_id"], body["expires_at"]
+    if team_id is not None:
+        if not isinstance(team_id, str) or not team_id or len(team_id) > 128:
+            raise web.HTTPBadRequest(text="请选择有效项目组")
+        teams = await call_store(request.app, "list_teams", user["id"])
+        if not any(team["id"] == team_id for team in teams):
+            raise web.HTTPBadRequest(text="项目组不存在或已停用")
+    if expires_at is not None:
+        if (team_id is None or type(expires_at) not in (int, float)
+                or not 0 < expires_at <= 253402300799 or expires_at <= time.time()):
+            raise web.HTTPBadRequest(text="结束时间必须为未来的有效时间，公共设备不设置结束时间")
+    worker_id = request.match_info["worker_id"]
+    updated = await asyncio.to_thread(
+        distributed_store(request.app).set_worker_access, worker_id, team_id, expires_at)
+    if not updated:
+        raise web.HTTPNotFound(text="Worker 不存在")
+    return web.json_response({"ok": True, "worker_id": worker_id,
+                              "access_team_id": team_id, "access_expires_at": expires_at},
+                             headers={"Cache-Control": "no-store"})
 
 
 async def api_worker_enabled(request):
@@ -2865,6 +2962,9 @@ async def stop_job(app, pid):
             ledger = cost_ledger(app)
             if ledger:
                 ledger.finish_job(pid, "canceled", ended_at)
+        elif state == "cancel_requested" and job and not job.get("cleanup_pending"):
+            job.update(cleanup_pending=True, step="正在停止并释放显存")
+            save_jobs()
         return state
     if job is None:
         raise web.HTTPNotFound(reason="任务不存在")
@@ -4169,6 +4269,9 @@ async def api_health(request):
     user = require_user(request)
     workers = (await asyncio.to_thread(distributed_store(request.app).list_workers, summary=True)
                if CONTROLLER_MODE else [])
+    if CONTROLLER_MODE and user["role"] != "admin":
+        team_ids = await call_store(request.app, "user_worker_teams", user["id"])
+        workers = [worker for worker in workers if worker_access_allowed(worker, team_ids)]
     comfy_online = controller_comfy_online(request.app, workers)
     maintenance_active = controller_maintenance_active(request.app, workers)
     if user["role"] != "admin":
@@ -4196,6 +4299,8 @@ async def on_start(app):
     app["auth_store"] = await asyncio.to_thread(AuthStore, app["auth_path"])
     if app.get('distributed') is not None:
         app['distributed'].priority_resolver = app['auth_store'].priority_job_ids
+        app['distributed'].access_resolver = app['auth_store'].job_worker_teams
+        app['distributed'].access_guard = app['auth_store'].lock
     app["resource_access"] = await asyncio.to_thread(
         ResourceAccess, app["auth_store"], ROOT, COMFY_INPUT)
     trace_configs = []
@@ -4423,7 +4528,7 @@ def make_app(auth_path=None, *, project_repository=None):
             api_capacity_probe_outputs=api_capacity_probe_outputs, api_capacity_worker=api_capacity_worker,
             api_worker_enabled=api_worker_enabled, api_worker_delete=api_worker_delete,
             api_worker_restart=api_worker_restart, api_worker_sync=api_worker_sync,
-            api_workers_sync_all=api_workers_sync_all)
+            api_workers_sync_all=api_workers_sync_all, api_worker_access=api_worker_access)
         if not admin_sandbox:
             register_worker_routes(
                 app, api_agent_register=api_agent_register, api_agent_heartbeat=api_agent_heartbeat,

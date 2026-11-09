@@ -64,6 +64,102 @@ class WorkerCleanupRestartTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await worker.cancel_and_release({"job_id": "job-1"}))
         worker.restart_comfy_only.assert_not_awaited()
 
+    async def test_one_deadline_covers_ws_lock_http_retry_and_status_report(self):
+        for blocked in ("ws", "lock", "http", "retry", "status"):
+            with self.subTest(blocked=blocked):
+                worker = self.make_worker()
+                assignment = {"job_id": "job-1", "cancel_requested": True,
+                              "_capacity_measurements": {"diagnostics": {}}}
+                gate = asyncio.Event()
+                cancel_calls = 0
+                states = []
+
+                async def report(_assignment, event):
+                    states.append(event["data"]["state"])
+                    if blocked == "status" and states[-1] == "stopping":
+                        await gate.wait()
+
+                async def request(method, url, **kwargs):
+                    nonlocal cancel_calls
+                    if url.endswith("/queue"):
+                        return {"queue_running": [], "queue_pending": []}
+                    cancel_calls += 1
+                    if blocked == "retry" and cancel_calls == 1:
+                        raise aiohttp.ClientConnectionError("uncertain delivery")
+                    await gate.wait()
+
+                worker.report_event = mock.AsyncMock(side_effect=report)
+                worker._json_request = mock.AsyncMock(side_effect=request)
+                worker.restart_comfy_only = mock.AsyncMock()
+                if blocked == "ws":
+                    assignment["_ws"] = mock.Mock(closed=False, close=mock.AsyncMock(side_effect=gate.wait))
+                if blocked == "lock":
+                    await worker.comfy_lock.acquire()
+                try:
+                    with mock.patch("agent.CANCEL_GRACE_SECONDS", 0.03):
+                        released = await asyncio.wait_for(worker.cancel_and_release(assignment), 0.5)
+                    self.assertTrue(released)
+                    worker.restart_comfy_only.assert_awaited_once_with()
+                    self.assertEqual(states[-1], "recovering")
+                    self.assertIsNone(worker.release_failed)
+                    self.assertTrue(assignment["_comfy_recovered"])
+                    diagnostics = assignment["_capacity_measurements"]["diagnostics"]
+                    self.assertFalse(diagnostics["cleanup_complete"])
+                    self.assertIn("停止超过", diagnostics["cleanup_error"])
+                    if blocked == "retry":
+                        self.assertEqual(cancel_calls, 2)
+                finally:
+                    if worker.comfy_lock.locked():
+                        worker.comfy_lock.release()
+
+    async def test_recovery_requires_empty_queue_and_keeps_gate_on_failure(self):
+        queues = [{}, {"queue_running": [[1]], "queue_pending": []},
+                  {"queue_running": [], "queue_pending": [[1]]}]
+        for field in ("queue_running", "queue_pending"):
+            for invalid in (None, False, 0, "", {}):
+                queues.append({"queue_running": [], "queue_pending": [], field: invalid})
+        for queue in queues:
+            with self.subTest(queue=queue):
+                worker = self.make_worker()
+                worker.report_event = mock.AsyncMock()
+                worker._json_request = mock.AsyncMock(side_effect=[
+                    {"cleanup_complete": False}, queue,
+                ])
+                worker.restart_comfy_only = mock.AsyncMock()
+                assignment = {"job_id": "job-1"}
+                self.assertFalse(await worker.cancel_and_release(assignment))
+                self.assertNotIn("_comfy_recovered", assignment)
+                self.assertIn("恢复失败", worker.release_failed)
+                self.assertIsNone(await worker.acquire())
+
+    async def test_duplicate_cancellation_does_not_replace_cleanup_or_restart_twice(self):
+        worker = self.make_worker()
+        assignment = {"job_id": "job-1"}
+        worker.current = assignment
+        worker.report_event = mock.AsyncMock()
+        gate = asyncio.Event()
+
+        async def request(method, url, **kwargs):
+            if url.endswith("/queue"):
+                return {"queue_running": [], "queue_pending": []}
+            await gate.wait()
+
+        worker._json_request = mock.AsyncMock(side_effect=request)
+        worker.restart_comfy_only = mock.AsyncMock()
+        with mock.patch("agent.CANCEL_GRACE_SECONDS", 0.03):
+            await worker.cancel_current("other-job")
+            self.assertNotIn("_cleanup_task", assignment)
+            await worker.cancel_current("job-1")
+            cleanup = assignment["_cleanup_task"]
+            for _ in range(5):
+                await worker.cancel_current("job-1")
+                self.assertIs(assignment["_cleanup_task"], cleanup)
+            self.assertIsNone(await worker.acquire())
+            self.assertTrue(await asyncio.wait_for(cleanup, 0.5))
+            await worker.cancel_current("job-1")
+            self.assertIs(assignment["_cleanup_task"], cleanup)
+        worker.restart_comfy_only.assert_awaited_once_with()
+
 
 class WorkerCapacityIdentityTest(WorkerFixture, unittest.TestCase):
     def test_identity_persists_without_registration_and_is_not_hostname(self):
@@ -372,7 +468,7 @@ class WorkerIPTransmissionTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             self.assertIs(worker.capabilities["telemetry"], telemetry)
             await worker.ensure_registered()
             self.assertEqual(requests[-1][1]["capabilities"]["telemetry"]["ip_address"], "10.20.0.7")
-            self.assertEqual(worker.capabilities["agent_version"], 9)
+            self.assertEqual(worker.capabilities["agent_version"], 10)
             assert_stored("10.20.0.7")
 
             probe.getsockname.return_value = ("10.20.0.8", 54321)
@@ -564,6 +660,55 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("upload_seconds", body["capacity_measurements"])
         self.worker.collect_outputs.assert_not_awaited()
 
+    async def test_cancel_recovery_reports_release_without_erasing_cleanup_failure(self):
+        self.fail_stage = "execute"
+        self.cleanup_ok = False
+        self.assignment["cancel_requested"] = True
+        request = self.worker._json_request
+
+        async def recovered(method, url, **kwargs):
+            if url.endswith("/queue"):
+                return {"queue_running": [], "queue_pending": []}
+            return await request(method, url, **kwargs)
+
+        self.worker._json_request = mock.AsyncMock(side_effect=recovered)
+        body = await self.execute()
+        self.assertTrue(body["canceled"])
+        self.assertTrue(body["capacity_released"])
+        self.assertTrue(body["comfy_recovered"])
+        diagnostics = body["capacity_measurements"]["diagnostics"]
+        self.assertFalse(diagnostics["cleanup_complete"])
+        self.assertIn("未确认", diagnostics["cleanup_error"])
+        self.assertIsNone(self.worker.release_failed)
+        self.assertTrue(self.worker.comfy_online)
+        self.assertFalse(self.worker.local_busy)
+        self.worker.restart_comfy_only.assert_awaited_once_with()
+
+    async def test_cancel_interrupts_stalled_download_or_upload_without_stopping_worker(self):
+        for stage in ("prepare_inputs", "collect_outputs"):
+            with self.subTest(stage=stage):
+                self.assignment.pop("_cleanup_task", None)
+                self.assignment.pop("cancel_requested", None)
+                entered = asyncio.Event()
+                gate = asyncio.Event()
+
+                async def blocked(*args):
+                    entered.set()
+                    await gate.wait()
+
+                with mock.patch.object(self.worker, stage, new=mock.AsyncMock(side_effect=blocked)):
+                    execution = asyncio.create_task(self.worker.execute(self.assignment))
+                    await asyncio.wait_for(entered.wait(), 1)
+                    await self.worker.cancel_current("job-1")
+                    await asyncio.wait_for(execution, 1)
+                self.assertFalse(execution.cancelled())
+                self.assertIsNone(self.worker.current)
+                self.assertNotIn("_execution_task", self.assignment)
+                body = self.requests[-1][1]
+                self.assertTrue(body["canceled"])
+                self.assertTrue(body["capacity_released"])
+                self.assertFalse(self.worker.stop_event.is_set())
+
     async def test_complete_does_not_claim_release_when_release_gate_is_closed(self):
         self.worker.release_failed = "release not confirmed"
         body = await self.execute()
@@ -738,6 +883,76 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["capacity_measurements"]["diagnostics"]["execution_error"]["exception_type"],
                          "CancelledError")
         self.assertIsNone(self.worker.current)
+
+    async def test_external_shutdown_still_propagates_after_user_requested_cancel(self):
+        entered = asyncio.Event()
+        gate = asyncio.Event()
+        cleanup_started = asyncio.Event()
+        cleanup_ack = asyncio.Event()
+        request = self.worker._json_request
+
+        async def execute_comfy(_assignment):
+            entered.set()
+            await gate.wait()
+
+        async def pending_cleanup(method, url, **kwargs):
+            if url.endswith("/cancel"):
+                cleanup_started.set()
+                await cleanup_ack.wait()
+            return await request(method, url, **kwargs)
+
+        self.worker.execute_comfy = mock.AsyncMock(side_effect=execute_comfy)
+        self.worker._json_request = mock.AsyncMock(side_effect=pending_cleanup)
+        execution = asyncio.create_task(self.worker.execute(self.assignment))
+        await asyncio.wait_for(entered.wait(), 1)
+        await self.worker.cancel_current("job-1")
+        await asyncio.wait_for(cleanup_started.wait(), 1)
+        execution.cancel()
+        await asyncio.sleep(0)
+        self.assertFalse(execution.done())
+        cleanup_ack.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await asyncio.wait_for(execution, 1)
+        self.assertIsNone(self.worker.current)
+        self.assertTrue(self.requests[-1][1]["capacity_released"])
+
+    async def test_worker_run_continues_after_canceling_stalled_assignment(self):
+        entered = asyncio.Event()
+        acquired_again = asyncio.Event()
+        gate = asyncio.Event()
+        count = 0
+
+        async def prepare(_assignment):
+            entered.set()
+            await gate.wait()
+
+        async def acquire():
+            nonlocal count
+            count += 1
+            if count == 1:
+                return self.assignment
+            acquired_again.set()
+            self.worker.stop_event.set()
+            return None
+
+        async def heartbeat():
+            await entered.wait()
+            await self.worker.cancel_current("job-1")
+            await self.worker.stop_event.wait()
+
+        self.worker.prepare_inputs = mock.AsyncMock(side_effect=prepare)
+        self.worker.acquire = mock.AsyncMock(side_effect=acquire)
+        self.worker.heartbeat_loop = heartbeat
+        self.worker.scan_capabilities = mock.AsyncMock()
+        self.worker.local_status = mock.AsyncMock()
+        self.worker.acknowledge_deployment = mock.Mock()
+        execution = asyncio.create_task(self.worker.run())
+        await asyncio.wait_for(execution, 2)
+        self.assertTrue(acquired_again.is_set())
+        self.assertFalse(execution.cancelled())
+        self.assertEqual(execution.cancelling(), 0)
+        self.assertIsNone(self.worker.current)
+        self.assertTrue(self.requests[-1][1]["canceled"])
 
     async def test_diagnostic_sampling_failure_does_not_fail_generation(self):
         self.worker.scan_telemetry.side_effect = RuntimeError("probe unavailable")
@@ -1038,7 +1253,7 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
             "name": "actual CUDA device", "type": "cuda", "index": 2, "vram_total": 1234,
         }])
         self.assertEqual(caps["telemetry"]["execution_device"], hardware["execution_device"])
-        self.assertEqual(caps["agent_version"], 9)
+        self.assertEqual(caps["agent_version"], 10)
         self.assertEqual(caps["supports_task_diagnostics"], 1)
         self.assertIs(caps["supports_service_restart"], os.name == "nt")
         self.assertIs(caps["supports_host_reboot"], os.name == "nt")

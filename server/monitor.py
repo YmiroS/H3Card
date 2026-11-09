@@ -7,9 +7,9 @@ from pathlib import PurePosixPath
 
 from aiohttp import web
 
-from server.auth import require_monitor
+from server.auth import call_store, require_monitor
 from distributed import (TEMPERATURE_MAX_GPU_INDEX, capability_model_inventory,
-                         worker_capability_comparisons)
+                         worker_access_allowed, worker_capability_comparisons)
 
 
 WORKER_FIELDS = (
@@ -166,14 +166,21 @@ def safe_worker(worker):
     return result
 
 
-def _summary(app, jobs, get_health):
+def _summary(app, jobs, get_health, team_ids=None):
     store = app.get("distributed")
     workers = store.list_workers(telemetry_only=True) if store is not None else []
+    workers = [worker for worker in workers if worker_access_allowed(worker, team_ids)]
+    if store is not None and team_ids is not None:
+        hidden = store.inaccessible_worker_ids(team_ids)
+        jobs = [job for job in jobs if job.get("worker_id") not in hidden
+                and job.get("target_worker_id") not in hidden]
     raw_health = get_health(app, workers)
     health = {key: _scalar(raw_health.get(key)) for key in (
         "ok", "mode", "server_time", "started_at", "sandbox", "capabilities", "jobs", "comfy_online")}
     llm = _mapping(raw_health.get("llm"))
     health["llm"] = {"ok": llm.get("ok") is True, "model": _label(llm.get("model"))}
+    if team_ids is not None:
+        health["jobs"] = len(jobs)
     recent = sorted(jobs, key=lambda job: _number(job.get("created")) or 0, reverse=True)[:60]
     # AuthStore 和 DistributedStore 的公共只读方法内部持有各自 SQLite 锁。
     submitters = app["auth_store"].job_submitters([job["id"] for job in recent])
@@ -203,9 +210,10 @@ def _summary(app, jobs, get_health):
     }
 
 
-def _detail(app, worker_id):
+def _detail(app, worker_id, team_ids=None):
     store = app.get("distributed")
     workers = store.list_workers() if store is not None else []
+    workers = [worker for worker in workers if worker_access_allowed(worker, team_ids)]
     worker = next((worker for worker in workers if worker["id"] == worker_id), None)
     if worker is None:
         raise web.HTTPNotFound(reason="Worker 不存在")
@@ -247,16 +255,19 @@ def register_monitor_routes(app, *, web_root, get_jobs, get_health, frontend=Non
         return web.FileResponse(path, headers={"Cache-Control": "no-store"})
 
     async def summary(request):
-        require_monitor(request)
+        user = require_monitor(request)
+        team_ids = await call_store(request.app, "user_worker_teams", user["id"])
         jobs = get_jobs()
-        return await _response(_summary, request.app, jobs, get_health)
+        return await _response(_summary, request.app, jobs, get_health, team_ids)
 
     async def detail(request):
-        require_monitor(request)
-        return await _response(_detail, request.app, request.match_info["worker_id"])
+        user = require_monitor(request)
+        team_ids = await call_store(request.app, "user_worker_teams", user["id"])
+        return await _response(_detail, request.app, request.match_info["worker_id"], team_ids)
 
     async def temperature(request):
-        require_monitor(request)
+        user = require_monitor(request)
+        team_ids = await call_store(request.app, "user_worker_teams", user["id"])
         try:
             gpu_index = int(request.query.get("gpu_index", "0"))
             minutes = int(request.query.get("minutes", "30"))
@@ -266,6 +277,9 @@ def register_monitor_routes(app, *, web_root, get_jobs, get_health, frontend=Non
             raise web.HTTPBadRequest(reason="显卡编号或时间范围无效")
         store = request.app.get("distributed")
         if store is None:
+            raise web.HTTPNotFound(reason="Worker 不存在")
+        hidden = await asyncio.to_thread(store.inaccessible_worker_ids, team_ids)
+        if request.match_info["worker_id"] in hidden:
             raise web.HTTPNotFound(reason="Worker 不存在")
         try:
             return await _response(store.temperature_history, request.match_info["worker_id"],

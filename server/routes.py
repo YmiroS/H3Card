@@ -94,7 +94,7 @@ def register_controller_routes(app, *, api_workers, api_worker_temperature,
                                api_capacity_estimate, api_capacity_review,
                                api_capacity_probe_outputs, api_capacity_worker,
                                api_worker_enabled, api_worker_delete, api_worker_restart,
-                               api_worker_sync, api_workers_sync_all):
+                               api_worker_sync, api_workers_sync_all, api_worker_access):
     app.router.add_get("/api/workers", api_workers)
     app.router.add_get("/api/workers/{worker_id}/temperature", api_worker_temperature)
     app.router.add_get("/api/costs", api_costs)
@@ -105,6 +105,7 @@ def register_controller_routes(app, *, api_workers, api_worker_temperature,
     app.router.add_post("/api/capacity/jobs/{pid}/probe-outputs", api_capacity_probe_outputs)
     app.router.add_post("/api/capacity/workers/{worker_id}", api_capacity_worker)
     app.router.add_post("/api/workers/{worker_id}/enabled", api_worker_enabled)
+    app.router.add_post("/api/workers/{worker_id}/access", api_worker_access)
     app.router.add_delete("/api/workers/{worker_id}", api_worker_delete)
     app.router.add_post("/api/admin/workers/sync-all", api_workers_sync_all)
     app.router.add_post("/api/admin/workers/{worker_id}/restart", api_worker_restart)

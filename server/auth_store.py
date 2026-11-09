@@ -1139,6 +1139,43 @@ class AuthStore:
             row = self.db.execute('SELECT * FROM job_acl WHERE job_id=?', (job_id,)).fetchone()
             return dict(row) if row else None
 
+    def user_worker_teams(self, user_id):
+        """Current worker access, independent of project ownership and canvas shares."""
+        with self.lock:
+            user = self.db.execute(
+                "SELECT role FROM users WHERE id=? AND enabled=1 AND approval_status='approved'",
+                (user_id,),
+            ).fetchone()
+            if user is None:
+                return set()
+            if user['role'] == 'admin':
+                return None
+            return {row[0] for row in self.db.execute(
+                "SELECT t.id FROM team_members m JOIN teams t ON t.id=m.team_id "
+                "WHERE m.user_id=? AND t.state='active'", (user_id,),
+            )}
+
+    def job_worker_teams(self, job_ids):
+        """Batch resolve trusted submitters against live approved users/memberships."""
+        job_ids = list(set(job_ids))
+        result = {job_id: set() for job_id in job_ids}
+        with self.lock:
+            for offset in range(0, len(job_ids), 500):
+                batch = job_ids[offset:offset + 500]
+                rows = self.db.execute(
+                    'SELECT j.job_id,u.role,t.id AS team_id FROM job_acl j '
+                    "LEFT JOIN users u ON u.id=j.user_id AND u.enabled=1 AND u.approval_status='approved' "
+                    'LEFT JOIN team_members m ON m.user_id=u.id '
+                    "LEFT JOIN teams t ON t.id=m.team_id AND t.state='active' "
+                    'WHERE j.job_id IN (' + ','.join('?' for _ in batch) + ')', batch,
+                )
+                for row in rows:
+                    if row['role'] == 'admin':
+                        result[row['job_id']] = None
+                    elif row['team_id'] is not None:
+                        result[row['job_id']].add(row['team_id'])
+        return result
+
     def dispatch_priority_settings(self, *, actor_id=None, session_token=None):
         with self.lock:
             if actor_id is not None:

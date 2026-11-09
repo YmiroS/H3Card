@@ -281,6 +281,7 @@ class ModelDispatchTest(unittest.TestCase):
 
     def test_queue_api_copies_privacy_and_single_list_consistency(self):
         import app as host
+        import threading
         from types import SimpleNamespace
         jobs = {
             'private': {'id': 'private', 'created': 1, 'status': 'queued'},
@@ -290,6 +291,10 @@ class ModelDispatchTest(unittest.TestCase):
         request = SimpleNamespace(app={}, match_info={'pid': 'visible'})
         store = mock.Mock()
         store.queue_ahead_snapshot.return_value = {'private': 0, 'visible': 1}
+        store.inaccessible_worker_ids.return_value = set()
+        store.lock = threading.RLock()
+        store.job_worker_ids.return_value = {}
+        store.job_worker_names.return_value = {}
         async def permission(_request, jid):
             return 'operate' if jid != 'private' else None
         async def run():
@@ -297,7 +302,8 @@ class ModelDispatchTest(unittest.TestCase):
                     mock.patch.object(host, 'JOBS', jobs), \
                     mock.patch.object(host, 'distributed_store', return_value=store), \
                     mock.patch.object(host, 'job_permission', side_effect=permission), \
-                    mock.patch.object(host, 'require_user', return_value={'role': 'user'}), \
+                    mock.patch.object(host, 'require_user', return_value={'id': 'viewer', 'role': 'user'}), \
+                    mock.patch.object(host, 'call_store', new=mock.AsyncMock(return_value=set())), \
                     mock.patch.object(host, 'job_node_names', return_value={}), \
                     mock.patch.object(host, 'job_submitter_info', new=mock.AsyncMock(return_value={})):
                 listing = json.loads((await host.api_jobs(request)).text)['jobs']
@@ -2435,7 +2441,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         for name in ("nt", "posix"):
             with mock.patch("agent.os.name", name):
                 caps = await self.agent.scan_capabilities()
-            self.assertEqual(caps["agent_version"], 9)
+            self.assertEqual(caps["agent_version"], 10)
             self.assertEqual(caps["supports_task_diagnostics"], 1)
             self.assertIs(caps["supports_service_restart"], name == "nt")
             self.assertIs(caps["supports_host_reboot"], name == "nt")
@@ -2448,7 +2454,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 {"KSampler": {}} if url.endswith("object_info") else {"system": system, "devices": []})
             caps = await self.agent.scan_capabilities()
             self.assertEqual(caps["system"], system)
-            self.assertEqual(caps["agent_version"], 9)
+            self.assertEqual(caps["agent_version"], 10)
             self.assertIs(self.agent.comfy_online, True)
 
     async def test_manual_service_restart_does_not_wait_for_task_queue_release_or_comfy(self):
@@ -3191,7 +3197,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(check.call_args.kwargs["required_nodes"], ["RTXTrueHDR"])
             recovery.assert_called_once()
             ready.assert_not_called()
-            self.assertEqual(json.loads(state_path.read_text())["maintenance"]["status"], "error")
+            self.assertEqual(json.loads(state_path.read_text(encoding="utf-8"))["maintenance"]["status"], "error")
 
     def test_restart_result_requires_matching_token_and_propagates_error(self):
         worker = mock.Mock()
@@ -3345,7 +3351,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         url, kwargs = comfy_calls[0]
         self.assertEqual(url, "http://comfy/api/jobs/job-1/cancel")
         self.assertEqual(kwargs["json"], {"free_memory": True})
-        self.assertEqual(kwargs["timeout"].total, 130)
+        self.assertEqual(kwargs["timeout"].total, 60)
 
     async def test_missing_ack_and_timeout_keep_release_failed_gate(self):
         for ack in ({"cancelled": True}, asyncio.TimeoutError()):
@@ -3385,7 +3391,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                         ("POST", "http://comfy/api/jobs/job-1/cancel"),
                     )
                     self.assertEqual(request.kwargs["json"], {"free_memory": True})
-                    self.assertEqual(request.kwargs["timeout"].total, 130)
+                    self.assertEqual(request.kwargs["timeout"].total, 60)
                     self.assertEqual(request.kwargs["timeout"].sock_connect, 15)
 
     async def test_release_failed_gate_recovers_after_comfy_confirms_cleanup(self):
@@ -3512,7 +3518,7 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         await self.agent.cancel_current("job-1")
         await self.cleanup_started.wait()
         business_events = [call.args[1] for call in self.agent.report_event.await_args_list
-                           if call.args[1]["type"] != "capacity_diagnostics"]
+                           if call.args[1]["type"] not in ("capacity_diagnostics", "cleanup_status")]
         self.assertEqual(business_events, [])
         self.agent.collect_outputs.assert_not_awaited()
         self.assertEqual(self.failed_requests(), [])

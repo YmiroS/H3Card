@@ -25,6 +25,8 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+CANCEL_GRACE_SECONDS = 60
+
 
 class AgentError(RuntimeError):
     pass
@@ -762,7 +764,7 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 9,
+            "agent_version": 10,
             "supports_task_diagnostics": 1,
             "supports_service_restart": os.name == "nt",
             "supports_guarded_service_restart": os.name == "nt",
@@ -1428,52 +1430,93 @@ class WorkerAgent:
     async def cancel_current(self, job_id):
         if not self.current or self.current["job_id"] != job_id:
             return
-        self.current["cancel_requested"] = True
-        # 心跳只发起清理，不等待长达 130 秒的确认，继续为旧任务续租。
-        self.start_cleanup(self.current)
+        assignment = self.current
+        assignment["cancel_requested"] = True
+        # 清理独立于执行协程；完成清理或恢复后再中断本地等待。
+        self.start_cleanup(assignment)
+
+    async def report_cleanup_state(self, assignment, state):
+        try:
+            await asyncio.wait_for(self.report_event(assignment, {
+                "type": "cleanup_status", "data": {"state": state},
+            }), timeout=2)
+        except Exception as exc:
+            print(f"[Worker] 清理状态上报失败：{type(exc).__name__}: {exc}", flush=True)
+
+    async def cancel_and_confirm(self, assignment):
+        if assignment.get("cancel_requested"):
+            await self.report_cleanup_state(assignment, "stopping")
+        ws = assignment.get("_ws")
+        if ws is not None and not ws.closed:
+            try:
+                await asyncio.wait_for(ws.close(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+        async with self.comfy_lock:
+            cancel_url = self.comfy + f"/api/jobs/{assignment['job_id']}/cancel"
+            request_options = {
+                "json": {"free_memory": True},
+                "timeout": aiohttp.ClientTimeout(total=CANCEL_GRACE_SECONDS, sock_connect=15),
+            }
+            try:
+                ack = await self._json_request("POST", cancel_url, **request_options)
+            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError):
+                # 重试共享同一截止时间，不能重新获得完整宽限期。
+                ack = await self._json_request("POST", cancel_url, **request_options)
+            if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
+                    or not isinstance(ack.get("cancelled"), bool)):
+                raise AgentError("ComfyUI 未确认 cleanup_complete")
 
     async def cancel_and_release(self, assignment):
+        diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
         try:
-            ws = assignment.get("_ws")
-            if ws is not None and not ws.closed:
-                await ws.close()
-            async with self.comfy_lock:
-                cancel_url = self.comfy + f"/api/jobs/{assignment['job_id']}/cancel"
-                request_options = {
-                    "json": {"free_memory": True},
-                    "timeout": aiohttp.ClientTimeout(total=130, sock_connect=15),
-                }
-                try:
-                    ack = await self._json_request("POST", cancel_url, **request_options)
-                except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError):
-                    # Retry the idempotent cancellation when delivery or response is uncertain.
-                    ack = await self._json_request("POST", cancel_url, **request_options)
-                if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
-                        or not isinstance(ack.get("cancelled"), bool)):
-                    raise AgentError("ComfyUI 未确认 cleanup_complete")
-            diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+            # 同一个截止时间覆盖状态上报、关闭 WS、等待提交锁和两次 HTTP 请求。
+            await asyncio.wait_for(self.cancel_and_confirm(assignment), timeout=CANCEL_GRACE_SECONDS)
             if diagnostics is not None:
                 diagnostics["cleanup_complete"] = True
             return True
         except Exception as exc:
-            diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+            detail = (f"停止超过 {CANCEL_GRACE_SECONDS} 秒，未确认任务退出和显存释放"
+                      if isinstance(exc, asyncio.TimeoutError) else str(exc))
             if diagnostics is not None:
                 diagnostics["cleanup_complete"] = False
-                diagnostics["cleanup_error"] = str(exc)[:4000]
+                diagnostics["cleanup_error"] = detail[:4000]
             self.release_failed = (
-                f"显存释放未确认：{type(exc).__name__}: {exc}；"
+                f"显存释放未确认：{type(exc).__name__}: {detail}；"
                 "已停止接单，正在自动重启 ComfyUI，Worker 保持运行。"
             )
             print(f"[Worker] {self.release_failed}", flush=True)
+            await self.report_cleanup_state(assignment, "recovering")
             try:
                 await self.restart_comfy_only()
+                queue = await self._json_request(
+                    "GET", self.comfy + "/queue",
+                    timeout=aiohttp.ClientTimeout(total=5, sock_connect=3),
+                )
+                if (not isinstance(queue, dict)
+                        or not isinstance(queue.get("queue_running"), list)
+                        or not isinstance(queue.get("queue_pending"), list)
+                        or queue["queue_running"] or queue["queue_pending"]):
+                    raise AgentError("ComfyUI 恢复后未确认队列为空")
             except Exception as restart_exc:
                 self.release_failed += (
-                    f" 自动重启失败：{type(restart_exc).__name__}: {restart_exc}；"
+                    f" 自动重启失败，恢复失败：{type(restart_exc).__name__}: {restart_exc}；"
                     "请检查 ComfyUI 后重启相关进程。"
                 )
                 print(f"[Worker] {self.release_failed}", flush=True)
-            return False
+                return False
+            assignment["_comfy_recovered"] = True
+            self.release_failed = None
+            self.comfy_online = True
+            self.local_busy = False
+            print("[Worker] ComfyUI 已恢复并确认队列为空，原 Worker 保持运行。", flush=True)
+            return True
+        finally:
+            execution = assignment.get("_execution_task")
+            if (assignment.get("cancel_requested") and execution is not None
+                    and not execution.done() and not assignment.get("_handling_failure")):
+                assignment["_cancel_execution_wait"] = True
+                execution.cancel()
 
     async def acquire(self):
         if (self.release_failed or not self.comfy_online or self.local_busy or self.current
@@ -1812,6 +1855,8 @@ class WorkerAgent:
         # 旧 Controller 没有 attempt_id，仍按原租约正常执行和回报。
         attempt = {"attempt_id": assignment["attempt_id"]} if assignment.get("attempt_id") else {}
         print(f"[Worker] 领取任务 {job_id}")
+        assignment["_execution_task"] = asyncio.current_task()
+        assignment["_handling_failure"] = False
         try:
             # Explicit fresh boundary probe; cached self.telemetry is never a before sample.
             await self.sample_diagnostics(assignment, "before")
@@ -1852,19 +1897,29 @@ class WorkerAgent:
             )
             print(f"[Worker] 任务完成 {job_id}，产物 {len(outputs)} 个")
         except (Exception, asyncio.CancelledError) as exc:
+            assignment["_handling_failure"] = True
+            internal_cancel = (isinstance(exc, asyncio.CancelledError)
+                               and assignment.pop("_cancel_execution_wait", False))
+            if internal_cancel:
+                # 仅消费清理协程发起的这一次取消；外部 Worker 停机仍须向上传播。
+                execution = asyncio.current_task()
+                execution.uncancel()
+                internal_cancel = execution.cancelling() == 0
             canceled = (isinstance(exc, JobFailed) and exc.canceled
                         or bool(assignment.get("cancel_requested")))
             cleanup = self.start_cleanup(assignment)
-            self.record_execution_error(assignment, exc, stage)
+            self.record_execution_error(
+                assignment, JobFailed("任务已取消", canceled=True) if internal_cancel else exc, stage)
             released = await asyncio.shield(cleanup)
-            diagnostics["cleanup_complete"] = bool(released)
+            if not assignment.get("_comfy_recovered"):
+                diagnostics["cleanup_complete"] = bool(released)
             if not released and diagnostics["cleanup_error"] is None:
                 diagnostics["cleanup_error"] = str(self.release_failed or "显存释放未确认")[:4000]
             # 未完成阶段保持缺失；总时长记录到清理返回，释放失败仍明确标为未释放。
             measurements["total_seconds"] = time.monotonic() - started
             await self.sample_diagnostics(assignment, "after")
             self.finish_diagnostic_reports(assignment)
-            error = str(exc) if released else self.release_failed
+            error = ("任务已取消" if internal_cancel else str(exc)) if released else self.release_failed
             print(f"[Worker] 任务失败 {job_id}：{error}")
             try:
                 await self._json_request(
@@ -1872,17 +1927,19 @@ class WorkerAgent:
                     headers=self._agent_headers(assignment["lease_token"]),
                     json={"error": error, "canceled": bool(canceled and released),
                           **attempt, "capacity_measurements": dict(measurements),
+                          "comfy_recovered": assignment.get("_comfy_recovered") is True,
                           "capacity_released": bool(released)},
                 )
             except Exception as report_error:
                 print(f"[Worker] 上报失败状态失败：{report_error}")
-            if isinstance(exc, asyncio.CancelledError):
+            if isinstance(exc, asyncio.CancelledError) and not internal_cancel:
                 raise
         finally:
             self.finish_diagnostic_reports(assignment)
             task = assignment.get("_cleanup_task")
             if task is not None:
                 await asyncio.shield(task)
+            assignment.pop("_execution_task", None)
             self.current = None
 
     async def run(self):
