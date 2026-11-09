@@ -2536,6 +2536,35 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             duplicate = await self.client.post(url, json={"action": action})
             self.assertEqual(duplicate.status, 409)
 
+    async def test_alert_restart_http_requires_literal_true_to_confirm_recovery(self):
+        for index, online in enumerate((False, 'false', 'true', 1, [], {}, None, True)):
+            with self.subTest(comfy_online=online):
+                credentials = self.store.register_worker(f'guarded-{index}', {
+                    'supports_service_restart': True, 'supports_guarded_service_restart': True,
+                    'hardware': {'host_id': f'guarded-host-{index}'},
+                })
+                worker_id = credentials['worker_id']
+                headers = {'X-Worker-ID': worker_id,
+                           'Authorization': f"Bearer {credentials['worker_token']}"}
+                self.store.heartbeat(worker_id, comfy_online=True)
+                job_id, request_id = f'guarded-job-{index}', f'guarded-request-{index}'
+                self.store.enqueue(job_id, {})
+                assignment = self.store.acquire(worker_id)
+                self.assertTrue(self.store.mark_running(job_id, worker_id, assignment['lease_token']))
+                self.store.request_alert_restart(worker_id, job_id, assignment['attempt_id'], request_id)
+                for status in ('running', 'done'):
+                    response = await self.client.post('/agent/v1/heartbeat', headers=headers, json={
+                        'current_job_id': job_id,
+                        'comfy_online': True if status == 'running' else online,
+                        'maintenance': {'request_id': request_id, 'status': status},
+                    })
+                    self.assertEqual(response.status, 200, await response.text())
+                    result = await response.json()
+                expected = 'done' if online is True else 'error'
+                self.assertEqual(result['maintenance_ack']['status'], expected)
+                self.assertEqual(self.store.alert_restart_status(request_id)['status'], expected)
+                self.assertTrue(self.store.finish(job_id, worker_id, assignment['lease_token'], 'done'))
+
     async def test_restart_rejects_invalid_json_and_action(self):
         worker_id = self.store.register_worker("restart", {"supports_service_restart": True, "supports_host_reboot": True,
                 "hardware": {"host_id": str(time.time_ns())}})["worker_id"]
