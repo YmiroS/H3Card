@@ -1,0 +1,9 @@
+{
+  "1": {"class_type": "LoadImage", "inputs": {"image": "chouka_local_original.png"}},
+  "2": {"class_type": "LoadImageMask", "inputs": {"image": "chouka_local_mask.png", "channel": "red"}},
+  "3": {"class_type": "LoadImage", "inputs": {"image": "chouka_local_optional_reference.png"}},
+  "10": {"class_type": "ChoukaLocalCrop", "inputs": {"image": ["1", 0], "mask": ["2", 0], "megapixels": 1.0, "feather": 32}},
+  "20": {"class_type": "ChoukaCloudImageEdit", "inputs": {"image": ["10", 0], "reference": ["3", 0], "prompt": "Replace the selected material in image 1 using image 2 when supplied. Preserve shape, lighting and surrounding details.", "provider": "gpt_image", "callback_url": "", "callback_token": ""}},
+  "90": {"class_type": "ChoukaLocalStitch", "inputs": {"generated": ["20", 0], "context": ["10", 1]}},
+  "99": {"class_type": "ChoukaLocalSaveImage", "inputs": {"images": ["90", 0], "filename_prefix": "Chouka/local_edit_gpt"}}
+}
