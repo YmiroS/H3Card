@@ -1058,6 +1058,121 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertNotIn("private", json.dumps(load))
         self.assertNotIn("first.png", json.dumps(load))
 
+    async def test_target_generate_reads_only_target_off_event_loop_and_revalidates(self):
+        cap, graph, _caps, worker_id = self.target_fixture()
+        loop_thread = threading.get_ident()
+        original = self.store.list_generation_workers
+
+        def selected(*, worker_id):
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return original(worker_id=worker_id)
+
+        with mock.patch.dict(controller_app.CAPS, {'target-video': cap}), \
+             mock.patch.object(controller_app, 'patch_graph', return_value=graph), \
+             mock.patch.object(controller_app, 'cost_ledger', return_value=None), \
+             mock.patch.object(self.store, 'list_generation_workers', side_effect=selected) as listing:
+            response = await self.client.post('/api/generate', json={
+                'project': 'p', 'capability': 'target-video', 'target_worker_id': worker_id,
+            })
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(listing.call_args_list, [mock.call(worker_id=worker_id)] * 2)
+
+        async def disable_before_final_check(*args, **kwargs):
+            self.store.set_worker_enabled(worker_id, False)
+            return {}
+
+        with mock.patch.dict(controller_app.CAPS, {'target-video': cap}), \
+             mock.patch.object(controller_app, 'patch_graph', return_value=graph), \
+             mock.patch.object(controller_app, 'generation_assets', side_effect=disable_before_final_check):
+            response = await self.client.post('/api/generate', json={
+                'project': 'p', 'capability': 'target-video', 'target_worker_id': worker_id,
+            })
+        self.assertEqual(response.status, 400, await response.text())
+        self.assertEqual(self.auth.db.execute('SELECT COUNT(*) FROM job_acl').fetchone()[0], 1)
+
+    async def test_generation_picker_decodes_off_event_loop(self):
+        cap, _graph, _caps, worker_id = self.target_fixture()
+        original = self.store.list_generation_workers
+        loop_thread = threading.get_ident()
+
+        def listed():
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return original()
+
+        with mock.patch.dict(controller_app.CAPS, {'target-video': cap}), \
+             mock.patch.object(controller_app, 'ROOT', self.root), \
+             mock.patch.object(self.store, 'list_generation_workers', side_effect=listed):
+            response = await self.client.get('/api/generation/workers?capability=target-video')
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())['workers'][0]['id'], worker_id)
+
+    async def test_jobs_batch_permissions_and_skip_unused_queue_scan(self):
+        ids = [f'job-{index}' for index in range(1505)]
+        with self.auth._tx():
+            self.auth.db.executemany('INSERT INTO job_acl VALUES(?,?,?)',
+                                    [(jid, 'p', self.admin['id']) for jid in ids])
+        controller_app.JOBS.update({jid: {
+            'id': jid, 'status': 'running', 'created': index,
+        } for index, jid in enumerate(ids)})
+        original = self.store.job_worker_names
+        loop_thread = threading.get_ident()
+
+        def names(job_ids):
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return original(job_ids)
+
+        with mock.patch.object(self.auth, 'job_permissions', wraps=self.auth.job_permissions) as batch, \
+             mock.patch.object(self.auth, 'project_permission', wraps=self.auth.project_permission) as permission, \
+             mock.patch.object(self.store, 'job_worker_names', side_effect=names), \
+             mock.patch.object(self.store, 'queue_ahead_snapshot', side_effect=AssertionError('unused scan')):
+            response = await self.client.get('/api/jobs')
+        self.assertEqual(response.status, 200, await response.text())
+        jobs = (await response.json())['jobs']
+        self.assertEqual([job['id'] for job in jobs], list(reversed(ids)))
+        self.assertEqual({job['permission'] for job in jobs}, {'operate'})
+        self.assertTrue(all(job['queue_ahead'] is None for job in jobs))
+        batch.assert_called_once()
+        permission.assert_called_once_with(self.admin['id'], 'p')
+
+    async def test_jobs_batch_keeps_user_limit_visibility_and_live_revocation(self):
+        viewer = self.auth.create_user('jobs-viewer', auth_support.PASSWORD)
+        self.auth.set_grant(viewer['id'], self.admin['id'], 'read')
+        self.own_project('hidden')
+        self.auth.set_project_state('hidden', 'deleted')
+        visible = [f'visible-{index}' for index in range(65)]
+        hidden = [f'hidden-{index}' for index in range(10)]
+        with self.auth._tx():
+            self.auth.db.executemany('INSERT INTO job_acl VALUES(?,?,?)',
+                                    [(jid, 'p', self.admin['id']) for jid in visible]
+                                    + [(jid, 'hidden', self.admin['id']) for jid in hidden])
+        controller_app.JOBS.update({jid: {'id': jid, 'status': 'done', 'created': index}
+                                    for index, jid in enumerate(visible + hidden)})
+        self.client.session.headers.update(await self.login('jobs-viewer'))
+        response = await self.client.get('/api/jobs')
+        self.assertEqual(response.status, 200, await response.text())
+        jobs = (await response.json())['jobs']
+        self.assertEqual([job['id'] for job in jobs], list(reversed(visible))[:60])
+        self.assertEqual({job['permission'] for job in jobs}, {'read'})
+        self.auth.delete_grant(viewer['id'], self.admin['id'])
+        response = await self.client.get('/api/jobs')
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())['jobs'], [])
+
+    async def test_jobs_batch_keeps_admin_legacy_and_inaccessible_acl_permissions(self):
+        self.own_project('inactive')
+        self.register_job('inactive-job', 'inactive')
+        self.auth.set_project_state('inactive', 'deleted')
+        self.auth.db.executemany("INSERT INTO legacy_jobs(job_id,reason) VALUES(?,'test')",
+                                [('legacy-job',), ('inactive-job',)])
+        ids = ['inactive-job', 'legacy-job', 'unknown-job']
+        controller_app.JOBS.update({jid: {'id': jid, 'status': 'done', 'created': index}
+                                    for index, jid in enumerate(ids)})
+        response = await self.client.get('/api/jobs')
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual({job['id']: job['permission'] for job in (await response.json())['jobs']}, {
+            'inactive-job': 'read', 'legacy-job': 'operate', 'unknown-job': 'read',
+        })
+
     async def test_generation_workers_user_minimal_read_and_auth_boundaries(self):
         cap, _graph, caps, worker_id = self.target_fixture()
         self.store.register_worker("Linux", {**caps, "hardware": {"os": {"name": "Linux"}}})

@@ -1443,7 +1443,7 @@ class DistributedStore:
             ).fetchall()
         return {row["job_id"]: row["name"] for row in rows}
 
-    def list_workers(self, *, summary=False, telemetry_only=False):
+    def list_workers(self, *, summary=False, telemetry_only=False, worker_id=None):
         now = time.time()
         columns = "*"
         if summary or telemetry_only:
@@ -1462,10 +1462,29 @@ class DistributedStore:
                     ) AS capabilities_json"""
         with self.lock, self.db:
             self._expire_service_restarts_locked(now)
-            rows = self.db.execute(
-                f"""SELECT {columns} FROM workers WHERE retired = 0
-                    ORDER BY created_at DESC, id DESC"""
-            ).fetchall()
+            if worker_id is None:
+                rows = self.db.execute(
+                    f"""SELECT {columns} FROM workers WHERE retired = 0
+                        ORDER BY created_at DESC, id DESC"""
+                ).fetchall()
+            else:
+                # 先按现有名称规则去重，不能让旧注册通过单台查询重新出现。
+                seen_names = set()
+                selected = False
+                for row in self.db.execute(
+                    """SELECT id, name FROM workers WHERE retired = 0
+                       ORDER BY created_at DESC, id DESC"""
+                ):
+                    name_key = _worker_name_key(row["name"])
+                    if name_key in seen_names:
+                        continue
+                    seen_names.add(name_key)
+                    if row["id"] == worker_id:
+                        selected = True
+                        break
+                rows = self.db.execute(
+                    f"SELECT {columns} FROM workers WHERE retired = 0 AND id = ?", (worker_id,),
+                ).fetchall() if selected else []
         workers = []
         seen_names = set()
         for row in rows:
@@ -1523,9 +1542,9 @@ class DistributedStore:
                     hosts[host_id] = state
         return hosts
 
-    def list_generation_workers(self):
+    def list_generation_workers(self, *, worker_id=None):
         with self.lock:
-            workers = self.list_workers()
+            workers = self.list_workers(worker_id=worker_id)
             maintenance = self._service_maintenance_hosts_locked()
             for worker in workers:
                 host_id = _worker_host_id(worker["capabilities"])

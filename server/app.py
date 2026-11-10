@@ -1562,9 +1562,11 @@ async def api_generate(request):
                 or cap.get("outputType") != "video"):
             raise web.HTTPBadRequest(text="仅控制器模式的非 IF 视频能力支持指定执行端")
         team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
-        target = next((worker for worker in distributed_store(request.app).list_generation_workers()
-                       if worker["id"] == target_worker_id
-                       and worker_access_allowed(worker, team_ids)), None)
+        targets = await asyncio.to_thread(
+            distributed_store(request.app).list_generation_workers, worker_id=target_worker_id,
+        )
+        target = next((worker for worker in targets
+                       if worker_access_allowed(worker, team_ids)), None)
         if target is None:
             raise web.HTTPBadRequest(text="指定执行端不存在或不可访问")
     if cap.get("execution") == "cloud_image":
@@ -1633,9 +1635,11 @@ async def api_generate(request):
         # Validate the final patched graph and effective GPU policy before any job ACL,
         # public job record or queue entry is created. Busy targets may queue normally.
         team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
-        worker = next((item for item in distributed_store(request.app).list_generation_workers()
-                       if item["id"] == target_worker_id
-                       and worker_access_allowed(item, team_ids)), None)
+        targets = await asyncio.to_thread(
+            distributed_store(request.app).list_generation_workers, worker_id=target_worker_id,
+        )
+        worker = next((item for item in targets
+                       if worker_access_allowed(item, team_ids)), None)
         if worker is None:
             raise web.HTTPBadRequest(text="指定执行端不存在或不可访问")
         reason = generation_worker_reason(
@@ -2133,7 +2137,8 @@ async def job_submitter_info(request, jobs):
 
 def job_queue_snapshot(app, jobs):
     # Presentation only: never persist snapshots or infer positions from queue_remaining.
-    counts = distributed_store(app).queue_ahead_snapshot() if CONTROLLER_MODE else {}
+    counts = (distributed_store(app).queue_ahead_snapshot()
+              if CONTROLLER_MODE and any(job.get('status') == 'queued' for job in jobs) else {})
     return {
         job['id']: {
             'queue_ahead': counts.get(job['id']) if job.get('status') == 'queued' else None,
@@ -2186,11 +2191,13 @@ async def api_job(request):
     job = JOBS.get(pid)
     if not job:
         raise web.HTTPNotFound(reason="没有这个任务")
-    node_name = job_node_names(request.app, [job]).get(pid)
+    node_names, queue_snapshot = await asyncio.to_thread(
+        lambda: (job_node_names(request.app, [job]), job_queue_snapshot(request.app, [job])),
+    )
     submitters = await job_submitter_info(request, [job])
     projected = await project_job_workers(request, [
-        job | job_display_info(job, node_name) | submitters.get(pid, {})
-        | job_queue_snapshot(request.app, [job])[pid] | {"permission": permission}
+        job | job_display_info(job, node_names.get(pid)) | submitters.get(pid, {})
+        | queue_snapshot[pid] | {"permission": permission}
     ])
     return web.json_response(projected[0])
 
@@ -2212,17 +2219,30 @@ async def api_job_inputs(request):
 
 
 async def api_jobs(request):
-    is_admin = require_user(request)["role"] == "admin"
+    user = require_user(request)
+    is_admin = user["role"] == "admin"
+    ordered = sorted(list(JOBS.values()), key=lambda j: j["created"], reverse=True)
+    permissions = await call_store(
+        request.app, "job_permissions", user["id"], [job["id"] for job in ordered],
+        limit=None if is_admin else 60,
+    )
     visible = []
-    for job in sorted(list(JOBS.values()), key=lambda j: j["created"], reverse=True):
-        permission = await job_permission(request, job["id"])
+    for job in ordered:
+        jid = job["id"]
+        permission = permissions.get(jid)
+        if is_admin and not permission:
+            if jid not in permissions and await resource_call(request.app, "is_legacy_job", jid):
+                permission = "operate"
+            elif jid in JOBS:
+                permission = "read"
         if permission:
             visible.append((job, permission))
         if not is_admin and len(visible) == 60:
             break
     jobs = [job for job, _permission in visible]
-    node_names = job_node_names(request.app, jobs)
-    queue_snapshot = job_queue_snapshot(request.app, jobs)
+    node_names, queue_snapshot = await asyncio.to_thread(
+        lambda: (job_node_names(request.app, jobs), job_queue_snapshot(request.app, jobs)),
+    )
     submitters = await job_submitter_info(request, jobs)
     projected = await project_job_workers(request, [
         job | job_display_info(job, node_names.get(job["id"]))
@@ -2738,19 +2758,23 @@ async def api_generation_workers(request):
     gpu_policy = HIGH_VRAM_GPU_POLICY if cid in HIGH_VRAM_CAPABILITIES else None
     duration_seconds = rw.duration(cap, {}) if cid in HIGH_VRAM_CAPABILITIES else None
     team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
-    workers = []
-    for worker in distributed_store(request.app).list_generation_workers():
-        if not worker_access_allowed(worker, team_ids) or not is_windows_worker(worker):
-            continue
-        reason = generation_worker_reason(
-            worker, graph, cid, gpu_policy, duration_seconds,
-            targeted_video=cap.get("outputType") == "video",
-        )
-        item = {key: worker[key] for key in ("id", "name", "state")}
-        item["selectable"] = reason is None
-        if reason:
-            item["reason"] = reason
-        workers.append(item)
+    def picker_workers():
+        workers = []
+        for worker in distributed_store(request.app).list_generation_workers():
+            if not worker_access_allowed(worker, team_ids) or not is_windows_worker(worker):
+                continue
+            reason = generation_worker_reason(
+                worker, graph, cid, gpu_policy, duration_seconds,
+                targeted_video=cap.get("outputType") == "video",
+            )
+            item = {key: worker[key] for key in ("id", "name", "state")}
+            item["selectable"] = reason is None
+            if reason:
+                item["reason"] = reason
+            workers.append(item)
+        return workers
+
+    workers = await asyncio.to_thread(picker_workers)
     return web.json_response({"workers": workers, "controller_mode": True})
 
 

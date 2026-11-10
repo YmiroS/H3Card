@@ -297,13 +297,18 @@ class ModelDispatchTest(unittest.TestCase):
         store.job_worker_names.return_value = {}
         async def permission(_request, jid):
             return 'operate' if jid != 'private' else None
+        async def call_store(_app, method, *args, **kwargs):
+            if method == 'job_permissions':
+                return {jid: 'operate' if jid != 'private' else None for jid in args[1]}
+            self.assertEqual(method, 'user_worker_teams')
+            return set()
         async def run():
             with mock.patch.object(host, 'CONTROLLER_MODE', True), \
                     mock.patch.object(host, 'JOBS', jobs), \
                     mock.patch.object(host, 'distributed_store', return_value=store), \
                     mock.patch.object(host, 'job_permission', side_effect=permission), \
                     mock.patch.object(host, 'require_user', return_value={'id': 'viewer', 'role': 'user'}), \
-                    mock.patch.object(host, 'call_store', new=mock.AsyncMock(return_value=set())), \
+                    mock.patch.object(host, 'call_store', new=mock.AsyncMock(side_effect=call_store)), \
                     mock.patch.object(host, 'job_node_names', return_value={}), \
                     mock.patch.object(host, 'job_submitter_info', new=mock.AsyncMock(return_value={})):
                 listing = json.loads((await host.api_jobs(request)).text)['jobs']
@@ -1171,6 +1176,39 @@ class DistributedStoreTest(unittest.TestCase):
             self.store.db.execute("SELECT COUNT(*) FROM workers").fetchone()[0], 2
         )
         self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
+
+    def test_target_worker_listing_decodes_only_selected_latest_registration(self):
+        for index in range(8):
+            self.store.register_worker(f'large-{index}', {
+                'input_choices': {'Model': {'name': ['x' * 100000]}},
+            })
+        newest = self.store.register_worker(' GPU-01 ', {
+            'node_classes': ['KSampler'], 'is_primary_node': True,
+        })['worker_id']
+        self.store.heartbeat(newest, comfy_online=True, busy=True)
+        expected = [worker for worker in self.store.list_generation_workers() if worker['id'] == newest]
+        with mock.patch('distributed.json.loads', wraps=json.loads) as loads:
+            actual = self.store.list_generation_workers(worker_id=newest)
+        self.assertEqual(actual, expected)
+        self.assertEqual(loads.call_count, 1)
+        for worker_id in (self.worker_id, 'missing'):
+            with self.subTest(worker_id=worker_id), \
+                 mock.patch('distributed.json.loads', side_effect=AssertionError('unrelated decode')):
+                self.assertEqual(self.store.list_generation_workers(worker_id=worker_id), [])
+        self.assertEqual(self.store.list_workers(worker_id=newest, summary=True)[0]['state'], 'busy')
+        self.store.retire_worker(newest)
+        self.assertEqual(self.store.list_generation_workers(worker_id=newest), [])
+
+    def test_target_worker_listing_keeps_same_host_maintenance_gate(self):
+        peer = self.store.register_worker('peer', {'hardware': {'host_id': 'same-host'}})['worker_id']
+        self.store.heartbeat(self.worker_id, comfy_online=True,
+                             capabilities={'hardware': {'host_id': 'same-host'}})
+        with self.store.db:
+            self.store.db.execute(
+                "UPDATE workers SET sync_action='restart_services',sync_status='running' WHERE id=?", (peer,))
+        workers = self.store.list_generation_workers(worker_id=self.worker_id)
+        self.assertEqual(len(workers), 1)
+        self.assertEqual(workers[0]['state'], 'syncing')
 
     def test_worker_summary_matches_full_states_without_loading_capabilities(self):
         for index, primary in enumerate((True, False, 1, "true", None)):
