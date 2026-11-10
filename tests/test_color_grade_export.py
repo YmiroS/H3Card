@@ -1,6 +1,7 @@
 """Video color-grade LUT export (FFmpeg lut3d)."""
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,7 +10,15 @@ from unittest import mock
 from aiohttp import FormData, web
 from aiohttp.test_utils import TestClient, TestServer
 
-from server.color_grade_export import ColorGradeExportApi, _ffmpeg_filter_path
+from server.color_grade_export import (
+    ColorGradeExportApi,
+    _ffmpeg_filter_path,
+    _normalize_vignette,
+    build_color_grade_vf,
+    build_grade_args,
+    progress_ratio,
+    write_vignette_mask,
+)
 
 
 class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
@@ -17,6 +26,46 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
         escaped = _ffmpeg_filter_path(Path("D:/tmp/grade.cube"))
         self.assertIn("grade.cube", escaped)
         self.assertIn("\\:", escaped)
+
+    def test_vignette_filter_appended_when_enabled(self):
+        cube = Path("D:/tmp/grade.cube")
+        plain = build_color_grade_vf(cube)
+        self.assertTrue(plain.startswith("lut3d="))
+        self.assertNotIn("geq=", plain)
+        args = build_grade_args(
+            Path("D:/in.mp4"), cube, Path("D:/out.part.mp4"),
+            mask=Path("D:/tmp/vignette.png"), size=(1920, 1080),
+        )
+        graph = args[args.index("-filter_complex") + 1]
+        self.assertIn("lut3d=", graph)
+        self.assertIn("overlay=format=auto", graph)
+        self.assertIn("1920:1080", graph)
+        self.assertNotIn("geq", graph)
+
+    def test_progress_ratio_uses_out_time(self):
+        self.assertIsNone(progress_ratio("out_time=00:00:01.000000", 0))
+        self.assertAlmostEqual(progress_ratio("out_time=00:00:01.000000", 4), 0.25)
+        self.assertEqual(progress_ratio("progress=end", 4), 1.0)
+
+    def test_vignette_mask_is_clear_at_center(self):
+        vig = _normalize_vignette({
+            "enabled": True,
+            "size": 0.5,
+            "anamorphism": 1.0,
+            "softness": 0.5,
+            "color": "#000000",
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vignette.png"
+            write_vignette_mask(path, 160, 90, vig)
+            from PIL import Image
+            image = Image.open(path)
+            self.assertEqual(image.getpixel((image.width // 2, image.height // 2))[3], 0)
+            self.assertGreater(image.getpixel((0, 0))[3], 200)
+
+    def test_vignette_ignored_when_disabled(self):
+        self.assertIsNone(_normalize_vignette({"enabled": False, "size": 0.2}))
+        self.assertIsNone(_normalize_vignette("nope"))
 
     async def test_apply_runs_ffmpeg_and_returns_video_asset(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -50,9 +99,19 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
             ffmpeg = root / "ffmpeg.exe"
             ffmpeg.write_bytes(b"")
 
-            async def fake_run(exe, args):
+            async def fake_probe(exe, source):
+                return 160, 90, 2.0
+
+            async def fake_run(exe, args, duration=0.0, on_progress=None):
                 self.assertEqual(args[-2], "mp4")
                 self.assertTrue(str(args[-1]).endswith(".part.mp4"), args[-1])
+                graph = args[args.index("-filter_complex") + 1]
+                self.assertIn("lut3d=", graph)
+                self.assertIn("overlay=format=auto", graph)
+                self.assertNotIn("geq", graph)
+                self.assertEqual(duration, 2.0)
+                if on_progress:
+                    await on_progress(0.5)
                 Path(args[-1]).write_bytes(b"graded")
 
             api = ColorGradeExportApi(
@@ -67,7 +126,8 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
             )
             app = web.Application()
             app.router.add_post("/api/color-grade/video", api.apply)
-            with mock.patch("server.color_grade_export._run_ffmpeg", side_effect=fake_run):
+            with mock.patch("server.color_grade_export._probe_media", side_effect=fake_probe), \
+                    mock.patch("server.color_grade_export._run_ffmpeg", side_effect=fake_run):
                 async with TestClient(TestServer(app)) as client:
                     form = FormData()
                     form.add_field("project", "p")
@@ -75,9 +135,17 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
                     form.add_field(
                         "cube", cube, filename="grade.cube", content_type="text/plain",
                     )
+                    form.add_field(
+                        "vignette",
+                        '{"enabled":true,"size":0.5,"anamorphism":1.0,"softness":0.4,"color":"#000000"}',
+                    )
                     response = await client.post("/api/color-grade/video", data=form)
-                    self.assertEqual(response.status, 200, await response.text())
-                    payload = await response.json()
+                    body = await response.text()
+                    self.assertEqual(response.status, 200, body)
+                    events = [json.loads(line) for line in body.splitlines() if line.strip()]
+                    self.assertTrue(any(item.get("type") == "progress" for item in events))
+                    payload = events[-1]
+                    self.assertEqual(payload["type"], "done")
                     self.assertEqual(payload["kind"], "video")
                     self.assertTrue(payload["url"].startswith("/api/upload/grade_"))
                     self.assertTrue(
