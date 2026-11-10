@@ -45,9 +45,6 @@ ORIGINAL_REGISTRY = deepcopy(dependencies.PLUGIN_DEPENDENCIES)
 
 class DependencyExecutorTests(unittest.TestCase):
     def setUp(self):
-        # These cases isolate existing third-party dependency policy. The new
-        # project-package copy path has real temporary-directory tests separately.
-        self.enterContext(mock.patch.object(dependencies, "install_local_edit_nodes", return_value=()))
         self.enterContext(mock.patch.object(dependencies, "PLUGIN_DEPENDENCIES", {
             PLUGIN: deepcopy(ORIGINAL_REGISTRY[PLUGIN]),
         }))
@@ -275,28 +272,16 @@ class DependencyExecutorTests(unittest.TestCase):
 
     def test_real_helper_cli_missing_plugin_exits_nonzero_without_installing(self):
         missing_root = self.comfy / "missing-plugin"
-        # Exercise the real CLI but keep its interpreter lock in the private
-        # fixture, not next to the machine's installed Python executable.
-        source = (
-            "import importlib.util,sys; from pathlib import Path; "
-            "s=importlib.util.spec_from_file_location('cli_dependency_fixture',sys.argv[1]); "
-            "d=importlib.util.module_from_spec(s); s.loader.exec_module(d); "
-            "lock_python=Path(sys.argv[2]).parent/'fixture-python.exe'; "
-            "real_lock=d.dependency_lock; "
-            "d.dependency_lock=lambda python,deadline: real_lock(lock_python,deadline); "
-            "sys.argv=[sys.argv[1],'--comfy-root',sys.argv[2]]; d.main()"
-        )
         result = subprocess_run_real(
-            [sys.executable, "-B", "-s", "-c", source, str(HELPER), str(missing_root)])
+            [sys.executable, "-B", "-s", str(HELPER), "--comfy-root", str(missing_root)])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("插件依赖处理失败", result.stdout)
-        self.assertIn("本地编辑节点安装被拒绝", result.stdout)
+        self.assertIn(PLUGIN, result.stdout)
         self.assertFalse(missing_root.exists())
 
 
 class GIMMDependencyExecutorTests(unittest.TestCase):
     def setUp(self):
-        self.enterContext(mock.patch.object(dependencies, "install_local_edit_nodes", return_value=()))
         self.enterContext(mock.patch.object(dependencies, "PLUGIN_DEPENDENCIES", {
             GIMM_PLUGIN: deepcopy(ORIGINAL_REGISTRY[GIMM_PLUGIN]),
         }))
@@ -596,7 +581,6 @@ import time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import sync_dependencies as d
-d.install_local_edit_nodes = lambda comfy_root: ()
 d.PLUGIN_DEPENDENCIES = {
     'ComfyUI_Nvidia_VFX_Nodes': d.PLUGIN_DEPENDENCIES['ComfyUI_Nvidia_VFX_Nodes'],
 }

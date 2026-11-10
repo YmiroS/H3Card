@@ -214,10 +214,6 @@ async def _local_test_request(request, handler):
     if request.headers.get('Origin') or request.headers.get('Sec-Fetch-Site') == 'cross-site':
         _check_source(request)
     path = request.path
-    if request.method == 'POST' and path == '/agent/v1/local-edit/cloud':
-        # This one callback authenticates its own single-use ticket, not the local
-        # browser session. Keep loopback/source checks above and all Worker routes closed.
-        return await handler(request)
     local_auth_routes = {'/api/auth/me', '/api/auth/presence'}
     if path.startswith('/agent/v1/') or (path.startswith('/api/auth/') and path not in local_auth_routes):
         raise web.HTTPForbidden(text='本地测试模式不提供账号管理或 Worker 接口')
