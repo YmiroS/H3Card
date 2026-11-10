@@ -34,7 +34,8 @@ def load():
         raise ChatError("cloud-ai-config.json 读取失败，请管理员检查配置", status=503)
     if not isinstance(config, dict):
         raise ChatError("聊天配置必须为 JSON 对象", status=503)
-    config = {"base_url": "http://30.245.124.125:8000/v1", "chat_model": "gpt-4o", **config}
+    config = {"base_url": "http://30.245.124.125:8000/v1", "chat_model": "gpt-4o",
+              "character_model": "gpt-6.1-sol", **config}
     config["api_key"] = os.environ.get("CHOUKA_IMAGE_API_KEY") or config.get("api_key")
     if config.get("enabled", True) is not True or not all(
             isinstance(config.get(k), str) and config[k].strip()
@@ -116,12 +117,20 @@ def validate(body):
     return messages
 
 
-async def complete(session, messages, *, end_user_name, end_user_phone):
+async def complete(session, messages, *, end_user_name, end_user_phone, model=None, max_tokens=None):
     config = load()
+    model = config["chat_model"] if model is None else model
+    if not isinstance(model, str) or not model.strip() or any(ord(c) < 33 for c in model):
+        raise ChatError("聊天模型配置无效", status=503)
+    body = {"model": model, "messages": messages, "stream": False}
+    if max_tokens is not None:
+        if type(max_tokens) is not int or not 1 <= max_tokens <= 100000:
+            raise ChatError("聊天 token 限制无效", status=503)
+        body["max_tokens"] = max_tokens
     try:
         async with session.post(
                 config["base_url"].rstrip("/") + "/chat/completions",
-                json={"model": config["chat_model"], "messages": messages, "stream": False},
+                json=body,
                 headers={"Authorization": f"Bearer {config['api_key']}",
                          "X-End-User-Name": end_user_name,
                          "X-End-User-Phone": end_user_phone},
@@ -148,4 +157,4 @@ async def complete(session, messages, *, end_user_name, end_user_phone):
     # Only opaque request identifiers are safe; never reflect arbitrary header text.
     if not request_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id) or config["api_key"] in request_id:
         request_id = None
-    return {"content": content, "model": config["chat_model"], "request_id": request_id}
+    return {"content": content, "model": model, "request_id": request_id}

@@ -74,6 +74,7 @@ from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
 from server.texture_api import register_texture_routes
+from server.character_api import register_character_routes
 from server.worker_command_api import register_worker_command_routes
 from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
@@ -4475,6 +4476,10 @@ def make_app(auth_path=None, *, project_repository=None):
         kind_of=kind_of, duration_pattern=DUR_RE, audio_pattern=AUDIO_STREAM_RE)
     register_chat_routes(app)
     register_texture_routes(
+        app, root=ROOT, comfy_http=COMFY_HTTP,
+        require_project=require_project, require_resource=require_resource,
+        resource_call=resource_call)
+    register_character_routes(
         app, root=ROOT, comfy_http=COMFY_HTTP,
         require_project=require_project, require_resource=require_resource,
         resource_call=resource_call)

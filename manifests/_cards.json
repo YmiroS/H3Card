@@ -251,7 +251,7 @@
    },
    {
     "id": "texture_enhance",
-    "name": "质感提升",
+    "name": "角色编辑",
     "slots": "img1+aud0+vid0"
    }
   ]

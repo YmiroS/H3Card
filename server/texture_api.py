@@ -15,11 +15,11 @@ from .project_repository import InvalidProjectId
 
 def selected_image(card):
     if card.get("type") != "card_tools" or card.get("cap") != "texture_enhance":
-        raise web.HTTPBadRequest(text="请选择质感提升工具卡片")
+        raise web.HTTPBadRequest(text="请选择角色编辑工具卡片")
     outputs = card.get("outputs") or []
     if outputs:
         if len(outputs) != 1 or not isinstance(outputs[0], dict) or outputs[0].get("kind") != "image":
-            raise web.HTTPConflict(text="质感编辑只支持一张已应用图片")
+            raise web.HTTPConflict(text="角色编辑只支持一张已应用图片")
         return outputs[0], "applied"
     image = (card.get("assets") or {}).get("images[0]")
     if not isinstance(image, dict) or image.get("kind") != "image":
@@ -61,7 +61,7 @@ class TextureApi:
         value = image.get("url") or image.get("ref") or image
         ref = await self.resource_call(self.app, "reference", value)
         if not ref:
-            raise web.HTTPBadRequest(text="质感编辑只接受画布内已登记的图片")
+            raise web.HTTPBadRequest(text="角色编辑只接受画布内已登记的图片")
         await self.require_resource(request, *ref, project_id=project_id)
         path = await self.resource_call(self.app, "local_path", *ref)
         if ref[0] == "comfy" and not path.is_file():
@@ -82,6 +82,67 @@ class TextureApi:
         info = await asyncio.to_thread(cloud_images.inspect_image, data)
         await self.require_resource(request, *ref, project_id=project_id)
         return data, ref, info
+
+    async def context(self, request, body):
+        """Resolve a trusted working image without substituting the card's old image."""
+        project_id, card_id = body["project"], body["card"]
+        card = await self.card(request, project_id, card_id)
+        version = source_version(card)
+        image, source_kind = selected_image(card)
+        explicit = "working_base_ref" in body or "expected_source" in body
+        if explicit:
+            value, expected = body.get("working_base_ref"), body.get("expected_source")
+            if (not isinstance(value, str) or not 1 <= len(value) <= 4096
+                    or not isinstance(expected, dict)
+                    or set(expected) != {"type", "cap", "input", "outputs"}):
+                raise web.HTTPBadRequest(text="工作底图和完整来源快照必须成对提供")
+            if expected != json.loads(version):
+                raise web.HTTPConflict(text="卡片来源已变化，请刷新工作底图")
+            # The card's selected source must also remain accessible, even for an explicit base.
+            selected_ref = await self.resource_call(self.app, "reference", image.get("url") or image.get("ref") or image)
+            if not selected_ref:
+                raise web.HTTPBadRequest(text="卡片图片未登记")
+            await self.require_resource(request, *selected_ref, project_id=project_id)
+            image, source_kind = {"kind": "image", "url": value}, "working"
+        data, ref, info = await self.source(request, project_id, image)
+        await self.check_context(request, project_id, card_id, version, ref)
+        return version, image, source_kind, data, ref, info
+
+    async def check_context(self, request, project_id, card_id, version, ref):
+        latest = await self.card(request, project_id, card_id)
+        if source_version(latest) != version:
+            raise web.HTTPConflict(text="编辑底图已变化，未采用本次请求；不要自动重试")
+        selected, _ = selected_image(latest)
+        selected_ref = await self.resource_call(
+            self.app, "reference", selected.get("url") or selected.get("ref") or selected)
+        if not selected_ref:
+            raise web.HTTPBadRequest(text="卡片图片未登记")
+        await self.require_resource(request, *selected_ref, project_id=project_id)
+        await self.require_resource(request, *ref, project_id=project_id)
+
+    async def save_preview(self, request, project_id, ref, result, *, prefix="texture", origin="质感编辑预览"):
+        name = f"{prefix}_{uuid.uuid4().hex}{result['extension']}"
+        path = self.root / "data" / "uploads" / name
+        parent = await self.resource_call(self.app, "lookup", *ref)
+        temporary = path.with_suffix(path.suffix + ".part")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(temporary.write_bytes, result["image_bytes"])
+            await self.require_project(request, project_id, operate=True)
+            await self.require_resource(request, *ref, project_id=project_id)
+            os.replace(temporary, path)
+            await self.resource_call(self.app, "register", project_id, "upload", name,
+                                     parent_id=parent["resource_id"], external=True)
+        except BaseException as error:
+            temporary.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)
+            if isinstance(error, OSError):
+                raise cloud_images.ImageEditError(
+                    "云端已返回结果，但预览保存失败。请联系管理员核对，不要重复生成。",
+                    status=500, request_id=result["request_id"]) from error
+            raise
+        return {"kind": "image", "url": f"/api/upload/{name}", "ref": f"chouka/{name}",
+                "origin": origin, "width": result["width"], "height": result["height"]}
 
     async def generate(self, request):
         temporary_base = None
@@ -105,19 +166,17 @@ class TextureApi:
                 body = await request.json()
         except (ValueError, UnicodeError):
             raise web.HTTPBadRequest(text="请求必须为 JSON 对象")
-        if (not isinstance(body, dict) or set(body) != {"project", "card", "prompt"}
+        if (not isinstance(body, dict) or set(body) not in (
+                {"project", "card", "prompt"},
+                {"project", "card", "prompt", "working_base_ref", "expected_source"})
                 or not all(isinstance(body[key], str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", body[key])
                            for key in ("project", "card"))
                 or not isinstance(body["prompt"], str) or not 1 <= len(body["prompt"].strip()) <= 20000):
             raise web.HTTPBadRequest(text="必须提供画布、卡片和编辑提示词，不接受外部图片地址或凭据")
         project_id, card_id = body["project"], body["card"]
-        card = await self.card(request, project_id, card_id)
-        # A canceled client may retry while its previous upstream call is still running.
         # Each request returns only a private preview; applying it remains explicit.
         try:
-            version = source_version(card)
-            image, source_kind = selected_image(card)
-            data, ref, info = await self.source(request, project_id, image)
+            version, image, source_kind, data, ref, info = await self.context(request, body)
             if reader is not None:
                 part = await reader.next()
                 if part is None or part.name != "base":
@@ -136,9 +195,7 @@ class TextureApi:
                 data = bytes(temporary_base)
                 info = await asyncio.to_thread(cloud_images.inspect_image, data)
             cloud_images.load()  # Fail before uploading any image when credentials are missing.
-            latest = await self.card(request, project_id, card_id)
-            if source_version(latest) != version:
-                raise web.HTTPConflict(text="编辑底图已变化，未提交生成")
+            await self.check_context(request, project_id, card_id, version, ref)
             user = require_user(request)
             result = await cloud_images.edit(self.app["session"], [data], body["prompt"],
                                              end_user_name=user["username"], end_user_phone=user["phone"],
@@ -154,35 +211,14 @@ class TextureApi:
                 if source_version(latest) != version:
                     return web.json_response({"error": "编辑底图已变化，未采用本次结果，请联系管理员确认后再生成",
                                               "request_id": result["request_id"], "retryable": False}, status=409)
-                await self.require_resource(request, *ref, project_id=project_id)
+                await self.check_context(request, project_id, card_id, version, ref)
                 response = {"source_kind": source_kind, "source": {"url": image.get("url"),
                             "width": info["width"], "height": info["height"]},
                             "request_id": result["request_id"], "model": result["model"], "image": None}
                 if result.get("result_url"):
                     return web.json_response({**response, "result_url": result["result_url"],
                                               "warning": "服务返回图片链接，未自动下载或发送调用 Key；请管理员确认获取方式，不要重复生成"})
-                name = f"texture_{uuid.uuid4().hex}{result['extension']}"
-                path = self.root / "data" / "uploads" / name
-                parent = await self.resource_call(self.app, "lookup", *ref)
-                temporary = path.with_suffix(path.suffix + ".part")
-                try:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    await asyncio.to_thread(temporary.write_bytes, result["image_bytes"])
-                    await self.require_project(request, project_id, operate=True)
-                    os.replace(temporary, path)
-                    await self.resource_call(self.app, "register", project_id, "upload", name,
-                                             parent_id=parent["resource_id"], external=True)
-                except Exception as error:
-                    temporary.unlink(missing_ok=True)
-                    path.unlink(missing_ok=True)
-                    if isinstance(error, OSError):
-                        raise cloud_images.ImageEditError(
-                            "云端已返回结果，但预览保存失败。请联系管理员核对，不要重复生成。",
-                            status=500, request_id=result["request_id"]) from error
-                    raise
-                response["image"] = {"kind": "image", "url": f"/api/upload/{name}",
-                                     "ref": f"chouka/{name}", "origin": "质感编辑预览",
-                                     "width": result["width"], "height": result["height"]}
+                response["image"] = await self.save_preview(request, project_id, ref, result)
                 return web.json_response(response)
         except cloud_images.ImageEditError as error:
             return web.json_response(error.response(), status=error.status)
