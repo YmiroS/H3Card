@@ -84,7 +84,7 @@ class CharacterApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call["messages"][0]["role"], "system")
         url = call["messages"][1]["content"][1]["image_url"]["url"]
         data = base64.b64decode(url.split(",")[1])
-        self.assertLessEqual(len(data), cloud_chat.MAX_IMAGE_BYTES)
+        self.assertLessEqual(len(data), character_api.MAX_ANALYSIS_IMAGE_BYTES)
         with Image.open(BytesIO(data)) as image:
             self.assertEqual(image.size, (320, 240))
             self.assertGreater(image.getpixel((0, 0))[1], 80)  # Green working base, not red card image.
@@ -413,7 +413,7 @@ class CharacterProfileTests(unittest.TestCase):
                 self.assertEqual("调整胡须密度" in prompt, beard == "adapt")
 
     def test_chat_thumbnail_compresses_to_configured_single_image_limit(self):
-        with mock.patch.object(cloud_chat, "MAX_IMAGE_BYTES", 1500):
+        with mock.patch.object(character_api, "MAX_ANALYSIS_IMAGE_BYTES", 1500):
             data = character_api.analysis_image(png("red", (2048, 2048)))
             self.assertLessEqual(len(data), 1500)
         for source in ((1000, 1), (1, 1000), (320, 240)):
