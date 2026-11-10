@@ -1,4 +1,4 @@
-import{reactExports as i,jsxRuntimeExports as r}from"./http-BHgZKsmB.js";import{usePageRuntime as a}from"./usePageRuntime-BFBbmQXA.js";import"./main-CNc75no0.js";import"./monitor-alerts-BXpxzu-0.js";const o=`@scope (body[data-chouka-page="ifStudio"]) {\r
+import{reactExports as i,jsxRuntimeExports as r}from"./http-CceZLADw.js";import{usePageRuntime as a}from"./usePageRuntime-CXxn_IOj.js";import"./main-BIyf998m.js";import"./monitor-alerts-BXpxzu-0.js";const o=`@scope (body[data-chouka-page="ifStudio"]) {\r
 \r
   :scope { color-scheme: dark; font: 14px/1.5 "Microsoft YaHei", "PingFang SC", system-ui, sans-serif; }\r
   * { box-sizing: border-box; }\r
