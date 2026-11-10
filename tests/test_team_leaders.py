@@ -74,7 +74,7 @@ class TeamLeaderMigrationTests(unittest.TestCase):
             with self.subTest(opening=opening):
                 store = AuthStore(self.path)
                 try:
-                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 10)
+                    self.assertEqual(store.db.execute('PRAGMA user_version').fetchone()[0], 11)
                     self.assertEqual(store.db.execute('PRAGMA foreign_keys').fetchone()[0], 1)
                     self.assertEqual(store.db.execute('PRAGMA foreign_key_check').fetchall(), [])
                     for table, rows in before.items():

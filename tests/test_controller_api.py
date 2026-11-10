@@ -2536,6 +2536,35 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             duplicate = await self.client.post(url, json={"action": action})
             self.assertEqual(duplicate.status, 409)
 
+    async def test_alert_restart_http_requires_literal_true_to_confirm_recovery(self):
+        for index, online in enumerate((False, 'false', 'true', 1, [], {}, None, True)):
+            with self.subTest(comfy_online=online):
+                credentials = self.store.register_worker(f'guarded-{index}', {
+                    'supports_service_restart': True, 'supports_guarded_service_restart': True,
+                    'hardware': {'host_id': f'guarded-host-{index}'},
+                })
+                worker_id = credentials['worker_id']
+                headers = {'X-Worker-ID': worker_id,
+                           'Authorization': f"Bearer {credentials['worker_token']}"}
+                self.store.heartbeat(worker_id, comfy_online=True)
+                job_id, request_id = f'guarded-job-{index}', f'guarded-request-{index}'
+                self.store.enqueue(job_id, {})
+                assignment = self.store.acquire(worker_id)
+                self.assertTrue(self.store.mark_running(job_id, worker_id, assignment['lease_token']))
+                self.store.request_alert_restart(worker_id, job_id, assignment['attempt_id'], request_id)
+                for status in ('running', 'done'):
+                    response = await self.client.post('/agent/v1/heartbeat', headers=headers, json={
+                        'current_job_id': job_id,
+                        'comfy_online': True if status == 'running' else online,
+                        'maintenance': {'request_id': request_id, 'status': status},
+                    })
+                    self.assertEqual(response.status, 200, await response.text())
+                    result = await response.json()
+                expected = 'done' if online is True else 'error'
+                self.assertEqual(result['maintenance_ack']['status'], expected)
+                self.assertEqual(self.store.alert_restart_status(request_id)['status'], expected)
+                self.assertTrue(self.store.finish(job_id, worker_id, assignment['lease_token'], 'done'))
+
     async def test_restart_rejects_invalid_json_and_action(self):
         worker_id = self.store.register_worker("restart", {"supports_service_restart": True, "supports_host_reboot": True,
                 "hardware": {"host_id": str(time.time_ns())}})["worker_id"]
@@ -4014,6 +4043,155 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             })
             self.assertEqual(self.store.list_workers()[0]["state"], "busy")
             self.assertIsNone(self.store.acquire(worker_id))
+
+    async def test_cancel_recovery_steps_keep_lease_and_finish_with_verified_release(self):
+        credentials = self.store.register_worker("recover-worker", {})
+        worker_id = credentials["worker_id"]
+        headers = {"X-Worker-ID": worker_id,
+                   "Authorization": f"Bearer {credentials['worker_token']}"}
+        self.store.heartbeat(worker_id, comfy_online=True)
+        controller_app.JOBS["recover-job"] = {
+            "id": "recover-job", "status": "queued", "created": 1,
+            "progress": 0.3, "outputs": [], "error": None,
+        }
+        self.register_job("recover-job")
+        self.store.enqueue("recover-job", {"graph": {}}, [])
+        assignment = self.store.acquire(worker_id)
+        headers["X-Lease-Token"] = assignment["lease_token"]
+        response = await self.client.post("/agent/v1/jobs/recover-job/start", headers=headers, json={})
+        self.assertEqual(response.status, 200)
+        job = controller_app.JOBS["recover-job"]
+        self.assertEqual(await controller_app.stop_job(self.client.app, "recover-job"), "cancel_requested")
+        self.assertEqual(job["step"], "正在停止并释放显存")
+        for state, expected in (("stopping", "正在停止并释放显存"),
+                                ("recovering", "停止未完成，正在恢复 ComfyUI")):
+            event = {"type": "cleanup_status", "data": {"state": state}}
+            denied = await self.client.post("/agent/v1/jobs/recover-job/event",
+                headers={**headers, "X-Lease-Token": "wrong"}, json=event)
+            self.assertEqual(denied.status, 409)
+            response = await self.client.post("/agent/v1/jobs/recover-job/event", headers=headers, json=event)
+            self.assertEqual(response.status, 200)
+            self.assertEqual(job["step"], expected)
+            self.assertTrue(job["cleanup_pending"])
+            self.assertTrue(self.store.validate_lease("recover-job", worker_id, assignment["lease_token"]))
+        # 重复停止及迟到的采样/中断事件不能覆盖恢复提示或提前放开接单。
+        await self.client.post("/agent/v1/jobs/recover-job/event", headers=headers,
+                              json={"type": "cleanup_status", "data": {"state": "stopping"}})
+        await controller_app.stop_job(self.client.app, "recover-job")
+        for kind, data in (("executing", {"node": "2"}),
+                           ("execution_interrupted", {"cleanup_pending": True})):
+            await self.client.post("/agent/v1/jobs/recover-job/event", headers=headers,
+                                   json={"type": kind, "data": data})
+        self.assertEqual(job["step"], "停止未完成，正在恢复 ComfyUI")
+        for state in ("unknown", [], None):
+            response = await self.client.post("/agent/v1/jobs/recover-job/event", headers=headers,
+                json={"type": "cleanup_status", "data": {"state": state}})
+            self.assertEqual(response.status, 400)
+        self.store.enqueue("after-recovery", {"graph": {}}, [])
+        self.assertIsNone(self.store.acquire(worker_id))
+        response = await self.client.post("/agent/v1/jobs/recover-job/complete", headers=headers,
+                                          json={"outputs": []})
+        self.assertEqual(response.status, 409)
+        reading = asyncio.Event()
+        body_ready = asyncio.Event()
+
+        async def late_body():
+            reading.set()
+            await body_ready.wait()
+            return {"type": "cleanup_status", "data": {"state": "recovering"}}
+
+        request = types.SimpleNamespace(app=self.client.app, headers=headers,
+                                        match_info={"pid": "recover-job"}, json=late_body)
+        late_event = asyncio.create_task(controller_app.api_agent_event(request))
+        await asyncio.wait_for(reading.wait(), 1)
+        response = await self.client.post("/agent/v1/jobs/recover-job/failed", headers=headers, json={
+            "canceled": True, "capacity_released": True, "comfy_recovered": True,
+            "capacity_measurements": {"diagnostics": {
+                "version": 1, "cleanup_complete": False, "cleanup_error": "停止超过60秒",
+            }},
+        })
+        self.assertEqual(response.status, 200)
+        self.assertEqual(job["status"], "canceled")
+        self.assertEqual(job["step"], "已停止，ComfyUI 已恢复")
+        self.assertIsNone(job["error"])
+        self.assertFalse(job["cleanup_pending"])
+        body_ready.set()
+        with self.assertRaises(web.HTTPConflict):
+            await asyncio.wait_for(late_event, 1)
+        self.assertFalse(job["cleanup_pending"])
+        self.assertEqual(job["step"], "已停止，ComfyUI 已恢复")
+        row = self.store.db.execute("SELECT released_at, measurements_json FROM capacity_attempts WHERE id=?",
+                                    (assignment["attempt_id"],)).fetchone()
+        self.assertIsNotNone(row["released_at"])
+        self.assertFalse(json.loads(row["measurements_json"])["diagnostics"]["cleanup_complete"])
+
+    async def test_late_cleanup_events_cannot_resurrect_recovered_terminal_job(self):
+        for boundary, event_type in (("body", "execution_interrupted"),
+                                     ("body", "execution_error"),
+                                     ("diagnostics", "execution_error")):
+            with self.subTest(boundary=boundary, event_type=event_type):
+                credentials = self.store.register_worker(f"late-{boundary}-{event_type}", {})
+                worker_id = credentials["worker_id"]
+                headers = {"X-Worker-ID": worker_id,
+                           "Authorization": f"Bearer {credentials['worker_token']}"}
+                self.store.heartbeat(worker_id, comfy_online=True)
+                pid = f"late-{boundary}-{event_type}"
+                controller_app.JOBS[pid] = {
+                    "id": pid, "status": "queued", "created": 1,
+                    "progress": 0.3, "outputs": [], "error": None,
+                }
+                self.register_job(pid)
+                self.store.enqueue(pid, {"graph": {}}, [])
+                assignment = self.store.acquire(worker_id)
+                headers["X-Lease-Token"] = assignment["lease_token"]
+                response = await self.client.post(f"/agent/v1/jobs/{pid}/start", headers=headers, json={})
+                self.assertEqual(response.status, 200)
+                job = controller_app.JOBS[pid]
+                entered, release = asyncio.Event(), asyncio.Event()
+                event = {"type": event_type, "data": {
+                    "cleanup_pending": True, "exception_message": "late-event",
+                }}
+                original_thread = asyncio.to_thread
+
+                async def delayed_body():
+                    entered.set()
+                    await release.wait()
+                    return event
+
+                async def delayed_thread(func, *args, **kwargs):
+                    if boundary == "diagnostics" and func == self.store.record_capacity_diagnostics:
+                        entered.set()
+                        await release.wait()
+                    return await original_thread(func, *args, **kwargs)
+
+                with mock.patch.object(controller_app.asyncio, "to_thread", side_effect=delayed_thread):
+                    if boundary == "body":
+                        request = types.SimpleNamespace(app=self.client.app, headers=headers,
+                                                        match_info={"pid": pid}, json=delayed_body)
+                        late = asyncio.create_task(controller_app.api_agent_event(request))
+                    else:
+                        late = asyncio.create_task(self.client.post(
+                            f"/agent/v1/jobs/{pid}/event", headers=headers, json=event))
+                    try:
+                        await asyncio.wait_for(entered.wait(), 1)
+                        response = await self.client.post(f"/agent/v1/jobs/{pid}/failed", headers=headers,
+                            json={"canceled": True, "capacity_released": True, "comfy_recovered": True})
+                        self.assertEqual(response.status, 200)
+                        release.set()
+                        if boundary == "body":
+                            with self.assertRaises(web.HTTPConflict):
+                                await asyncio.wait_for(late, 1)
+                        else:
+                            response = await asyncio.wait_for(late, 1)
+                            self.assertEqual(response.status, 409)
+                        self.assertEqual(job["status"], "canceled")
+                        self.assertEqual(job["step"], "已停止，ComfyUI 已恢复")
+                        self.assertFalse(job["cleanup_pending"])
+                    finally:
+                        release.set()
+                        if not late.done():
+                            late.cancel()
+                        await asyncio.gather(late, return_exceptions=True)
 
     async def test_execution_error_atomically_finishes_dispatch(self):
         response = await self.client.post("/agent/v1/register", json={

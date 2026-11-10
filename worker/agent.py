@@ -25,6 +25,13 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+# Embedded Python's isolated mode omits the script directory from sys.path.
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from remote_commands import RemoteCommands, capabilities as remote_command_capabilities
+
+
+CANCEL_GRACE_SECONDS = 60
+
 
 class AgentError(RuntimeError):
     pass
@@ -225,8 +232,15 @@ class WorkerAgent:
         self.current = None
         self.comfy_lock = asyncio.Lock()
         self.release_failed = None
+        self.remote_commands = RemoteCommands(
+            host_id, comfy_root=self.comfy_input.parent,
+            worker_root=Path(__file__).resolve().parent,
+            app_root=Path(__file__).resolve().parent.parent,
+        )
         self.capabilities = {
             "is_primary_node": self.is_primary_node,
+            "agent_version": 11,
+            "remote_commands": remote_command_capabilities(),
         }
         self.telemetry = {}
         self.last_capability_scan = 0.0
@@ -235,6 +249,8 @@ class WorkerAgent:
         self.comfy_online = False
         self.local_busy = False
         self.pending_sync = None
+        self._maintenance_executing = False
+        self._guarded_restart = None
         maintenance = self.state.get("maintenance")
         self.boot_identity = None
         if isinstance(maintenance, dict) and maintenance.get("request_id"):
@@ -277,6 +293,22 @@ class WorkerAgent:
         finally:
             tmp.unlink(missing_ok=True)
 
+    def remote_commands_busy(self):
+        remote = getattr(self, "remote_commands", None)
+        return bool(remote and remote.busy)
+
+    def remote_command_can_start(self):
+        return not (self.current or self.local_busy or self.release_failed
+                    or not self.comfy_online or self.pending_sync
+                    or self.maintenance_blocks_jobs() or self.deployment_blocks_jobs()
+                    or self.stop_event.is_set())
+
+    async def remote_command_request(self, method, path, **kwargs):
+        return await self._json_request(
+            method, self.server + path, headers=self._agent_headers(),
+            timeout=aiohttp.ClientTimeout(total=15, sock_connect=5), **kwargs,
+        )
+
     def deployment_blocks_jobs(self):
         return bool(self.config.get("deployment_drain_file") and
                     self.configured_path("deployment_drain_file", "").exists())
@@ -293,7 +325,8 @@ class WorkerAgent:
 
     def acknowledge_deployment(self):
         if (not self.deployment_blocks_jobs() or self.current or self.local_busy
-                or self.release_failed or not self.comfy_online or self.pending_sync):
+                or self.release_failed or not self.comfy_online or self.pending_sync
+                or self.remote_commands_busy()):
             return
         request = json.loads(self.configured_path("deployment_drain_file", "").read_text(encoding="utf-8"))
         # Only the serial acquire/execute loop may acknowledge: an acquire request
@@ -760,9 +793,11 @@ class WorkerAgent:
             "system": stats.get("system") or {},
             "devices": stats.get("devices") or [],
             "telemetry": self.telemetry,
-            "agent_version": 9,
+            "agent_version": 11,
+            "remote_commands": remote_command_capabilities(),
             "supports_task_diagnostics": 1,
             "supports_service_restart": os.name == "nt",
+            "supports_guarded_service_restart": os.name == "nt",
             "supports_host_reboot": os.name == "nt",
             "supports_capacity_telemetry": 1,
             "supports_file_sync": True,
@@ -841,7 +876,8 @@ class WorkerAgent:
         if self.sync_report and (self.sync_report.get("request_id") == request_id
                                  or self.sync_report.get("status") == "running"):
             return
-        if request_id in self.state.get("attempted_host_reboots", []):
+        if (request_id in self.state.get("attempted_host_reboots", [])
+                or request_id in self.state.get("attempted_guarded_restarts", [])):
             return
         if request_id == (self.state.get("maintenance") or {}).get("request_id"):
             return
@@ -850,6 +886,10 @@ class WorkerAgent:
         if request_id == (self.state.get("last_restart_result") or {}).get("request_id"):
             return
         self.pending_sync = {"request_id": request_id, "type": action}
+        # 即使只收到一半约束也必须保留并拒绝，不能降级为旧网页无约束重启。
+        for key in ("expected_job_id", "expected_attempt_id"):
+            if key in command:
+                self.pending_sync[key] = command[key]
         timing = "等待空闲" if action == "sync_files" else "立即执行，将中断当前任务"
         print(f"[Worker] 已收到维护请求 {action}：{request_id}，{timing}", flush=True)
 
@@ -950,7 +990,28 @@ class WorkerAgent:
             cwd=repo, timeout=timeout * 2 + 120,
         )
 
+    def _check_guarded_assignment(self, command, assignment=None):
+        current = self.current
+        if (self.is_primary_node or command.get("type") != "restart_services"
+                or not command.get("expected_job_id") or not command.get("expected_attempt_id")
+                or current is None or assignment is not None and current is not assignment
+                or current.get("job_id") != command["expected_job_id"]
+                or current.get("attempt_id") != command["expected_attempt_id"]
+                or any(current.get(key) for key in (
+                    "cancel_requested", "_cleanup_task", "_execution_finished", "_finished", "finished"))
+                or current.get("status") in {"done", "error", "canceled"}
+                or (current.get("_lease_deadline") is not None
+                    and time.monotonic() >= current["_lease_deadline"])):
+            raise AgentError("原任务已结束、取消、清理或更换执行批次，拒绝重启节点服务")
+        return current
+
+    def _check_active_guarded_restart(self):
+        guard = getattr(self, "_guarded_restart", None)
+        if guard is not None:
+            self._check_guarded_assignment(*guard)
+
     async def schedule_node_restart(self, request_id, commit):
+        self._check_active_guarded_restart()
         if os.name != "nt":
             raise AgentError("节点重启只能在 Windows Worker 上运行")
         repo = self.code_repo_path().resolve()
@@ -965,6 +1026,8 @@ class WorkerAgent:
             cwd=launcher.parent, timeout=30,
         )
 
+        # 启动脚本检查含 await；恢复执行后先复验，再写状态或启动监督器。
+        self._check_active_guarded_restart()
         timeout = max(float(self.config.get("restart_timeout_seconds", 300)), 60.0) if commit else 900.0
         restart_token = uuid.uuid4().hex
         log_path = self.configured_path("restart_log", "logs/restart-node.log")
@@ -1165,12 +1228,14 @@ class WorkerAgent:
 
     def maintenance_blocks_jobs(self):
         maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
-        return (maintenance.get("status") in {"running", "restarting", "error"}
+        return (getattr(self, "_maintenance_executing", False)
+                or maintenance.get("status") in {"running", "restarting", "error"}
                 or bool(self.sync_report and self.sync_report.get("status") in {"running", "error"}))
 
     async def execute_pending_sync(self):
         command = self.pending_sync
-        if (not command
+        if (not command or self.remote_commands_busy()
+                or getattr(self, "_maintenance_executing", False)
                 or self.sync_report and self.sync_report.get("status") == "running"):
             return
         action = command["type"]
@@ -1208,7 +1273,20 @@ class WorkerAgent:
                         else "正在重启节点服务，未更新代码"),
         }
         print(f"[Worker] 开始维护 {action}：{request_id}", flush=True)
+        self._maintenance_executing = True
+        guarded = any(key in command for key in ("expected_job_id", "expected_attempt_id"))
+        guarded_assignment = None
         try:
+            if guarded:
+                # 在首次网络 await 前持久化去重，网络结果不确定也绝不重新启动第二次。
+                guarded_assignment = self._check_guarded_assignment(command)
+                self.state.setdefault("attempted_guarded_restarts", []).append(request_id)
+                self.state["maintenance"] = {
+                    **self.sync_report, "action": action, "phase": "awaiting_running_ack",
+                    "deadline": time.time() + 900,
+                }
+                self._save_state()
+                self._guarded_restart = (command, guarded_assignment)
             if action in ("reboot_host", "restart_services"):
                 if action == "reboot_host":
                     await self.schedule_host_reboot(request_id)
@@ -1217,11 +1295,15 @@ class WorkerAgent:
                     reply = await self._json_request(
                         "POST", self.server + "/agent/v1/heartbeat", headers=self._agent_headers(),
                         json={"comfy_online": self.comfy_online, "busy": True, "local_busy": True,
-                              "current_job_id": None, "maintenance": dict(self.sync_report)},
+                              "current_job_id": (guarded_assignment["job_id"]
+                                                 if guarded_assignment is not None else None),
+                              "maintenance": dict(self.sync_report)},
                     )
                     ack = (reply or {}).get("maintenance_ack") or {}
                     if ack.get("request_id") != request_id or ack.get("status") != "running":
                         raise AgentError("服务端未确认服务重启维护状态，未执行重启")
+                    if guarded:
+                        self._check_guarded_assignment(command, guarded_assignment)
                     await self.schedule_node_restart(request_id, "")
                 return
             if os.name != "nt":
@@ -1239,13 +1321,17 @@ class WorkerAgent:
             commit, _ = await self.pull_code()
             print(f"[Worker] chouka 已更新至 {commit[:12]}，准备重启节点", flush=True)
             await self.schedule_node_restart(request_id, commit)
-        except Exception as exc:
+        except (Exception, asyncio.CancelledError) as exc:
             self.sync_report = {
                 "request_id": request_id,
                 "status": "error",
-                "message": str(exc)[:1000],
+                "message": str(exc)[:1000] or "维护流程被取消，未确认重启完成",
             }
-            if action in ("reboot_host", "restart_services"):
+            if guarded:
+                attempted = self.state.setdefault("attempted_guarded_restarts", [])
+                if request_id not in attempted:
+                    attempted.append(request_id)
+            if guarded or action in ("reboot_host", "restart_services"):
                 previous = self.state.get("maintenance") or {}
                 self.state["maintenance"] = {
                     **(previous if previous.get("request_id") == request_id else {}),
@@ -1254,8 +1340,12 @@ class WorkerAgent:
                 self.fresh_capabilities_ready = False
                 self._save_state()
             print(f"[Worker] 节点维护失败：{exc}", flush=True)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
         finally:
             self.pending_sync = None
+            self._maintenance_executing = False
+            self._guarded_restart = None
 
     async def heartbeat_loop(self):
         interval = max(float(self.config.get("heartbeat_seconds", 10)), 2.0)
@@ -1291,17 +1381,20 @@ class WorkerAgent:
                 self.refresh_deployment_report()
                 sync_running = (bool(self.pending_sync) or self.maintenance_blocks_jobs()
                                 or self.deployment_blocks_jobs())
+                # Remote occupancy is host-command scheduling state, not native
+                # ComfyUI busy: advertising it as local_busy can deadlock peer claims.
+                remote_running = self.remote_commands_busy()
                 body = {
                     "comfy_online": self.comfy_online,
                     "busy": (bool(self.current) or self.local_busy
-                             or bool(self.release_failed) or sync_running),
+                             or bool(self.release_failed) or sync_running or remote_running),
                     "local_busy": (self.local_busy or bool(self.release_failed)
                                    or bool(self.current and self.current.get("_cleanup_task"))
                                    or sync_running),
                     "current_job_id": self.current["job_id"] if self.current else None,
                     "capacity_released": bool(
                         self.current is None and not self.release_failed
-                        and self.comfy_online and not self.local_busy and not sync_running
+                        and self.comfy_online and not self.local_busy and not sync_running and not remote_running
                     ),
                 }
                 if self.telemetry:
@@ -1342,6 +1435,13 @@ class WorkerAgent:
                 for command in (reply or {}).get("commands", []):
                     if command.get("type") in ("cancel_job", "abort_job"):
                         await self.cancel_current(command.get("job_id"))
+                    elif command.get("type") == "remote_command":
+                        try:
+                            self.remote_commands.receive(command)
+                        except ValueError as exc:
+                            print(f"[Worker] 远程命令无效：{exc}", flush=True)
+                    elif command.get("type") == "cancel_remote_command":
+                        self.remote_commands.cancel(command.get("execution_id"))
                     elif command.get("type") in ("sync_files", "reboot_host", "restart_services"):
                         self.queue_sync(command)
                 # 主循环可能正阻塞在长任务上；人工重启由心跳直接执行。
@@ -1371,56 +1471,98 @@ class WorkerAgent:
     async def cancel_current(self, job_id):
         if not self.current or self.current["job_id"] != job_id:
             return
-        self.current["cancel_requested"] = True
-        # 心跳只发起清理，不等待长达 130 秒的确认，继续为旧任务续租。
-        self.start_cleanup(self.current)
+        assignment = self.current
+        assignment["cancel_requested"] = True
+        # 清理独立于执行协程；完成清理或恢复后再中断本地等待。
+        self.start_cleanup(assignment)
+
+    async def report_cleanup_state(self, assignment, state):
+        try:
+            await asyncio.wait_for(self.report_event(assignment, {
+                "type": "cleanup_status", "data": {"state": state},
+            }), timeout=2)
+        except Exception as exc:
+            print(f"[Worker] 清理状态上报失败：{type(exc).__name__}: {exc}", flush=True)
+
+    async def cancel_and_confirm(self, assignment):
+        if assignment.get("cancel_requested"):
+            await self.report_cleanup_state(assignment, "stopping")
+        ws = assignment.get("_ws")
+        if ws is not None and not ws.closed:
+            try:
+                await asyncio.wait_for(ws.close(), timeout=5)
+            except asyncio.TimeoutError:
+                pass
+        async with self.comfy_lock:
+            cancel_url = self.comfy + f"/api/jobs/{assignment['job_id']}/cancel"
+            request_options = {
+                "json": {"free_memory": True},
+                "timeout": aiohttp.ClientTimeout(total=CANCEL_GRACE_SECONDS, sock_connect=15),
+            }
+            try:
+                ack = await self._json_request("POST", cancel_url, **request_options)
+            except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError):
+                # 重试共享同一截止时间，不能重新获得完整宽限期。
+                ack = await self._json_request("POST", cancel_url, **request_options)
+            if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
+                    or not isinstance(ack.get("cancelled"), bool)):
+                raise AgentError("ComfyUI 未确认 cleanup_complete")
 
     async def cancel_and_release(self, assignment):
+        diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
         try:
-            ws = assignment.get("_ws")
-            if ws is not None and not ws.closed:
-                await ws.close()
-            async with self.comfy_lock:
-                cancel_url = self.comfy + f"/api/jobs/{assignment['job_id']}/cancel"
-                request_options = {
-                    "json": {"free_memory": True},
-                    "timeout": aiohttp.ClientTimeout(total=130, sock_connect=15),
-                }
-                try:
-                    ack = await self._json_request("POST", cancel_url, **request_options)
-                except (aiohttp.ClientConnectionError, aiohttp.ClientPayloadError):
-                    # Retry the idempotent cancellation when delivery or response is uncertain.
-                    ack = await self._json_request("POST", cancel_url, **request_options)
-                if (not isinstance(ack, dict) or ack.get("cleanup_complete") is not True
-                        or not isinstance(ack.get("cancelled"), bool)):
-                    raise AgentError("ComfyUI 未确认 cleanup_complete")
-            diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+            # 同一个截止时间覆盖状态上报、关闭 WS、等待提交锁和两次 HTTP 请求。
+            await asyncio.wait_for(self.cancel_and_confirm(assignment), timeout=CANCEL_GRACE_SECONDS)
             if diagnostics is not None:
                 diagnostics["cleanup_complete"] = True
             return True
         except Exception as exc:
-            diagnostics = assignment.get("_capacity_measurements", {}).get("diagnostics")
+            detail = (f"停止超过 {CANCEL_GRACE_SECONDS} 秒，未确认任务退出和显存释放"
+                      if isinstance(exc, asyncio.TimeoutError) else str(exc))
             if diagnostics is not None:
                 diagnostics["cleanup_complete"] = False
-                diagnostics["cleanup_error"] = str(exc)[:4000]
+                diagnostics["cleanup_error"] = detail[:4000]
             self.release_failed = (
-                f"显存释放未确认：{type(exc).__name__}: {exc}；"
+                f"显存释放未确认：{type(exc).__name__}: {detail}；"
                 "已停止接单，正在自动重启 ComfyUI，Worker 保持运行。"
             )
             print(f"[Worker] {self.release_failed}", flush=True)
+            await self.report_cleanup_state(assignment, "recovering")
             try:
                 await self.restart_comfy_only()
+                queue = await self._json_request(
+                    "GET", self.comfy + "/queue",
+                    timeout=aiohttp.ClientTimeout(total=5, sock_connect=3),
+                )
+                if (not isinstance(queue, dict)
+                        or not isinstance(queue.get("queue_running"), list)
+                        or not isinstance(queue.get("queue_pending"), list)
+                        or queue["queue_running"] or queue["queue_pending"]):
+                    raise AgentError("ComfyUI 恢复后未确认队列为空")
             except Exception as restart_exc:
                 self.release_failed += (
-                    f" 自动重启失败：{type(restart_exc).__name__}: {restart_exc}；"
+                    f" 自动重启失败，恢复失败：{type(restart_exc).__name__}: {restart_exc}；"
                     "请检查 ComfyUI 后重启相关进程。"
                 )
                 print(f"[Worker] {self.release_failed}", flush=True)
-            return False
+                return False
+            assignment["_comfy_recovered"] = True
+            self.release_failed = None
+            self.comfy_online = True
+            self.local_busy = False
+            print("[Worker] ComfyUI 已恢复并确认队列为空，原 Worker 保持运行。", flush=True)
+            return True
+        finally:
+            execution = assignment.get("_execution_task")
+            if (assignment.get("cancel_requested") and execution is not None
+                    and not execution.done() and not assignment.get("_handling_failure")):
+                assignment["_cancel_execution_wait"] = True
+                execution.cancel()
 
     async def acquire(self):
         if (self.release_failed or not self.comfy_online or self.local_busy or self.current
-                or self.pending_sync or self.maintenance_blocks_jobs() or self.deployment_blocks_jobs()):
+                or self.pending_sync or self.maintenance_blocks_jobs() or self.deployment_blocks_jobs()
+                or self.remote_commands_busy()):
             return None
         return await self._json_request(
             "POST", self.server + "/agent/v1/jobs/acquire",
@@ -1608,6 +1750,9 @@ class WorkerAgent:
                         pass
                 if event is not None and event["data"].get("prompt_id") == job_id:
                     event_type, data = event.get("type"), event["data"]
+                    if event_type == "execution_success" or (
+                            event_type == "executing" and data.get("node") is None):
+                        assignment["_execution_finished"] = True
                     self.observe_diagnostic_progress(assignment, event_type, data)
                     if event_type == "execution_error":
                         self.start_cleanup(assignment)
@@ -1618,6 +1763,7 @@ class WorkerAgent:
                     next_history_check = time.monotonic() + 5
                     try:
                         if await self.history_finished(job_id):
+                            assignment["_execution_finished"] = True
                             return
                     except JobFailed:
                         raise
@@ -1734,6 +1880,10 @@ class WorkerAgent:
         return "file"
 
     async def execute(self, assignment):
+        # acquire 的网络请求可能早于维护封锁发出；迟到的接单结果不能启动新任务。
+        if (self.maintenance_blocks_jobs() or self.remote_commands_busy()
+                or getattr(self, "stop_event", None) is not None and self.stop_event.is_set()):
+            return
         started = time.monotonic()
         ttl = max(float(assignment.get("lease_expires_at", 0)) - time.time(), 1.0)
         assignment["_lease_deadline"] = started + ttl
@@ -1747,6 +1897,8 @@ class WorkerAgent:
         # 旧 Controller 没有 attempt_id，仍按原租约正常执行和回报。
         attempt = {"attempt_id": assignment["attempt_id"]} if assignment.get("attempt_id") else {}
         print(f"[Worker] 领取任务 {job_id}")
+        assignment["_execution_task"] = asyncio.current_task()
+        assignment["_handling_failure"] = False
         try:
             # Explicit fresh boundary probe; cached self.telemetry is never a before sample.
             await self.sample_diagnostics(assignment, "before")
@@ -1762,6 +1914,7 @@ class WorkerAgent:
             measurements["prepare_seconds"] = prepared - started
             stage = "execute"
             await self.execute_comfy(assignment)
+            assignment["_execution_finished"] = True
             executed = time.monotonic()
             measurements["execute_seconds"] = executed - prepared
             if assignment.get("cancel_requested"):
@@ -1786,19 +1939,29 @@ class WorkerAgent:
             )
             print(f"[Worker] 任务完成 {job_id}，产物 {len(outputs)} 个")
         except (Exception, asyncio.CancelledError) as exc:
+            assignment["_handling_failure"] = True
+            internal_cancel = (isinstance(exc, asyncio.CancelledError)
+                               and assignment.pop("_cancel_execution_wait", False))
+            if internal_cancel:
+                # 仅消费清理协程发起的这一次取消；外部 Worker 停机仍须向上传播。
+                execution = asyncio.current_task()
+                execution.uncancel()
+                internal_cancel = execution.cancelling() == 0
             canceled = (isinstance(exc, JobFailed) and exc.canceled
                         or bool(assignment.get("cancel_requested")))
             cleanup = self.start_cleanup(assignment)
-            self.record_execution_error(assignment, exc, stage)
+            self.record_execution_error(
+                assignment, JobFailed("任务已取消", canceled=True) if internal_cancel else exc, stage)
             released = await asyncio.shield(cleanup)
-            diagnostics["cleanup_complete"] = bool(released)
+            if not assignment.get("_comfy_recovered"):
+                diagnostics["cleanup_complete"] = bool(released)
             if not released and diagnostics["cleanup_error"] is None:
                 diagnostics["cleanup_error"] = str(self.release_failed or "显存释放未确认")[:4000]
             # 未完成阶段保持缺失；总时长记录到清理返回，释放失败仍明确标为未释放。
             measurements["total_seconds"] = time.monotonic() - started
             await self.sample_diagnostics(assignment, "after")
             self.finish_diagnostic_reports(assignment)
-            error = str(exc) if released else self.release_failed
+            error = ("任务已取消" if internal_cancel else str(exc)) if released else self.release_failed
             print(f"[Worker] 任务失败 {job_id}：{error}")
             try:
                 await self._json_request(
@@ -1806,17 +1969,19 @@ class WorkerAgent:
                     headers=self._agent_headers(assignment["lease_token"]),
                     json={"error": error, "canceled": bool(canceled and released),
                           **attempt, "capacity_measurements": dict(measurements),
+                          "comfy_recovered": assignment.get("_comfy_recovered") is True,
                           "capacity_released": bool(released)},
                 )
             except Exception as report_error:
                 print(f"[Worker] 上报失败状态失败：{report_error}")
-            if isinstance(exc, asyncio.CancelledError):
+            if isinstance(exc, asyncio.CancelledError) and not internal_cancel:
                 raise
         finally:
             self.finish_diagnostic_reports(assignment)
             task = assignment.get("_cleanup_task")
             if task is not None:
                 await asyncio.shield(task)
+            assignment.pop("_execution_task", None)
             self.current = None
 
     async def run(self):
@@ -1835,7 +2000,11 @@ class WorkerAgent:
                     try:
                         await self.local_status()
                         self.acknowledge_deployment()
-                        if self.pending_sync and not self.local_busy and not self.release_failed:
+                        if await self.remote_commands.pump(
+                                self.remote_command_request, self.remote_command_can_start):
+                            continue
+                        if (self.pending_sync and not self.local_busy and not self.release_failed
+                                and not self.remote_commands_busy()):
                             await self.execute_pending_sync()
                             continue
                         assignment = await self.acquire()
