@@ -17,6 +17,7 @@ _HEX_COLOR = re.compile(r"^#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
 _MAX_CUBE_BYTES = 8 * 1024 * 1024
 _MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_VIGNETTE_BYTES = 4096
+_MAX_MOTION_BLUR_BYTES = 4096
 
 
 def _ffmpeg_filter_path(path: Path) -> str:
@@ -137,6 +138,42 @@ def parse_media_probe(stderr: str) -> tuple[int, int, float]:
     return width, height, duration
 
 
+def _normalize_motion_blur(raw: object) -> dict | None:
+    """Return sanitized motion-blur params, or None when the effect is off/invalid."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("enabled") is not True:
+        return None
+    try:
+        samples = int(round(float(raw.get("samples", 8))))
+        shutter = float(raw.get("shutter", 0.5))
+    except (TypeError, ValueError):
+        return None
+    samples = int(_clamp(samples, 2, 64))
+    shutter = _clamp(shutter, 0.0, 1.0)
+    frames = motion_blur_mix_frames(samples, shutter)
+    if frames is None:
+        return None
+    return {"samples": samples, "shutter": shutter, "frames": frames}
+
+
+def motion_blur_mix_frames(samples: int, shutter: float) -> int | None:
+    """Map openfilm samples/shutter onto a discrete-video tmix window."""
+    if shutter <= 0 or samples < 2:
+        return None
+    capped = int(_clamp(samples, 2, 64))
+    # Half-up (not banker's round) so 8×0.5 → 5, matching JS Math.round.
+    span = int(1 + (capped - 1) * shutter + 0.5)
+    return max(2, min(capped, span))
+
+
+def motion_blur_tmix(frames: int) -> str:
+    """Equal-weight tmix, matching openfilm's average of shutter samples."""
+    n = max(2, min(64, int(frames)))
+    weights = " ".join(["1"] * n)
+    return f"tmix=frames={n}:weights='{weights}'"
+
+
 def build_color_grade_vf(cube_path: Path, vignette: dict | None = None) -> str:
     """Single-input lut3d graph. Vignette is a mask overlay, not a geq expression."""
     del vignette
@@ -144,7 +181,8 @@ def build_color_grade_vf(cube_path: Path, vignette: dict | None = None) -> str:
 
 
 def build_grade_args(source: Path, cube_path: Path, temporary: Path, *,
-                     mask: Path | None = None, size: tuple[int, int] | None = None) -> list[str]:
+                     mask: Path | None = None, size: tuple[int, int] | None = None,
+                     motion_blur: dict | None = None) -> list[str]:
     """FFmpeg args. `-progress pipe:1` reports encode time on stdout."""
     args = [
         "-y", "-hide_banner", "-loglevel", "error", "-nostats",
@@ -152,17 +190,20 @@ def build_grade_args(source: Path, cube_path: Path, temporary: Path, *,
         "-i", str(source.resolve()),
     ]
     cube = _ffmpeg_filter_path(cube_path)
+    blur = ""
+    if motion_blur is not None:
+        blur = "," + motion_blur_tmix(int(motion_blur["frames"]))
     if mask is not None and size is not None:
         width, height = size
         args += ["-i", str(mask.resolve())]
         graph = (
             f"[1:v]scale={width}:{height}:flags=bilinear[vig];"
             f"[0:v]lut3d='{cube}'[graded];"
-            f"[graded][vig]overlay=format=auto[vout]"
+            f"[graded][vig]overlay=format=auto{blur}[vout]"
         )
         args += ["-filter_complex", graph, "-map", "[vout]", "-map", "0:a?"]
     else:
-        args += ["-vf", f"lut3d='{cube}'"]
+        args += ["-vf", f"lut3d='{cube}'{blur}"]
     args += [
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "veryfast",
         "-c:a", "copy",
@@ -260,6 +301,7 @@ class ColorGradeExportApi:
         cube_bytes = None
         cube_name = "grade.cube"
         vignette_raw = None
+        motion_blur_raw = None
         while True:
             part = await reader.next()
             if part is None:
@@ -276,6 +318,14 @@ class ColorGradeExportApi:
                     vignette_raw = json.loads(text)
                 except json.JSONDecodeError as exc:
                     raise web.HTTPBadRequest(text="暗角参数不是合法 JSON") from exc
+            elif part.name == "motion_blur":
+                text = await part.text()
+                if len(text.encode("utf-8")) > _MAX_MOTION_BLUR_BYTES:
+                    raise web.HTTPRequestEntityTooLarge(text="动态模糊参数过大")
+                try:
+                    motion_blur_raw = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise web.HTTPBadRequest(text="动态模糊参数不是合法 JSON") from exc
             elif part.name == "cube":
                 cube_name = Path(part.filename or "grade.cube").name
                 if not _CUBE_NAME.match(cube_name):
@@ -296,6 +346,7 @@ class ColorGradeExportApi:
         if b"LUT_3D_SIZE" not in cube_bytes:
             raise web.HTTPBadRequest(text="不是有效的 3D LUT（.cube）")
         vignette = _normalize_vignette(vignette_raw)
+        motion_blur = _normalize_motion_blur(motion_blur_raw)
         await self.require_project(request, project_id, operate=True)
         ref = await self.resource_call(self.app, "reference", video_url)
         if not ref:
@@ -353,6 +404,7 @@ class ColorGradeExportApi:
                     build_grade_args(
                         source, cube_path, temporary,
                         mask=mask, size=(width, height) if mask else None,
+                        motion_blur=motion_blur,
                     ),
                     duration=duration,
                     on_progress=on_progress,

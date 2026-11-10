@@ -13,9 +13,11 @@ from aiohttp.test_utils import TestClient, TestServer
 from server.color_grade_export import (
     ColorGradeExportApi,
     _ffmpeg_filter_path,
+    _normalize_motion_blur,
     _normalize_vignette,
     build_color_grade_vf,
     build_grade_args,
+    motion_blur_mix_frames,
     progress_ratio,
     write_vignette_mask,
 )
@@ -66,6 +68,22 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
     def test_vignette_ignored_when_disabled(self):
         self.assertIsNone(_normalize_vignette({"enabled": False, "size": 0.2}))
         self.assertIsNone(_normalize_vignette("nope"))
+
+    def test_motion_blur_tmix_follows_openfilm_shutter_window(self):
+        self.assertIsNone(motion_blur_mix_frames(8, 0))
+        self.assertEqual(motion_blur_mix_frames(8, 0.5), 5)
+        self.assertEqual(motion_blur_mix_frames(8, 1), 8)
+        blur = _normalize_motion_blur(
+            {"enabled": True, "samples": 8, "shutter": 0.5}
+        )
+        args = build_grade_args(
+            Path("D:/in.mp4"), Path("D:/tmp/grade.cube"), Path("D:/out.part.mp4"),
+            motion_blur=blur,
+        )
+        vf = args[args.index("-vf") + 1]
+        self.assertIn("lut3d=", vf)
+        self.assertIn("tmix=frames=5", vf)
+        self.assertIsNone(_normalize_motion_blur({"enabled": False, "samples": 8}))
 
     async def test_apply_runs_ffmpeg_and_returns_video_asset(self):
         with tempfile.TemporaryDirectory() as tmp:
