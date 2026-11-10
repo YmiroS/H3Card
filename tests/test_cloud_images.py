@@ -30,6 +30,7 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.enterContext(mock.patch.object(cloud_images, "CONF", self.config))
         self.enterContext(mock.patch.dict(os.environ, {"CHOUKA_IMAGE_API_KEY": ""}))
         self.received = []
+        self.generations = []
         self.response_headers = {"X-Request-ID": "image-request-1"}
         self.payload = {"data": [{"b64_json": base64.b64encode(png()).decode()}]}
         self.status = 200
@@ -37,6 +38,7 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.redirect_hits = 0
         application = web.Application()
         application.router.add_post("/v1/images/edits", self.gateway)
+        application.router.add_post("/v1/images/generations", self.generation_gateway)
         application.router.add_get("/download", self.download)
         self.server = TestServer(application)
         await self.server.start_server()
@@ -62,6 +64,49 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         if self.raw_body is not None:
             return web.Response(body=self.raw_body, status=self.status, headers=self.response_headers)
         return web.json_response(self.payload, status=self.status, headers=self.response_headers)
+
+    async def generation_gateway(self, request):
+        self.generations.append({"body": await request.json(),
+                                 "authorization": request.headers.get("Authorization"),
+                                 "name": request.headers.get("X-End-User-Name"),
+                                 "phone": request.headers.get("X-End-User-Phone")})
+        return web.json_response(self.payload, status=self.status, headers=self.response_headers)
+
+    async def test_text_to_image_uses_generation_endpoint_and_one_paid_request(self):
+        result = await cloud_images.generate(self.session, "  一只橘猫  ", size="1536x1024", quality="high",
+                                              end_user_name="图片用户", end_user_phone="13800138000")
+        self.assertEqual(result["image_bytes"], png())
+        self.assertEqual(result["model"], "gpt-image-2.5-sunburst")
+        self.assertEqual(len(self.generations), 1)
+        sent = self.generations[0]
+        self.assertEqual(sent["body"], {"model": "gpt-image-2.5-sunburst", "prompt": "一只橘猫", "n": 1,
+                                        "size": "1536x1024", "quality": "high", "output_format": "png"})
+        self.assertEqual(sent["authorization"], "Bearer test-secret")
+        self.assertEqual((sent["name"], sent["phone"]), ("图片用户", "13800138000"))
+        self.assertEqual(self.received, [])
+
+    async def test_generation_rejects_invalid_params_without_network(self):
+        for params in ({"prompt": ""}, {"prompt": "x" * 20001}, {"prompt": "cat", "size": "original"},
+                       {"prompt": "cat", "quality": "invalid"}):
+            with self.subTest(params=params), self.assertRaises(cloud_images.ImageEditError):
+                await cloud_images.generate(self.session, **params,
+                                             end_user_name="image-test-user", end_user_phone="13800138000")
+        self.assertEqual(self.generations, [])
+
+    async def test_generation_http_failure_does_not_retry(self):
+        self.status = 429
+        self.payload = {"error": "rate limit test-secret"}
+        with self.assertRaises(cloud_images.ImageEditError) as caught:
+            await cloud_images.generate(self.session, "猫", end_user_name="user", end_user_phone="13800138000")
+        self.assertFalse(caught.exception.response()["retryable"])
+        self.assertNotIn("test-secret", str(caught.exception))
+        self.assertEqual(len(self.generations), 1)
+
+    async def test_edit_quality_override_is_forwarded(self):
+        await cloud_images.edit(self.session, [png()], "编辑", quality="high",
+                                end_user_name="user", end_user_phone="13800138000")
+        fields = {part["name"]: part["data"].decode() for part in self.received[-1]["parts"] if not part["filename"]}
+        self.assertEqual(fields["quality"], "high")
 
     async def download(self, request):
         self.redirect_hits += 1

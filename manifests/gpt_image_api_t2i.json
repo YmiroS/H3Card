@@ -1,0 +1,15 @@
+{
+ "id": "gpt_image_api_t2i",
+ "name": "GPT Image 2.5 Sunburst · 付费 API 文生图",
+ "group": "图片", "outputType": "image", "kind": "gen", "card": "image",
+ "execution": "cloud_image", "billingMode": "paid_api", "cloudProvider": "gpt_image",
+ "modelName": "gpt-image-2.5-sunburst", "parameterPanel": "paid-image",
+ "slots": "img0+aud0+vid0", "images": 0, "audios": 0, "videos": 0,
+ "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+ "note": "付费 API：请求按服务商计费，失败/超时不自动重试。尺寸和质量为请求参数，实际支持及尺寸以网关返回为准。",
+ "inputs": [
+  {"key": "prompt", "label": "提示词", "type": "textarea", "required": true, "default": "", "maxLength": 20000},
+  {"key": "size", "label": "请求尺寸", "type": "select", "default": "1024x1024", "options": ["1024x1024", "1536x1024", "1024x1536"]},
+  {"key": "quality", "label": "请求质量", "type": "select", "default": "medium", "options": ["low", "medium", "high"]}
+ ], "warnings": []
+}

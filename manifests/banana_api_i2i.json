@@ -1,0 +1,21 @@
+{
+ "id": "banana_api_i2i",
+ "name": "Banana Pro / Gemini 3 Pro Image · 付费 API 图生图",
+ "group": "图片", "outputType": "image", "kind": "gen", "card": "image",
+ "execution": "cloud_image", "billingMode": "paid_api", "cloudProvider": "banana",
+ "modelName": "gemini-3-pro-image", "parameterPanel": "paid-image",
+ "slots": "img8+aud0+vid0", "images": 8, "audios": 0, "videos": 0,
+ "slotLimits": {"image": {"min": 1, "max": 8}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+ "note": "付费 API：请求按服务商计费，失败/超时不自动重试。在提示词中描述构图和图1至图8用途，实际尺寸以模型返回为准。",
+ "inputs": [
+  {"key": "images[0]", "label": "图1（主图）", "type": "image", "required": true},
+  {"key": "images[1]", "label": "图2（参考图）", "type": "image", "required": false},
+  {"key": "images[2]", "label": "图3（参考图）", "type": "image", "required": false},
+  {"key": "images[3]", "label": "图4（参考图）", "type": "image", "required": false},
+  {"key": "images[4]", "label": "图5（参考图）", "type": "image", "required": false},
+  {"key": "images[5]", "label": "图6（参考图）", "type": "image", "required": false},
+  {"key": "images[6]", "label": "图7（参考图）", "type": "image", "required": false},
+  {"key": "images[7]", "label": "图8（参考图）", "type": "image", "required": false},
+  {"key": "prompt", "label": "提示词", "type": "textarea", "required": true, "default": "", "maxLength": 20000}
+ ], "warnings": []
+}

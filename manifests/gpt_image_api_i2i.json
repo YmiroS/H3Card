@@ -1,0 +1,23 @@
+{
+ "id": "gpt_image_api_i2i",
+ "name": "GPT Image 2.5 Sunburst · 付费 API 图生图",
+ "group": "图片", "outputType": "image", "kind": "gen", "card": "image",
+ "execution": "cloud_image", "billingMode": "paid_api", "cloudProvider": "gpt_image",
+ "modelName": "gpt-image-2.5-sunburst", "parameterPanel": "paid-image",
+ "slots": "img8+aud0+vid0", "images": 8, "audios": 0, "videos": 0,
+ "slotLimits": {"image": {"min": 1, "max": 8}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+ "note": "付费 API：请求按服务商计费，失败/超时不自动重试。尺寸和质量为请求参数，实际支持及尺寸以网关返回为准。",
+ "inputs": [
+  {"key": "images[0]", "label": "图1（主图）", "type": "image", "required": true},
+  {"key": "images[1]", "label": "图2（参考图）", "type": "image", "required": false},
+  {"key": "images[2]", "label": "图3（参考图）", "type": "image", "required": false},
+  {"key": "images[3]", "label": "图4（参考图）", "type": "image", "required": false},
+  {"key": "images[4]", "label": "图5（参考图）", "type": "image", "required": false},
+  {"key": "images[5]", "label": "图6（参考图）", "type": "image", "required": false},
+  {"key": "images[6]", "label": "图7（参考图）", "type": "image", "required": false},
+  {"key": "images[7]", "label": "图8（参考图）", "type": "image", "required": false},
+  {"key": "prompt", "label": "提示词", "type": "textarea", "required": true, "default": "", "maxLength": 20000},
+  {"key": "size", "label": "请求尺寸", "type": "select", "default": "original", "options": ["original", "1024x1024", "1536x1024", "1024x1536"]},
+  {"key": "quality", "label": "请求质量", "type": "select", "default": "medium", "options": ["low", "medium", "high"]}
+ ], "warnings": []
+}

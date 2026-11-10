@@ -86,12 +86,13 @@ def extract_image(text, request_id):
     return {**info, "image_bytes": data}
 
 
-async def generate(session, images, prompt, *, end_user_name, end_user_phone):
+async def generate(session, images, prompt, *, end_user_name, end_user_phone, text_only=False):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
-        raise BananaError("图片编辑提示词不能为空，且不得超过 20000 字符", status=400)
-    if not isinstance(images, (list, tuple)) or not 1 <= len(images) <= 8:
-        raise BananaError("图片编辑需要 1 到 8 张有序输入图片", status=400)
+        raise BananaError("生图提示词不能为空，且不得超过 20000 字符", status=400)
+    minimum, maximum = (0, 0) if text_only else (1, 8)
+    if not isinstance(images, (list, tuple)) or not minimum <= len(images) <= maximum:
+        raise BananaError("文生图不接受输入图，图生图需要 1 到 8 张有序输入图片", status=400)
     infos = [await asyncio.to_thread(cloud_images.inspect_image, data) for data in images]
     # 2026-11-05 实测 google.image_config.image_size 顶层与 extra_body 两种写法都不改变输出尺寸，
     # 按内网当前行为不传档位参数，尺寸跟随输入图。

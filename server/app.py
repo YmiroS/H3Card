@@ -80,6 +80,7 @@ from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
 from server.cloud_lighting import CloudLighting
 from server.job_polling import CACHE_KEY as JOB_POLL_CACHE_KEY, JobPollCache, job_poll_response
+from server.cloud_generation import CloudGeneration, CAPABILITIES as CLOUD_GENERATION_CAPABILITIES
 from server.cloud_images import ImageEditError
 from server.project_repository import ProjectRepository, InvalidProjectId
 from server.project_service import ProjectService, ProjectError
@@ -386,7 +387,9 @@ def mode_ok(md):
         return bool(md["route"])
     if CAPS.get(md["id"], {}).get("execution") in ("browser", "if_studio", "cloud_image"):
         return True
-    return graph_ok(md["id"])
+    return graph_ok(md["id"]) or any(
+        graph_ok(cid) or CAPS.get(cid, {}).get("execution") == "cloud_image"
+        for cid in (md.get("modelSwitch") or {}).values())
 
 
 def step_labels(graph):
@@ -1572,7 +1575,8 @@ async def api_generate(request):
             raise web.HTTPBadRequest(text="指定执行端不存在或不可访问")
     if cap.get("execution") == "cloud_image":
         try:
-            result = await request.app["cloud_lighting"].submit(request, body, cap)
+            handler = ("cloud_generation" if cid in CLOUD_GENERATION_CAPABILITIES else "cloud_lighting")
+            result = await request.app[handler].submit(request, body, cap)
         except ImageEditError as error:
             return web.json_response(error.response(), status=error.status)
         return await generation_response(request, body, project, linked_card, result)
@@ -4383,6 +4387,9 @@ async def on_stop(app):
     sr_runner = app.get("sr_runner")
     if sr_runner:
         await sr_runner.shutdown()
+    cloud_generation = app.get("cloud_generation")
+    if cloud_generation:
+        await cloud_generation.close()
     cloud_lighting = app.get("cloud_lighting")
     if cloud_lighting:
         await cloud_lighting.close()
@@ -4470,10 +4477,12 @@ def make_app(auth_path=None, *, project_repository=None):
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
     app["local_output_tasks"] = {}
-    app["cloud_lighting"] = CloudLighting(
-        app, root=ROOT, comfy_http=COMFY_HTTP, jobs=JOBS, save_jobs=save_jobs,
+    cloud_job_options = dict(
+        root=ROOT, comfy_http=COMFY_HTTP, jobs=JOBS, save_jobs=save_jobs,
         require_project=require_project, require_resource=require_resource,
         require_user=require_user, resource_call=resource_call, call_store=call_store)
+    app["cloud_lighting"] = CloudLighting(app, **cloud_job_options)
+    app["cloud_generation"] = CloudGeneration(app, **cloud_job_options)
     app[JOB_POLL_CACHE_KEY] = JobPollCache()
     app["local_gpu_state"] = {}
     app["capacity_probe_state"] = {"task": None}

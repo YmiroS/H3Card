@@ -92,6 +92,21 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(content[1], {"type": "image_url",
                                       "image_url": {"url": f"data:image/png;base64,{encoded}"}})
 
+    async def test_text_to_image_sends_only_prompt_when_explicitly_enabled(self):
+        result = await cloud_banana.generate(self.session, [], "  一只橘猫  ", text_only=True,
+                                             end_user_name="banana-user", end_user_phone="13800138000")
+        self.assertEqual(result["image_bytes"], png("blue"))
+        self.assertEqual(len(self.received), 1)
+        self.assertEqual(self.received[0]["body"]["messages"], [{"role": "user", "content": [
+            {"type": "text", "text": "一只橘猫"}]}])
+        self.assertEqual(self.received[0]["body"]["model"], "gemini-3-pro-image")
+
+    async def test_text_only_mode_rejects_reference_images(self):
+        with self.assertRaises(cloud_banana.BananaError):
+            await cloud_banana.generate(self.session, [png()], "cat", text_only=True,
+                                        end_user_name="banana-user", end_user_phone="13800138000")
+        self.assertEqual(self.received, [])
+
     async def test_multiple_images_keep_order_and_detected_mime(self):
         originals = [png("red"), png("blue", size=(4, 3), format="JPEG")]
         result = await cloud_banana.generate(self.session, originals, "图1主图，图2参考",

@@ -130,7 +130,7 @@ def decode_result(payload, request_id, model):
     raise ImageEditError("云端结果缺少 b64_json 或 url", request_id=request_id)
 
 
-async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=None):
+async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=None, quality=None):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise ImageEditError("图片编辑提示词不能为空，且不得超过 20000 字符", status=400)
@@ -140,6 +140,10 @@ async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=N
     size = config["size"] if size is None else size
     if size == "original":
         size = f"{infos[0]['width']}x{infos[0]['height']}"
+    if quality is not None:
+        if quality not in ("low", "medium", "high"):
+            raise ImageEditError("图片质量只支持 low、medium 或 high", status=400)
+        config = {**config, "quality": quality}
     form = aiohttp.FormData()
     for key in ("model", "quality", "output_format"):
         form.add_field(key, config[key])
@@ -148,10 +152,30 @@ async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=N
     for index, (data, info) in enumerate(zip(images, infos), 1):
         form.add_field("image[]", data, filename=f"image_{index}{info['extension']}",
                        content_type=info["mime"])
+    return await request_image(session, config, prompt.strip(), "/images/edits", data=form,
+                               end_user_name=end_user_name, end_user_phone=end_user_phone)
+
+
+async def generate(session, prompt, *, end_user_name, end_user_phone,
+                   size="1024x1024", quality="medium"):
+    config = load()
+    if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
+        raise ImageEditError("生图提示词不能为空，且不得超过 20000 字符", status=400)
+    if size not in ("1024x1024", "1536x1024", "1024x1536"):
+        raise ImageEditError("文生图尺寸无效", status=400)
+    if quality not in ("low", "medium", "high"):
+        raise ImageEditError("图片质量只支持 low、medium 或 high", status=400)
+    body = {"model": config["model"], "prompt": prompt.strip(), "n": 1,
+            "size": size, "quality": quality, "output_format": config["output_format"]}
+    return await request_image(session, config, prompt.strip(), "/images/generations", json=body,
+                               end_user_name=end_user_name, end_user_phone=end_user_phone)
+
+
+async def request_image(session, config, prompt, endpoint, *, end_user_name, end_user_phone, **payload):
     request_id = None
     try:
         async with session.post(
-                config["base_url"].rstrip("/") + "/images/edits", data=form,
+                config["base_url"].rstrip("/") + endpoint, **payload,
                 headers={"Authorization": f"Bearer {config['api_key']}",
                          "X-End-User-Name": end_user_name,
                          "X-End-User-Phone": end_user_phone},

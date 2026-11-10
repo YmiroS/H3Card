@@ -48,7 +48,7 @@ class CloudLighting:
     async def source(self, request, project_id, value):
         ref = await self.resource_call(self.app, "reference", value)
         if not ref:
-            raise web.HTTPBadRequest(text="多灯打光只接受画布内已登记的图片")
+            raise web.HTTPBadRequest(text="云端生图只接受画布内已登记的图片")
         await self.require_resource(request, *ref, project_id=project_id)
         path = await self.resource_call(self.app, "local_path", *ref)
         if ref[0] == "comfy" and not path.is_file():

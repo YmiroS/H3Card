@@ -519,6 +519,262 @@ class CostLedgerTest(unittest.TestCase):
         self.assertEqual(report["overview"]["estimated_cost"], 0)
         self.assertTrue(all(job["cost_source"] == "unknown" for job in report["jobs"]))
 
+    def cost_row(self, job_id):
+        return dict(self.ledger.db.execute(
+            "SELECT * FROM cost_events WHERE job_id=?", (job_id,),
+        ).fetchone())
+
+    def test_image_api_pricing_is_unknown_not_free(self):
+        for capability in ("banana_api_t2i", "banana_api_i2i",
+                           "gpt_image_api_t2i", "gpt_image_api_i2i"):
+            with self.subTest(capability=capability):
+                spec = self.ledger.pricing["capabilities"][capability]
+                self.assertEqual(spec["category"], "image")
+                self.assertEqual(spec["basis"], "per_job")
+                self.assertEqual(spec["billing_mode"], "paid_api")
+                self.assertTrue(spec["name"])
+                self.assertTrue(spec["note"])
+                self.assertEqual(self.ledger.estimate(capability), (None, None))
+                self.assertEqual(self.ledger.retail_quote(capability), (None, None, "per_job"))
+
+    def test_image_api_all_states_have_unknown_cost_and_no_gpu_usage(self):
+        statuses = ("queued", "running", "done", "error", "timeout", "unknown", "canceled")
+        for capability in ("banana_api_t2i", "banana_api_i2i",
+                           "gpt_image_api_t2i", "gpt_image_api_i2i"):
+            model = "gemini-3-pro-image" if capability.startswith("banana") else "gpt-image-2.5-sunburst"
+            for status in statuses:
+                with self.subTest(capability=capability, status=status):
+                    job = {"id": capability + status, "capability": capability,
+                           "status": status, "created": 1, "started": 100,
+                           "usage": {"cost": 999, "prompt_tokens": 1_000_000},
+                           "worker_id": "not-a-gpu", "generation_unknown": status == "unknown"}
+                    if status not in ("queued", "running"):
+                        job["ended"] = 3700
+                    self.ledger.record_image_api(job, model=model)
+                    self.ledger.record_image_api(job, model=model)
+                    row = self.cost_row(job["id"])
+                    self.assertEqual((row["event_kind"], row["category"], row["status"]),
+                                     ("image_api", "image", status))
+                    self.assertEqual(row["cost_source"], "unknown")
+                    for key in ("api_cost_micros", "total_cost_micros", "estimated_min_micros",
+                                "estimated_max_micros", "prompt_tokens", "completion_tokens"):
+                        self.assertIsNone(row[key], key)
+                    for key in ("electricity_rate_micros", "full_rate_micros",
+                                "electricity_cost_micros", "compute_cost_micros"):
+                        self.assertEqual(row[key], 0, key)
+                    dims = json.loads(row["dimensions_json"])
+                    self.assertEqual(dims["model"], model)
+                    self.assertEqual(dims["billing_mode"], "paid_api")
+                    self.assertEqual(dims["generation_unknown"], status == "unknown")
+        report = self.ledger.report()
+        self.assertEqual(report["overview"]["tasks"], 4 * len(statuses))
+        self.assertEqual(report["overview"]["unknown_cost_tasks"], 4 * len(statuses))
+        self.assertEqual(report["overview"]["retail_unknown_tasks"], 4)
+        for key in ("gpu_hours", "running_accrued", "actual_cost", "estimated_cost",
+                    "total_cost", "api_cost", "electricity_cost", "failed_waste"):
+            self.assertEqual(report["overview"][key], 0, key)
+        self.assertEqual(report["by_worker"][0]["label"], "付费 API")
+        self.assertTrue(all(row["cost_source"] == "unknown" for row in report["jobs"]))
+        self.assertTrue(all(row["retail_source"] == "unpriced" for row in report["jobs"]
+                            if row["status"] == "done"))
+
+    def test_image_api_updates_same_job_and_preserves_metadata(self):
+        job = {"id": "cloud-life", "capability": "banana_api_i2i", "status": "queued",
+               "created": 1, "project": "account-project", "projectName": "客户项目",
+               "card": "card-1", "cardName": "图片编辑", "provider": "configured-provider",
+               "requested_size": "2K", "quality": "high", "input_image_count": 2,
+               "modelName": "gemini-3-pro-image", "billingMode": "paid_api"}
+        self.ledger.record_image_api(job, model=job["modelName"],
+                                     assets={"images[0]": "a.png", "images[1]": "b.png"})
+        for status in ("running", "done"):
+            update = {**job, "status": status, "started": 100, "request_id": "supplier-42"}
+            if status == "done":
+                update["ended"] = 160
+            self.ledger.record_image_api(update, model=job["modelName"])
+            self.ledger.record_image_api(update, model=job["modelName"])
+        # Generic callbacks with only an id must not reclassify or erase this event.
+        self.ledger.record_job({"id": job["id"], "status": "done"})
+        row = self.cost_row(job["id"])
+        self.assertEqual(row["runtime_seconds"], 60)
+        self.assertEqual(row["created_at"], 1)
+        self.assertEqual(row["project_id"], "account-project")
+        self.assertEqual(row["project_name"], "客户项目")
+        self.assertEqual(row["card_id"], "card-1")
+        dims = json.loads(row["dimensions_json"])
+        self.assertEqual(dims, {"model": "gemini-3-pro-image", "provider": "configured-provider",
+                               "billing_mode": "paid_api", "requested_size": "2K", "quality": "high",
+                               "input_image_count": 2, "image_count": 2,
+                               "request_id": "supplier-42", "generation_unknown": False})
+        self.assertEqual(self.ledger.report()["overview"]["tasks"], 1)
+        before = self.cost_row(job["id"])
+        self.ledger.record_job({"id": job["id"], "status": "queued"})
+        self.assertEqual(self.cost_row(job["id"]), before)
+
+    def test_record_job_routes_image_api_without_gpu_finish(self):
+        for capability in ("banana_api_t2i", "banana_api_i2i",
+                           "gpt_image_api_t2i", "gpt_image_api_i2i"):
+            self.ledger.record_job({"id": capability, "capability": capability,
+                                    "status": "done", "created": 1, "started": 100, "ended": 3700},
+                                   historical=True)
+            row = self.cost_row(capability)
+            self.assertEqual(row["event_kind"], "image_api")
+            self.assertEqual(row["runtime_seconds"], 3600)
+            self.assertIsNone(row["total_cost_micros"])
+            self.assertIsNone(row["estimated_min_micros"])
+            self.assertTrue(json.loads(row["dimensions_json"])["model"])
+        for marker in ({"execution": "cloud_image"}, {"event_kind": "image_api"},
+                       {"billingMode": "paid_api"}, {"billing_mode": "paid_api"}):
+            job_id = next(iter(marker))
+            self.ledger.record_job({"id": job_id, "capability": "future-image-api", **marker})
+            self.assertEqual(self.cost_row(job_id)["event_kind"], "image_api")
+        self.assertEqual(self.ledger.report()["overview"]["gpu_hours"], 0)
+
+    def test_image_api_start_finish_retries_never_create_gpu_cost(self):
+        for status in ("done", "error", "timeout", "unknown", "canceled"):
+            self.ledger.record_image_api({"id": status, "capability": "gpt_image_api_t2i",
+                                          "status": "queued", "created": 1},
+                                         model="gpt-image-2.5-sunburst")
+            self.ledger.start_job(status, "not-a-gpu", 100)
+            self.ledger.start_job(status, "not-a-gpu", 200)
+            self.ledger.finish_job(status, status, 3700, "not-a-gpu")
+            before = self.cost_row(status)
+            self.ledger.finish_job(status, status, 4000, "not-a-gpu")
+            self.ledger.start_job(status, "not-a-gpu", 5000)
+            self.assertEqual(self.cost_row(status), before)
+            self.assertEqual(before["runtime_seconds"], 3600)
+            self.assertEqual(before["status"], status)
+            self.assertEqual(before["cost_source"], "unknown")
+            self.assertEqual(before["compute_cost_micros"], 0)
+            self.assertIsNone(before["total_cost_micros"])
+        self.assertEqual(self.ledger.report()["overview"]["gpu_hours"], 0)
+
+    def test_image_api_params_assets_and_elapsed_do_not_price_supplier_usage(self):
+        job = {"id": "metadata", "capability": "gpt_image_api_i2i", "status": "unknown", "created": 1,
+               "params": {"size": "1536x1024", "quality": "high", "request_id": "p-123",
+                          "generation_unknown": True, "elapsed_ms": 1250,
+                          "usage": {"cost": 50, "input_tokens": 1_000_000}},
+               "assets": {"images[0]": "a.png", "images[1]": "b.png", "images[2]": "",
+                          "video[0]": "not-an-image.mp4"}}
+        self.ledger.record_image_api(job, model="gpt-image-2.5-sunburst")
+        row = self.cost_row("metadata")
+        dims = json.loads(row["dimensions_json"])
+        self.assertEqual(dims["requested_size"], "1536x1024")
+        self.assertEqual(dims["input_image_count"], 2)
+        self.assertEqual(dims["request_id"], "p-123")
+        self.assertEqual(dims["provider"], "openai")
+        self.assertTrue(dims["generation_unknown"])
+        self.assertEqual(row["runtime_seconds"], 1.25)
+        self.assertIsNone(row["api_cost_micros"])
+        self.ledger.record_image_api({"id": "metadata", "status": "done",
+                                      "generation_unknown": False}, model=None)
+        row = self.cost_row("metadata")
+        self.assertFalse(json.loads(row["dimensions_json"])["generation_unknown"])
+        self.assertIsNone(row["total_cost_micros"])
+        self.assertIsNone(row["prompt_tokens"])
+
+    def test_report_keeps_image_retail_text_tokens_and_gpu_cost_separate(self):
+        capability = "gpt_image_api_t2i"
+        # Test a future configured image quote without inventing production prices.
+        self.ledger.pricing["capabilities"][capability].update(retail_min=2, retail_max=3)
+        self.ledger.record_image_api({"id": "priced-image", "capability": capability,
+                                      "status": "done", "created": 1, "started": 100, "ended": 3700},
+                                     model="gpt-image-2.5-sunburst")
+        self.ledger.record_api("text", "qwen3.7-plus", 1_000_000, 1_000_000, 3_600_000)
+        text_row = dict(self.ledger.db.execute(
+            "SELECT * FROM cost_events WHERE event_kind='api'"
+        ).fetchone())
+        # Accidental generic lifecycle callbacks must not alter token-based history.
+        self.ledger.start_job(text_row["job_id"], "gpu", 100)
+        self.ledger.finish_job(text_row["job_id"], "error", 3700)
+        self.assertEqual(self.cost_row(text_row["job_id"]), text_row)
+        self.ledger.record_job({"id": "gpu-done", "capability": "zimage_t2i", "created": 1,
+                                "status": "done", "started": 100, "ended": 3700})
+        self.ledger.record_job({"id": "gpu-running", "capability": "zimage_t2i", "created": 1,
+                                "status": "running", "started": 1400})
+        image_before = self.cost_row("priced-image")
+        report_end = time.time() + 100
+        with mock.patch("costs.time.time", return_value=5000):
+            report = self.ledger.report(end=report_end)
+        self.assertEqual(self.cost_row("priced-image"), image_before)
+        self.assertEqual(report["overview"]["gpu_hours"], 1)
+        self.assertEqual(report["overview"]["running_accrued"], 5)
+        self.assertAlmostEqual(report["overview"]["actual_cost"], 14.7767, places=6)
+        self.assertAlmostEqual(report["overview"]["api_cost"], 9.7767, places=6)
+        self.assertAlmostEqual(report["overview"]["electricity_cost"], 0.6, places=6)
+        self.assertEqual(report["overview"]["unknown_cost_tasks"], 1)
+        details = {row["job_id"]: row for row in report["jobs"]}
+        self.assertEqual((details["priced-image"]["retail_min"], details["priced-image"]["retail_max"]), (2, 3))
+        self.assertEqual(details["priced-image"]["cost_source"], "unknown")
+        self.assertEqual(details[text_row["job_id"]]["retail_min"], 0.03)
+        self.assertEqual(details["gpu-done"]["actual_cost"], 5)
+        paid = next(row for row in report["by_worker"] if row["key"] == "paid_api")
+        self.assertEqual(paid["label"], "付费 API")
+        self.assertEqual(paid["tasks"], 2)
+        categories = {row["key"] for row in report["by_category"]}
+        self.assertEqual(categories, {"image", "text", "image_generation"})
+
+    def test_image_api_backfill_recovers_cloud_jobs_without_dispatch_rows(self):
+        jobs = []
+        for initial in (None, "queued", "running"):
+            job_id = "cloud-restart-" + str(initial)
+            job = {"id": job_id, "capability": "banana_api_t2i", "status": "error", "created": 1,
+                   "started": 100, "ended": 160, "billingMode": "paid_api", "execution": "cloud_image",
+                   "modelName": "gemini-3-pro-image", "provider": "gateway", "request_id": "persisted-id",
+                   "generation_unknown": True, "project": "original-account"}
+            if initial:
+                self.ledger.record_image_api({**job, "status": initial, "ended": None}, model=job["modelName"])
+            jobs.append(job)
+        self.ledger.backfill(jobs)
+        before = [self.cost_row(job["id"]) for job in jobs]
+        self.ledger.backfill(jobs)
+        self.assertEqual([self.cost_row(job["id"]) for job in jobs], before)
+        for row in before:
+            self.assertEqual(row["event_kind"], "image_api")
+            self.assertEqual(row["status"], "error")
+            self.assertEqual(row["project_id"], "original-account")
+            self.assertEqual(row["runtime_seconds"], 60)
+            self.assertEqual(row["cost_source"], "unknown")
+            self.assertIsNone(row["total_cost_micros"])
+            self.assertEqual(json.loads(row["dimensions_json"])["request_id"], "persisted-id")
+        self.assertEqual(self.ledger.report()["overview"]["gpu_hours"], 0)
+
+    def test_image_api_backfill_does_not_add_legacy_cloud_lighting(self):
+        self.ledger.record_image_api({"id": "existing-image-api", "capability": "future-api",
+                                      "status": "running", "created": 1}, model="explicit-model")
+        self.ledger.backfill([
+            {"id": "legacy-lighting", "capability": "lighting", "execution": "cloud_image",
+             "status": "done", "created": 1},
+            {"id": "existing-image-api", "status": "error", "ended": 160},
+            {"id": "explicit-paid-api", "capability": "future-api", "billingMode": "paid_api",
+             "status": "error", "created": 1, "modelName": "explicit-model"},
+        ])
+        self.assertIsNone(self.ledger.db.execute(
+            "SELECT job_id FROM cost_events WHERE job_id='legacy-lighting'"
+        ).fetchone())
+        self.assertEqual(self.cost_row("existing-image-api")["status"], "error")
+        self.assertEqual(self.cost_row("explicit-paid-api")["event_kind"], "image_api")
+
+    def test_image_api_backfill_preserves_terminal_history_and_dispatch_is_safe(self):
+        jobs = []
+        for status in ("done", "error", "timeout", "unknown", "canceled"):
+            job = {"id": "cloud-history-" + status, "capability": "gpt_image_api_i2i", "status": status,
+                   "created": 1, "started": 100, "ended": 160,
+                   "billingMode": "paid_api", "project": "original-account"}
+            self.ledger.record_image_api(job, model="gpt-image-2.5-sunburst")
+            self.store.enqueue(job["id"], {"capability": "zimage_t2i"})
+            jobs.append({**job, "status": "error", "project": "changed-account", "ended": 999})
+        before = [self.cost_row(job["id"]) for job in jobs]
+        self.ledger.backfill(jobs)
+        self.assertEqual([self.cost_row(job["id"]) for job in jobs], before)
+        self.store.enqueue("missing-cloud-dispatch", {"capability": "banana_api_i2i"})
+        with self.store.db:
+            self.store.db.execute("UPDATE dispatch_jobs SET status='done' WHERE job_id='missing-cloud-dispatch'")
+        self.ledger.backfill([])
+        row = self.cost_row("missing-cloud-dispatch")
+        self.assertEqual(row["event_kind"], "image_api")
+        self.assertIsNone(row["total_cost_micros"])
+        self.assertEqual(self.ledger.report()["overview"]["gpu_hours"], 0)
+
     def test_api_cost_uses_separate_input_and_output_token_rates(self):
         self.ledger.record_api(
             "text", "qwen3.7-plus", 1_000_000, 1_000_000, 250,

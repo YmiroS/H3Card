@@ -9,6 +9,12 @@ from pathlib import Path
 
 
 MICROS = 1_000_000
+IMAGE_API_MODELS = {
+    "banana_api_t2i": ("gemini-3-pro-image", "gemini"),
+    "banana_api_i2i": ("gemini-3-pro-image", "gemini"),
+    "gpt_image_api_t2i": ("gpt-image-2.5-sunburst", "openai"),
+    "gpt_image_api_i2i": ("gpt-image-2.5-sunburst", "openai"),
+}
 
 
 def _micros(yuan):
@@ -228,6 +234,15 @@ class CostLedger:
                    model_family=None, historical=False):
         capability = job.get("capability") or "unknown"
         spec = self._spec(capability)
+        with self.lock:
+            existing = self.db.execute(
+                "SELECT event_kind FROM cost_events WHERE job_id=?", (job["id"],)
+            ).fetchone()
+        if (capability in IMAGE_API_MODELS or job.get("execution") == "cloud_image"
+                or job.get("event_kind") == "image_api" or spec.get("billing_mode") == "paid_api"
+                or job.get("billingMode") == "paid_api" or job.get("billing_mode") == "paid_api"
+                or (existing and existing["event_kind"] == "image_api")):
+            return self.record_image_api(job, model=job.get("model"), params=params, assets=assets)
         dims = self.dimensions(capability, params, assets, graph, probe_video)
         estimate_min, estimate_max = self.estimate(capability, dims)
         electricity_rate, full_rate = self._rates()
@@ -273,9 +288,111 @@ class CostLedger:
             self.finish_job(job["id"], job.get("status") or "done", job["ended"],
                             worker_id=job.get("worker_id"), started_at=job["started"])
 
+    def record_image_api(self, job, *, model, params=None, assets=None):
+        """Upsert a paid image request by job['id']; supplier cost stays unknown.
+
+        New jobs supply capability; timestamps use Unix seconds. Optional metadata
+        comes from job or params, and assets use the usual images[n] mapping.
+        Neither token usage nor an unqualified supplier usage.cost is a CNY price.
+        """
+        params = params if params is not None else (job.get("params") or {})
+        assets = assets if assets is not None else job.get("assets")
+        now = time.time()
+        with self.lock, self.db:
+            previous = self.db.execute(
+                "SELECT * FROM cost_events WHERE job_id=?", (job["id"],)
+            ).fetchone()
+            previous = dict(previous) if previous else {}
+            capability = job.get("capability") or previous.get("capability") or "unknown"
+            default_model, default_provider = IMAGE_API_MODELS.get(capability, (None, None))
+            dims = json.loads(previous.get("dimensions_json") or "{}")
+
+            def value(*keys):
+                for source in (job, params):
+                    for key in keys:
+                        if source.get(key) not in (None, ""):
+                            return source[key]
+                return None
+
+            resolved_model = model or value("modelName", "model") or dims.get("model") or default_model
+            provider = value("provider") or dims.get("provider") or default_provider
+            dims.update(model=resolved_model, provider=provider, billing_mode="paid_api")
+            for key, aliases in (
+                ("requested_size", ("requested_size", "size", "image_size", "resolution")),
+                ("quality", ("quality", "requested_quality")),
+                ("request_id", ("request_id", "provider_request_id")),
+                ("generation_unknown", ("generation_unknown",)),
+            ):
+                incoming = value(*aliases)
+                if incoming is not None:
+                    dims[key] = incoming
+            image_count = value("input_image_count", "image_count")
+            if image_count is None and assets is not None:
+                image_count = sum(bool(v) for k, v in assets.items() if k.startswith("images["))
+            if image_count is not None:
+                dims["input_image_count"] = dims["image_count"] = int(image_count)
+            else:
+                dims.setdefault("input_image_count", dims.get("image_count", 0))
+                dims.setdefault("image_count", dims["input_image_count"])
+            dims.setdefault("generation_unknown", False)
+            status = job.get("status") or previous.get("status") or "queued"
+            # Delayed queued/running notifications cannot reopen a finished request.
+            if previous.get("status") in ("done", "error", "canceled", "timeout") and status in ("queued", "running"):
+                return
+            started = job.get("started") if job.get("started") is not None else previous.get("started_at")
+            ended = job.get("ended") if job.get("ended") is not None else previous.get("ended_at")
+            runtime = previous.get("runtime_seconds")
+            if started is not None and ended is not None:
+                runtime = max(0.0, float(ended) - float(started))
+            elif value("elapsed_ms") is not None:
+                runtime = (_number(value("elapsed_ms")) or 0) / 1000
+            elif value("runtime_seconds", "elapsed") is not None:
+                runtime = _number(value("runtime_seconds", "elapsed"))
+            self.db.execute(
+                """INSERT INTO cost_events (
+                    job_id,event_kind,capability,category,model_family,project_id,project_name,
+                    card_id,card_name,worker_id,status,created_at,started_at,ended_at,runtime_seconds,
+                    pricing_version,electricity_rate_micros,full_rate_micros,
+                    electricity_cost_micros,compute_cost_micros,cost_source,dimensions_json,updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                    event_kind='image_api', capability=excluded.capability, category='image',
+                    model_family=COALESCE(excluded.model_family,cost_events.model_family),
+                    project_id=COALESCE(excluded.project_id,cost_events.project_id),
+                    project_name=COALESCE(excluded.project_name,cost_events.project_name),
+                    card_id=COALESCE(excluded.card_id,cost_events.card_id),
+                    card_name=COALESCE(excluded.card_name,cost_events.card_name),
+                    worker_id=COALESCE(excluded.worker_id,cost_events.worker_id),
+                    status=excluded.status, started_at=excluded.started_at, ended_at=excluded.ended_at,
+                    runtime_seconds=excluded.runtime_seconds,
+                    electricity_rate_micros=0, full_rate_micros=0,
+                    electricity_cost_micros=0, compute_cost_micros=0,
+                    api_cost_micros=NULL, total_cost_micros=NULL,
+                    estimated_min_micros=NULL, estimated_max_micros=NULL,
+                    prompt_tokens=NULL, completion_tokens=NULL, cost_source='unknown',
+                    dimensions_json=excluded.dimensions_json, updated_at=excluded.updated_at""",
+                (job["id"], "image_api", capability, "image", resolved_model,
+                 job.get("project"), job.get("projectName"), job.get("card"),
+                 job.get("cardName") or job.get("name"), job.get("worker_id"), status,
+                 float(job.get("created") or now), started, ended, runtime,
+                 self.pricing.get("version", "unknown"), 0, 0, 0, 0, "unknown",
+                 json.dumps(dims, ensure_ascii=False, separators=(",", ":")), now),
+            )
+
     def start_job(self, job_id, worker_id, started_at=None):
         started_at = float(started_at or time.time())
         with self.lock, self.db:
+            row = self.db.execute(
+                "SELECT event_kind,status,started_at,ended_at FROM cost_events WHERE job_id=?", (job_id,)
+            ).fetchone()
+            if row and row["event_kind"] == "image_api":
+                if row["ended_at"] is None and row["status"] not in ("done", "error", "canceled", "timeout"):
+                    start = row["started_at"] if row["started_at"] is not None else started_at
+                    self.record_image_api({"id": job_id, "status": "running", "started": start,
+                                           "worker_id": worker_id}, model=None)
+                return
+            if row and row["event_kind"] == "api":
+                return
             self.db.execute(
                 """UPDATE cost_events SET status='running', worker_id=?,
                    started_at=COALESCE(started_at,?), ended_at=NULL,
@@ -288,12 +405,19 @@ class CostLedger:
         ended_at = float(ended_at or time.time())
         with self.lock, self.db:
             row = self.db.execute(
-                """SELECT status,started_at,ended_at,cost_source,
+                """SELECT event_kind,status,started_at,ended_at,cost_source,
                           electricity_rate_micros,full_rate_micros
                    FROM cost_events WHERE job_id=?""",
                 (job_id,),
             ).fetchone()
             if not row:
+                return
+            if row["event_kind"] == "image_api":
+                if row["ended_at"] is None:
+                    self.record_image_api({"id": job_id, "status": status, "ended": ended_at,
+                                           "started": started_at, "worker_id": worker_id}, model=None)
+                return
+            if row["event_kind"] == "api":
                 return
             if row["status"] in ("done", "error", "canceled") and row["cost_source"] == "actual":
                 return
@@ -344,6 +468,21 @@ class CostLedger:
 
     def backfill(self, jobs):
         jobs_by_id = {job.get("id"): job for job in jobs if job.get("id")}
+        # Cloud requests have no dispatch_jobs row. Recover interrupted requests
+        # from JOBS, but never rewrite an already terminal account-history event.
+        with self.lock, self.db:
+            for job in jobs_by_id.values():
+                existing = self.db.execute(
+                    "SELECT event_kind,status FROM cost_events WHERE job_id=?", (job["id"],)
+                ).fetchone()
+                if not (job.get("capability") in IMAGE_API_MODELS
+                        or job.get("billingMode") == "paid_api"
+                        or job.get("billing_mode") == "paid_api"
+                        or (existing and existing["event_kind"] == "image_api")):
+                    continue
+                if existing and existing["status"] not in ("queued", "running"):
+                    continue
+                self.record_image_api(job, model=job.get("modelName") or job.get("model"))
         with self.lock:
             tables = {row[0] for row in self.db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table'"
@@ -354,7 +493,8 @@ class CostLedger:
                    FROM dispatch_jobs d
                    WHERE NOT EXISTS (
                        SELECT 1 FROM cost_events c WHERE c.job_id=d.job_id
-                       AND c.status IN ('done','error','canceled')
+                       AND (c.status IN ('done','error','canceled')
+                            OR (c.event_kind='image_api' AND c.status NOT IN ('queued','running')))
                    )"""
             )) if "dispatch_jobs" in tables else []
         for row in dispatch:
@@ -448,17 +588,20 @@ class CostLedger:
             overview["total_cost"] += recognized
             overview["electricity_cost"] += _yuan(row.get("electricity_cost_micros"))
             overview["api_cost"] += _yuan(row.get("api_cost_micros"))
-            overview["gpu_hours"] += (row.get("runtime_seconds") or 0) / 3600
+            is_api = row["event_kind"] in ("api", "image_api")
+            if not is_api:
+                overview["gpu_hours"] += (row.get("runtime_seconds") or 0) / 3600
             if row["status"] in ("error", "canceled"):
                 overview["failed_waste"] += actual
-            if row["status"] == "running" and row.get("started_at"):
+            if not is_api and row["status"] == "running" and row.get("started_at"):
                 overview["running_accrued"] += max(0, now - row["started_at"]) * row["full_rate_micros"] / 3600 / MICROS
-            if not has_actual and estimate == 0 and row["status"] in ("done", "error", "canceled"):
+            if (not has_actual and estimate == 0
+                    and (row["event_kind"] == "image_api" or row["status"] in ("done", "error", "canceled"))):
                 overview["unknown_cost_tasks"] += 1
 
             category = row["category"] or "other"
-            worker_key = row.get("worker_id") or "unassigned"
-            worker_label = row.get("worker_name") or "未分配执行端"
+            worker_key = "paid_api" if is_api else (row.get("worker_id") or "unassigned")
+            worker_label = "付费 API" if is_api else (row.get("worker_name") or "未分配执行端")
             add(groups["by_category"], category, labels.get(category, category), row,
                 actual, estimate, recognized, retail_min, retail_max, retail_priced)
             add(groups["by_capability"], row["capability"], row["card_name"] or row["capability"],
