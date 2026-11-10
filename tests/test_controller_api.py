@@ -943,6 +943,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         application.router.add_get("/api/status", controller_app.api_status)
         application.router.add_get("/api/cards", controller_app.api_cards)
         application.router.add_post("/api/reload", controller_app.api_reload)
+        application[controller_app.JOB_POLL_CACHE_KEY] = controller_app.JobPollCache()
         application.router.add_get("/api/jobs", controller_app.api_jobs)
         application.router.add_get("/api/jobs/history", controller_app.api_jobs_history)
         application.router.add_get("/api/job/{pid}", controller_app.api_job)
@@ -1133,6 +1134,71 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertTrue(all(job['queue_ahead'] is None for job in jobs))
         batch.assert_called_once()
         permission.assert_called_once_with(self.admin['id'], 'p')
+
+    async def test_job_deltas_preserve_records_completion_and_deletion(self):
+        self.register_job('delta-job', 'p')
+        controller_app.JOBS['delta-job'] = {
+            'id': 'delta-job', 'status': 'running', 'created': 1, 'project': 'p',
+            'prompts': [{'text': '原始提示词'}], 'assets': {'image': 'reference.png'},
+        }
+        first = await (await self.client.get('/api/jobs?delta=1')).json()
+        self.assertTrue(first['reset'])
+        legacy = await (await self.client.get('/api/jobs')).json()
+        self.assertEqual(first['jobs'], legacy['jobs'])
+        url = '/api/jobs?delta=1&cursor=' + first['cursor']
+        unchanged = await self.client.get(url)
+        self.assertEqual(unchanged.headers['Cache-Control'], 'private, no-store')
+        self.assertEqual((await unchanged.json())['jobs'], [])
+        controller_app.JOBS['delta-job'].update(
+            status='done', progress=1, outputs=[{'url': '/output.png', 'kind': 'image'}])
+        completed = await (await self.client.get(url)).json()
+        self.assertEqual(completed['jobs'][0]['status'], 'done')
+        self.assertEqual(completed['jobs'][0]['prompts'], first['jobs'][0]['prompts'])
+        self.assertEqual(completed['jobs'][0]['assets'], first['jobs'][0]['assets'])
+        controller_app.JOBS.clear()
+        deleted = await (await self.client.get(
+            '/api/jobs?delta=1&cursor=' + completed['cursor'])).json()
+        self.assertFalse(deleted['reset'])
+        self.assertEqual(deleted['removed'], ['delta-job'])
+        self.assertEqual(deleted['jobs'], [])
+        # Unknown/evicted cursors resynchronize rather than losing historical rows.
+        missing = await (await self.client.get('/api/jobs?delta=1&cursor=' + '0' * 64)).json()
+        self.assertTrue(missing['reset'])
+        self.assertEqual((await self.client.get('/api/jobs?delta=1&cursor=invalid')).status, 400)
+
+    async def test_job_delta_initial_snapshot_compression_honors_gzip_opt_out(self):
+        self.register_job('delta-large', 'p')
+        controller_app.JOBS['delta-large'] = {
+            'id': 'delta-large', 'status': 'done', 'created': 1, 'prompts': ['x' * 100000],
+        }
+        response = await self.client.get('/api/jobs?delta=1', headers={'Accept-Encoding': 'gzip'})
+        self.assertEqual(response.headers.get('Content-Encoding'), 'gzip')
+        self.assertEqual((await response.json())['jobs'][0]['prompts'], ['x' * 100000])
+        for encoding in ('gzip;q=0', 'gzip;q=0, *;q=1', 'identity'):
+            response = await self.client.get('/api/jobs?delta=1',
+                                             headers={'Accept-Encoding': encoding})
+            self.assertNotIn('Content-Encoding', response.headers)
+            self.assertEqual(len((await response.json())['jobs']), 1)
+
+    async def test_job_deltas_recheck_access_and_scope_cursors_to_user(self):
+        viewer = self.auth.create_user('delta-viewer', auth_support.PASSWORD)
+        self.auth.set_grant(viewer['id'], self.admin['id'], 'read')
+        self.register_job('delta-private', 'p')
+        controller_app.JOBS['delta-private'] = {
+            'id': 'delta-private', 'status': 'done', 'created': 1, 'project': 'p',
+        }
+        admin_page = await (await self.client.get('/api/jobs?delta=1')).json()
+        self.client.session.headers.update(await self.login('delta-viewer'))
+        visible = await (await self.client.get(
+            '/api/jobs?delta=1&cursor=' + admin_page['cursor'])).json()
+        self.assertTrue(visible['reset'])
+        self.assertEqual(visible['jobs'][0]['permission'], 'read')
+        self.auth.delete_grant(viewer['id'], self.admin['id'])
+        revoked = await (await self.client.get(
+            '/api/jobs?delta=1&cursor=' + visible['cursor'])).json()
+        self.assertFalse(revoked['reset'])
+        self.assertEqual(revoked['jobs'], [])
+        self.assertEqual(revoked['removed'], ['delta-private'])
 
     async def test_jobs_batch_keeps_user_limit_visibility_and_live_revocation(self):
         viewer = self.auth.create_user('jobs-viewer', auth_support.PASSWORD)

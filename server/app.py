@@ -79,6 +79,7 @@ from server.worker_command_api import register_worker_command_routes
 from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
 from server.cloud_lighting import CloudLighting
+from server.job_polling import CACHE_KEY as JOB_POLL_CACHE_KEY, JobPollCache, job_poll_response
 from server.cloud_images import ImageEditError
 from server.project_repository import ProjectRepository, InvalidProjectId
 from server.project_service import ProjectService, ProjectError
@@ -2249,6 +2250,8 @@ async def api_jobs(request):
         | submitters.get(job['id'], {}) | queue_snapshot[job['id']] | {"permission": permission}
         for job, permission in visible
     ])
+    if request.query.get("delta") == "1":
+        return await job_poll_response(request, projected, user["id"])
     return web.json_response({"jobs": projected})
 
 
@@ -4471,6 +4474,7 @@ def make_app(auth_path=None, *, project_repository=None):
         app, root=ROOT, comfy_http=COMFY_HTTP, jobs=JOBS, save_jobs=save_jobs,
         require_project=require_project, require_resource=require_resource,
         require_user=require_user, resource_call=resource_call, call_store=call_store)
+    app[JOB_POLL_CACHE_KEY] = JobPollCache()
     app["local_gpu_state"] = {}
     app["capacity_probe_state"] = {"task": None}
     app["sr_runner"] = sr_service.Runner(ROOT / "data" / "sr_tasks.json", ARTIFACT_DIR,
