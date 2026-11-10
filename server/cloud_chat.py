@@ -12,7 +12,6 @@ import aiohttp
 from . import cloud_images
 
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
-MAX_IMAGE_BYTES = 5 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_TEXT_CHARS = 100_000
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
@@ -87,8 +86,10 @@ def validate(body):
                             or image.get("detail", "auto") not in ("auto", "low", "high")):
                         invalid()
                     value = image["url"]
-                    if not isinstance(value, str) or len(value) > 4 * ((MAX_IMAGE_BYTES + 2) // 3) + 32:
+                    if not isinstance(value, str):
                         invalid()
+                    if len(value) > 4 * ((MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 32:
+                        raise ChatError("聊天图片总计不得超过 15 MiB", status=413)
                     match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]*={0,2})", value)
                     if not match:
                         invalid()
@@ -98,8 +99,8 @@ def validate(body):
                         invalid()
                     image_count += 1
                     image_bytes += len(data)
-                    if len(data) > MAX_IMAGE_BYTES or image_bytes > MAX_TOTAL_IMAGE_BYTES or image_count > 8:
-                        raise ChatError("聊天图片超限：单张 5 MiB，总计 15 MiB，最多 8 张", status=413)
+                    if image_bytes > MAX_TOTAL_IMAGE_BYTES or image_count > 8:
+                        raise ChatError("聊天图片超限：总计 15 MiB，最多 8 张", status=413)
                     try:
                         info = cloud_images.inspect_image(data)
                     except cloud_images.ImageEditError:

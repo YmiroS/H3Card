@@ -35,7 +35,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             self.end_user_headers.append((request.headers.get('X-End-User-Name'),
                                           request.headers.get('X-End-User-Phone')))
             return web.json_response(self.payload, status=self.status, headers={'X-Request-ID': 'req-1'})
-        upstream = web.Application()
+        upstream = web.Application(client_max_size=cloud_chat.MAX_REQUEST_BYTES)
         upstream.router.add_post('/v1/chat/completions', gateway)
         self.server = TestServer(upstream)
         await self.server.start_server()
@@ -92,6 +92,18 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             {'type': 'text', 'text': 'describe'}, {'type': 'image_url', 'image_url': {'url': url}}]}]})
         self.assertEqual(response.status, 200)
         self.assertEqual(len(self.calls), 1)
+
+    async def test_single_image_over_five_mib_within_total_limit(self):
+        output = BytesIO()
+        Image.frombytes('RGB', (1500, 1500), os.urandom(1500 * 1500 * 3)).save(output, format='PNG')
+        data = output.getvalue()
+        self.assertGreater(len(data), 5 * 1024 * 1024)
+        self.assertLess(len(data), cloud_chat.MAX_TOTAL_IMAGE_BYTES)
+        url = 'data:image/png;base64,' + base64.b64encode(data).decode()
+        response = await self.post({'messages': [{'role': 'user', 'content': [
+            {'type': 'image_url', 'image_url': {'url': url}}]}]})
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.calls[0][0]['messages'][0]['content'][0]['image_url']['url'], url)
 
     async def test_validation_and_auth_before_gateway(self):
         invalid = [None, {}, {'messages': []}, {'messages': [{'role': [], 'content': 'hi'}]},
