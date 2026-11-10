@@ -1,4 +1,4 @@
-"""Bounded, non-streaming chat gateway; never retries or exposes upstream errors."""
+"""Bounded chat gateway; never retries or exposes upstream errors."""
 import asyncio
 import base64
 import binascii
@@ -8,6 +8,7 @@ import re
 from urllib.parse import urlsplit
 
 import aiohttp
+from aiohttp import web
 
 from . import cloud_images
 
@@ -55,9 +56,10 @@ def load():
 
 def validate(body):
     def invalid():
-        raise ChatError("聊天输入无效：仅接受 messages、文本及 base64 data URL 静态图片", status=400)
+        raise ChatError("聊天输入无效：仅接受 messages、布尔型 stream、文本及 base64 data URL 静态图片", status=400)
 
-    if not isinstance(body, dict) or set(body) != {"messages"}:
+    if (not isinstance(body, dict) or not {"messages"} <= set(body) <= {"messages", "stream"}
+            or ("stream" in body and type(body["stream"]) is not bool)):
         invalid()
     messages = body["messages"]
     if not isinstance(messages, list) or not 1 <= len(messages) <= 100:
@@ -158,3 +160,100 @@ async def complete(session, messages, *, end_user_name, end_user_phone, model=No
     if not request_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id) or config["api_key"] in request_id:
         request_id = None
     return {"content": content, "model": model, "request_id": request_id}
+
+
+async def stream(session, request, messages, *, end_user_name, end_user_phone):
+    config = load()
+    model = config["chat_model"]
+    if not isinstance(model, str) or not model.strip() or any(ord(c) < 33 for c in model):
+        raise ChatError("聊天模型配置无效", status=503)
+    downstream = web.StreamResponse(
+        headers={"Content-Type": "text/event-stream; charset=utf-8",
+                 "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
+    started = False
+    try:
+        async with session.post(
+                config["base_url"].rstrip("/") + "/chat/completions",
+                json={"model": model, "messages": messages, "stream": True},
+                headers={"Authorization": f"Bearer {config['api_key']}",
+                         "X-End-User-Name": end_user_name,
+                         "X-End-User-Phone": end_user_phone},
+                proxy=None, allow_redirects=False,
+                timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=300)) as upstream:
+            if not 200 <= upstream.status < 300:
+                raise ChatError(f"云端聊天返回 HTTP {upstream.status}，请联系管理员核对，不要自动重试")
+            if upstream.content_type != "text/event-stream":
+                raise ChatError("云端聊天流式响应格式无效，请联系管理员确认，不要自动重试")
+            await downstream.prepare(request)
+            started = True
+            size = 0
+            pending = bytearray()
+            finished = False
+            async for chunk in upstream.content.iter_chunked(65536):
+                size += len(chunk)
+                if size > MAX_RESPONSE_BYTES:
+                    raise ChatError("云端聊天响应超过大小限制")
+                pending.extend(chunk)
+                while True:
+                    boundaries = [(index, len(separator)) for separator in (b"\n\n", b"\r\n\r\n", b"\r\r")
+                                  if (index := pending.find(separator)) >= 0]
+                    if not boundaries:
+                        break
+                    index, length = min(boundaries)
+                    frame = bytes(pending[:index])
+                    del pending[:index + length]
+                    try:
+                        lines = frame.decode("utf-8").splitlines()
+                        if any(line.startswith("event:") and line[6:].strip() == "error" for line in lines):
+                            raise ValueError()
+                        data = "\n".join(line[5:].lstrip(" ") for line in lines if line.startswith("data:"))
+                        if not data:
+                            continue
+                        if data == "[DONE]":
+                            finished = True
+                            await downstream.write(b"data: [DONE]\n\n")
+                            break
+                        payload = json.loads(data)
+                        choices = payload["choices"]
+                        if not isinstance(choices, list):
+                            raise ValueError()
+                        if not choices:
+                            continue
+                        choice = choices[0]
+                        if not isinstance(choice, dict):
+                            raise ValueError()
+                        delta = choice["delta"]
+                        if not isinstance(delta, dict):
+                            raise ValueError()
+                        content = delta.get("content")
+                        reason = choice.get("finish_reason")
+                        if ((content is not None and not isinstance(content, str))
+                                or (reason is not None and reason not in
+                                    ("stop", "length", "content_filter", "tool_calls"))):
+                            raise ValueError()
+                        safe_choice = {"delta": {"content": content}}
+                        if reason is not None:
+                            safe_choice["finish_reason"] = reason
+                        safe_frame = {"choices": [safe_choice]}
+                    except (ValueError, UnicodeError, KeyError, IndexError, TypeError):
+                        raise ChatError("云端聊天流式响应格式无效，请联系管理员确认，不要自动重试")
+                    await downstream.write(("data: " + json.dumps(safe_frame, ensure_ascii=False,
+                                                               separators=(",", ":")) + "\n\n").encode("utf-8"))
+                if finished:
+                    break
+            if not finished:
+                raise ChatError("云端聊天流式响应未完成，请勿自动重试")
+    except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        error = ChatError("请求未完成，回答状态可能未知。不要自动重试，请联系管理员确认。",
+                          status=504, answer_unknown=True)
+        if not started:
+            raise error from exc
+        await downstream.write(("event: error\ndata: " + json.dumps(error.response(), ensure_ascii=False)
+                                + "\n\n").encode("utf-8"))
+    except ChatError as error:
+        if not started:
+            raise
+        await downstream.write(("event: error\ndata: " + json.dumps(error.response(), ensure_ascii=False)
+                                + "\n\n").encode("utf-8"))
+    await downstream.write_eof()
+    return downstream

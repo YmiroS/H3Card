@@ -100,6 +100,7 @@ class CloudBananaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.received[0]["body"]["messages"], [{"role": "user", "content": [
             {"type": "text", "text": "一只橘猫"}]}])
         self.assertEqual(self.received[0]["body"]["model"], "gemini-3-pro-image")
+        self.assertIs(self.received[0]["body"]["stream"], False)
 
     async def test_text_only_mode_rejects_reference_images(self):
         with self.assertRaises(cloud_banana.BananaError):
