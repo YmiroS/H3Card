@@ -4,12 +4,11 @@
  "group": "图片", "outputType": "image", "kind": "gen", "card": "image",
  "execution": "cloud_image", "billingMode": "paid_api", "cloudProvider": "gpt_image",
  "modelName": "gpt-image-2.5-sunburst", "parameterPanel": "paid-image",
+ "imageControls": {"mode": "t2i", "defaultRatio": "3:4", "defaultClarity": "720P"},
  "slots": "img0+aud0+vid0", "images": 0, "audios": 0, "videos": 0,
  "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
- "note": "付费 API：请求按服务商计费，失败/超时不自动重试。尺寸和质量为请求参数，实际支持及尺寸以网关返回为准。",
+ "note": "付费 API：请求按服务商计费，失败/超时不自动重试。通过画面比例和短边清晰度设置尺寸，输入与成品均按 16 像素对齐；云端尺寸不符时本地适配，不代表原生画质提升。",
  "inputs": [
-  {"key": "prompt", "label": "提示词", "type": "textarea", "required": true, "default": "", "maxLength": 20000},
-  {"key": "size", "label": "请求尺寸", "type": "select", "default": "1024x1024", "options": ["1024x1024", "1536x1024", "1024x1536"]},
-  {"key": "quality", "label": "请求质量", "type": "select", "default": "medium", "options": ["low", "medium", "high"]}
+  {"key": "prompt", "label": "提示词", "type": "textarea", "required": true, "default": "", "maxLength": 20000}
  ], "warnings": []
 }

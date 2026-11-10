@@ -1,13 +1,17 @@
 """Paid image API jobs; no ComfyUI dispatch and no generation retries."""
 import asyncio
+from io import BytesIO
+import math
 import os
 import time
 import uuid
 
 from aiohttp import web
+from PIL import Image, ImageOps
 
 from . import cloud_banana, cloud_images
 from .cloud_lighting import CloudLighting
+from .image_controls import RATIOS, CLARITIES
 
 
 CAPABILITIES = {
@@ -16,7 +20,47 @@ CAPABILITIES = {
     "gpt_image_api_t2i": ("gpt_image", False),
     "gpt_image_api_i2i": ("gpt_image", True),
 }
-GPT_SIZES = {"1024x1024", "1536x1024", "1024x1536"}
+
+
+def generation_dimensions(params, needs_images, info=None):
+    ratio = params.get("image_ratio", "original" if needs_images else "3:4")
+    clarity = params.get("image_clarity", "720P")
+    if not isinstance(ratio, str) or ratio not in RATIOS + (("original",) if needs_images else ()):
+        raise web.HTTPBadRequest(text="画面比例无效")
+    if not isinstance(clarity, str) or clarity not in CLARITIES:
+        raise web.HTTPBadRequest(text="清晰度只支持 480P、720P、1080P、1440P 或 2K")
+    w, h = (info["width"], info["height"]) if ratio == "original" else map(int, ratio.split(":"))
+    scale = CLARITIES[clarity] / min(w, h)
+    width = max(16, math.floor(w * scale / 16 + .5) * 16)
+    height = max(16, math.floor(h * scale / 16 + .5) * 16)
+    return ratio, clarity, bounded_dimensions(width, height)
+
+
+def bounded_dimensions(width, height):
+    if width * height > cloud_images.MAX_PIXELS:
+        scale = math.sqrt(cloud_images.MAX_PIXELS / (width * height))
+        width = max(16, math.floor(width * scale / 16) * 16)
+        height = max(16, math.floor(height * scale / 16) * 16)
+        if width * height > cloud_images.MAX_PIXELS:
+            if width >= height:
+                width = cloud_images.MAX_PIXELS // height // 16 * 16
+            else:
+                height = cloud_images.MAX_PIXELS // width // 16 * 16
+    return width, height
+
+
+def resize_image(data, size, *, crop=False):
+    info = cloud_images.inspect_image(data)
+    if (info["width"], info["height"]) == size:
+        return data, info
+    with Image.open(BytesIO(data)) as image:
+        image = image.convert("RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB")
+        image = (ImageOps.fit(image, size, method=Image.Resampling.LANCZOS) if crop
+                 else image.resize(size, Image.Resampling.LANCZOS))
+        output = BytesIO()
+        image.save(output, format="PNG")
+    data = output.getvalue()
+    return data, cloud_images.inspect_image(data)
 
 
 class CloudGeneration(CloudLighting):
@@ -48,14 +92,7 @@ class CloudGeneration(CloudLighting):
         if (set(assets) - set(allowed_keys) or invalid_count
                 or any(not isinstance(assets[key], str) or not assets[key] for key in keys)):
             raise web.HTTPBadRequest(text="文生图不接受输入图；图生图需要按顺序提供 1–8 张图片")
-        size = quality = None
-        if provider == "gpt_image":
-            size = params.get("size", "original" if needs_images else "1024x1024")
-            quality = params.get("quality", "medium")
-            if not isinstance(size, str) or size not in GPT_SIZES | ({"original"} if needs_images else set()):
-                raise web.HTTPBadRequest(text="GPT 图片请求尺寸无效")
-            if not isinstance(quality, str) or quality not in {"low", "medium", "high"}:
-                raise web.HTTPBadRequest(text="GPT 图片质量只支持 low、medium 或 high")
+        quality = "high" if provider == "gpt_image" else None
         project_id, card_id = body["project"], body.get("card")
         if (card_id and not body.get("dry_run")
                 and any(job.get("execution") == "cloud_image" and job.get("project") == project_id
@@ -63,16 +100,23 @@ class CloudGeneration(CloudLighting):
                         for job in self.jobs.values())):
             raise web.HTTPConflict(text="当前卡片已有云端生图任务，请等待结果，不要重复提交")
         sources = [await self.source(request, project_id, assets[key]) for key in keys]
-        if size == "original":
-            size = f"{sources[0][2]['width']}x{sources[0][2]['height']}"
+        ratio, clarity, dimensions = generation_dimensions(params, needs_images, sources[0][2] if sources else None)
+        size = f"{dimensions[0]}x{dimensions[1]}"
         if body.get("dry_run"):
             return {"dry_run": True, "execution": "cloud_image", "billingMode": "paid_api",
                     "provider": provider, "prompt": prompt.strip(), "size": size,
+                    "image_ratio": ratio, "image_clarity": clarity,
                     "quality": quality, "changed": {}}
         config = cloud_banana.load() if provider == "banana" else cloud_images.load()
+        prepared = []
+        for index, (data, ref, info) in enumerate(sources):
+            target = dimensions if index == 0 else bounded_dimensions(
+                *(max(16, info[key] // 16 * 16) for key in ("width", "height")))
+            data, info = await asyncio.to_thread(resize_image, data, target, crop=index == 0 and ratio != "original")
+            prepared.append((data, ref, info))
         await self.require_project(request, project_id, operate=True)
-        inputs = {key: await self.snapshot_input(project_id, ref, data, info)
-                  for key, (data, ref, info) in zip(keys, sources)}
+        inputs = {key: await self.snapshot_input(project_id, ref, data, info, copy_upload=True)
+                  for key, (data, ref, info) in zip(keys, prepared)}
         user = self.require_user(request)
         pid = str(uuid.uuid4())
         await self.call_store(self.app, "register_job", pid, project_id, user["id"])
@@ -82,7 +126,9 @@ class CloudGeneration(CloudLighting):
                "execution": "cloud_image", "billingMode": "paid_api", "provider": provider,
                "outputType": "image", "status": "queued", "progress": 0.0,
                "created": time.time(), "seed": None, "step": "等待付费 API 生图",
-               "requested_size": size, "quality": quality, "input_image_count": count,
+               "requested_size": size, "image_ratio": ratio, "image_clarity": clarity,
+               "quality": quality, "input_image_count": count,
+               "input_sizes": [f"{info['width']}x{info['height']}" for _, _, info in prepared],
                "outputs": [], "error": None, "retryable": False,
                "project": project_id, "projectName": body.get("projectName"),
                "card": card_id, "cardName": body.get("cardName"),
@@ -91,7 +137,7 @@ class CloudGeneration(CloudLighting):
         self.jobs[pid] = job
         self.save_jobs()
         task = asyncio.create_task(self.run_generation(
-            job, user["id"], [source[0] for source in sources], [source[1] for source in sources],
+            job, user["id"], [source[0] for source in prepared], [source[1] for source in sources],
             prompt.strip(), end_user_name=user["username"], end_user_phone=user["phone"]))
         self.tasks[pid] = task
         task.add_done_callback(lambda finished: self.tasks.pop(pid, None))
@@ -107,7 +153,7 @@ class CloudGeneration(CloudLighting):
             identity = {"end_user_name": end_user_name, "end_user_phone": end_user_phone}
             if job["provider"] == "banana":
                 result = await cloud_banana.generate(self.app["session"], images, prompt,
-                                                     text_only=not images, **identity)
+                    text_only=not images, output_size=tuple(map(int, job["requested_size"].split("x"))), **identity)
             elif images:
                 result = await cloud_images.edit(self.app["session"], images, prompt,
                                                  size=job["requested_size"], quality=job["quality"], **identity)
@@ -119,6 +165,12 @@ class CloudGeneration(CloudLighting):
                 raise cloud_images.ImageEditError(
                     "云端已返回图片链接，但未自动下载。请联系管理员确认结果，不要重复生成。",
                     request_id=result["request_id"], generation_unknown=True)
+            await self.authorize_all(user_id, job["project"], refs)
+            dimensions = tuple(map(int, job["requested_size"].split("x")))
+            job["provider_size"] = f"{result['width']}x{result['height']}"
+            job["output_resized"] = (result["width"], result["height"]) != dimensions
+            data, info = await asyncio.to_thread(resize_image, result["image_bytes"], dimensions, crop=True)
+            result.update(info, image_bytes=data)
             async with self.app["project_locks"][job["project"]]:
                 await self.authorize_all(user_id, job["project"], refs)
                 name = "generated" + result["extension"]

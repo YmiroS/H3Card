@@ -286,14 +286,20 @@ class ImageControlsRuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
             "capability": cid, "project": "p", "dry_run": True,
             "params": {"seed": 123, **params}, "assets": ASSETS if assets is None else assets})
 
-    async def test_cards_publish_only_eight_metadata_without_changing_manifests(self):
+    async def test_cards_publish_local_and_paid_metadata_without_changing_manifests(self):
         response = await self.client.get("/api/cards")
         self.assertEqual(response.status, 200)
         caps = (await response.json())["capabilities"]
         native_caps = {cid: cap for cid, cap in caps.items()
                        if cap.get("execution") != "if_studio"}
+        paid_ids = {"banana_api_t2i", "banana_api_i2i", "gpt_image_api_t2i", "gpt_image_api_i2i"}
         self.assertEqual({cid for cid, cap in native_caps.items() if "imageControls" in cap},
-                         set(CAP_IDS))
+                         set(CAP_IDS) | paid_ids)
+        for cid in paid_ids:
+            mode = "i2i" if cid.endswith("i2i") else "t2i"
+            self.assertEqual(caps[cid]["imageControls"], {
+                "mode": mode, "defaultRatio": "original" if mode == "i2i" else "3:4",
+                "defaultClarity": "720P"})
         self.assertEqual(caps["if_image"]["execution"], "if_studio")
         self.assertIn("imageControls", caps["if_image"])
         for cid, published in native_caps.items():

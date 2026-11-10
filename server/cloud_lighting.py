@@ -70,9 +70,9 @@ class CloudLighting:
         await self.require_resource(request, *ref, project_id=project_id)
         return data, ref, info
 
-    async def snapshot_input(self, project_id, ref, data, info):
-        """把非上传来源复制成任务输入；上传来源直接沿用原引用。"""
-        if ref[0] == "upload":
+    async def snapshot_input(self, project_id, ref, data, info, *, copy_upload=False):
+        """把非上传来源或预处理图片复制成任务输入；原始上传可直接沿用。"""
+        if ref[0] == "upload" and not copy_upload:
             return "chouka/" + ref[1]
         parent = await self.resource_call(self.app, "lookup", *ref)
         name = f"lighting_input_{uuid.uuid4().hex}{info['extension']}"

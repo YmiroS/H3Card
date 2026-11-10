@@ -87,11 +87,18 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_generation_rejects_invalid_params_without_network(self):
         for params in ({"prompt": ""}, {"prompt": "x" * 20001}, {"prompt": "cat", "size": "original"},
-                       {"prompt": "cat", "quality": "invalid"}):
+                       {"prompt": "cat", "quality": "invalid"}, {"prompt": "cat", "size": "1001x751"},
+                       {"prompt": "cat", "size": "8000x8000"}, {"prompt": "cat", "size": {}}):
             with self.subTest(params=params), self.assertRaises(cloud_images.ImageEditError):
                 await cloud_images.generate(self.session, **params,
                                              end_user_name="image-test-user", end_user_phone="13800138000")
         self.assertEqual(self.generations, [])
+
+    async def test_generation_supports_aligned_short_edge_sizes_and_defaults_high(self):
+        await cloud_images.generate(self.session, "猫", size="1920x1088",
+                                    end_user_name="user", end_user_phone="13800138000")
+        self.assertEqual(self.generations[0]["body"]["size"], "1920x1088")
+        self.assertEqual(self.generations[0]["body"]["quality"], "high")
 
     async def test_generation_http_failure_does_not_retry(self):
         self.status = 429

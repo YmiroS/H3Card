@@ -157,12 +157,14 @@ async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=N
 
 
 async def generate(session, prompt, *, end_user_name, end_user_phone,
-                   size="1024x1024", quality="medium"):
+                   size="1024x1024", quality="high"):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise ImageEditError("生图提示词不能为空，且不得超过 20000 字符", status=400)
-    if size not in ("1024x1024", "1536x1024", "1024x1536"):
-        raise ImageEditError("文生图尺寸无效", status=400)
+    dimensions = re.fullmatch(r"([1-9]\d{0,6})x([1-9]\d{0,6})", size) if isinstance(size, str) else None
+    if (not dimensions or any(int(side) % 16 for side in dimensions.groups())
+            or int(dimensions[1]) * int(dimensions[2]) > MAX_PIXELS):
+        raise ImageEditError("文生图宽高必须为 16 的倍数，且不得超过 3200 万像素", status=400)
     if quality not in ("low", "medium", "high"):
         raise ImageEditError("图片质量只支持 low、medium 或 high", status=400)
     body = {"model": config["model"], "prompt": prompt.strip(), "n": 1,
