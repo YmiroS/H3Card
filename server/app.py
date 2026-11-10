@@ -74,6 +74,7 @@ from server.sandbox import sandbox_guard, validate_runtime, deny_outbound
 from server.monitor import register_monitor_routes
 from server.frontend import load_frontend
 from server.texture_api import register_texture_routes
+from server.local_texture import CAPABILITIES as LOCAL_TEXTURE_CAPS, redact as redact_local_texture, register_local_texture_routes
 from server.character_api import register_character_routes
 from server.worker_command_api import register_worker_command_routes
 from server.color_grade_export import register_color_grade_routes
@@ -109,6 +110,9 @@ MODEL_FAMILY = {
         "minimax_h3_character_transfer", "minimax_h3_fusion_v2", "minimax_h3_fusion_v2_bf16",
         "minimax_h3_fusion_v3",
     )},
+    "texture_local_flux": "flux2_klein",
+    "texture_local_gpt": "cloud_local_gpt",
+    "texture_local_banana": "cloud_local_banana",
     "flux2_klein_edit": "flux2_klein",
     "flux2_klein_storyboard9": "flux2_klein",
     "rmbg_erase": "flux2_klein",
@@ -140,6 +144,8 @@ def model_family(capability_id):
 MODEL_NAMES = {
     "minimax_h3": "MiniMax H3",
     "flux2_klein": "FLUX.2 Klein",
+    "cloud_local_gpt": "GPT Image",
+    "cloud_local_banana": "Nano Banana",
     "krea2": "Krea2",
     "zimage": "Z-Image",
     "qwen_image_edit_2511": "Qwen Image Edit 2511",
@@ -1274,10 +1280,12 @@ async def ws_loop(app):
 
 async def handle_event(session, ev, remote=False, app=None):
     t, d = ev.get("type"), ev.get("data") or {}
-    if DEBUG:
-        print(f"[ev] {t} {json.dumps(d, ensure_ascii=False)[:220]}", flush=True)
     pid = d.get("prompt_id")
     job = JOBS.get(pid) if pid else None
+    if job and job.get("capability") in LOCAL_TEXTURE_CAPS:
+        d = redact_local_texture(d)
+    if DEBUG:
+        print(f"[ev] {t} {json.dumps(d, ensure_ascii=False)[:220]}", flush=True)
 
     if job and (job.get("cleanup_pending") or job.get("execution") == "cloud_image"):
         return
@@ -1540,10 +1548,24 @@ async def generation_assets(request, assets, project_id=None, capability_id=None
 
 
 async def api_generate(request):
+    try:
+        return await _api_generate(request)
+    except BaseException as error:
+        api = request.app.get("local_texture")
+        if api:
+            api.invalidate(request)
+        if request.get("local_texture_context") and isinstance(error, web.HTTPException):
+            # Submission validation errors can echo the trusted graph's ticket inputs.
+            raise type(error)(text="局部编辑提交失败；请检查执行端状态，不要自动重试") from None
+        raise
+
+
+async def _api_generate(request):
     body = await authorized_body(request)
     project = request.app["project_repository"].read(body["project"])
     linked_card = next((card for card in project.get("cards", [])
-                        if card.get("id") == body.get("card") and card.get("director_shot")), None)
+                        if card.get("id") == body.get("card") and card.get("director_shot")
+                        and body.get("capability") not in LOCAL_TEXTURE_CAPS), None)
     if linked_card:
         # Snapshot the previous trusted completion before replacing its job ID.
         sync_card_job(linked_card, JOBS, CAPS, body["project"])
@@ -1553,6 +1575,13 @@ async def api_generate(request):
     cap = CAPS.get(cid)
     if not cap:
         raise web.HTTPBadRequest(reason=f"未知能力 {cid}")
+    local_context = None
+    if cid in LOCAL_TEXTURE_CAPS:
+        try:
+            local_context = await request.app["local_texture"].prepare(request, body, cap)
+        except ImageEditError as error:
+            return web.json_response(error.response(), status=error.status)
+        request["local_texture_context"] = local_context
     target_worker_id = body.get("target_worker_id")
     if "target_worker_id" in body:
         if (not isinstance(target_worker_id, str) or not target_worker_id.strip()
@@ -1597,6 +1626,10 @@ async def api_generate(request):
             inspect_imported_videos, cap, uploaded
         )
     graph = patch_graph(cap, params, uploaded, video_metadata)
+    if local_context:
+        request.app["local_texture"].validate_graph(graph, local_context)
+    elif any(node.get("class_type") == "ChoukaCloudImageEdit" for node in graph.values()):
+        raise web.HTTPBadRequest(text="云局部编辑节点仅允许受控局部能力")
     duration_seconds = rw.duration(cap, params) if cid in HIGH_VRAM_CAPABILITIES else None
     if body.get("dry_run"):
         tpl = json.loads((ROOT / cap["graph"]).read_text(encoding="utf-8"))
@@ -1646,6 +1679,13 @@ async def api_generate(request):
             raise web.HTTPBadRequest(text=reason)
     await require_project(request, body["project"], operate=True)
     pid = str(uuid.uuid4())
+    if local_context:
+        # Pre-bind before /prompt; a fast local callback may arrive before its receipt.
+        local_context["submission"] = {"job_id": pid, "state": "submitting"}
+        try:
+            await request.app["local_texture"].inject(request, graph, local_context)
+        except ImageEditError as error:
+            return web.json_response(error.response(), status=error.status)
     await call_store(request.app, "register_job", pid, body["project"], require_user(request)["id"])
     await resource_call(request.app, "register_job_inputs", pid, uploaded)
     if not CONTROLLER_MODE:
@@ -1661,6 +1701,8 @@ async def api_generate(request):
     # 59 个节点名白传
     STEPS[pid] = step_labels(graph)
     WEIGHTS[pid] = step_weights(graph)
+    if local_context:
+        request.app["local_texture"].previews[pid] = local_context
     JOBS[pid] = {"id": pid, "capability": cid, "name": cap["name"],
                  "modelName": model_name(cid),
                  "outputType": cap["outputType"], "status": "queued",
@@ -1673,6 +1715,8 @@ async def api_generate(request):
                       "text": graph[str(spec["target"]["node"])]["inputs"][spec["target"]["input"]]}
                      for spec in cap.get("inputs", [])
                      if spec["type"] == "textarea" or spec["key"] == "negative_prompt"
+                 ] if not local_context else [
+                     {"key": "prompt", "label": "提示词", "text": redact_local_texture(local_context["prompt"])}
                  ],
                  # 任务面板要能说清"这是哪张卡在跑"，还要能点回那张卡
                  "project": body.get("project"),
@@ -1727,6 +1771,8 @@ async def api_generate(request):
         distributed_store(request.app).enqueue(pid, dispatch_payload, required_nodes)
         if ledger:
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
+    if local_context:
+        local_context["submission"].update(job_id=pid, state="accepted")
     return await generation_job_response(request, body, pid, project, linked_card)
 
 
@@ -2146,6 +2192,8 @@ def job_queue_snapshot(app, jobs):
 
 async def project_job_workers(request, jobs):
     """Hide restricted machine identities in responses, never rewrite job/billing history."""
+    if any(job.get("capability") in LOCAL_TEXTURE_CAPS for job in jobs):
+        jobs = await request.app["local_texture"].project_previews(request, jobs)
     if not CONTROLLER_MODE or require_user(request)["role"] == "admin":
         return jobs
     team_ids = await call_store(request.app, "user_worker_teams", require_user(request)["id"])
@@ -2186,6 +2234,8 @@ async def api_job(request):
     job = JOBS.get(pid)
     if not job:
         raise web.HTTPNotFound(reason="没有这个任务")
+    if job.get("capability") in LOCAL_TEXTURE_CAPS:
+        await request.app["local_texture"].check_preview(request, pid)
     node_name = job_node_names(request.app, [job]).get(pid)
     submitters = await job_submitter_info(request, [job])
     projected = await project_job_workers(request, [
@@ -2289,6 +2339,8 @@ async def api_jobs_history(request):
             jobs.append(item | current | {"permission": permission or "read"})
         else:
             jobs.append(item | {"history_only": True, "permission": "read"})
+    if any(job.get("capability") in LOCAL_TEXTURE_CAPS for job in jobs):
+        jobs = await request.app["local_texture"].project_previews(request, jobs)
     nodes = job_node_names(request.app, jobs)
     submitters = await job_submitter_info(request, jobs)
     queue = job_queue_snapshot(request.app, jobs)
@@ -2460,6 +2512,9 @@ async def api_agent_event(request):
     data = event.setdefault("data", {})
     if not isinstance(data, dict):
         raise web.HTTPBadRequest(reason="事件 data 必须是 JSON 对象")
+    if JOBS.get(pid, {}).get("capability") in LOCAL_TEXTURE_CAPS:
+        data = redact_local_texture(data)
+        event["data"] = data
     data["prompt_id"] = pid
     event_type = event.get("type")
     if event_type == "capacity_diagnostics":
@@ -2685,6 +2740,8 @@ async def api_agent_failed(request):
     pid = request.match_info["pid"]
     lease_token = request.headers.get("X-Lease-Token", "")
     body = await request.json()
+    if JOBS.get(pid, {}).get("capability") in LOCAL_TEXTURE_CAPS:
+        body = redact_local_texture(body)
     canceled = bool(body.get("canceled"))
     dispatch_status = "canceled" if canceled else "error"
     store = distributed_store(request.app)
@@ -4477,6 +4534,10 @@ def make_app(auth_path=None, *, project_repository=None):
     register_chat_routes(app)
     register_texture_routes(
         app, root=ROOT, comfy_http=COMFY_HTTP,
+        require_project=require_project, require_resource=require_resource,
+        resource_call=resource_call)
+    register_local_texture_routes(
+        app, root=ROOT, comfy_http=COMFY_HTTP, controller=CONTROLLER_MODE, port=PORT, jobs=JOBS,
         require_project=require_project, require_resource=require_resource,
         resource_call=resource_call)
     register_character_routes(

@@ -1,0 +1,28 @@
+{
+  "id": "texture_local_flux",
+  "name": "局部材质替换（本地 Flux）",
+  "editor_only": true,
+  "group": "图片",
+  "kind": "gen",
+  "card": "image",
+  "outputType": "image",
+  "images": 3,
+  "audios": 0,
+  "videos": 0,
+  "slots": "img3+aud0+vid0",
+  "slotLimits": {"image": {"min": 2, "max": 3}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+  "graph": "graphs/texture_local_flux.api.json",
+  "output": {"node": "99"},
+  "rewrite": null,
+  "note": "仅供编辑器：图1原图，图2独立黑白mask PNG（白=修改、黑=保护，不使用alpha反向mask），图3可选材质参考。裁片作为模型图1，参考材质作为模型图2。megapixels是局部正方形生成画布预算，sqrt(MP*1e6)按32对齐并限制512–2048；非正方形裁片保持比例补边，feather为原图像素的有限向外羽化。只保存合成后的原尺寸整图。需安装项目chouka_local_edit节点包及Comfy核心Flux2/ReferenceLatent节点，另备flux-2-klein-9b-fp8.safetensors、qwen_3_8b_fp8mixed.safetensors、flux2-vae.safetensors；未下载权重，未验证真实Flux推理。",
+  "inputs": [
+    {"key": "images[0]", "label": "原图", "type": "image", "required": true, "target": {"node": "1", "input": "image", "kind": "upload_image"}},
+    {"key": "images[1]", "label": "独立蒙版 PNG（白=修改）", "type": "image", "required": true, "target": {"node": "2", "input": "image", "kind": "upload_image"}},
+    {"key": "images[2]", "label": "材质参考（可选）", "type": "image", "required": false, "target": {"node": "3", "input": "image", "kind": "upload_image"}, "dropIfEmpty": [{"node": "21", "input": "latent"}, {"node": "22", "input": "latent"}]},
+    {"key": "prompt", "label": "修改提示词", "type": "textarea", "default": "Replace the selected material in image 1 using image 2 when supplied. Preserve shape, lighting and surrounding details.", "target": {"node": "14", "input": "text"}},
+    {"key": "megapixels", "label": "局部生成预算（MP）", "type": "number", "min": 0.25, "max": 16.0, "step": 0.01, "default": 1.0, "target": {"node": "10", "input": "megapixels", "vtype": "FLOAT"}},
+    {"key": "feather", "label": "融合羽化（原图像素）", "type": "number", "min": 0, "max": 128, "step": 1, "default": 32, "target": {"node": "10", "input": "feather", "vtype": "INT"}},
+    {"key": "steps", "label": "采样步数", "type": "slider", "min": 4, "max": 6, "step": 1, "default": 4, "target": {"node": "24", "input": "steps", "vtype": "INT"}},
+    {"key": "seed", "label": "种子", "type": "seed", "default": 0, "max": 18446744073709551615, "target": {"node": "24", "input": "seed", "vtype": "INT"}}
+  ]
+}
