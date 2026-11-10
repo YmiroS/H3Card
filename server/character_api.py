@@ -18,6 +18,7 @@ from .texture_api import TextureApi
 BASE_FIELDS = {"project", "card", "working_base_ref", "expected_source"}
 AGE_FIELDS = BASE_FIELDS | {"profile", "profile_confirmed", "profile_source_digest", "target_age",
                             "hair_policy", "beard_policy", "provider", "megapixels"}
+MAX_ANALYSIS_IMAGE_BYTES = 5 * 1024 * 1024
 
 
 def analysis_image(data):
@@ -29,7 +30,7 @@ def analysis_image(data):
         output = BytesIO()
         image.save(output, format="JPEG", quality=85)
         encoded = output.getvalue()
-        if len(encoded) <= cloud_chat.MAX_IMAGE_BYTES:
+        if len(encoded) <= MAX_ANALYSIS_IMAGE_BYTES:
             return encoded
         if max(image.size) <= 64:
             raise cloud_chat.ChatError("分析图片压缩后仍超过聊天限制", status=413)

@@ -311,6 +311,56 @@ class StoreTests(unittest.TestCase):
             self.assertNotIn('phone', user)
         self.assertEqual(self.store.get_user(self.viewer)['phone'], '13800138000')
 
+    def test_job_permissions_match_live_project_rules(self):
+        for pid, owner, state in (
+                ('shared', self.owner, 'active'), ('personal', self.viewer, 'active'),
+                ('private', self.admin, 'active'), ('pending', self.owner, 'pending')):
+            self.store.create_project(pid, owner, state)
+            self.store.register_job(pid + '-job', pid, owner)
+        ids = ['missing', 'shared-job', 'personal-job', 'private-job', 'pending-job']
+        for grant in ('read', 'operate', None):
+            if grant:
+                self.store.set_grant(self.viewer, self.owner, grant)
+            else:
+                self.store.delete_grant(self.viewer, self.owner)
+            for user in (self.viewer, self.admin):
+                expected = {jid: self.store.project_permission(user, self.store.get_job(jid)['project_id'])
+                            for jid in ids if self.store.get_job(jid)}
+                self.assertEqual(self.store.job_permissions(user, ids), expected)
+        self.store.set_user(self.viewer, enabled=False)
+        self.assertEqual(self.store.job_permissions(self.viewer, ids),
+                         {jid: None for jid in ids if jid != 'missing'})
+        self.assertEqual(self.store.job_permissions(self.viewer, []), {})
+
+    def test_job_permissions_batch_large_lists_and_reuse_project_checks(self):
+        self.store.create_project('shared', self.owner)
+        self.store.set_grant(self.viewer, self.owner, 'read')
+        ids = [f'job-{index}' for index in range(1505)]
+        with self.store._tx():
+            self.store.db.executemany('INSERT INTO job_acl VALUES(?,?,?)',
+                                     [(jid, 'shared', self.owner) for jid in ids])
+        with patch.object(self.store, 'project_permission',
+                          wraps=self.store.project_permission) as permission:
+            result = self.store.job_permissions(self.viewer, ids)
+        self.assertEqual(result, dict.fromkeys(ids, 'read'))
+        permission.assert_called_once_with(self.viewer, 'shared')
+        self.store.delete_grant(self.viewer, self.owner)
+        self.assertEqual(self.store.job_permissions(self.viewer, ids), dict.fromkeys(ids))
+
+    def test_job_permissions_limit_counts_only_visible_jobs(self):
+        self.store.create_project('private', self.admin)
+        self.store.create_project('shared', self.owner)
+        self.store.set_grant(self.viewer, self.owner, 'read')
+        hidden = [f'hidden-{index}' for index in range(505)]
+        visible = [f'visible-{index}' for index in range(65)]
+        with self.store._tx():
+            self.store.db.executemany('INSERT INTO job_acl VALUES(?,?,?)',
+                                     [(jid, 'private', self.admin) for jid in hidden]
+                                     + [(jid, 'shared', self.owner) for jid in visible])
+        result = self.store.job_permissions(self.viewer, hidden + visible, limit=60)
+        self.assertEqual([jid for jid, permission in result.items() if permission], visible[:60])
+        self.assertNotIn(visible[60], result)
+
     def test_grants_future_nontransitive_and_jobs(self):
         self.store.set_grant(self.viewer, self.owner, 'read')
         self.store.create_project('future', self.owner)

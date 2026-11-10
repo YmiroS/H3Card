@@ -1139,6 +1139,33 @@ class AuthStore:
             row = self.db.execute('SELECT * FROM job_acl WHERE job_id=?', (job_id,)).fetchone()
             return dict(row) if row else None
 
+    def job_permissions(self, user_id, job_ids, *, limit=None):
+        self._identifier(user_id, '用户 ID')
+        job_ids = list(job_ids)
+        permissions, projects = {}, {}
+        visible = 0
+        with self.lock:
+            for offset in range(0, len(job_ids), 500):
+                batch = job_ids[offset:offset + 500]
+                rows = self.db.execute(
+                    'SELECT job_id,project_id FROM job_acl WHERE job_id IN ('
+                    + ','.join('?' for _ in batch) + ')', batch,
+                ).fetchall()
+                acls = {row['job_id']: row['project_id'] for row in rows}
+                for jid in batch:
+                    if jid not in acls:
+                        continue
+                    project_id = acls[jid]
+                    if project_id not in projects:
+                        projects[project_id] = self.project_permission(user_id, project_id)
+                    permission = projects[project_id]
+                    permissions[jid] = permission
+                    if permission:
+                        visible += 1
+                        if limit is not None and visible >= limit:
+                            return permissions
+        return permissions
+
     def user_worker_teams(self, user_id):
         """Current worker access, independent of project ownership and canvas shares."""
         with self.lock:
