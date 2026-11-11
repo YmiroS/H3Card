@@ -78,6 +78,7 @@ from server.character_api import register_character_routes
 from server.worker_command_api import register_worker_command_routes
 from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
+from server.creation_agent.skills import register_skill_routes
 from server.cloud_lighting import CloudLighting
 from server.job_polling import CACHE_KEY as JOB_POLL_CACHE_KEY, JobPollCache, job_poll_response
 from server.cloud_generation import CloudGeneration, CAPABILITIES as CLOUD_GENERATION_CAPABILITIES
@@ -4512,6 +4513,8 @@ def make_app(auth_path=None, *, project_repository=None):
         broadcast_collaboration=broadcast_collaboration, sync_card=sync_edit_card,
         kind_of=kind_of, duration_pattern=DUR_RE, audio_pattern=AUDIO_STREAM_RE)
     register_chat_routes(app)
+    register_skill_routes(app, os.environ.get('CREATION_AGENT_SKILL_STORE')
+                          or Path(app['auth_path']).parent / 'creation-agent-skills.json')
     register_texture_routes(
         app, root=ROOT, comfy_http=COMFY_HTTP,
         require_project=require_project, require_resource=require_resource,

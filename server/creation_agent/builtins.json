@@ -1,0 +1,42 @@
+[
+  {
+    "id": "image-creation",
+    "name": "图片创作",
+    "description": "读取当前画布与图片能力，整理单张普通图片的创作提案；仅准备供用户确认的计划，不执行生成。"
+  },
+  {
+    "id": "h3-prompt-writing",
+    "name": "H3 Prompt Writing",
+    "description": "Official MiniMax H3 video prompt writing/rewriting: T2VA, I2VA, FL2VA, L2VA, Ref2VA. Load before writing H3 prompts; complete base and reference guides are included."
+  },
+  {
+    "id": "gpt-manju-image-optimization",
+    "name": "GPT漫剧生图优化",
+    "description": "多参考图单帧提示词优化：漫剧与电影感 3D 底图、灰模换角、动作透视匹配、扩图、Color Key、尘雾变体、披风局改与多余肢体修复。只要提示词时输出可复制文本；不强制切换模型。"
+  },
+  {
+    "id": "eastern-fantasy-artifacts",
+    "name": "东方玄幻法宝道具",
+    "description": "整理东方玄幻法宝、神兵与祭器的参考分析、轮廓、材料、工艺和神异机制，辅助编写设计与返修提示词。"
+  },
+  {
+    "id": "cg-environment-art-director",
+    "name": "CG 场景美术指导",
+    "description": "根据场景主题、参考图或已有提示词整理 CG 场景的构图、尺度、材质、光影与环境叙事，支持时段、天气、季节及多视角提示词设计。"
+  },
+  {
+    "id": "conceptual-character-creator",
+    "name": "角色风格设计与画风一致性",
+    "description": "整理角色概念、风格设定、多视角角色板与后续镜头的一致性约束，提供角色及技能展示的提示词模板、预检与返修参考。"
+  },
+  {
+    "id": "first-frame-reference-director",
+    "name": "首帧参考图整合指导",
+    "description": "将角色卡、线稿、灰模及环境参考按职责整合为首帧方案与提示词，梳理身份、动作、构图、画风、空间和光影的一致性。"
+  },
+  {
+    "id": "secondary-motion-prompts",
+    "name": "物理动态与介质响应优化",
+    "description": "优化衣发、配件、道具及水、雪、沙、泥、烟尘等动态提示词，梳理受力、接触、形变与运动连续性，提供局部改写和结果排查参考。"
+  }
+]
