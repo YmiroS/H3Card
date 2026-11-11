@@ -1462,29 +1462,26 @@ class DistributedStore:
                     ) AS capabilities_json"""
         with self.lock, self.db:
             self._expire_service_restarts_locked(now)
-            if worker_id is None:
-                rows = self.db.execute(
-                    f"""SELECT {columns} FROM workers WHERE retired = 0
-                        ORDER BY created_at DESC, id DESC"""
-                ).fetchall()
-            else:
-                # 先按现有名称规则去重，不能让旧注册通过单台查询重新出现。
-                seen_names = set()
-                selected = False
-                for row in self.db.execute(
-                    """SELECT id, name FROM workers WHERE retired = 0
-                       ORDER BY created_at DESC, id DESC"""
-                ):
-                    name_key = _worker_name_key(row["name"])
-                    if name_key in seen_names:
-                        continue
-                    seen_names.add(name_key)
-                    if row["id"] == worker_id:
-                        selected = True
-                        break
-                rows = self.db.execute(
-                    f"SELECT {columns} FROM workers WHERE retired = 0 AND id = ?", (worker_id,),
-                ).fetchall() if selected else []
+            # 只排序轻量身份字段；先去重，再按主键读取能力清单，避免数十 MB 临时排序。
+            seen_names = set()
+            selected_ids = []
+            for row in self.db.execute(
+                """SELECT id, name FROM workers WHERE retired = 0
+                   ORDER BY created_at DESC, id DESC"""
+            ):
+                name_key = _worker_name_key(row["name"])
+                if name_key in seen_names:
+                    continue
+                seen_names.add(name_key)
+                if worker_id is None or row["id"] == worker_id:
+                    selected_ids.append(row["id"])
+            rows = []
+            for selected_id in selected_ids:
+                row = self.db.execute(
+                    f"SELECT {columns} FROM workers WHERE retired = 0 AND id = ?", (selected_id,),
+                ).fetchone()
+                if row is not None:
+                    rows.append(row)
         workers = []
         seen_names = set()
         for row in rows:

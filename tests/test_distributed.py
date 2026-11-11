@@ -288,7 +288,7 @@ class ModelDispatchTest(unittest.TestCase):
             'visible': {'id': 'visible', 'created': 2, 'status': 'queued'},
             'done': {'id': 'done', 'created': 3, 'status': 'done'},
         }
-        request = SimpleNamespace(app={}, match_info={'pid': 'visible'})
+        request = SimpleNamespace(app={}, match_info={'pid': 'visible'}, query={})
         store = mock.Mock()
         store.queue_ahead_snapshot.return_value = {'private': 0, 'visible': 1}
         store.inaccessible_worker_ids.return_value = set()
@@ -1176,6 +1176,34 @@ class DistributedStoreTest(unittest.TestCase):
             self.store.db.execute("SELECT COUNT(*) FROM workers").fetchone()[0], 2
         )
         self.assertTrue(self.store.authenticate(self.worker_id, self.worker_token))
+
+    def test_worker_listing_sorts_identities_before_reading_large_capabilities(self):
+        newest = self.store.register_worker(' GPU-01 ', {
+            'node_classes': ['KSampler'], 'input_choices': {'Model': ['x' * 100000]},
+            'telemetry': {'cpu_percent': 12},
+        })['worker_id']
+        peer = self.store.register_worker('peer', {'is_primary_node': True})['worker_id']
+        for options in ({}, {'summary': True}, {'telemetry_only': True}):
+            with self.subTest(options=options):
+                statements = []
+                self.store.db.set_trace_callback(statements.append)
+                try:
+                    workers = self.store.list_workers(**options)
+                finally:
+                    self.store.db.set_trace_callback(None)
+                self.assertEqual([item['id'] for item in workers], [peer, newest])
+                reads = [sql for sql in statements if 'FROM workers' in sql]
+                identity_reads = [sql for sql in reads if 'ORDER BY' in sql]
+                self.assertEqual(len(identity_reads), 1)
+                self.assertIn('SELECT id, name FROM workers', identity_reads[0])
+                payload_reads = [sql for sql in reads if 'AND id =' in sql]
+                self.assertEqual(len(payload_reads), 2)
+                self.assertTrue(all(self.worker_id not in sql for sql in payload_reads))
+                self.assertTrue(all('ORDER BY' not in sql for sql in payload_reads))
+                for worker in workers:
+                    self.assertNotIn('token_hash', worker)
+                if not options:
+                    self.assertEqual(workers[1]['capabilities']['telemetry']['cpu_percent'], 12)
 
     def test_target_worker_listing_decodes_only_selected_latest_registration(self):
         for index in range(8):
