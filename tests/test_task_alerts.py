@@ -206,6 +206,74 @@ class AlertServiceTest(unittest.IsolatedAsyncioTestCase):
         await self.service.run_once()
         self.service.client.deliver_task_alert.assert_awaited_once()
 
+    async def test_fusion_v3_waits_until_strictly_after_sixty_minutes(self):
+        self.use_worker()
+        self.jobs['job'].update(capability='minimax_h3_fusion_v3', name='已重命名的V3任务',
+                                started=START + 3601)
+        for elapsed in (2100, 2101, 3599, 3600):
+            with self.subTest(elapsed=elapsed), patch(
+                    'server.task_alerts.time.time', return_value=START + elapsed):
+                await self.service.run_once()
+                self.assertIsNone(self.service.store.get('job'))
+        self.service.client.deliver_task_alert.assert_not_awaited()
+        self.jobs['job']['status'] = 'queued'
+        with patch('server.task_alerts.time.time', return_value=START + 3601):
+            await self.service.run_once()
+            self.assertIsNone(self.service.store.get('job'))
+            self.jobs['job']['status'] = 'running'
+            await self.service.run_once()
+            await self.service.run_once()
+        row = self.service.store.get('job')
+        self.assertEqual(row['threshold_minutes'], 60)
+        self.assertEqual(row['started_at'], START)
+        self.assertEqual(row['elapsed_seconds'], 3601)
+        self.assertTrue(row['restart_enabled'])
+        self.assertEqual(row['task_name'], '已重命名的V3任务')
+        self.service.client.deliver_task_alert.assert_awaited_once()
+        self.service.client.update_task_alert.assert_not_awaited()
+
+    async def test_other_capabilities_keep_thirty_five_minutes_even_with_v3_name(self):
+        job = self.jobs['job']
+        capabilities = ('minimax_h3_fusion_v2', 'minimax_h3_fusion_v2_bf16',
+                        'minimax_h3_fusion_v3_extra', 'unknown', None)
+        self.jobs = {f'job-{index}': dict(job, id=f'job-{index}', capability=capability,
+                                        name='H3无损融合单采V3')
+                     for index, capability in enumerate(capabilities)}
+        with patch('server.task_alerts.time.time', return_value=START + THRESHOLD_SECONDS):
+            await self.service.run_once()
+        self.assertEqual(self.service.store.active(), [])
+        await self.service.run_once()
+        self.assertEqual(self.service.client.deliver_task_alert.await_count, len(capabilities))
+        for job_id in self.jobs:
+            with self.subTest(job_id=job_id):
+                row = self.service.store.get(job_id)
+                self.assertEqual(row['threshold_minutes'], 35)
+                self.assertEqual(row['elapsed_seconds'], 2101)
+
+    async def test_fusion_v3_threshold_persists_across_retry_reopen_and_expiry(self):
+        from server.dingtalk_approval import build_task_alert_params
+
+        self.jobs['job'].update(capability='minimax_h3_fusion_v3', name='H3无损融合单采V3')
+        self.service.client.deliver_task_alert.side_effect = TimeoutError('response-lost')
+        with patch('server.task_alerts.time.time', return_value=START + 3601):
+            await self.service.run_once()
+        original = self.service.store.get('job')
+        self.assertEqual(original['threshold_minutes'], 60)
+        self.assertEqual(build_task_alert_params(original)['title'], '生成任务运行超过 60 分钟')
+        self.service.store.close()
+        self.service.store = TaskAlertStore(self.service.path)
+        with patch('server.task_alerts.time.time', return_value=START + 3632):
+            await self.service.run_once()
+            self.jobs['job']['status'] = 'done'
+            await self.service.run_once()
+        row = self.service.store.get('job')
+        self.assertEqual(row['out_track_id'], original['out_track_id'])
+        self.assertEqual(row['threshold_minutes'], 60)
+        self.assertEqual(row['status'], 'expired')
+        self.assertEqual(build_task_alert_params(row)['title'], '生成任务运行超过 60 分钟')
+        self.service.client.deliver_task_alert.assert_awaited_once()
+        self.assertEqual(self.service.client.update_task_alert.await_count, 2)
+
     async def test_once_only_trusted_submitter_and_minimal_snapshot(self):
         await self.service.run_once()
         await self.service.run_once()

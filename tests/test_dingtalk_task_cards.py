@@ -101,6 +101,22 @@ class TaskParamsTest(unittest.TestCase):
             self.assertNotIn(str(row[field]), str(params))
         self.assertNotIn('outTrackId', params)
 
+    def test_title_uses_persisted_threshold_for_every_card_state(self):
+        for threshold in (35, 60):
+            for status in dta.TASK_ALERT_STATUSES:
+                with self.subTest(threshold=threshold, status=status):
+                    params = dta.build_task_alert_params(
+                        {**ROW, 'threshold_minutes': threshold, 'status': status})
+                    self.assertEqual(params['title'], f'生成任务运行超过 {threshold} 分钟')
+                    self.assertEqual(set(params), PARAM_KEYS)
+                    self.assertTrue(all(isinstance(value, str) for value in params.values()))
+                    self.assertEqual(params['restartEnabled'],
+                                     'true' if status == 'alerting' else 'false')
+
+    def test_legacy_v3_alert_without_threshold_keeps_historical_title(self):
+        params = dta.build_task_alert_params({**ROW, 'task_name': 'H3无损融合单采V3'})
+        self.assertEqual(params['title'], '生成任务运行超过 35 分钟')
+
     def test_all_states_and_disabled_reasons(self):
         for status in dta.TASK_ALERT_STATUSES:
             with self.subTest(status=status):
@@ -138,6 +154,26 @@ class TaskParamsTest(unittest.TestCase):
 
 
 class TaskClientTest(unittest.IsolatedAsyncioTestCase):
+    async def test_sixty_minute_title_is_sent_and_updated_with_existing_template_fields(self):
+        session, calls = fake_session([
+            (200, {'accessToken': 'cached-token', 'expireIn': 7200}),
+            (200, {'success': True}), (200, {'success': True}),
+        ])
+        client = dta.DingTalkClient(ALERT_CONFIG)
+        row = {**ROW, 'threshold_minutes': 60, 'elapsed_seconds': 3601,
+               'task_name': 'H3无损融合单采V3'}
+        await client.deliver_task_alert(session, row)
+        await client.update_task_alert(session, {**row, 'status': 'expired'})
+        for method, _url, request in calls[1:]:
+            with self.subTest(method=method):
+                params = request['json']['cardData']['cardParamMap']
+                self.assertEqual(set(params), PARAM_KEYS)
+                self.assertEqual(params['title'], '生成任务运行超过 60 分钟')
+                self.assertEqual(params['elapsedText'], '1小时0分1秒')
+                self.assertEqual(request['json']['outTrackId'], ROW['out_track_id'])
+        self.assertEqual(calls[1][2]['json']['cardTemplateId'], 'task-alert.schema')
+        self.assertEqual(calls[2][2]['json']['cardData']['cardParamMap']['restartEnabled'], 'false')
+
     async def test_deliver_and_update_same_track_same_group_distinct_template_cached_token(self):
         session, calls = fake_session([
             (200, {'accessToken': 'cached-token', 'expireIn': 7200}),

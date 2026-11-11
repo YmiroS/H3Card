@@ -255,7 +255,7 @@
    },
    {
     "id": "texture_enhance",
-    "name": "角色编辑",
+    "name": "图片编辑",
     "slots": "img1+aud0+vid0"
    }
   ]
