@@ -29,7 +29,8 @@ test('test snapshots exclude runtime files, credentials and path escapes', () =>
   for (const file of ['web/features/task-panel.js', 'server/projects.py', 'tests/test_project.py',
     'tools/run-tests.cjs', 'manifests/cards.json', 'package-lock.json', 'web_dist/index.html',
     'web_dist/assets/index-ABC12345.js', 'web_dist/release.json', '启动Windows节点.bat',
-    '启动Windows节点_4090.bat', '启动Windows节点_A6000.bat', '启动Windows节点_PRO6000_96GB.bat',
+    '启动Windows节点_4090.bat', '启动Windows节点_A6000.bat', '启动Windows节点_A6000_单卡.bat',
+    '启动Windows节点_PRO6000_96GB.bat',
     '管理Windows节点自启.bat', '同步主节点模型和用户.bat', 'worker/sync_dependencies.py',
     'worker/autostart.py', 'worker/autostart.ps1']) assert.equal(sourceFile(file), true, file);
 });
@@ -49,7 +50,10 @@ test('snapshot includes uncommitted source but never copies local runtime data',
   write(source, 'data/auth.db', 'do not copy');
   write(source, 'worker/config.json', 'do not copy');
   write(source, '.env.controller', 'do not copy');
-  assert.equal(snapshot(source, target), 5);
+  write(source, '启动Windows节点_A6000_单卡.bat', '@echo off\r\nset "CUDA_VISIBLE_DEVICES=0"\r\n');
+  assert.equal(snapshot(source, target), 6);
+  assert.deepEqual(fs.readFileSync(path.join(target, '启动Windows节点_A6000_单卡.bat')),
+    fs.readFileSync(path.join(source, '启动Windows节点_A6000_单卡.bat')));
   assert.equal(fs.readFileSync(path.join(target, 'web/app.js'), 'utf8'), 'edited');
   assert.equal(fs.readFileSync(path.join(target, 'server/new.py'), 'utf8'), 'new code');
   assert.equal(fs.readFileSync(path.join(target, 'web_dist/index.html'), 'utf8'), 'built frontend');

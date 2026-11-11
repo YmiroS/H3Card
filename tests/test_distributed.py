@@ -123,6 +123,66 @@ class Pro6000CapabilityTest(unittest.TestCase):
                             HIGH_VRAM_GPU_POLICY, 1, targeted_video=targeted,
                         ), vram is not None and vram > limit)
 
+    def test_targeted_a6000_bf16_primary_device_and_vram_matrix(self):
+        def gpu(name="RTX A6000", vram=48 * 1024 ** 3, kind="cuda"):
+            return {"type": kind, "name": name, "vram_total": vram}
+
+        # 48GB 物理卡的 CUDA 可用总量可能略少，47GiB 是例外的包含边界。
+        cases = [
+            ([gpu()], True, False),
+            ([gpu("NVIDIA RTX A6000")], True, False),
+            ([gpu("cuda:0 nvidia rTx a6000 : cudaMallocAsync")], True, False),
+            ([gpu("NVIDIA RTX\t A6000")], True, False),
+            ([gpu(vram=49140 * 1024 ** 2)], True, False),
+            ([gpu(vram=47 * 1024 ** 3)], True, False),
+            ([gpu(vram=47 * 1024 ** 3 - 1)], False, False),
+            ([gpu(vram=24 * 1024 ** 3)], False, False),
+            ([gpu(vram=0)], False, False),
+            ([gpu(vram=None)], False, False),
+            ([gpu(vram="unknown")], False, False),
+            ([gpu(vram=float("inf"))], False, False),
+            ([gpu(vram=float("nan"))], False, False),
+            ([{"type": "cuda", "name": "RTX A6000"}], False, False),
+            ([gpu(kind="cpu")], False, False),
+            ([gpu(kind="CUDA")], False, False),
+            ([gpu(kind=None)], False, False),
+            ([{"name": "RTX A6000", "vram_total": 48 * 1024 ** 3}], False, False),
+            ([gpu("RTX 6000 Ada Generation")], False, False),
+            ([gpu("Quadro RTX 6000")], False, False),
+            ([gpu("Quadro 6000")], False, False),
+            ([gpu("RTX PRO 6000")], False, False),
+            ([gpu("RTX 4090")], False, False),
+            ([gpu("Other GPU")], False, False),
+            ([gpu("")], False, False),
+            ([gpu(None)], False, False),
+            ([gpu("RTX A60000")], False, False),
+            ([gpu("XRTX A6000")], False, False),
+            ([gpu("RTX A6000X")], False, False),
+            ([gpu("RTX 4090", 24 * 1024 ** 3), gpu()], False, False),
+            ([gpu("RTX PRO 6000"), gpu()], False, False),
+            ([gpu(kind="cpu"), gpu()], False, False),
+            ([None, gpu()], False, False),
+            ([gpu(), gpu("RTX 4090", 24 * 1024 ** 3)], True, False),
+            ([], False, False), (None, False, False),
+            ([None], False, False), ({"0": gpu()}, False, False),
+            # 原有 >80GiB 规则不依赖定向标记或 A6000 型号。
+            ([gpu(vram=80 * 1024 ** 3)], True, False),
+            ([gpu(vram=80 * 1024 ** 3 + 1)], True, True),
+            ([gpu("Other GPU", 80 * 1024 ** 3)], False, False),
+            ([gpu("Other GPU", 80 * 1024 ** 3 + 1)], True, True),
+            ([gpu(None, 96 * 1024 ** 3)], True, True),
+            ([gpu(vram=96 * 1024 ** 3, kind="cpu")], False, False),
+        ]
+        for cid in sorted(BF16_HIGH_VRAM_CAPABILITIES):
+            for devices, targeted_allowed, default_allowed in cases:
+                for targeted in (False, True):
+                    for policy in (None, HIGH_VRAM_GPU_POLICY):
+                        with self.subTest(capability=cid, devices=devices,
+                                          targeted=targeted, policy=policy):
+                            self.assertEqual(can_run_capability(
+                                cid, devices, policy, 1, targeted_video=targeted,
+                            ), targeted_allowed if targeted else default_allowed)
+
 
 class ModelDispatchTest(unittest.TestCase):
     def setUp(self):
@@ -478,6 +538,43 @@ class ModelDispatchTest(unittest.TestCase):
                         self.store.finish("fusion", self.worker_id, claim["lease_token"], "done",
                                           capacity_released=True)
                     self.store.remove_job("fusion")
+
+    def test_a6000_bf16_exception_requires_target_and_trusted_video_in_acquire(self):
+        caps = copy.deepcopy(self.caps)
+        caps["devices"][0].update(name="NVIDIA RTX A6000", vram_total=49140 * 1024 ** 2)
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities=caps)
+        video_spec = {"expected": {"kind": "video"}}
+        cases = [
+            (None, video_spec, False),
+            (self.worker_id, None, False),
+            (self.worker_id, {}, False),
+            (self.worker_id, {"expected": {}}, False),
+            (self.worker_id, {"expected": {"kind": "image"}}, False),
+            (self.worker_id, {"expected": {"kind": "text"}}, False),
+            (self.worker_id, {"expected": "video"}, False),
+            (self.worker_id, "video", False),
+            (self.worker_id, video_spec, True),
+        ]
+        for cid in sorted(BF16_HIGH_VRAM_CAPABILITIES):
+            for target, spec, expected in cases:
+                with self.subTest(capability=cid, target=target, spec=spec):
+                    # 伪造的旧字段不能代替可信的视频输出类型或目标节点。
+                    self.enqueue(capability=cid, target_worker_id=target, capacity_spec=spec,
+                                 outputType="video", targeted_video=True,
+                                 gpu_policy=HIGH_VRAM_GPU_POLICY, duration_seconds=1)
+                    claim = self.store.acquire(self.worker_id)
+                    try:
+                        self.assertEqual(claim is not None, expected)
+                        if claim:
+                            self.assertEqual(claim["job_id"], "fusion")
+                            self.assertEqual(claim["payload"]["target_worker_id"], self.worker_id)
+                        else:
+                            self.assertEqual(self.store.dispatch_status("fusion"), "queued")
+                    finally:
+                        if claim:
+                            self.store.finish("fusion", self.worker_id, claim["lease_token"], "done",
+                                              capacity_released=True)
+                        self.store.remove_job("fusion")
 
     def test_pro_bf16_actual_graph_still_requires_each_exact_model(self):
         self.graph = json.loads((ROOT / "graphs/minimax_h3_ref_2pass_bf16.api.json").read_text(encoding="utf-8"))
