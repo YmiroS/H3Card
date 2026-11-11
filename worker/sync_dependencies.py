@@ -97,6 +97,7 @@ def ensure_dependencies(comfy_root, *, deadline):
 
 LOCAL_EDIT_NODES = (
     "ChoukaLocalCrop", "ChoukaLocalStitch", "ChoukaCloudImageEdit", "ChoukaLocalSaveImage",
+    "ChoukaLocalModelSwitch",
 )
 
 

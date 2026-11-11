@@ -84,6 +84,37 @@ class ChoukaCloudImageEdit:
         return ticket_cache_key(callback_token)
 
 
+class ChoukaLocalModelSwitch:
+    BRANCHES = {"flux": "flux_image", "gpt_image": "gpt_image", "banana": "banana_image"}
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {"required": {"model": (["flux", "gpt_image", "banana"],)}, "optional": {
+            name: ("IMAGE", {"lazy": True}) for name in cls.BRANCHES.values()
+        }}
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    FUNCTION = "select"
+    CATEGORY = "Chouka/local_edit"
+
+    def check_lazy_status(self, model, flux_image=None, gpt_image=None, banana_image=None):
+        name = self.BRANCHES.get(model)
+        if name is None:
+            raise ValueError("unsupported local edit model")
+        images = {"flux_image": flux_image, "gpt_image": gpt_image, "banana_image": banana_image}
+        return [name] if images[name] is None else []
+
+    def select(self, model, flux_image=None, gpt_image=None, banana_image=None):
+        name = self.BRANCHES.get(model)
+        if name is None:
+            raise ValueError("unsupported local edit model")
+        image = {"flux_image": flux_image, "gpt_image": gpt_image, "banana_image": banana_image}[name]
+        if image is None:
+            raise ValueError("selected local edit branch has no image")
+        return (image,)
+
+
 class ChoukaLocalSaveImage:
     """Core SaveImage with copied/redacted prompt metadata, never task tickets.
 
@@ -121,10 +152,12 @@ NODE_CLASS_MAPPINGS = {
     "ChoukaLocalStitch": ChoukaLocalStitch,
     "ChoukaCloudImageEdit": ChoukaCloudImageEdit,
     "ChoukaLocalSaveImage": ChoukaLocalSaveImage,
+    "ChoukaLocalModelSwitch": ChoukaLocalModelSwitch,
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
     "ChoukaLocalCrop": "Chouka Local Crop",
     "ChoukaLocalStitch": "Chouka Local Stitch",
     "ChoukaCloudImageEdit": "Chouka Cloud Image Edit",
     "ChoukaLocalSaveImage": "Chouka Local Save Image (No Tickets)",
+    "ChoukaLocalModelSwitch": "Chouka Local Model Switch (Lazy)",
 }

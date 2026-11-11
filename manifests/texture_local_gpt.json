@@ -11,15 +11,15 @@
   "videos": 0,
   "slots": "img3+aud0+vid0",
   "slotLimits": {"image": {"min": 2, "max": 3}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
-  "graph": "graphs/texture_local_gpt.api.json",
+  "graph": "graphs/texture_local_edit.api.json",
   "output": {"node": "99"},
   "rewrite": null,
-  "note": "仅供编辑器，通过普通Comfy工作流分发。图1原图，图2独立黑白mask PNG（白=修改、黑=保护），图3可选材质参考。megapixels控制局部正方形生成预算：按32对齐、512–2048，裁片等比补边；feather单位为原图像素。只保存原尺寸最终整图。Cloud节点固定20；api_generate必须注入callback_url及每任务不同的短期单次callback_token，票据绑定gpt_image及prompt。节点仅发送image/reference，服务端决定provider/prompt；不接收云API key。Comfy进程须显式配置CHOUKA_LOCAL_EDIT_TRUSTED_ORIGINS（逗号分隔可信origin），回调固定/agent/v1/local-edit/cloud，不重定向或重试。回调丢失不得自动重试。未调用付费模型。",
+  "note": "仅供编辑器，通过普通Comfy工作流分发。图1原图，图2独立黑白mask PNG（白=修改、黑=保护），图3可选材质参考。megapixels控制局部正方形生成预算：按32对齐、512–2048，裁片等比补边；feather单位为原图像素。只保存原尺寸最终整图。共用texture_local_edit完整工作流，#80惰性模型开关由服务端选择gpt_image，仅执行GPT分支，不裁剪节点。Cloud节点固定#30（GPT）/#31（Banana）；仅向#30注入callback_url及每任务不同的短期单次callback_token，票据绑定gpt_image及prompt；未选分支保持无票据。完整图预检仍要求所有节点类型和模型配置有效。节点仅发送image/reference，服务端决定provider/prompt；不接收云API key。Comfy进程须显式配置CHOUKA_LOCAL_EDIT_TRUSTED_ORIGINS（逗号分隔可信origin），回调固定/agent/v1/local-edit/cloud，不重定向或重试。回调丢失不得自动重试。未调用付费模型。",
   "inputs": [
     {"key": "images[0]", "label": "原图", "type": "image", "required": true, "target": {"node": "1", "input": "image", "kind": "upload_image"}},
     {"key": "images[1]", "label": "独立蒙版 PNG（白=修改）", "type": "image", "required": true, "target": {"node": "2", "input": "image", "kind": "upload_image"}},
-    {"key": "images[2]", "label": "材质参考（可选）", "type": "image", "required": false, "target": {"node": "3", "input": "image", "kind": "upload_image"}, "dropIfEmpty": [{"node": "20", "input": "reference"}]},
-    {"key": "prompt", "label": "修改提示词", "type": "textarea", "default": "Replace the selected material in image 1 using image 2 when supplied. Preserve shape, lighting and surrounding details.", "target": {"node": "20", "input": "prompt"}},
+    {"key": "images[2]", "label": "材质参考（可选）", "type": "image", "required": false, "target": {"node": "3", "input": "image", "kind": "upload_image"}, "dropIfEmpty": [{"node": "21", "input": "latent"}, {"node": "22", "input": "latent"}, {"node": "30", "input": "reference"}, {"node": "31", "input": "reference"}]},
+    {"key": "prompt", "label": "修改提示词", "type": "textarea", "default": "Replace the selected material in image 1 using image 2 when supplied. Preserve shape, lighting and surrounding details.", "target": {"node": "14", "input": "text"}},
     {"key": "megapixels", "label": "局部生成预算（MP）", "type": "number", "min": 0.25, "max": 16.0, "step": 0.01, "default": 1.0, "target": {"node": "10", "input": "megapixels", "vtype": "FLOAT"}},
     {"key": "feather", "label": "融合羽化（原图像素）", "type": "number", "min": 0, "max": 128, "step": 1, "default": 32, "target": {"node": "10", "input": "feather", "vtype": "INT"}}
   ]

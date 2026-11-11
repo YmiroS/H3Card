@@ -49,23 +49,37 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.reference = self.add_image("reference.png", png("green", (2, 3)))
         self.update_card(assets={"images[0]": self.base}, job="old-job", outputs=[], history=[{"old": True}],
                          director_shot={"id": "shot-1"})
+        self.template = {
+            "1": {"class_type": "LoadImage", "inputs": {"image": ""}},
+            "2": {"class_type": "LoadImageMask", "inputs": {"image": "", "channel": "red"}},
+            "3": {"class_type": "LoadImage", "inputs": {"image": "optional.png"}},
+            "10": {"class_type": "ChoukaLocalCrop", "inputs": {"image": ["1", 0], "mask": ["2", 0], "megapixels": 1, "feather": 16}},
+            "11": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux.safetensors", "weight_dtype": "default"}},
+            "12": {"class_type": "CLIPLoader", "inputs": {"clip_name": "clip.safetensors", "type": "flux2", "device": "default"}},
+            "13": {"class_type": "VAELoader", "inputs": {"vae_name": "vae.safetensors"}},
+            "14": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["12", 0], "text": ""}},
+            "15": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["14", 0]}},
+            "16": {"class_type": "VAEEncode", "inputs": {"pixels": ["10", 0], "vae": ["13", 0]}},
+            "17": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["14", 0], "latent": ["16", 0]}},
+            "18": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["15", 0], "latent": ["16", 0]}},
+            "19": {"class_type": "ImageScaleToTotalPixels", "inputs": {"image": ["3", 0], "upscale_method": "bicubic", "megapixels": 1, "resolution_steps": 32}},
+            "20": {"class_type": "VAEEncode", "inputs": {"pixels": ["19", 0], "vae": ["13", 0]}},
+            "21": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["17", 0], "latent": ["20", 0]}},
+            "22": {"class_type": "ReferenceLatent", "inputs": {"conditioning": ["18", 0], "latent": ["20", 0]}},
+            "23": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": ["10", 2], "height": ["10", 3], "batch_size": 1}},
+            "24": {"class_type": "KSampler", "inputs": {"model": ["11", 0], "positive": ["21", 0], "negative": ["22", 0], "latent_image": ["23", 0], "seed": 0, "steps": 4, "cfg": 1, "sampler_name": "euler", "scheduler": "simple", "denoise": 1}},
+            "25": {"class_type": "VAEDecode", "inputs": {"samples": ["24", 0], "vae": ["13", 0]}},
+            "30": {"class_type": "ChoukaCloudImageEdit", "inputs": {"image": ["10", 0], "prompt": "", "provider": "gpt_image", "callback_url": "", "callback_token": "", "reference": ["3", 0]}},
+            "31": {"class_type": "ChoukaCloudImageEdit", "inputs": {"image": ["10", 0], "prompt": "", "provider": "banana", "callback_url": "", "callback_token": "", "reference": ["3", 0]}},
+            "80": {"class_type": "ChoukaLocalModelSwitch", "inputs": {"model": "flux", "flux_image": ["25", 0], "gpt_image": ["30", 0], "banana_image": ["31", 0]}},
+            "90": {"class_type": "ChoukaLocalStitch", "inputs": {"generated": ["80", 0], "context": ["10", 1]}},
+            "99": {"class_type": "ChoukaLocalSaveImage", "inputs": {"images": ["90", 0], "filename_prefix": "Chouka/local_edit"}},
+        }
+        self.graph_path = self.root / "texture_local_edit.api.json"
+        self.graph_path.write_text(json.dumps(self.template), encoding="utf-8")
         self.caps = {}
         for cid in CAPABILITIES:
-            provider = {"texture_local_gpt": "gpt_image", "texture_local_banana": "banana"}.get(cid)
-            graph = {
-                "1": {"class_type": "LoadImage", "inputs": {"image": ""}},
-                "2": {"class_type": "LoadImage", "inputs": {"image": ""}},
-                "3": {"class_type": "LoadImage", "inputs": {"image": ""}},
-                "10": {"class_type": "LocalCrop", "inputs": {"image": ["1", 0], "mask": ["2", 0],
-                                                                    "megapixels": 1, "feather": 16}},
-                "20": {"class_type": "ChoukaCloudImageEdit" if provider else "FluxEdit",
-                       "inputs": {"image": ["10", 0], "prompt": "", **({"provider": provider,
-                                  "callback_url": "", "callback_token": "", "reference": ["3", 0]} if provider else {})}},
-                "30": {"class_type": "SaveImage", "inputs": {"images": ["20", 0], "filename_prefix": "texture"}},
-            }
-            filename = cid + ".json"
-            (self.root / filename).write_text(json.dumps(graph), encoding="utf-8")
-            self.caps[cid] = {"id": cid, "name": cid, "graph": filename, "editor_only": True,
+            self.caps[cid] = {"id": cid, "name": cid, "graph": self.graph_path.name, "editor_only": True,
                               "execution": "graph", "_graph_ok": True, "outputType": "image", "inputs": [
                 {"key": "images[0]", "label": "底图", "type": "image", "required": True,
                  "target": {"node": "1", "input": "image"}},
@@ -73,8 +87,9 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
                  "target": {"node": "2", "input": "image"}},
                 {"key": "images[2]", "label": "参考图", "type": "image",
                  "target": {"node": "3", "input": "image"},
-                 "dropIfEmpty": [{"node": "20", "input": "reference"}] if provider else []},
-                {"key": "prompt", "label": "提示词", "type": "textarea", "target": {"node": "20", "input": "prompt"}},
+                 "dropIfEmpty": [{"node": "21", "input": "latent"}, {"node": "22", "input": "latent"},
+                                 {"node": "30", "input": "reference"}, {"node": "31", "input": "reference"}]},
+                {"key": "prompt", "label": "提示词", "type": "textarea", "target": {"node": "14", "input": "text"}},
                 {"key": "megapixels", "label": "局部预算", "type": "number", "target": {"node": "10", "input": "megapixels", "vtype": "FLOAT"}},
                 {"key": "feather", "label": "羽化", "type": "number", "target": {"node": "10", "input": "feather", "vtype": "FLOAT"}},
             ]}
@@ -104,7 +119,8 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200, await response.text())
         result = await response.json()
         self.assertEqual(before, self.saved_card())
-        token = self.graphs[-1]["20"]["inputs"]["callback_token"]
+        node_id = "31" if self.body["capability"] == "texture_local_banana" else "30"
+        token = self.graphs[-1][node_id]["inputs"]["callback_token"]
         self.assertNotIn(token, json.dumps(result))
         self.assertNotIn(token, json.dumps(app.JOBS))
         self.assertNotIn("test-secret", json.dumps(self.graphs))
@@ -184,7 +200,7 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
     async def test_graph_ticket_private_and_card_not_written(self):
         token, result = await self.issue()
         self.assertEqual(self.submit.call_count, 1)
-        inputs = self.graphs[-1]["20"]["inputs"]
+        inputs = self.graphs[-1]["30"]["inputs"]
         self.assertEqual(inputs["provider"], "gpt_image")
         self.assertEqual(inputs["callback_url"], f"http://127.0.0.1:{app.PORT}/agent/v1/local-edit/cloud")
         job = await (await self.client.get("/api/job/" + result["id"])).json()
@@ -195,11 +211,17 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
     async def test_flux_normal_graph_without_ticket(self):
         self.body["capability"] = "texture_local_flux"
         before = self.saved_card()
-        response = await self.generate()
+        with mock.patch.object(cloud_images, "load") as gpt_load, mock.patch.object(cloud_banana, "load") as banana_load:
+            response = await self.generate()
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(self.saved_card(), before)
         self.assertEqual(self.api.tickets, {})
-        self.assertNotIn("callback_token", self.graphs[-1]["20"]["inputs"])
+        self.assertEqual(self.graphs[-1]["80"]["inputs"]["model"], "flux")
+        for node_id in ("30", "31"):
+            self.assertEqual(self.graphs[-1][node_id]["inputs"]["callback_token"], "")
+            self.assertEqual(self.graphs[-1][node_id]["inputs"]["callback_url"], "")
+        gpt_load.assert_not_called()
+        banana_load.assert_not_called()
 
     async def test_gpt_callback_headers_dimensions_reference_png_and_one_use(self):
         token, _ = await self.issue(reference=True)
@@ -431,21 +453,180 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
     async def test_graph_submission_failure_invalidates_ticket_and_redacts_error(self):
         async def fail(application, graph, **kwargs):
             self.graphs.append(copy.deepcopy(graph))
-            raise web.HTTPBadRequest(text=graph["20"]["inputs"]["callback_token"])
+            raise web.HTTPBadRequest(text=graph["30"]["inputs"]["callback_token"])
         self.submit.side_effect = fail
         response = await self.generate()
         self.assertEqual(response.status, 400)
         self.assertFalse(self.api.tickets)
-        token = self.graphs[-1]["20"]["inputs"]["callback_token"]
+        token = self.graphs[-1]["30"]["inputs"]["callback_token"]
         self.assertNotIn(token, await response.text())
         self.assertNotIn(token, json.dumps(app.JOBS))
         self.assertEqual((await self.callback(token)).status, 401)
         self.assertEqual(self.submit.call_count, 1)
 
     async def test_dry_run_never_issues_or_returns_ticket(self):
-        response = await self.generate({**self.body, "dry_run": True})
-        self.assertEqual(response.status, 200, await response.text())
-        self.assertNotIn("lt_", await response.text())
+        with mock.patch.object(cloud_images, "load") as gpt_load, mock.patch.object(cloud_banana, "load") as banana_load:
+            for capability, model in (("texture_local_flux", "flux"), ("texture_local_gpt", "gpt_image"),
+                                      ("texture_local_banana", "banana")):
+                for reference in (False, True):
+                    with self.subTest(capability=capability, reference=reference):
+                        self.body["capability"] = capability
+                        if reference:
+                            self.body["assets"]["images[2]"] = self.reference["ref"]
+                        else:
+                            self.body["assets"].pop("images[2]", None)
+                        response = await self.generate({**self.body, "dry_run": True})
+                        self.assertEqual(response.status, 200, await response.text())
+                        self.assertNotIn("lt_", await response.text())
+                        changed = (await response.json())["changed"]
+                        for node_id in ("14", "30", "31"):
+                            field = "text" if node_id == "14" else "prompt"
+                            self.assertEqual(changed[f"#{node_id}.{field}"][1], self.body["params"]["prompt"])
+                        if model != "flux":
+                            self.assertEqual(changed["#80.model"], ["flux", model])
+                        for key in ("#21.latent", "#22.latent", "#30.reference", "#31.reference"):
+                            self.assertEqual(key in changed, not reference)
+                        self.assertFalse(self.api.tickets)
+            gpt_load.assert_not_called()
+            banana_load.assert_not_called()
+        self.submit.assert_not_called()
+        self.assertFalse(self.api.previews)
+
+    async def test_each_capability_retains_full_graph_and_only_selected_cloud_ticket(self):
+        for capability, model, selected in (("texture_local_flux", "flux", None),
+                                             ("texture_local_gpt", "gpt_image", "30"),
+                                             ("texture_local_banana", "banana", "31")):
+            for reference in (False, True):
+                with self.subTest(capability=capability, reference=reference):
+                    self.body["capability"] = capability
+                    self.body["params"]["prompt"] = "  可信编辑提示词  "
+                    if reference:
+                        self.body["assets"]["images[2]"] = self.reference["ref"]
+                    else:
+                        self.body["assets"].pop("images[2]", None)
+                    previous = len(self.api.tickets)
+                    with mock.patch.object(cloud_images, "load", wraps=cloud_images.load) as gpt_load, \
+                            mock.patch.object(cloud_banana, "load") as banana_load:
+                        response = await self.generate()
+                    self.assertEqual(response.status, 200, await response.text())
+                    graph = self.graphs[-1]
+                    self.assertEqual(set(graph), set(self.template))
+                    for node_id in self.template:
+                        self.assertEqual(graph[node_id]["class_type"], self.template[node_id]["class_type"])
+                    self.assertEqual(graph["80"]["inputs"], {**self.template["80"]["inputs"], "model": model})
+                    self.assertEqual(graph["90"], self.template["90"])
+                    self.assertEqual(graph["99"], self.template["99"])
+                    for node_id in (str(n) for n in range(11, 26)):
+                        expected = copy.deepcopy(self.template[node_id])
+                        if node_id == "14":
+                            expected["inputs"]["text"] = self.body["params"]["prompt"]
+                        if node_id in ("21", "22") and not reference:
+                            del expected["inputs"]["latent"]
+                        self.assertEqual(graph[node_id], expected)
+                    self.assertEqual(len(self.api.tickets), previous + (selected is not None))
+                    self.assertEqual(gpt_load.call_count, int(selected == "30"))
+                    self.assertEqual(banana_load.call_count, int(selected == "31"))
+                    for node_id, provider in (("30", "gpt_image"), ("31", "banana")):
+                        inputs = graph[node_id]["inputs"]
+                        self.assertEqual(inputs["provider"], provider)
+                        self.assertEqual(inputs["prompt"], "可信编辑提示词")
+                        self.assertEqual(inputs["image"], ["10", 0])
+                        self.assertEqual("reference" in inputs, reference)
+                        if reference:
+                            self.assertEqual(inputs["reference"], ["3", 0])
+                        if node_id == selected:
+                            digest = hashlib.sha256(inputs["callback_token"].encode()).hexdigest()
+                            self.assertEqual(self.api.tickets[digest]["provider"], provider)
+                            self.assertEqual(self.api.tickets[digest]["prompt"], "可信编辑提示词")
+                        else:
+                            self.assertEqual(inputs["callback_token"], "")
+                            self.assertEqual(inputs["callback_url"], "")
+
+    async def test_selector_is_from_context_not_template_or_request(self):
+        graph = copy.deepcopy(self.template)
+        graph["80"]["inputs"]["model"] = ["30", 0]
+        self.graph_path.write_text(json.dumps(graph), encoding="utf-8")
+        for capability, model in (("texture_local_flux", "flux"), ("texture_local_gpt", "gpt_image"),
+                                  ("texture_local_banana", "banana")):
+            self.body["capability"] = capability
+            response = await self.generate()
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual(self.graphs[-1]["80"]["inputs"]["model"], model)
+        for key, value in (("model", "banana"), ("provider", "gpt_image"),
+                           ("selector", ["31", 0]), ("80.model", "banana"),
+                           ("callback_token", "attacker"), ("flux_image", ["31", 0])):
+            response = await self.generate({**self.body, "params": {"prompt": "ok", key: value}})
+            self.assertEqual(response.status, 400, await response.text())
+        context = {"provider": "gpt_image", "prompt": "ok", "allow_reference": True}
+        graph = copy.deepcopy(self.template)
+        graph["14"]["inputs"]["text"] = "ok"
+        self.api.configure_graph(graph, context)
+        self.api.validate_graph(graph, context)
+        graph["80"]["inputs"]["model"] = "banana"
+        with self.assertRaises(web.HTTPBadRequest):
+            self.api.validate_graph(graph, context)
+        with self.assertRaises(web.HTTPBadRequest):
+            self.api.configure_graph(graph, {**context, "provider": "attacker"})
+
+    async def test_cloud_authorization_fields_are_rejected_not_repaired(self):
+        for capability in CAPABILITIES:
+            self.body["capability"] = capability
+            for node_id in ("30", "31"):
+                for field, value in (("provider", "flux"), ("provider", "banana" if node_id == "30" else "gpt_image"),
+                                     ("callback_url", "http://attacker/"), ("callback_token", "attacker"),
+                                     ("api_key", "secret")):
+                    with self.subTest(capability=capability, node=node_id, field=field):
+                        graph = copy.deepcopy(self.template)
+                        graph[node_id]["inputs"][field] = value
+                        self.graph_path.write_text(json.dumps(graph), encoding="utf-8")
+                        response = await self.generate({**self.body, "dry_run": True})
+                        self.assertEqual(response.status, 400, await response.text())
+                        context = {"provider": None, "prompt": "trusted", "allow_reference": True}
+                        self.api.configure_graph(graph, context)
+                        self.assertEqual(graph[node_id]["inputs"][field], value)
+                        with self.assertRaises(web.HTTPBadRequest):
+                            self.api.validate_graph(graph, context)
+        self.assertFalse(self.api.tickets)
+        self.submit.assert_not_called()
+
+    async def test_wrong_connections_extra_outputs_and_nodes_rejected_before_dispatch(self):
+        mutations = [
+            ("30", "image", ["1", 0]), ("31", "image", ["10", 1]),
+            ("30", "reference", ["1", 0]), ("31", "reference", ["30", 0]),
+            ("80", "flux_image", ["30", 0]), ("80", "gpt_image", ["31", 0]),
+            ("80", "banana_image", ["30", 0]), ("90", "generated", ["31", 0]),
+            ("90", "context", ["10", 0]), ("99", "images", ["30", 0]),
+            ("16", "pixels", ["31", 0]), ("10", "image", ["30", 0]),
+            ("21", "latent", ["16", 0]), ("22", "latent", ["16", 0]),
+            ("99", "prompt", "attacker"), ("99", "extra_pnginfo", {"ticket": "unsafe"}),
+        ]
+        graphs = []
+        for node_id, field, value in mutations:
+            graph = copy.deepcopy(self.template)
+            graph[node_id]["inputs"][field] = value
+            graphs.append((f"#{node_id}.{field}", graph))
+        for node_id, class_type in (("30", "SaveImage"), ("31", "PreviewImage"),
+                                    ("99", "SaveImage"), ("80", "ImageSwitch")):
+            graph = copy.deepcopy(self.template)
+            graph[node_id]["class_type"] = class_type
+            graphs.append((f"#{node_id} class", graph))
+        for class_type in ("SaveImage", "PreviewImage", "ChoukaCloudImageEdit", "ChoukaLocalModelSwitch", "ChoukaLocalSaveImage"):
+            graph = copy.deepcopy(self.template)
+            graph["100"] = {"class_type": class_type, "inputs": {"images": ["31", 0]}}
+            graphs.append((f"extra {class_type}", graph))
+        for node_id in ("11", "30", "31", "80", "99"):
+            graph = copy.deepcopy(self.template)
+            del graph[node_id]
+            graphs.append((f"missing #{node_id}", graph))
+        self.body["assets"]["images[2]"] = self.reference["ref"]
+        for capability in CAPABILITIES:
+            self.body["capability"] = capability
+            for name, graph in graphs:
+                with self.subTest(capability=capability, mutation=name):
+                    self.graph_path.write_text(json.dumps(graph), encoding="utf-8")
+                    for dry_run in (False, True):
+                        response = await self.generate({**self.body, "dry_run": dry_run})
+                        self.assertEqual(response.status, 400, await response.text())
         self.assertFalse(self.api.tickets)
         self.submit.assert_not_called()
 
@@ -453,10 +634,9 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.caps["texture_local_gpt"]["editor_only"] = False
         self.assertEqual((await self.generate()).status, 400)
         self.caps["texture_local_gpt"]["editor_only"] = True
-        graph_path = self.root / "texture_local_gpt.json"
-        graph = json.loads(graph_path.read_text())
-        graph["20"]["inputs"]["provider"] = "banana"
-        graph_path.write_text(json.dumps(graph))
+        graph = copy.deepcopy(self.template)
+        graph["30"]["inputs"]["provider"] = "banana"
+        self.graph_path.write_text(json.dumps(graph), encoding="utf-8")
         self.assertEqual((await self.generate()).status, 400)
         self.submit.assert_not_called()
 
@@ -466,7 +646,11 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         (self.root / "graphs").mkdir(exist_ok=True)
         for capability in CAPABILITIES:
             cap = json.loads((fixture.ROOT / "manifests" / (capability + ".json")).read_text(encoding="utf-8"))
+            self.assertEqual(cap["graph"], "graphs/texture_local_edit.api.json")
+            self.assertEqual(next(spec["target"] for spec in cap["inputs"] if spec["key"] == "prompt"),
+                             {"node": "14", "input": "text"})
             (self.root / cap["graph"]).write_bytes((fixture.ROOT / cap["graph"]).read_bytes())
+            template = json.loads((self.root / cap["graph"]).read_text(encoding="utf-8"))
             cap["_graph_ok"] = True
             app.CAPS[capability] = cap
             for reference in (False, True):
@@ -480,8 +664,13 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
                 graph = self.graphs[-1]
                 self.assertEqual(graph["1"]["inputs"]["image"], self.base["ref"])
                 self.assertEqual(graph["2"]["inputs"]["image"], self.mask["ref"])
-                if capability != "texture_local_flux":
-                    self.assertEqual("reference" in graph["20"]["inputs"], reference)
+                self.assertEqual(set(graph), set(template))
+                self.assertEqual(graph["80"]["inputs"]["model"],
+                                 {"texture_local_flux": "flux", "texture_local_gpt": "gpt_image", "texture_local_banana": "banana"}[capability])
+                for node_id in ("30", "31"):
+                    self.assertEqual("reference" in graph[node_id]["inputs"], reference)
+                for node_id in ("21", "22"):
+                    self.assertEqual("latent" in graph[node_id]["inputs"], reference)
             for megapixels in (.25, 3840 * 2160 / 1024 ** 2, 16):
                 self.body["params"]["megapixels"] = megapixels
                 response = await self.generate({**self.body, "dry_run": True})
@@ -569,7 +758,7 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         async def submit(application, graph, prompt_id=None, **kwargs):
             nonlocal pending
             self.graphs.append(copy.deepcopy(graph))
-            pending = asyncio.create_task(self.callback(graph["20"]["inputs"]["callback_token"]))
+            pending = asyncio.create_task(self.callback(graph["30"]["inputs"]["callback_token"]))
             # Let the callback enter auth/source checks before /prompt acknowledges.
             await asyncio.sleep(0)
             return prompt_id
@@ -595,13 +784,36 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.submit.assert_not_called()
         store.enqueue.assert_called_once()
         pid, payload, required_nodes = store.enqueue.call_args.args
-        token = payload["graph"]["20"]["inputs"]["callback_token"]
+        token = payload["graph"]["30"]["inputs"]["callback_token"]
         self.assertEqual(payload["model_family"], "cloud_local_gpt")
         self.assertNotIn(token, json.dumps(payload["capacity_spec"]))
         self.assertNotIn(token, await result.text())
         self.assertNotIn(token, json.dumps(app.JOBS))
-        self.assertIn("ChoukaCloudImageEdit", required_nodes)
+        self.assertEqual(set(payload["graph"]), set(self.template))
+        self.assertEqual(set(required_nodes), {node["class_type"] for node in self.template.values()})
+        self.assertEqual(payload["graph"]["31"]["inputs"]["callback_token"], "")
         self.assertIn(hashlib.sha256(token.encode()).hexdigest(), self.api.tickets)
+
+    async def test_controller_all_caps_keep_full_required_nodes_and_model_families(self):
+        self.api.controller = True
+        self.application["http_redirect_origin"] = str(self.client.make_url("/")).rstrip("/")
+        store = mock.Mock()
+        async def response(request, body, pid, project, linked_card):
+            return web.json_response(app.JOBS[pid])
+        with mock.patch.object(app, "CONTROLLER_MODE", True), mock.patch.object(app, "distributed_store", return_value=store), \
+                mock.patch.object(app, "generation_job_response", side_effect=response):
+            for capability, family in (("texture_local_flux", "flux2_klein"),
+                                       ("texture_local_gpt", "cloud_local_gpt"),
+                                       ("texture_local_banana", "cloud_local_banana")):
+                with self.subTest(capability=capability):
+                    self.body["capability"] = capability
+                    result = await self.generate()
+                    self.assertEqual(result.status, 200, await result.text())
+                    _, payload, required_nodes = store.enqueue.call_args.args
+                    self.assertEqual(set(payload["graph"]), set(self.template))
+                    self.assertEqual(set(required_nodes), {node["class_type"] for node in self.template.values()})
+                    self.assertEqual(payload["model_family"], family)
+        self.submit.assert_not_called()
 
     async def test_controller_enqueue_failure_invalidates_ticket(self):
         self.api.controller = True
@@ -646,7 +858,7 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(token, json.dumps(redact({"error": "Bearer " + token, "nodes": [token]})))
         # The same graph ticket may appear in Comfy's echoed execution error.
         await app.handle_event(self.application["session"], {"type": "execution_error", "data": {
-            "prompt_id": result["id"], "node_id": "20", "node_type": "ChoukaCloudImageEdit", "exception_message": token}},
+            "prompt_id": result["id"], "node_id": "30", "node_type": "ChoukaCloudImageEdit", "exception_message": token}},
             app=self.application)
         self.assertNotIn(token, json.dumps(app.JOBS))
 

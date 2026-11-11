@@ -29,7 +29,8 @@ from PIL import Image
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from comfy_nodes.chouka_local_edit import (
-    ChoukaCloudImageEdit, ChoukaLocalCrop, ChoukaLocalStitch, ChoukaLocalSaveImage, NODE_CLASS_MAPPINGS,
+    ChoukaCloudImageEdit, ChoukaLocalCrop, ChoukaLocalStitch, ChoukaLocalSaveImage,
+    ChoukaLocalModelSwitch, NODE_CLASS_MAPPINGS,
 )
 from comfy_nodes.chouka_local_edit import cloud
 from comfy_nodes.chouka_local_edit.geometry import (
@@ -182,7 +183,7 @@ class GeometryTests(unittest.TestCase):
 @unittest.skipIf(torch is None, "torch unavailable: pure numpy geometry still tested")
 class TorchNodeTests(unittest.TestCase):
     def test_ports_and_real_cpu_tensor_crop_stitch(self):
-        self.assertEqual(set(NODE_CLASS_MAPPINGS), {"ChoukaLocalCrop", "ChoukaLocalStitch", "ChoukaCloudImageEdit", "ChoukaLocalSaveImage"})
+        self.assertEqual(set(NODE_CLASS_MAPPINGS), {"ChoukaLocalCrop", "ChoukaLocalStitch", "ChoukaCloudImageEdit", "ChoukaLocalSaveImage", "ChoukaLocalModelSwitch"})
         self.assertEqual(ChoukaLocalCrop.RETURN_TYPES, ("IMAGE", "CHOUKA_LOCAL_EDIT_CONTEXT", "INT", "INT"))
         base, mask = image_mask()
         base_tensor = torch.from_numpy(base)
@@ -214,6 +215,31 @@ class TorchNodeTests(unittest.TestCase):
         np.testing.assert_array_equal(output.numpy(), base)
         self.assertIsInstance(edit.call_args.args[0], np.ndarray)
         self.assertIsInstance(edit.call_args.args[-1], np.ndarray)
+
+
+class LazyModelSwitchTests(unittest.TestCase):
+    def test_only_selected_branch_is_requested_and_returned(self):
+        switch = ChoukaLocalModelSwitch()
+        inputs = switch.INPUT_TYPES()
+        self.assertEqual(inputs["required"]["model"][0], ["flux", "gpt_image", "banana"])
+        for model, name in switch.BRANCHES.items():
+            with self.subTest(model=model):
+                self.assertEqual(inputs["optional"][name], ("IMAGE", {"lazy": True}))
+                self.assertEqual(switch.check_lazy_status(model), [name])
+                selected = object()
+                values = {name: selected}
+                self.assertEqual(switch.check_lazy_status(model, **values), [])
+                self.assertIs(switch.select(model, **values)[0], selected)
+                others = {key: object() for key in switch.BRANCHES.values() if key != name}
+                self.assertEqual(switch.check_lazy_status(model, **others), [name])
+                with self.assertRaisesRegex(ValueError, "has no image"):
+                    switch.select(model, **others)
+
+    def test_invalid_model_does_not_fall_back_to_a_paid_branch(self):
+        switch = ChoukaLocalModelSwitch()
+        for method in (switch.check_lazy_status, switch.select):
+            with self.assertRaisesRegex(ValueError, "unsupported"):
+                method("unknown")
 
 
 class SafeSaveTests(unittest.TestCase):
@@ -452,7 +478,13 @@ class GraphManifestTests(unittest.TestCase):
                 self.assertNotEqual(manifest.get("execution"), "browser")
                 self.assertEqual(manifest["output"], {"node": "99"})
                 self.assertEqual([nid for nid, node in graph.items() if node["class_type"] in ("SaveImage", "ChoukaLocalSaveImage")], ["99"])
-                self.assertEqual(graph["99"]["class_type"], "SaveImage" if provider == "flux" else "ChoukaLocalSaveImage")
+                self.assertEqual(manifest["graph"], "graphs/texture_local_edit.api.json")
+                self.assertEqual(graph["99"]["class_type"], "ChoukaLocalSaveImage")
+                self.assertEqual(graph["80"], {"class_type": "ChoukaLocalModelSwitch", "inputs": {
+                    "model": "flux", "flux_image": ["25", 0],
+                    "gpt_image": ["30", 0], "banana_image": ["31", 0],
+                }})
+                self.assertEqual(graph["90"]["inputs"]["generated"], ["80", 0])
                 self.assertFalse(any("Preview" in node["class_type"] for node in graph.values()))
                 self.assertEqual(graph["99"]["inputs"]["images"], ["90", 0])
                 self.assertEqual(graph["90"]["inputs"]["context"], ["10", 1])
@@ -479,7 +511,7 @@ class GraphManifestTests(unittest.TestCase):
                     target = spec["target"]
                     self.assertIn(target["input"], graph[target["node"]]["inputs"])
                 for key, node_id, field in (("megapixels", "10", "megapixels"), ("feather", "10", "feather"),
-                                             ("prompt", "14" if provider == "flux" else "20", "text" if provider == "flux" else "prompt")):
+                                             ("prompt", "14", "text")):
                     self.assertEqual(specs[key]["target"]["node"], node_id)
                     self.assertEqual(specs[key]["target"]["input"], field)
                     self.assertEqual(specs[key]["default"], graph[node_id]["inputs"][field])
@@ -492,22 +524,49 @@ class GraphManifestTests(unittest.TestCase):
                 reached = self.reachable(without_reference)
                 self.assertNotIn("3", reached, "absent reference must not execute the template loader")
                 self.assertTrue({"1", "2", "10", "90", "99"}.issubset(reached))
-                if provider != "flux":
-                    self.assertEqual(graph["20"]["class_type"], "ChoukaCloudImageEdit")
-                    self.assertEqual(graph["20"]["inputs"]["provider"], "gpt_image" if provider == "gpt" else "banana")
-                    self.assertEqual(graph["20"]["inputs"]["callback_url"], "")
-                    self.assertEqual(graph["20"]["inputs"]["callback_token"], "")
-                    self.assertEqual(set(ChoukaCloudImageEdit.INPUT_TYPES()["required"]),
-                                     {"image", "prompt", "provider", "callback_url", "callback_token"})
+                for node_id, cloud_provider in (("30", "gpt_image"), ("31", "banana")):
+                    self.assertEqual(graph[node_id]["class_type"], "ChoukaCloudImageEdit")
+                    self.assertEqual(graph[node_id]["inputs"]["provider"], cloud_provider)
+                    self.assertEqual(graph[node_id]["inputs"]["callback_url"], "")
+                    self.assertEqual(graph[node_id]["inputs"]["callback_token"], "")
+                    self.assertNotIn("reference", without_reference[node_id]["inputs"])
+                self.assertEqual(set(ChoukaCloudImageEdit.INPUT_TYPES()["required"]),
+                                 {"image", "prompt", "provider", "callback_url", "callback_token"})
+
+    def test_native_workflow_matches_api_graph(self):
+        graph = json.loads((ROOT / "graphs/texture_local_edit.api.json").read_text(encoding="utf-8"))
+        workflow = json.loads((ROOT / "graphs/texture_local_edit.json").read_text(encoding="utf-8"))
+        nodes = {str(node["id"]): node for node in workflow["nodes"]}
+        links = {link[0]: link for link in workflow["links"]}
+        self.assertEqual(set(nodes), set(graph))
+        for node_id, expected in graph.items():
+            with self.subTest(node=node_id):
+                node = nodes[node_id]
+                self.assertEqual(node["type"], expected["class_type"])
+                self.assertEqual(node["mode"], 0)
+                connected = {}
+                for slot, item in enumerate(node.get("inputs", [])):
+                    if item.get("link") is not None:
+                        link = links[item["link"]]
+                        self.assertEqual((str(link[3]), link[4]), (node_id, slot))
+                        self.assertIn(link[0], nodes[str(link[1])]["outputs"][link[2]]["links"])
+                        connected[item["name"]] = [str(link[1]), link[2]]
+                values = node.get("widgets_values_named", {})
+                actual = {key: connected[key] if key in connected else values[key]
+                          for key in expected["inputs"]}
+                self.assertEqual(actual, expected["inputs"])
+                self.assertEqual(connected, {key: value for key, value in expected["inputs"].items()
+                                             if isinstance(value, list)})
 
     def test_flux_core_double_reference_chain(self):
-        graph = json.loads((ROOT / "graphs/texture_local_flux.api.json").read_text())
+        graph = json.loads((ROOT / "graphs/texture_local_edit.api.json").read_text())
         allowed = {"LoadImage", "LoadImageMask", "ChoukaLocalCrop", "ChoukaLocalStitch", "UNETLoader",
                    "CLIPLoader", "VAELoader", "CLIPTextEncode", "ConditioningZeroOut", "VAEEncode",
-                   "ReferenceLatent", "ImageScaleToTotalPixels", "EmptyFlux2LatentImage", "KSampler", "VAEDecode", "SaveImage"}
+                   "ReferenceLatent", "ImageScaleToTotalPixels", "EmptyFlux2LatentImage", "KSampler", "VAEDecode",
+                   "ChoukaCloudImageEdit", "ChoukaLocalModelSwitch", "ChoukaLocalSaveImage"}
         self.assertTrue({n["class_type"] for n in graph.values()}.issubset(allowed))
         self.assertEqual(graph["11"]["inputs"]["unet_name"], "flux-2-klein-9b-fp8.safetensors")
-        self.assertEqual(graph["12"]["inputs"]["clip_name"], "qwen_3_8b_fp8mixed.safetensors")
+        self.assertEqual(graph["12"]["inputs"]["clip_name"], "qwen_3_8b_fp4mixed.safetensors")
         self.assertEqual(graph["13"]["inputs"]["vae_name"], "flux2-vae.safetensors")
         self.assertEqual(graph["16"]["inputs"]["pixels"], ["10", 0])
         self.assertEqual(graph["17"]["inputs"]["latent"], ["16", 0])

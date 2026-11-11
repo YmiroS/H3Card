@@ -1634,6 +1634,7 @@ async def _api_generate(request):
         )
     graph = patch_graph(cap, params, uploaded, video_metadata)
     if local_context:
+        request.app["local_texture"].configure_graph(graph, local_context)
         request.app["local_texture"].validate_graph(graph, local_context)
     elif any(node.get("class_type") == "ChoukaCloudImageEdit" for node in graph.values()):
         raise web.HTTPBadRequest(text="云局部编辑节点仅允许受控局部能力")

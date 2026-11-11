@@ -1,6 +1,6 @@
 {
  "id": "texture_enhance",
- "name": "角色编辑",
+ "name": "图片编辑",
  "execution": "browser",
  "kind": "tool",
  "card": "card_tools",

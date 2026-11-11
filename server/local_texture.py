@@ -25,6 +25,38 @@ TICKET_TTL = 3600  # Includes queue time; never persisted across controller rest
 MAX_PENDING_TICKETS = 1024
 MAX_USER_TICKETS = 32
 TICKET_PATTERN = re.compile(r"lt_[A-Za-z0-9_-]{43}")
+CLOUD_NODE_IDS = {"gpt_image": "30", "banana": "31"}
+# This is one controlled workflow, not an arbitrary graph validator. Pinning its
+# classes also pins OUTPUT_NODEs: only the metadata-safe #99 may be an output.
+GRAPH_CLASSES = {
+    "1": "LoadImage", "2": "LoadImageMask", "3": "LoadImage",
+    "10": "ChoukaLocalCrop", "11": "UNETLoader", "12": "CLIPLoader",
+    "13": "VAELoader", "14": "CLIPTextEncode", "15": "ConditioningZeroOut",
+    "16": "VAEEncode", "17": "ReferenceLatent", "18": "ReferenceLatent",
+    "19": "ImageScaleToTotalPixels", "20": "VAEEncode", "21": "ReferenceLatent",
+    "22": "ReferenceLatent", "23": "EmptyFlux2LatentImage", "24": "KSampler",
+    "25": "VAEDecode", "30": "ChoukaCloudImageEdit", "31": "ChoukaCloudImageEdit",
+    "80": "ChoukaLocalModelSwitch", "90": "ChoukaLocalStitch", "99": "ChoukaLocalSaveImage",
+}
+GRAPH_LINKS = {
+    "10": {"image": ["1", 0], "mask": ["2", 0]},
+    "14": {"clip": ["12", 0]}, "15": {"conditioning": ["14", 0]},
+    "16": {"pixels": ["10", 0], "vae": ["13", 0]},
+    "17": {"conditioning": ["14", 0], "latent": ["16", 0]},
+    "18": {"conditioning": ["15", 0], "latent": ["16", 0]},
+    "19": {"image": ["3", 0]}, "20": {"pixels": ["19", 0], "vae": ["13", 0]},
+    "21": {"conditioning": ["17", 0], "latent": ["20", 0]},
+    "22": {"conditioning": ["18", 0], "latent": ["20", 0]},
+    "23": {"width": ["10", 2], "height": ["10", 3]},
+    "24": {"model": ["11", 0], "positive": ["21", 0], "negative": ["22", 0],
+           "latent_image": ["23", 0]},
+    "25": {"samples": ["24", 0], "vae": ["13", 0]},
+    "30": {"image": ["10", 0], "reference": ["3", 0]},
+    "31": {"image": ["10", 0], "reference": ["3", 0]},
+    "80": {"flux_image": ["25", 0], "gpt_image": ["30", 0], "banana_image": ["31", 0]},
+    "90": {"generated": ["80", 0], "context": ["10", 1]},
+    "99": {"images": ["90", 0]},
+}
 
 
 def redact(value):
@@ -129,7 +161,7 @@ class LocalTexture(TextureApi):
             raise web.HTTPBadRequest(text="局部编辑需要底图、蒙版、可选参考图及受控参数")
         prompt = params.get("prompt")
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
-            raise web.HTTPBadRequest(text="局部编辑提示词必须为 1–20000 字符")
+            raise web.HTTPBadRequest(text="编辑提示词必须为 1–20000 字符")
         for key, default, low, high in (("megapixels", 1, .25, 16), ("feather", 32, 0, 128)):
             value = params.setdefault(key, default)
             if isinstance(value, bool) or not isinstance(value, (float, int)) or not math.isfinite(value) or not low <= value <= high:
@@ -160,23 +192,64 @@ class LocalTexture(TextureApi):
                 "user_id": user["id"], "username": user["username"], "phone": user["phone"],
                 "capability": cap["id"]}
 
+    @staticmethod
+    def graph_model(context):
+        provider = context["provider"]
+        if provider is None:
+            return "flux"
+        if provider not in CLOUD_NODE_IDS:
+            raise web.HTTPBadRequest(text="局部编辑模型选项无效")
+        return provider
+
+    def configure_graph(self, graph, context):
+        """Set only trusted selection/prompt; never repair cloud authorization."""
+        model = self.graph_model(context)
+        for node_id, field, value in (("80", "model", model),
+                                      ("30", "prompt", context["prompt"]),
+                                      ("31", "prompt", context["prompt"])):
+            node = graph.get(node_id)
+            if not isinstance(node, dict) or not isinstance(node.get("inputs"), dict):
+                raise web.HTTPBadRequest(text="局部编辑统一工作流节点缺失")
+            node["inputs"][field] = value
+
     def validate_graph(self, graph, context):
-        cloud_nodes = {str(key) for key, node in graph.items() if node.get("class_type") == "ChoukaCloudImageEdit"}
-        if context["provider"] is None:
-            if cloud_nodes:
-                raise web.HTTPBadRequest(text="Flux 局部工作流不得调用云节点")
-            return
-        if cloud_nodes != {"20"}:
-            raise web.HTTPBadRequest(text="云局部工作流必须且只能使用 #20 ChoukaCloudImageEdit")
-        inputs = graph["20"].get("inputs", {})
-        if (set(inputs) - {"image", "prompt", "provider", "callback_url", "callback_token", "reference"}
-                or not {"image", "prompt", "provider", "callback_url", "callback_token"} <= set(inputs)
-                or inputs["callback_url"] != "" or inputs["callback_token"] != ""
-                or inputs["provider"] != context["provider"]
-                or not isinstance(inputs["prompt"], str) or inputs["prompt"].strip() != context["prompt"]
-                or not isinstance(inputs["image"], list) or len(inputs["image"]) != 2
-                or bool(inputs.get("reference")) != context["allow_reference"]):
-            raise web.HTTPBadRequest(text="云局部编辑节点契约不符")
+        model = self.graph_model(context)
+        if (set(graph) != set(GRAPH_CLASSES)
+                or any(not isinstance(node, dict) or node.get("class_type") != GRAPH_CLASSES[key]
+                       or not isinstance(node.get("inputs"), dict) for key, node in graph.items())):
+            raise web.HTTPBadRequest(text="局部编辑必须使用完整受控工作流及唯一安全输出 #99")
+        # Check every dependency, including unused branches. Otherwise a cloud
+        # node wired into Flux/crop could defeat lazy selection and spend a ticket.
+        links = copy.deepcopy(GRAPH_LINKS)
+        if not context["allow_reference"]:
+            for node_id, field in (("21", "latent"), ("22", "latent"),
+                                   ("30", "reference"), ("31", "reference")):
+                links[node_id].pop(field)
+        for node_id, node in graph.items():
+            actual = {key: value for key, value in node["inputs"].items() if isinstance(value, list)}
+            if actual != links.get(node_id, {}):
+                raise web.HTTPBadRequest(text=f"局部编辑节点 #{node_id} 连线契约不符")
+        for provider, node_id in CLOUD_NODE_IDS.items():
+            inputs = graph[node_id]["inputs"]
+            fields = {"image", "prompt", "provider", "callback_url", "callback_token"}
+            if context["allow_reference"]:
+                fields.add("reference")
+            if (set(inputs) != fields or inputs["provider"] != provider
+                    or inputs["callback_url"] != "" or inputs["callback_token"] != ""
+                    or inputs["prompt"] != context["prompt"]):
+                raise web.HTTPBadRequest(text="云局部编辑节点契约不符")
+        text = graph["14"]["inputs"].get("text")
+        if (graph["80"]["inputs"] != {"model": model, **GRAPH_LINKS["80"]}
+                or graph["90"]["inputs"] != GRAPH_LINKS["90"]
+                or not isinstance(text, str) or text.strip() != context["prompt"]
+                or graph["2"]["inputs"].get("channel") != "red"
+                or any(("latent" in graph[node_id]["inputs"]) != context["allow_reference"]
+                       for node_id in ("21", "22"))):
+            raise web.HTTPBadRequest(text="局部编辑模型选择、提示词或拼接契约不符")
+        save = graph["99"]["inputs"]
+        if (set(save) - {"images", "filename_prefix"}
+                or not isinstance(save.get("filename_prefix", ""), str)):
+            raise web.HTTPBadRequest(text="局部编辑仅允许安全保存最终整图")
 
     async def inject(self, request, graph, context):
         await self.check_context(request, context["project"], context["card"], context["source"], context["refs"][0])
@@ -196,7 +269,7 @@ class LocalTexture(TextureApi):
             self.tickets[digest] = {**copy.deepcopy(context), "submission": context["submission"],
                                     "expires": now + TICKET_TTL}
         request["local_texture_ticket"] = digest
-        graph["20"]["inputs"].update(callback_url=url, callback_token=token)
+        graph[CLOUD_NODE_IDS[context["provider"]]]["inputs"].update(callback_url=url, callback_token=token)
 
     def invalidate(self, request):
         self.tickets.pop(request.get("local_texture_ticket"), None)

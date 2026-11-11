@@ -4,7 +4,7 @@
   "3": {"class_type": "LoadImage", "inputs": {"image": "chouka_local_optional_reference.png"}},
   "10": {"class_type": "ChoukaLocalCrop", "inputs": {"image": ["1", 0], "mask": ["2", 0], "megapixels": 1.0, "feather": 32}},
   "11": {"class_type": "UNETLoader", "inputs": {"unet_name": "flux-2-klein-9b-fp8.safetensors", "weight_dtype": "default"}},
-  "12": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux2", "device": "default"}},
+  "12": {"class_type": "CLIPLoader", "inputs": {"clip_name": "qwen_3_8b_fp4mixed.safetensors", "type": "flux2", "device": "default"}},
   "13": {"class_type": "VAELoader", "inputs": {"vae_name": "flux2-vae.safetensors"}},
   "14": {"class_type": "CLIPTextEncode", "inputs": {"clip": ["12", 0], "text": "Replace the selected material in image 1 using image 2 when supplied. Preserve shape, lighting and surrounding details."}},
   "15": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["14", 0]}},
@@ -18,6 +18,9 @@
   "23": {"class_type": "EmptyFlux2LatentImage", "inputs": {"width": ["10", 2], "height": ["10", 3], "batch_size": 1}},
   "24": {"class_type": "KSampler", "inputs": {"model": ["11", 0], "positive": ["21", 0], "negative": ["22", 0], "latent_image": ["23", 0], "seed": 0, "steps": 4, "cfg": 1.0, "sampler_name": "euler", "scheduler": "simple", "denoise": 1.0}},
   "25": {"class_type": "VAEDecode", "inputs": {"samples": ["24", 0], "vae": ["13", 0]}},
-  "90": {"class_type": "ChoukaLocalStitch", "inputs": {"generated": ["25", 0], "context": ["10", 1]}},
-  "99": {"class_type": "SaveImage", "inputs": {"images": ["90", 0], "filename_prefix": "Chouka/local_edit_flux"}}
+  "30": {"class_type": "ChoukaCloudImageEdit", "inputs": {"image": ["10", 0], "reference": ["3", 0], "prompt": "Replace the selected material in image 1 using image 2 when supplied. Preserve shape, lighting and surrounding details.", "provider": "gpt_image", "callback_url": "", "callback_token": ""}},
+  "31": {"class_type": "ChoukaCloudImageEdit", "inputs": {"image": ["10", 0], "reference": ["3", 0], "prompt": "Replace the selected material in image 1 using image 2 when supplied. Preserve shape, lighting and surrounding details.", "provider": "banana", "callback_url": "", "callback_token": ""}},
+  "80": {"class_type": "ChoukaLocalModelSwitch", "inputs": {"model": "flux", "flux_image": ["25", 0], "gpt_image": ["30", 0], "banana_image": ["31", 0]}},
+  "90": {"class_type": "ChoukaLocalStitch", "inputs": {"generated": ["80", 0], "context": ["10", 1]}},
+  "99": {"class_type": "ChoukaLocalSaveImage", "inputs": {"images": ["90", 0], "filename_prefix": "Chouka/local_edit"}}
 }
