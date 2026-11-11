@@ -6,7 +6,7 @@ RATIOS = (
     "1:1", "1:2", "2:1", "9:16", "16:9", "3:4", "4:3",
     "3:2", "2:3", "5:4", "4:5", "21:9", "9:21",
 )
-CLARITIES = {"480P": 480, "720P": 720, "1080P": 1080, "1440P": 1440, "2K": 2048}
+CLARITIES = {"480P": 480, "720P": 720, "1080P": 1080, "1440P": 1440, "2K": 2048, "4K": 4096}
 _T2I_LATENTS = {
     "zimage_t2i": "41", "krea2_t2i": "2",
     "qwen_image_2512_t2i": "7", "qwen_image_21_t2i": "38",
@@ -24,13 +24,28 @@ def image_controls(capability_id):
     return None
 
 
+def bounded_dimensions(width, height):
+    """Keep 16-aligned output within the shared 32-million-pixel budget."""
+    max_pixels = 32_000_000
+    if width * height > max_pixels:
+        scale = math.sqrt(max_pixels / (width * height))
+        width = max(16, math.floor(width * scale / 16) * 16)
+        height = max(16, math.floor(height * scale / 16) * 16)
+        if width * height > max_pixels:
+            if width >= height:
+                width = max_pixels // height // 16 * 16
+            else:
+                height = max_pixels // width // 16 * 16
+    return width, height
+
+
 def _dimensions(ratio, pixels):
     width, height = map(int, ratio.split(":"))
     # Align each side independently from the nominal short edge, matching JS Math.round.
     short = math.floor(pixels / 16 + .5) * 16
     if width >= height:
-        return math.floor(pixels * width / height / 16 + .5) * 16, short
-    return short, math.floor(pixels * height / width / 16 + .5) * 16
+        return bounded_dimensions(math.floor(pixels * width / height / 16 + .5) * 16, short)
+    return bounded_dimensions(short, math.floor(pixels * height / width / 16 + .5) * 16)
 
 
 def patch_image_controls(graph, capability_id, params):
@@ -45,10 +60,13 @@ def patch_image_controls(graph, capability_id, params):
     if not isinstance(ratio, str) or ratio not in ratios:
         raise ValueError("image_ratio 必须为支持的比例字符串")
     if not isinstance(clarity, str) or clarity not in CLARITIES:
-        raise ValueError("image_clarity 必须为 480P、720P、1080P、1440P 或 2K")
+        raise ValueError("image_clarity 必须为 480P、720P、1080P、1440P、2K 或 4K")
     pixels = CLARITIES[clarity]
     if ratio != "original":
         width, height = _dimensions(ratio, pixels)
+    # Original-ratio local sizing is resolved by the existing ComfyUI scale node.
+    # Its short-edge interface has no pixel-budget input; enforcing a dynamic cap
+    # would require changing the workflow chain, not just this sizing adapter.
     aligned_pixels = math.floor(pixels / 16 + .5) * 16
 
     if capability_id in _I2I_SCALES:

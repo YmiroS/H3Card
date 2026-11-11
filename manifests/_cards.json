@@ -16,7 +16,9 @@
      "qwen2512": "qwen_image_2512_t2i",
      "qwen21": "qwen_image_21_t2i",
      "banana_api": "banana_api_t2i",
-     "gpt_image_api": "gpt_image_api_t2i"
+     "gpt_image_api": "gpt_image_api_t2i",
+     "gpt_image_api_2": "gpt_image_api_2_t2i",
+     "gpt_image_api_26": "gpt_image_api_26_t2i"
     }
    },
    {
@@ -29,7 +31,9 @@
      "qwen2511": "qwen_image_edit_2511_i2i",
      "qwen21": "qwen_image_21_multi",
      "banana_api": "banana_api_i2i",
-     "gpt_image_api": "gpt_image_api_i2i"
+     "gpt_image_api": "gpt_image_api_i2i",
+     "gpt_image_api_2": "gpt_image_api_2_i2i",
+     "gpt_image_api_26": "gpt_image_api_26_i2i"
     }
    },
    {

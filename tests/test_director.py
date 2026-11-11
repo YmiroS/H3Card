@@ -459,14 +459,18 @@ class DirectorApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture
 
     async def test_gpt_text_to_image_prompt_supports_32000_on_director_save(self):
         first = shot()
-        first["image"] = {"capability": "gpt_image_api_t2i", "params": {"prompt": "文" * 32000}}
-        document = director([first])
-        await self.save(document)
-        self.assertEqual(self.read_project()["director"]["shots"][0]["image"]["params"]["prompt"], "文" * 32000)
-        valid = director([first], rev=1)
+        for revision, capability in enumerate(("gpt_image_api_t2i", "gpt_image_api_2_t2i", "gpt_image_api_26_t2i")):
+            first["image"] = {"capability": capability, "params": {"prompt": "文" * 32000}}
+            document = director([first], rev=revision)
+            await self.save(document)
+            saved = self.read_project()["director"]["shots"][0]["image"]
+            self.assertEqual(saved["capability"], capability)
+            self.assertEqual(saved["params"]["prompt"], "文" * 32000)
+        valid = director([first], rev=3)
         await self.assert_rejected(changed(valid, ("shots", 0, "image", "params", "prompt"), "文" * 32001))
         await self.assert_rejected(changed(valid, ("shots", 0, "image", "params"), {"other": "x" * 20001}))
-        for capability in ("gpt_image_api_i2i", "banana_api_t2i", "banana_api_i2i"):
+        for capability in ("gpt_image_api_i2i", "gpt_image_api_2_i2i", "gpt_image_api_26_i2i",
+                           "banana_api_t2i", "banana_api_i2i"):
             with self.subTest(capability=capability):
                 await self.assert_rejected(changed(valid, ("shots", 0, "image"),
                     {"capability": capability, "params": {"prompt": "x" * 20001}}))

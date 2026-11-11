@@ -527,7 +527,9 @@ class CostLedgerTest(unittest.TestCase):
 
     def test_image_api_pricing_is_unknown_not_free(self):
         for capability in ("banana_api_t2i", "banana_api_i2i",
-                           "gpt_image_api_t2i", "gpt_image_api_i2i"):
+                           "gpt_image_api_t2i", "gpt_image_api_i2i",
+                           "gpt_image_api_2_t2i", "gpt_image_api_2_i2i",
+                           "gpt_image_api_26_t2i", "gpt_image_api_26_i2i"):
             with self.subTest(capability=capability):
                 spec = self.ledger.pricing["capabilities"][capability]
                 self.assertEqual(spec["category"], "image")
@@ -541,8 +543,12 @@ class CostLedgerTest(unittest.TestCase):
     def test_image_api_all_states_have_unknown_cost_and_no_gpu_usage(self):
         statuses = ("queued", "running", "done", "error", "timeout", "unknown", "canceled")
         for capability in ("banana_api_t2i", "banana_api_i2i",
-                           "gpt_image_api_t2i", "gpt_image_api_i2i"):
-            model = "gemini-3-pro-image" if capability.startswith("banana") else "gpt-image-2.5-sunburst"
+                           "gpt_image_api_t2i", "gpt_image_api_i2i",
+                           "gpt_image_api_2_t2i", "gpt_image_api_2_i2i",
+                           "gpt_image_api_26_t2i", "gpt_image_api_26_i2i"):
+            model = ("gemini-3-pro-image" if capability.startswith("banana") else
+                     "gpt-image-2.6-sunburst" if "_26_" in capability else
+                     "gpt-image-2" if "_2_" in capability else "gpt-image-2.5-sunburst")
             for status in statuses:
                 with self.subTest(capability=capability, status=status):
                     job = {"id": capability + status, "capability": capability,
@@ -568,9 +574,9 @@ class CostLedgerTest(unittest.TestCase):
                     self.assertEqual(dims["billing_mode"], "paid_api")
                     self.assertEqual(dims["generation_unknown"], status == "unknown")
         report = self.ledger.report()
-        self.assertEqual(report["overview"]["tasks"], 4 * len(statuses))
-        self.assertEqual(report["overview"]["unknown_cost_tasks"], 4 * len(statuses))
-        self.assertEqual(report["overview"]["retail_unknown_tasks"], 4)
+        self.assertEqual(report["overview"]["tasks"], 8 * len(statuses))
+        self.assertEqual(report["overview"]["unknown_cost_tasks"], 8 * len(statuses))
+        self.assertEqual(report["overview"]["retail_unknown_tasks"], 8)
         for key in ("gpu_hours", "running_accrued", "actual_cost", "estimated_cost",
                     "total_cost", "api_cost", "electricity_cost", "failed_waste"):
             self.assertEqual(report["overview"][key], 0, key)
@@ -613,7 +619,9 @@ class CostLedgerTest(unittest.TestCase):
 
     def test_record_job_routes_image_api_without_gpu_finish(self):
         for capability in ("banana_api_t2i", "banana_api_i2i",
-                           "gpt_image_api_t2i", "gpt_image_api_i2i"):
+                           "gpt_image_api_t2i", "gpt_image_api_i2i",
+                           "gpt_image_api_2_t2i", "gpt_image_api_2_i2i",
+                           "gpt_image_api_26_t2i", "gpt_image_api_26_i2i"):
             self.ledger.record_job({"id": capability, "capability": capability,
                                     "status": "done", "created": 1, "started": 100, "ended": 3700},
                                    historical=True)
@@ -622,7 +630,11 @@ class CostLedgerTest(unittest.TestCase):
             self.assertEqual(row["runtime_seconds"], 3600)
             self.assertIsNone(row["total_cost_micros"])
             self.assertIsNone(row["estimated_min_micros"])
-            self.assertTrue(json.loads(row["dimensions_json"])["model"])
+            expected_model = ("gemini-3-pro-image" if capability.startswith("banana") else
+                              "gpt-image-2.6-sunburst" if "_26_" in capability else
+                              "gpt-image-2" if "_2_" in capability else "gpt-image-2.5-sunburst")
+            self.assertEqual(json.loads(row["dimensions_json"])["model"], expected_model)
+            self.assertEqual(row["model_family"], expected_model)
         for marker in ({"execution": "cloud_image"}, {"event_kind": "image_api"},
                        {"billingMode": "paid_api"}, {"billing_mode": "paid_api"}):
             job_id = next(iter(marker))

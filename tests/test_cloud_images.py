@@ -92,6 +92,40 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((sent["name"], sent["phone"]), ("图片用户", "13800138000"))
         self.assertEqual(self.received, [])
 
+    async def test_internal_models_are_exact_and_isolated_across_json_and_multipart(self):
+        shared_config = {**cloud_images.load(), "model": "admin-default-model"}
+        models = ("gpt-image-2", "gpt-image-2.5-sunburst", "gpt-image-2.6-sunburst")
+        calls, expected = [], []
+        with mock.patch.object(cloud_images, "load", return_value=shared_config):
+            for model in models:
+                for editing in (False, True):
+                    prompt = f"{model}-{'edit' if editing else 'generate'}"
+                    identity = {"end_user_name": "user", "end_user_phone": "13800138000"}
+                    calls.append(cloud_images.edit(self.session, [png()], prompt, model=model, **identity)
+                                 if editing else cloud_images.generate(self.session, prompt, model=model, **identity))
+                    expected.append(model)
+            results = await asyncio.gather(*calls)
+            # Existing edit/lighting and generation callers still use the admin default.
+            results += [await cloud_images.edit(self.session, [png()], "legacy-edit", **identity),
+                        await cloud_images.generate(self.session, "legacy-generate", **identity)]
+        self.assertEqual([result["model"] for result in results], expected + ["admin-default-model"] * 2)
+        self.assertEqual(shared_config["model"], "admin-default-model")
+        self.assertEqual(cloud_images.load()["model"], "gpt-image-2.5-sunburst")
+        json_models = {sent["body"]["prompt"]: sent["body"]["model"] for sent in self.generations}
+        edit_models = {}
+        for sent in self.received:
+            fields = {part["name"]: part["data"].decode() for part in sent["parts"] if not part["filename"]}
+            edit_models[fields["prompt"]] = fields["model"]
+            self.assertEqual(sent["authorization"], "Bearer test-secret")
+        for model in models:
+            self.assertEqual(json_models[f"{model}-generate"], model)
+            self.assertEqual(edit_models[f"{model}-edit"], model)
+        self.assertEqual(json_models["legacy-generate"], "admin-default-model")
+        self.assertEqual(edit_models["legacy-edit"], "admin-default-model")
+        self.assertEqual(len(self.generations), 4)
+        self.assertEqual(len(self.received), 4)
+        self.assertTrue(all(sent["authorization"] == "Bearer test-secret" for sent in self.generations))
+
     async def test_generation_rejects_invalid_params_without_network(self):
         for params in ({"prompt": ""}, {"prompt": "x" * 32001}, {"prompt": "cat", "size": "original"},
                        {"prompt": "cat", "quality": "invalid"}, {"prompt": "cat", "size": "1001x751"},
@@ -116,6 +150,18 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
                                     end_user_name="user", end_user_phone="13800138000")
         self.assertEqual(self.generations[0]["body"]["size"], "1920x1088")
         self.assertEqual(self.generations[0]["body"]["quality"], "high")
+
+    async def test_4k_size_is_forwarded_in_json_and_multipart(self):
+        identity = {"end_user_name": "user", "end_user_phone": "13800138000"}
+        await cloud_images.generate(self.session, "4K 文生图", size="4096x4096", model="gpt-image-2", **identity)
+        await cloud_images.edit(self.session, [png()], "4K 图生图", size="4096x4096",
+                                model="gpt-image-2.6-sunburst", **identity)
+        self.assertEqual(self.generations[0]["body"]["size"], "4096x4096")
+        fields = {part["name"]: part["data"].decode() for part in self.received[0]["parts"] if not part["filename"]}
+        self.assertEqual(fields["size"], "4096x4096")
+        self.assertEqual(self.generations[0]["body"]["model"], "gpt-image-2")
+        self.assertEqual(fields["model"], "gpt-image-2.6-sunburst")
+        self.assertEqual(len(self.generations) + len(self.received), 2)
 
     async def test_generation_http_failure_does_not_retry(self):
         self.status = 429

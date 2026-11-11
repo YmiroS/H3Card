@@ -17,6 +17,17 @@ from server.cloud_generation import CAPABILITIES, bounded_dimensions, generation
 from server.image_controls import RATIOS, CLARITIES
 
 
+# Independent expectations, including legacy 2.5 (not global config.model).
+GPT_MODELS = {
+    "gpt_image_api_t2i": "gpt-image-2.5-sunburst",
+    "gpt_image_api_i2i": "gpt-image-2.5-sunburst",
+    "gpt_image_api_2_t2i": "gpt-image-2",
+    "gpt_image_api_2_i2i": "gpt-image-2",
+    "gpt_image_api_26_t2i": "gpt-image-2.6-sunburst",
+    "gpt_image_api_26_i2i": "gpt-image-2.6-sunburst",
+}
+
+
 class GenerationDimensionsTests(unittest.TestCase):
     def test_all_ratio_clarity_pairs_match_short_edge_controls_and_align_16(self):
         for ratio in RATIOS:
@@ -28,7 +39,10 @@ class GenerationDimensionsTests(unittest.TestCase):
                     self.assertEqual(width % 16, 0)
                     self.assertEqual(height % 16, 0)
                     self.assertLessEqual(width * height, cloud_images.MAX_PIXELS)
-                    self.assertLessEqual(abs(min(width, height) - short), 8)
+                    if short * short * max(w, h) / min(w, h) <= cloud_images.MAX_PIXELS:
+                        self.assertLessEqual(abs(min(width, height) - short), 8)
+                    else:
+                        self.assertLess(min(width, height), short)
                     self.assertLess(abs(width / height - w / h), .04)
 
     def test_original_and_extreme_aspect_ratios_respect_pixel_limit(self):
@@ -40,6 +54,22 @@ class GenerationDimensionsTests(unittest.TestCase):
                         {"width": w, "height": h})
                     self.assertTrue(all(side >= 16 and side % 16 == 0 for side in size))
                     self.assertLessEqual(size[0] * size[1], cloud_images.MAX_PIXELS)
+
+    def test_4k_square_preserves_short_edge_and_extreme_ratios_are_bounded(self):
+        self.assertEqual(generation_dimensions({"image_ratio": "1:1", "image_clarity": "4K"}, False)[2],
+                         (4096, 4096))
+        for ratio in ("21:9", "9:21", "2:1", "1:2"):
+            size = generation_dimensions({"image_ratio": ratio, "image_clarity": "4K"}, False)[2]
+            self.assertLess(min(size), 4096)
+            self.assertLessEqual(size[0] * size[1], 32_000_000)
+            self.assertEqual(size, generation_dimensions(
+                {"image_ratio": "original", "image_clarity": "4K"}, True,
+                dict(zip(("width", "height"), map(int, ratio.split(":")))))[2])
+        for source in ((4096, 7808), (4096, 7824), (4000, 8000), (4097, 4095)):
+            size = generation_dimensions({"image_ratio": "original", "image_clarity": "4K"}, True,
+                                         dict(zip(("width", "height"), source)))[2]
+            self.assertTrue(all(side >= 16 and side % 16 == 0 for side in size))
+            self.assertLessEqual(size[0] * size[1], 32_000_000)
 
     def test_secondary_reference_alignment_respects_pixel_limit(self):
         for w, h in ((1, 32000000), (32000000, 1), (3, 10000000), (10000000, 3), (65, 49)):
@@ -56,6 +86,26 @@ class GenerationDimensionsTests(unittest.TestCase):
         data, info = resize_image(png("red", (65, 49)), (64, 48))
         self.assertEqual((info["width"], info["height"]), (64, 48))
         self.assertEqual(data, png("red", (64, 48)))
+
+
+class GptManifestTests(unittest.TestCase):
+    def test_models_preserve_existing_contracts_and_have_distinct_switches(self):
+        cards = json.loads((ROOT / "manifests/_cards.json").read_text(encoding="utf-8"))
+        image_card = next(card for card in cards if card["id"] == "card_image")
+        for prefix, display, model in (
+                ("gpt_image_api", "GPT Image 2.5 Sunburst", "gpt-image-2.5-sunburst"),
+                ("gpt_image_api_2", "GPT Image 2", "gpt-image-2"),
+                ("gpt_image_api_26", "GPT Image 2.6 Sunburst", "gpt-image-2.6-sunburst")):
+            for mode, label in (("t2i", "文生图"), ("i2i", "图生图")):
+                cid = f"{prefix}_{mode}"
+                cap = json.loads((ROOT / f"manifests/{cid}.json").read_text(encoding="utf-8"))
+                original = json.loads((ROOT / f"manifests/gpt_image_api_{mode}.json").read_text(encoding="utf-8"))
+                self.assertEqual(cap, {**original, "id": cid, "modelName": model,
+                                       "name": f"{display} · 付费 API {label}"})
+                switch = next(item["modelSwitch"] for item in image_card["modes"] if item["name"] == label)
+                self.assertEqual(switch[prefix], cid)
+                self.assertEqual(CAPABILITIES[cid], ("gpt_image", mode == "i2i"))
+                self.assertEqual(GPT_MODELS[cid], model)
 
 
 class CloudGenerationFixture(CloudLightingFixture):
@@ -123,7 +173,7 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(len(self.generations), 1)
         sent = self.generations[0]
         self.assertEqual(sent["body"]["prompt"], PROMPT)
-        self.assertEqual(sent["body"]["model"], "fake-lighting-model")
+        self.assertEqual(sent["body"]["model"], "gpt-image-2.5-sunburst")
         self.assertEqual(sent["body"]["n"], 1)
         self.assertEqual(sent["body"]["output_compression"], 100)
         self.assertEqual((sent["name"], sent["phone"]), ("lighting-owner", "13800138000"))
@@ -142,6 +192,51 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual((await self.client.get(output["url"])).status, 401)
         self.assertNotIn("13800138000", json.dumps(done))
         self.assertNotIn("fake-lighting-secret", json.dumps(done))
+
+    async def test_all_gpt_prompt_limits_and_reference_bounds_apply_before_network(self):
+        for capability in GPT_MODELS:
+            editing = capability.endswith("i2i")
+            assets = {"images[0]": self.upstream["ref"]} if editing else {}
+            limit = 20000 if editing else 32000
+            with self.subTest(capability=capability):
+                response = await self.generate(capability=capability, assets=assets, dry_run=True,
+                                               params={"prompt": "文" * limit, "image_clarity": "4K"})
+                self.assertEqual(response.status, 200, await response.text())
+                response = await self.generate(capability=capability, assets=assets, dry_run=True,
+                                               params={"prompt": "文" * (limit + 1)})
+                self.assertEqual(response.status, 400, await response.text())
+                if editing:
+                    for invalid in ({}, {"images[1]": self.upstream["ref"]},
+                                    {f"images[{i}]": self.upstream["ref"] for i in range(9)}):
+                        response = await self.generate(capability=capability, assets=invalid, dry_run=True)
+                        self.assertEqual(response.status, 400, await response.text())
+                    response = await self.generate(capability=capability, dry_run=True,
+                        assets={f"images[{i}]": self.upstream["ref"] for i in range(8)})
+                    self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.generations, [])
+        self.assert_no_submission()
+
+    async def test_selected_model_survives_config_change_before_execution(self):
+        runner = self.application["cloud_generation"]
+        authorize = runner.authorize_all
+        release = asyncio.Event()
+
+        async def gated_authorize(*args):
+            await release.wait()
+            await authorize(*args)
+
+        with mock.patch.object(runner, "authorize_all", side_effect=gated_authorize):
+            response = await self.generate(capability="gpt_image_api_26_t2i")
+            self.assertEqual(response.status, 200, await response.text())
+            submitted = await response.json()
+            self.assertEqual(submitted["modelName"], "gpt-image-2.6-sunburst")
+            config = json.loads(self.config.read_text(encoding="utf-8"))
+            self.config.write_text(json.dumps({**config, "model": "changed-admin-default"}), encoding="utf-8")
+            release.set()
+            done = await self.finish_job(submitted)
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["modelName"], "gpt-image-2.6-sunburst")
+        self.assertEqual(self.generations[0]["body"]["model"], "gpt-image-2.6-sunburst")
 
     async def test_gpt_32000_prompt_reaches_gateway_and_is_preserved_in_job(self):
         prompt = "文" * 32000
@@ -287,7 +382,7 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
             {"capability": "banana_api_i2i", "params": {"prompt": "x" * 20001}},
             {"capability": "gpt_image_api_i2i", "params": {"prompt": "x" * 20001}},
             {"params": {"prompt": PROMPT, "image_ratio": "original"}},
-            {"params": {"prompt": PROMPT, "image_clarity": "4K"}},
+            {"params": {"prompt": PROMPT, "image_clarity": "8K"}},
             {"params": {"prompt": PROMPT, "image_ratio": []}},
             {"params": {"prompt": PROMPT, "image_clarity": {}}},
             {"assets": {"images[0]": self.upstream["ref"]}},
@@ -405,6 +500,68 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
 
 class CloudGenerationControllerTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestCase):
     controller_mode = True
+
+    async def test_concurrent_gpt_models_keep_protocol_identity_jobs_and_billing_separate(self):
+        submitted_jobs = []
+        prompts = {}
+        for capability, model in GPT_MODELS.items():
+            editing = capability.endswith("i2i")
+            limit = 20000 if editing else 32000
+            prompt = capability + "文" * (limit - len(capability))
+            prompts[capability] = prompt
+            submitted = await self.start_job(capability=capability, card=None,
+                assets={"images[0]": self.upstream["ref"]} if editing else {},
+                # HTTP clients cannot override the trusted capability/model mapping.
+                model="forged-body-model", modelName="forged-body-name",
+                params={"prompt": prompt, "model": "forged-param-model", "modelName": "forged-param-name",
+                        "image_clarity": "480P", "image_ratio": "1:1"})
+            self.assertEqual(submitted["modelName"], model)
+            self.assertEqual(submitted["capability"], capability)
+            submitted_jobs.append(submitted)
+        self.assertEqual(len(self.application["cloud_generation"].tasks), 6)
+        self.assertEqual(len(self.generations), 3)
+        self.assertEqual(len(self.received), 3)
+        # All requests are simultaneously pending at the fake upstream.
+        for submitted in submitted_jobs:
+            done = await self.finish_job(submitted)
+            self.assertEqual(done["status"], "done")
+            self.assertEqual(done["modelName"], GPT_MODELS[submitted["capability"]])
+            self.assertEqual(done["billingMode"], "paid_api")
+        for capability, model in GPT_MODELS.items():
+            if capability.endswith("i2i"):
+                sent = next(item for item in self.received if item["fields"]["prompt"] == prompts[capability])
+                self.assertEqual(sent["fields"]["model"], model)
+                self.assertEqual(sent["fields"]["size"], "480x480")
+                self.assertEqual(len(sent["images"]), 1)
+                self.assertEqual((sent["end_user_name"], sent["end_user_phone"]),
+                                 ("lighting-owner", "13800138000"))
+            else:
+                sent = next(item for item in self.generations if item["body"]["prompt"] == prompts[capability])
+                self.assertEqual(sent["body"]["model"], model)
+                self.assertEqual(sent["body"]["size"], "480x480")
+                self.assertEqual(sent["body"]["n"], 1)
+                self.assertEqual((sent["name"], sent["phone"]), ("lighting-owner", "13800138000"))
+            self.assertEqual(sent["authorization"], "Bearer fake-lighting-secret")
+        report = self.application["costs"].report()
+        rows = {row["job_id"]: row for row in report["jobs"]}
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(report["overview"]["gpu_hours"], 0)
+        self.assertEqual(report["overview"]["unknown_cost_tasks"], 6)
+        for submitted in submitted_jobs:
+            row = rows[submitted["id"]]
+            self.assertEqual(row["event_kind"], "image_api")
+            self.assertEqual(row["capability"], submitted["capability"])
+            self.assertEqual(row["dimensions"]["model"], submitted["modelName"])
+            self.assertEqual(row["dimensions"]["billing_mode"], "paid_api")
+            self.assertEqual(row["cost_source"], "unknown")
+            self.assertEqual(row["retail_source"], "unpriced")
+            db_row = dict(self.application["costs"].db.execute(
+                "SELECT * FROM cost_events WHERE job_id=?", (submitted["id"],)).fetchone())
+            self.assertEqual(db_row["project_id"], self.project)
+            self.assertEqual(db_row["model_family"], submitted["modelName"])
+            self.assertIsNone(db_row["total_cost_micros"])
+            self.assertIsNone(db_row["api_cost_micros"])
+        self.assertEqual(len(self.generations) + len(self.received), 6)
 
     async def test_controller_records_api_cost_separately_from_gpu(self):
         submitted = await self.start_job()
