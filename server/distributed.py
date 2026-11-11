@@ -532,6 +532,20 @@ class DistributedStore:
             for name, definition in sync_columns.items():
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE workers ADD COLUMN {name} {definition}")
+            # Cover hot polling fields so legacy rows need not traverse multi-MB JSON overflow pages.
+            self.db.executescript("""
+                CREATE INDEX IF NOT EXISTS idx_workers_poll_summary ON workers(
+                    retired, created_at DESC, id DESC, name, enabled, comfy_online, busy,
+                    current_job_id, last_seen, sync_status, access_team_id, access_expires_at,
+                    json_type(COALESCE(NULLIF(capabilities_json, ''), '{}'), '$.is_primary_node') = 'true'
+                );
+                CREATE INDEX IF NOT EXISTS idx_workers_restart_expiry
+                    ON workers(retired, sync_action, sync_status, sync_started_at);
+                CREATE INDEX IF NOT EXISTS idx_workers_auth
+                    ON workers(id, retired, token_hash);
+                CREATE INDEX IF NOT EXISTS idx_workers_access
+                    ON workers(id, access_team_id, access_expires_at);
+            """)
             # Upgrade pre-existing public aliases of already reserved physical hosts.
             registrations = self._worker_access_rows_locked()
             reconciled = set()
@@ -734,7 +748,8 @@ class DistributedStore:
             return False
         with self.lock:
             row = self.db.execute(
-                "SELECT token_hash FROM workers WHERE id = ? AND retired = 0", (worker_id,)
+                "SELECT token_hash FROM workers INDEXED BY idx_workers_auth "
+                "WHERE id = ? AND retired = 0", (worker_id,)
             ).fetchone()
         return bool(row and hmac.compare_digest(row["token_hash"], _hash_token(token)))
 
@@ -1469,26 +1484,33 @@ class DistributedStore:
                     ) AS capabilities_json"""
         with self.lock, self.db:
             self._expire_service_restarts_locked(now)
-            # 只排序轻量身份字段；先去重，再按主键读取能力清单，避免数十 MB 临时排序。
-            seen_names = set()
-            selected_ids = []
-            for row in self.db.execute(
-                """SELECT id, name FROM workers WHERE retired = 0
-                   ORDER BY created_at DESC, id DESC"""
-            ):
-                name_key = _worker_name_key(row["name"])
-                if name_key in seen_names:
-                    continue
-                seen_names.add(name_key)
-                if worker_id is None or row["id"] == worker_id:
-                    selected_ids.append(row["id"])
-            rows = []
-            for selected_id in selected_ids:
-                row = self.db.execute(
-                    f"SELECT {columns} FROM workers WHERE retired = 0 AND id = ?", (selected_id,),
-                ).fetchone()
-                if row is not None:
-                    rows.append(row)
+            if summary:
+                # 与覆盖索引保持相同表达式；公共健康轮询完全不读取能力 JSON。
+                rows = self.db.execute(
+                    f"""SELECT {columns} FROM workers WHERE retired = 0
+                        ORDER BY created_at DESC, id DESC"""
+                ).fetchall()
+            else:
+                # 只排序轻量身份字段；先去重，再按主键读取能力清单。
+                seen_names = set()
+                selected_ids = []
+                for row in self.db.execute(
+                    """SELECT id, name FROM workers WHERE retired = 0
+                       ORDER BY created_at DESC, id DESC"""
+                ):
+                    name_key = _worker_name_key(row["name"])
+                    if name_key in seen_names:
+                        continue
+                    seen_names.add(name_key)
+                    if worker_id is None or row["id"] == worker_id:
+                        selected_ids.append(row["id"])
+                rows = []
+                for selected_id in selected_ids:
+                    row = self.db.execute(
+                        f"SELECT {columns} FROM workers WHERE retired = 0 AND id = ?", (selected_id,),
+                    ).fetchone()
+                    if row is not None:
+                        rows.append(row)
         workers = []
         seen_names = set()
         for row in rows:
@@ -1496,6 +1518,8 @@ class DistributedStore:
             if name_key in seen_names:
                 continue
             seen_names.add(name_key)
+            if worker_id is not None and row["id"] != worker_id:
+                continue
             item = dict(row)
             item.pop("token_hash", None)
             item.pop("retired", None)

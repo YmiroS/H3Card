@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import re
@@ -1362,6 +1363,144 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             response = await self.client.get('/api/generation/workers?capability=target-video')
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual((await response.json())['workers'][0]['id'], worker_id)
+
+    async def test_monitoring_summaries_require_admin_before_reading_inventory_or_jobs(self):
+        self.auth.create_user('summary-user', auth_support.PASSWORD)
+        self.auth.create_user('summary-monitor', auth_support.PASSWORD, role='monitor')
+        paths = ('/api/workers?summary=1', '/api/workers?worker_id=missing',
+                 '/api/workers?summary=1&worker_id=missing', '/api/workers',
+                 '/api/jobs?summary=1', '/api/jobs?summary=1&delta=1')
+        for username, status in (('summary-user', 403), ('summary-monitor', 403),
+                                 (None, 401)):
+            if username:
+                self.client.session.headers.update(await self.login(username))
+            else:
+                self.client.session.cookie_jar.clear()
+            with self.subTest(user=username), \
+                 mock.patch.object(self.store, 'list_workers',
+                                   side_effect=AssertionError('unauthorized inventory read')) as workers, \
+                 mock.patch.object(self.auth, 'job_permissions',
+                                   side_effect=AssertionError('unauthorized job query')) as permissions, \
+                 mock.patch.object(controller_app, 'JOBS', wraps=controller_app.JOBS) as jobs:
+                jobs.values.side_effect = AssertionError('unauthorized in-memory job scan')
+                for path in paths:
+                    with self.subTest(path=path):
+                        response = await self.client.get(path)
+                        self.assertEqual(response.status, status, await response.text())
+                workers.assert_not_called()
+                permissions.assert_not_called()
+                jobs.values.assert_not_called()
+
+    async def test_jobs_summary_preserves_all_visible_rows_without_mutating_full_records(self):
+        fields = {
+            'id', 'status', 'history_only', 'permission', 'modelName', 'nodeName',
+            'card', 'name', 'cardName', 'project', 'projectName', 'progress', 'step',
+            'created', 'started', 'ended', 'worker_id', 'error', 'capability',
+            'submitter_display_name', 'submitter_username', 'queue_ahead', 'queue_order',
+            'queue_wait_seconds',
+        }
+        owner = self.auth.create_user('summary-owner', auth_support.PASSWORD)
+        self.own_project('summary-project', owner=owner)
+        self.own_project('summary-deleted')
+        self.register_job('summary-deleted-job', 'summary-deleted')
+        self.auth.set_project_state('summary-deleted', 'deleted')
+        self.auth.db.execute("INSERT INTO legacy_jobs(job_id,reason) VALUES(?,'test')",
+                             ('summary-legacy',))
+        worker_id = self.store.register_worker('summary-gpu', {})['worker_id']
+        statuses = ('queued', 'running', 'done', 'error', 'canceled')
+        for index in range(65):
+            jid = f'summary-{index:03d}'
+            self.register_job(jid, 'summary-project', owner)
+            controller_app.JOBS[jid] = {
+                'id': jid, 'status': statuses[index % len(statuses)],
+                'history_only': index == 64, 'modelName': '测试模型',
+                'card': 'card_image', 'name': '测试任务', 'cardName': '生图',
+                'project': 'summary-project', 'projectName': '摘要画布',
+                'progress': 0.5, 'step': '采样中', 'created': index,
+                'started': index + 1, 'ended': index + 2, 'worker_id': worker_id,
+                'error': '测试错误' if index % len(statuses) == 3 else None,
+                'capability': 'zimage_t2i',
+                'outputs': [{'url': f'/output/{jid}.png', 'kind': 'image',
+                             'metadata': {'text': 'output-data-' * 2048}}],
+                'params': {'prompt': 'prompt-data-' * 100},
+                'prompts': [{'text': '完整提示词'}], 'assets': {'image': 'reference.png'},
+                'graph': {'1': {'class_type': 'KSampler'}}, 'extra_payload': ['x' * 1024],
+            }
+        # Keep two real queued dispatch rows so queue presentation is not mocked.
+        for jid in ('summary-000', 'summary-005'):
+            self.store.enqueue(jid, {'capability': 'zimage_t2i', 'graph': {}})
+        self.store.enqueue('summary-002', {'capability': 'zimage_t2i', 'graph': {}})
+        with self.store.db:
+            self.store.db.execute(
+                "UPDATE dispatch_jobs SET worker_id=?, status='done' WHERE job_id=?",
+                (worker_id, 'summary-002'))
+        for index, jid in enumerate(('summary-deleted-job', 'summary-orphan', 'summary-legacy')):
+            controller_app.JOBS[jid] = {
+                'id': jid, 'status': 'done', 'created': 100 + index,
+                'outputs': [{'url': '/output/history.png', 'kind': 'image'}],
+            }
+        before = copy.deepcopy(controller_app.JOBS)
+        response = await self.client.get('/api/jobs')
+        self.assertEqual(response.status, 200, await response.text())
+        full_bytes = len(await response.read())
+        full = (await response.json())['jobs']
+        with mock.patch.object(self.auth, 'job_permissions',
+                               wraps=self.auth.job_permissions) as permissions, \
+             mock.patch.object(self.store, 'job_worker_names',
+                               wraps=self.store.job_worker_names) as names:
+            response = await self.client.get('/api/jobs?summary=1')
+        self.assertEqual(response.status, 200, await response.text())
+        summary_bytes = len(await response.read())
+        # Measure actual decoded HTTP bodies, not a re-serialized Python projection.
+        print(f'jobs response bytes: full={full_bytes}, summary={summary_bytes}')
+        self.assertLess(summary_bytes * 10, full_bytes)
+        summary = (await response.json())['jobs']
+        self.assertEqual(len(summary), 68)
+        self.assertEqual(summary, [{key: value for key, value in job.items() if key in fields}
+                                   for job in full])
+        self.assertEqual([job['id'] for job in summary],
+                         [job['id'] for job in sorted(before.values(),
+                                                     key=lambda job: job['created'], reverse=True)])
+        permissions.assert_called_once()
+        self.assertIsNone(permissions.call_args.kwargs['limit'])
+        names.assert_called_once()
+        by_id = {job['id']: job for job in summary}
+        self.assertEqual(set(by_id['summary-002']), fields)
+        self.assertEqual(by_id['summary-002']['nodeName'], 'summary-gpu')
+        self.assertEqual(by_id['summary-002']['submitter_username'], owner['username'])
+        self.assertEqual(by_id['summary-002']['permission'], 'operate')
+        self.assertEqual(by_id['summary-005']['queue_ahead'], 1)
+        self.assertEqual(by_id['summary-000']['queue_ahead'], 0)
+        self.assertTrue(by_id['summary-064']['history_only'])
+        self.assertEqual(by_id['summary-deleted-job']['permission'], 'read')
+        self.assertEqual(by_id['summary-orphan']['permission'], 'read')
+        self.assertEqual(by_id['summary-legacy']['permission'], 'operate')
+        self.assertEqual(controller_app.JOBS, before)
+
+        # Summary polling must not truncate the legacy list, delta cache or detail.
+        self.assertEqual((await (await self.client.get('/api/jobs')).json())['jobs'], full)
+        delta = await (await self.client.get('/api/jobs?delta=1')).json()
+        self.assertTrue(delta['reset'])
+        self.assertEqual(delta['jobs'], full)
+        self.assertEqual((await self.client.get('/api/jobs?summary=1')).status, 200)
+        unchanged = await (await self.client.get(
+            '/api/jobs?delta=1&cursor=' + delta['cursor'])).json()
+        self.assertFalse(unchanged['reset'])
+        self.assertEqual(unchanged['jobs'], [])
+        self.assertEqual(unchanged['removed'], [])
+        response = await self.client.get('/api/job/summary-002')
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(await response.json(), next(job for job in full if job['id'] == 'summary-002'))
+
+        # An ordinary authorized owner can still read complete single-job outputs.
+        self.client.session.headers.update(await self.login(owner['username']))
+        response = await self.client.get('/api/job/summary-002')
+        self.assertEqual(response.status, 200, await response.text())
+        detail = await response.json()
+        for key in ('outputs', 'params', 'prompts', 'assets', 'graph'):
+            self.assertEqual(detail[key], before['summary-002'][key])
+        self.assertEqual(detail['permission'], 'operate')
+        self.assertEqual(controller_app.JOBS, before)
 
     async def test_jobs_batch_permissions_and_skip_unused_queue_scan(self):
         ids = [f'job-{index}' for index in range(1505)]
@@ -3361,6 +3500,144 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertNotIn("sync_files", {
             command["type"] for command in heartbeat["commands"]
         })
+
+    def monitoring_workers_fixture(self):
+        # Shared bulk inventory must disappear from summaries without inflating
+        # the genuine missing/extra-model comparison or hiding its differences.
+        shared_models = [f'models/shared-{index:05d}.safetensors' for index in range(8192)]
+        capabilities = {
+            'agent_version': 5, 'supports_code_restart': True,
+            'supports_service_restart': True, 'supports_host_reboot': False,
+            'remote_commands': ['restart_services', 'sync_files'],
+            'telemetry': {'hostname': 'summary-host', 'memory': {'total_bytes': 1024}},
+            'devices': [{'type': 'cuda', 'name': 'RTX 5090', 'vram_total': 32 * 1024 ** 3}],
+            'system': {'os': 'Windows'}, 'is_primary_node': True,
+            'node_classes': ['UNETLoader', 'KSampler'],
+            'input_choices': {'UNETLoader': {'unet_name': shared_models + ['missing.safetensors']}},
+            'input_types': {'UNETLoader': {'unet_name': 'COMBO'}},
+            'extra_inventory': ['large-inventory-entry' * 100],
+        }
+        primary = self.store.register_worker('summary-primary', capabilities)['worker_id']
+        target_caps = copy.deepcopy(capabilities)
+        target_caps.update(agent_version=4, is_primary_node=False,
+                           node_classes=['UNETLoader', 'ExtraNode'])
+        target_caps['input_choices']['UNETLoader']['unet_name'] = shared_models + ['extra.safetensors']
+        old = self.store.register_worker('summary-target', target_caps)['worker_id']
+        target = self.store.register_worker('  SUMMARY-TARGET  ', target_caps)['worker_id']
+        with self.store.db:
+            self.store.db.execute('UPDATE workers SET created_at=1 WHERE id=?', (old,))
+        self.store.heartbeat(primary, comfy_online=True)
+        self.store.heartbeat(target, comfy_online=True, busy=True)
+        unrelated = self.store.register_worker('summary-unrelated', target_caps)['worker_id']
+        with self.store.db:
+            self.store.db.execute('UPDATE workers SET last_seen=0 WHERE id=?', (unrelated,))
+        return primary, target, old, unrelated
+
+    async def test_workers_summary_preserves_states_and_full_comparison_without_mutation(self):
+        primary, target, old, unrelated = self.monitoring_workers_fixture()
+        expected_states = {primary: 'idle', target: 'busy', unrelated: 'offline'}
+        for state in ('disabled', 'syncing', 'error'):
+            worker_id = self.store.register_worker('summary-' + state, {})['worker_id']
+            self.store.heartbeat(worker_id, comfy_online=True)
+            if state == 'disabled':
+                self.store.set_worker_enabled(worker_id, False)
+            else:
+                with self.store.db:
+                    self.store.db.execute('UPDATE workers SET sync_status=? WHERE id=?',
+                                          ('pending' if state == 'syncing' else 'error', worker_id))
+            expected_states[worker_id] = state
+        before = [dict(row) for row in self.store.db.execute('SELECT * FROM workers ORDER BY id')]
+        response = await self.client.get('/api/workers')
+        self.assertEqual(response.status, 200, await response.text())
+        full_bytes = len(await response.read())
+        full = await response.json()
+        response = await self.client.get('/api/workers?summary=1')
+        self.assertEqual(response.status, 200, await response.text())
+        summary_bytes = len(await response.read())
+        print(f'workers response bytes: full={full_bytes}, summary={summary_bytes}')
+        self.assertLess(summary_bytes * 10, full_bytes)
+        summary = await response.json()
+        fields = {'agent_version', 'supports_code_restart', 'supports_service_restart',
+                  'supports_host_reboot', 'remote_commands', 'telemetry', 'devices',
+                  'system', 'is_primary_node'}
+        expected = copy.deepcopy(full)
+        for worker in expected['workers']:
+            worker['capabilities'] = {key: value for key, value in worker['capabilities'].items()
+                                      if key in fields}
+        self.assertEqual(summary, expected)
+        self.assertEqual(summary['comparison_baseline'], {
+            'status': 'ready', 'worker_id': primary, 'agent_version': 5,
+        })
+        by_id = {worker['id']: worker for worker in summary['workers']}
+        self.assertNotIn(old, by_id)
+        self.assertEqual({wid: worker['state'] for wid, worker in by_id.items()}, expected_states)
+        self.assertEqual(set(by_id[target]['capabilities']), fields)
+        self.assertEqual(by_id[target]['capability_comparison'], {
+            'status': 'missing', 'model_inventory_status': 'missing',
+            'missing_node_classes': ['KSampler'], 'extra_node_classes': ['ExtraNode'],
+            'missing_models': [{'node_class': 'UNETLoader', 'input': 'unet_name',
+                                'name': 'missing.safetensors'}],
+            'extra_models': [{'node_class': 'UNETLoader', 'input': 'unet_name',
+                              'name': 'extra.safetensors'}],
+        })
+        self.assertEqual(by_id[unrelated]['capability_comparison']['status'], 'stale')
+        self.assertEqual(by_id[primary]['capability_comparison']['status'], 'primary')
+        self.assertEqual(await (await self.client.get('/api/workers')).json(), full)
+        self.assertEqual([dict(row) for row in self.store.db.execute('SELECT * FROM workers ORDER BY id')],
+                         before)
+
+    async def test_workers_detail_loads_only_target_and_primary_with_complete_inventory(self):
+        primary, target, _old, unrelated = self.monitoring_workers_fixture()
+        full_response = await self.client.get('/api/workers')
+        self.assertEqual(full_response.status, 200, await full_response.text())
+        full = await full_response.json()
+        by_id = {worker['id']: worker for worker in full['workers']}
+        summary_response = await self.client.get('/api/workers?summary=1')
+        self.assertEqual(summary_response.status, 200, await summary_response.text())
+        summary = await summary_response.json()
+        self.assertEqual(summary['comparison_baseline'], full['comparison_baseline'])
+        for worker in summary['workers']:
+            self.assertNotIn('input_choices', worker['capabilities'])
+            self.assertEqual(worker['capability_comparison'], by_id[worker['id']]['capability_comparison'])
+        loop_thread = threading.get_ident()
+        original = self.store.list_workers
+
+        def listed(**kwargs):
+            self.assertNotEqual(threading.get_ident(), loop_thread)
+            return original(**kwargs)
+
+        for selected, expected_full_ids in ((target, {target, primary}), (primary, {primary})):
+            with self.subTest(worker_id=selected), \
+                 mock.patch.object(self.store, 'list_workers', side_effect=listed) as listing:
+                response = await self.client.get('/api/workers', params={'worker_id': selected})
+            self.assertEqual(response.status, 200, await response.text())
+            self.assertEqual(await response.json(), {
+                'comparison_baseline': full['comparison_baseline'], 'workers': [by_id[selected]],
+            })
+            # Observe the real store calls, not mocked inventory/comparison results.
+            reads = [call.kwargs for call in listing.call_args_list]
+            self.assertTrue(any(read.get('summary') for read in reads))
+            full_reads = [read.get('worker_id') for read in reads if not read.get('summary')]
+            self.assertEqual(set(full_reads), expected_full_ids)
+            self.assertEqual(len(full_reads), len(expected_full_ids))
+            self.assertNotIn(unrelated, full_reads)
+            for key in ('node_classes', 'input_choices', 'input_types', 'extra_inventory'):
+                self.assertIn(key, by_id[selected]['capabilities'])
+            self.assertEqual(len(by_id[selected]['capabilities']['input_choices']['UNETLoader']['unet_name']),
+                             8193)
+        self.assertEqual(await (await self.client.get('/api/workers')).json(), full)
+
+    async def test_workers_detail_rejects_missing_and_superseded_registration(self):
+        _primary, target, old, _unrelated = self.monitoring_workers_fixture()
+        for worker_id in ('does-not-exist', old):
+            with self.subTest(worker_id=worker_id), \
+                 mock.patch.object(self.store, 'list_workers', wraps=self.store.list_workers) as listing:
+                response = await self.client.get('/api/workers', params={'worker_id': worker_id})
+            self.assertEqual(response.status, 404, await response.text())
+            listing.assert_called_once_with(worker_id=worker_id)
+        response = await self.client.get('/api/workers', params={'worker_id': target})
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual([worker['id'] for worker in (await response.json())['workers']], [target])
 
     async def test_workers_api_compares_versions_models_and_nodes_to_primary(self):
         primary_caps = {

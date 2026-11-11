@@ -1292,11 +1292,18 @@ class DistributedStoreTest(unittest.TestCase):
                 reads = [sql for sql in statements if 'FROM workers' in sql]
                 identity_reads = [sql for sql in reads if 'ORDER BY' in sql]
                 self.assertEqual(len(identity_reads), 1)
-                self.assertIn('SELECT id, name FROM workers', identity_reads[0])
+                plan = self.store.db.execute('EXPLAIN QUERY PLAN ' + identity_reads[0]).fetchall()
+                self.assertTrue(any('idx_workers_poll_summary' in row[3] for row in plan), plan)
+                self.assertFalse(any('TEMP B-TREE' in row[3] for row in plan), plan)
                 payload_reads = [sql for sql in reads if 'AND id =' in sql]
-                self.assertEqual(len(payload_reads), 2)
-                self.assertTrue(all(self.worker_id not in sql for sql in payload_reads))
-                self.assertTrue(all('ORDER BY' not in sql for sql in payload_reads))
+                if options.get('summary'):
+                    self.assertEqual(len(payload_reads), 0)
+                    self.assertEqual(len(reads), 1)
+                else:
+                    self.assertIn('SELECT id, name FROM workers', identity_reads[0])
+                    self.assertEqual(len(payload_reads), 2)
+                    self.assertTrue(all(self.worker_id not in sql for sql in payload_reads))
+                    self.assertTrue(all('ORDER BY' not in sql for sql in payload_reads))
                 for worker in workers:
                     self.assertNotIn('token_hash', worker)
                 if not options:
@@ -2366,6 +2373,37 @@ class DistributedStoreMigrationTest(unittest.TestCase):
                 )
                 self.assertTrue(store.authenticate("legacy-worker", "legacy-token"))
                 self.assertEqual(store.list_workers()[0]["id"], "legacy-worker")
+                store.heartbeat('legacy-worker', comfy_online=True, capabilities={
+                    'is_primary_node': True, 'input_choices': {'model': ['x' * 2_000_000]},
+                })
+                statements = []
+                store.db.set_trace_callback(statements.append)
+                try:
+                    self.assertTrue(store.list_workers(summary=True)[0]['is_primary_node'])
+                    self.assertTrue(store.authenticate('legacy-worker', 'legacy-token'))
+                    self.assertEqual(store.inaccessible_worker_ids(set()), set())
+                finally:
+                    store.db.set_trace_callback(None)
+                queries = [sql for sql in statements if sql.lstrip().startswith('SELECT')
+                           and 'FROM workers' in sql]
+                self.assertEqual(len(queries), 3)
+                worker_root = store.db.execute(
+                    "SELECT rootpage FROM sqlite_master WHERE name='workers'").fetchone()[0]
+                for sql in queries:
+                    with self.subTest(query=sql):
+                        plan = store.db.execute('EXPLAIN QUERY PLAN ' + sql).fetchall()
+                        self.assertTrue(any('idx_workers_' in row[3] for row in plan),
+                                        (sql, [tuple(row) for row in plan]))
+                        program = store.db.execute('EXPLAIN ' + sql).fetchall()
+                        table_cursors = {row[2] for row in program
+                                         if row[1] == 'OpenRead' and row[3] == worker_root}
+                        self.assertFalse(any(row[1] == 'Column' and row[2] in table_cursors
+                                             for row in program), sql)
+                        self.assertFalse(any(row[1] == 'Function' and 'json_type' in str(row[5])
+                                             for row in program), sql)
+                expiry = next(sql for sql in statements if 'UPDATE workers SET sync_status' in sql)
+                plan = store.db.execute('EXPLAIN QUERY PLAN ' + expiry).fetchall()
+                self.assertTrue(any('idx_workers_restart_expiry' in row[3] for row in plan), plan)
             finally:
                 store.close()
 

@@ -2277,6 +2277,9 @@ async def api_job_inputs(request):
 
 async def api_jobs(request):
     user = require_user(request)
+    summary = request.query.get("summary") == "1"
+    if summary:
+        require_admin(request)
     is_admin = user["role"] == "admin"
     ordered = sorted(list(JOBS.values()), key=lambda j: j["created"], reverse=True)
     permissions = await call_store(
@@ -2306,6 +2309,14 @@ async def api_jobs(request):
         | submitters.get(job['id'], {}) | queue_snapshot[job['id']] | {"permission": permission}
         for job, permission in visible
     ])
+    if summary:
+        fields = ("id", "status", "history_only", "permission", "modelName", "nodeName",
+                  "card", "name", "cardName", "project", "projectName", "progress", "step",
+                  "created", "started", "ended", "worker_id", "error", "capability",
+                  "submitter_display_name", "submitter_username", "queue_ahead", "queue_order",
+                  "queue_wait_seconds")
+        projected = [{key: job[key] for key in fields if key in job} for job in projected]
+        return web.json_response({"jobs": projected})
     if request.query.get("delta") == "1":
         return await job_poll_response(request, projected, user["id"])
     return web.json_response({"jobs": projected})
@@ -2845,10 +2856,32 @@ async def api_generation_workers(request):
 
 
 async def api_workers(request):
+    require_admin(request)
     store = distributed_store(request.app)
+    summary = request.query.get("summary") == "1"
+    worker_id = request.query.get("worker_id")
 
     def encode_workers():
-        baseline, workers = worker_capability_comparisons(store.list_workers())
+        if worker_id is not None:
+            with store.lock:
+                workers = store.list_workers(worker_id=worker_id)
+                if not workers:
+                    raise web.HTTPNotFound(text="Worker 不存在或已被新的注册替代")
+                primary = [item for item in store.list_workers(summary=True)
+                           if item["is_primary_node"] and item["id"] != worker_id]
+                for item in primary:
+                    workers.extend(store.list_workers(worker_id=item["id"]))
+            baseline, workers = worker_capability_comparisons(workers)
+            workers = [item for item in workers if item["id"] == worker_id]
+        else:
+            baseline, workers = worker_capability_comparisons(store.list_workers())
+        if summary:
+            fields = ("agent_version", "supports_code_restart", "supports_service_restart",
+                      "supports_host_reboot", "remote_commands", "telemetry", "devices",
+                      "system", "is_primary_node")
+            workers = [item | {"capabilities": {
+                key: value for key, value in item["capabilities"].items() if key in fields
+            }} for item in workers]
         return json.dumps({"comparison_baseline": baseline, "workers": workers}).encode("utf-8")
 
     body = await asyncio.to_thread(encode_workers)
