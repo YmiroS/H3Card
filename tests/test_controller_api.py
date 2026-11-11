@@ -3646,7 +3646,7 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                  mock.patch.object(self.store, 'list_workers', wraps=self.store.list_workers) as listing:
                 response = await self.client.get('/api/workers', params={'worker_id': worker_id})
             self.assertEqual(response.status, 404, await response.text())
-            listing.assert_called_once_with(worker_id=worker_id)
+            listing.assert_called_once_with(worker_id=worker_id, access_config=True)
         response = await self.client.get('/api/workers', params={'worker_id': target})
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual([worker['id'] for worker in (await response.json())['workers']], [target])

@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 from contextlib import closing
+from datetime import datetime
 from pathlib import Path
 from unittest import mock
 
@@ -385,6 +386,226 @@ class WorkerAccessStoreTest(unittest.TestCase):
         self.assertTrue(worker_access_allowed(worker, None, 19))
         self.assertTrue(worker_access_allowed(worker, set(), 20))
         self.assertTrue(worker_access_allowed({}, set(), 19))
+
+    def test_daily_window_boundaries_repeat_and_absolute_cutoff(self):
+        window = {"start": "09:00", "end": "18:00", "time_zone": "Asia/Shanghai"}
+        worker = {"access_team_id": self.team_a, "access_expires_at": None,
+                  "access_daily_window": window}
+        for instant, restricted in (
+            ("2026-11-11T08:59:59+08:00", False),
+            ("2026-11-11T09:00:00+08:00", True),
+            ("2026-11-11T17:59:59+08:00", True),
+            ("2026-11-11T18:00:00+08:00", False),
+            ("2026-11-11T23:00:00+08:00", False),
+            ("2026-11-12T08:59:59+08:00", False),
+            ("2026-11-12T09:00:00+08:00", True),
+            # The same actual instant expressed in UTC; server TZ is irrelevant.
+            ("2026-11-12T01:00:00+00:00", True),
+        ):
+            now = datetime.fromisoformat(instant).timestamp()
+            with self.subTest(instant=instant):
+                self.assertEqual(worker_access_team(worker, now), self.team_a if restricted else None)
+                self.assertEqual(worker_access_allowed(worker, {self.team_b}, now), not restricted)
+        cutoff = datetime.fromisoformat("2026-11-12T10:00:00+08:00").timestamp()
+        worker["access_expires_at"] = cutoff
+        self.assertEqual(worker_access_team(worker, cutoff - 1), self.team_a)
+        for now in (cutoff, cutoff + 86400):
+            self.assertIsNone(worker_access_team(worker, now))
+
+    def test_overnight_and_dst_use_local_wall_clock_at_actual_instant(self):
+        worker = {"access_team_id": self.team_a, "access_daily_window": {
+            "start": "22:00", "end": "06:00", "time_zone": "Asia/Shanghai"}}
+        for instant, restricted in (
+            ("2026-11-11T21:59:59+08:00", False),
+            ("2026-11-11T22:00:00+08:00", True),
+            ("2026-11-12T00:00:00+08:00", True),
+            ("2026-11-12T05:59:59+08:00", True),
+            ("2026-11-12T06:00:00+08:00", False),
+            ("2026-11-12T22:00:00+08:00", True),
+        ):
+            with self.subTest(instant=instant):
+                self.assertEqual(worker_access_team(worker, datetime.fromisoformat(instant).timestamp()),
+                                 self.team_a if restricted else None)
+        worker["access_daily_window"] = {
+            "start": "01:15", "end": "01:45", "time_zone": "America/New_York"}
+        for instant, restricted in (
+            ("2026-11-01T05:30:00+00:00", True),   # First 01:30 (EDT).
+            ("2026-11-01T06:30:00+00:00", True),   # Repeated 01:30 (EST).
+            ("2026-11-01T06:45:00+00:00", False),
+            ("2026-07-01T05:30:00+00:00", True),
+            ("2026-12-01T05:30:00+00:00", False),  # Winter is 00:30, not 01:30.
+        ):
+            with self.subTest(instant=instant):
+                self.assertEqual(worker_access_team(worker, datetime.fromisoformat(instant).timestamp()),
+                                 self.team_a if restricted else None)
+        worker["access_daily_window"] = {
+            "start": "02:15", "end": "03:15", "time_zone": "America/New_York"}
+        for instant, restricted in (("2026-03-08T06:59:59+00:00", False),
+                                    ("2026-03-08T07:00:00+00:00", True),
+                                    ("2026-03-08T07:15:00+00:00", False)):
+            self.assertEqual(worker_access_team(worker, datetime.fromisoformat(instant).timestamp()),
+                             self.team_a if restricted else None)
+
+    def test_daily_schedule_all_list_dtos_redaction_and_outsider_dispatch(self):
+        worker = self.worker("scheduled")
+        window = {"start": "09:00", "end": "18:00", "time_zone": "Asia/Shanghai"}
+        self.store.set_worker_access(worker, self.team_a, daily_window=window)
+        persisted = self.worker_row(worker)
+        for instant, restricted in (
+            ("2026-11-11T08:59:59+08:00", False),
+            ("2026-11-11T09:00:00+08:00", True),
+            ("2026-11-11T18:00:00+08:00", False),
+            ("2026-11-12T09:00:00+08:00", True),
+        ):
+            with self.subTest(instant=instant), mock.patch(
+                    "distributed.time.time", return_value=datetime.fromisoformat(instant).timestamp()):
+                self.store.heartbeat(worker, comfy_online=True)
+                for options in ({}, {"summary": True}, {"telemetry_only": True}, {"worker_id": worker}):
+                    item = self.store.list_workers(**options)[0]
+                    self.assertEqual(item["access_daily_window"], window)
+                    self.assertNotIn("access_daily_window_json", item)
+                    self.assertEqual(item["access_team_id"], self.team_a if restricted else None)
+                    self.assertEqual(worker_access_allowed(item, {self.team_b}), not restricted)
+                    config = self.store.list_workers(access_config=True, **options)[0]
+                    self.assertEqual(config["access_team_id"], self.team_a)
+                    self.assertEqual(config["access_daily_window"], window)
+                    self.assertEqual(worker_access_allowed(config, {self.team_b}), not restricted)
+                self.assertEqual(self.store.inaccessible_worker_ids({self.team_b}),
+                                 {worker} if restricted else set())
+                job = "target-" + instant
+                self.enqueue(job, self.bob, target_worker_id=worker)
+                claim = self.store.acquire(worker)
+                if restricted:
+                    self.assertIsNone(claim)
+                    self.assertEqual(self.store.dispatch_status(job), "queued")
+                    self.store.request_cancel(job)
+                else:
+                    self.assertEqual(claim["job_id"], job)
+                    self.finish(worker, claim)
+        after = self.worker_row(worker)
+        for key in ("access_team_id", "access_expires_at", "access_daily_window_json"):
+            self.assertEqual(after[key], persisted[key])
+
+    def test_daily_schedule_inherits_outside_window_and_clears_across_host_aliases(self):
+        window = {"start": "09:00", "end": "18:00", "time_zone": "Asia/Shanghai"}
+        caps = {**self.caps, "host_id": "scheduled-host"}
+        first = self.worker("original", caps=caps)
+        alias = self.worker("alias", caps=caps)
+        outside = datetime.fromisoformat("2026-11-11T20:00:00+08:00").timestamp()
+        expiry = outside + 3 * 86400
+        self.store.set_worker_access(first, self.team_a, expiry, window)
+        with mock.patch("distributed.time.time", return_value=outside):
+            same_name = self.worker(" ORIGINAL ")
+            self.store.retire_worker(alias)
+            new_host_alias = self.worker("new-alias", caps=caps)
+            for worker in (first, alias, same_name, new_host_alias):
+                row = self.worker_row(worker)
+                self.assertEqual(row["access_team_id"], self.team_a)
+                self.assertEqual(json.loads(row["access_daily_window_json"]), window)
+                self.assertEqual(row["access_expires_at"], expiry)
+            self.assertEqual(self.store.inaccessible_worker_ids(set()), set())
+            reopened = DistributedStore(self.root / "dispatch.db")
+            try:
+                inside = outside + 13 * 3600
+                with mock.patch("distributed.time.time", return_value=inside):
+                    self.assertEqual(reopened.inaccessible_worker_ids(set()),
+                                     {first, alias, same_name, new_host_alias})
+            finally:
+                reopened.close()
+        self.store.set_worker_access(new_host_alias, None, daily_window=window)
+        for worker in (first, alias, same_name, new_host_alias):
+            self.assertIsNone(self.worker_row(worker)["access_daily_window_json"])
+        latest = self.worker("latest", caps=caps)
+        self.assertIsNone(self.worker_row(latest)["access_daily_window_json"])
+
+    def test_corrupt_persisted_schedules_fail_closed_in_lists_redaction_and_dispatch(self):
+        worker = self.worker(team=self.team_a)
+        self.enqueue(submitter=self.bob, target_worker_id=worker)
+        bad_windows = ("{broken", "null", "[]", "{}", '""',
+                       json.dumps({"start": "99:00", "end": "18:00", "time_zone": "UTC"}),
+                       json.dumps({"start": "09:00", "end": "18:00", "time_zone": "Missing/Zone"}))
+        for raw in bad_windows:
+            with self.subTest(raw=raw), self.store.lock, self.store.db:
+                self.store.db.execute("UPDATE workers SET access_daily_window_json=? WHERE id=?", (raw, worker))
+                for options in ({}, {"summary": True}, {"telemetry_only": True}):
+                    item = self.store.list_workers(**options)[0]
+                    self.assertEqual(item["access_team_id"], self.team_a)
+                    self.assertFalse(worker_access_allowed(item, {self.team_b}))
+                self.assertEqual(self.store.inaccessible_worker_ids({self.team_b}), {worker})
+                self.assertIsNone(self.store.acquire(worker))
+        self.store.db.execute("UPDATE workers SET access_expires_at=0 WHERE id=?", (worker,))
+        self.assertEqual(self.store.inaccessible_worker_ids(set()), set())
+        self.assertEqual(self.store.acquire(worker)["job_id"], "job")
+
+    def test_daily_boundary_does_not_interrupt_running_job_or_rewrite_history(self):
+        worker = self.worker()
+        window = {"start": "09:00", "end": "18:00", "time_zone": "Asia/Shanghai"}
+        start = datetime.fromisoformat("2026-11-11T09:00:00+08:00").timestamp()
+        with mock.patch("distributed.time.time", return_value=start - 1):
+            self.store.heartbeat(worker, comfy_online=True)
+            self.store.set_worker_access(worker, self.team_a, daily_window=window)
+            self.enqueue(submitter=self.bob, target_worker_id=worker)
+            claim = self.store.acquire(worker)
+            self.assertTrue(self.store.mark_running("job", worker, claim["lease_token"]))
+            before = tuple(self.store.db.execute("SELECT * FROM capacity_attempts WHERE id=?",
+                                                (claim["attempt_id"],)).fetchone())
+        with mock.patch("distributed.time.time", return_value=start):
+            result = self.store.heartbeat(worker, comfy_online=True, current_job_id="job")
+            self.assertEqual(result["commands"], [])
+            self.assertEqual(self.store.dispatch_status("job"), "running")
+            self.assertTrue(self.store.validate_lease("job", worker, claim["lease_token"]))
+            self.assertEqual(tuple(self.store.db.execute("SELECT * FROM capacity_attempts WHERE id=?",
+                                                        (claim["attempt_id"],)).fetchone()), before)
+            self.finish(worker, claim)
+            self.enqueue("next", submitter=self.bob, target_worker_id=worker)
+            self.assertIsNone(self.store.acquire(worker))
+
+    def test_slim_dispatch_preference_uses_daily_window_not_stored_team_only(self):
+        public = self.worker("public")
+        scheduled = self.worker("scheduled")
+        window = {"start": "09:00", "end": "18:00", "time_zone": "Asia/Shanghai"}
+        self.store.set_worker_access(scheduled, self.team_a, daily_window=window)
+        start = datetime.fromisoformat("2026-11-11T09:00:00+08:00").timestamp()
+        for index, instant in enumerate((start - 1, start, start + 9 * 3600, start + 86400)):
+            with mock.patch("distributed.time.time", return_value=instant):
+                for worker in (public, scheduled):
+                    self.store.heartbeat(worker, comfy_online=True)
+                self.enqueue(str(index))
+                restricted = instant in (start, start + 86400)
+                if restricted:
+                    self.assertIsNone(self.store.acquire(public))
+                    self.finish(scheduled, self.store.acquire(scheduled))
+                else:
+                    self.finish(public, self.store.acquire(public))
+        # A larger foreign GPU must not block outsiders during its private window,
+        # but should participate normally when it becomes public.
+        large = copy.deepcopy(self.caps)
+        large["devices"][0]["vram_total"] = 96 * 1024 ** 3
+        self.store.heartbeat(scheduled, comfy_online=True, capabilities=large)
+        for index, instant in enumerate((start, start + 9 * 3600)):
+            with mock.patch("distributed.time.time", return_value=instant):
+                for worker in (public, scheduled):
+                    self.store.heartbeat(worker, comfy_online=True)
+                self.enqueue(f"large-{index}", self.bob, gpu_policy=HIGH_VRAM_GPU_POLICY)
+                if instant == start:
+                    self.assertIsNone(self.store.acquire(scheduled))
+                    self.finish(public, self.store.acquire(public))
+                else:
+                    self.assertIsNone(self.store.acquire(public))
+                    self.finish(scheduled, self.store.acquire(scheduled))
+
+    def test_invalid_daily_windows_are_rejected_by_store(self):
+        worker = self.worker()
+        window = {"start": "09:00", "end": "18:00", "time_zone": "Asia/Shanghai"}
+        for invalid in (True, [], {}, "09:00-18:00", {"start": "09:00", "end": "18:00"},
+                        {**window, "extra": True}, {**window, "end": "09:00"},
+                        *({**window, "start": value} for value in
+                          (None, 9, "9:00", "24:00", "09:60", " 09:00", "09:00:00", "０９:00")),
+                        *({**window, "time_zone": value} for value in
+                          (None, 8, "", "Not/AZone", "/etc/localtime", "../UTC", "+08:00"))):
+            with self.subTest(window=invalid), self.assertRaises(ValueError):
+                self.store.set_worker_access(worker, self.team_a, daily_window=invalid)
+        self.assertIsNone(self.worker_row(worker)["access_daily_window_json"])
 
     def test_idle_compatible_dedicated_worker_precedes_public(self):
         public = self.worker("public")
@@ -809,6 +1030,7 @@ class WorkerAccessMigrationTest(unittest.TestCase):
                 self.assertEqual(row["id"], "old")
                 self.assertIsNone(row["access_team_id"])
                 self.assertIsNone(row["access_expires_at"])
+                self.assertIsNone(row["access_daily_window"])
                 expiry = now + 3600
                 self.assertTrue(store.set_worker_access("old", "team", expiry))
             finally:
