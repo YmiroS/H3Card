@@ -83,8 +83,9 @@ class CloudGeneration(CloudLighting):
         if not isinstance(params, dict) or not isinstance(assets, dict):
             raise web.HTTPBadRequest(text="生图参数与素材必须为对象")
         prompt = params.get("prompt")
-        if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
-            raise web.HTTPBadRequest(text="生图提示词不能为空，且不得超过 20000 字符")
+        prompt_limit = 32000 if cap["id"] == "gpt_image_api_t2i" else 20000
+        if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= prompt_limit:
+            raise web.HTTPBadRequest(text=f"生图提示词不能为空，且不得超过 {prompt_limit} 字符")
         count = len(assets)
         allowed_keys = [f"images[{index}]" for index in range(8)]
         keys = [key for key in allowed_keys if key in assets]

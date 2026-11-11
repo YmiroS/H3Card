@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import binascii
+import ipaddress
 from io import BytesIO
 import json
 import logging
@@ -12,7 +13,9 @@ from urllib.parse import urlsplit
 import warnings
 
 import aiohttp
+from aiohttp.resolver import ThreadedResolver
 from PIL import Image
+from yarl import URL
 
 
 CONF = Path(__file__).resolve().parent.parent / "cloud-ai-config.json"
@@ -159,8 +162,8 @@ async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=N
 async def generate(session, prompt, *, end_user_name, end_user_phone,
                    size="1024x1024", quality="high"):
     config = load()
-    if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
-        raise ImageEditError("生图提示词不能为空，且不得超过 20000 字符", status=400)
+    if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 32000:
+        raise ImageEditError("生图提示词不能为空，且不得超过 32000 字符", status=400)
     dimensions = re.fullmatch(r"([1-9]\d{0,6})x([1-9]\d{0,6})", size) if isinstance(size, str) else None
     if (not dimensions or any(int(side) % 16 for side in dimensions.groups())
             or int(dimensions[1]) * int(dimensions[2]) > MAX_PIXELS):
@@ -168,9 +171,62 @@ async def generate(session, prompt, *, end_user_name, end_user_phone,
     if quality not in ("low", "medium", "high"):
         raise ImageEditError("图片质量只支持 low、medium 或 high", status=400)
     body = {"model": config["model"], "prompt": prompt.strip(), "n": 1,
-            "size": size, "quality": quality, "output_format": config["output_format"]}
-    return await request_image(session, config, prompt.strip(), "/images/generations", json=body,
-                               end_user_name=end_user_name, end_user_phone=end_user_phone)
+            "size": size, "quality": quality, "output_format": config["output_format"],
+            "output_compression": 100}
+    result = await request_image(session, config, prompt.strip(), "/images/generations", json=body,
+                                 end_user_name=end_user_name, end_user_phone=end_user_phone)
+    if "result_url" in result:
+        return await download_result(result, config)
+    return result
+
+
+class PublicImageResolver(ThreadedResolver):
+    async def resolve(self, host, port=0, family=0):
+        records = await super().resolve(host, port, family)
+        if not records or any(not ipaddress.ip_address(record["host"]).is_global
+                              or ipaddress.ip_address(record["host"]).is_multicast for record in records):
+            raise OSError("Non-public image result address")
+        return records
+
+
+async def download_result(result, config):
+    request_id = result["request_id"]
+    try:
+        value = result["result_url"]
+        if len(value) > 16384:
+            raise ValueError("Image result URL exceeds limit")
+        url = URL(value, encoded=True)
+        if url.user is not None or url.password is not None or url.fragment:
+            raise ValueError("Invalid image result URL")
+        # Only the administrator-configured gateway may use a private/HTTP origin.
+        same_origin = url.origin() == URL(config["base_url"]).origin()
+        if not same_origin:
+            if url.scheme != "https" or url.port != 443:
+                raise ValueError("Image result must use public HTTPS")
+            try:
+                address = ipaddress.ip_address(url.host)
+            except ValueError:
+                address = None
+            if address is not None and (not address.is_global or address.is_multicast):
+                raise ValueError("Non-public image result address")
+        connector = aiohttp.TCPConnector(
+            resolver=None if same_origin else PublicImageResolver(), use_dns_cache=False, limit=1)
+        # Do not reuse API headers, cookies, proxy configuration or connection credentials.
+        async with aiohttp.ClientSession(
+                connector=connector, trust_env=False, cookie_jar=aiohttp.DummyCookieJar(),
+                auto_decompress=False,
+                timeout=aiohttp.ClientTimeout(total=60, connect=10, sock_connect=10, sock_read=30)) as download:
+            async with download.get(url, allow_redirects=False, proxy=None) as response:
+                if response.status != 200:
+                    raise ValueError("Image result download failed")
+                if response.content_length is not None and response.content_length > MAX_IMAGE_BYTES:
+                    raise ValueError("Image result exceeds limit")
+                data = await read_limited(response, MAX_IMAGE_BYTES)
+        info = await asyncio.to_thread(inspect_image, data)
+    except (ImageEditError, ValueError, OSError, aiohttp.ClientError, asyncio.TimeoutError):
+        raise ImageEditError("云端已返回图片，但结果下载或校验失败。请联系管理员确认，不要重复生成。",
+                             request_id=request_id, generation_unknown=True) from None
+    return {"request_id": request_id, "model": result["model"], **info, "image_bytes": data}
 
 
 async def request_image(session, config, prompt, endpoint, *, end_user_name, end_user_phone, **payload):

@@ -66,6 +66,7 @@ class CloudGenerationFixture(CloudLightingFixture):
                             self.root / "manifests" / (capability + ".json"))
         app.load_caps()
         self.generations = []
+        self.result_downloads = []
         self.update_card(cap="gpt_image_api_t2i", assets={})
 
     async def drain_cloud_tasks(self):
@@ -74,6 +75,9 @@ class CloudGenerationFixture(CloudLightingFixture):
         await super().drain_cloud_tasks()
 
     async def unexpected_request(self, request):
+        if request.path == "/result.png" and request.method == "GET":
+            self.result_downloads.append(dict(request.headers))
+            return web.Response(body=png("blue", self.result_size), content_type="image/png")
         if request.path != "/v1/images/generations" or request.method != "POST":
             return await super().unexpected_request(request)
         self.generations.append({"body": await request.json(),
@@ -121,6 +125,7 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(sent["body"]["prompt"], PROMPT)
         self.assertEqual(sent["body"]["model"], "fake-lighting-model")
         self.assertEqual(sent["body"]["n"], 1)
+        self.assertEqual(sent["body"]["output_compression"], 100)
         self.assertEqual((sent["name"], sent["phone"]), ("lighting-owner", "13800138000"))
         self.assertEqual(self.received, [])
         self.assertEqual(self.chat_received, [])
@@ -137,6 +142,35 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual((await self.client.get(output["url"])).status, 401)
         self.assertNotIn("13800138000", json.dumps(done))
         self.assertNotIn("fake-lighting-secret", json.dumps(done))
+
+    async def test_gpt_32000_prompt_reaches_gateway_and_is_preserved_in_job(self):
+        prompt = "文" * 32000
+        submitted, done = await self.complete(params={"prompt": prompt})
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(self.generations[0]["body"]["prompt"], prompt)
+        self.assertEqual(done["prompts"][0]["text"], prompt)
+        self.assertEqual(submitted["prompts"][0]["text"], prompt)
+        self.assertEqual(len(self.generations), 1)
+        self.assertEqual(self.generations[0]["body"]["output_compression"], 100)
+
+    async def test_gpt_url_result_downloads_once_and_publishes_protected_artifact(self):
+        self.result_payload = {"data": [{"url": str(self.remote.make_url("/result.png?signature=secret-token"))}]}
+        submitted, done = await self.complete()
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["request_id"], "generation-id")
+        self.assertFalse(done["retryable"])
+        self.assertEqual(len(done["outputs"]), 1)
+        self.assertEqual(len(self.generations), 1)
+        self.assertEqual(len(self.result_downloads), 1)
+        for name in ("Authorization", "Cookie", "X-End-User-Name", "X-End-User-Phone"):
+            self.assertNotIn(name, self.result_downloads[0])
+        self.assertNotIn("secret-token", json.dumps(done))
+        self.assertNotIn("result_url", done)
+        response = await self.client.get(done["outputs"][0]["url"])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), png("blue", (720, 960)))
+        self.client.session.cookie_jar.clear()
+        self.assertEqual((await self.client.get(done["outputs"][0]["url"])).status, 401)
 
     async def test_gemini_text_to_image_does_not_send_image_or_fake_size(self):
         _, done = await self.complete(capability="banana_api_t2i")
@@ -248,7 +282,10 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
 
     async def test_invalid_prompt_images_and_gpt_settings_fail_before_paid_request(self):
         cases = [
-            {"params": {"prompt": " "}}, {"params": {"prompt": "x" * 20001}},
+            {"params": {"prompt": " "}}, {"params": {"prompt": "x" * 32001}},
+            {"capability": "banana_api_t2i", "params": {"prompt": "x" * 20001}},
+            {"capability": "banana_api_i2i", "params": {"prompt": "x" * 20001}},
+            {"capability": "gpt_image_api_i2i", "params": {"prompt": "x" * 20001}},
             {"params": {"prompt": PROMPT, "image_ratio": "original"}},
             {"params": {"prompt": PROMPT, "image_clarity": "4K"}},
             {"params": {"prompt": PROMPT, "image_ratio": []}},

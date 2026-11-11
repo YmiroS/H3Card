@@ -36,6 +36,12 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.status = 200
         self.raw_body = None
         self.redirect_hits = 0
+        self.download_requests = []
+        self.download_status = 200
+        self.download_body = png()
+        self.download_headers = {}
+        self.download_chunked = False
+        self.download_delay = 0
         application = web.Application()
         application.router.add_post("/v1/images/edits", self.gateway)
         application.router.add_post("/v1/images/generations", self.generation_gateway)
@@ -80,19 +86,30 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.generations), 1)
         sent = self.generations[0]
         self.assertEqual(sent["body"], {"model": "gpt-image-2.5-sunburst", "prompt": "一只橘猫", "n": 1,
-                                        "size": "1536x1024", "quality": "high", "output_format": "png"})
+                                        "size": "1536x1024", "quality": "high", "output_format": "png",
+                                        "output_compression": 100})
         self.assertEqual(sent["authorization"], "Bearer test-secret")
         self.assertEqual((sent["name"], sent["phone"]), ("图片用户", "13800138000"))
         self.assertEqual(self.received, [])
 
     async def test_generation_rejects_invalid_params_without_network(self):
-        for params in ({"prompt": ""}, {"prompt": "x" * 20001}, {"prompt": "cat", "size": "original"},
+        for params in ({"prompt": ""}, {"prompt": "x" * 32001}, {"prompt": "cat", "size": "original"},
                        {"prompt": "cat", "quality": "invalid"}, {"prompt": "cat", "size": "1001x751"},
                        {"prompt": "cat", "size": "8000x8000"}, {"prompt": "cat", "size": {}}):
             with self.subTest(params=params), self.assertRaises(cloud_images.ImageEditError):
                 await cloud_images.generate(self.session, **params,
                                              end_user_name="image-test-user", end_user_phone="13800138000")
         self.assertEqual(self.generations, [])
+
+    async def test_generation_accepts_32000_characters_without_truncating(self):
+        prompt = "文" * 32000
+        await cloud_images.generate(self.session, prompt, end_user_name="user", end_user_phone="13800138000")
+        self.assertEqual(self.generations[0]["body"]["prompt"], prompt)
+        self.assertEqual(len(self.generations), 1)
+        with self.assertRaises(cloud_images.ImageEditError):
+            await cloud_images.edit(self.session, [png()], "文" * 20001,
+                                    end_user_name="user", end_user_phone="13800138000")
+        self.assertEqual(self.received, [])
 
     async def test_generation_supports_aligned_short_edge_sizes_and_defaults_high(self):
         await cloud_images.generate(self.session, "猫", size="1920x1088",
@@ -117,7 +134,17 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
 
     async def download(self, request):
         self.redirect_hits += 1
-        return web.Response(body=png(), content_type="image/png")
+        self.download_requests.append(dict(request.headers))
+        if self.download_delay:
+            await asyncio.sleep(self.download_delay)
+        if self.download_chunked:
+            response = web.StreamResponse(status=self.download_status, headers=self.download_headers)
+            await response.prepare(request)
+            await response.write(self.download_body)
+            await response.write_eof()
+            return response
+        return web.Response(body=self.download_body, status=self.download_status,
+                            headers=self.download_headers, content_type="application/octet-stream")
 
     async def test_single_image_uses_explicit_model_and_detected_mime(self):
         original = png(format="JPEG")
@@ -181,6 +208,114 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["result_url"], url)
         self.assertNotIn("image_bytes", result)
         self.assertEqual(self.redirect_hits, 0)
+
+    async def test_generation_url_downloads_validated_bytes_without_forwarding_credentials(self):
+        self.payload = {"data": [{"url": str(self.server.make_url("/download?signature=private-token"))}]}
+        self.session.headers["Cookie"] = "private-session=secret"
+        self.session.headers["Authorization"] = "Bearer ambient-secret"
+        self.download_body = png(format="WEBP")
+        result = await cloud_images.generate(self.session, "cat", end_user_name="user",
+                                             end_user_phone="13800138000")
+        self.assertEqual(result["image_bytes"], self.download_body)
+        self.assertEqual(result["extension"], ".webp")
+        self.assertEqual((result["width"], result["height"]), (3, 2))
+        self.assertEqual(result["request_id"], "image-request-1")
+        self.assertNotIn("result_url", result)
+        self.assertEqual(len(self.generations), 1)
+        self.assertEqual(len(self.download_requests), 1)
+        for name in ("Authorization", "Cookie", "X-End-User-Name", "X-End-User-Phone"):
+            self.assertNotIn(name, self.download_requests[0])
+
+    async def test_generation_url_download_failures_keep_receipt_without_retry(self):
+        self.payload = {"data": [{"url": str(self.server.make_url("/download?signature=private-token"))}]}
+        cases = [(302, png(), {"Location": str(self.server.make_url("/download"))}),
+                 (404, b"private provider error", {}), (200, b"not an image", {}),
+                 (200, png(), {"Content-Length": str(cloud_images.MAX_IMAGE_BYTES + 1)})]
+        for status, body, headers in cases:
+            with self.subTest(status=status, headers=headers):
+                self.download_status, self.download_body, self.download_headers = status, body, headers
+                before = len(self.download_requests)
+                with self.assertRaises(cloud_images.ImageEditError) as caught:
+                    await cloud_images.generate(self.session, "cat", end_user_name="user",
+                                                 end_user_phone="13800138000")
+                self.assertTrue(caught.exception.generation_unknown)
+                self.assertEqual(caught.exception.request_id, "image-request-1")
+                self.assertFalse(caught.exception.response()["retryable"])
+                self.assertNotIn("private-token", str(caught.exception))
+                self.assertNotIn("private provider error", str(caught.exception))
+                self.assertEqual(len(self.download_requests), before + 1)
+        self.assertEqual(len(self.generations), len(cases))
+
+    async def test_generation_url_chunked_download_is_bounded(self):
+        self.payload = {"data": [{"url": str(self.server.make_url("/download"))}]}
+        self.download_chunked = True
+        with mock.patch.object(cloud_images, "MAX_IMAGE_BYTES", len(png()) - 1):
+            with self.assertRaises(cloud_images.ImageEditError) as caught:
+                await cloud_images.generate(self.session, "cat", end_user_name="user",
+                                             end_user_phone="13800138000")
+        self.assertTrue(caught.exception.generation_unknown)
+        self.assertEqual(len(self.generations), 1)
+        self.assertEqual(len(self.download_requests), 1)
+
+    async def test_generation_url_rejects_other_private_origins_before_fetch(self):
+        urls = ["http://127.0.0.1/private", "https://127.0.0.1/private",
+                "https://10.0.0.1/private", "https://169.254.169.254/metadata",
+                "https://[::1]/private", "https://[::ffff:127.0.0.1]/private",
+                "https://224.0.0.1/private", "https://example.invalid:444/image",
+                "http://example.invalid/image"]
+        for url in urls:
+            self.payload = {"data": [{"url": url}]}
+            with self.subTest(url=url), self.assertRaises(cloud_images.ImageEditError) as caught:
+                await cloud_images.generate(self.session, "cat", end_user_name="user",
+                                             end_user_phone="13800138000")
+            self.assertTrue(caught.exception.generation_unknown)
+            self.assertEqual(caught.exception.request_id, "image-request-1")
+        self.assertEqual(len(self.generations), len(urls))
+        self.assertEqual(self.download_requests, [])
+
+    async def test_result_resolver_validates_actual_dns_addresses(self):
+        resolver = cloud_images.PublicImageResolver()
+        try:
+            public = {"host": "8.8.8.8"}
+            with mock.patch.object(cloud_images.ThreadedResolver, "resolve",
+                                   new=mock.AsyncMock(return_value=[public])):
+                self.assertEqual(await resolver.resolve("public.example", 443), [public])
+            for address in ("127.0.0.1", "10.0.0.1", "169.254.169.254", "::1", "::ffff:127.0.0.1", "224.0.0.1"):
+                records = [public, {"host": address}]
+                with self.subTest(address=address), mock.patch.object(
+                        cloud_images.ThreadedResolver, "resolve", new=mock.AsyncMock(return_value=records)):
+                    with self.assertRaises(OSError):
+                        await resolver.resolve("public.example", 443)
+            with mock.patch.object(cloud_images.ThreadedResolver, "resolve", new=mock.AsyncMock(return_value=[])):
+                with self.assertRaises(OSError):
+                    await resolver.resolve("public.example", 443)
+        finally:
+            await resolver.close()
+
+    async def test_generation_url_private_dns_is_blocked_by_download_connector(self):
+        self.payload = {"data": [{"url": "https://public.example/image"}]}
+        with mock.patch.object(cloud_images.ThreadedResolver, "resolve", new=mock.AsyncMock(
+                return_value=[{"host": "127.0.0.1"}])):
+            with self.assertRaises(cloud_images.ImageEditError) as caught:
+                await cloud_images.generate(self.session, "cat", end_user_name="user",
+                                             end_user_phone="13800138000")
+        self.assertTrue(caught.exception.generation_unknown)
+        self.assertEqual(len(self.generations), 1)
+        self.assertEqual(self.download_requests, [])
+
+    async def test_result_download_timeout_is_bounded_and_does_not_submit_generation(self):
+        self.download_delay = .3
+        timeout = aiohttp.ClientTimeout(total=2, connect=1, sock_read=.1)
+        result = {"request_id": "timeout-receipt", "model": "gpt-image-2.5-sunburst",
+                  "result_url": str(self.server.make_url("/download"))}
+        with mock.patch.object(cloud_images.aiohttp, "ClientTimeout", return_value=timeout):
+            with self.assertRaises(cloud_images.ImageEditError) as caught:
+                await cloud_images.download_result(result, cloud_images.load())
+        self.assertEqual(caught.exception.request_id, "timeout-receipt")
+        self.assertTrue(caught.exception.generation_unknown)
+        self.assertFalse(caught.exception.response()["retryable"])
+        self.assertEqual(self.generations, [])
+        self.assertEqual(len(self.download_requests), 1)
 
     async def test_redirect_is_not_followed(self):
         self.status = 307

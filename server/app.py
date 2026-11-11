@@ -3251,8 +3251,10 @@ def validate_director(document):
                            for asset in settings["assets"].values())):
                 raise web.HTTPBadRequest(text="关联卡片素材不正确")
             for key, value in settings["params"].items():
+                text_limit = (32_000 if stage == "image" and key == "prompt"
+                              and settings["capability"] == "gpt_image_api_t2i" else 20_000)
                 if (len(key) > 128 or not isinstance(value, (str, int, float, bool))
-                        or isinstance(value, str) and len(value) > 20_000
+                        or isinstance(value, str) and len(value) > text_limit
                         or isinstance(value, float) and not math.isfinite(value)):
                     raise web.HTTPBadRequest(text="生成参数不正确")
         if not isinstance(shot["assets"], list) or len(shot["assets"]) > 9:
