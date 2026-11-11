@@ -317,7 +317,9 @@ class TaskAlertService:
             if not execution:
                 continue
             started = _timestamp(execution.get('started_at'))
-            if started is None or now - started <= THRESHOLD_SECONDS:
+            threshold_minutes = (60 if job.get('capability') == 'minimax_h3_fusion_v3'
+                                 else THRESHOLD_SECONDS // 60)
+            if started is None or now - started <= threshold_minutes * 60:
                 continue
             submitters = await asyncio.to_thread(self.app['auth_store'].job_submitters, [job['id']])
             submitter = submitters.get(job['id'], {})
@@ -329,7 +331,7 @@ class TaskAlertService:
                 'job_id': job['id'], 'worker_id': execution.get('worker_id') or '',
                 'worker_name': _text(execution.get('worker_name')),
                 'attempt_id': execution.get('attempt_id') or '', 'started_at': started,
-                'elapsed_seconds': int(now - started),
+                'elapsed_seconds': int(now - started), 'threshold_minutes': threshold_minutes,
                 'task_name': _text(job.get('name'), _text(job.get('capability'))),
                 'project_name': _text(job.get('projectName'), _text(job.get('project'))),
                 'card_id': _text(job.get('card')), 'submitter': person,
