@@ -26,8 +26,10 @@ HIGH_VRAM_GPU_POLICY = "primary_gpu_vram_gte_32gb"
 MIN_HIGH_QUALITY_VRAM_BYTES = 32_000_000_000
 BF16_TWO_PASS_CAPABILITY = "minimax_h3_ref_2pass_bf16"
 BF16_HIGH_VRAM_CAPABILITIES = frozenset({BF16_TWO_PASS_CAPABILITY, "minimax_h3_fusion_v2_bf16"})
-# devices 的显存字段单位是 bytes；这两种模式要求严格超过 80 GiB，而不是 >=80。
+# 自动派发及本地模式要求主卡严格超过 80 GiB；定向 A6000 例外在共用资格入口处理。
 BF16_TWO_PASS_VRAM_EXCLUSIVE_BYTES = 80 * 1024 ** 3
+# 48GB A6000 的 CUDA 可见总量会略少于 48GiB，保留驱动开销余量。
+A6000_BF16_MIN_VRAM_BYTES = 47 * 1024 ** 3
 MAX_4090_HIGH_QUALITY_DURATION_SECONDS = 5
 MODEL_INPUT_NAMES = frozenset({
     "ckpt_name", "unet_name", "vae_name", "clip_name", "clip_name1", "clip_name2",
@@ -298,15 +300,20 @@ def is_pro_6000_worker(devices):
 
 def can_run_capability(capability, devices, gpu_policy=None, duration_seconds=None, *,
                        targeted_video=False):
-    # 显式指定的视频仅豁免 PRO 6000 专用保留规则，不豁免下方显存/策略门槛。
+    # 定向视频可使用 PRO 6000；仅定向 BF16 另允许 48GB A6000 主卡。
     if (is_pro_6000_worker(devices) and capability not in BF16_HIGH_VRAM_CAPABILITIES
             and not targeted_video):
         return False
     if capability in BF16_HIGH_VRAM_CAPABILITIES:
-        # 共用入口先执行硬门槛，不能被 32GB 策略、短视频或亲和性兜底放宽。
-        # 96GB RTX PRO 6000 和其他 >80GiB 卡均可；旧 24/48GB 6000
-        # 或仅凭 PRO/Blackwell 名称、显存未知的设备不能获得豁免。
-        return primary_gpu_vram_bytes(devices) > BF16_TWO_PASS_VRAM_EXCLUSIVE_BYTES
+        vram = primary_gpu_vram_bytes(devices)
+        if vram > BF16_TWO_PASS_VRAM_EXCLUSIVE_BYTES:
+            return True
+        primary = primary_gpu(devices)
+        return bool(
+            targeted_video and primary and primary.get("type") == "cuda"
+            and re.search(r"\brtx\s+a6000\b", str(primary.get("name") or ""), re.IGNORECASE)
+            and vram >= A6000_BF16_MIN_VRAM_BYTES
+        )
     if not requires_high_vram(capability, gpu_policy):
         return True
     primary = primary_gpu(devices)
