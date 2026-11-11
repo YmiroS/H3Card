@@ -824,6 +824,101 @@ class MakeAppWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertFalse(outsider['team_leader'])
 
 
+class CreationAgentSkillsWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
+    async def test_make_app_registers_skill_page_and_all_six_api_routes(self):
+        self.auth_setup()
+        self.addCleanup(self.auth_teardown)
+        self.own_project('skill-project')
+        self.auth.create_user('skill-reader', PASSWORD)
+        # Keep real make_app, startup, sessions and routes; isolate all mutable data
+        # and disable the ComfyUI listener, job restoration and external approval.
+        patches = (
+            mock.patch.object(controller_app, 'ROOT', self.root),
+            mock.patch.object(controller_app, 'COMFY_INPUT', self.root / 'comfy-input'),
+            mock.patch.object(controller_app, 'ARTIFACT_DIR', self.root / 'data' / 'artifacts'),
+            mock.patch.object(controller_app, 'CONTROLLER_MODE', False),
+            mock.patch.object(controller_app, 'EXECUTION_MODE', 'local'),
+            mock.patch.object(controller_app, 'load_caps', return_value=0),
+            mock.patch.object(controller_app, 'load_jobs', return_value=None),
+            mock.patch.object(controller_app, 'ws_loop', new=mock.AsyncMock()),
+            mock.patch.object(controller_app, 'setup_dingtalk', return_value=None),
+            mock.patch.object(controller_app, 'lan_ips', return_value=[]),
+            mock.patch.dict(controller_app.JOBS, {}, clear=True),
+            mock.patch.dict('os.environ', {
+                'CHOUKA_LOCAL_TEST': '0', 'CHOUKA_ADMIN_SANDBOX': '0',
+                'CHOUKA_AUTH_ORIGIN': '', 'CHOUKA_HTTP_REDIRECT_ORIGIN': '',
+                'CHOUKA_HTTPS_REDIRECT_ORIGIN': '', 'CHOUKA_TLS_CERT': '', 'CHOUKA_TLS_KEY': '',
+            }),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+        from server.creation_agent.skills import BUILTIN_DEFAULTS, metadata, validate_skill
+        from test_creation_agent_skills import ZIP_MAIN, zip_bytes
+        admin_url = '/api/creation-agent/admin/skills'
+        payload = validate_skill({'id': 'wiring-guide', 'name': '装配测试指南',
+                   'description': '真实 Python 服务路由', 'instruction': '仅载入完整指南时返回'})
+        for override in ('', str(self.root / 'override' / 'skills.json')):
+            with self.subTest(environment_override=bool(override)), \
+                    mock.patch.dict('os.environ', {'CREATION_AGENT_SKILL_STORE': override}):
+                application = controller_app.make_app(
+                    auth_path=self.root / 'data' / 'auth.db', project_repository=self.projects)
+                expected_path = Path(override) if override else self.root / 'data' / 'creation-agent-skills.json'
+                self.assertEqual(application['creation_agent_skills'].path, expected_path)
+                self.client = TestClient(TestServer(application))
+                try:
+                    await self.client.start_server()
+                    self.origin = str(self.client.make_url('/')).rstrip('/')
+                    self.headers = await self.login()
+                    page_response = await self.client.get('/skills')
+                    page_body = await page_response.read()
+                    response = await self.client.get(admin_url)
+                    self.assertEqual(response.status, 200, await response.text())
+                    self.assertEqual((await response.json())['skills'], BUILTIN_DEFAULTS)
+                    zip_url = admin_url + '/import-zip'
+                    archive = zip_bytes([('SKILL.md', ZIP_MAIN)])
+                    headers = dict(self.headers, **{'Content-Type': 'application/zip'})
+                    self.client.session.headers.clear()
+                    response = await self.client.post(zip_url, data=archive, headers={'Origin': self.origin,
+                        'Content-Type': 'application/zip'})
+                    self.assertEqual(response.status, 403, await response.text())
+                    response = await self.client.post(zip_url, data=archive, headers=headers)
+                    self.assertEqual(response.status, 200, await response.text())
+                    self.assertEqual((await response.json())['skill']['instruction'], ZIP_MAIN)
+                    self.assertFalse(expected_path.exists(), 'ZIP preview must not write the store')
+                    response = await self.client.post(admin_url, json=payload, headers=self.headers)
+                    self.assertEqual(response.status, 200, await response.text())
+                    self.assertEqual(json.loads(expected_path.read_bytes()), {'version': 2, 'skills': [payload]})
+                    response = await self.client.get('/api/creation-agent/status?projectId=skill-project')
+                    self.assertEqual(response.status, 200, await response.text())
+                    status = await response.json()
+                    self.assertEqual(status['engine'], 'chat-api')
+                    self.assertIn(metadata(payload), status['skills'])
+                    load_url = '/api/creation-agent/skills/wiring-guide?projectId=skill-project'
+                    response = await self.client.get(load_url)
+                    self.assertEqual(response.status, 200, await response.text())
+                    self.assertEqual(await response.json(), payload)
+                    response = await self.client.delete(admin_url + '/wiring-guide', headers=self.headers)
+                    self.assertEqual(response.status, 200, await response.text())
+                    self.assertEqual((await self.client.get(load_url)).status, 404)
+                    reader_headers = await self.login('skill-reader')
+                    self.assertEqual((await self.client.post(zip_url, data=archive,
+                        headers=dict(reader_headers, **{'Content-Type': 'application/zip'}))).status, 403)
+                    for url in ('/skills', admin_url):
+                        self.assertEqual((await self.client.get(url, allow_redirects=False)).status, 403)
+                    self.client.session.cookie_jar.clear()
+                    response = await self.client.get('/skills', allow_redirects=False)
+                    self.assertEqual(response.status, 302)
+                    self.assertEqual(response.headers['Location'], '/login')
+                    self.assertEqual((await self.client.get(admin_url)).status, 401)
+                    self.assertEqual((await self.client.post(zip_url, data=archive, headers=headers)).status, 401)
+                    # Assert the page last so a missing SPA route does not hide API wiring evidence.
+                    self.assertEqual(page_response.status, 200, page_body.decode(errors='replace'))
+                    self.assertEqual(page_body, application['frontend'].index.read_bytes())
+                finally:
+                    await self.client.close()
+
+
 class CapacityProbeWiringTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture):
     async def asyncSetUp(self):
         self.auth_setup()

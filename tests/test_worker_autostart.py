@@ -29,7 +29,8 @@ class NodeAutostartTest(unittest.TestCase):
                        "worker_name": "TEST", "comfy_url": "http://127.0.0.1:8188",
                        "comfy_input_dir": str(self.root.parent / "ComfyUI/input")}
         for name in ("启动Windows节点.bat", "启动Windows节点_4090.bat",
-                     "启动Windows节点_A6000.bat", "启动Windows节点_PRO6000_96GB.bat"):
+                     "启动Windows节点_A6000.bat", "启动Windows节点_A6000_单卡.bat",
+                     "启动Windows节点_PRO6000_96GB.bat"):
             (self.root / name).write_bytes((ROOT / name).read_bytes())
         self.save_config()
 
@@ -68,6 +69,78 @@ class NodeAutostartTest(unittest.TestCase):
         agent.config, agent.config_path = self.config, self.root / "worker/config.json"
         with mock.patch.object(WorkerAgent, "_nvidia_gpus", side_effect=AssertionError("No probing")):
             self.assertEqual(agent.node_launcher_path(), Path(plan["launcher"]))
+
+    def test_explicit_a6000_single_launcher_reuses_config_task_and_restart_selection(self):
+        automatic = self.describe(["NVIDIA RTX A6000"])
+        self.assertEqual(Path(automatic["launcher"]).name, "启动Windows节点_A6000.bat")
+        self.assertEqual(node_launcher_for(
+            self.root / "worker/config.json", self.config, [{"name": "NVIDIA RTX A6000"}]),
+            self.root / "启动Windows节点_A6000.bat")
+
+        self.config["node_launcher"] = "../启动Windows节点_A6000_单卡.bat"
+        self.save_config()
+        before = {str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()}
+        agent = WorkerAgent.__new__(WorkerAgent)
+        agent.config, agent.config_path = self.config, self.root / "worker/config.json"
+        with mock.patch.object(WorkerAgent, "_nvidia_gpus", side_effect=AssertionError("不得探测显卡")):
+            explicit = autostart.describe_installation(self.root)
+            self.assertEqual(agent.node_launcher_path(), self.root / "启动Windows节点_A6000_单卡.bat")
+        self.assertEqual(Path(explicit["launcher"]).name, "启动Windows节点_A6000_单卡.bat")
+        for key in ("task_name", "config", "working_directory", "python"):
+            with self.subTest(key=key):
+                self.assertEqual(explicit[key], automatic[key])
+        self.assertEqual(Path(explicit["config"]), self.root / "worker/config.json")
+        self.assertEqual(before, {
+            str(path): path.read_bytes() for path in self.root.rglob("*") if path.is_file()})
+
+    def test_a6000_single_launcher_static_encoding_gpu_and_unrestricted_args(self):
+        # 只检查脚本文本，不在 macOS 上模拟或执行 Windows BAT。
+        raw = (self.root / "启动Windows节点_A6000_单卡.bat").read_bytes()
+        content = raw.decode("ascii")
+        self.assertTrue(raw.endswith(b"\r\n"))
+        self.assertNotIn(b"\n", raw.replace(b"\r\n", b""))
+        self.assertNotIn(b"\r", raw.replace(b"\r\n", b""))
+        self.assertIn("setlocal", content.splitlines())
+        for setting in ('set "CUDA_DEVICE_ORDER=PCI_BUS_ID"',
+                        'set "CUDA_VISIBLE_DEVICES=0"', 'set "RESERVE_VRAM=4"',
+                        'set "COMFY_EXTRA_ARGS=--windows-standalone-build"',
+                        'set "WORKER_CONFIG=worker\\config.json"',
+                        'set "WORKER=worker\\agent.py"',
+                        'set "RESTART_HELPER=worker\\restart_node.py"'):
+            with self.subTest(setting=setting):
+                self.assertIn(setting, content.splitlines())
+        self.assertNotRegex(content.lower(),
+                            r"--(?:lowvram|highvram|gpu-only|novram|cpu|"
+                            r"force-fp\w*|fp\w*|bf16\w*|\w+-in-\w+|"
+                            r"workflow\w*|model\w*|capabilit\w*)\b")
+        self.assertNotRegex(content.lower(), r"\.(?:safetensors|ckpt)\b")
+        self.assertIn('"%PY%" -s "%COMFY_MAIN%" %COMFY_EXTRA_ARGS% '
+                      '--listen %COMFY_HOST% --port %COMFY_PORT% '
+                      '--reserve-vram %RESERVE_VRAM%', content)
+
+    def test_a6000_single_launcher_static_readiness_dedup_and_worker_entry(self):
+        content = (self.root / "启动Windows节点_A6000_单卡.bat").read_text(encoding="ascii")
+        check = 'if /i "%~1"=="check" ('
+        readiness = '"%PY%" -u "%RESTART_HELPER%" --wait-comfy --config "%WORKER_CONFIG%"'
+        status = '"%PY%" -u "%WORKER%" --config "%WORKER_CONFIG%" --instance-status'
+        worker_start = ('start "H3Card Worker A6000 Single" "%PY%" -u "%WORKER%" '
+                        '--config "%WORKER_CONFIG%"')
+        for entry in (check, 'if /i "%~1"=="--comfy-start-only" exit /b 0',
+                      'if /i "%~1"=="--comfy-only" exit /b 0',
+                      'if /i not "%~1"=="--no-pause" pause', readiness, status, worker_start,
+                      'if "%WORKER_STATUS%"=="0" (',
+                      'if not "%WORKER_STATUS%"=="1" (',
+                      'goto wait_worker_start', 'goto worker_started'):
+            with self.subTest(entry=entry):
+                self.assertIn(entry, content)
+        self.assertLess(content.index(check), content.index('start "ComfyUI'))
+        self.assertLess(content.index("--comfy-start-only"), content.index(readiness))
+        self.assertLess(content.index(readiness), content.index('--comfy-only" exit /b 0'))
+        self.assertLess(content.index(readiness), content.index(status))
+        self.assertLess(content.index(status), content.index(worker_start))
+        self.assertGreaterEqual(content.count(status), 3)
+        self.assertIn('if errorlevel 1 (\n  echo ComfyUI failed readiness checks.', content)
+        self.assertIn("platform registration and heartbeat", content)
 
     def test_missing_unknown_and_mixed_gpus_are_not_guessed_for_install(self):
         for names in ([], ["RTX 4070 Ti"], ["RTX 5090", "RTX 4090"],

@@ -18,7 +18,7 @@ STATIC_ASSETS = (
 def register_page_routes(app, *, index, director_index, if_studio_index,
                          controller_index, controller_costs, controller_capacity,
                          permissions_page, teams_page, static_asset):
-    for path, handler in (("/", index), ("/video-comparison", index),
+    for path, handler in (("/", index), ("/video-comparison", index), ("/skills", index),
                           ("/director", director_index),
                           ("/if-studio", if_studio_index), ("/controller", controller_index),
                           ("/controller/costs", controller_costs),

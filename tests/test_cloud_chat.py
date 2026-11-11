@@ -29,11 +29,22 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.user = {'enabled': True, 'username': 'chat-test-user',
                      'display_name': 'Chat Display Only', 'phone': '13800138000'}
         self.status = 200
+        self.stream_chunks = None
+        self.stream_gate = None
         self.payload = {'choices': [{'message': {'content': 'hello'}}], 'usage': {'total_tokens': 10}, 'cost': 99}
         async def gateway(request):
             self.calls.append((await request.json(), request.headers.get('Authorization')))
             self.end_user_headers.append((request.headers.get('X-End-User-Name'),
                                           request.headers.get('X-End-User-Phone')))
+            if self.stream_chunks is not None and self.status == 200:
+                response = web.StreamResponse(headers={'Content-Type': 'text/event-stream'})
+                await response.prepare(request)
+                for index, chunk in enumerate(self.stream_chunks):
+                    await response.write(chunk)
+                    if index == 0 and self.stream_gate is not None:
+                        await self.stream_gate.wait()
+                await response.write_eof()
+                return response
             return web.json_response(self.payload, status=self.status, headers={'X-Request-ID': 'req-1'})
         upstream = web.Application(client_max_size=cloud_chat.MAX_REQUEST_BYTES)
         upstream.router.add_post('/v1/chat/completions', gateway)
@@ -67,6 +78,70 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await response.json(), {'content': 'hello', 'model': 'gpt-4o', 'request_id': 'req-1'})
         self.assertEqual(self.calls, [({'messages': messages, 'model': 'gpt-4o', 'stream': False}, 'Bearer fake-secret')])
         self.assertEqual(self.end_user_headers, [('chat-test-user', '13800138000')])
+
+    async def test_explicit_false_keeps_json_and_true_streams_sse(self):
+        messages = [{'role': 'user', 'content': 'hi'}]
+        response = await self.post({'messages': messages, 'stream': False})
+        self.assertEqual(await response.json(), {'content': 'hello', 'model': 'gpt-4o', 'request_id': 'req-1'})
+        self.assertFalse(self.calls[-1][0]['stream'])
+        self.stream_chunks = [b'data: {"choices":[{"delta":{"content":"',
+                              '你'.encode('utf-8')[:1], '你'.encode('utf-8')[1:],
+                              b'"}}]}\n\n', b'data: [DONE]\n\n']
+        response = await self.post({'messages': messages, 'stream': True})
+        self.assertEqual(response.status, 200)
+        self.assertEqual(response.content_type, 'text/event-stream')
+        self.assertEqual(response.headers['Cache-Control'], 'no-cache, no-transform')
+        self.assertEqual(await response.read(), b''.join(self.stream_chunks))
+        self.assertTrue(self.calls[-1][0]['stream'])
+        self.assertEqual(self.end_user_headers[-1], ('chat-test-user', '13800138000'))
+
+    async def test_stream_forwards_before_upstream_finishes(self):
+        first = b'data: {"choices":[{"delta":{"content":"hello"}}]}\n\n'
+        self.stream_chunks = [first, b'data: [DONE]\n\n']
+        self.stream_gate = asyncio.Event()
+        try:
+            response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}], 'stream': True})
+            self.assertEqual(await asyncio.wait_for(response.content.readexactly(len(first)), 2), first)
+            self.assertFalse(self.stream_gate.is_set())
+            self.stream_gate.set()
+            self.assertEqual(await response.read(), self.stream_chunks[1])
+        finally:
+            self.stream_gate.set()
+
+    async def test_stream_failure_before_headers_and_after_start(self):
+        messages = [{'role': 'user', 'content': 'hi'}]
+        response = await self.post({'messages': messages, 'stream': True})
+        self.assertEqual(response.status, 502)
+        self.assertNotIn('fake-secret', await response.text())
+        self.stream_chunks = [b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n', b'data: [DONE]\n\n']
+        with mock.patch.object(cloud_chat, 'MAX_RESPONSE_BYTES', len(self.stream_chunks[0])):
+            response = await self.post({'messages': messages, 'stream': True})
+            body = await response.text()
+        self.assertIn('event: error\n', body)
+        self.assertNotIn('data: [DONE]', body)
+        self.assertIn('"retryable": false', body)
+
+    async def test_stream_ignores_usage_and_rejects_missing_done(self):
+        self.stream_chunks = [b'data: {"choices":[],"usage":{"cost":"private"}}\r\n\r\n',
+                              b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}\r\n\r\n',
+                              b'data: [DONE]\r\n\r\n']
+        response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}], 'stream': True})
+        text = await response.text()
+        self.assertIn('"finish_reason":"stop"', text)
+        self.assertNotIn('private', text)
+        self.assertIn('data: [DONE]', text)
+        self.stream_chunks = [b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n']
+        response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}], 'stream': True})
+        self.assertIn('event: error', await response.text())
+
+    async def test_stream_filters_upstream_error_details(self):
+        self.stream_chunks = [b'event: error\ndata: {"error":"fake-secret"}\n\n']
+        response = await self.post({'messages': [{'role': 'user', 'content': 'hi'}], 'stream': True})
+        self.assertEqual(response.status, 200)
+        body = await response.text()
+        self.assertIn('event: error', body)
+        self.assertNotIn('fake-secret', body)
+        self.assertNotIn('data: [DONE]', body)
 
     async def test_identity_is_per_authenticated_user_not_client_headers_or_display_name(self):
         body = {'messages': [{'role': 'user', 'content': 'hi'}]}
@@ -110,7 +185,9 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                    {'messages': [{'role': 'tool', 'content': 'hi'}]},
                    {'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'https://example.com/a.png'}}]}]},
                    {'messages': [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,YQ=='}}]}]},
-                   {'messages': [{'role': 'user', 'content': 'hi'}], 'model': 'external'}]
+                   {'messages': [{'role': 'user', 'content': 'hi'}], 'model': 'external'},
+                   {'messages': [{'role': 'user', 'content': 'hi'}], 'stream': 'true'},
+                   {'messages': [{'role': 'user', 'content': 'hi'}], 'stream': 1}]
         for body in invalid:
             with self.subTest(body=body):
                 response = await self.post(body)

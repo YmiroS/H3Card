@@ -86,7 +86,8 @@ def extract_image(text, request_id):
     return {**info, "image_bytes": data}
 
 
-async def generate(session, images, prompt, *, end_user_name, end_user_phone, text_only=False):
+async def generate(session, images, prompt, *, end_user_name, end_user_phone, text_only=False,
+                   output_size=None):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise BananaError("生图提示词不能为空，且不得超过 20000 字符", status=400)
@@ -98,6 +99,10 @@ async def generate(session, images, prompt, *, end_user_name, end_user_phone, te
     # 按内网当前行为不传档位参数，尺寸跟随输入图。
     body = {"model": config["banana_model"], "modalities": ["IMAGE"],
             "messages": build_messages(images, infos, prompt.strip()), "stream": False}
+    if output_size is not None:
+        width, height = output_size
+        body["messages"][0]["content"][0]["text"] += (
+            f"\n\n输出画布要求：宽 {width} 像素、高 {height} 像素，生成一张完整图片。")
     request_id = None
     try:
         async with session.post(

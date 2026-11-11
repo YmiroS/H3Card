@@ -23,6 +23,9 @@ async def completions(request):
         except (ValueError, UnicodeError):
             raise cloud_chat.ChatError("请求必须为有效 JSON 对象", status=400)
         messages = await asyncio.to_thread(cloud_chat.validate, body)
+        if body.get("stream") is True:
+            return await cloud_chat.stream(request.app["session"], request, messages,
+                                           end_user_name=user["username"], end_user_phone=user["phone"])
         result = await cloud_chat.complete(request.app["session"], messages,
                                            end_user_name=user["username"], end_user_phone=user["phone"])
         return web.json_response(result)

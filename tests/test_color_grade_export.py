@@ -14,11 +14,13 @@ from server.color_grade_export import (
     ColorGradeExportApi,
     _ffmpeg_filter_path,
     _normalize_motion_blur,
+    _normalize_sharpen,
     _normalize_vignette,
     build_color_grade_vf,
     build_grade_args,
     motion_blur_mix_frames,
     progress_ratio,
+    sharpen_matrix_size,
     write_vignette_mask,
 )
 
@@ -84,6 +86,34 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("lut3d=", vf)
         self.assertIn("tmix=frames=5", vf)
         self.assertIsNone(_normalize_motion_blur({"enabled": False, "samples": 8}))
+
+    def test_sharpen_unsharp_after_lut3d(self):
+        self.assertEqual(sharpen_matrix_size(0.5), 3)
+        self.assertEqual(sharpen_matrix_size(1), 5)
+        self.assertEqual(sharpen_matrix_size(5), 21)
+        self.assertEqual(sharpen_matrix_size(10), 23)
+        self.assertIsNone(_normalize_sharpen({"enabled": False, "amount": 1}))
+        self.assertIsNone(_normalize_sharpen({"enabled": True, "amount": 0}))
+        sharp = _normalize_sharpen(
+            {"enabled": True, "amount": 1.25, "radius": 1}
+        )
+        self.assertEqual(sharp["matrix"], 5)
+        args = build_grade_args(
+            Path("D:/in.mp4"), Path("D:/tmp/grade.cube"), Path("D:/out.part.mp4"),
+            sharpen=sharp,
+        )
+        vf = args[args.index("-vf") + 1]
+        self.assertIn("lut3d=", vf)
+        self.assertIn("unsharp=5:5:1.25:3:3:0", vf)
+        with_mask = build_grade_args(
+            Path("D:/in.mp4"), Path("D:/tmp/grade.cube"), Path("D:/out.part.mp4"),
+            mask=Path("D:/tmp/vignette.png"), size=(1920, 1080),
+            sharpen=sharp,
+        )
+        graph = with_mask[with_mask.index("-filter_complex") + 1]
+        self.assertIn("lut3d=", graph)
+        self.assertIn("unsharp=5:5:1.25:3:3:0", graph)
+        self.assertLess(graph.index("unsharp="), graph.index("overlay="))
 
     async def test_apply_runs_ffmpeg_and_returns_video_asset(self):
         with tempfile.TemporaryDirectory() as tmp:

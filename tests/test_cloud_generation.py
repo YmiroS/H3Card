@@ -13,7 +13,49 @@ from aiohttp import web
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from test_cloud_lighting import CloudLightingFixture, ROOT, PASSWORD, PROMPT, LOAD_JOBS, app, png
 from server import cloud_images
-from server.cloud_generation import CAPABILITIES
+from server.cloud_generation import CAPABILITIES, bounded_dimensions, generation_dimensions, resize_image
+from server.image_controls import RATIOS, CLARITIES
+
+
+class GenerationDimensionsTests(unittest.TestCase):
+    def test_all_ratio_clarity_pairs_match_short_edge_controls_and_align_16(self):
+        for ratio in RATIOS:
+            w, h = map(int, ratio.split(":"))
+            for clarity, short in CLARITIES.items():
+                with self.subTest(ratio=ratio, clarity=clarity):
+                    _, _, (width, height) = generation_dimensions(
+                        {"image_ratio": ratio, "image_clarity": clarity}, False)
+                    self.assertEqual(width % 16, 0)
+                    self.assertEqual(height % 16, 0)
+                    self.assertLessEqual(width * height, cloud_images.MAX_PIXELS)
+                    self.assertLessEqual(abs(min(width, height) - short), 8)
+                    self.assertLess(abs(width / height - w / h), .04)
+
+    def test_original_and_extreme_aspect_ratios_respect_pixel_limit(self):
+        for w, h in ((1001, 751), (751, 1001), (1, 32000000), (32000000, 1)):
+            for clarity in CLARITIES:
+                with self.subTest(source=(w, h), clarity=clarity):
+                    _, _, size = generation_dimensions(
+                        {"image_ratio": "original", "image_clarity": clarity}, True,
+                        {"width": w, "height": h})
+                    self.assertTrue(all(side >= 16 and side % 16 == 0 for side in size))
+                    self.assertLessEqual(size[0] * size[1], cloud_images.MAX_PIXELS)
+
+    def test_secondary_reference_alignment_respects_pixel_limit(self):
+        for w, h in ((1, 32000000), (32000000, 1), (3, 10000000), (10000000, 3), (65, 49)):
+            with self.subTest(source=(w, h)):
+                size = bounded_dimensions(*(max(16, side // 16 * 16) for side in (w, h)))
+                self.assertTrue(all(side >= 16 and side % 16 == 0 for side in size))
+                self.assertLessEqual(size[0] * size[1], cloud_images.MAX_PIXELS)
+        self.assertEqual(bounded_dimensions(64, 48), (64, 48))
+
+    def test_aligned_image_is_preserved_and_odd_image_is_resized(self):
+        original = png("blue", (64, 48))
+        data, info = resize_image(original, (64, 48))
+        self.assertEqual(data, original)
+        data, info = resize_image(png("red", (65, 49)), (64, 48))
+        self.assertEqual((info["width"], info["height"]), (64, 48))
+        self.assertEqual(data, png("red", (64, 48)))
 
 
 class CloudGenerationFixture(CloudLightingFixture):
@@ -24,6 +66,7 @@ class CloudGenerationFixture(CloudLightingFixture):
                             self.root / "manifests" / (capability + ".json"))
         app.load_caps()
         self.generations = []
+        self.result_downloads = []
         self.update_card(cap="gpt_image_api_t2i", assets={})
 
     async def drain_cloud_tasks(self):
@@ -32,6 +75,9 @@ class CloudGenerationFixture(CloudLightingFixture):
         await super().drain_cloud_tasks()
 
     async def unexpected_request(self, request):
+        if request.path == "/result.png" and request.method == "GET":
+            self.result_downloads.append(dict(request.headers))
+            return web.Response(body=png("blue", self.result_size), content_type="image/png")
         if request.path != "/v1/images/generations" or request.method != "POST":
             return await super().unexpected_request(request)
         self.generations.append({"body": await request.json(),
@@ -79,28 +125,67 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(sent["body"]["prompt"], PROMPT)
         self.assertEqual(sent["body"]["model"], "fake-lighting-model")
         self.assertEqual(sent["body"]["n"], 1)
+        self.assertEqual(sent["body"]["output_compression"], 100)
         self.assertEqual((sent["name"], sent["phone"]), ("lighting-owner", "13800138000"))
         self.assertEqual(self.received, [])
         self.assertEqual(self.chat_received, [])
         output = done["outputs"][0]
         response = await self.client.get(output["url"])
         self.assertEqual(response.status, 200)
-        self.assertEqual(await response.read(), png("blue"))
+        self.assertEqual(await response.read(), png("blue", (720, 960)))
+        self.assertEqual((output["width"], output["height"]), (720, 960))
+        self.assertEqual(done["provider_size"], "4x3")
+        self.assertTrue(done["output_resized"])
+        self.assertEqual(sent["body"]["quality"], "high")
         self.assertEqual(await self.indexed_assets(submitted), [])
         self.client.session.cookie_jar.clear()
         self.assertEqual((await self.client.get(output["url"])).status, 401)
         self.assertNotIn("13800138000", json.dumps(done))
         self.assertNotIn("fake-lighting-secret", json.dumps(done))
 
+    async def test_gpt_32000_prompt_reaches_gateway_and_is_preserved_in_job(self):
+        prompt = "文" * 32000
+        submitted, done = await self.complete(params={"prompt": prompt})
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(self.generations[0]["body"]["prompt"], prompt)
+        self.assertEqual(done["prompts"][0]["text"], prompt)
+        self.assertEqual(submitted["prompts"][0]["text"], prompt)
+        self.assertEqual(len(self.generations), 1)
+        self.assertEqual(self.generations[0]["body"]["output_compression"], 100)
+
+    async def test_gpt_url_result_downloads_once_and_publishes_protected_artifact(self):
+        self.result_payload = {"data": [{"url": str(self.remote.make_url("/result.png?signature=secret-token"))}]}
+        submitted, done = await self.complete()
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["request_id"], "generation-id")
+        self.assertFalse(done["retryable"])
+        self.assertEqual(len(done["outputs"]), 1)
+        self.assertEqual(len(self.generations), 1)
+        self.assertEqual(len(self.result_downloads), 1)
+        for name in ("Authorization", "Cookie", "X-End-User-Name", "X-End-User-Phone"):
+            self.assertNotIn(name, self.result_downloads[0])
+        self.assertNotIn("secret-token", json.dumps(done))
+        self.assertNotIn("result_url", done)
+        response = await self.client.get(done["outputs"][0]["url"])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), png("blue", (720, 960)))
+        self.client.session.cookie_jar.clear()
+        self.assertEqual((await self.client.get(done["outputs"][0]["url"])).status, 401)
+
     async def test_gemini_text_to_image_does_not_send_image_or_fake_size(self):
         _, done = await self.complete(capability="banana_api_t2i")
         self.assertEqual(done["status"], "done")
         self.assertEqual(done["modelName"], "fake-banana-model")
         self.assertEqual(done["billingMode"], "paid_api")
-        self.assertIsNone(done["requested_size"])
+        self.assertEqual(done["requested_size"], "720x960")
+        self.assertEqual((done["outputs"][0]["width"], done["outputs"][0]["height"]), (720, 960))
         self.assertEqual(len(self.chat_received), 1)
         body = self.chat_received[0]["body"]
-        self.assertEqual(body["messages"][0]["content"], [{"type": "text", "text": PROMPT}])
+        content = body["messages"][0]["content"]
+        self.assertEqual(len(content), 1)
+        self.assertEqual(content[0]["type"], "text")
+        self.assertTrue(content[0]["text"].startswith(PROMPT))
+        self.assertIn("宽 720 像素、高 960 像素", content[0]["text"])
         self.assertNotIn("size", body)
         self.assertEqual(self.generations, [])
         self.assertEqual(self.received, [])
@@ -110,12 +195,13 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         self.update_card(cap="gpt_image_api_i2i")
         submitted, done = await self.complete(capability="gpt_image_api_i2i",
             assets={"images[2]": second["ref"], "images[0]": self.upstream["ref"]},
-            params={"prompt": PROMPT, "quality": "high", "size": "original"})
+            params={"prompt": PROMPT, "quality": "low", "image_ratio": "original", "image_clarity": "720P"})
         self.assertEqual(done["status"], "done")
         self.assertEqual(len(self.received), 1)
-        self.assertEqual(self.received[0]["images"], [png("red"), png("green")])
+        self.assertEqual(self.received[0]["images"], [png("red", (960, 720)), png("green", (16, 16))])
+        self.assertEqual(submitted["input_sizes"], ["960x720", "16x16"])
         self.assertEqual(self.received[0]["fields"]["quality"], "high")
-        self.assertEqual(self.received[0]["fields"]["size"], "4x3")
+        self.assertEqual(self.received[0]["fields"]["size"], "960x720")
         self.assertEqual(submitted["input_image_count"], 2)
         self.assertEqual(len(await self.indexed_assets(submitted)), 2)
         self.assertEqual(self.generations, [])
@@ -127,8 +213,62 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         self.assertEqual(done["status"], "done")
         parts = self.chat_received[0]["body"]["messages"][0]["content"]
         self.assertEqual(len(parts), 3)
-        self.assertIn(base64.b64encode(png("red")).decode(), parts[1]["image_url"]["url"])
-        self.assertIn(base64.b64encode(png("yellow")).decode(), parts[2]["image_url"]["url"])
+        self.assertIn(base64.b64encode(png("red", (960, 720))).decode(), parts[1]["image_url"]["url"])
+        self.assertIn(base64.b64encode(png("yellow", (16, 16))).decode(), parts[2]["image_url"]["url"])
+
+    async def test_requested_ratio_and_clarity_are_applied_to_both_providers(self):
+        for capability in ("gpt_image_api_i2i", "banana_api_i2i"):
+            with self.subTest(capability=capability):
+                submitted, done = await self.complete(capability=capability,
+                    assets={"images[0]": self.upstream["ref"]},
+                    params={"prompt": PROMPT, "image_ratio": "16:9", "image_clarity": "1080P"})
+                self.assertEqual(done["status"], "done")
+                self.assertEqual(submitted["requested_size"], "1920x1088")
+                self.assertEqual(submitted["input_sizes"], ["1920x1088"])
+                output = done["outputs"][0]
+                self.assertEqual((output["width"], output["height"]), (1920, 1088))
+                if capability.startswith("gpt"):
+                    self.assertEqual(self.received[-1]["fields"]["size"], "1920x1088")
+                    data = self.received[-1]["images"][0]
+                else:
+                    content = self.chat_received[-1]["body"]["messages"][0]["content"]
+                    data = base64.b64decode(content[1]["image_url"]["url"].split(",", 1)[1])
+                info = cloud_images.inspect_image(data)
+                self.assertEqual((info["width"], info["height"]), (1920, 1088))
+
+    async def test_odd_gateway_output_is_adapted_without_retry(self):
+        self.result_size = (1001, 751)
+        _, done = await self.complete(params={"prompt": PROMPT, "image_ratio": "2:3", "image_clarity": "480P"})
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(done["provider_size"], "1001x751")
+        self.assertTrue(done["output_resized"])
+        response = await self.client.get(done["outputs"][0]["url"])
+        info = cloud_images.inspect_image(await response.read())
+        self.assertEqual((info["width"], info["height"]), (480, 720))
+        self.assertEqual(len(self.generations), 1)
+
+    async def test_matching_gateway_size_is_not_reencoded(self):
+        self.result_size = (480, 720)
+        _, done = await self.complete(params={"prompt": PROMPT, "image_ratio": "2:3", "image_clarity": "480P"})
+        self.assertFalse(done["output_resized"])
+        response = await self.client.get(done["outputs"][0]["url"])
+        self.assertEqual(await response.read(), png("blue", (480, 720)))
+
+    async def test_original_input_and_preprocessed_snapshot_are_separate(self):
+        source = self.add_upload("odd-source.png", png("green", (1001, 751)))
+        submitted, done = await self.complete(capability="gpt_image_api_i2i",
+            assets={"images[0]": source["ref"]}, params={"prompt": PROMPT, "image_clarity": "480P"})
+        self.assertEqual(done["status"], "done")
+        self.assertEqual(submitted["input_sizes"], ["640x480"])
+        ref = await self.application["cloud_generation"].resource_call(self.application, "reference", source["ref"])
+        path = await self.application["cloud_generation"].resource_call(self.application, "local_path", *ref)
+        self.assertEqual(path.read_bytes(), png("green", (1001, 751)))
+        indexed = await self.indexed_assets(submitted)
+        self.assertEqual(len(indexed), 1)
+        self.assertNotEqual(indexed[0]["ref"], source["ref"])
+        response = await self.client.get(indexed[0]["url"])
+        self.assertEqual(response.status, 200)
+        self.assertEqual(await response.read(), self.received[-1]["images"][0])
 
     async def test_eight_reference_images_are_accepted_but_ninth_slot_is_rejected(self):
         assets = {f"images[{index}]": self.upstream["ref"] for index in range(8)}
@@ -142,9 +282,14 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
 
     async def test_invalid_prompt_images_and_gpt_settings_fail_before_paid_request(self):
         cases = [
-            {"params": {"prompt": " "}}, {"params": {"prompt": "x" * 20001}},
-            {"params": {"prompt": PROMPT, "size": "original"}},
-            {"params": {"prompt": PROMPT, "quality": "auto"}},
+            {"params": {"prompt": " "}}, {"params": {"prompt": "x" * 32001}},
+            {"capability": "banana_api_t2i", "params": {"prompt": "x" * 20001}},
+            {"capability": "banana_api_i2i", "params": {"prompt": "x" * 20001}},
+            {"capability": "gpt_image_api_i2i", "params": {"prompt": "x" * 20001}},
+            {"params": {"prompt": PROMPT, "image_ratio": "original"}},
+            {"params": {"prompt": PROMPT, "image_clarity": "4K"}},
+            {"params": {"prompt": PROMPT, "image_ratio": []}},
+            {"params": {"prompt": PROMPT, "image_clarity": {}}},
             {"assets": {"images[0]": self.upstream["ref"]}},
             {"capability": "banana_api_i2i", "assets": {}},
             {"capability": "gpt_image_api_i2i", "assets": {"images[1]": self.upstream["ref"]}},
@@ -162,7 +307,8 @@ class CloudGenerationTests(CloudGenerationFixture, unittest.IsolatedAsyncioTestC
         result = await response.json()
         self.assertTrue(result["dry_run"])
         self.assertEqual(result["billingMode"], "paid_api")
-        self.assertEqual(result["size"], "1024x1024")
+        self.assertEqual(result["size"], "720x960")
+        self.assertEqual(result["quality"], "high")
         self.assertEqual(self.generations, [])
         self.assert_no_submission()
 

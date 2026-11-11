@@ -457,6 +457,20 @@ class DirectorApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture
             with self.subTest(path=path, length=len(value)):
                 await self.assert_rejected(changed(valid, path, value))
 
+    async def test_gpt_text_to_image_prompt_supports_32000_on_director_save(self):
+        first = shot()
+        first["image"] = {"capability": "gpt_image_api_t2i", "params": {"prompt": "文" * 32000}}
+        document = director([first])
+        await self.save(document)
+        self.assertEqual(self.read_project()["director"]["shots"][0]["image"]["params"]["prompt"], "文" * 32000)
+        valid = director([first], rev=1)
+        await self.assert_rejected(changed(valid, ("shots", 0, "image", "params", "prompt"), "文" * 32001))
+        await self.assert_rejected(changed(valid, ("shots", 0, "image", "params"), {"other": "x" * 20001}))
+        for capability in ("gpt_image_api_i2i", "banana_api_t2i", "banana_api_i2i"):
+            with self.subTest(capability=capability):
+                await self.assert_rejected(changed(valid, ("shots", 0, "image"),
+                    {"capability": capability, "params": {"prompt": "x" * 20001}}))
+
     async def test_schema_limits_accept_exact_maximum(self):
         self.register_asset("reference.png")
         self.project_job("j" * 128)

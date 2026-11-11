@@ -1705,6 +1705,117 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
                                   capacity_released=True)
                 self.store.remove_job(job["id"])
 
+    async def test_a6000_targeted_bf16_picker_submit_and_acquire_agree(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        other_caps = {**caps, "devices": [{
+            "type": "cuda", "name": "RTX PRO 6000", "vram_total": 96 * 1024 ** 3,
+        }]}
+        other = self.store.register_worker("other BF16 worker", other_caps)["worker_id"]
+        self.store.heartbeat(other, comfy_online=True)
+        cases = [
+            ("RTX A6000", 49140 * 1024 ** 2, None, True),
+            ("NVIDIA RTX A6000", 48 * 1024 ** 3, None, True),
+            ("RTX A6000", None, None, False),
+            ("RTX A6000", 24 * 1024 ** 3, None, False),
+            ("RTX 6000 Ada Generation", 48 * 1024 ** 3, None, False),
+            ("RTX 4090", 24 * 1024 ** 3, None, False),
+            ("RTX A6000", 48 * 1024 ** 3, "nodes", False),
+            ("RTX A6000", 48 * 1024 ** 3, "models", False),
+        ]
+        for cid in sorted(BF16_HIGH_VRAM_CAPABILITIES):
+            for name, vram, missing, allowed in cases:
+                worker_caps = json.loads(json.dumps(caps))
+                worker_caps["devices"][0].update(name=name, vram_total=vram)
+                if missing == "nodes":
+                    worker_caps["node_classes"] = []
+                elif missing == "models":
+                    worker_caps["input_choices"] = {}
+                self.store.heartbeat(worker_id, comfy_online=True, capabilities=worker_caps)
+                with self.subTest(capability=cid, name=name, vram=vram, missing=missing), \
+                     mock.patch.dict(controller_app.CAPS, {cid: {**cap, "id": cid}}), \
+                     mock.patch.object(controller_app, "ROOT", self.root), \
+                     mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+                     mock.patch.object(controller_app, "cost_ledger", return_value=None):
+                    response = await self.client.get("/api/generation/workers?capability=" + cid)
+                    self.assertEqual(response.status, 200, await response.text())
+                    picked = next(w for w in (await response.json())["workers"] if w["id"] == worker_id)
+                    self.assertEqual(picked["selectable"], allowed)
+                    response = await self.client.post("/api/generate", json={
+                        "project": "p", "capability": cid, "target_worker_id": worker_id,
+                        "params": {"duration": 1},
+                    })
+                    self.assertEqual(response.status, 200 if allowed else 400, await response.text())
+                    if not allowed:
+                        self.assertEqual(self.store.queue_ahead_snapshot(), {})
+                        continue
+                    job = await response.json()
+                    self.assertEqual(job["target_worker_id"], worker_id)
+                    self.assertIsNone(self.store.acquire(other))
+                    claim = self.store.acquire(worker_id)
+                    self.assertEqual(claim["job_id"], job["id"])
+                    self.assertEqual(claim["payload"]["target_worker_id"], worker_id)
+                    self.store.finish(job["id"], worker_id, claim["lease_token"], "done",
+                                      capacity_released=True)
+                    self.store.remove_job(job["id"])
+
+    async def test_a6000_automatic_bf16_keeps_strict_gate_and_ignores_client_override(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        caps["devices"][0].update(name="RTX A6000", vram_total=48 * 1024 ** 3)
+        self.store.heartbeat(worker_id, comfy_online=True, capabilities=caps)
+        pro = self.store.register_worker("PRO automatic BF16", {**caps, "devices": [{
+            "type": "cuda", "name": "RTX PRO 6000", "vram_total": 96 * 1024 ** 3,
+        }]})["worker_id"]
+        self.store.heartbeat(pro, comfy_online=True)
+        for cid in sorted(BF16_HIGH_VRAM_CAPABILITIES):
+            with self.subTest(capability=cid), \
+                 mock.patch.dict(controller_app.CAPS, {cid: {**cap, "id": cid}}), \
+                 mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+                 mock.patch.object(controller_app, "cost_ledger", return_value=None):
+                response = await self.client.post("/api/generate", json={
+                    "project": "p", "capability": cid, "targeted_video": True,
+                    "capacity_spec": {"expected": {"kind": "video"}},
+                })
+                self.assertEqual(response.status, 200, await response.text())
+                job = await response.json()
+                self.assertNotIn("target_worker_id", job)
+                self.assertIsNone(self.store.acquire(worker_id))
+                claim = self.store.acquire(pro)
+                self.assertEqual(claim["job_id"], job["id"])
+                self.assertNotIn("target_worker_id", claim["payload"])
+                self.store.finish(job["id"], pro, claim["lease_token"], "done",
+                                  capacity_released=True)
+                self.store.remove_job(job["id"])
+
+    async def test_a6000_targeted_bf16_rechecks_hardware_and_models_before_acquire(self):
+        cap, graph, caps, worker_id = self.target_fixture()
+        caps["devices"][0].update(name="RTX A6000", vram_total=48 * 1024 ** 3)
+        self.store.heartbeat(worker_id, comfy_online=True, capabilities=caps)
+        cid = "minimax_h3_ref_2pass_bf16"
+        with mock.patch.dict(controller_app.CAPS, {cid: {**cap, "id": cid}}), \
+             mock.patch.object(controller_app, "patch_graph", return_value=graph), \
+             mock.patch.object(controller_app, "cost_ledger", return_value=None):
+            response = await self.client.post("/api/generate", json={
+                "project": "p", "capability": cid, "target_worker_id": worker_id,
+            })
+            self.assertEqual(response.status, 200, await response.text())
+            job = await response.json()
+        for failure in ("hardware", "nodes", "models"):
+            changed = json.loads(json.dumps(caps))
+            if failure == "hardware":
+                changed["devices"][0]["name"] = "RTX 6000 Ada Generation"
+            elif failure == "nodes":
+                changed["node_classes"] = []
+            else:
+                changed["input_choices"] = {}
+            self.store.heartbeat(worker_id, comfy_online=True, capabilities=changed)
+            with self.subTest(failure=failure):
+                self.assertIsNone(self.store.acquire(worker_id))
+                self.assertEqual(self.store.dispatch_status(job["id"]), "queued")
+        self.store.heartbeat(worker_id, comfy_online=True, capabilities=caps)
+        self.assertEqual(self.store.acquire(worker_id)["job_id"], job["id"])
+        with self.assertRaises(web.HTTPBadRequest):
+            controller_app.check_local_capability({"local_gpu_state": {"devices": caps["devices"]}}, cid)
+
     async def test_pro_targeted_video_does_not_bypass_node_model_or_imported_video_policy(self):
         cap, graph, caps, worker_id = self.target_fixture()
         caps["devices"][0].update(name="RTX PRO 6000", vram_total=96 * 1024 ** 3)

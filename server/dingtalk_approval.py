@@ -154,7 +154,7 @@ def build_task_alert_params(row):
     result = ('重启该节点服务（中断当前任务） · 仅指定审批人可操作'
               if enabled else f'不可重启：{reasons[status]}')
     return {
-        'title': '生成任务运行超过 35 分钟',
+        'title': f"生成任务运行超过 {row.get('threshold_minutes', 35)} 分钟",
         'workerName': str(row.get('worker_name') or ''),
         'workerId': str(row.get('worker_id') or ''),
         'taskName': str(row.get('task_name') or ''),

@@ -30,13 +30,14 @@ AUTH_ASSETS = {
 PUBLIC = {'/login', '/login.html', '/auth.js', '/style.css', *AUTH_ASSETS}
 ADMIN_PAGES = {'/controller', '/controller.html', '/controller/costs', '/costs.html',
                '/controller/capacity', '/capacity.html',
-               '/admin/permissions', '/permissions.html'}
+               '/admin/permissions', '/permissions.html', '/skills'}
 MONITOR_ASSETS = {'/monitor', '/monitor.css', '/monitor-page.js', '/monitor-alerts.js'}
 MONITOR_PUBLIC = {'/login', '/login.html', '/auth.js', *AUTH_ASSETS}
 MONITOR_READ = MONITOR_ASSETS | MONITOR_PUBLIC | {'/api/monitor/summary', '/api/auth/me'}
 MONITOR_WORKER = re.compile(r'/api/monitor/workers/[^/\\\x00-\x20%?#]+(?:/temperature)?')
 TEAM_PAGES = {'/teams', '/teams.html'}
-ADMIN_APIS = ('/api/admin', '/api/workers', '/api/costs', '/api/capacity', '/api/reload', '/api/status')
+ADMIN_APIS = ('/api/admin', '/api/workers', '/api/costs', '/api/capacity', '/api/reload', '/api/status',
+              '/api/creation-agent/admin')
 
 
 async def call_store(app, method, *args, **kwargs):
