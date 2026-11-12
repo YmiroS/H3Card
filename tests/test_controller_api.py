@@ -608,7 +608,8 @@ class CostLedgerTest(unittest.TestCase):
         self.assertEqual(row["project_name"], "客户项目")
         self.assertEqual(row["card_id"], "card-1")
         dims = json.loads(row["dimensions_json"])
-        self.assertEqual(dims, {"model": "gemini-3-pro-image", "provider": "configured-provider",
+        self.assertEqual(dims, {"model": "gemini-3-pro-image", "model_source": "unknown",
+                               "provider": "configured-provider", "billing_source": "unknown",
                                "billing_mode": "paid_api", "requested_size": "2K", "quality": "high",
                                "input_image_count": 2, "image_count": 2,
                                "request_id": "supplier-42", "generation_unknown": False})
@@ -630,11 +631,10 @@ class CostLedgerTest(unittest.TestCase):
             self.assertEqual(row["runtime_seconds"], 3600)
             self.assertIsNone(row["total_cost_micros"])
             self.assertIsNone(row["estimated_min_micros"])
-            expected_model = ("gemini-3-pro-image" if capability.startswith("banana") else
-                              "gpt-image-2.6-sunburst" if "_26_" in capability else
-                              "gpt-image-2" if "_2_" in capability else "gpt-image-2.5-sunburst")
-            self.assertEqual(json.loads(row["dimensions_json"])["model"], expected_model)
-            self.assertEqual(row["model_family"], expected_model)
+            dimensions = json.loads(row['dimensions_json'])
+            self.assertIsNone(dimensions['model'])
+            self.assertEqual(dimensions['model_source'], 'unknown')
+            self.assertIsNone(row['model_family'])
         for marker in ({"execution": "cloud_image"}, {"event_kind": "image_api"},
                        {"billingMode": "paid_api"}, {"billing_mode": "paid_api"}):
             job_id = next(iter(marker))
@@ -711,7 +711,11 @@ class CostLedgerTest(unittest.TestCase):
         self.assertEqual(self.cost_row("priced-image"), image_before)
         self.assertEqual(report["overview"]["gpu_hours"], 1)
         self.assertEqual(report["overview"]["running_accrued"], 5)
-        self.assertAlmostEqual(report["overview"]["actual_cost"], 14.7767, places=6)
+        self.assertAlmostEqual(report['overview']['actual_cost'], 5, places=6)
+        self.assertAlmostEqual(report['overview']['estimated_cost'], 9.7767, places=6)
+        self.assertAlmostEqual(report['overview']['total_cost'], 14.7767, places=6)
+        self.assertIsNone(text_row['total_cost_micros'])
+        self.assertEqual(text_row['cost_source'], 'estimated')
         self.assertAlmostEqual(report["overview"]["api_cost"], 9.7767, places=6)
         self.assertAlmostEqual(report["overview"]["electricity_cost"], 0.6, places=6)
         self.assertEqual(report["overview"]["unknown_cost_tasks"], 1)
@@ -719,6 +723,9 @@ class CostLedgerTest(unittest.TestCase):
         self.assertEqual((details["priced-image"]["retail_min"], details["priced-image"]["retail_max"]), (2, 3))
         self.assertEqual(details["priced-image"]["cost_source"], "unknown")
         self.assertEqual(details[text_row["job_id"]]["retail_min"], 0.03)
+        self.assertEqual(details[text_row['job_id']]['cost_source'], 'estimated')
+        self.assertEqual(details[text_row['job_id']]['actual_cost'], 0)
+        self.assertAlmostEqual(details[text_row['job_id']]['estimated_cost'], 9.7767, places=6)
         self.assertEqual(details["gpu-done"]["actual_cost"], 5)
         paid = next(row for row in report["by_worker"] if row["key"] == "paid_api")
         self.assertEqual(paid["label"], "付费 API")
@@ -800,6 +807,10 @@ class CostLedgerTest(unittest.TestCase):
         self.assertAlmostEqual(report["overview"]["total_cost"], 9.7767, places=6)
         self.assertEqual(report["jobs"][0]["category_name"], "文本与反推")
         self.assertEqual(report["jobs"][0]["project_name"], "文案项目")
+        self.assertEqual(report['overview']['actual_cost'], 0)
+        self.assertAlmostEqual(report['overview']['estimated_cost'], 9.7767, places=6)
+        self.assertEqual(report['jobs'][0]['cost_source'], 'estimated')
+        self.assertIsNone(self.cost_row(report['jobs'][0]['job_id'])['total_cost_micros'])
 
     def test_h3_retail_prices_follow_segment_and_output_second_rules(self):
         self.assertEqual(
@@ -4699,7 +4710,15 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         expected = (200 * 1.9596 + 100 * 7.8171) / 1_000_000
         self.assertAlmostEqual(costs["overview"]["api_cost"], expected, places=6)
         self.assertEqual(costs["jobs"][0]["project_name"], "文案项目")
-        self.assertEqual(costs["jobs"][0]["cost_source"], "actual")
+        self.assertEqual(costs['jobs'][0]['cost_source'], 'estimated')
+        self.assertEqual(costs['overview']['actual_cost'], 0)
+        self.assertAlmostEqual(costs['overview']['estimated_cost'], expected, places=6)
+        self.assertAlmostEqual(costs['overview']['total_cost'], expected, places=6)
+        event_id = costs['jobs'][0]['job_id']
+        row = dict(self.ledger.db.execute('SELECT * FROM cost_events WHERE job_id=?', (event_id,)).fetchone())
+        self.assertEqual(row['prompt_tokens'], 200)
+        self.assertEqual(row['completion_tokens'], 100)
+        self.assertIsNone(row['total_cost_micros'])
 
     async def test_register_heartbeat_acquire_and_complete(self):
         denied = await self.client.post("/agent/v1/register", json={
@@ -5175,7 +5194,7 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
         card = next(item for item in payload["cards"] if item["id"] == "card_tools")
         modes = {mode["id"]: mode for mode in card["modes"]}
         self.assertEqual(modes["color_grade"], {
-            "id": "color_grade", "name": "图片调色", "slots": "img1+aud0+vid0"})
+            "id": "color_grade", "name": "调色（图片）", "slots": "img1+aud0+vid0"})
         response = await self.client.post("/api/generate", json={
             "project": "p", "capability": "color_grade", "dry_run": True})
         self.assertEqual(response.status, 400)
@@ -5191,7 +5210,7 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
         card = next(item for item in payload["cards"] if item["id"] == "card_tools")
         modes = {mode["id"]: mode for mode in card["modes"]}
         self.assertEqual(modes["video_color_grade"], {
-            "id": "video_color_grade", "name": "视频调色", "slots": "img0+aud0+vid1"})
+            "id": "video_color_grade", "name": "调色（视频）", "slots": "img0+aud0+vid1"})
         response = await self.client.post("/api/generate", json={
             "project": "p", "capability": "video_color_grade", "dry_run": True})
         self.assertEqual(response.status, 400)

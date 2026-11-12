@@ -15,7 +15,7 @@ sys.path.insert(0, str(ROOT / 'server'))
 import app
 from aiohttp.test_utils import TestClient, TestServer
 from server.auth_store import AuthStore
-from server.local_sandbox import import_archive, sanitize_database, scrub, prepare, check
+from server.local_sandbox import import_archive, sanitize_database, scrub, prepare, prepare_costs, check
 from server.sandbox import allowed, validate_runtime
 
 
@@ -80,6 +80,86 @@ class SandboxBoundaryTests(unittest.TestCase):
                              ('PUT', '/api/projects/example/director'),
                              ('POST', '/api/projects/example/presence')]:
             self.assertFalse(allowed(method, path), (method, path))
+
+    def test_cost_routes_are_exact_and_never_open_generation(self):
+        for path in ('/api/costs/catalog', '/api/costs/dashboard', '/api/costs/dashboard/export'):
+            for method in ('GET', 'HEAD'):
+                self.assertTrue(allowed(method, path))
+            for method in ('POST', 'PUT', 'PATCH', 'DELETE'):
+                self.assertFalse(allowed(method, path))
+        for method, path in (
+                ('POST', '/api/costs/departments'),
+                ('PATCH', '/api/costs/departments/dept_1'),
+                ('PUT', '/api/costs/accounts/user-1/department')):
+            self.assertTrue(allowed(method, path))
+            self.assertFalse(allowed(method, path + '/'))
+            self.assertFalse(allowed(method, path + '/other'))
+            for other in {'POST', 'PUT', 'PATCH', 'DELETE'} - {method}:
+                self.assertFalse(allowed(other, path))
+        for path in ('/api/costs/generate', '/api/costs/departments-extra',
+                     '/api/costs/accounts/user/department-extra', '/api/chat/completions'):
+            for method in ('GET', 'POST', 'PUT', 'PATCH', 'DELETE'):
+                self.assertFalse(allowed(method, path))
+
+    def test_prepare_costs_imports_isolated_evidence_without_credentials(self):
+        import contextlib
+        import io
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory).resolve()
+            snapshot = root / 'snapshot.json'
+            source = {
+                'capturedAt': '2026-11-11T11:19:29Z', 'pricingVersion': 'review-test',
+                'accounts': [{'id': 'u1', 'username': '原账号', 'enabled': True}],
+                'history': [{'id': 'j1', 'submitter_id': 'u1', 'project': 'p1'}],
+                'groups': {'by_worker': [{'key': 'w1', 'label': '原GPU'}]},
+                'jobs': [
+                    {'job_id': 'j1', 'event_kind': 'generation', 'capability': 'test',
+                     'category': 'video', 'status': 'done', 'created_at': 100,
+                     'runtime_seconds': 3600, 'cost_source': 'actual', 'actual_cost': 2.5,
+                     'worker_name': '原GPU', 'dimensions': {'duration': 5, 'api_key': '不复制'}},
+                    {'job_id': 'j2', 'event_kind': 'image_api', 'capability': 'cloud-test',
+                     'category': 'image', 'status': 'error', 'created_at': 101,
+                     'cost_source': 'unknown', 'dimensions': {'model': '未定价模型'}},
+                ],
+            }
+            snapshot.write_text(json.dumps(source), encoding='utf-8')
+            before = snapshot.read_bytes()
+            destination = root / 'runtime'
+            def copy_minimal(target):
+                shutil.copyfile(ROOT / 'pricing.json', target / 'pricing.json')
+            import shutil
+            with mock.patch('server.local_sandbox.copy_code', side_effect=copy_minimal), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                prepare_costs(destination, snapshot)
+            self.assertEqual(before, snapshot.read_bytes())
+            self.assertEqual(check(destination), destination)
+            self.assertEqual(json.loads((destination / 'data/jobs.json').read_text()), [])
+            login = json.loads((destination / 'local-login.json').read_text())
+            auth = AuthStore(destination / 'data/auth.db')
+            try:
+                self.assertEqual(auth.login(login['username'], login['password'])['user']['role'], 'admin')
+                self.assertEqual(auth.get_user('u1')['username'], '原账号')
+                self.assertEqual(auth.job_submitters(['j1'])['j1']['submitter_id'], 'u1')
+                self.assertNotEqual(auth.db.execute('SELECT password_hash FROM users WHERE id=?',
+                                                   ('u1',)).fetchone()[0], login['password'])
+            finally:
+                auth.close()
+            with sqlite3.connect(destination / 'data/control.db') as db:
+                db.row_factory = sqlite3.Row
+                rows = {row['job_id']: row for row in db.execute('SELECT * FROM cost_events')}
+                self.assertEqual(rows['j1']['worker_id'], 'w1')
+                self.assertEqual(rows['j1']['total_cost_micros'], 2500000)
+                self.assertIsNone(rows['j2']['total_cost_micros'])
+                self.assertEqual(rows['j2']['cost_source'], 'unknown')
+                dims = json.loads(rows['j1']['dimensions_json'])
+                self.assertNotIn('api_key', dims)
+                self.assertEqual(dims['electricity_basis'], 'local_review_recomputed')
+                self.assertEqual(dims['worker_name'], '原GPU')
+            marker = json.loads((destination / 'data/.admin-sandbox.json').read_text())
+            self.assertEqual(marker['source'], 'costs_snapshot')
+            self.assertEqual((destination / 'local-login.json').stat().st_mode & 0o777, 0o600)
+            with self.assertRaisesRegex(ValueError, '已经存在'):
+                prepare_costs(destination, snapshot)
 
     def test_runtime_requires_correct_marker_and_no_links(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -167,6 +247,9 @@ class SandboxBoundaryTests(unittest.TestCase):
             self.assertEqual(session['user']['role'], 'admin')
             auth.close()
             self.assertFalse((destination / 'llm.json').exists())
+            for name in ('builtins.json', 'builtin_defaults.json'):
+                self.assertEqual((destination / 'server/creation_agent' / name).read_bytes(),
+                                 (ROOT / 'server/creation_agent' / name).read_bytes())
             self.assertEqual(json.loads((destination / 'snapshot.json').read_text()),
                              {'source': '本地副本已清除', 'tasks': 34})
             with self.assertRaises(ValueError):
@@ -376,8 +459,8 @@ class SandboxApplicationTests(unittest.IsolatedAsyncioTestCase):
         await self.login()
         for name in ('admin-shell.css', 'admin-shell.js', 'controller-page.js', 'costs-page.js'):
             response = await self.client.get('/' + name)
-            self.assertEqual(response.status, 200, name)
-            self.assertEqual(await response.read(), (ROOT / 'web' / name).read_bytes())
+            # 集成模式仅提供经过构建目录校验的资源，不回退旧版 web 文件。
+            self.assertEqual(response.status, 404, name)
             self.assertEqual(response.headers['X-H3Card-Sandbox'], 'local-copy')
         for path in ('/controller.html', '/web/controller.html', '/local-login.json', '/server.log'):
             response = await self.client.get(path)
@@ -625,7 +708,12 @@ class SandboxApplicationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 403)
         response = await self.client.get('/api/health', headers={'Host': 'evil.invalid:18299'})
         self.assertEqual(response.status, 403)
-        self.assertFalse(any('/agent/v1/' in str(route.resource) for route in self.application.router.routes()))
+        for path in ('/agent/v1/register', '/agent/v1/heartbeat', '/agent/v1/jobs/acquire'):
+            self.assertFalse(any(route.resource.canonical == path
+                                 for route in self.application.router.routes()))
+        response = await self.client.post('/agent/v1/local-edit/cloud', json={}, headers=headers)
+        self.assertEqual(response.status, 403)
+        self.assertIn('本地隔离', (await response.json())['error'])
 
 
 if __name__ == '__main__':

@@ -45,9 +45,6 @@ ORIGINAL_REGISTRY = deepcopy(dependencies.PLUGIN_DEPENDENCIES)
 
 class DependencyExecutorTests(unittest.TestCase):
     def setUp(self):
-        # These cases isolate existing third-party dependency policy. The new
-        # project-package copy path has real temporary-directory tests separately.
-        self.enterContext(mock.patch.object(dependencies, "install_local_edit_nodes", return_value=()))
         self.enterContext(mock.patch.object(dependencies, "PLUGIN_DEPENDENCIES", {
             PLUGIN: deepcopy(ORIGINAL_REGISTRY[PLUGIN]),
         }))
@@ -110,6 +107,35 @@ class DependencyExecutorTests(unittest.TestCase):
         self.assertEqual(self.version.call_args_list, [mock.call("nvidia-vfx")] * 2)
         self.run.assert_called_once()
         self.assert_import_command(self.run.call_args)
+
+    def test_dependency_checks_never_create_or_rewrite_local_edit_plugin(self):
+        self.enterContext(mock.patch.object(dependencies, "PLUGIN_DEPENDENCIES", deepcopy(ORIGINAL_REGISTRY)))
+        gimm = self.comfy / "custom_nodes" / GIMM_PLUGIN
+        gimm.mkdir()
+        (gimm / "__init__.py").write_text("# Third-party fixture; subprocess is mocked.\n", encoding="utf-8")
+        versions = {"nvidia-vfx": VERSION, **GIMM_PACKAGES}
+        self.version.side_effect = versions.__getitem__
+        local_edit = self.comfy / "custom_nodes" / "chouka_local_edit"
+        for deployed in (False, True):
+            with self.subTest(manually_deployed=deployed):
+                if deployed:
+                    local_edit.mkdir()
+                    for name in ("__init__.py", "geometry.py", "cloud.py"):
+                        (local_edit / name).write_text(
+                            "raise AssertionError('Keep this customized manual deployment')\n",
+                            encoding="utf-8",
+                        )
+                    before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in local_edit.iterdir()}
+                self.run.reset_mock()
+                self.assertEqual(self.ensure(), NODES + GIMM_NODES)
+                self.assertEqual(self.run.call_count, 3)  # Two imports and the mocked GIMM CUDA probe.
+                self.assertFalse(any("pip" in call.args[0] for call in self.run.call_args_list))
+                if deployed:
+                    after = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in local_edit.iterdir()}
+                    self.assertEqual(after, before)
+                    self.assertFalse((local_edit / ".chouka-local-edit-owned.json").exists())
+                else:
+                    self.assertFalse(local_edit.exists())
 
     def test_missing_version_installs_only_pinned_binary_from_official_indexes(self):
         self.missing_then_installed()
@@ -290,13 +316,12 @@ class DependencyExecutorTests(unittest.TestCase):
             [sys.executable, "-B", "-s", "-c", source, str(HELPER), str(missing_root)])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("插件依赖处理失败", result.stdout)
-        self.assertIn("本地编辑节点安装被拒绝", result.stdout)
+        self.assertIn(PLUGIN, result.stdout)
         self.assertFalse(missing_root.exists())
 
 
 class GIMMDependencyExecutorTests(unittest.TestCase):
     def setUp(self):
-        self.enterContext(mock.patch.object(dependencies, "install_local_edit_nodes", return_value=()))
         self.enterContext(mock.patch.object(dependencies, "PLUGIN_DEPENDENCIES", {
             GIMM_PLUGIN: deepcopy(ORIGINAL_REGISTRY[GIMM_PLUGIN]),
         }))
@@ -596,7 +621,6 @@ import time
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import sync_dependencies as d
-d.install_local_edit_nodes = lambda comfy_root: ()
 d.PLUGIN_DEPENDENCIES = {
     'ComfyUI_Nvidia_VFX_Nodes': d.PLUGIN_DEPENDENCIES['ComfyUI_Nvidia_VFX_Nodes'],
 }

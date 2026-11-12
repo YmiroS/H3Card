@@ -3,7 +3,6 @@
 import argparse
 import errno
 import importlib.metadata
-import importlib.util
 import os
 import subprocess
 import sys
@@ -95,33 +94,7 @@ def ensure_dependencies(comfy_root, *, deadline):
         return _install_and_check(comfy_root, deadline)
 
 
-LOCAL_EDIT_NODES = (
-    "ChoukaLocalCrop", "ChoukaLocalStitch", "ChoukaCloudImageEdit", "ChoukaLocalSaveImage",
-    "ChoukaLocalModelSwitch",
-)
-
-
-def install_local_edit_nodes(comfy_root):
-    # Resolve our sibling explicitly: embedded Python -s/-I and spec-loaded
-    # callers must not depend on worker/ being present in sys.path. The
-    # installer itself is stdlib-only; it never imports Comfy or other plugins.
-    helper = Path(__file__).resolve().with_name("install_local_edit_nodes.py")
-    spec = importlib.util.spec_from_file_location("chouka_local_edit_installer", helper)
-    installer = importlib.util.module_from_spec(spec)
-    try:
-        spec.loader.exec_module(installer)
-        target = installer.install(comfy_root)
-    except (OSError, ValueError) as exc:
-        raise RuntimeError(f"本地编辑节点安装被拒绝，未重启 ComfyUI：{exc}") from exc
-    print(f"项目本地编辑节点已就绪：{target}", flush=True)
-    return LOCAL_EDIT_NODES
-
-
 def _install_and_check(comfy_root, deadline):
-    # Inside the existing interpreter lock, before any pip/import checks.
-    # Do not add this to PLUGIN_DEPENDENCIES: it has no pip requirements and
-    # must not change the approved third-party plugin/version rules.
-    local_edit_nodes = install_local_edit_nodes(comfy_root)
     required_nodes = []
     for directory, spec in PLUGIN_DEPENDENCIES.items():
         plugin = Path(comfy_root) / "custom_nodes" / directory
@@ -175,7 +148,6 @@ def _install_and_check(comfy_root, deadline):
                 str(plugin / spec["cuda_probe"]),
             ], deadline)
         required_nodes.extend(spec["nodes"])
-    required_nodes.extend(local_edit_nodes)
     return required_nodes
 
 

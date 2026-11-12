@@ -10,7 +10,7 @@ import aiohttp
 from aiohttp import web
 
 from . import cloud_banana
-from . import cloud_images
+from . import cloud_images, provider_billing
 
 
 def lighting_size(info, megapixels):
@@ -44,6 +44,30 @@ class CloudLighting:
         self.resource_call = resource_call
         self.call_store = call_store
         self.tasks = {}
+
+    async def record_cost(self, job, params=None, assets=None):
+        ledger = self.app.get("costs")
+        if ledger:
+            await asyncio.to_thread(ledger.record_image_api, job, model=job.get("modelName"),
+                                    params=params, assets=assets)
+
+    async def capture_metadata(self, job, metadata):
+        for key in ("request_id", "provider_billing", "usage", "model_source"):
+            if key in metadata:
+                job[key] = metadata[key]
+        if metadata.get("model") is not None:
+            job["modelName"] = metadata["model"]
+        try:
+            self.save_jobs()
+        finally:
+            # 任务快照写入失败也不能阻止独立账本接收已扣费证据。
+            await self.record_cost(job)
+
+    async def bind_cost_user(self, job, user_id):
+        job.update(user_id=user_id, submitter_id=user_id)
+        ledger = self.app.get("costs")
+        if ledger:
+            await asyncio.to_thread(ledger.bind_attribution, job["id"], user_id)
 
     async def source(self, request, project_id, value):
         ref = await self.resource_call(self.app, "reference", value)
@@ -136,8 +160,12 @@ class CloudLighting:
         if reference_ref:
             inputs["reference_image"] = reference_ref
         await self.resource_call(self.app, "register_job_inputs", pid, inputs)
+        model_metadata = provider_billing.normalize({}, config["banana_model" if provider == "banana" else "model"], config)
         job = {"id": pid, "capability": cap["id"], "name": cap["name"],
-               "modelName": config["model"], "execution": "cloud_image", "outputType": "image",
+               "modelName": model_metadata["model"],
+               "model_source": model_metadata["model_source"], "billingMode": "paid_api",
+               "provider_billing": None, "usage": model_metadata["usage"],
+               "execution": "cloud_image", "outputType": "image",
                "status": "queued", "progress": 0.0, "created": time.time(), "seed": None,
                "megapixels": megapixels,
                "requested_size": None if provider == "banana" else size,
@@ -146,6 +174,8 @@ class CloudLighting:
                "card": card_id, "cardName": body.get("cardName"),
                "referenceMode": reference_mode, "provider": provider,
                "prompts": [{"key": "prompt", "label": "布光提示词", "text": prompt.strip()}]}
+        await self.bind_cost_user(job, user_id)
+        await self.record_cost(job, params, inputs)
         self.jobs[pid] = job
         self.save_jobs()
         images = [data] if reference is None else [data, reference[0]]
@@ -174,17 +204,24 @@ class CloudLighting:
             await self.authorize_all(user_id, job["project"], refs)
             job.update(status="running", started=time.time(), step="云端多灯打光中")
             self.save_jobs()
+            await self.record_cost(job)
+
+            async def on_metadata(metadata):
+                await self.capture_metadata(job, metadata)
+
             if provider == "banana":
                 result = await cloud_banana.generate(self.app["session"], images, prompt,
-                                                     end_user_name=end_user_name, end_user_phone=end_user_phone)
+                                                     end_user_name=end_user_name, end_user_phone=end_user_phone,
+                                                     on_metadata=on_metadata)
             else:
                 result = await cloud_images.edit(self.app["session"], images, prompt, size=size,
-                                                 end_user_name=end_user_name, end_user_phone=end_user_phone)
-            job.update(request_id=result["request_id"], modelName=result["model"])
+                                                 end_user_name=end_user_name, end_user_phone=end_user_phone,
+                                                 on_metadata=on_metadata)
+            await self.capture_metadata(job, result)
             if "image_bytes" not in result:
                 raise cloud_images.ImageEditError(
                     "云端已返回图片链接，但未自动下载。请联系管理员确认结果，不要重复生成。",
-                    request_id=result["request_id"])
+                    request_id=result["request_id"], generation_unknown=True)
             async with self.app["project_locks"][job["project"]]:
                 await self.authorize_all(user_id, job["project"], refs)
                 name = "relight" + result["extension"]
@@ -221,7 +258,10 @@ class CloudLighting:
                 path.unlink(missing_ok=True)
             job.update(step="", ended=time.time())
             job["ms"] = int((job["ended"] - job.get("started", job["created"])) * 1000)
-            self.save_jobs()
+            try:
+                self.save_jobs()
+            finally:
+                await self.record_cost(job)
 
     async def close(self):
         tasks = list(self.tasks.values())

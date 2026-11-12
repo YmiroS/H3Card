@@ -1,6 +1,6 @@
 {
  "id": "video_color_grade",
- "name": "视频调色",
+ "name": "调色（视频）",
  "execution": "browser",
  "kind": "tool",
  "card": "card_tools",

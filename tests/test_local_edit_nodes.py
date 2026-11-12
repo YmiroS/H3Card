@@ -1,9 +1,11 @@
 """Targeted CPU/stdlib tests. No Comfy service, models, pip or paid calls.
 
 python -B -m unittest discover -s tests -p test_local_edit_nodes.py -v
-Torch node tests skip explicitly on numpy/PIL-only Python; pure geometry and
-transport/graph/installer tests still execute. HTTP tests use only an ephemeral
-loopback fixture, never the real controller or Comfy service.
+Set CHOUKA_LOCAL_EDIT_NODE_DIR to the complete externally deployed plugin to
+run node/package tests; without it only pure JSON graph tests execute. An
+explicit invalid plugin path fails import rather than skipping. Torch tests
+also skip when torch is unavailable. HTTP tests use only an ephemeral loopback
+fixture, never the real controller or Comfy service.
 """
 import sys
 sys.dont_write_bytecode = True
@@ -11,36 +13,55 @@ sys.dont_write_bytecode = True
 import copy
 from email.parser import BytesParser
 from email.policy import default
+import hashlib
 import importlib.util
 import io
 import json
 import os
 from pathlib import Path
-import shutil
-import tempfile
 import threading
 import unittest
 from unittest import mock
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import numpy as np
-from PIL import Image
-
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-from comfy_nodes.chouka_local_edit import (
-    ChoukaCloudImageEdit, ChoukaLocalCrop, ChoukaLocalStitch, ChoukaLocalSaveImage,
-    ChoukaLocalModelSwitch, NODE_CLASS_MAPPINGS,
-)
-from comfy_nodes.chouka_local_edit import cloud
-from comfy_nodes.chouka_local_edit.geometry import (
-    canvas_side, crop_numpy, feather_mask, stitch_numpy,
-)
+NODE_DIR_ENV = os.environ.get("CHOUKA_LOCAL_EDIT_NODE_DIR")
+NODE_SKIP_REASON = "set CHOUKA_LOCAL_EDIT_NODE_DIR to a complete externally deployed plugin"
+NODE_DIR = None
+local_edit = None
+torch = None
 
-try:
-    import torch
-except ImportError:
-    torch = None
+if NODE_DIR_ENV is not None:
+    if not NODE_DIR_ENV.strip():
+        raise ValueError("CHOUKA_LOCAL_EDIT_NODE_DIR must point to a complete plugin directory")
+    NODE_DIR = Path(NODE_DIR_ENV).resolve()
+    spec = importlib.util.spec_from_file_location(
+        "_chouka_local_edit_test_package", NODE_DIR / "__init__.py",
+        submodule_search_locations=[str(NODE_DIR)],
+    )
+    local_edit = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = local_edit
+    spec.loader.exec_module(local_edit)
+
+    import numpy as np
+    from PIL import Image
+
+    ChoukaCloudImageEdit = local_edit.ChoukaCloudImageEdit
+    ChoukaLocalCrop = local_edit.ChoukaLocalCrop
+    ChoukaLocalStitch = local_edit.ChoukaLocalStitch
+    ChoukaLocalSaveImage = local_edit.ChoukaLocalSaveImage
+    ChoukaLocalModelSwitch = local_edit.ChoukaLocalModelSwitch
+    NODE_CLASS_MAPPINGS = local_edit.NODE_CLASS_MAPPINGS
+    cloud = local_edit.cloud
+    canvas_side = local_edit.geometry.canvas_side
+    crop_numpy = local_edit.geometry.crop_numpy
+    feather_mask = local_edit.geometry.feather_mask
+    stitch_numpy = local_edit.geometry.stitch_numpy
+
+    try:
+        import torch
+    except ImportError:
+        pass
 
 
 def image_mask(height=83, width=173, box=(47, 20, 91, 39)):
@@ -57,6 +78,7 @@ def png_bytes(size=(32, 32), mode="RGB", color=120):
     return output.getvalue()
 
 
+@unittest.skipUnless(local_edit is not None, NODE_SKIP_REASON)
 class GeometryTests(unittest.TestCase):
     def test_canvas_budget_sqrt_alignment_and_limits(self):
         self.assertEqual(canvas_side(1.0), 992)
@@ -180,7 +202,8 @@ class GeometryTests(unittest.TestCase):
                 crop_numpy(base, mask, .25, invalid)
 
 
-@unittest.skipIf(torch is None, "torch unavailable: pure numpy geometry still tested")
+@unittest.skipUnless(local_edit is not None, NODE_SKIP_REASON)
+@unittest.skipIf(torch is None, "torch unavailable: external package's numpy geometry still tested")
 class TorchNodeTests(unittest.TestCase):
     def test_ports_and_real_cpu_tensor_crop_stitch(self):
         self.assertEqual(set(NODE_CLASS_MAPPINGS), {"ChoukaLocalCrop", "ChoukaLocalStitch", "ChoukaCloudImageEdit", "ChoukaLocalSaveImage", "ChoukaLocalModelSwitch"})
@@ -210,13 +233,14 @@ class TorchNodeTests(unittest.TestCase):
 
     def test_cloud_tensor_adapter(self):
         base, _ = image_mask()
-        with mock.patch("comfy_nodes.chouka_local_edit.cloud_edit_numpy", return_value=base.copy()) as edit:
+        with mock.patch.object(local_edit, "cloud_edit_numpy", return_value=base.copy()) as edit:
             output, = ChoukaCloudImageEdit().edit(torch.from_numpy(base), "material", "banana", "", "", torch.from_numpy(base))
         np.testing.assert_array_equal(output.numpy(), base)
         self.assertIsInstance(edit.call_args.args[0], np.ndarray)
         self.assertIsInstance(edit.call_args.args[-1], np.ndarray)
 
 
+@unittest.skipUnless(local_edit is not None, NODE_SKIP_REASON)
 class LazyModelSwitchTests(unittest.TestCase):
     def test_only_selected_branch_is_requested_and_returned(self):
         switch = ChoukaLocalModelSwitch()
@@ -242,6 +266,7 @@ class LazyModelSwitchTests(unittest.TestCase):
                 method("unknown")
 
 
+@unittest.skipUnless(local_edit is not None, NODE_SKIP_REASON)
 class SafeSaveTests(unittest.TestCase):
     def test_metadata_redacted_in_saved_png_without_mutating_execution_graph(self):
         ticket = "unit-" + "save-ticket"
@@ -313,6 +338,7 @@ class _CallbackHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
 
+@unittest.skipUnless(local_edit is not None, NODE_SKIP_REASON)
 class CloudTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -329,9 +355,6 @@ class CloudTests(unittest.TestCase):
         cls.thread.join()
 
     def setUp(self):
-        self.env = mock.patch.dict(os.environ, {"CHOUKA_LOCAL_EDIT_TRUSTED_ORIGINS": self.origin})
-        self.env.start()
-        self.addCleanup(self.env.stop)
         self.server.calls = []
         self.server.status = 200
         self.server.payload = png_bytes()
@@ -399,13 +422,29 @@ class CloudTests(unittest.TestCase):
             self.call()
         self.assertEqual(len(self.server.calls), 1)
 
-    def test_fail_closed_origin_path_and_token_validation(self):
-        urls = ("http://untrusted.invalid" + cloud.CALLBACK_PATH,
-                self.origin + "/wrong", self.url + "?x=1", self.url + "#x",
+    def test_upstream_callback_needs_no_local_origin_configuration(self):
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CHOUKA_LOCAL_EDIT_TRUSTED_ORIGINS", None)
+            result = self.call()
+        self.assertEqual(result.shape, (1, 32, 32, 3))
+        self.assertEqual(len(self.server.calls), 1)
+        for configured in ("", "https://other.invalid", "not a valid origin"):
+            with self.subTest(configured=configured), mock.patch.dict(
+                    os.environ, {"CHOUKA_LOCAL_EDIT_TRUSTED_ORIGINS": configured}):
+                for origin in ("http://controller.invalid:8199", "https://controller.invalid",
+                               "http://192.0.2.10:8199", "http://[::1]:8199"):
+                    cloud.validate_callback_url(origin + cloud.CALLBACK_PATH)
+
+    def test_fail_closed_url_path_and_token_validation(self):
+        urls = (self.origin + "/wrong", self.url + "?x=1", self.url + "#x",
                 self.url + "?", self.url + "#", self.url + "/",
                 self.url.replace("127.0.0.1", "user@127.0.0.1"),
-                self.url.replace("127.0.0.1", "127.0.0.1.evil.invalid"),
+                self.url.replace("127.0.0.1", "user:password@127.0.0.1"),
+                self.url.replace("127.0.0.1", "%31%32%37.0.0.1"),
                 "file:///agent/v1/local-edit/cloud", " " + self.url,
+                "http:///agent/v1/local-edit/cloud", self.url + "\r\n",
+                "http://127.0.0.1:0" + cloud.CALLBACK_PATH,
+                "http://127.0.0.1:65536" + cloud.CALLBACK_PATH,
                 self.url.replace("127.0.0.1", "127.0.0.1\\evil"))
         with mock.patch("urllib.request.build_opener") as opened:
             for url in urls:
@@ -414,9 +453,6 @@ class CloudTests(unittest.TestCase):
             for token in ("", "with spaces", "header\r\ninjection", "x" * 8193):
                 with self.assertRaises(ValueError):
                     self.call(token=token)
-            with mock.patch.dict(os.environ, {"CHOUKA_LOCAL_EDIT_TRUSTED_ORIGINS": ""}):
-                with self.assertRaises(ValueError):
-                    self.call()
             opened.assert_not_called()
         self.assertEqual(self.server.calls, [])
 
@@ -490,10 +526,8 @@ class GraphManifestTests(unittest.TestCase):
                 self.assertEqual(graph["90"]["inputs"]["context"], ["10", 1])
                 self.assertEqual(graph["2"], {"class_type": "LoadImageMask", "inputs": {"image": "chouka_local_mask.png", "channel": "red"}})
                 specs = {spec["key"]: spec for spec in manifest["inputs"]}
-                crop_inputs = ChoukaLocalCrop.INPUT_TYPES()["required"]
                 for key, limits in (("megapixels", (0.25, 16.0)), ("feather", (0, 128))):
                     self.assertEqual((specs[key]["min"], specs[key]["max"]), limits)
-                    self.assertEqual((crop_inputs[key][1]["min"], crop_inputs[key][1]["max"]), limits)
                 self.assertEqual(specs["images[0]"]["target"]["node"], "1")
                 self.assertEqual(specs["images[1]"]["target"]["node"], "2")
                 self.assertTrue(specs["images[0]"]["required"])
@@ -530,8 +564,19 @@ class GraphManifestTests(unittest.TestCase):
                     self.assertEqual(graph[node_id]["inputs"]["callback_url"], "")
                     self.assertEqual(graph[node_id]["inputs"]["callback_token"], "")
                     self.assertNotIn("reference", without_reference[node_id]["inputs"])
-                self.assertEqual(set(ChoukaCloudImageEdit.INPUT_TYPES()["required"]),
-                                 {"image", "prompt", "provider", "callback_url", "callback_token"})
+
+    @unittest.skipUnless(local_edit is not None, NODE_SKIP_REASON)
+    def test_manifest_parameters_match_deployed_node_interfaces(self):
+        crop_inputs = ChoukaLocalCrop.INPUT_TYPES()["required"]
+        for provider in ("flux", "gpt", "banana"):
+            with self.subTest(provider=provider):
+                manifest = json.loads((ROOT / "manifests" / ("texture_local_" + provider + ".json")).read_text(encoding="utf-8"))
+                specs = {spec["key"]: spec for spec in manifest["inputs"]}
+                for key, limits in (("megapixels", (0.25, 16.0)), ("feather", (0, 128))):
+                    self.assertEqual((crop_inputs[key][1]["min"], crop_inputs[key][1]["max"]), limits)
+                    self.assertEqual((specs[key]["min"], specs[key]["max"]), limits)
+        self.assertEqual(set(ChoukaCloudImageEdit.INPUT_TYPES()["required"]),
+                         {"image", "prompt", "provider", "callback_url", "callback_token"})
 
     def test_native_workflow_matches_api_graph(self):
         graph = json.loads((ROOT / "graphs/texture_local_edit.api.json").read_text(encoding="utf-8"))
@@ -579,167 +624,36 @@ class GraphManifestTests(unittest.TestCase):
         self.assertTrue(4 <= sampler["steps"] <= 6)
 
 
-class InstallerTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        spec = importlib.util.spec_from_file_location("install_local_edit_nodes", ROOT / "worker/install_local_edit_nodes.py")
-        cls.installer = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.installer)
+@unittest.skipUnless(local_edit is not None, NODE_SKIP_REASON)
+class DeployedPackageTests(unittest.TestCase):
+    def test_complete_package_and_ownership_hashes(self):
+        package_files = {"__init__.py", "geometry.py", "cloud.py"}
+        ledger_name = ".chouka-local-edit-owned.json"
+        for name in package_files | {ledger_name}:
+            with self.subTest(file=name):
+                self.assertTrue((NODE_DIR / name).is_file())
+        self.assertEqual({path.name for path in NODE_DIR.glob("*.py")}, package_files)
+        ledger = json.loads((NODE_DIR / ledger_name).read_text(encoding="utf-8"))
+        self.assertEqual(ledger["owner"], "chouka_local_edit")
+        self.assertIs(type(ledger["version"]), int)
+        self.assertEqual(ledger["version"], 1)
+        self.assertEqual(set(ledger["files"]), package_files)
+        for name, expected_hash in ledger["files"].items():
+            with self.subTest(file=name):
+                self.assertEqual(hashlib.sha256((NODE_DIR / name).read_bytes()).hexdigest(), expected_hash)
 
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / "ComfyRoot"
-        (self.root / "custom_nodes").mkdir(parents=True)
-        (self.root / "main.py").write_text("# fixture only\n")
-        self.target = self.root / "custom_nodes/chouka_local_edit"
-        self.other = self.root / "custom_nodes/other_plugin.py"
-        self.other.write_text("untouched")
-
-    def test_fresh_install_idempotent_and_other_plugin_untouched(self):
-        installed = self.installer.install(self.root)
-        self.assertEqual(installed, self.target)
-        before = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.target.iterdir()}
-        self.installer.install(self.root)
-        after = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in self.target.iterdir()}
-        self.assertEqual(before, after)
-        self.assertEqual(self.other.read_text(), "untouched")
-        self.assertEqual(set(before), {*self.installer.PACKAGE_FILES, self.installer.LEDGER_NAME})
-
-    def test_refuses_foreign_and_modified_destination_without_writes(self):
-        self.target.mkdir()
-        stranger = self.target / "__init__.py"
-        stranger.write_text("user plugin")
-        with self.assertRaisesRegex(ValueError, "not a managed"):
-            self.installer.install(self.root)
-        self.assertEqual(stranger.read_text(), "user plugin")
-        stranger.unlink()
-        self.installer.install(self.root)
-        stranger.write_text("locally edited")
-        before = {p.name: p.read_bytes() for p in self.target.iterdir()}
-        with self.assertRaisesRegex(ValueError, "locally modified"):
-            self.installer.install(self.root)
-        self.assertEqual(before, {p.name: p.read_bytes() for p in self.target.iterdir()})
-
-    def test_own_package_update_and_extra_user_file_refusal(self):
-        project = Path(self.temp.name) / "Project"
-        source = project / "comfy_nodes/chouka_local_edit"
-        shutil.copytree(ROOT / "comfy_nodes/chouka_local_edit", source, ignore=shutil.ignore_patterns("__pycache__"))
-        fake_script = project / "worker/install_local_edit_nodes.py"
-        with mock.patch.object(self.installer, "__file__", str(fake_script)):
-            self.installer.install(self.root)
-            (source / "cloud.py").write_text("# updated project code\n")
-            self.installer.install(self.root)
-            self.assertEqual((self.target / "cloud.py").read_text(), "# updated project code\n")
-            extra = self.target / "user_extra.py"
-            extra.write_text("keep me")
-            (source / "cloud.py").write_text("# next update\n")
-            with self.assertRaisesRegex(ValueError, "unfamiliar"):
-                self.installer.install(self.root)
-            self.assertEqual(extra.read_text(), "keep me")
-            self.assertEqual((self.target / "cloud.py").read_text(), "# updated project code\n")
-
-    def test_invalid_root_rejected(self):
-        with self.assertRaises(ValueError):
-            self.installer.install(Path(self.temp.name))
-        self.assertFalse((Path(self.temp.name) / "custom_nodes/chouka_local_edit").exists())
-
-
-class DependencySyncLocalEditTests(unittest.TestCase):
-    @classmethod
-    def setUpClass(cls):
-        spec = importlib.util.spec_from_file_location("local_edit_dependency_sync", ROOT / "worker/sync_dependencies.py")
-        cls.dependencies = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(cls.dependencies)
-
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name) / "ComfyRoot"
-        (self.root / "custom_nodes").mkdir(parents=True)
-        (self.root / "main.py").write_text("# temporary Comfy fixture\n")
-        self.target = self.root / "custom_nodes/chouka_local_edit"
-
-    def test_package_installed_before_existing_checks_and_nodes_appended(self):
-        d = self.dependencies
-        versions = {}
-        expected_nodes = []
-        for name, spec in d.PLUGIN_DEPENDENCIES.items():
-            plugin = self.root / "custom_nodes" / name
-            plugin.mkdir()
-            (plugin / "__init__.py").write_text("# never imported\n")
-            versions.update(spec["packages"])
-            expected_nodes.extend(spec["nodes"])
-        original_registry = copy.deepcopy(d.PLUGIN_DEPENDENCIES)
-        def checked(command, deadline):
-            self.assertTrue((self.target / "__init__.py").is_file(), "copy must precede third-party checks")
-        with mock.patch.object(d, "run_checked", side_effect=checked) as run, \
-             mock.patch.object(d.importlib.metadata, "version", side_effect=versions.__getitem__):
-            result = d._install_and_check(self.root, 12345)
-        self.assertEqual(result, expected_nodes + list(NODE_CLASS_MAPPINGS))
-        self.assertEqual(tuple(NODE_CLASS_MAPPINGS), d.LOCAL_EDIT_NODES)
-        self.assertEqual(d.PLUGIN_DEPENDENCIES, original_registry)
-        self.assertEqual(run.call_count, 3)  # existing two import checks and GIMM CUDA probe, all mocked
-        self.assertFalse(any("pip" in call.args[0] for call in run.call_args_list))
-
-    def test_ensure_installs_inside_existing_lock_without_pip(self):
-        from contextlib import contextmanager
-        d = self.dependencies
-        active = []
-        @contextmanager
-        def locked(python, deadline):
-            active.append(True)
-            try:
-                yield
-            finally:
-                active.pop()
-        actual_install = d.install_local_edit_nodes
-        def installed(comfy_root):
-            self.assertEqual(active, [True])
-            return actual_install(comfy_root)
-        with mock.patch.object(d, "PLUGIN_DEPENDENCIES", {}), \
-             mock.patch.object(d, "dependency_lock", side_effect=locked), \
-             mock.patch.object(d, "install_local_edit_nodes", side_effect=installed), \
-             mock.patch.object(d, "run_checked") as run:
-            self.assertEqual(d.ensure_dependencies(self.root, deadline=12345), list(NODE_CLASS_MAPPINGS))
-            run.assert_not_called()
-        self.assertEqual(active, [])
-
-    def test_unfamiliar_or_edited_package_blocks_all_dependency_commands(self):
-        d = self.dependencies
-        self.target.mkdir()
-        initializer = self.target / "__init__.py"
-        initializer.write_text("# user plugin\n")
-        with mock.patch.object(d, "run_checked") as run, \
-             mock.patch.object(d.importlib.metadata, "version") as version:
-            with self.assertRaisesRegex(RuntimeError, "安装被拒绝"):
-                d._install_and_check(self.root, 12345)
-            self.assertEqual(initializer.read_text(), "# user plugin\n")
-            initializer.unlink()
-            d.install_local_edit_nodes(self.root)
-            initializer.write_text("# user edit\n")
-            before = {p.name: p.read_bytes() for p in self.target.iterdir()}
-            with self.assertRaisesRegex(RuntimeError, "locally modified"):
-                d._install_and_check(self.root, 12345)
-            self.assertEqual(before, {p.name: p.read_bytes() for p in self.target.iterdir()})
-            run.assert_not_called()
-            version.assert_not_called()
-
-    def test_isolated_python_can_resolve_installer_without_worker_on_sys_path(self):
-        import subprocess
-        source = (
-            "import importlib.util,sys,time; "
-            "s=importlib.util.spec_from_file_location('isolated_sync',sys.argv[1]); "
-            "d=importlib.util.module_from_spec(s); s.loader.exec_module(d); "
-            "d.PLUGIN_DEPENDENCIES={}; "
-            "n=d._install_and_check(sys.argv[2],time.time()+10); "
-            "assert tuple(n)==d.LOCAL_EDIT_NODES"
-        )
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", source,
-                                 str(ROOT / "worker/sync_dependencies.py"), str(self.root)],
-                                capture_output=True, timeout=30)
-        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", errors="replace"))
-        self.assertTrue((self.target / "cloud.py").is_file())
+    def test_expected_five_nodes_are_registered_from_deployed_package(self):
+        expected = {
+            "ChoukaLocalCrop": ChoukaLocalCrop,
+            "ChoukaLocalStitch": ChoukaLocalStitch,
+            "ChoukaCloudImageEdit": ChoukaCloudImageEdit,
+            "ChoukaLocalSaveImage": ChoukaLocalSaveImage,
+            "ChoukaLocalModelSwitch": ChoukaLocalModelSwitch,
+        }
+        self.assertEqual(NODE_CLASS_MAPPINGS, expected)
+        self.assertEqual(Path(local_edit.__file__).resolve(), NODE_DIR / "__init__.py")
+        for node in expected.values():
+            self.assertEqual(node.__module__, local_edit.__name__)
 
 
 if __name__ == "__main__":

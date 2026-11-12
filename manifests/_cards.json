@@ -208,17 +208,17 @@
    },
    {
     "id": "youku_sr_video",
-    "name": "参考图视频超分",
+    "name": "超分（视频）",
     "slots": "img3+aud0+vid1"
    },
    {
     "id": "image_color_match",
-    "name": "参考图校色（图片）",
+    "name": "自动校色（图片）",
     "slots": "img2+aud0+vid0"
    },
    {
     "id": "video_color_match",
-    "name": "参考图校色（视频）",
+    "name": "自动校色（视频）",
     "slots": "img1+aud0+vid1"
    },
    {
@@ -244,12 +244,12 @@
    },
    {
     "id": "color_grade",
-    "name": "图片调色",
+    "name": "调色（图片）",
     "slots": "img1+aud0+vid0"
    },
    {
     "id": "video_color_grade",
-    "name": "视频调色",
+    "name": "调色（视频）",
     "slots": "img0+aud0+vid1"
    },
    {

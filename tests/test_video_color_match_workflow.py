@@ -15,8 +15,8 @@ sys.path.insert(0, str(ROOT / "server"))
 import app
 import scan_workflows
 
-IMAGE_MODE = {"id": "image_color_match", "name": "参考图校色（图片）", "slots": "img2+aud0+vid0"}
-VIDEO_MODE = {"id": "video_color_match", "name": "参考图校色（视频）", "slots": "img1+aud0+vid1"}
+IMAGE_MODE = {"id": "image_color_match", "name": "自动校色（图片）", "slots": "img2+aud0+vid0"}
+VIDEO_MODE = {"id": "video_color_match", "name": "自动校色（视频）", "slots": "img1+aud0+vid1"}
 
 
 def capability(wid):
