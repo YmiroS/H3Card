@@ -1,8 +1,10 @@
 """Cloud relighting jobs, separate from ComfyUI scheduling and cancellation."""
 import asyncio
+import hashlib
 import json
 import math
 import os
+import re
 import time
 import uuid
 
@@ -10,7 +12,7 @@ import aiohttp
 from aiohttp import web
 
 from . import cloud_banana
-from . import cloud_images, provider_billing
+from . import cloud_images, local_relight, provider_billing
 
 
 def lighting_size(info, megapixels):
@@ -30,6 +32,150 @@ def lighting_size(info, megapixels):
     return f"{width}x{height}"
 
 
+# 云端编辑对单次请求同时卡总像素（65.5万–829万）和长宽比（≤3:1）。
+HEAD_MIN_PIXELS = 655_360
+HEAD_MAX_PIXELS = 8_294_400
+HEAD_MAX_RATIO = 3.0
+# 送图尺寸还要取 16 的倍数，留一档余量免得量化后又顶回 3:1 之外。
+HEAD_SAFE_RATIO = 2.7
+
+
+def head_crop_size(cw, ch, long_side=768):
+    """头肩特写的送图尺寸：只等比缩放（不拉伸、不单独拉长某一边凑像素），落进网关像素窗口。"""
+    scale = long_side / max(1, max(cw, ch))
+    pixels = cw * ch * scale * scale
+    if pixels < HEAD_MIN_PIXELS:
+        scale = math.sqrt(HEAD_MIN_PIXELS / max(1, cw * ch))
+    elif pixels > HEAD_MAX_PIXELS:
+        scale = math.sqrt(HEAD_MAX_PIXELS / max(1, cw * ch))
+    tw = th = 16
+    for _ in range(16):
+        tw = max(16, round(cw * scale / 16) * 16)
+        th = max(16, round(ch * scale / 16) * 16)
+        pixels = tw * th
+        if HEAD_MIN_PIXELS <= pixels <= HEAD_MAX_PIXELS:
+            return tw, th
+        scale *= 1.02 if pixels < HEAD_MIN_PIXELS else 0.98
+    return tw, th
+
+
+def head_box_safe(person_box, width, height, max_ratio=HEAD_SAFE_RATIO):
+    """头肩切片的长宽比必须落在网关 3:1 窗口内。
+
+    太扁就往放高、放不下再左右收窄；太高窄就先左右放宽（不越出画面）、放不下只留上部更矮的切片。
+    """
+    x0, y0, x1, y1 = person_box
+    box = local_relight.head_box(person_box)
+    if x1 <= x0 or y1 <= y0 or width <= 0 or height <= 0:
+        return box
+    left, top = x0 * width, y0 * height
+    right, bottom = x1 * width, box[3] * height
+    if right - left > max_ratio * (bottom - top):
+        bottom = top + min((right - left) / max_ratio, y1 * height - top)
+        center = (left + right) / 2
+        half = min((bottom - top) * max_ratio / 2, (right - left) / 2)
+        left, right = max(0.0, center - half), min(float(width), center + half)
+    elif bottom - top > max_ratio * (right - left):
+        center = (left + right) / 2
+        half = (bottom - top) / max_ratio / 2
+        widened = (min(float(width), center + half) - max(0.0, center - half))
+        left, right = max(0.0, center - half), min(float(width), center + half)
+        if widened < (bottom - top) / max_ratio:
+            bottom = top + (right - left) * max_ratio
+    return [left / width, top / height, right / width, bottom / height]
+
+
+def _valid_subject_point(value):
+    """点选对象回放的点击位置必须是 0–1 的两个有限数。"""
+    return (isinstance(value, (list, tuple)) and len(value) == 2
+            and all(isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 1
+                    for v in value))
+
+
+def _valid_mask_index(value):
+    """身份在索引层里的位号：1–255 的整数（0 固定是背景，bool 不算数字）。"""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and 1 <= value <= 255)
+
+
+def _manual_selection(local_manual, local_subjects):
+    """校验 params.local_manual，返回 (位图素材引用, 参与出图的身份 id)。
+
+    ids 是出图范围的唯一口径：勾了但没带位图编号的身份一律报错，
+    绝不静默少画一个人（和前端 slice(0,12) 静默丢弃是同一个毛病）。
+    """
+    layer = local_manual.get("layer")
+    if not isinstance(layer, str) or not layer.strip():
+        raise web.HTTPBadRequest(text="手工分割位图缺失，请在编辑器里保存后再出图")
+    ids = local_manual.get("ids")
+    if (not isinstance(ids, list) or not ids or len(ids) > 12
+            or not all(isinstance(sid, str) for sid in ids)):
+        raise web.HTTPBadRequest(text="手工分割的身份列表无效，请重新保存后再出图")
+    indexed = {subject.get("id"): subject for subject in local_subjects
+               if isinstance(subject, dict)}
+    missing = [sid for sid in ids if not _valid_mask_index(
+        (indexed.get(sid) or {}).get("mask_index"))]
+    if missing:
+        raise web.HTTPBadRequest(
+            text=f"手工身份 {'、'.join(missing[:3])} 没有对应的位图编号，请重新保存后再出图")
+    return layer, list(ids)
+
+
+def _fuse_tint_amount(value):
+    """色调回拉比例：0–1 之间取数，缺省用面板默认值；关掉（false）按 0 处理。"""
+    if value is False:
+        return 0.0
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return local_relight.TINT["amount"]
+    if not math.isfinite(value):
+        return local_relight.TINT["amount"]
+    return max(0.0, min(1.0, float(value)))
+
+
+def _tuned(value, low, high, default):
+    """面板上的可调档：非数字或 NaN 退回内置值，其余夹进允许范围。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return float(default)
+    if not math.isfinite(value):
+        return float(default)
+    return max(low, min(high, float(value)))
+
+
+def dump_intermediate(job, image, name):
+    """另存一份云端返回的原图，供离线扫档复用（同一张云端图，差异只来自档位）。
+
+    只在 CHOUKA_LOCAL_RELIT_DUMP 指向已存在目录时写，目录写错不会赔掉已计费的出图。
+    """
+    folder = os.environ.get("CHOUKA_LOCAL_RELIT_DUMP")
+    if not folder or not os.path.isdir(folder):
+        return
+    image.save(os.path.join(folder, f"{name}-{job['id']}.png"))
+
+
+# ---- 远端分区识别的送图尺寸与身份层缓存 ----
+# 大模型只出一张「每人一纯色」的分区图，反解成身份索引层之后可以复用：
+# 同图、同提示词、同聚类数、同层尺寸才算同一份分区，换一项就重新出图。
+PARTITION_SEND_MEGAPIXELS = 1_200_000 / (1024 * 1024)
+PARTITION_CACHE_DIR = "partition_cache"
+
+
+def partition_send_size(info):
+    """
+    分区请求的送图尺寸：直接套 `lighting_size`，别在这儿再抄一份网关口径。
+
+    云端编辑同时卡三件事——宽高必须是 16 的倍数、总像素有上下限、极端长宽比还会另算。
+    自己写一套取整漏掉「量化后仍超预算」那一步，退化尺寸就会把 400 元一次的请求
+    送到网关吃 400，而且这种失败发生在计费之前，用户只看到「识别失败」。
+    """
+    return lighting_size(info, PARTITION_SEND_MEGAPIXELS)
+
+
+def partition_layer_size(info):
+    """身份层尺寸：长边压到蒙版预览同一档（PREVIEW_SIDE），缓存和给前端的蒙版才不会分叉。"""
+    scale = min(1.0, local_relight.PREVIEW_SIDE / max(1, info["width"], info["height"]))
+    return (max(1, int(info["width"] * scale)), max(1, int(info["height"] * scale)))
+
+
 class CloudLighting:
     def __init__(self, app, *, root, comfy_http, jobs, save_jobs, require_project,
                  require_resource, require_user, resource_call, call_store):
@@ -44,6 +190,9 @@ class CloudLighting:
         self.resource_call = resource_call
         self.call_store = call_store
         self.tasks = {}
+        self.subject_jobs = {}
+        if os.environ.get("CHOUKA_REHEARSAL") == "1":
+            print("[抽卡系统] 局部打光演练模式：云端重打光用本地模拟，产物带 REHEARSAL 角标")
 
     async def record_cost(self, job, params=None, assets=None):
         ledger = self.app.get("costs")
@@ -111,6 +260,285 @@ class CloudLighting:
             raise
         return "chouka/" + name
 
+    SUBJECT_STEPS = ("排队", "读取原图", "模型推理", "聚合蒙版")
+
+    def _subjects_plan(self, body):
+        """校验识别请求，返回 (project_id, image, mode, min_area, box, point, target_kind)。
+
+        mode=local|remote|manual；target_kind=person|object 是编辑器里用户对目标类型的选择，
+        类型和识别方式正交：本地两路都认；大模型分区本轮只分人，物体框选直接拒并说明原因。
+        """
+        project_id, image = body.get("project"), body.get("image")
+        if not isinstance(image, str) or not image.strip():
+            raise web.HTTPBadRequest(text="识别对象需要一张画布内已登记的图片")
+        mode = body.get("mode", "local")
+        if mode not in ("local", "remote", "manual"):
+            raise web.HTTPBadRequest(text="识别方式只支持 local、remote 或 manual")
+        if mode == "remote" and not local_relight.available():
+            raise web.HTTPNotImplemented(
+                text="远端识别需要服务端具备本地分割兜底（实例分割权重或 rembg/onnxruntime）")
+        target_kind = body.get("target_kind")
+        if target_kind not in (None, "person", "object"):
+            raise web.HTTPBadRequest(text="目标类型只支持 person 或 object")
+        box = body.get("box")
+        if box is not None:
+            if (not isinstance(box, (list, tuple)) or len(box) != 4
+                    or not all(isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 1
+                               for v in box)
+                    or box[2] <= box[0] or box[3] <= box[1]):
+                raise web.HTTPBadRequest(text="补选框必须是 0–1 之间的有效矩形")
+            box = [float(v) for v in box]
+        if mode == "manual" and box is None:
+            raise web.HTTPBadRequest(text="手工通道要先框住目标：请在编辑器里框出区域后再提交")
+        if mode == "remote" and box is not None and target_kind == "object":
+            # 分区提示词只按人分色（§6：本轮不扩调色板），层里根本没有物体身份，
+            # 硬投票只会把框里的人当成物体还回来，不如直接说清楚。
+            raise web.HTTPBadRequest(
+                text="远端分区图只圈人物，认物体请切回本地模型识别")
+        point = body.get("point")
+        if point is not None:
+            if mode == "remote":
+                raise web.HTTPBadRequest(
+                    text="远端分区只按区域出身份，点选请用本地模型识别")
+            if (not isinstance(point, (list, tuple)) or len(point) != 2
+                    or not all(isinstance(v, (int, float)) and math.isfinite(v) and 0 <= v <= 1
+                               for v in point)):
+                raise web.HTTPBadRequest(text="点选位置必须是 0–1 之间的坐标")
+            point = [float(v) for v in point]
+        sensitivity = body.get("sensitivity")
+        min_area = local_relight.SENSITIVITY_MIN_AREA.get(
+            sensitivity, local_relight.MIN_PERSON_AREA_RATIO)
+        return project_id, image, mode, min_area, box, point, target_kind
+
+    def _subjects_candidates(self, data, mode, min_area, box, point, user, target_kind=None):
+        """按识别方式出候选：local 走分割模型；remote 走大模型颜色分区（演练模式用本地结果模拟）。"""
+        from io import BytesIO
+        from PIL import Image
+        picture = Image.open(BytesIO(data)).convert("RGB")
+        if mode in ("local", "manual"):
+            if point is not None:
+                seg = local_relight.segment_point(picture, point)
+                kind = target_kind or "person"
+                return [{"id": "c0", "kind": kind, "label": "点选人物" if kind == "person" else "点选物体",
+                         "mode": "point", "point": point, "box": seg["box"],
+                         "coverage": seg["coverage"],
+                         "mask": local_relight.mask_to_data_url(seg["mask"])}], "yolo" if local_relight.yolo_available() else "rembg"
+            if box is not None:
+                seg = local_relight.segment_box(picture, box)
+                # 手工通道（K6）拿粗分割当编辑器底稿；类型跟用户在编辑器里的选择走，不再写死人物。
+                kind = target_kind or ("person" if mode == "manual" else "object")
+                return [{"id": "m0", "kind": kind, "label": "框选人物" if kind == "person" else "框选物体",
+                         "mode": "box", "box": seg["box"], "coverage": seg["coverage"],
+                         "mask": local_relight.mask_to_data_url(seg["mask"])}], "yolo" if local_relight.yolo_available() else "rembg"
+            people = local_relight.segment_auto(picture, min_area_ratio=min_area)
+            return [{"id": f"p{index}", "kind": "person", "label": f"人物 {index}",
+                     "box": person["box"], "coverage": person["coverage"],
+                     "mask": local_relight.mask_to_data_url(person["mask"])}
+                    for index, person in enumerate(people, 1)], "yolo" if local_relight.yolo_available() else "rembg"
+        # remote 演练模式不调云端，用本地结果走一遍步骤；真实远端走 _subjects_remote（async）。
+        people = local_relight.segment_auto(picture, min_area_ratio=min_area)
+        return [{"id": f"p{index}", "kind": "person", "label": f"人物 {index}",
+                 "box": person["box"], "coverage": person["coverage"],
+                 "mask": local_relight.mask_to_data_url(person["mask"])}
+                for index, person in enumerate(people, 1)], "rehearsal"
+
+    def _remote_real(self, plan):
+        return plan[2] == "remote" and os.environ.get("CHOUKA_REHEARSAL") != "1"
+
+    def _partition_key(self, project_id, ref, data, size):
+        """缓存键：项目 + 图片来源 + 图片内容 + 提示词 + 聚类数 + 层尺寸，一项不同就不算同一份分区。"""
+        parts = [
+            project_id,
+            hashlib.sha256(f"{ref[0]}|{ref[1]}".encode("utf-8")).hexdigest()[:12],
+            hashlib.sha256(data).hexdigest()[:16],
+            "p" + hashlib.sha256(local_relight.PARTITION_PROMPT.encode("utf-8")).hexdigest()[:8],
+            f"k{local_relight.PARTITION_K}",
+            f"{size[0]}x{size[1]}",
+        ]
+        return "-".join(re.sub(r"[^0-9A-Za-z._-]", "_", str(part))[:48] for part in parts)
+
+    def _partition_read(self, key):
+        """读身份层缓存 → (记录, 是否完好)。读不出来就删条目并回报坏了，绝不拿半截分区当结果。"""
+        folder = self.root / "data" / PARTITION_CACHE_DIR
+        meta_path, png_path = folder / f"{key}.json", folder / f"{key}.png"
+        if not (meta_path.is_file() and png_path.is_file()):
+            return None, True
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            size = (int(meta["size"][0]), int(meta["size"][1]))
+            layer = local_relight.decode_identity_layer(png_path.read_bytes(), size)
+            entries = [entry for entry in meta["entries"] if int(entry["index"]) > 0]
+            if not entries or int(entries[-1]["index"]) > int(layer.max()):
+                raise ValueError("分区缓存与身份层对不上")
+            return {"layer": layer, "entries": entries}, True
+        except Exception:
+            for path in (meta_path, png_path):
+                path.unlink(missing_ok=True)
+            return None, False
+
+    def _partition_write(self, key, layer, entries, size):
+        folder = self.root / "data" / PARTITION_CACHE_DIR
+        folder.mkdir(parents=True, exist_ok=True)
+        payloads = (
+            (".json", json.dumps({"size": list(size), "entries": entries, "created": time.time()},
+                                 ensure_ascii=False).encode("utf-8")),
+            (".png", local_relight.encode_identity_layer(layer)),
+        )
+        for suffix, payload in payloads:
+            path = folder / f"{key}{suffix}"
+            temporary = path.with_suffix(path.suffix + ".part")
+            temporary.write_bytes(payload)
+            os.replace(temporary, path)
+
+    async def _partition_fetch(self, data, send_size, size, user):
+        """花 1 次云端出图换一张分区图并反解成身份层；一个人都没分出来算失败。"""
+        result = await cloud_images.edit(
+            self.app["session"], [data], local_relight.PARTITION_PROMPT,
+            size=send_size, quality="medium",
+            end_user_name=user["username"], end_user_phone=user.get("phone", ""))
+        if "image_bytes" not in result:
+            raise cloud_images.ImageEditError(
+                "云端已返回分区图链接，但未自动下载。请联系管理员确认，不要重复提交。",
+                request_id=result.get("request_id"))
+        from io import BytesIO
+        from PIL import Image
+        partition = Image.open(BytesIO(result["image_bytes"])).convert("RGB")
+        record = await asyncio.to_thread(
+            local_relight.partition_index_layer, partition, target_size=size,
+            min_area_ratio=local_relight.MIN_PERSON_AREA_RATIO)
+        if not record["entries"]:
+            raise cloud_images.ImageEditError(
+                "大模型没有分出人物色块，换一张图或改用本地模型识别。",
+                request_id=result.get("request_id"))
+        return record["layer"], record["entries"]
+
+    async def _partition_layer(self, project_id, ref, data, user):
+        """这张图的身份索引层：命中缓存免费复用，未命中（或缓存已失效）才出一次分区图。
+
+        返回 (层, 条目, 来源)，来源 cached/fresh/renewed 决定按钮文案——
+        renewed 表示「命中过但分区已失效」，这次仍然花了 1 次出图，不能说成免费。
+        """
+        info = cloud_images.inspect_image(data)
+        size = partition_layer_size(info)
+        key = self._partition_key(project_id, ref, data, size)
+        record, intact = await asyncio.to_thread(self._partition_read, key)
+        if record:
+            return record["layer"], record["entries"], "cached"
+        layer, entries = await self._partition_fetch(data, partition_send_size(info), size, user)
+        await asyncio.to_thread(self._partition_write, key, layer, entries, size)
+        return layer, entries, ("renewed" if not intact else "fresh")
+
+    def _layer_candidates(self, layer, entries):
+        """身份层 → 逐人候选：号就是候选号，同一张图两次识别拿到的编号不会变。"""
+        return [{"id": f"p{entry['index']}", "kind": "person", "label": f"人物 {entry['index']}",
+                 "box": entry["box"], "coverage": entry["coverage"],
+                 "mask": local_relight.mask_to_data_url(mask)}
+                for entry, mask in local_relight.layer_to_candidates(layer, entries)]
+
+    async def _subjects_remote(self, plan, ref, data, user):
+        """远端识别：整图按身份层出候选，带框只在层里做框内投票。返回 (候选, 引擎, 分区来源, 说明)。"""
+        layer, entries, freshness = await self._partition_layer(plan[0], ref, data, user)
+        # 命中过但读不出来的分区不回退旧结果，直接重出并在说明里写清这次仍然计了 1 次。
+        note = ("之前的分区结果已失效，本次重新出了分区图（1 次）。" if freshness == "renewed" else None)
+        if plan[4] is None:
+            candidates = await asyncio.to_thread(self._layer_candidates, layer, entries)
+            return candidates, "cloud", freshness, note
+        vote = await asyncio.to_thread(local_relight.region_index_vote, layer, plan[4])
+        if vote["status"] != "ok":
+            return [], "cloud", freshness, vote["message"]
+        return [{"id": f"p{vote['index']}", "kind": "person",
+                 "label": f"人物 {vote['index']}", "box": vote["box"],
+                 "coverage": vote["coverage"],
+                 "mask": local_relight.mask_to_data_url(vote["mask"])}], "cloud", freshness, note
+
+    def _subjects_work(self, plan, data, user):
+        return self._subjects_candidates(data, plan[2], plan[3], plan[4], plan[5], user,
+                                         target_kind=plan[6])
+
+    async def subjects(self, request, body):
+        """识别局部打光候选：整图抠人，或按框抠一个物体。缺分割模型回 501。"""
+        if not local_relight.available():
+            raise web.HTTPNotImplemented(
+                text="局部打光识别还没接入：服务端缺少分割模型（实例分割权重或 rembg/onnxruntime）")
+        plan = self._subjects_plan(body)
+        user = self.require_user(request)
+        data, ref, _info = await self.source(request, plan[0], plan[1])
+        if self._remote_real(plan):
+            candidates, engine, partition, note = await self._subjects_remote(plan, ref, data, user)
+        else:
+            candidates, engine = await asyncio.to_thread(self._subjects_work, plan, data, user)
+            partition = note = None
+        return web.json_response({"candidates": candidates, "engine": engine,
+                                  "partition": partition, "note": note})
+
+    def _subjects_signature(self, plan):
+        """同图 + 同识别方式 + 同灵敏度 + 同框/同点 = 同一个识别请求：连点只留一个任务。"""
+        return json.dumps([plan[0], plan[1], plan[2], plan[3], plan[4], plan[5]],
+                          sort_keys=True, ensure_ascii=False)
+
+    async def start_subjects_job(self, request, body):
+        """异步识别：建 job 立即返回，步骤进度走 GET 状态端点（本地秒过、远端逐步可见）。"""
+        plan = self._subjects_plan(body)
+        user = self.require_user(request)
+        data, ref, _info = await self.source(request, plan[0], plan[1])
+        now = time.time()
+        for job_id, old in list(self.subject_jobs.items()):
+            if now - old.get("created", now) > 3600:
+                self.subject_jobs.pop(job_id, None)
+        signature = self._subjects_signature(plan)
+        for old in self.subject_jobs.values():
+            # 防连点：同一个请求还在跑就复用任务号，不再排第二遍队（远端一次就是一笔计费）。
+            if old.get("signature") == signature and old["status"] == "running":
+                return web.json_response({"job_id": old["id"], "steps": list(self.SUBJECT_STEPS),
+                                          "reused": True})
+        job_id = uuid.uuid4().hex[:12]
+        job = {"id": job_id, "project": plan[0], "mode": plan[2], "status": "running",
+               "step": 0, "candidates": None, "engine": None, "error": None,
+               "partition": None, "note": None, "signature": signature, "created": now}
+        self.subject_jobs[job_id] = job
+        task = asyncio.create_task(self._run_subjects_job(job, plan, ref, data, user))
+        self.tasks[job_id] = task
+        task.add_done_callback(lambda done: self.tasks.pop(job_id, None))
+        return web.json_response({"job_id": job_id, "steps": list(self.SUBJECT_STEPS)})
+
+    async def _run_subjects_job(self, job, plan, ref, data, user):
+        try:
+            await asyncio.sleep(0.12)  # 让步骤条有机会画出第一步
+            job["step"] = 1  # 读取原图在创建 job 前已完成
+            job["step"] = 2  # 模型推理
+            if job["mode"] == "remote" and os.environ.get("CHOUKA_REHEARSAL") == "1":
+                await asyncio.sleep(1.0)  # 演练模式模拟大模型推理耗时，步骤条可感知
+            if self._remote_real(plan):
+                candidates, engine, partition, note = await self._subjects_remote(plan, ref, data, user)
+            else:
+                candidates, engine = await asyncio.to_thread(self._subjects_work, plan, data, user)
+                partition = note = None
+            job["step"] = 3
+            job.update(status="done", candidates=candidates, engine=engine,
+                       partition=partition, note=note)
+        except cloud_images.ImageEditError as error:
+            # 计费状态未知时不能让用户一键重试：重试等于再花一次，先联系管理员确认。
+            job.update(status="failed", error=str(error), retryable=not error.generation_unknown,
+                       generation_unknown=error.generation_unknown)
+        except Exception:
+            job.update(status="failed", error="识别失败，请重试或改用本地模型", retryable=True)
+        finally:
+            job["ended"] = time.time()
+
+    def subjects_job(self, request):
+        job_id = request.match_info["jid"]
+        job = self.subject_jobs.get(job_id)
+        if job is None:
+            raise web.HTTPNotFound(text="识别任务不存在或已过期")
+        return web.json_response({
+            "status": job["status"], "step": job["step"],
+            "steps": list(self.SUBJECT_STEPS), "mode": job["mode"],
+            "engine": job["engine"], "error": job["error"],
+            "candidates": job["candidates"], "partition": job.get("partition"),
+            "note": job.get("note"), "retryable": job.get("retryable", True),
+            "generation_unknown": bool(job.get("generation_unknown")),
+        })
+
     async def submit(self, request, body, cap):
         params, assets = body.get("params") or {}, body.get("assets") or {}
         if (not isinstance(params, dict) or not isinstance(assets, dict)
@@ -120,12 +548,51 @@ class CloudLighting:
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
             raise web.HTTPBadRequest(text="多灯布光提示词不能为空，且不得超过 20000 字符")
         reference_mode = params.get("reference_mode", "analyze")
-        if reference_mode not in ("analyze", "direct"):
-            raise web.HTTPBadRequest(text="参考图方式只支持 analyze 或 direct")
+        if reference_mode not in ("analyze", "direct", "local", "geometry"):
+            raise web.HTTPBadRequest(
+                text="参考图方式只支持 analyze、direct、local 或 geometry")
         reference_image = params.get("reference_image")
         if reference_mode == "direct" and (
                 not isinstance(reference_image, str) or not reference_image.strip()):
             raise web.HTTPBadRequest(text="双图直传缺少参考图，请重新选择参考图后再试")
+        geometry_png = params.get("geometry_png")
+        if reference_mode == "geometry" and (
+                not isinstance(geometry_png, str) or not geometry_png.strip()):
+            raise web.HTTPBadRequest(text="3D 布光缺少白模截图，请先在工作台里确认应用后再出图")
+        local_subjects = params.get("local_subjects") or []
+        local_mask = params.get("local_mask")
+        local_manual = params.get("local_manual")
+        if reference_mode == "local":
+            if not isinstance(local_subjects, list) or len(local_subjects) > 12:
+                raise web.HTTPBadRequest(text="局部打光对象列表无效")
+            for subject in local_subjects:
+                if (not isinstance(subject, dict) or not isinstance(subject.get("id"), str)
+                        or subject.get("kind") not in ("person", "object")
+                        or not isinstance(subject.get("box"), (list, tuple))
+                        or len(subject["box"]) != 4):
+                    raise web.HTTPBadRequest(text="局部打光对象缺少有效的 ID、类型或包围盒")
+                if subject.get("mode") not in (None, "point", "box"):
+                    raise web.HTTPBadRequest(text="局部打光对象的选取方式无效，请重新点选或框选")
+                if subject.get("mode") == "point" and not _valid_subject_point(subject.get("point")):
+                    raise web.HTTPBadRequest(text="点选对象缺少有效的点击位置，请重新点选")
+            if local_mask is not None and (not isinstance(local_mask, str) or not local_mask.strip()):
+                raise web.HTTPBadRequest(text="局部打光蒙版地址无效")
+            manual_layer = None
+            manual_ids = []
+            if local_manual is not None:
+                # 两条通道语义重叠且互不相容：静默「谁优先」正是旧现状的病灶，这里直接报 400。
+                if local_mask:
+                    raise web.HTTPBadRequest(
+                        text="上传蒙版与手工分割位图不能同时生效，请在面板里二选一")
+                if not isinstance(local_manual, dict):
+                    raise web.HTTPBadRequest(text="手工分割参数无效，请重新保存后再出图")
+                manual_layer, manual_ids = _manual_selection(local_manual, local_subjects)
+            if not local_mask and not manual_layer and not local_subjects:
+                raise web.HTTPBadRequest(text="局部打光还没选对象，请先识别人物或手动补选后再出图")
+            if params.get("local_strength", "standard") not in ("conservative", "standard", "strong"):
+                raise web.HTTPBadRequest(text="局部打光强度档位无效")
+            if params.get("local_edge", "soft") not in ("soft", "tight"):
+                raise web.HTTPBadRequest(text="局部打光边缘过渡无效")
         provider = params.get("image_provider", "gpt_image")
         if provider not in ("gpt_image", "banana"):
             raise web.HTTPBadRequest(text="出图模型只支持 gpt_image 或 banana")
@@ -140,25 +607,81 @@ class CloudLighting:
         if reference_mode == "direct":
             # 参考图按项目素材登记后通过同一套权限校验，不信任前端给的任意地址。
             reference = await self.source(request, project_id, reference_image)
+        elif reference_mode == "geometry":
+            # 图2 换成工作台导出的白模截图，取图和权限走同一套。
+            reference = await self.source(request, project_id, geometry_png)
         megapixels = params.get("megapixels", 1.5)
         size = lighting_size(info, megapixels)
         if body.get("dry_run"):
             return {"dry_run": True, "execution": "cloud_image", "changed": {},
                     "prompt": prompt.strip(), "provider": provider,
                     "size": None if provider == "banana" else size}
-        config = (cloud_banana.load() if provider == "banana"
+        # 演练模式不调云端，提交也不需要云端出图配置。
+        rehearsal_submit = os.environ.get("CHOUKA_REHEARSAL") == "1"
+        config = ({"model": "rehearsal（演练）"} if rehearsal_submit
+                  else cloud_banana.load() if provider == "banana"
                   else cloud_images.load())
         await self.require_project(request, project_id, operate=True)
         input_ref = await self.snapshot_input(project_id, ref, data, info)
         reference_ref = (await self.snapshot_input(project_id, reference[1], reference[0],
                                                    reference[2])) if reference else None
+        local = None
+        mask_ref = None
+        mask_input_ref = None
+        manual_ref = None
+        manual_input_ref = None
+        if reference_mode == "local":
+            mask_data = None
+            manual_data = None
+            if local_mask:
+                mask_data, mask_ref, mask_info = await self.source(request, project_id, local_mask)
+                mask_input_ref = await self.snapshot_input(project_id, mask_ref, mask_data, mask_info)
+            if manual_layer:
+                # 手工位图和其它输入走同一套登记+授权，否则出图权限过不了。
+                manual_data, manual_ref, manual_info = await self.source(
+                    request, project_id, manual_layer)
+                manual_input_ref = await self.snapshot_input(
+                    project_id, manual_ref, manual_data, manual_info)
+            # 局部打光只认自己的灯位。没灯位 = 沿用原图光，此时脚下压暗不挑方向；
+            # 也不退回灯位打光页那套共享灯：借来的方位只会造出一个原图没有的坡向。
+            local_lights = params.get("local_lights") or []
+            if not isinstance(local_lights, list):
+                local_lights = []
+            key_azimuth = None
+            candidates = [light for light in local_lights if isinstance(light, dict)]
+            if candidates:
+                key = max(candidates, key=lambda light: light.get("intensity", 0) or 0)
+                if isinstance(key.get("azimuth"), (int, float)):
+                    key_azimuth = float(key["azimuth"])
+            local = {"subjects": local_subjects, "mask_data": mask_data,
+                     "manual_layer": manual_data, "manual_ids": manual_ids,
+                     "head_fill": params.get("local_head_fill", True) is not False,
+                     "grounding": params.get("local_grounding", True) is not False,
+                     "face_guard": params.get("local_face_guard", True) is not False,
+                     "fuse_tint": _fuse_tint_amount(params.get("local_fuse_tint")),
+                     "edge_falloff": _tuned(params.get("local_edge_falloff"), 2.0, 14.0,
+                                            local_relight.EDGE_FALLOFF),
+                     "guard_area": _tuned(params.get("local_guard_area"), 0.25, 0.55,
+                                          local_relight.FACE_GUARD["ratio"]),
+                     "guard_sigma": _tuned(params.get("local_guard_sigma"), 0.10, 0.40,
+                                           local_relight.FACE_GUARD["sigma_frac"]),
+                     "shadow_strength": _tuned(params.get("local_shadow_strength"), 0.0, 1.0,
+                                               local_relight.SHADOW["strength"]),
+                     "pool_strength": _tuned(params.get("local_pool_strength"), 0.0, 0.60,
+                                             local_relight.POOL["strength"]),
+                     "edge": params.get("local_edge", "soft"), "key_azimuth": key_azimuth}
         user = self.require_user(request)
         end_user_name, end_user_phone = user["username"], user["phone"]
         pid, user_id = str(uuid.uuid4()), user["id"]
         await self.call_store(self.app, "register_job", pid, project_id, user_id)
         inputs = {"images[0]": input_ref}
         if reference_ref:
-            inputs["reference_image"] = reference_ref
+            key = "geometry_png" if reference_mode == "geometry" else "reference_image"
+            inputs[key] = reference_ref
+        if mask_input_ref:
+            inputs["local_mask"] = mask_input_ref
+        if manual_input_ref:
+            inputs["local_manual_layer"] = manual_input_ref
         await self.resource_call(self.app, "register_job_inputs", pid, inputs)
         model_metadata = provider_billing.normalize({}, config["banana_model" if provider == "banana" else "model"], config)
         job = {"id": pid, "capability": cap["id"], "name": cap["name"],
@@ -180,9 +703,13 @@ class CloudLighting:
         self.save_jobs()
         images = [data] if reference is None else [data, reference[0]]
         refs = [ref] if reference is None else [ref, reference[1]]
+        if mask_ref:
+            refs.append(mask_ref)
+        if manual_ref:
+            refs.append(manual_ref)
         task = asyncio.create_task(
             self.run(job, user_id, images, refs, size, prompt.strip(), provider,
-                     end_user_name=end_user_name, end_user_phone=end_user_phone))
+                     end_user_name=end_user_name, end_user_phone=end_user_phone, local=local))
         self.tasks[pid] = task
         task.add_done_callback(lambda finished: self.tasks.pop(pid, None))
         return dict(job)
@@ -198,7 +725,7 @@ class CloudLighting:
             await self.authorize(user_id, project_id, ref)
 
     async def run(self, job, user_id, images, refs, size, prompt, provider="gpt_image", *,
-                  end_user_name, end_user_phone):
+                  end_user_name, end_user_phone, local=None):
         path = temporary = None
         try:
             await self.authorize_all(user_id, job["project"], refs)
@@ -209,7 +736,11 @@ class CloudLighting:
             async def on_metadata(metadata):
                 await self.capture_metadata(job, metadata)
 
-            if provider == "banana":
+            if local is not None:
+                result = await self._run_local(
+                    job, images, size, prompt, provider, local,
+                    end_user_name=end_user_name, end_user_phone=end_user_phone)
+            elif provider == "banana":
                 result = await cloud_banana.generate(self.app["session"], images, prompt,
                                                      end_user_name=end_user_name, end_user_phone=end_user_phone,
                                                      on_metadata=on_metadata)
@@ -262,6 +793,165 @@ class CloudLighting:
                 self.save_jobs()
             finally:
                 await self.record_cost(job)
+
+    async def _run_local(self, job, images, size, prompt, provider, local, *,
+                         end_user_name, end_user_phone):
+        """局部打光：识别蒙版 → 整图云端重打光 1 次 → 蒙版内回贴 → 接地 → 头肩补光。
+
+        环境不变的保证来自回贴（只搬蒙版内像素），不依赖模型自觉；
+        接地是唯一会动到对象外脚下地面的步骤，可关；头肩只对选中人物另调 1 次。
+        """
+        from io import BytesIO
+        from PIL import Image
+
+        np = local_relight._imports()[1]
+        width, height = (int(v) for v in size.split("x"))
+        base_img = Image.open(BytesIO(images[0])).convert("RGB").resize((width, height), Image.LANCZOS)
+        base_arr = np.asarray(base_img, np.float32)
+        # 演练模式：整条链路跑真代码，只有云端重打光用本地提亮模拟，成品带 REHEARSAL 角标。
+        rehearsal = os.environ.get("CHOUKA_REHEARSAL") == "1"
+
+        job.update(step="识别打光范围", progress=0.1)
+        self.save_jobs()
+        person_boxes = []
+        if local["mask_data"]:
+            mask = await asyncio.to_thread(local_relight.decode_mask, local["mask_data"], (width, height))
+            person_mask = np.zeros((height, width), np.float32)
+        else:
+            subjects = local["subjects"]
+            # 位图里已经存了身份的对象一律短路回放：绝不再跑分割，
+            # 否则手工涂抹的成果会被模型重新切一版直接冲掉（P0-3）。
+            manual_ids = set(local.get("manual_ids") or [])
+            layer = None
+            if manual_ids:
+                layer = await asyncio.to_thread(local_relight.decode_identity_layer,
+                                                local["manual_layer"], (width, height))
+            pending = [subject for subject in subjects if subject["id"] not in manual_ids]
+            people = (await asyncio.to_thread(local_relight.segment_auto, base_img)
+                      if pending else [])
+            found_ids = [f"p{index}" for index in range(1, len(people) + 1)]
+            missing = [s["id"] for s in pending
+                       if s.get("source") == "auto" and s.get("kind") == "person"
+                       and s["id"] not in found_ids]
+            if missing:
+                raise web.HTTPBadRequest(text="人物候选已变化，请回到面板重新识别后再出图")
+            masks, person_masks = [], []
+            for subject in subjects:
+                if subject["id"] in manual_ids:
+                    picked = (layer == subject["mask_index"]).astype(np.float32)
+                    if not picked.any():
+                        raise web.HTTPBadRequest(
+                            text=f"手工身份 {subject['id']} 在位图里已经空了，"
+                                 "请在编辑器里补上后再出图")
+                    masks.append(picked)
+                    if subject.get("kind") == "person":
+                        person_masks.append(picked)
+                        person_boxes.append(subject["box"])
+                elif subject.get("source") == "manual":
+                    # 按当初的选取方式回放：点选必须重跑点选分割，用包围盒框选会把精细蒙版退化成一大块。
+                    if subject.get("mode") == "point" and _valid_subject_point(subject.get("point")):
+                        seg = await asyncio.to_thread(local_relight.segment_point,
+                                                      base_img, subject["point"])
+                    else:
+                        seg = await asyncio.to_thread(local_relight.segment_box,
+                                                      base_img, subject["box"])
+                    masks.append(seg["mask"])
+                    if subject.get("kind") == "person":
+                        person_masks.append(seg["mask"])
+                        person_boxes.append(seg["box"])
+                elif subject.get("kind") == "person":
+                    person = people[found_ids.index(subject["id"])]
+                    small = Image.fromarray((np.clip(person["mask"], 0, 1) * 255).astype("uint8"), "L")
+                    full = np.asarray(small.resize((width, height), Image.LANCZOS), np.float32) / 255.0
+                    masks.append(full)
+                    person_masks.append(full)
+                    person_boxes.append(person["box"])
+            mask = local_relight.union_mask(masks, (height, width))
+            person_mask = local_relight.union_mask(person_masks, (height, width))
+
+        job.update(step="云端重打光", progress=0.3)
+        self.save_jobs()
+        if rehearsal:
+            relit_lit = await asyncio.to_thread(local_relight.rehearsal_relit, base_img)
+            result = {"request_id": "rehearsal-local", "model": "rehearsal（演练）",
+                      "image_bytes": local_relight.encode_png(np.asarray(relit_lit))}
+        elif provider == "banana":
+            result = await cloud_banana.generate(self.app["session"], [images[0]], prompt,
+                                                 end_user_name=end_user_name, end_user_phone=end_user_phone)
+        else:
+            result = await cloud_images.edit(self.app["session"], [images[0]], prompt, size=size,
+                                             end_user_name=end_user_name, end_user_phone=end_user_phone)
+        if "image_bytes" not in result:
+            raise cloud_images.ImageEditError(
+                "云端已返回图片链接，但未自动下载。请联系管理员确认结果，不要重复生成。",
+                request_id=result["request_id"])
+        relit_img = Image.open(BytesIO(result["image_bytes"])).convert("RGB").resize(
+            (width, height), Image.LANCZOS)
+        dump_intermediate(job, relit_img, "cloud-relit")
+
+        job.update(step="软过渡回贴", progress=0.7)
+        self.save_jobs()
+        out = await asyncio.to_thread(local_relight.composite, base_arr,
+                                      np.asarray(relit_img, np.float32), mask, local["edge"],
+                                      falloff=local["edge_falloff"])
+
+        if local["grounding"] and person_boxes:
+            job.update(step="接地阴影", progress=0.8)
+            self.save_jobs()
+            out = await asyncio.to_thread(local_relight.grounding, out, base_arr, person_mask,
+                                          local["key_azimuth"],
+                                          shadow_strength=local["shadow_strength"],
+                                          pool_strength=local["pool_strength"])
+
+        if local["head_fill"] and person_boxes:
+            job.update(step="头肩补光", progress=0.85)
+            self.save_jobs()
+            primary = max(person_boxes, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+            hbox = head_box_safe(primary, width, height)
+            px = (int(hbox[0] * width), int(hbox[1] * height),
+                  int(hbox[2] * width), int(hbox[3] * height))
+            crop = base_img.crop(px)
+            tw, th = head_crop_size(crop.size[0], crop.size[1])
+            head_input = local_relight.encode_png(np.asarray(crop.resize((tw, th), Image.LANCZOS)))
+            head_prompt = (prompt + "\n这是头肩特写，只调整光照，保持身份、发丝与甲片细节不变。")[:20000]
+            if rehearsal:
+                head_lit = await asyncio.to_thread(local_relight.rehearsal_relit, crop)
+                head_result = {"request_id": "rehearsal-head",
+                               "image_bytes": local_relight.encode_png(np.asarray(head_lit))}
+            elif provider == "banana":
+                head_result = await cloud_banana.generate(
+                    self.app["session"], [head_input], head_prompt,
+                    end_user_name=end_user_name, end_user_phone=end_user_phone)
+            else:
+                head_result = await cloud_images.edit(
+                    self.app["session"], [head_input], head_prompt, size=f"{tw}x{th}",
+                    end_user_name=end_user_name, end_user_phone=end_user_phone)
+            if "image_bytes" in head_result:
+                model_crop = Image.open(BytesIO(head_result["image_bytes"])).convert("RGB")
+                dump_intermediate(job, model_crop, "cloud-head")
+                weight = local_relight.head_weight(person_mask, hbox, (height, width))
+                out = await asyncio.to_thread(local_relight.blend_head, out, model_crop, hbox, weight)
+
+        if local["face_guard"] and person_boxes:
+            job.update(step="脸部保形", progress=0.9)
+            self.save_jobs()
+            out = await asyncio.to_thread(local_relight.face_guard, base_arr, out,
+                                          person_mask, person_boxes,
+                                          head_ratio=local["guard_area"],
+                                          sigma_frac=local["guard_sigma"])
+
+        if local["fuse_tint"] > 0 and person_boxes:
+            job.update(step="色调回拉", progress=0.95)
+            self.save_jobs()
+            out = await asyncio.to_thread(local_relight.tint_match, out,
+                                          person_mask, local["fuse_tint"])
+
+        if rehearsal:
+            out = await asyncio.to_thread(local_relight.rehearsal_mark, out)
+        final_bytes = local_relight.encode_png(out)
+        info = cloud_images.inspect_image(final_bytes)
+        return {**result, "image_bytes": final_bytes, "extension": ".png",
+                "width": info["width"], "height": info["height"]}
 
     async def close(self):
         tasks = list(self.tasks.values())

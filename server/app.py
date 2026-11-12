@@ -1555,6 +1555,20 @@ async def generation_assets(request, assets, project_id=None, capability_id=None
     return {key: resolved.get(ref, ref) for key, ref in assets.items()}
 
 
+async def api_lighting_subjects(request):
+    body = await authorized_body(request)
+    return await request.app["cloud_lighting"].subjects(request, body)
+
+
+async def api_lighting_subjects_job(request):
+    body = await authorized_body(request)
+    return await request.app["cloud_lighting"].start_subjects_job(request, body)
+
+
+async def api_lighting_subjects_job_status(request):
+    return request.app["cloud_lighting"].subjects_job(request)
+
+
 async def api_generate(request):
     try:
         return await _api_generate(request)
@@ -4666,7 +4680,10 @@ def make_app(auth_path=None, *, project_repository=None):
         api_text=api_text, api_jobs=api_jobs, api_jobs_history=api_jobs_history,
         api_jobs_clear=api_jobs_clear,
         api_job=api_job, api_job_inputs=api_job_inputs,
-        api_cancel=api_cancel, api_job_delete=api_job_delete)
+        api_cancel=api_cancel, api_job_delete=api_job_delete,
+        api_lighting_subjects=api_lighting_subjects,
+        api_lighting_subjects_job=api_lighting_subjects_job,
+        api_lighting_subjects_job_status=api_lighting_subjects_job_status)
     register_media_routes(
         app, api_upload=api_upload, api_preview_file=api_preview_file,
         api_preview_status=api_preview_status, api_thumbnail=api_thumbnail,

@@ -1,6 +1,9 @@
 # 运行时数据（可再生 / 用户产物），不入库
 data/
 
+# 分割模型权重（人工预置；CHOUKA_SEG_MODELS 可改指向）
+server/models/
+
 # 改写用的 API key。模板 llm.json.例子 要入库，填好的这份绝不能
 /llm.json
 /image-edit.json
