@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
-from . import cloud_images
+from . import cloud_images, provider_billing
 
 # 实测单次响应 4–11 MB（两张候选图 base64 内嵌在 content 里），上限留约 3 倍余量。
 MAX_RESPONSE_BYTES = 32 * 1024 * 1024
@@ -87,7 +87,7 @@ def extract_image(text, request_id):
 
 
 async def generate(session, images, prompt, *, end_user_name, end_user_phone, text_only=False,
-                   output_size=None):
+                   output_size=None, on_metadata=None):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise BananaError("生图提示词不能为空，且不得超过 20000 字符", status=400)
@@ -113,11 +113,17 @@ async def generate(session, images, prompt, *, end_user_name, end_user_phone, te
                 allow_redirects=False, proxy=None,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10,
                                               sock_read=config["banana_timeout_seconds"])) as response:
-            request_id = response.headers.get("X-Request-ID", "")[:200] or None
+            request_id = response.headers.get("X-Request-ID", "")
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)
+                    or config["api_key"] in request_id):
+                request_id = None
             if not 200 <= response.status < 300:
                 detail = "无可用结构化错误详情"
                 try:
-                    payload = json.loads(await cloud_images.read_limited(response, 16 * 1024))
+                    payload = provider_billing.loads(await cloud_images.read_limited(response, 16 * 1024))
+                    if on_metadata:
+                        await on_metadata({**provider_billing.normalize(payload, config["banana_model"], config),
+                                           "request_id": request_id})
                     error = payload.get("error", payload.get("detail", payload.get("message"))) if isinstance(payload, dict) else None
                     if isinstance(error, dict):
                         error = "; ".join(f"{key}={error[key]}" for key in ("message", "type", "param", "code")
@@ -145,11 +151,17 @@ async def generate(session, images, prompt, *, end_user_name, end_user_phone, te
         raise BananaError("请求未完成，生成状态可能未知。不要自动重试，请联系管理员确认。",
                           status=504, request_id=request_id, generation_unknown=True)
     try:
-        payload = json.loads(raw)
+        payload = provider_billing.loads(raw)
+    except (ValueError, UnicodeError):
+        raise BananaError("云端 Banana 响应格式无效，请联系管理员确认，不要自动重试", request_id=request_id)
+    metadata = {**provider_billing.normalize(payload, config["banana_model"], config), "request_id": request_id}
+    if on_metadata:
+        await on_metadata(metadata)
+    try:
         content = payload["choices"][0]["message"]["content"]
         if not isinstance(content, str):
             raise ValueError()
     except (ValueError, UnicodeError, KeyError, IndexError, TypeError):
         raise BananaError("云端 Banana 响应格式无效，请联系管理员确认，不要自动重试", request_id=request_id)
     result = await asyncio.to_thread(extract_image, content, request_id)
-    return {"request_id": request_id, "model": config["banana_model"], **result}
+    return {**result, **metadata}
