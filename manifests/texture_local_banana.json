@@ -14,7 +14,7 @@
   "graph": "graphs/texture_local_edit.api.json",
   "output": {"node": "99"},
   "rewrite": null,
-  "note": "仅供编辑器，通过普通Comfy工作流分发。图1原图，图2独立黑白mask PNG（白=修改、黑=保护），图3可选材质参考。megapixels控制局部正方形生成预算：按32对齐、512–2048，裁片等比补边；feather单位为原图像素。只保存原尺寸最终整图，Banana更高分辨率返回必须保持画布宽高比。共用texture_local_edit完整工作流，#80惰性模型开关由服务端选择banana，仅执行Banana分支，不裁剪节点。Cloud节点固定#30（GPT）/#31（Banana）；仅向#31注入callback_url及每任务不同的短期单次callback_token，票据绑定banana及prompt；未选分支保持无票据。完整图预检仍要求所有节点类型和模型配置有效。节点仅发送image/reference，服务端决定provider/prompt；不接收云API key。Comfy进程须显式配置CHOUKA_LOCAL_EDIT_TRUSTED_ORIGINS（逗号分隔可信origin），回调固定/agent/v1/local-edit/cloud，不重定向或重试。回调丢失不得自动重试。未调用付费模型。",
+  "note": "仅供编辑器，通过普通Comfy工作流分发。图1原图，图2独立黑白mask PNG（白=修改、黑=保护），图3可选材质参考。megapixels控制局部正方形生成预算：按32对齐、512–2048，裁片等比补边；feather单位为原图像素。只保存原尺寸最终整图，Banana更高分辨率返回必须保持画布宽高比。共用texture_local_edit完整工作流，#80惰性模型开关由服务端选择banana，仅执行Banana分支，不裁剪节点。Cloud节点固定#30（GPT）/#31（Banana）；仅向#31注入callback_url及每任务不同的短期单次callback_token，票据绑定banana及prompt；未选分支保持无票据。完整图预检仍要求所有节点类型和模型配置有效。节点仅发送image/reference，服务端决定provider/prompt；不接收云API key。回调地址与单次票据由控制端随任务下发，不读取Worker配置或要求本机origin白名单；仅允许HTTP(S)及固定/agent/v1/local-edit/cloud路径，不重定向或重试。回调丢失不得自动重试。未调用付费模型。",
   "inputs": [
     {"key": "images[0]", "label": "原图", "type": "image", "required": true, "target": {"node": "1", "input": "image", "kind": "upload_image"}},
     {"key": "images[1]", "label": "独立蒙版 PNG（白=修改）", "type": "image", "required": true, "target": {"node": "2", "input": "image", "kind": "upload_image"}},
