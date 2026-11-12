@@ -1,13 +1,16 @@
 """认证聊天入口；请求级费用与项目归属只由服务端校验。"""
 import asyncio
+import base64
+import binascii
 import json
 import logging
+import re
 import time
 import uuid
 
 from aiohttp import web
 
-from . import cloud_chat, provider_billing
+from . import cloud_chat, cloud_images, provider_billing
 from .auth import require_project, require_user
 from .project_repository import InvalidProjectId
 
@@ -114,5 +117,63 @@ async def completions(request):
         return web.json_response(error.response(), status=error.status)
 
 
+async def image_edits(request):
+    user = require_user(request)
+    try:
+        if request.content_type != "application/json":
+            raise cloud_images.ImageEditError("请求必须为 JSON 对象", status=400)
+        raw = bytearray()
+        async for chunk in request.content.iter_chunked(65536):
+            raw.extend(chunk)
+            if len(raw) > cloud_chat.MAX_REQUEST_BYTES:
+                raise cloud_images.ImageEditError("图片编辑请求不得超过 24 MiB", status=413)
+        try:
+            body = json.loads(raw)
+        except (ValueError, UnicodeError):
+            raise cloud_images.ImageEditError("请求必须为有效 JSON 对象", status=400)
+        image, prompt = validate_image_edit(body)
+        result = await cloud_images.edit(request.app["session"], [image], prompt,
+                                         end_user_name=user["username"], end_user_phone=user["phone"])
+        return web.json_response(serialize_image_edit(result))
+    except cloud_images.ImageEditError as error:
+        return web.json_response(error.response(), status=error.status)
+
+
+def validate_image_edit(body):
+    if not isinstance(body, dict) or set(body) != {"image", "prompt"}:
+        raise cloud_images.ImageEditError("图片编辑请求只能包含 image 与 prompt", status=400)
+    value = body["image"]
+    prompt = body["prompt"]
+    if not isinstance(value, str) or not isinstance(prompt, str):
+        raise cloud_images.ImageEditError("image 必须是 data URL，prompt 必须是字符串", status=400)
+    match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]*={0,2})", value)
+    if not match:
+        raise cloud_images.ImageEditError("image 仅支持 PNG、JPEG、WebP 的 base64 data URL", status=400)
+    try:
+        data = base64.b64decode(match[2], validate=True)
+    except (ValueError, binascii.Error):
+        raise cloud_images.ImageEditError("image Base64 校验失败", status=400)
+    try:
+        info = cloud_images.inspect_image(data)
+    except cloud_images.ImageEditError:
+        raise cloud_images.ImageEditError("image 不是有效图片", status=400)
+    if info["mime"] != match[1]:
+        raise cloud_images.ImageEditError("image 声明的 MIME 与实际图片不符", status=400)
+    return data, prompt
+
+
+def serialize_image_edit(result):
+    payload = {"model": result["model"], "request_id": result["request_id"]}
+    if "image_bytes" in result:
+        payload["image"] = ("data:" + result["mime"] + ";base64,"
+                            + base64.b64encode(result["image_bytes"]).decode("ascii"))
+        payload["width"] = result["width"]
+        payload["height"] = result["height"]
+    else:
+        payload["url"] = result["result_url"]
+    return payload
+
+
 def register_chat_routes(app):
     app.router.add_post("/api/chat/completions", completions)
+    app.router.add_post("/api/images/edits", image_edits)
