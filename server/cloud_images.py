@@ -17,6 +17,8 @@ from aiohttp.resolver import ThreadedResolver
 from PIL import Image
 from yarl import URL
 
+from . import provider_billing
+
 
 CONF = Path(__file__).resolve().parent.parent / "cloud-ai-config.json"
 MAX_IMAGE_BYTES = 64 * 1024 * 1024
@@ -133,7 +135,8 @@ def decode_result(payload, request_id, model):
     raise ImageEditError("云端结果缺少 b64_json 或 url", request_id=request_id)
 
 
-async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=None, quality=None):
+async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=None, quality=None,
+               on_metadata=None):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise ImageEditError("图片编辑提示词不能为空，且不得超过 20000 字符", status=400)
@@ -156,11 +159,12 @@ async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=N
         form.add_field("image[]", data, filename=f"image_{index}{info['extension']}",
                        content_type=info["mime"])
     return await request_image(session, config, prompt.strip(), "/images/edits", data=form,
-                               end_user_name=end_user_name, end_user_phone=end_user_phone)
+                               end_user_name=end_user_name, end_user_phone=end_user_phone,
+                               on_metadata=on_metadata)
 
 
 async def generate(session, prompt, *, end_user_name, end_user_phone,
-                   size="1024x1024", quality="high"):
+                   size="1024x1024", quality="high", on_metadata=None):
     config = load()
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 32000:
         raise ImageEditError("生图提示词不能为空，且不得超过 32000 字符", status=400)
@@ -174,7 +178,8 @@ async def generate(session, prompt, *, end_user_name, end_user_phone,
             "size": size, "quality": quality, "output_format": config["output_format"],
             "output_compression": 100}
     result = await request_image(session, config, prompt.strip(), "/images/generations", json=body,
-                                 end_user_name=end_user_name, end_user_phone=end_user_phone)
+                                 end_user_name=end_user_name, end_user_phone=end_user_phone,
+                                 on_metadata=on_metadata)
     if "result_url" in result:
         return await download_result(result, config)
     return result
@@ -226,10 +231,12 @@ async def download_result(result, config):
     except (ImageEditError, ValueError, OSError, aiohttp.ClientError, asyncio.TimeoutError):
         raise ImageEditError("云端已返回图片，但结果下载或校验失败。请联系管理员确认，不要重复生成。",
                              request_id=request_id, generation_unknown=True) from None
-    return {"request_id": request_id, "model": result["model"], **info, "image_bytes": data}
+    return {**{key: result[key] for key in ("request_id", "model", "model_source", "provider_billing", "usage")
+               if key in result}, **info, "image_bytes": data}
 
 
-async def request_image(session, config, prompt, endpoint, *, end_user_name, end_user_phone, **payload):
+async def request_image(session, config, prompt, endpoint, *, end_user_name, end_user_phone,
+                        on_metadata=None, **payload):
     request_id = None
     try:
         async with session.post(
@@ -239,11 +246,17 @@ async def request_image(session, config, prompt, endpoint, *, end_user_name, end
                          "X-End-User-Phone": end_user_phone},
                 allow_redirects=False, proxy=None,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=450)) as response:
-            request_id = response.headers.get("X-Request-ID", "")[:200] or None
+            request_id = response.headers.get("X-Request-ID", "")
+            if (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)
+                    or config["api_key"] in request_id):
+                request_id = None
             if not 200 <= response.status < 300:
                 detail = "无可用结构化错误详情"
                 try:
-                    payload = json.loads(await read_limited(response, 16 * 1024))
+                    payload = provider_billing.loads(await read_limited(response, 16 * 1024))
+                    if on_metadata:
+                        await on_metadata({**provider_billing.normalize(payload, config["model"], config),
+                                           "request_id": request_id})
                     error = payload.get("error", payload.get("detail", payload.get("message"))) if isinstance(payload, dict) else None
                     if isinstance(error, dict):
                         error = "; ".join(f"{key}={error[key]}" for key in ("message", "type", "param", "code")
@@ -267,7 +280,12 @@ async def request_image(session, config, prompt, endpoint, *, end_user_name, end
         raise ImageEditError("请求未完成，生成状态可能未知。不要自动重试，请联系管理员确认。",
                              status=504, request_id=request_id, generation_unknown=True)
     try:
-        payload = json.loads(body)
+        payload = provider_billing.loads(body)
     except (ValueError, UnicodeError):
         raise ImageEditError("云端返回的不是有效 JSON，请联系管理员确认结果，不要重复生成", request_id=request_id)
-    return await asyncio.to_thread(decode_result, payload, request_id, config["model"])
+    metadata = {**provider_billing.normalize(payload, config["model"], config), "request_id": request_id}
+    # 先持久化扣费证据，再解码、下载或后处理；图片无效不代表供应商没有扣费。
+    if on_metadata:
+        await on_metadata(metadata)
+    result = await asyncio.to_thread(decode_result, payload, request_id, metadata["model"])
+    return {**result, **metadata}

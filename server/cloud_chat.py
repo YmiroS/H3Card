@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 import aiohttp
 from aiohttp import web
 
-from . import cloud_images
+from . import cloud_images, provider_billing
 
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
 MAX_TOTAL_IMAGE_BYTES = 15 * 1024 * 1024
@@ -119,9 +119,12 @@ def validate(body):
     return messages
 
 
-async def complete(session, messages, *, end_user_name, end_user_phone, model=None, max_tokens=None):
+async def complete(session, messages, *, end_user_name, end_user_phone, model=None, max_tokens=None,
+                   billing_state=None):
     config = load()
     model = config["chat_model"] if model is None else model
+    billing_state = {} if billing_state is None else billing_state
+    provider_billing.capture(billing_state, {}, model, config)
     if not isinstance(model, str) or not model.strip() or any(ord(c) < 33 for c in model):
         raise ChatError("聊天模型配置无效", status=503)
     body = {"model": model, "messages": messages, "stream": False}
@@ -138,33 +141,47 @@ async def complete(session, messages, *, end_user_name, end_user_phone, model=No
                          "X-End-User-Phone": end_user_phone},
                 proxy=None, allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=300)) as response:
-            if not 200 <= response.status < 300:
-                raise ChatError(f"云端聊天返回 HTTP {response.status}，请联系管理员核对，不要自动重试")
             raw = bytearray()
             async for chunk in response.content.iter_chunked(65536):
                 raw.extend(chunk)
                 if len(raw) > MAX_RESPONSE_BYTES:
                     raise ChatError("云端聊天响应超过大小限制")
+            try:
+                payload = provider_billing.loads(raw)
+            except (ValueError, UnicodeError):
+                payload = None
+            provider_billing.capture(billing_state, payload, model, config)
+            if not 200 <= response.status < 300:
+                raise ChatError(f"云端聊天返回 HTTP {response.status}，请联系管理员核对，不要自动重试")
             request_id = response.headers.get("X-Request-ID")
     except (aiohttp.ClientError, asyncio.TimeoutError):
         raise ChatError("请求未完成，回答状态可能未知。不要自动重试，请联系管理员确认。",
                         status=504, answer_unknown=True)
     try:
-        payload = json.loads(raw)
         content = payload["choices"][0]["message"]["content"]
         if not isinstance(content, str):
             raise ValueError()
     except (ValueError, UnicodeError, KeyError, IndexError, TypeError):
         raise ChatError("云端聊天响应格式无效，请联系管理员确认，不要自动重试")
-    # Only opaque request identifiers are safe; never reflect arbitrary header text.
+    # 只允许不透明的请求标识，不反射任意上游响应头。
     if not request_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id) or config["api_key"] in request_id:
         request_id = None
-    return {"content": content, "model": model, "request_id": request_id}
+    return {"content": content, "model": billing_state["model"], "request_id": request_id}
 
 
-async def stream(session, request, messages, *, end_user_name, end_user_phone):
+def _stream_frame(frame):
+    lines = frame.decode("utf-8").splitlines()
+    error_event = any(line.startswith("event:") and line[6:].strip() == "error" for line in lines)
+    data = "\n".join(line[5:].lstrip(" ") for line in lines if line.startswith("data:"))
+    return data, error_event
+
+
+async def stream(session, request, messages, *, end_user_name, end_user_phone, billing_state=None):
     config = load()
     model = config["chat_model"]
+    billing_state = {} if billing_state is None else billing_state
+    provider_billing.capture(billing_state, {}, model, config)
+    billing_state["status"] = "running"
     if not isinstance(model, str) or not model.strip() or any(ord(c) < 33 for c in model):
         raise ChatError("聊天模型配置无效", status=503)
     downstream = web.StreamResponse(
@@ -181,8 +198,18 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone):
                 proxy=None, allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=300)) as upstream:
             if not 200 <= upstream.status < 300:
+                try:
+                    raw = await cloud_images.read_limited(upstream, MAX_RESPONSE_BYTES)
+                    provider_billing.capture(billing_state, provider_billing.loads(raw), model, config)
+                except (cloud_images.ImageEditError, ValueError, UnicodeError):
+                    pass
                 raise ChatError(f"云端聊天返回 HTTP {upstream.status}，请联系管理员核对，不要自动重试")
             if upstream.content_type != "text/event-stream":
+                try:
+                    raw = await cloud_images.read_limited(upstream, MAX_RESPONSE_BYTES)
+                    provider_billing.capture(billing_state, provider_billing.loads(raw), model, config)
+                except (cloud_images.ImageEditError, ValueError, UnicodeError):
+                    pass
                 raise ChatError("云端聊天流式响应格式无效，请联系管理员确认，不要自动重试")
             await downstream.prepare(request)
             started = True
@@ -203,17 +230,23 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone):
                     frame = bytes(pending[:index])
                     del pending[:index + length]
                     try:
-                        lines = frame.decode("utf-8").splitlines()
-                        if any(line.startswith("event:") and line[6:].strip() == "error" for line in lines):
-                            raise ValueError()
-                        data = "\n".join(line[5:].lstrip(" ") for line in lines if line.startswith("data:"))
+                        data, error_event = _stream_frame(frame)
                         if not data:
+                            if error_event:
+                                raise ValueError()
                             continue
-                        if data == "[DONE]":
+                        if data == "[DONE]" and not error_event:
                             finished = True
+                            billing_state["status"] = "done"
                             await downstream.write(b"data: [DONE]\n\n")
                             break
-                        payload = json.loads(data)
+                        payload = provider_billing.loads(data)
+                        provider_billing.capture(billing_state, payload, model, config)
+                        if error_event or isinstance(payload, dict) and "error" in payload:
+                            raise ValueError()
+                        if (isinstance(payload, dict) and "choices" not in payload
+                                and ("usage" in payload or "cost" in payload)):
+                            continue
                         choices = payload["choices"]
                         if not isinstance(choices, list):
                             raise ValueError()
@@ -242,8 +275,17 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone):
                 if finished:
                     break
             if not finished:
+                # EOF 仍视为未完成；仅抢救已完整收到、但缺少帧分隔符的扣费证据。
+                if pending:
+                    try:
+                        data, _ = _stream_frame(bytes(pending))
+                        if data and data != "[DONE]":
+                            provider_billing.capture(billing_state, provider_billing.loads(data), model, config)
+                    except (ValueError, UnicodeError):
+                        pass
                 raise ChatError("云端聊天流式响应未完成，请勿自动重试")
     except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+        billing_state["status"] = "error"
         error = ChatError("请求未完成，回答状态可能未知。不要自动重试，请联系管理员确认。",
                           status=504, answer_unknown=True)
         if not started:
@@ -251,6 +293,7 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone):
         await downstream.write(("event: error\ndata: " + json.dumps(error.response(), ensure_ascii=False)
                                 + "\n\n").encode("utf-8"))
     except ChatError as error:
+        billing_state["status"] = "error"
         if not started:
             raise
         await downstream.write(("event: error\ndata: " + json.dumps(error.response(), ensure_ascii=False)

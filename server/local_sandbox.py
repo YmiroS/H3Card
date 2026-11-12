@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from decimal import Decimal, ROUND_HALF_EVEN
 
 
 SOURCE = Path(__file__).resolve().parents[1]
@@ -78,9 +79,24 @@ def copy_code(destination):
             target = destination / source.relative_to(SOURCE)
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copyfile(source, target)
-    for name in ('pricing.json',):
-        if (SOURCE / name).is_file():
-            shutil.copyfile(SOURCE / name, destination / name)
+    for name in ('pricing.json', 'server/creation_agent/builtins.json',
+                 'server/creation_agent/builtin_defaults.json'):
+        source = SOURCE / name
+        if source.is_symlink():
+            raise ValueError('拒绝运行资源中的符号链接')
+        if source.is_file():
+            target = destination / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
+    # 仅复制正式构建目录中经目录校验的公开资源，不携带源码映射或运行配置。
+    if (SOURCE / 'web_dist').is_dir():
+        from server.frontend import load_frontend
+        frontend = load_frontend(SOURCE / 'web_dist')
+        for source in {frontend.index, *frontend.assets.values(), *frontend.pages.values(),
+                       *frontend.protected_assets.values()}:
+            target = destination / 'web_dist' / source.relative_to(SOURCE / 'web_dist')
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(source, target)
 
 
 def import_archive(archive_path, destination):
@@ -196,6 +212,130 @@ def prepare(directory, snapshot):
                       'counts': counts, 'login_file': str(destination / 'local-login.json')}, ensure_ascii=False))
 
 
+def prepare_costs(directory, snapshot_path):
+    """把最小费用快照装入全新验收库；不读取生产数据库或保留生产密码。"""
+    from server.auth_store import AuthStore
+    from server.costs import CostLedger
+    requested = Path(directory).expanduser().absolute()
+    destination = requested.resolve()
+    if destination.exists() or requested.is_symlink():
+        raise ValueError('费用验收目录已经存在，不覆盖已有数据库或登录信息')
+    if SOURCE == destination or SOURCE in destination.parents:
+        raise ValueError('费用验收运行树必须放在后端源码目录之外')
+    source = Path(snapshot_path).expanduser().resolve()
+    if source.stat().st_size > 32 * 1024 * 1024:
+        raise ValueError('费用快照超过本地导入限制')
+    snapshot = json.loads(source.read_text(encoding='utf-8'))
+    if not isinstance(snapshot, dict) or not all(isinstance(snapshot.get(k), list)
+                                               for k in ('jobs', 'accounts', 'history')):
+        raise ValueError('费用快照缺少明细、账号或任务关联')
+    jobs = snapshot['jobs']
+    if len({j['job_id'] for j in jobs}) != len(jobs):
+        raise ValueError('费用快照含重复任务，拒绝导入')
+    destination.mkdir(parents=True, mode=0o700)
+    (destination / 'data').mkdir(mode=0o700)
+    copy_code(destination)
+    auth = AuthStore(destination / 'data/auth.db')
+    ledger = CostLedger(destination / 'data/control.db', destination / 'pricing.json')
+    try:
+        accounts = {a['id']: a for a in snapshot['accounts']}
+        history = {j['id']: j for j in snapshot['history']}
+        for j in history.values():
+            uid = j.get('submitter_id')
+            if uid and uid not in accounts:
+                accounts[uid] = {'id': uid, 'username': j.get('submitter_username') or uid,
+                                 'display_name': j.get('submitter_display_name') or uid,
+                                 'enabled': False}
+        blocked_hash = auth.hasher.hash(secrets.token_urlsafe(48))
+        with auth.lock, auth.db:
+            for account in accounts.values():
+                username, username_key = auth._username(account['username'])
+                auth.db.execute(
+                    'INSERT INTO users(id,username,username_key,password_hash,role,enabled,'
+                    'created_at,display_name,approval_status) VALUES(?,?,?,?,?,?,?,?,?)',
+                    (account['id'], username, username_key, blocked_hash, 'user',
+                     int(bool(account.get('enabled'))), time.time(),
+                     account.get('display_name') or username, 'approved'))
+        username, password = 'costs_review', secrets.token_urlsafe(24)
+        admin = auth.create_user(username, password, role='admin')
+        auth.set_user(admin['id'], display_name='本地费用验收管理员', phone='13800000000')
+        auth.set_ready()
+        with auth.lock, auth.db:
+            for j in jobs:
+                h = history.get(j['job_id']) or {}
+                uid, project_id = h.get('submitter_id'), h.get('project')
+                if uid and project_id:
+                    auth.db.execute(
+                        'INSERT OR IGNORE INTO project_acl(project_id,owner_id,state,created_at) '
+                        'VALUES(?,?,?,?)', (project_id, uid, 'active', time.time()))
+                    auth.db.execute('INSERT INTO job_acl(job_id,project_id,user_id) VALUES(?,?,?)',
+                                    (j['job_id'], project_id, uid))
+        def micros(value):
+            return int((Decimal(str(value or 0)) * 1000000).to_integral_value(rounding=ROUND_HALF_EVEN))
+        electricity_rate, full_rate = ledger._rates()
+        worker_keys = {}
+        for group in snapshot.get('groups', {}).get('by_worker', []):
+            worker_keys.setdefault(group['label'], set()).add(group['key'])
+        dimension_keys = {
+            'audio_count', 'billing_mode', 'duration', 'elapsed_ms', 'force_rate',
+            'frame_load_cap', 'generation_unknown', 'height', 'history_ts_ms',
+            'image_count', 'input_image_count', 'legacy_source', 'megapixels', 'model',
+            'output_count', 'output_duration', 'output_fps', 'output_height', 'output_width',
+            'provider', 'quality', 'request_id', 'requested_size', 'resolution',
+            'retail_dimension_source', 'scale_to_length', 'segment_count', 'source_duration',
+            'source_fps', 'source_frames', 'target_fps', 'video_count', 'width',
+        }
+        with ledger.lock, ledger.db:
+            for j in jobs:
+                h = history.get(j['job_id']) or {}
+                actual = j.get('cost_source') == 'actual'
+                estimated = j.get('cost_source') == 'estimated'
+                runtime = j.get('runtime_seconds')
+                dims = {key: scrub(value) for key, value in (j.get('dimensions') or {}).items()
+                        if key in dimension_keys and isinstance(value, (str, int, float, bool))}
+                dims['local_review_import'] = True
+                dims['worker_name'] = j.get('worker_name') or ''
+                matches = worker_keys.get(j.get('worker_name'), set())
+                worker_id = next(iter(matches)) if len(matches) == 1 else None
+                # 原快照没有逐笔电费；只在验收副本按当前系统费率复算并明确标记。
+                electricity = (round(float(runtime or 0) / 3600 * electricity_rate)
+                               if j['event_kind'] == 'generation' else 0)
+                dims['electricity_basis'] = 'local_review_recomputed' if runtime is not None else 'unknown'
+                project_id = h.get('project') or None
+                ledger.db.execute(
+                    'INSERT INTO cost_events(job_id,event_kind,capability,category,model_family,'
+                    'project_id,project_name,card_name,worker_id,status,created_at,runtime_seconds,'
+                    'pricing_version,electricity_rate_micros,full_rate_micros,'
+                    'electricity_cost_micros,compute_cost_micros,api_cost_micros,total_cost_micros,'
+                    'estimated_min_micros,estimated_max_micros,cost_source,dimensions_json,updated_at) '
+                    'VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)',
+                    (j['job_id'], j['event_kind'], j['capability'], j['category'], dims.get('model'),
+                     project_id, j.get('project_name'), j.get('card_name'),
+                     worker_id, j['status'], j['created_at'], runtime,
+                     str(snapshot.get('pricingVersion') or 'unknown'), electricity_rate, full_rate,
+                     electricity if runtime is not None else None,
+                     max(0, micros(j.get('actual_cost')) - electricity) if actual else None,
+                     micros(j.get('actual_cost')) if actual and j['event_kind'] != 'generation' else None,
+                     micros(j.get('actual_cost')) if actual else None,
+                     micros(j.get('estimated_cost')) if estimated else None,
+                     micros(j.get('estimated_cost')) if estimated else None,
+                     j.get('cost_source'), json.dumps(dims, ensure_ascii=False), time.time()))
+        write_json(destination / 'data/jobs.json', [])
+        write_json(destination / 'local-login.json', {'username': username, 'password': password})
+        write_json(destination / 'data/.admin-sandbox.json', {
+            'runtime_root': str(destination), 'prepared': True,
+            'source': 'costs_snapshot', 'captured_at': snapshot.get('capturedAt'),
+            'electricity_basis': 'local_review_recomputed',
+            'warning': '隔离验收副本；逐笔电费按本地配置复算，不是新增供应商账单',
+        })
+        print(json.dumps({'runtime': str(destination), 'records': len(jobs),
+                          'accounts': len(accounts), 'login_file': str(destination / 'local-login.json'),
+                          'captured_at': snapshot.get('capturedAt')}, ensure_ascii=False))
+    finally:
+        ledger.close()
+        auth.close()
+
+
 def check(directory):
     destination = Path(directory).expanduser().resolve()
     from server.sandbox import validate_runtime
@@ -241,15 +381,18 @@ def stop(directory):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=('prepare', 'sync', 'start', 'stop'))
+    parser.add_argument('action', choices=('prepare', 'prepare-costs', 'sync', 'start', 'stop'))
     parser.add_argument('--directory', required=True)
     parser.add_argument('--snapshot')
     parser.add_argument('--port', type=int, default=18299)
     options = parser.parse_args()
-    if options.action == 'prepare':
+    if options.action in ('prepare', 'prepare-costs'):
         if not options.snapshot:
-            parser.error('prepare需要--snapshot')
-        prepare(options.directory, options.snapshot)
+            parser.error('准备验收目录需要--snapshot')
+        if options.action == 'prepare-costs':
+            prepare_costs(options.directory, options.snapshot)
+        else:
+            prepare(options.directory, options.snapshot)
     elif options.action == 'sync':
         copy_code(check(options.directory))
         print('仅同步代码，未覆盖验收数据')

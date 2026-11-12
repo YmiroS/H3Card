@@ -1,5 +1,6 @@
 """仅本机管理验收的显式隔离边界；默认不启用，不改变正式服务。"""
 import json
+import re
 from pathlib import Path
 
 from aiohttp import web
@@ -15,7 +16,8 @@ STATIC = {'/favicon.png', '/icon.png', '/auth-art.webp', '/auth-logo.png',
           '/admin-shell.js', '/controller-page.js', '/costs-page.js'}
 READ_APIS = {'/api/health', '/api/status', '/api/workers', '/api/generation/workers', '/api/jobs',
              '/api/projects', '/api/cards', '/api/team-candidates', '/api/teams',
-             '/api/capacity', '/api/capacity/export', '/api/costs', '/api/auth/me'}
+             '/api/capacity', '/api/capacity/export', '/api/costs', '/api/auth/me',
+             '/api/costs/catalog', '/api/costs/dashboard', '/api/costs/dashboard/export'}
 AUTH_WRITES = {'/api/auth/login', '/api/auth/logout', '/api/auth/password',
                '/api/auth/presence', '/api/auth/phone', '/api/auth/register'}
 
@@ -54,6 +56,12 @@ def allowed(method, path):
     if path == '/api/teams' or path.startswith('/api/teams/'):
         return True
     if path == '/api/capacity/estimate':
+        return True
+    if method == 'POST' and path == '/api/costs/departments':
+        return True
+    if method == 'PATCH' and re.fullmatch(r'/api/costs/departments/[A-Za-z0-9_-]{1,128}', path):
+        return True
+    if method == 'PUT' and re.fullmatch(r'/api/costs/accounts/[A-Za-z0-9_-]{1,128}/department', path):
         return True
     if path.startswith('/api/capacity/jobs/'):
         return path.endswith('/review') or path.endswith('/probe-outputs')

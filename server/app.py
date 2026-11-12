@@ -79,6 +79,7 @@ from server.character_api import register_character_routes
 from server.worker_command_api import register_worker_command_routes
 from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
+from server.cost_dashboard import register_cost_dashboard_routes
 from server.creation_agent.skills import register_skill_routes
 from server.cloud_lighting import CloudLighting
 from server.job_polling import CACHE_KEY as JOB_POLL_CACHE_KEY, JobPollCache, job_poll_response
@@ -281,15 +282,17 @@ async def project_write_lock(request, handler):
     return await handler(request)
 
 
-def record_api_cost(app, capability, result, elapsed_ms, body):
+def record_api_cost(app, capability, result, elapsed_ms, body, *, user_id=None):
     ledger = cost_ledger(app)
     if ledger:
-        ledger.record_api(
+        event_id = ledger.record_api(
             capability, result.get("model"), result.get("prompt_tokens"),
             result.get("completion_tokens"), elapsed_ms,
             project=body.get("project"), project_name=body.get("projectName"),
             card=body.get("card"), card_name=body.get("cardName"),
         )
+        if user_id and event_id:
+            ledger.bind_attribution(event_id, user_id)
 
 
 def controller_comfy_online(app, workers=None):
@@ -1782,6 +1785,7 @@ async def _api_generate(request):
         distributed_store(request.app).enqueue(pid, dispatch_payload, required_nodes)
         if ledger:
             ledger.record_job(JOBS[pid], params, uploaded, graph, cached_probe, family)
+            ledger.bind_attribution(pid, require_user(request)["id"])
     if local_context:
         local_context["submission"].update(job_id=pid, state="accepted")
     return await generation_job_response(request, body, pid, project, linked_card)
@@ -1957,7 +1961,7 @@ async def api_rewrite(request):
         warns.append(warn)
     elapsed_ms = int((time.time() - t0) * 1000)
     if via == "api":
-        record_api_cost(request.app, cid, got, elapsed_ms, body)
+        record_api_cost(request.app, cid, got, elapsed_ms, body, user_id=require_user(request)["id"])
     return web.json_response({"text": text, "warn": "；".join(warns),
                               "via": via, "fallback": fell, "model": mname,
                               "tokens": tokens, "ms": elapsed_ms})
@@ -2084,7 +2088,7 @@ async def api_text(request):
             raise web.HTTPBadGateway(reason=(
                 f"有道翻译不可用（{youdao_error}），云端翻译失败：{e}")[:400])
         elapsed_ms = int((time.time() - t0) * 1000)
-        record_api_cost(request.app, "text", got, elapsed_ms, body)
+        record_api_cost(request.app, "text", got, elapsed_ms, body, user_id=require_user(request)["id"])
         return web.json_response({
             "text": translated,
             "warn": f"有道翻译不可用，已改用 {got['model']}",
@@ -2127,7 +2131,7 @@ async def api_text(request):
     text = rw.text_clean(raw)
     elapsed_ms = int((time.time() - t0) * 1000)
     if via == "api":
-        record_api_cost(request.app, "text", got, elapsed_ms, body)
+        record_api_cost(request.app, "text", got, elapsed_ms, body, user_id=require_user(request)["id"])
     return web.json_response({"text": text, "warn": "；".join(warns),
                               "via": via, "model": mname, "tokens": tokens,
                               "ms": elapsed_ms})
@@ -4606,6 +4610,7 @@ def make_app(auth_path=None, *, project_repository=None):
         broadcast_collaboration=broadcast_collaboration, sync_card=sync_edit_card,
         kind_of=kind_of, duration_pattern=DUR_RE, audio_pattern=AUDIO_STREAM_RE)
     register_chat_routes(app)
+    register_cost_dashboard_routes(app)
     register_skill_routes(app, os.environ.get('CREATION_AGENT_SKILL_STORE')
                           or Path(app['auth_path']).parent / 'creation-agent-skills.json')
     register_texture_routes(

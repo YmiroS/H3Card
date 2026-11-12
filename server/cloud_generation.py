@@ -9,7 +9,7 @@ import uuid
 from aiohttp import web
 from PIL import Image, ImageOps
 
-from . import cloud_banana, cloud_images
+from . import cloud_banana, cloud_images, provider_billing
 from .cloud_lighting import CloudLighting
 from .image_controls import RATIOS, CLARITIES
 
@@ -64,12 +64,6 @@ def resize_image(data, size, *, crop=False):
 
 
 class CloudGeneration(CloudLighting):
-    async def record_cost(self, job, params=None, assets=None):
-        ledger = self.app.get("costs")
-        if ledger:
-            await asyncio.to_thread(ledger.record_image_api, job, model=job["modelName"],
-                                    params=params, assets=assets)
-
     async def authorize_all(self, user_id, project_id, refs):
         # Text-to-image has no resource references, but still requires project access.
         permission = await self.call_store(self.app, "project_permission", user_id, project_id)
@@ -122,9 +116,12 @@ class CloudGeneration(CloudLighting):
         pid = str(uuid.uuid4())
         await self.call_store(self.app, "register_job", pid, project_id, user["id"])
         await self.resource_call(self.app, "register_job_inputs", pid, inputs)
+        model_metadata = provider_billing.normalize({}, config["banana_model" if provider == "banana" else "model"], config)
         job = {"id": pid, "capability": cap["id"], "name": cap["name"],
-               "modelName": config["banana_model" if provider == "banana" else "model"],
+               "modelName": model_metadata["model"],
                "execution": "cloud_image", "billingMode": "paid_api", "provider": provider,
+               "model_source": model_metadata["model_source"],
+               "provider_billing": None, "usage": model_metadata["usage"],
                "outputType": "image", "status": "queued", "progress": 0.0,
                "created": time.time(), "seed": None, "step": "等待付费 API 生图",
                "requested_size": size, "image_ratio": ratio, "image_clarity": clarity,
@@ -134,6 +131,7 @@ class CloudGeneration(CloudLighting):
                "project": project_id, "projectName": body.get("projectName"),
                "card": card_id, "cardName": body.get("cardName"),
                "prompts": [{"key": "prompt", "label": "生图提示词", "text": prompt.strip()}]}
+        await self.bind_cost_user(job, user["id"])
         await self.record_cost(job, params, inputs)
         self.jobs[pid] = job
         self.save_jobs()
@@ -151,7 +149,11 @@ class CloudGeneration(CloudLighting):
             job.update(status="running", started=time.time(), step="付费 API 生图中")
             self.save_jobs()
             await self.record_cost(job)
-            identity = {"end_user_name": end_user_name, "end_user_phone": end_user_phone}
+            async def on_metadata(metadata):
+                await self.capture_metadata(job, metadata)
+
+            identity = {"end_user_name": end_user_name, "end_user_phone": end_user_phone,
+                        "on_metadata": on_metadata}
             if job["provider"] == "banana":
                 result = await cloud_banana.generate(self.app["session"], images, prompt,
                     text_only=not images, output_size=tuple(map(int, job["requested_size"].split("x"))), **identity)
@@ -161,7 +163,7 @@ class CloudGeneration(CloudLighting):
             else:
                 result = await cloud_images.generate(self.app["session"], prompt,
                                                      size=job["requested_size"], quality=job["quality"], **identity)
-            job.update(request_id=result["request_id"], modelName=result["model"])
+            await self.capture_metadata(job, result)
             if "image_bytes" not in result:
                 raise cloud_images.ImageEditError(
                     "云端已返回图片链接，但未自动下载。请联系管理员确认结果，不要重复生成。",
@@ -207,5 +209,7 @@ class CloudGeneration(CloudLighting):
                 path.unlink(missing_ok=True)
             job.update(step="", ended=time.time())
             job["ms"] = int((job["ended"] - job.get("started", job["created"])) * 1000)
-            self.save_jobs()
-            await self.record_cost(job)
+            try:
+                self.save_jobs()
+            finally:
+                await self.record_cost(job)

@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """Controller-side durable cost ledger and aggregation."""
 import json
+import math
+import secrets
+from decimal import Decimal, DecimalException, InvalidOperation
 import sqlite3
 import threading
 import time
@@ -28,7 +31,7 @@ def _yuan(value):
 def _number(value):
     try:
         number = float(value)
-        return number if number >= 0 else None
+        return number if math.isfinite(number) and number >= 0 else None
     except (TypeError, ValueError):
         return None
 
@@ -39,6 +42,7 @@ class CostLedger:
         self.pricing_path = Path(pricing_path)
         self.pricing = json.loads(self.pricing_path.read_text(encoding="utf-8"))
         self.lock = threading.RLock()
+        self.dashboard_cursor_key = secrets.token_bytes(32)
         self.db = sqlite3.connect(str(self.path), check_same_thread=False)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -90,12 +94,111 @@ class CostLedger:
                     dimensions_json TEXT NOT NULL DEFAULT '{}',
                     updated_at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS cost_departments (
+                    id TEXT PRIMARY KEY,
+                    name TEXT NOT NULL COLLATE NOCASE UNIQUE
+                );
+                CREATE TABLE IF NOT EXISTS cost_account_departments (
+                    user_id TEXT PRIMARY KEY,
+                    department_id TEXT NOT NULL REFERENCES cost_departments(id)
+                );
+                CREATE TABLE IF NOT EXISTS cost_attributions (
+                    job_id TEXT PRIMARY KEY,
+                    user_id TEXT NOT NULL,
+                    department_id TEXT,
+                    department_name TEXT,
+                    bound_at REAL NOT NULL
+                );
+                INSERT OR IGNORE INTO cost_departments(id,name) VALUES
+                    ('production-1','制作一部'),('production-2','制作二部'),('production-3','制作三部');
                 CREATE INDEX IF NOT EXISTS idx_cost_created ON cost_events(created_at);
                 CREATE INDEX IF NOT EXISTS idx_cost_category ON cost_events(category, created_at);
                 CREATE INDEX IF NOT EXISTS idx_cost_capability ON cost_events(capability, created_at);
                 CREATE INDEX IF NOT EXISTS idx_cost_worker ON cost_events(worker_id, created_at);
                 """
             )
+
+    def department_catalog(self):
+        with self.lock:
+            departments = [dict(row) for row in self.db.execute(
+                'SELECT id,name FROM cost_departments ORDER BY id')]
+            assignments = dict(self.db.execute(
+                'SELECT user_id,department_id FROM cost_account_departments').fetchall())
+        return departments, assignments
+
+    @staticmethod
+    def _department_name(name):
+        if (not isinstance(name, str) or not 1 <= len(name.strip()) <= 50
+                or any(ord(char) < 32 for char in name)):
+            raise ValueError('部门名称须为 1 至 50 字且不能包含控制字符')
+        return name.strip()
+
+    def save_department(self, name, department_id=None):
+        name = self._department_name(name)
+        with self.lock, self.db:
+            if department_id is not None:
+                if not self.db.execute('SELECT 1 FROM cost_departments WHERE id=?',
+                                       (department_id,)).fetchone():
+                    raise ValueError('部门不存在')
+                self.db.execute('UPDATE cost_departments SET name=? WHERE id=?',
+                                (name, department_id))
+            else:
+                department_id = uuid.uuid4().hex
+                self.db.execute('INSERT INTO cost_departments(id,name) VALUES(?,?)',
+                                (department_id, name))
+        return {'id': department_id, 'name': name}
+
+    def assign_department(self, user_id, department_id):
+        # 真实账号存在性由调用方使用 AuthStore 校验，不复制用户表。
+        with self.lock, self.db:
+            if department_id is None:
+                self.db.execute('DELETE FROM cost_account_departments WHERE user_id=?', (user_id,))
+            else:
+                if not self.db.execute('SELECT 1 FROM cost_departments WHERE id=?',
+                                       (department_id,)).fetchone():
+                    raise ValueError('部门不存在')
+                self.db.execute(
+                    'INSERT INTO cost_account_departments(user_id,department_id) VALUES(?,?) '
+                    'ON CONFLICT(user_id) DO UPDATE SET department_id=excluded.department_id',
+                    (user_id, department_id))
+        return {'account_id': user_id, 'department_id': department_id}
+
+    def bind_attribution(self, job_id, user_id):
+        """首次可信绑定冻结部门快照，后续调用不重写历史。"""
+        if not user_id:
+            return
+        with self.lock, self.db:
+            department = self.db.execute(
+                'SELECT d.id,d.name FROM cost_account_departments a '
+                'JOIN cost_departments d ON d.id=a.department_id WHERE a.user_id=?',
+                (user_id,)).fetchone()
+            self.db.execute(
+                'INSERT OR IGNORE INTO cost_attributions '
+                '(job_id,user_id,department_id,department_name,bound_at) VALUES(?,?,?,?,?)',
+                (job_id, user_id, department['id'] if department else None,
+                 department['name'] if department else None, time.time()))
+
+    def dashboard_rows(self, start, end):
+        """全量读取，兼容目录查询与本地导入等既有调用。"""
+        rows, _ = self.dashboard_snapshot(start, end)
+        return rows
+
+    def dashboard_snapshot(self, start, end, max_rowid=None):
+        """冻结首次读取的入账上界，防止晚补录历史任务混入后续分页。"""
+        with self.lock:
+            if max_rowid is None:
+                max_rowid = self.db.execute('SELECT COALESCE(MAX(rowid),0) FROM cost_events').fetchone()[0]
+            has_workers = self.db.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workers'").fetchone()
+            worker = 'w.name' if has_workers else 'NULL'
+            join = ' LEFT JOIN workers w ON w.id=c.worker_id' if has_workers else ''
+            rows = [dict(row) for row in self.db.execute(
+                'SELECT c.*,a.user_id AS snapshot_user_id,a.department_id AS snapshot_department_id,'
+                'a.department_name AS snapshot_department_name,' + worker + ' AS worker_name '
+                'FROM cost_events c LEFT JOIN cost_attributions a ON a.job_id=c.job_id' + join +
+                ' WHERE c.created_at>=? AND c.created_at<=? AND c.rowid<=? '
+                'ORDER BY c.created_at DESC,c.job_id DESC', (start, end, max_rowid))]
+            return rows, max_rowid
 
     def _rates(self):
         rates = self.pricing.get("rates") or {}
@@ -288,12 +391,24 @@ class CostLedger:
             self.finish_job(job["id"], job.get("status") or "done", job["ended"],
                             worker_id=job.get("worker_id"), started_at=job["started"])
 
-    def record_image_api(self, job, *, model, params=None, assets=None):
-        """Upsert a paid image request by job['id']; supplier cost stays unknown.
+    @staticmethod
+    def _set_model_metadata(dimensions, model, model_source):
+        """来源只接受调用方明示，不将配置模型冒充供应商响应模型。"""
+        if model:
+            if model != dimensions.get('model'):
+                dimensions['model_source'] = 'unknown'
+            dimensions['model'] = model
+        if model_source is not None:
+            dimensions['model_source'] = model_source if model_source in ('response', 'config', 'unknown') else 'unknown'
+        elif dimensions.get('model_source') not in ('response', 'config', 'unknown'):
+            dimensions['model_source'] = 'unknown'
+        if not dimensions.get('model'):
+            dimensions['model_source'] = 'unknown'
 
-        New jobs supply capability; timestamps use Unix seconds. Optional metadata
-        comes from job or params, and assets use the usual images[n] mapping.
-        Neither token usage nor an unqualified supplier usage.cost is a CNY price.
+    def record_image_api(self, job, *, model, params=None, assets=None):
+        """按任务 ID 更新图片 API，费用复用供应商金额及实际模型用量规则。
+
+        缺失字段保留已捕获数据，原币金额不推断币种，不按 API 耗时计 GPU。
         """
         params = params if params is not None else (job.get("params") or {})
         assets = assets if assets is not None else job.get("assets")
@@ -304,7 +419,7 @@ class CostLedger:
             ).fetchone()
             previous = dict(previous) if previous else {}
             capability = job.get("capability") or previous.get("capability") or "unknown"
-            default_model, default_provider = IMAGE_API_MODELS.get(capability, (None, None))
+            _, default_provider = IMAGE_API_MODELS.get(capability, (None, None))
             dims = json.loads(previous.get("dimensions_json") or "{}")
 
             def value(*keys):
@@ -314,8 +429,9 @@ class CostLedger:
                             return source[key]
                 return None
 
-            resolved_model = model or value("modelName", "model") or dims.get("model") or default_model
+            resolved_model = model or value("modelName", "model") or dims.get("model")
             provider = value("provider") or dims.get("provider") or default_provider
+            self._set_model_metadata(dims, resolved_model, value('model_source'))
             dims.update(model=resolved_model, provider=provider, billing_mode="paid_api")
             for key, aliases in (
                 ("requested_size", ("requested_size", "size", "image_size", "resolution")),
@@ -336,9 +452,11 @@ class CostLedger:
                 dims.setdefault("image_count", dims["input_image_count"])
             dims.setdefault("generation_unknown", False)
             status = job.get("status") or previous.get("status") or "queued"
-            # Delayed queued/running notifications cannot reopen a finished request.
+            # 延迟通知不能重开终态，但仍允许补录供应商账单。
             if previous.get("status") in ("done", "error", "canceled", "timeout") and status in ("queued", "running"):
-                return
+                if all(job.get(key) is None for key in ('provider_billing', 'usage', 'model_source')):
+                    return
+                status = previous["status"]
             started = job.get("started") if job.get("started") is not None else previous.get("started_at")
             ended = job.get("ended") if job.get("ended") is not None else previous.get("ended_at")
             runtime = previous.get("runtime_seconds")
@@ -367,9 +485,6 @@ class CostLedger:
                     runtime_seconds=excluded.runtime_seconds,
                     electricity_rate_micros=0, full_rate_micros=0,
                     electricity_cost_micros=0, compute_cost_micros=0,
-                    api_cost_micros=NULL, total_cost_micros=NULL,
-                    estimated_min_micros=NULL, estimated_max_micros=NULL,
-                    prompt_tokens=NULL, completion_tokens=NULL, cost_source='unknown',
                     dimensions_json=excluded.dimensions_json, updated_at=excluded.updated_at""",
                 (job["id"], "image_api", capability, "image", resolved_model,
                  job.get("project"), job.get("projectName"), job.get("card"),
@@ -378,6 +493,140 @@ class CostLedger:
                  self.pricing.get("version", "unknown"), 0, 0, 0, 0, "unknown",
                  json.dumps(dims, ensure_ascii=False, separators=(",", ":")), now),
             )
+
+            self._apply_provider_billing(job['id'], job.get('provider_billing'), job.get('usage'))
+            if job.get('user_id'):
+                self.bind_attribution(job['id'], job['user_id'])
+
+    @staticmethod
+    def _decimal(value):
+        try:
+            number = Decimal(str(value))
+            return number if number.is_finite() and number >= 0 else None
+        except (InvalidOperation, ValueError, TypeError):
+            return None
+
+    @staticmethod
+    def _bounded_cost_micros(value):
+        """外部金额须先校验 SQLite int64 边界，越界不丢失原币证据。"""
+        if value is None:
+            return None
+        try:
+            micros = (value * MICROS).to_integral_value()
+            if not micros.is_finite() or not 0 <= micros <= 2 ** 63 - 1:
+                return None
+            return int(micros)
+        except (DecimalException, ValueError, OverflowError):
+            return None
+
+    def _to_cny(self, amount, currency, dimensions):
+        if currency == 'CNY':
+            return amount
+        if currency == 'USD':
+            exchange = (self.pricing.get('exchange_rates') or {}).get('USD') or {}
+            rate = self._decimal(exchange.get('rate'))
+            if rate is not None and rate > 0 and exchange.get('version'):
+                dimensions['exchange_rate'] = str(rate)
+                dimensions['exchange_version'] = str(exchange['version'])
+                try:
+                    return amount * rate
+                except DecimalException:
+                    return None
+        return None
+
+    def _apply_provider_billing(self, job_id, provider_billing=None, usage=None):
+        # 调用者持有重入锁；缺失更新不会擦除已捕获的原币金额或用量。
+        row = self.db.execute('SELECT * FROM cost_events WHERE job_id=?', (job_id,)).fetchone()
+        dims = json.loads(row['dimensions_json'] or '{}')
+        if isinstance(provider_billing, dict):
+            amount = self._decimal(provider_billing.get('amount'))
+            if amount is not None:
+                dims['provider_billing'] = {
+                    'amount': str(provider_billing['amount']),
+                    'currency': provider_billing.get('currency'),
+                    'field': provider_billing.get('field')}
+        saved_usage = dims.get('usage') or {}
+        if isinstance(usage, dict):
+            for key in ('input_tokens', 'output_tokens', 'cached_tokens', 'reasoning_tokens'):
+                value = usage.get(key)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    saved_usage[key] = value
+        if saved_usage:
+            dims['usage'] = saved_usage
+        billing = dims.get('provider_billing')
+        actual = estimated = None
+        source = 'unknown'
+        if billing is not None:
+            # 无新账单的状态通知保留首次确认的换算结果与汇率版本。
+            if provider_billing is None and row['total_cost_micros'] is not None:
+                actual = Decimal(row['total_cost_micros']) / MICROS
+            else:
+                actual = self._to_cny(self._decimal(billing['amount']), billing.get('currency'), dims)
+            source = 'provider:' + str(billing.get('field') or 'amount')
+        else:
+            model = dims.get('model')
+            rates = (self.pricing.get('api_rates') or {}).get(model) if model else None
+            if rates and all(saved_usage.get(key) is not None for key in ('input_tokens', 'output_tokens')):
+                input_rate = self._decimal(rates.get('input_per_million_tokens'))
+                output_rate = self._decimal(rates.get('output_per_million_tokens'))
+                if input_rate is not None and output_rate is not None:
+                    cached = saved_usage.get('cached_tokens', 0)
+                    cached_rate = self._decimal(rates.get('cached_input_per_million_tokens'))
+                    # 缓存是输入子集；有缓存时必须明确配置缓存单价，不裁剪也不套用输入价。
+                    if cached <= saved_usage['input_tokens'] and (cached == 0 or cached_rate is not None):
+                        try:
+                            amount = ((saved_usage['input_tokens'] - cached) * input_rate
+                                      + cached * (cached_rate if cached else Decimal(0))
+                                      + saved_usage['output_tokens'] * output_rate) / MICROS
+                            estimated = self._to_cny(amount, rates.get('currency', self.pricing.get('currency')), dims)
+                        except DecimalException:
+                            estimated = None
+                        source = 'api_rates'
+        dims['billing_source'] = source
+        actual_micros = self._bounded_cost_micros(actual)
+        estimated_micros = self._bounded_cost_micros(estimated)
+        self.db.execute(
+            'UPDATE cost_events SET api_cost_micros=?,total_cost_micros=?,estimated_min_micros=?, '
+            'estimated_max_micros=?,cost_source=?,prompt_tokens=?,completion_tokens=?,dimensions_json=? '
+            'WHERE job_id=?',
+            (actual_micros, actual_micros, estimated_micros, estimated_micros,
+             'actual' if actual_micros is not None else 'estimated' if estimated_micros is not None else 'unknown',
+             saved_usage.get('input_tokens'), saved_usage.get('output_tokens'),
+             json.dumps(dims, ensure_ascii=False, separators=(',', ':')), job_id))
+
+    def record_provider_api(self, *, job_id, event_kind, capability, model, created_at, status,
+                            provider_billing, usage, user_id, project_id='', project_name='',
+                            card_id='', card_name='', scene='', model_source=None):
+        """供应商费用优先，Token 费率仅估算，未确认的币种不猜测换算。"""
+        if event_kind not in ('api', 'image_api'):
+            raise ValueError('不支持的 API 事件类型')
+        with self.lock, self.db:
+            previous = self.db.execute('SELECT * FROM cost_events WHERE job_id=?', (job_id,)).fetchone()
+            dims = json.loads(previous['dimensions_json'] or '{}') if previous else {}
+            self._set_model_metadata(dims, model, model_source)
+            if scene:
+                dims['scene'] = scene
+            if previous and previous['status'] in ('done', 'error', 'canceled', 'timeout') and status in ('queued', 'running'):
+                status = previous['status']
+            category = 'image' if event_kind == 'image_api' else 'text'
+            self.db.execute(
+                '''INSERT INTO cost_events (job_id,event_kind,capability,category,project_id,project_name,
+                   card_id,card_name,status,created_at,pricing_version,electricity_rate_micros,
+                   full_rate_micros,electricity_cost_micros,compute_cost_micros,dimensions_json,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET
+                   status=excluded.status,dimensions_json=excluded.dimensions_json,
+                   capability=excluded.capability,
+                   card_id=CASE WHEN excluded.card_id!='' THEN excluded.card_id ELSE cost_events.card_id END,
+                   card_name=CASE WHEN excluded.card_name!='' THEN excluded.card_name ELSE cost_events.card_name END,
+                   project_id=CASE WHEN excluded.project_id!='' THEN excluded.project_id ELSE cost_events.project_id END,
+                   project_name=CASE WHEN excluded.project_name!='' THEN excluded.project_name ELSE cost_events.project_name END,
+                   updated_at=excluded.updated_at''',
+                (job_id, event_kind, capability, category, project_id, project_name, card_id, card_name,
+                 status, float(created_at), self.pricing.get('version', 'unknown'), 0, 0, 0, 0,
+                 json.dumps(dims, ensure_ascii=False, separators=(',', ':')), time.time()))
+            self._apply_provider_billing(job_id, provider_billing, usage)
+            self.bind_attribution(job_id, user_id)
+        return job_id
 
     def start_job(self, job_id, worker_id, started_at=None):
         started_at = float(started_at or time.time())
@@ -436,35 +685,23 @@ class CostLedger:
 
     def record_api(self, capability, model, prompt_tokens, completion_tokens, elapsed_ms,
                    project=None, project_name=None, card=None, card_name=None):
-        prompt_tokens = int(prompt_tokens or 0)
-        completion_tokens = int(completion_tokens or 0)
-        rates = next((value for key, value in (self.pricing.get("api_rates") or {}).items()
-                      if key.lower() in str(model or "").lower()), None)
-        api_cost = 0
-        if rates:
-            api_cost = _micros(
-                prompt_tokens * rates.get("input_per_million_tokens", 0) / 1_000_000
-                + completion_tokens * rates.get("output_per_million_tokens", 0) / 1_000_000
-            )
         now = time.time()
-        job_id = "api:" + uuid.uuid4().hex
-        electricity_rate, full_rate = self._rates()
-        dimensions = {"model": model or "", "elapsed_ms": int(elapsed_ms or 0)}
+        job_id = 'api:' + uuid.uuid4().hex
+        self.record_provider_api(
+            job_id=job_id, event_kind='api', capability=capability, model=model,
+            created_at=now, status='done', provider_billing=None,
+            usage={'input_tokens': prompt_tokens, 'output_tokens': completion_tokens}, user_id=None,
+            project_id=project or '', project_name=project_name or '',
+            card_id=card or '', card_name=card_name or '')
         with self.lock, self.db:
+            row = self.db.execute('SELECT dimensions_json FROM cost_events WHERE job_id=?', (job_id,)).fetchone()
+            dimensions = json.loads(row['dimensions_json'])
+            dimensions['elapsed_ms'] = int(elapsed_ms or 0)
             self.db.execute(
-                """INSERT INTO cost_events (
-                    job_id,event_kind,capability,category,project_id,project_name,card_id,card_name,
-                    status,created_at,started_at,ended_at,runtime_seconds,pricing_version,
-                    electricity_rate_micros,full_rate_micros,electricity_cost_micros,
-                    compute_cost_micros,api_cost_micros,total_cost_micros,cost_source,
-                    prompt_tokens,completion_tokens,dimensions_json,updated_at
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (job_id, "api", capability, "text", project, project_name, card, card_name,
-                 "done", now, now - (elapsed_ms or 0) / 1000, now, (elapsed_ms or 0) / 1000,
-                 self.pricing.get("version", "unknown"), electricity_rate, full_rate,
-                 0, 0, api_cost, api_cost, "actual", prompt_tokens, completion_tokens,
-                 json.dumps(dimensions, ensure_ascii=False, separators=(",", ":")), now),
-            )
+                'UPDATE cost_events SET started_at=?,ended_at=?,runtime_seconds=?,dimensions_json=? WHERE job_id=?',
+                (now - (elapsed_ms or 0) / 1000, now, (elapsed_ms or 0) / 1000,
+                 json.dumps(dimensions, ensure_ascii=False, separators=(',', ':')), job_id))
+        return job_id
 
     def backfill(self, jobs):
         jobs_by_id = {job.get("id"): job for job in jobs if job.get("id")}
@@ -514,13 +751,7 @@ class CostLedger:
         start = float(start or 0)
         end = float(end or time.time())
         limit = max(1, min(int(limit or 100), 2000))
-        with self.lock:
-            rows = [dict(row) for row in self.db.execute(
-                """SELECT c.*,w.name AS worker_name FROM cost_events c
-                   LEFT JOIN workers w ON w.id=c.worker_id
-                   WHERE c.created_at>=? AND c.created_at<=?
-                   ORDER BY c.created_at DESC""", (start, end)
-            )]
+        rows = self.dashboard_rows(start, end)
         labels = self.pricing.get("categories") or {}
         overview = {
             "tasks": len(rows), "done": 0, "error": 0, "canceled": 0,
@@ -561,7 +792,10 @@ class CostLedger:
             actual = _yuan(row.get("total_cost_micros")) if has_actual else 0.0
             low = row.get("estimated_min_micros")
             high = row.get("estimated_max_micros")
-            estimate = _yuan(round((low + high) / 2)) if not has_actual and row["status"] == "done" and low is not None and high is not None else 0.0
+            is_api = row['event_kind'] in ('api', 'image_api')
+            has_estimate = (not has_actual and low is not None and high is not None
+                            and (row['status'] == 'done' or (is_api and row['cost_source'] == 'estimated')))
+            estimate = _yuan(round((low + high) / 2)) if has_estimate else 0.0
             recognized = actual + estimate
             dimensions = json.loads(row.get("dimensions_json") or "{}")
             quote_capability = "text" if row["event_kind"] == "api" else row["capability"]
@@ -587,16 +821,16 @@ class CostLedger:
             overview["estimated_cost"] += estimate
             overview["total_cost"] += recognized
             overview["electricity_cost"] += _yuan(row.get("electricity_cost_micros"))
-            overview["api_cost"] += _yuan(row.get("api_cost_micros"))
-            is_api = row["event_kind"] in ("api", "image_api")
+            # API 已知费用与 recognized 同口径，实际与估算仍分别累计。
+            overview['api_cost'] += recognized if is_api else _yuan(row.get('api_cost_micros'))
             if not is_api:
                 overview["gpu_hours"] += (row.get("runtime_seconds") or 0) / 3600
             if row["status"] in ("error", "canceled"):
                 overview["failed_waste"] += actual
             if not is_api and row["status"] == "running" and row.get("started_at"):
                 overview["running_accrued"] += max(0, now - row["started_at"]) * row["full_rate_micros"] / 3600 / MICROS
-            if (not has_actual and estimate == 0
-                    and (row["event_kind"] == "image_api" or row["status"] in ("done", "error", "canceled"))):
+            if (not has_actual and not has_estimate
+                    and (is_api or row["status"] in ("done", "error", "canceled"))):
                 overview["unknown_cost_tasks"] += 1
 
             category = row["category"] or "other"
@@ -617,7 +851,7 @@ class CostLedger:
                     "worker_name": worker_label, "created_at": row["created_at"],
                     "runtime_seconds": row.get("runtime_seconds"), "actual_cost": actual,
                     "estimated_cost": estimate, "recognized_cost": recognized,
-                    "cost_source": "actual" if has_actual else ("estimated" if estimate else "unknown"),
+                    "cost_source": "actual" if has_actual else ("estimated" if has_estimate else "unknown"),
                     "retail_min": retail_min, "retail_max": retail_max,
                     "retail_basis": retail_basis,
                     "retail_source": ("priced" if row["status"] == "done" and retail_low_micros is not None
