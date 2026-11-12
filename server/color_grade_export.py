@@ -55,7 +55,10 @@ def _normalize_vignette(raw: object) -> dict | None:
         size = _clamp(float(raw.get("size", 0.5)), 0.0, 1.0)
         anamorphism = _clamp(float(raw.get("anamorphism", 1.0)), 0.2, 3.0)
         softness = _clamp(float(raw.get("softness", 0.5)), 0.0, 1.0)
+        opacity = _clamp(float(raw.get("opacity", 1.0)), 0.0, 1.0)
     except (TypeError, ValueError):
+        return None
+    if opacity <= 0:
         return None
     color = raw.get("color", "#000000")
     if not isinstance(color, str):
@@ -65,6 +68,7 @@ def _normalize_vignette(raw: object) -> dict | None:
         "size": size,
         "anamorphism": anamorphism,
         "softness": max(softness, 1e-3),
+        "opacity": opacity,
         "color": (r, g, b),
     }
 
@@ -100,6 +104,7 @@ def write_vignette_mask(path: Path, width: int, height: int, params: dict) -> No
     anamorphism = max(float(params["anamorphism"]), 0.01)
     size = float(params["size"])
     softness = max(float(params["softness"]), 1e-3)
+    opacity = _clamp(float(params.get("opacity", 1.0)), 0.0, 1.0)
     red, green, blue = params["color"]
     color = (
         int(round(_clamp(red, 0, 1) * 255)),
@@ -121,6 +126,7 @@ def write_vignette_mask(path: Path, width: int, height: int, params: dict) -> No
                 amount = 1.0
             else:
                 amount = t * t * (3.0 - 2.0 * t)
+            amount *= opacity
             pixels[index:index + 4] = bytes((*color, int(round(amount * 255))))
             index += 4
     Image.frombytes("RGBA", (mask_w, mask_h), bytes(pixels)).save(path, format="PNG")

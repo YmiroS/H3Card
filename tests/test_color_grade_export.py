@@ -57,6 +57,7 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
             "size": 0.5,
             "anamorphism": 1.0,
             "softness": 0.5,
+            "opacity": 1.0,
             "color": "#000000",
         })
         with tempfile.TemporaryDirectory() as tmp:
@@ -66,6 +67,26 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
             image = Image.open(path)
             self.assertEqual(image.getpixel((image.width // 2, image.height // 2))[3], 0)
             self.assertGreater(image.getpixel((0, 0))[3], 200)
+
+    def test_vignette_opacity_scales_mask_alpha(self):
+        vig = _normalize_vignette({
+            "enabled": True,
+            "size": 0.5,
+            "anamorphism": 1.0,
+            "softness": 0.5,
+            "opacity": 0.5,
+            "color": "#000000",
+        })
+        self.assertAlmostEqual(vig["opacity"], 0.5)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "vignette.png"
+            write_vignette_mask(path, 160, 90, vig)
+            from PIL import Image
+            image = Image.open(path)
+            corner = image.getpixel((0, 0))[3]
+            self.assertGreater(corner, 90)
+            self.assertLess(corner, 160)
+        self.assertIsNone(_normalize_vignette({"enabled": True, "opacity": 0}))
 
     def test_vignette_ignored_when_disabled(self):
         self.assertIsNone(_normalize_vignette({"enabled": False, "size": 0.2}))
