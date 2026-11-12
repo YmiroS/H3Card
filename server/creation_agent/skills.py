@@ -24,9 +24,9 @@ ID = re.compile(r'[a-z][a-z0-9-]{1,63}')
 TEXT_EXTENSIONS = frozenset(('.md', '.txt', '.yaml', '.yml'))
 # Match ECMAScript String.trim used by the shared browser/Node schemas.
 TRIM_SPACE = '\u0009\u000a\u000b\u000c\u000d\u0020\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a\u2028\u2029\u202f\u205f\u3000\ufeff'
-METADATA_FIELDS = ('id', 'name', 'description', 'triggers', 'autoOutputs')
+METADATA_FIELDS = ('id', 'name', 'description', 'triggers', 'autoOutputs', 'recommendedModelIds')
 CORE_FIELDS = {'id', 'name', 'description', 'instruction'}
-OPTIONAL_FIELDS = {'triggers', 'autoOutputs', 'references', 'referenceTriggers', 'enabled'}
+OPTIONAL_FIELDS = {'triggers', 'autoOutputs', 'recommendedModelIds', 'references', 'referenceTriggers', 'enabled', 'executionSummary'}
 LOG = logging.getLogger(__name__)
 
 
@@ -99,6 +99,22 @@ def validate_skill(value):
             or len(set(outputs)) != len(outputs)):
         raise SkillError('autoOutputs 只能包含不重复的 image、video、text')
     result['autoOutputs'] = list(outputs)
+    models = value.get('recommendedModelIds', [])
+    if not isinstance(models, list) or len(models) > 16:
+        raise SkillError('recommendedModelIds 必须为最多 16 个模型 ID 的列表')
+    recommended = []
+    for model in models:
+        if not isinstance(model, str):
+            raise SkillError('recommendedModelIds 必须包含文字模型 ID')
+        model = model.strip(TRIM_SPACE)
+        if not model or len(model) > 200:
+            raise SkillError('recommendedModelIds 的模型 ID 必须为 1–200 字')
+        if any(unicodedata.category(char) in ('Cc', 'Cf') for char in model):
+            raise SkillError('recommendedModelIds 不能包含控制字符')
+        if model in recommended:
+            raise SkillError('recommendedModelIds 不能重复')
+        recommended.append(model)
+    result['recommendedModelIds'] = recommended
     refs = value.get('references', {})
     if not isinstance(refs, dict) or len(refs) > 128:
         raise SkillError('references 必须为最多 128 个文字文件的对象')
@@ -124,6 +140,18 @@ def validate_skill(value):
     if type(value.get('enabled', True)) is not bool:
         raise SkillError('enabled 必须为布尔值')
     result['enabled'] = value.get('enabled', True)
+    if 'executionSummary' in value:
+        summary = value['executionSummary']
+        if (not isinstance(summary, dict) or set(summary) != {'text', 'sourceFingerprint', 'reviewed'}):
+            raise SkillError('executionSummary 必须包含 text、sourceFingerprint、reviewed，且不能有其他字段')
+        text_length(summary['text'], 8000, 'executionSummary.text')
+        fingerprint = summary['sourceFingerprint']
+        if not isinstance(fingerprint, str) or not re.fullmatch(r'fnv1a64:[a-f0-9]{16}', fingerprint):
+            raise SkillError('executionSummary.sourceFingerprint 格式无效')
+        if type(summary['reviewed']) is not bool:
+            raise SkillError('executionSummary.reviewed 必须为布尔值')
+        result['executionSummary'] = {'text': summary['text'].strip(TRIM_SPACE),
+                                      'sourceFingerprint': fingerprint, 'reviewed': summary['reviewed']}
     return result
 
 
@@ -145,7 +173,8 @@ def matching_references(skill, text):
 
 
 def metadata(skill):
-    return {key: skill[key] for key in METADATA_FIELDS}
+    return {key: list(skill[key]) if key == 'recommendedModelIds' else skill[key]
+            for key in METADATA_FIELDS}
 
 
 # This packaged snapshot is independent of the optional frontend source checkout.

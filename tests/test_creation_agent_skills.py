@@ -26,7 +26,7 @@ LOAD_URL = '/api/creation-agent/skills/'
 def skill_payload(**changes):
     return dict({'id': 'custom-guide', 'name': '自定义指南',
                  'description': '供创作使用的简介', 'instruction': '仅在载入后提供的完整指南',
-                 'triggers': [], 'autoOutputs': [], 'references': {},
+                 'triggers': [], 'autoOutputs': [], 'recommendedModelIds': [], 'references': {},
                  'referenceTriggers': {}, 'enabled': True}, **changes)
 
 
@@ -91,6 +91,64 @@ class SkillRoutesTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture
             ADMIN_URL + '/custom-guide', headers=self.headers)).status, 200)
         self.assertEqual((await self.client.delete(
             ADMIN_URL + '/missing-guide', headers=self.headers)).status, 409)
+
+    async def test_model_recommendations_publish_status_restart_revoke_restore(self):
+        proposed = skill_payload(recommendedModelIds=[' second ', 'first', 'Model', 'model', 'é', 'e\u0301'])
+        expected = skill_payload(recommendedModelIds=['second', 'first', 'Model', 'model', 'é', 'e\u0301'])
+        await self.publish(proposed)
+        self.assertEqual(skills.SkillStore(self.path).load('custom-guide'), expected)
+        self.assertEqual(json.loads(self.path.read_bytes()), {'version': 2, 'skills': [expected]})
+        listing = await (await self.client.get(ADMIN_URL)).json()
+        self.assertEqual(listing['skills'][-1], expected)
+        status = await (await self.client.get(STATUS_URL + '?projectId=admin-project')).json()
+        self.assertEqual(status['skills'][-1]['recommendedModelIds'], expected['recommendedModelIds'])
+        loaded = await (await self.client.get(LOAD_URL + 'custom-guide?projectId=admin-project')).json()
+        self.assertEqual(loaded, expected)
+        self.assertEqual((await self.client.delete(ADMIN_URL + '/custom-guide', headers=self.headers)).status, 200)
+        self.assertEqual(skills.SkillStore(self.path).list()[-1], dict(expected, enabled=False))
+        await self.publish(expected)
+        self.assertEqual(skills.SkillStore(self.path).load('custom-guide'), expected)
+
+    async def test_execution_summary_round_trip_without_metadata_or_old_data_changes(self):
+        approved = {'text': ' 已核对摘要 ', 'sourceFingerprint': 'fnv1a64:0123456789abcdef', 'reviewed': True}
+        await self.publish(skill_payload(executionSummary=approved))
+        stored = skill_payload(executionSummary=dict(approved, text='已核对摘要'))
+        self.assertEqual(skills.SkillStore(self.path).load('custom-guide'), stored)
+        self.assertEqual((await (await self.client.get(ADMIN_URL)).json())['skills'][-1], stored)
+        self.assertNotIn('executionSummary', skills.metadata(stored))
+        self.assertEqual((await (await self.client.get(
+            LOAD_URL + 'custom-guide?projectId=admin-project')).json()), stored)
+        self.assertEqual(json.loads(self.path.read_bytes())['skills'], [stored])
+        await self.publish(skill_payload())
+        self.assertNotIn('executionSummary', skills.SkillStore(self.path).load('custom-guide'))
+
+    async def test_invalid_execution_summary_rejected_without_rewriting_store(self):
+        await self.publish()
+        before = self.path.read_bytes()
+        valid = {'text': '摘要', 'sourceFingerprint': 'fnv1a64:0123456789abcdef', 'reviewed': False}
+        bad = [None, [], {}, dict(valid, extra='x'), dict(valid, text=' '),
+               dict(valid, text='😀' * 4001), dict(valid, text=1),
+               dict(valid, sourceFingerprint='fnv1a64:ABCDEF0123456789'),
+               dict(valid, sourceFingerprint='fnv1a64:1234'),
+               dict(valid, reviewed=1), dict(valid, reviewed='true')]
+        for value in bad:
+            with self.subTest(value=repr(value)[:70]):
+                await self.publish(skill_payload(executionSummary=value), expected=400)
+                self.assertEqual(self.path.read_bytes(), before)
+
+    async def test_invalid_model_recommendations_fail_without_writing(self):
+        await self.publish()
+        before = self.path.read_bytes()
+        invalid = ['model', [1], [''], [' \ufeff '], ['x' * 201], ['\0'], ['a\nb'],
+                   ['a\u200b'], [' one ', 'one'], [f'm{i}' for i in range(17)],
+                   ['😀' * 201]]
+        for models in invalid:
+            with self.subTest(models=repr(models)[:90]):
+                await self.publish(skill_payload(recommendedModelIds=models), expected=400)
+                self.assertEqual(self.path.read_bytes(), before)
+        await self.publish(skill_payload(recommendedModelIds=['x' * 200, '😀' * 200]))
+        self.assertEqual(skills.SkillStore(self.path).load('custom-guide')['recommendedModelIds'],
+                         ['x' * 200, '😀' * 200])
 
     async def test_ecmascript_whitespace_cannot_poison_shared_schema(self):
         for field in ('name', 'description', 'instruction'):
@@ -345,6 +403,9 @@ class SkillRoutesTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixture
             {'version': 2, 'skills': [skill_payload(), skill_payload()]},
             {'version': 2, 'skills': [skill_payload(references={'A.md': '', 'a.MD': ''})]},
             {'version': 2, 'skills': [skill_payload(referenceTriggers={'missing.md': []})]},
+            {'version': 2, 'skills': [skill_payload(recommendedModelIds=[' one ', 'one'])]},
+            {'version': 2, 'skills': [skill_payload(recommendedModelIds=['a\u200b'])]},
+            {'version': 2, 'skills': [skill_payload(recommendedModelIds=[f'm{i}' for i in range(17)])]},
             {'version': 1, 'skills': [skill_payload()]},
 
         ]
@@ -594,6 +655,21 @@ class SkillContractTest(unittest.TestCase):
             self.assertEqual(json.loads(path.read_bytes()), {'version': 2, 'skills': [skill_payload(name='迁移后')]})
             store.revoke('custom-guide')
             self.assertEqual(skills.SkillStore(path).list()[-1], skill_payload(name='迁移后', enabled=False))
+
+    def test_recommended_model_metadata_is_copied_and_old_entries_default_empty(self):
+        self.assertTrue(all(item['recommendedModelIds'] == [] for item in skills.BUILTIN_DEFAULTS))
+        legacy = skills.validate_skill(legacy_payload())
+        self.assertEqual(legacy['recommendedModelIds'], [])
+        item = skills.validate_skill(skill_payload(recommendedModelIds=[' first ', 'second']))
+        visible = skills.metadata(item)
+        visible['recommendedModelIds'].append('changed')
+        self.assertEqual(item['recommendedModelIds'], ['first', 'second'])
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / 'skills.json'
+            path.write_text(json.dumps({'version': 2, 'skills': [legacy_payload()]}), encoding='utf-8')
+            self.assertEqual(skills.SkillStore(path).load('custom-guide')['recommendedModelIds'], [])
+            path.write_text(json.dumps({'version': 1, 'skills': [legacy_payload()]}), encoding='utf-8')
+            self.assertEqual(skills.SkillStore(path).load('custom-guide')['recommendedModelIds'], [])
 
     def test_reference_paths_keyword_types_and_utf16_limits(self):
         invalid = [
