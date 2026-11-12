@@ -11,7 +11,9 @@ import threading
 import time
 import uuid
 from contextlib import nullcontext
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from capacity import CapacityStore
 from worker_commands import WorkerCommands
@@ -370,14 +372,61 @@ def _worker_name_key(name):
     return str(name).strip().casefold()
 
 
+def validate_worker_daily_window(window):
+    """Validate the shared API/store contract without assuming the server's timezone."""
+    if window is None:
+        return None
+    if not isinstance(window, dict) or set(window) != {"start", "end", "time_zone"}:
+        raise ValueError("daily_window 必须包含且仅包含 start、end 和 time_zone")
+    for key in ("start", "end"):
+        if not isinstance(window[key], str) or not re.fullmatch(r"(?:[01][0-9]|2[0-3]):[0-5][0-9]", window[key]):
+            raise ValueError("每日开始和结束时间必须为有效 HH:mm")
+    if window["start"] == window["end"]:
+        raise ValueError("每日开始和结束时间不能相同")
+    try:
+        if not isinstance(window["time_zone"], str) or not window["time_zone"]:
+            raise ValueError("请选择有效 IANA 时区")
+        ZoneInfo(window["time_zone"])
+    except (ValueError, ZoneInfoNotFoundError) as exc:
+        raise ValueError("请选择有效 IANA 时区（需安装 tzdata 时区数据库）") from exc
+    return dict(window)
+
+
+def _worker_daily_window(worker):
+    # Raw SQL rows and decoded worker DTOs must use identical authorization rules.
+    if "access_daily_window_json" in worker:
+        raw = worker["access_daily_window_json"]
+        if raw is None:
+            return None
+        window = json.loads(raw)
+        if window is None:
+            raise ValueError("Invalid persisted daily window")
+    else:
+        window = worker.get("access_daily_window")
+    return validate_worker_daily_window(window)
+
+
 def worker_access_team(worker, now=None):
-    """Project expired reservations as public without erasing their stored history."""
+    """Project the effective reservation; never rewrite configuration or running jobs."""
     team_id = worker.get("access_team_id")
     expires_at = worker.get("access_expires_at")
     if now is None:
         now = time.time()
     if not team_id or (expires_at is not None and expires_at <= now):
         return None
+    try:
+        window = _worker_daily_window(worker)
+        if window is not None:
+            local = datetime.fromtimestamp(now, ZoneInfo(window["time_zone"]))
+            wall_time = local.strftime("%H:%M")
+            start, end = window["start"], window["end"]
+            inside = start <= wall_time < end if start < end else wall_time >= start or wall_time < end
+            if not inside:
+                return None
+    except (ValueError, TypeError, OverflowError, OSError):
+        # Corrupt historical schedules or unavailable timezone data must not open
+        # reserved hardware to outsiders. Absolute expiration still overrides it.
+        return team_id
     return team_id
 
 
@@ -451,6 +500,7 @@ class DistributedStore:
                     last_model_family TEXT,
                     access_team_id TEXT,
                     access_expires_at REAL,
+                    access_daily_window_json TEXT,
                     sync_request_id TEXT,
                     sync_action TEXT NOT NULL DEFAULT 'sync_files',
                     sync_status TEXT NOT NULL DEFAULT 'idle',
@@ -521,6 +571,7 @@ class DistributedStore:
             sync_columns = {
                 "access_team_id": "TEXT",
                 "access_expires_at": "REAL",
+                "access_daily_window_json": "TEXT",
                 "sync_request_id": "TEXT",
                 "sync_action": "TEXT NOT NULL DEFAULT 'sync_files'",
                 "sync_status": "TEXT NOT NULL DEFAULT 'idle'",
@@ -532,11 +583,17 @@ class DistributedStore:
             for name, definition in sync_columns.items():
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE workers ADD COLUMN {name} {definition}")
+            if "access_daily_window_json" not in columns:
+                # Rebuild only these metadata indexes on upgrade, keeping the new
+                # schedule checks covered without reading large capability rows.
+                self.db.execute("DROP INDEX IF EXISTS idx_workers_poll_summary")
+                self.db.execute("DROP INDEX IF EXISTS idx_workers_access")
             # Cover hot polling fields so legacy rows need not traverse multi-MB JSON overflow pages.
             self.db.executescript("""
                 CREATE INDEX IF NOT EXISTS idx_workers_poll_summary ON workers(
                     retired, created_at DESC, id DESC, name, enabled, comfy_online, busy,
                     current_job_id, last_seen, sync_status, access_team_id, access_expires_at,
+                    access_daily_window_json,
                     json_type(COALESCE(NULLIF(capabilities_json, ''), '{}'), '$.is_primary_node') = 'true'
                 );
                 CREATE INDEX IF NOT EXISTS idx_workers_restart_expiry
@@ -544,7 +601,7 @@ class DistributedStore:
                 CREATE INDEX IF NOT EXISTS idx_workers_auth
                     ON workers(id, retired, token_hash);
                 CREATE INDEX IF NOT EXISTS idx_workers_access
-                    ON workers(id, access_team_id, access_expires_at);
+                    ON workers(id, access_team_id, access_expires_at, access_daily_window_json);
             """)
             # Upgrade pre-existing public aliases of already reserved physical hosts.
             registrations = self._worker_access_rows_locked()
@@ -561,7 +618,7 @@ class DistributedStore:
     def _worker_access_rows_locked(self):
         # Only parse identity fields; do not decode peers' large model/node inventories.
         rows = self.db.execute(
-            """SELECT id, name, access_team_id, access_expires_at,
+            """SELECT id, name, access_team_id, access_expires_at, access_daily_window_json,
                       json_extract(capabilities_json, '$.hardware.host_id') AS hardware_host_id,
                       json_extract(capabilities_json, '$.telemetry.host_id') AS telemetry_host_id,
                       json_extract(capabilities_json, '$.host_id') AS reported_host_id
@@ -603,7 +660,7 @@ class DistributedStore:
 
     def _inherit_worker_access_locked(self, scope, now):
         if not scope:
-            return None, None
+            return None, None, None
         source = scope[0]
         if len({_worker_name_key(item["name"]) for item in scope}) > 1:
             # Legacy aliases may still be public. A newer public alias must not
@@ -612,12 +669,15 @@ class DistributedStore:
             if source is None:
                 source = next((item for item in scope if item["access_team_id"]), scope[0])
         team_id, expires_at = source["access_team_id"], source["access_expires_at"]
+        window_json = source["access_daily_window_json"] if team_id else None
         self.db.executemany(
-            """UPDATE workers SET access_team_id = ?, access_expires_at = ?
-               WHERE id = ? AND (access_team_id IS NOT ? OR access_expires_at IS NOT ?)""",
-            [(team_id, expires_at, item["id"], team_id, expires_at) for item in scope],
+            """UPDATE workers SET access_team_id = ?, access_expires_at = ?, access_daily_window_json = ?
+               WHERE id = ? AND (access_team_id IS NOT ? OR access_expires_at IS NOT ?
+                                 OR access_daily_window_json IS NOT ?)""",
+            [(team_id, expires_at, window_json, item["id"], team_id, expires_at, window_json)
+             for item in scope],
         )
-        return team_id, expires_at
+        return team_id, expires_at, window_json
 
     def job_history_page(self, live_jobs, *, limit, status="all", before=None):
         """Read a bounded dispatch archive page; never restore it into the execution queue."""
@@ -698,24 +758,27 @@ class DistributedStore:
         with self.lock, self.db:
             self._begin_guarded_transaction_locked()
             scope = self._worker_access_scope_locked(name, _worker_host_id(capabilities))
-            team_id, expires_at = self._inherit_worker_access_locked(scope, now)
+            team_id, expires_at, window_json = self._inherit_worker_access_locked(scope, now)
             self.db.execute(
                 """INSERT INTO workers
                    (id, name, token_hash, last_seen, capabilities_json, created_at, updated_at,
-                    access_team_id, access_expires_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    access_team_id, access_expires_at, access_daily_window_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (worker_id, name, _hash_token(token), now,
-                 _json(capabilities or {}), now, now, team_id, expires_at),
+                 _json(capabilities or {}), now, now, team_id, expires_at, window_json),
             )
         return {"worker_id": worker_id, "worker_token": token}
 
-    def set_worker_access(self, worker_id, team_id, expires_at=None):
+    def set_worker_access(self, worker_id, team_id, expires_at=None, daily_window=None):
         if team_id is not None and (not isinstance(team_id, str) or not team_id.strip()):
             raise ValueError("team_id must be a nonempty string or None")
         if expires_at is not None and not _finite_number(expires_at):
             raise ValueError("expires_at must be a finite timestamp or None")
         if team_id is None:
             expires_at = None
+            daily_window = None
+        daily_window = validate_worker_daily_window(daily_window)
+        window_json = _json(daily_window) if daily_window is not None else None
         with self.lock, self.db:
             self._begin_guarded_transaction_locked()
             registrations = self._worker_access_rows_locked()
@@ -725,9 +788,10 @@ class DistributedStore:
             scope = self._worker_access_scope_locked(target["name"], target["host_id"], registrations)
             now = time.time()
             self.db.executemany(
-                """UPDATE workers SET access_team_id = ?, access_expires_at = ?, updated_at = ?
+                """UPDATE workers SET access_team_id = ?, access_expires_at = ?,
+                                      access_daily_window_json = ?, updated_at = ?
                    WHERE id = ?""",
-                [(team_id, expires_at, now, item["id"]) for item in scope],
+                [(team_id, expires_at, window_json, now, item["id"]) for item in scope],
             )
         return True
 
@@ -738,7 +802,7 @@ class DistributedStore:
         now = time.time()
         with self.lock:
             rows = self.db.execute(
-                "SELECT id, access_team_id, access_expires_at FROM workers"
+                "SELECT id, access_team_id, access_expires_at, access_daily_window_json FROM workers"
             ).fetchall()
         return {row["id"] for row in rows
                 if not worker_access_allowed(dict(row), team_ids, now)}
@@ -1465,13 +1529,14 @@ class DistributedStore:
             ).fetchall()
         return {row["job_id"]: row["name"] for row in rows}
 
-    def list_workers(self, *, summary=False, telemetry_only=False, worker_id=None):
+    def list_workers(self, *, summary=False, telemetry_only=False, worker_id=None, access_config=False):
+        """Default to effective scope; admins may retain unexpired configuration for editing."""
         now = time.time()
         columns = "*"
         if summary or telemetry_only:
             # 轮询只取所需字段，避免把每台数 MB 的节点/模型清单解码成 Python 对象。
             columns = """id, name, enabled, comfy_online, busy, current_job_id,
-                         last_seen, sync_status, access_team_id, access_expires_at,
+                         last_seen, sync_status, access_team_id, access_expires_at, access_daily_window_json,
                          json_type(COALESCE(NULLIF(capabilities_json, ''), '{}'),
                                    '$.is_primary_node') = 'true' AS is_primary_node"""
             if telemetry_only and not summary:
@@ -1523,7 +1588,15 @@ class DistributedStore:
             item = dict(row)
             item.pop("token_hash", None)
             item.pop("retired", None)
-            item["access_team_id"] = worker_access_team(item, now)
+            if (not access_config or (item["access_expires_at"] is not None
+                                      and item["access_expires_at"] <= now)):
+                item["access_team_id"] = worker_access_team(item, now)
+            try:
+                item["access_daily_window"] = _worker_daily_window(item)
+            except (ValueError, TypeError):
+                # Malformed schedules remain all-day restricted, never public.
+                item["access_daily_window"] = None
+            item.pop("access_daily_window_json", None)
             if item["access_team_id"] is None:
                 item["access_expires_at"] = None
             item["enabled"] = bool(item["enabled"])
@@ -1691,7 +1764,8 @@ class DistributedStore:
                                 seen_names.add(name_key)
                                 latest_ids.add(registration["id"])
                         others = self.db.execute(
-                            """SELECT id, capabilities_json, sync_status, access_team_id, access_expires_at
+                            """SELECT id, capabilities_json, sync_status, access_team_id, access_expires_at,
+                                      access_daily_window_json
                                FROM workers
                                WHERE id != ? AND retired = 0 AND enabled = 1 AND comfy_online = 1
                                  AND busy = 0 AND current_job_id IS NULL

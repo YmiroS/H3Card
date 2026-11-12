@@ -11,7 +11,7 @@ from PIL import Image, ImageOps
 
 from . import cloud_banana, cloud_images
 from .cloud_lighting import CloudLighting
-from .image_controls import RATIOS, CLARITIES
+from .image_controls import RATIOS, CLARITIES, bounded_dimensions
 
 
 CAPABILITIES = {
@@ -19,6 +19,20 @@ CAPABILITIES = {
     "banana_api_i2i": ("banana", True),
     "gpt_image_api_t2i": ("gpt_image", False),
     "gpt_image_api_i2i": ("gpt_image", True),
+    "gpt_image_api_2_t2i": ("gpt_image", False),
+    "gpt_image_api_2_i2i": ("gpt_image", True),
+    "gpt_image_api_26_t2i": ("gpt_image", False),
+    "gpt_image_api_26_i2i": ("gpt_image", True),
+}
+
+# Trusted server-side selection, never taken from HTTP params or global config.model.
+GPT_IMAGE_MODELS = {
+    "gpt_image_api_t2i": "gpt-image-2.5-sunburst",
+    "gpt_image_api_i2i": "gpt-image-2.5-sunburst",
+    "gpt_image_api_2_t2i": "gpt-image-2",
+    "gpt_image_api_2_i2i": "gpt-image-2",
+    "gpt_image_api_26_t2i": "gpt-image-2.6-sunburst",
+    "gpt_image_api_26_i2i": "gpt-image-2.6-sunburst",
 }
 
 
@@ -28,25 +42,12 @@ def generation_dimensions(params, needs_images, info=None):
     if not isinstance(ratio, str) or ratio not in RATIOS + (("original",) if needs_images else ()):
         raise web.HTTPBadRequest(text="画面比例无效")
     if not isinstance(clarity, str) or clarity not in CLARITIES:
-        raise web.HTTPBadRequest(text="清晰度只支持 480P、720P、1080P、1440P 或 2K")
+        raise web.HTTPBadRequest(text="清晰度只支持 480P、720P、1080P、1440P、2K 或 4K")
     w, h = (info["width"], info["height"]) if ratio == "original" else map(int, ratio.split(":"))
     scale = CLARITIES[clarity] / min(w, h)
     width = max(16, math.floor(w * scale / 16 + .5) * 16)
     height = max(16, math.floor(h * scale / 16 + .5) * 16)
     return ratio, clarity, bounded_dimensions(width, height)
-
-
-def bounded_dimensions(width, height):
-    if width * height > cloud_images.MAX_PIXELS:
-        scale = math.sqrt(cloud_images.MAX_PIXELS / (width * height))
-        width = max(16, math.floor(width * scale / 16) * 16)
-        height = max(16, math.floor(height * scale / 16) * 16)
-        if width * height > cloud_images.MAX_PIXELS:
-            if width >= height:
-                width = cloud_images.MAX_PIXELS // height // 16 * 16
-            else:
-                height = cloud_images.MAX_PIXELS // width // 16 * 16
-    return width, height
 
 
 def resize_image(data, size, *, crop=False):
@@ -83,7 +84,7 @@ class CloudGeneration(CloudLighting):
         if not isinstance(params, dict) or not isinstance(assets, dict):
             raise web.HTTPBadRequest(text="生图参数与素材必须为对象")
         prompt = params.get("prompt")
-        prompt_limit = 32000 if cap["id"] == "gpt_image_api_t2i" else 20000
+        prompt_limit = 32000 if provider == "gpt_image" and not needs_images else 20000
         if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= prompt_limit:
             raise web.HTTPBadRequest(text=f"生图提示词不能为空，且不得超过 {prompt_limit} 字符")
         count = len(assets)
@@ -123,7 +124,7 @@ class CloudGeneration(CloudLighting):
         await self.call_store(self.app, "register_job", pid, project_id, user["id"])
         await self.resource_call(self.app, "register_job_inputs", pid, inputs)
         job = {"id": pid, "capability": cap["id"], "name": cap["name"],
-               "modelName": config["banana_model" if provider == "banana" else "model"],
+               "modelName": config["banana_model"] if provider == "banana" else GPT_IMAGE_MODELS[cap["id"]],
                "execution": "cloud_image", "billingMode": "paid_api", "provider": provider,
                "outputType": "image", "status": "queued", "progress": 0.0,
                "created": time.time(), "seed": None, "step": "等待付费 API 生图",
@@ -157,10 +158,12 @@ class CloudGeneration(CloudLighting):
                     text_only=not images, output_size=tuple(map(int, job["requested_size"].split("x"))), **identity)
             elif images:
                 result = await cloud_images.edit(self.app["session"], images, prompt,
-                                                 size=job["requested_size"], quality=job["quality"], **identity)
+                                                 size=job["requested_size"], quality=job["quality"],
+                                                 model=job["modelName"], **identity)
             else:
                 result = await cloud_images.generate(self.app["session"], prompt,
-                                                     size=job["requested_size"], quality=job["quality"], **identity)
+                                                     size=job["requested_size"], quality=job["quality"],
+                                                     model=job["modelName"], **identity)
             job.update(request_id=result["request_id"], modelName=result["model"])
             if "image_bytes" not in result:
                 raise cloud_images.ImageEditError(

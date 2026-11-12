@@ -1,0 +1,14 @@
+{
+ "id": "gpt_image_api_2_t2i",
+ "name": "GPT Image 2 · 付费 API 文生图",
+ "group": "图片", "outputType": "image", "kind": "gen", "card": "image",
+ "execution": "cloud_image", "billingMode": "paid_api", "cloudProvider": "gpt_image",
+ "modelName": "gpt-image-2", "parameterPanel": "paid-image",
+ "imageControls": {"mode": "t2i", "defaultRatio": "3:4", "defaultClarity": "720P"},
+ "slots": "img0+aud0+vid0", "images": 0, "audios": 0, "videos": 0,
+ "slotLimits": {"image": {"min": 0, "max": 0}, "audio": {"min": 0, "max": 0}, "video": {"min": 0, "max": 0}},
+ "note": "付费 API：请求按服务商计费，失败/超时不自动重试。通过画面比例和短边清晰度设置尺寸，输入与成品均按 16 像素对齐；云端尺寸不符时本地适配，不代表原生画质提升。",
+ "inputs": [
+  {"key": "prompt", "label": "提示词", "type": "textarea", "required": true, "default": "", "maxLength": 32000}
+ ], "warnings": []
+}

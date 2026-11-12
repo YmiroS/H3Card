@@ -53,7 +53,7 @@ from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
     MAX_4090_HIGH_QUALITY_DURATION_SECONDS, TEMPERATURE_MAX_GPU_INDEX, WorkerBusyError,
     BF16_HIGH_VRAM_CAPABILITIES, can_run_capability, is_pro_6000_worker, worker_capability_comparisons,
-    is_windows_worker, generation_worker_reason, worker_access_allowed,
+    is_windows_worker, generation_worker_reason, worker_access_allowed, validate_worker_daily_window,
 )
 from video_preview import MediaThumbnails, VideoPreviews, preview_status, preview_file
 from if_reference import IFReferenceCopies
@@ -2864,17 +2864,17 @@ async def api_workers(request):
     def encode_workers():
         if worker_id is not None:
             with store.lock:
-                workers = store.list_workers(worker_id=worker_id)
+                workers = store.list_workers(worker_id=worker_id, access_config=True)
                 if not workers:
                     raise web.HTTPNotFound(text="Worker 不存在或已被新的注册替代")
-                primary = [item for item in store.list_workers(summary=True)
+                primary = [item for item in store.list_workers(summary=True, access_config=True)
                            if item["is_primary_node"] and item["id"] != worker_id]
                 for item in primary:
-                    workers.extend(store.list_workers(worker_id=item["id"]))
+                    workers.extend(store.list_workers(worker_id=item["id"], access_config=True))
             baseline, workers = worker_capability_comparisons(workers)
             workers = [item for item in workers if item["id"] == worker_id]
         else:
-            baseline, workers = worker_capability_comparisons(store.list_workers())
+            baseline, workers = worker_capability_comparisons(store.list_workers(access_config=True))
         if summary:
             fields = ("agent_version", "supports_code_restart", "supports_service_restart",
                       "supports_host_reboot", "remote_commands", "telemetry", "devices",
@@ -2911,9 +2911,16 @@ async def api_worker_access(request):
         body = await request.json()
     except (ValueError, UnicodeError) as exc:
         raise web.HTTPBadRequest(text="请求体必须为 JSON 对象") from exc
-    if not isinstance(body, dict) or set(body) != {"team_id", "expires_at"}:
-        raise web.HTTPBadRequest(text="请求体只能包含 team_id 和 expires_at")
+    if (not isinstance(body, dict) or not {"team_id", "expires_at"} <= set(body)
+            or set(body) - {"team_id", "expires_at", "daily_window"}):
+        raise web.HTTPBadRequest(text="请求体必须包含 team_id 和 expires_at，仅可选填 daily_window")
     team_id, expires_at = body["team_id"], body["expires_at"]
+    try:
+        daily_window = validate_worker_daily_window(body.get("daily_window"))
+    except ValueError as exc:
+        raise web.HTTPBadRequest(text=str(exc)) from exc
+    if team_id is None and daily_window is not None:
+        raise web.HTTPBadRequest(text="公共设备不设置每日专用时间段")
     if team_id is not None:
         if not isinstance(team_id, str) or not team_id or len(team_id) > 128:
             raise web.HTTPBadRequest(text="请选择有效项目组")
@@ -2926,11 +2933,12 @@ async def api_worker_access(request):
             raise web.HTTPBadRequest(text="结束时间必须为未来的有效时间，公共设备不设置结束时间")
     worker_id = request.match_info["worker_id"]
     updated = await asyncio.to_thread(
-        distributed_store(request.app).set_worker_access, worker_id, team_id, expires_at)
+        distributed_store(request.app).set_worker_access, worker_id, team_id, expires_at, daily_window)
     if not updated:
         raise web.HTTPNotFound(text="Worker 不存在")
     return web.json_response({"ok": True, "worker_id": worker_id,
-                              "access_team_id": team_id, "access_expires_at": expires_at},
+                              "access_team_id": team_id, "access_expires_at": expires_at,
+                              "access_daily_window": daily_window},
                              headers={"Cache-Control": "no-store"})
 
 
@@ -3343,7 +3351,8 @@ def validate_director(document):
                 raise web.HTTPBadRequest(text="关联卡片素材不正确")
             for key, value in settings["params"].items():
                 text_limit = (32_000 if stage == "image" and key == "prompt"
-                              and settings["capability"] == "gpt_image_api_t2i" else 20_000)
+                              and CLOUD_GENERATION_CAPABILITIES.get(settings["capability"])
+                              == ("gpt_image", False) else 20_000)
                 if (len(key) > 128 or not isinstance(value, (str, int, float, bool))
                         or isinstance(value, str) and len(value) > text_limit
                         or isinstance(value, float) and not math.isfinite(value)):

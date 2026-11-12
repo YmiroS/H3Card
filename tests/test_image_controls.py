@@ -1,5 +1,6 @@
 import copy
 import json
+import math
 import sys
 import unittest
 from pathlib import Path
@@ -48,7 +49,12 @@ def expected_dimensions(ratio, pixels):
     # Integer half-up arithmetic provides an independent rounding oracle.
     long = ((2 * pixels * max(w, h) + 16 * min(w, h)) // (32 * min(w, h))) * 16
     short = ((pixels + 8) // 16) * 16
-    return (long, short) if w >= h else (short, long)
+    width, height = (long, short) if w >= h else (short, long)
+    if width * height > 32_000_000:
+        # Independent integer-square-root oracle for the bounded aligned sides.
+        width, height = (math.isqrt(32_000_000 * width // height) // 16 * 16,
+                         math.isqrt(32_000_000 * height // width) // 16 * 16)
+    return width, height
 
 
 def depends_on(graph, value, source):
@@ -79,7 +85,7 @@ class ImageControlsTest(unittest.TestCase):
         self.assertEqual(RATIOS, ("1:1", "1:2", "2:1", "9:16", "16:9", "3:4", "4:3",
                                   "3:2", "2:3", "5:4", "4:5", "21:9", "9:21"))
         self.assertEqual(CLARITIES, {"480P": 480, "720P": 720, "1080P": 1080,
-                                    "1440P": 1440, "2K": 2048})
+                                    "1440P": 1440, "2K": 2048, "4K": 4096})
         for cid in CAP_IDS:
             mode = cid.rsplit("_", 1)[1]
             self.assertEqual(image_controls(cid), {
@@ -119,7 +125,7 @@ class ImageControlsTest(unittest.TestCase):
             graph = app.patch_graph(capability(cid), {"seed": 123, "negative_prompt": ""}, ASSETS)
             self.assertEqual(graph[source]["inputs"][field], "", cid)
 
-    def test_all_eight_capabilities_five_clarities_thirteen_ratios(self):
+    def test_all_eight_capabilities_six_clarities_thirteen_ratios(self):
         for cid in CAP_IDS:
             cap = capability(cid)
             baseline = app.patch_graph(cap, {"seed": 123}, ASSETS)
@@ -145,6 +151,7 @@ class ImageControlsTest(unittest.TestCase):
                             actual_height = inputs["proportional_height"]
                         self.assertEqual(actual_width % 16, 0)
                         self.assertEqual(actual_height % 16, 0)
+                        self.assertLessEqual(actual_width * actual_height, 32_000_000)
                         self.assert_only_sizing_changed(baseline, graph, cid)
 
     def test_half_up_ties_and_transpose(self):
@@ -292,7 +299,9 @@ class ImageControlsRuntimeTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
         caps = (await response.json())["capabilities"]
         native_caps = {cid: cap for cid, cap in caps.items()
                        if cap.get("execution") != "if_studio"}
-        paid_ids = {"banana_api_t2i", "banana_api_i2i", "gpt_image_api_t2i", "gpt_image_api_i2i"}
+        paid_ids = {"banana_api_t2i", "banana_api_i2i", "gpt_image_api_t2i", "gpt_image_api_i2i",
+                    "gpt_image_api_2_t2i", "gpt_image_api_2_i2i",
+                    "gpt_image_api_26_t2i", "gpt_image_api_26_i2i"}
         self.assertEqual({cid for cid, cap in native_caps.items() if "imageControls" in cap},
                          set(CAP_IDS) | paid_ids)
         for cid in paid_ids:

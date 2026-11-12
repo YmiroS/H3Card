@@ -133,8 +133,12 @@ def decode_result(payload, request_id, model):
     raise ImageEditError("云端结果缺少 b64_json 或 url", request_id=request_id)
 
 
-async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=None, quality=None):
+async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=None, quality=None,
+               model=None):
     config = load()
+    # Internal capability routing only; callers without a model retain admin configuration.
+    if model is not None:
+        config = {**config, "model": model}
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 20000:
         raise ImageEditError("图片编辑提示词不能为空，且不得超过 20000 字符", status=400)
     if not isinstance(images, (list, tuple)) or not 1 <= len(images) <= 8:
@@ -160,8 +164,10 @@ async def edit(session, images, prompt, *, end_user_name, end_user_phone, size=N
 
 
 async def generate(session, prompt, *, end_user_name, end_user_phone,
-                   size="1024x1024", quality="high"):
+                   size="1024x1024", quality="high", model=None):
     config = load()
+    if model is not None:
+        config = {**config, "model": model}
     if not isinstance(prompt, str) or not 1 <= len(prompt.strip()) <= 32000:
         raise ImageEditError("生图提示词不能为空，且不得超过 32000 字符", status=400)
     dimensions = re.fullmatch(r"([1-9]\d{0,6})x([1-9]\d{0,6})", size) if isinstance(size, str) else None

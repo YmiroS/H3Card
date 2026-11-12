@@ -14,6 +14,10 @@ IMAGE_API_MODELS = {
     "banana_api_i2i": ("gemini-3-pro-image", "gemini"),
     "gpt_image_api_t2i": ("gpt-image-2.5-sunburst", "openai"),
     "gpt_image_api_i2i": ("gpt-image-2.5-sunburst", "openai"),
+    "gpt_image_api_2_t2i": ("gpt-image-2", "openai"),
+    "gpt_image_api_2_i2i": ("gpt-image-2", "openai"),
+    "gpt_image_api_26_t2i": ("gpt-image-2.6-sunburst", "openai"),
+    "gpt_image_api_26_i2i": ("gpt-image-2.6-sunburst", "openai"),
 }
 
 
