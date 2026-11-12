@@ -1,6 +1,6 @@
 {
  "id": "youku_sr_video",
- "name": "参考图视频超分",
+ "name": "超分（视频）",
  "execution": "remote_sr",
  "group": "视频",
  "kind": "tool",

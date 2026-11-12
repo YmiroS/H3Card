@@ -1,6 +1,6 @@
 {
  "id": "image_color_match",
- "name": "参考图校色（图片）",
+ "name": "自动校色（图片）",
  "file": "image_color_match",
  "source": "graphs/image_color_match.api.json",
  "group": "图片",

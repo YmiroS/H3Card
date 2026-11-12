@@ -5194,7 +5194,7 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
         card = next(item for item in payload["cards"] if item["id"] == "card_tools")
         modes = {mode["id"]: mode for mode in card["modes"]}
         self.assertEqual(modes["color_grade"], {
-            "id": "color_grade", "name": "图片调色", "slots": "img1+aud0+vid0"})
+            "id": "color_grade", "name": "调色（图片）", "slots": "img1+aud0+vid0"})
         response = await self.client.post("/api/generate", json={
             "project": "p", "capability": "color_grade", "dry_run": True})
         self.assertEqual(response.status, 400)
@@ -5210,7 +5210,7 @@ class BrowserCapabilityApiTest(unittest.IsolatedAsyncioTestCase, auth_support.Au
         card = next(item for item in payload["cards"] if item["id"] == "card_tools")
         modes = {mode["id"]: mode for mode in card["modes"]}
         self.assertEqual(modes["video_color_grade"], {
-            "id": "video_color_grade", "name": "视频调色", "slots": "img0+aud0+vid1"})
+            "id": "video_color_grade", "name": "调色（视频）", "slots": "img0+aud0+vid1"})
         response = await self.client.post("/api/generate", json={
             "project": "p", "capability": "video_color_grade", "dry_run": True})
         self.assertEqual(response.status, 400)
