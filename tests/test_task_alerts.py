@@ -206,6 +206,77 @@ class AlertServiceTest(unittest.IsolatedAsyncioTestCase):
         await self.service.run_once()
         self.service.client.deliver_task_alert.assert_awaited_once()
 
+    async def test_remote_sr_waits_until_strictly_after_sixty_minutes(self):
+        self.app['distributed'] = MagicMock()
+        job = self.jobs['job']
+        self.jobs = {
+            'by-execution': dict(job, id='by-execution', execution='remote_sr', name='远程超分任务'),
+            'by-executor': dict(job, id='by-executor', executor='remote_sr', name='已改名任务'),
+            'fallback': dict(job, id='fallback', execution='', executor='remote_sr'),
+        }
+        for elapsed in (2100, 2100.001, 2101, 3599, 3600):
+            with self.subTest(elapsed=elapsed), patch(
+                    'server.task_alerts.time.time', return_value=START + elapsed):
+                await self.service.run_once()
+                self.assertEqual(self.service.store.active(), [])
+        self.service.client.deliver_task_alert.assert_not_awaited()
+        with patch('server.task_alerts.time.time', return_value=START + 3600.001):
+            for job in self.jobs.values():
+                job['status'] = 'queued'
+            await self.service.run_once()
+            self.assertEqual(self.service.store.active(), [])
+            for job in self.jobs.values():
+                job['status'] = 'running'
+            await self.service.run_once()
+            self.assertEqual(self.service.client.deliver_task_alert.await_count, len(self.jobs))
+            for job_id in self.jobs:
+                with self.subTest(job_id=job_id):
+                    row = self.service.store.get(job_id)
+                    self.assertEqual(row['threshold_minutes'], 60)
+                    self.assertEqual(row['worker_name'], '远程超分服务')
+                    self.assertEqual(row['started_at'], START)
+                    self.assertFalse(row['restart_enabled'])
+                    code, body = await self.service.process_callback(callback(row))
+                    self.assertEqual(code, 200)
+                    params = body['cardData']['cardParamMap']
+                    self.assertEqual(params['title'], '生成任务运行超过 60 分钟')
+                    self.assertEqual(params['restartEnabled'], 'false')
+                    self.assertIsNone(self.service.store.get(job_id)['request_id'])
+            self.app['distributed'].job_execution.assert_not_called()
+            self.app['distributed'].request_alert_restart.assert_not_called()
+            self.service.store.close()
+            self.service.store = TaskAlertStore(self.service.path)
+            await self.service.run_once()
+            self.assertEqual(self.service.client.deliver_task_alert.await_count, len(self.jobs))
+            self.service.client.update_task_alert.assert_not_awaited()
+            for job in self.jobs.values():
+                job['status'] = 'done'
+            await self.service.run_once()
+        self.assertEqual(self.service.client.update_task_alert.await_count, len(self.jobs))
+        for call in self.service.client.update_task_alert.await_args_list:
+            row = call.args[1]
+            self.assertEqual(row['threshold_minutes'], 60)
+            self.assertEqual(row['status'], 'expired')
+
+    async def test_non_remote_sr_keeps_thirty_five_minutes_despite_remote_sr_name(self):
+        job = self.jobs['job']
+        executions = (
+            ('cloud_image', None), ('local', None), (None, None),
+            ('remote_sr_extra', None), (None, 'remote_sr_extra'),
+            ('cloud_image', 'remote_sr'), ('local', 'remote_sr'),
+        )
+        self.jobs = {f'job-{index}': dict(job, id=f'job-{index}', execution=execution,
+                                        executor=executor, name='远程超分服务')
+                     for index, (execution, executor) in enumerate(executions)}
+        with patch('server.task_alerts.time.time', return_value=START + THRESHOLD_SECONDS):
+            await self.service.run_once()
+        self.assertEqual(self.service.store.active(), [])
+        await self.service.run_once()
+        self.assertEqual(self.service.client.deliver_task_alert.await_count, len(executions))
+        for job_id in self.jobs:
+            with self.subTest(job_id=job_id):
+                self.assertEqual(self.service.store.get(job_id)['threshold_minutes'], 35)
+
     async def test_fusion_v3_waits_until_strictly_after_sixty_minutes(self):
         self.use_worker()
         self.jobs['job'].update(capability='minimax_h3_fusion_v3', name='已重命名的V3任务',

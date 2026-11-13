@@ -318,6 +318,7 @@ class TaskAlertService:
                 continue
             started = _timestamp(execution.get('started_at'))
             threshold_minutes = (60 if job.get('capability') == 'minimax_h3_fusion_v3'
+                                 or (job.get('execution') or job.get('executor')) == 'remote_sr'
                                  else THRESHOLD_SECONDS // 60)
             if started is None or now - started <= threshold_minutes * 60:
                 continue
