@@ -168,12 +168,11 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.status, 200)
         self.assertEqual(len(self.calls), 1)
 
-    async def test_single_image_over_five_mib_within_total_limit(self):
+    async def test_single_image_over_five_mib(self):
         output = BytesIO()
         Image.frombytes('RGB', (1500, 1500), os.urandom(1500 * 1500 * 3)).save(output, format='PNG')
         data = output.getvalue()
         self.assertGreater(len(data), 5 * 1024 * 1024)
-        self.assertLess(len(data), cloud_chat.MAX_TOTAL_IMAGE_BYTES)
         url = 'data:image/png;base64,' + base64.b64encode(data).decode()
         response = await self.post({'messages': [{'role': 'user', 'content': [
             {'type': 'image_url', 'image_url': {'url': url}}]}]})
@@ -237,18 +236,26 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(response.status, 503)
         self.assertEqual(len(self.calls), 1)
 
-    async def test_image_count_and_bytes(self):
+    async def test_more_than_eight_images_and_thirty_two_content_parts(self):
         output = BytesIO()
         Image.new('RGB', (2, 2)).save(output, format='PNG')
         data = output.getvalue()
         part = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(data).decode()}}
-        body = {'messages': [{'role': 'user', 'content': [part] * 9}]}
+        parts = [{'type': 'text', 'text': '参考图片'}, part] * 20
+        body = {'messages': [{'role': 'user', 'content': parts}]}
         response = await self.post(body)
-        self.assertEqual(response.status, 413)
-        with mock.patch.object(cloud_chat, 'MAX_TOTAL_IMAGE_BYTES', len(data) - 1):
-            response = await self.post({'messages': [{'role': 'user', 'content': [part]}]})
-            self.assertEqual(response.status, 413)
-        self.assertEqual(self.calls, [])
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.calls[0][0]['messages'], body['messages'])
+
+    async def test_image_larger_than_fifteen_mib_within_transport_budget(self):
+        output = BytesIO()
+        Image.new('RGB', (2, 2)).save(output, format='PNG')
+        data = output.getvalue() + b'\0' * (15 * 1024 * 1024)
+        self.assertGreater(len(data), 15 * 1024 * 1024)
+        part = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(data).decode()}}
+        response = await self.post({'messages': [{'role': 'user', 'content': [part]}]})
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(len(self.calls), 1)
 
     async def test_timeout_settings(self):
         session = mock.Mock()

@@ -1,0 +1,8 @@
+export function avatarKeyChannels(snapshot,joint,all=false){
+ const prefix=snapshot.anatomical?(joint?.startsWith('l')?'Left':'Right'):(joint?.startsWith('l')?'Right':'Left');
+ const suffix=joint?.slice(1),groups={s:['Shoulder','Arm','ForeArm','Hand'],e:['Arm','ForeArm'],w:['Arm','ForeArm','Hand'],h:['Hand'],t:['Foot','ToeBase'],hip:['UpLeg','Leg','Foot'],k:['UpLeg','Leg'],a:['UpLeg','Leg','Foot']};let names;
+ const lowerBody=['Hips','LumbarBase','LumbarBend','Spine','Spine1','Spine2',...['Left','Right'].flatMap(s=>[s+'UpLeg',s+'Leg',s+'Foot'])].map(n=>'mixamorig'+n);
+ if(all)names=Object.keys(snapshot.local_rotations||{});else if(joint==='whole')names=['mixamorigHips'];else if(joint==='pelvis')names=lowerBody;else if(joint==='waist')names=['mixamorigSpine'];else if(joint==='chest')names=['mixamorigSpine','mixamorigSpine1','mixamorigSpine2'];else if(joint==='neck')names=['Spine','Spine1','Spine2','Neck'].map(n=>'mixamorig'+n);else if(joint==='head'||joint==='nose')names=['mixamorigNeck','mixamorigHead'];else{names=(groups[suffix]||[]).map(n=>'mixamorig'+prefix+n);if(suffix==='hip')names=lowerBody;}
+ const channels=names.filter(n=>snapshot.local_rotations?.[n]).map(name=>({id:'avatar:'+name,label:name,kind:'avatar',meta:{bone:name,anatomical:snapshot.anatomical},value:{quaternion:snapshot.local_rotations[name],...(name==='mixamorigHips'?{position:snapshot.hip_position_local,pelvis_frame:snapshot.pelvis_frame_local}:{})}}));
+ if(all)channels.push({id:'avatar:display',label:'人体整体缩放',kind:'avatar-scale',meta:{},value:{display_scale:snapshot.display_scale||1}});return channels;
+}

@@ -1,0 +1,5 @@
+MediaPipe Tasks Vision 0.10.14
+Copyright Google LLC. Apache License 2.0.
+Official distribution: https://www.npmjs.com/package/@mediapipe/tasks-vision/v/0.10.14
+License: https://www.apache.org/licenses/LICENSE-2.0
+The unmodified vision_bundle.cjs is served with a .js extension for classic Web Worker MIME compatibility.

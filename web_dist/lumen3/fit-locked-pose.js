@@ -1,0 +1,10 @@
+import * as T from 'three';
+export function fitPoseInCurrentCamera({robot,joints,points,camera,moveRoot,iterations=4}){
+ const entries=Object.entries(points).filter(([k,p])=>joints[k]&&p.source!=='visible_hip_midpoint'&&p.visibility>=.35&&[p.u,p.v].every(Number.isFinite)),complete=['l','r'].some(side=>['s','e','w'].every(s=>entries.some(([k])=>k===side+s)));
+ if(entries.length<5&&!complete)throw new Error('请确认至少 5 个标记点，或完整的肩、肘、腕 3 点。');
+ const project=p=>{const v=p.clone().project(camera);return{u:(v.x+1)/2,v:(1-v.y)/2};};
+ const anchors=entries.filter(([k])=>['head','neck','pelvis','ls','rs','lhip','rhip'].includes(k));
+ if(anchors.length>=3&&moveRoot){const ratios=[];for(let i=0;i<anchors.length;i++)for(let j=i+1;j<anchors.length;j++){const[a,p]=anchors[i],[b,q]=anchors[j],x=project(joints[a].position),y=project(joints[b].position),target=Math.hypot((p.u-q.u)*camera.aspect,p.v-q.v),current=Math.hypot((x.u-y.u)*camera.aspect,x.v-y.v);if(target>.035&&current>.015)ratios.push(current/target);}ratios.sort((a,b)=>a-b);const ratio=T.MathUtils.clamp(ratios.length?ratios[Math.floor(ratios.length/2)]:1,.3,3),center=new T.Vector3(),uv={u:0,v:0};for(const[k,p]of anchors){center.add(joints[k].position);uv.u+=p.u;uv.v+=p.v;}center.multiplyScalar(1/anchors.length);uv.u/=anchors.length;uv.v/=anchors.length;const depth=-camera.worldToLocal(center.clone()).z;if(depth>.1){const forward=camera.getWorldDirection(new T.Vector3()),ray=new T.Vector3(uv.u*2-1,1-uv.v*2,.5).unproject(camera).sub(camera.position).normalize(),denominator=ray.dot(forward);if(denominator>.05){const target=camera.position.clone().addScaledVector(ray,T.MathUtils.clamp(depth*ratio,.15,500)/denominator);moveRoot(target.sub(center));}}}
+ const valid=Object.fromEntries(entries);if(entries.length>=5){for(let i=0;i<iterations;i++)robot.refine(valid,camera,{lockTorso:false,lockHead:false});}else robot.refineArms(valid,camera);
+ let sum=0;for(const[k,p]of entries){const v=project(joints[k].position);sum+=((v.u-p.u)*camera.aspect)**2+(v.v-p.v)**2;}return{count:entries.length,rms:Math.sqrt(sum/entries.length),camera_locked:true};
+}

@@ -13,7 +13,6 @@ from aiohttp import web
 from . import cloud_images, provider_billing
 
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
-MAX_TOTAL_IMAGE_BYTES = 15 * 1024 * 1024
 MAX_TEXT_CHARS = 100_000
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
@@ -54,9 +53,10 @@ def load():
     return config
 
 
-def validate(body):
+def validate(body, *, allow_local_images=False):
     def invalid():
-        raise ChatError("聊天输入无效：仅接受 messages、布尔型 stream、文本及 base64 data URL 静态图片", status=400)
+        images = "base64 data URL 或画布资源 URL 静态图片" if allow_local_images else "base64 data URL 静态图片"
+        raise ChatError("聊天输入无效：仅接受 messages、布尔型 stream、文本及 " + images, status=400)
 
     if (not isinstance(body, dict) or not {"messages"} <= set(body) <= {"messages", "stream"}
             or ("stream" in body and type(body["stream"]) is not bool)):
@@ -64,7 +64,7 @@ def validate(body):
     messages = body["messages"]
     if not isinstance(messages, list) or not 1 <= len(messages) <= 100:
         invalid()
-    text_chars = image_bytes = image_count = 0
+    text_chars = 0
     for message in messages:
         if (not isinstance(message, dict) or set(message) != {"role", "content"}
                 or message["role"] not in ("system", "user", "assistant")):
@@ -74,7 +74,7 @@ def validate(body):
             if not content.strip():
                 invalid()
             text_chars += len(content)
-        elif isinstance(content, list) and 1 <= len(content) <= 32:
+        elif isinstance(content, list) and content:
             for part in content:
                 if not isinstance(part, dict):
                     invalid()
@@ -91,8 +91,13 @@ def validate(body):
                     value = image["url"]
                     if not isinstance(value, str):
                         invalid()
-                    if len(value) > 4 * ((MAX_TOTAL_IMAGE_BYTES + 2) // 3) + 32:
-                        raise ChatError("聊天图片总计不得超过 15 MiB", status=413)
+                    if allow_local_images and value.startswith('/api/'):
+                        from .creation_agent_images import local_image_reference
+                        try:
+                            local_image_reference(value)
+                        except ValueError:
+                            invalid()
+                        continue
                     match = re.fullmatch(r"data:(image/(?:png|jpeg|webp));base64,([A-Za-z0-9+/]*={0,2})", value)
                     if not match:
                         invalid()
@@ -100,10 +105,6 @@ def validate(body):
                         data = base64.b64decode(match[2], validate=True)
                     except (ValueError, binascii.Error):
                         invalid()
-                    image_count += 1
-                    image_bytes += len(data)
-                    if image_bytes > MAX_TOTAL_IMAGE_BYTES or image_count > 8:
-                        raise ChatError("聊天图片超限：总计 15 MiB，最多 8 张", status=413)
                     try:
                         info = cloud_images.inspect_image(data)
                     except cloud_images.ImageEditError:

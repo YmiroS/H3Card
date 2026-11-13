@@ -1,0 +1,14 @@
+import * as T from 'three';
+import {lightHelperGeometry,createLightIcon} from './helper-shapes.js?v=45';
+import {pointRange} from './light-types.js?v=45';
+export function createLightRig(scene,helpers,lamps,{tint,aim}){
+ const objects=[];
+ function point(){const p=new T.PointLight();p.visible=false;p.shadow.mapSize.set(512,512);p.shadow.camera.near=.03;p.shadow.camera.far=35;p.shadow.bias=-.0005;p.shadow.normalBias=.015;scene.add(p);return p;}
+ function create(i){const h=createLightIcon();h.userData.light=i;helpers.add(h);const samples=Array.from({length:4},point),omni=point(),directional=new T.DirectionalLight();directional.visible=false;directional.shadow.mapSize.set(1024,1024);Object.assign(directional.shadow.camera,{left:-4,right:4,top:4,bottom:-4});directional.shadow.normalBias=.015;scene.add(directional,directional.target);return{h,samples,point:omni,directional,sampleCount:4};}
+ function dispose(o){o.h.removeFromParent();o.h.material.dispose();for(const p of [...o.samples,o.point,o.directional]){p.removeFromParent();p.dispose?.();}o.directional.target.removeFromParent();}
+ function sync(){while(objects.length<lamps.length)objects.push(create(objects.length));while(objects.length>lamps.length)dispose(objects.pop());}
+ function update(){sync();const active=lamps.filter(l=>l.enabled&&l.power>0&&l.type==='area').length,budget=Math.min(4,Math.max(1,Math.floor(8/Math.max(1,active)))),corners=[[-.5,-.5],[.5,.5],[-.5,.5],[.5,-.5]];lamps.forEach((l,i)=>{const o=objects[i];o.h.userData.light=i;const color=tint(l.kelvin),target=aim(l),type=l.type||'area';o.h.geometry=lightHelperGeometry(type);o.h.userData.lightType=type;o.h.position.fromArray(l.pos);o.h.lookAt(target);o.h.rotateZ(T.MathUtils.degToRad(l.roll_deg||0));o.h.scale.set(type==='area'?l.size:1,type==='area'?l.size:1,1);o.h.material.color.copy(color);o.sampleCount=type==='area'?budget:1;for(let j=0;j<4;j++){const p=o.samples[j];p.position.copy(o.h.position).add(new T.Vector3(corners[j][0]*l.size,corners[j][1]*l.size,0).applyQuaternion(o.h.quaternion));p.color.copy(color);p.intensity=l.enabled&&type==='area'&&j<budget?l.power/budget:0;p.visible=p.intensity>0;p.castShadow=p.visible&&l.shadow!==false;}
+  const p=o.point;p.position.copy(o.h.position);p.color.copy(color);p.intensity=l.enabled&&type==='point'?l.power:0;p.visible=p.intensity>0;p.distance=pointRange(l);p.decay=2;p.castShadow=p.visible&&l.shadow!==false;p.shadow.camera.far=Math.max(.04,p.distance||Math.max(35,p.position.distanceTo(target)+20));p.shadow.camera.updateProjectionMatrix();
+  const d=o.directional;d.position.copy(o.h.position);d.target.position.copy(target);d.target.updateMatrixWorld();d.color.copy(color);d.intensity=l.enabled&&type==='directional'?l.power/20:0;d.visible=d.intensity>0;d.castShadow=d.visible&&l.shadow!==false;d.shadow.camera.far=Math.max(35,d.position.distanceTo(target)+20);d.shadow.camera.updateProjectionMatrix();});}
+ sync();return {objects,sync,update};
+}

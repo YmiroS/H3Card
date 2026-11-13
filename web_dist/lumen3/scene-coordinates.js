@@ -1,0 +1,28 @@
+import * as T from 'three';
+// FBX UnitScaleFactor is centimetres per source unit. Read only GlobalSettings;
+// geometry payloads are skipped, including compressed binary arrays.
+export function readFbxSettings(buffer){
+ const bytes=new Uint8Array(buffer),settings={};const keys=new Set(['UnitScaleFactor','UpAxis','UpAxisSign','CoordAxis','CoordAxisSign','FrontAxis','FrontAxisSign','TimeMode','CustomFrameRate']);
+ if(new TextDecoder().decode(bytes.subarray(0,19))!=='Kaydara FBX Binary '){const text=new TextDecoder().decode(bytes),start=text.indexOf('GlobalSettings:');if(start>=0){const block=text.slice(start,text.indexOf('\nObjects:',start)>0?text.indexOf('\nObjects:',start):start+12000);for(const match of block.matchAll(/P:\s*"([^"]+)"[^\r\n]*?,\s*([-+\d.eE]+)\s*$/gm))if(keys.has(match[1]))settings[match[1]]=Number(match[2]);}return settings;}
+ const view=new DataView(buffer),version=view.getUint32(23,true),wide=version>=7500,header=wide?25:13,decode=new TextDecoder();let offset=27;
+ const integer=()=>{const value=wide?Number(view.getBigUint64(offset,true)):view.getUint32(offset,true);offset+=wide?8:4;return value;};
+ function property(){const type=String.fromCharCode(bytes[offset++]);if(type==='S'||type==='R'){const len=view.getUint32(offset,true);offset+=4;const value=type==='S'?decode.decode(bytes.subarray(offset,offset+len)):null;offset+=len;return value;}const methods={Y:['getInt16',2],C:['getUint8',1],I:['getInt32',4],F:['getFloat32',4],D:['getFloat64',8],L:['getBigInt64',8]};if(methods[type]){const[m,size]=methods[type],value=Number(view[m](offset,true));offset+=size;return value;}if('fdlibc'.includes(type)){const len=view.getUint32(offset+8,true);offset+=12+len;return null;}throw new Error('未知 FBX 属性类型');}
+ function node(path=[]){if(offset+header>bytes.length)return false;const begin=offset,end=integer(),count=integer(),length=integer(),nameLen=bytes[offset++];if(!end)return false;if(end<=begin||end>bytes.length)throw new Error('FBX 节点边界无效');const name=decode.decode(bytes.subarray(offset,offset+nameLen));offset+=nameLen;const propsEnd=offset+length;if(propsEnd>end)throw new Error('FBX 属性越界');const interested=path[0]==='GlobalSettings'||name==='GlobalSettings';if(!interested){offset=end;return true;}const values=[];if(name==='P')for(let i=0;i<count;i++)values.push(property());if(name==='P'&&keys.has(values[0]))settings[values[0]]=Number(values.at(-1));offset=propsEnd;while(offset+header<=end){if(!node([...path,name]))break;}offset=end;return true;}
+ try{while(offset+header<bytes.length&&node()){}return settings;}catch{return settings;}
+}
+export function sourceSettings(raw,overrides={}){
+ const f=raw.userData.sourceSettings||{},unit=Number(f.UnitScaleFactor??raw.userData.unitScaleFactor),detected=Number.isFinite(unit)&&unit>0?unit/100:null;
+ const metersPerUnit=overrides.metersPerUnit==='auto'||overrides.metersPerUnit==null?(detected??(raw.userData.sourceFormat==='OBJ'?1:.01)):Number(overrides.metersPerUnit);
+ const up=overrides.upAxis==='auto'||overrides.upAxis==null?Number(f.UpAxis??1):Number(overrides.upAxis),right=Number(f.CoordAxis??(up===0?2:0));
+ if(!Number.isFinite(metersPerUnit)||metersPerUnit<=0||metersPerUnit>1000)throw new Error('源单位换算必须为正数');
+ if(![0,1,2].includes(up))throw new Error('源向上轴无效');
+ return{metersPerUnit,upAxis:up,upSign:overrides.upAxis==='auto'||overrides.upAxis==null?(Number(f.UpAxisSign)||1):1,rightAxis:right===up?(up===0?2:0):right,rightSign:Number(f.CoordAxisSign)||1,unitSource:overrides.metersPerUnit==='auto'||overrides.metersPerUnit==null?(detected?'FBX_GlobalSettings':(raw.userData.sourceFormat==='OBJ'?'fallback_OBJ_meter_unmeasured':'fallback_centimeter_unmeasured')):'user_override',raw:f};
+}
+export function sourceMatrix(settings){const right=new T.Vector3().setComponent(settings.rightAxis,settings.rightSign),up=new T.Vector3().setComponent(settings.upAxis,settings.upSign),back=right.clone().cross(up).normalize();return new T.Matrix4().set(right.x,right.y,right.z,0,up.x,up.y,up.z,0,back.x,back.y,back.z,0,0,0,0,1).multiply(new T.Matrix4().makeScale(settings.metersPerUnit,settings.metersPerUnit,settings.metersPerUnit));}
+export function createImportedAsset(raw,{mode='world',targetHeight=1.8,allowEmpty=false,...overrides}={}){
+ raw.updateMatrixWorld(true);raw.traverse(o=>{if(o.isSkinnedMesh){o.skeleton.update();o.computeBoundingBox();}});const nativeBounds=new T.Box3().setFromObject(raw,true);
+ const settings=sourceSettings(raw,overrides),root=new T.Group(),normalization=new T.Group(),conversion=new T.Group();root.name='Shared scene placement';normalization.name='Shared scene framing';conversion.name='Source axes and units';conversion.applyMatrix4(sourceMatrix(settings));conversion.add(raw);normalization.add(conversion);root.add(normalization);root.updateMatrixWorld(true);raw.traverse(o=>{if(o.isSkinnedMesh){o.skeleton.update();o.computeBoundingBox();}});const bounds=new T.Box3().setFromObject(root,true);if(bounds.isEmpty()&&!allowEmpty)throw new Error('文件中没有有效模型边界');let fitScale=1;
+ if(mode==='fit'&&!bounds.isEmpty()){const size=bounds.getSize(new T.Vector3()),center=bounds.getCenter(new T.Vector3());fitScale=targetHeight/Math.max(size.y,1e-6);normalization.scale.setScalar(fitScale);normalization.position.set(-center.x*fitScale,-bounds.min.y*fitScale,-center.z*fitScale);root.updateMatrixWorld(true);}
+ return{root,normalization,conversion,factor:fitScale*settings.metersPerUnit,nativeBounds,convertedBounds:bounds,settings,mode};
+}
+export function importedCameraMatrix(raw,asset,overrides={}){const conversion=sourceMatrix(sourceSettings(raw,overrides));if(asset){asset.root.updateMatrixWorld(true);return asset.normalization.matrixWorld.clone().multiply(conversion);}return conversion;}

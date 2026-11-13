@@ -1,0 +1,41 @@
+import * as T from 'three';
+
+// A procedural reference-style shell; no image texture or proprietary model asset.
+export function createRobotSurface(scene,joints){
+ const root=new T.Group();root.name='Ivory shell android';scene.add(root);
+ const ivory=new T.MeshStandardMaterial({color:'#dfd6bf',roughness:.48,metalness:.17});
+ const trim=new T.MeshStandardMaterial({color:'#a8a596',roughness:.5,metalness:.36});
+ const dark=new T.MeshStandardMaterial({color:'#262d2c',roughness:.64,metalness:.32});
+ const black=new T.MeshStandardMaterial({color:'#101716',roughness:.26,metalness:.18});
+ const make=(geo,mat=ivory,parent=root)=>{const m=new T.Mesh(geo,mat);m.castShadow=true;m.receiveShadow=true;parent.add(m);return m;};
+ const sphere=(s,mat=ivory,parent=root)=>{const m=make(new T.SphereGeometry(1,32,24),mat,parent);m.scale.set(...s);return m;};
+ const lathe=(profile,mat=ivory,parent=root)=>make(new T.LatheGeometry(profile.map(p=>new T.Vector2(...p)),32),mat,parent);
+ const torso=new T.Group();root.add(torso);
+ const chest=sphere([.225,.24,.13],ivory,torso);chest.position.y=.14;
+ const abdomen=sphere([.145,.23,.095],dark,torso);abdomen.position.y=-.13;
+ const waist=sphere([.165,.1,.105],trim,torso);waist.position.y=-.29;
+ const chestSeam=make(new T.BoxGeometry(.004,.25,.008),trim,torso);chestSeam.position.set(0,.17,.128);
+ for(let i=0;i<3;i++){const plate=sphere([.105-i*.007,.047,.012],trim,torso);plate.position.set(0,-.055-i*.085,.095);}
+ const chestPlateShape=new T.Shape();chestPlateShape.moveTo(.012,.31);chestPlateShape.lineTo(.15,.30);chestPlateShape.quadraticCurveTo(.218,.25,.198,.11);chestPlateShape.lineTo(.15,.035);chestPlateShape.lineTo(.012,.06);chestPlateShape.closePath();const chestPlateGeometry=new T.ExtrudeGeometry(chestPlateShape,{depth:.008,bevelEnabled:true,bevelSegments:3,steps:1,bevelSize:.008,bevelThickness:.006,curveSegments:16});for(const sign of [-1,1]){const p=make(chestPlateGeometry,ivory,torso);p.position.z=.117;p.scale.x=sign;}
+ const pelvis=new T.Group();root.add(pelvis);sphere([.16,.12,.12],dark,pelvis);
+ for(const sign of [-1,1]){const p=sphere([.09,.125,.1],ivory,pelvis);p.position.set(sign*.09,-.015,.035);p.rotation.z=-sign*.2;}
+ const center=sphere([.075,.09,.027],ivory,pelvis);center.position.set(0,-.02,.132);
+ const neck=lathe([[.04,0],[.05,.025],[.045,.13],[.04,.15]],dark);
+ const neckRings=[];for(let n=0;n<4;n++)neckRings.push(make(new T.TorusGeometry(.046,.005,8,24),trim));
+ const head=new T.Group();root.add(head);
+ const skull=sphere([.105,.141,.107],ivory,head);skull.position.y=.008;
+ const mask=sphere([.087,.115,.032],ivory,head);mask.position.set(0,-.018,.091);
+ const jaw=sphere([.066,.06,.04],ivory,head);jaw.position.set(0,-.09,.075);
+ for(const x of [-1,1]){const eyeSocket=sphere([.026,.018,.012],dark,head);eyeSocket.position.set(x*.043,.016,.12);const eye=sphere([.014,.012,.009],black,head);eye.position.set(x*.043,.015,.13);const brow=sphere([.034,.008,.01],trim,head);brow.position.set(x*.043,.043,.12);const cheek=sphere([.026,.05,.014],ivory,head);cheek.position.set(x*.065,-.04,.111);const ear=make(new T.CylinderGeometry(.041,.041,.016,32),dark,head);ear.rotation.z=Math.PI/2;ear.position.set(x*.103,.005,0);const outer=make(new T.CylinderGeometry(.033,.033,.019,32),trim,head);outer.rotation.z=Math.PI/2;outer.position.copy(ear.position);}
+ const nose=sphere([.013,.032,.024],ivory,head);nose.position.set(0,-.018,.127);
+ const mouth=make(new T.BoxGeometry(.038,.003,.003),dark,head);mouth.position.set(0,-.069,.128);
+ const skullSeam=make(new T.TorusGeometry(.105,.0016,6,64,Math.PI),trim,head);skullSeam.rotation.y=Math.PI/2;skullSeam.position.y=.035;
+ const segmentSpecs=[['ls','le',.072,.059],['le','lw',.059,.041],['rs','re',.072,.059],['re','rw',.059,.041],['lhip','lk',.09,.069],['lk','la',.069,.045],['rhip','rk',.09,.069],['rk','ra',.069,.045]];
+ const segments=segmentSpecs.map(([a,b,r1,r2])=>{const group=new T.Group();root.add(group);const core=make(new T.CylinderGeometry(r1*.66,r2*.7,1,18),dark,group);const shell=lathe([[r2*.9,-.40],[r2*1.06,-.33],[r1*1.04,.18],[r1,.34],[r1*.83,.39]],ivory,group);const back=make(new T.BoxGeometry(.012,.56,.008),trim,group);back.position.z=-r1*.96;const seam=make(new T.BoxGeometry(.003,.50,.005),trim,group);seam.position.z=r1*.98;return {a,b,r1,r2,group,core,shell,back,seam};});
+ const jointParts={};for(const[k,r]of Object.entries({ls:.079,rs:.079,le:.055,re:.055,lw:.037,rw:.037,lhip:.09,rhip:.09,lk:.068,rk:.068,la:.042,ra:.042})){const g=new T.Group();root.add(g);sphere([r,r,r],dark,g);const axle=make(new T.CylinderGeometry(r*.82,r*.82,r*1.85,24),trim,g);axle.rotation.z=Math.PI/2;for(const sign of [-1,1]){const cap=make(new T.CylinderGeometry(r*.59,r*.59,.007,24),dark,g);cap.rotation.z=Math.PI/2;cap.position.x=sign*r*.96;}if(['ls','rs','lk','rk'].includes(k)){const armor=sphere([r*1.1,r*.95,r*.75],ivory,g);armor.position.z=r*.65;}jointParts[k]=g;}
+ const palms=[],fingers=[],feet=[];for(let side=0;side<2;side++){const g=new T.Group();root.add(g);sphere([.043,.067,.023],dark,g);const plate=sphere([.041,.057,.015],ivory,g);plate.position.z=.019;const digits=[];for(let n=0;n<5;n++){const finger=new T.Group();g.add(finger);finger.position.set((n-2)*.017,.065-Math.abs(n-2)*.009,0);finger.rotation.z=-(n-2)*.10;for(let part=0;part<3;part++){const cylinder=make(new T.CapsuleGeometry(.007,.019,4,8),part%2?trim:ivory,finger);cylinder.position.y=.014+part*.025;const hinge=sphere([.007,.007,.007],dark,finger);hinge.position.y=part*.025;}digits.push(finger);}palms.push(g);fingers.push(digits);const foot=new T.Group();root.add(foot);const sole=sphere([.066,.034,.14],dark,foot);sole.position.z=.045;const upper=sphere([.06,.052,.126],ivory,foot);upper.position.set(0,.025,.036);const instep=sphere([.05,.045,.06],ivory,foot);instep.position.set(0,.062,-.025);feet.push(foot);}
+ const Y=new T.Vector3(0,1,0),front=new T.Vector3(0,0,1);
+ function orientBetween(group,a,b){const p=joints[a].position,q=joints[b].position;group.position.copy(p).add(q).multiplyScalar(.5);const d=q.clone().sub(p).normalize();group.quaternion.setFromUnitVectors(Y,d);const rotation=joints[a].quaternion;const spin=new T.Quaternion(0,rotation.x*d.x+rotation.y*d.y+rotation.z*d.z,0,rotation.w).normalize();group.quaternion.multiply(spin);return p.distanceTo(q);}
+ function update(){const hip=joints.pelvis.position,n=joints.neck.position,ls=joints.ls.position,rs=joints.rs.position;torso.position.copy(hip).lerp(n,.47);const up=n.clone().sub(hip).normalize(),right=rs.clone().sub(ls).normalize(),forward=right.clone().cross(up).normalize();if(forward.lengthSq()<.1)forward.copy(front);const correctedRight=up.clone().cross(forward).normalize();torso.quaternion.setFromRotationMatrix(new T.Matrix4().makeBasis(correctedRight,up,forward));const torsoLength=n.distanceTo(hip);torso.scale.set(T.MathUtils.clamp(ls.distanceTo(rs)/.44,.55,1.7),T.MathUtils.clamp(torsoLength/.57,.5,1.8),1);pelvis.position.copy(hip);pelvis.quaternion.copy(torso.quaternion);head.position.copy(joints.head.position);head.lookAt(joints.nose.position);const headRot=joints.head.quaternion;head.rotateZ(new T.Euler().setFromQuaternion(headRot,'XYZ').z);neck.position.copy(n);const neckD=joints.head.position.clone().sub(n);neck.scale.y=Math.max(.3,(neckD.length()-.10)/.15);neck.quaternion.setFromUnitVectors(Y,neckD.normalize());neckRings.forEach((ring,i)=>{ring.position.copy(n).addScaledVector(neckD,.02+i*.025);ring.quaternion.setFromUnitVectors(new T.Vector3(0,0,1),neckD);});for(const s of segments){const len=orientBetween(s.group,s.b,s.a);s.core.scale.y=Math.max(.02,len-.025);s.shell.scale.y=Math.max(.02,len-.045);s.back.scale.y=Math.max(.02,len-.08);s.seam.scale.y=Math.max(.02,len-.08);}for(const[k,g]of Object.entries(jointParts)){g.position.copy(joints[k].position);g.quaternion.copy(joints[k].quaternion);}for(let i=0;i<2;i++){const wrist=joints[i?'rw':'lw'].position,tip=joints[i?'rh':'lh'].position,d=tip.clone().sub(wrist);palms[i].position.copy(wrist).addScaledVector(d,.45);palms[i].quaternion.setFromUnitVectors(Y,d.normalize());const foot=feet[i];foot.position.copy(joints[i?'ra':'la'].position).add(new T.Vector3(0,-.025,.02));foot.quaternion.copy(joints[i?'ra':'la'].quaternion);}}
+ return {root,update};
+}

@@ -1,0 +1,6 @@
+let worker=null,serial=0,pending=new Map();
+export function closePoseDetector(reason='识别已取消'){worker?.terminate();worker=null;for(const p of pending.values()){clearTimeout(p.timer);p.reject(new Error(reason));}pending.clear();}
+export async function detectPose(source,runningMode='IMAGE',timestamp=0){
+ if(!worker){worker=new Worker(new URL('./pose-detector-worker.js',import.meta.url));worker.onmessage=({data})=>{const p=pending.get(data.id);if(!p)return;pending.delete(data.id);clearTimeout(p.timer);data.error?p.reject(new Error(data.error)):p.resolve(data.result);};worker.onerror=e=>{const error=new Error(e.message||'姿态识别线程加载失败');for(const p of pending.values()){clearTimeout(p.timer);p.reject(error);}pending.clear();worker?.terminate();worker=null;};}
+ const activeWorker=worker,bitmap=await createImageBitmap(source),id=++serial;if(activeWorker!==worker){bitmap.close();throw new Error('识别已取消');}return new Promise((resolve,reject)=>{const timer=setTimeout(()=>closePoseDetector('模型加载或识别超时，请检查网络后重试。'),90000);pending.set(id,{resolve,reject,timer});try{worker.postMessage({id,bitmap,runningMode,timestamp},[bitmap]);}catch(e){clearTimeout(timer);pending.delete(id);bitmap.close();reject(e);}});
+}

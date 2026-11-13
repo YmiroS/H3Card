@@ -25,6 +25,8 @@ async def billing_context(request, body):
                                or not context[key].replace("-", "").replace("_", "").isalnum()):
             raise cloud_chat.ChatError("费用上下文标识无效", status=400)
     project_id, card_id = context.get("project_id", ""), context.get("card_id", "")
+    if context["scene"] == "creation_agent" and not project_id:
+        raise cloud_chat.ChatError("创作助手必须指定画布", status=400)
     if card_id and not project_id:
         raise cloud_chat.ChatError("卡片归属必须包含画布", status=400)
     result = {"scene": context["scene"], "project_id": project_id, "card_id": card_id,
@@ -81,9 +83,20 @@ async def completions(request):
             raise cloud_chat.ChatError("请求必须为有效 JSON 对象", status=400)
         if not isinstance(body, dict):
             raise cloud_chat.ChatError("请求必须为 JSON 对象", status=400)
-        messages = await asyncio.to_thread(cloud_chat.validate,
-                                          {key: value for key, value in body.items() if key != "billing_context"})
         context = await billing_context(request, body)
+        creation_agent = context["scene"] == "creation_agent"
+        messages = await asyncio.to_thread(
+            cloud_chat.validate, {key: value for key, value in body.items() if key != "billing_context"},
+            allow_local_images=creation_agent)
+        source_messages = messages
+        image_service = None
+        if creation_agent and any(isinstance(message["content"], list) and any(
+                part["type"] == "image_url" and part["image_url"]["url"].startswith("/api/")
+                for part in message["content"]) for message in messages):
+            image_service = request.app.get("creation_agent_images")
+            if image_service is None:
+                raise cloud_chat.ChatError("创作助手图片存储未配置，请联系管理员", status=503)
+            messages = await image_service.prepare(request, context["project_id"], messages)
         # 不使用会话 ID、上游 ID 或前端传入的 ID，每个认证请求恰有一个归账标识。
         job_id, created_at = uuid.uuid4().hex, time.time()
         ledger = request.app.get("costs")
@@ -94,6 +107,11 @@ async def completions(request):
                 raise web.HTTPUnauthorized(text="认证用户标识缺失")
             await asyncio.to_thread(ledger.bind_attribution, job_id, user_id)
         try:
+            # Uploads and billing IO can outlive ACL changes. Recheck all original
+            # references immediately before either provider dispatch path.
+            if image_service is not None:
+                await require_project(request, context["project_id"], operate=True)
+                await image_service.authorize(request, context["project_id"], source_messages)
             if body.get("stream") is True:
                 result = await cloud_chat.stream(request.app["session"], request, messages,
                                                 end_user_name=user["username"], end_user_phone=user["phone"],

@@ -88,7 +88,7 @@ def _int(config, key, low, high):
     return value
 
 
-def load_config():
+def _load_raw_config():
     path = Path(os.environ.get("CHOUKA_SR_CONFIG") or CONF)
     try:
         raw = json.loads(path.read_text(encoding="utf-8-sig")) if path.exists() else {}
@@ -96,6 +96,30 @@ def load_config():
         raise SRConfigError("sr-service.json 读取失败") from exc
     if not isinstance(raw, dict):
         raise SRConfigError("sr-service.json 必须是 JSON 对象")
+    return raw
+
+
+def load_oss_config(raw=None):
+    """Shared OSS settings, independent of SR enablement and model/gateway validation."""
+    raw = _load_raw_config() if raw is None else raw
+    oss = raw.get("oss") if isinstance(raw.get("oss"), dict) else {}
+    try:
+        config = OSSConfig.from_root(
+            oss.get("root"), endpoint=oss.get("endpoint"), region=oss.get("region"),
+            access_key_id=os.environ.get("CHOUKA_SR_OSS_ACCESS_KEY_ID") or oss.get("access_key_id"),
+            access_key_secret=(os.environ.get("CHOUKA_SR_OSS_ACCESS_KEY_SECRET")
+                               or oss.get("access_key_secret")),
+            security_token=os.environ.get("CHOUKA_SR_OSS_STS_TOKEN") or oss.get("security_token") or "",
+        )
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise SRConfigError("sr-service.json 的 OSS 配置无效") from exc
+    return {"oss": config, "sign_seconds": _int(
+        {"sign_seconds": raw.get("sign_seconds", DEFAULTS["sign_seconds"])},
+        "sign_seconds", 600, 7 * 24 * 3600)}
+
+
+def load_config():
+    raw = _load_raw_config()
     config = {**DEFAULTS, **{k: v for k, v in raw.items() if k != "oss"}}
     if config.get("enabled") is not True:
         raise SRConfigError("视频超分服务未启用")
@@ -116,17 +140,7 @@ def load_config():
     config["poll_interval"] = _int(config, "poll_interval", 1, 600)
     config["result_timeout"] = _int(config, "result_timeout", 60, 7 * 24 * 3600)
     config["max_concurrent"] = _int(config, "max_concurrent", 1, 64)
-    oss = raw.get("oss") if isinstance(raw.get("oss"), dict) else {}
-    try:
-        config["oss"] = OSSConfig.from_root(
-            oss.get("root"), endpoint=oss.get("endpoint"), region=oss.get("region"),
-            access_key_id=os.environ.get("CHOUKA_SR_OSS_ACCESS_KEY_ID") or oss.get("access_key_id"),
-            access_key_secret=(os.environ.get("CHOUKA_SR_OSS_ACCESS_KEY_SECRET")
-                               or oss.get("access_key_secret")),
-            security_token=os.environ.get("CHOUKA_SR_OSS_STS_TOKEN") or oss.get("security_token") or "",
-        )
-    except ValueError as exc:
-        raise SRConfigError(f"sr-service.json 的 OSS 配置无效：{exc}") from exc
+    config.update(load_oss_config(raw))
     return config
 
 

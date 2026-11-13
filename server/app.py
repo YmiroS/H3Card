@@ -79,6 +79,7 @@ from server.character_api import register_character_routes
 from server.worker_command_api import register_worker_command_routes
 from server.color_grade_export import register_color_grade_routes
 from server.chat_api import register_chat_routes
+from server.creation_agent_images import CreationAgentImages
 from server.cost_dashboard import register_cost_dashboard_routes
 from server.creation_agent.skills import register_skill_routes
 from server.cloud_lighting import CloudLighting
@@ -1826,6 +1827,23 @@ async def generation_response(request, body, project, linked_card, result):
 
 
 SR_REF_SLOTS = 3
+
+
+async def creation_agent_image_path(request, value, project_id):
+    """Resolve only an authorized original image; never submit or transcode SR tasks."""
+    await require_project(request, project_id, operate=True)
+    ref = await resource_call(request.app, "reference", value)
+    if not ref:
+        raise web.HTTPBadRequest(text="无法识别创作助手图片")
+    await require_resource(request, *ref, project_id=project_id)
+    if ref[0] == "comfy":
+        await cache_comfy_outputs(request, {"outputs": [{"url": value}]})
+    await require_project(request, project_id, operate=True)
+    await require_resource(request, *ref, project_id=project_id)
+    path = await resource_call(request.app, "local_path", *ref)
+    if not path.is_file():
+        raise web.HTTPNotFound(text="创作助手图片源文件不存在")
+    return path
 
 
 async def sr_input_path(request, value, project_id):
@@ -4460,6 +4478,8 @@ async def on_start(app):
         app['distributed'].access_guard = app['auth_store'].lock
     app["resource_access"] = await asyncio.to_thread(
         ResourceAccess, app["auth_store"], ROOT, COMFY_INPUT)
+    app["creation_agent_images"] = await asyncio.to_thread(
+        CreationAgentImages, app["auth_store"], app["resource_access"], creation_agent_image_path)
     trace_configs = []
     if app.get("admin_sandbox"):
         trace = aiohttp.TraceConfig()
