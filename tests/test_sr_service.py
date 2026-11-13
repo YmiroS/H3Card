@@ -80,6 +80,220 @@ class OSSSignatureTests(unittest.TestCase):
                                 region="cn-zhangjiakou", access_key_id="a", access_key_secret="b")
 
 
+class OSSDownloadTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.config = oss_config("download-sts-token/abc+def==")
+        self.key = "chouka-sr/legacy cache/中文 image.png"
+        self.requests = []
+        self.secret_body = "private-oss-error-body"
+        self.session = aiohttp.ClientSession(trust_env=False)
+        self.addAsyncCleanup(self.session.close)
+        self.client = OSSClient(self.session, self.config)
+
+    async def serve(self, handler):
+        async def record(request):
+            self.requests.append((request.method, request.path, dict(request.headers),
+                                  dict(request.query)))
+            return await handler(request)
+
+        application = web.Application()
+        application.router.add_route("*", "/{key:.*}", record)
+        server = TestServer(application)
+        await server.start_server()
+        self.addAsyncCleanup(server.close)
+        self.url = server.make_url("/" + self.key)
+        self.enterContext(mock.patch.object(self.client, "_url", return_value=self.url))
+        return server
+
+    def assert_safe_error(self, error):
+        message = str(error)
+        self.assertTrue(message)
+        for secret in (self.config.access_key_id, self.config.access_key_secret,
+                       self.config.security_token, self.secret_body, str(self.url),
+                       "ambient-cookie-secret", "ambient-header-secret"):
+            self.assertNotIn(secret, message)
+
+    async def test_get_returns_bytes_and_signs_one_get_for_the_same_key(self):
+        body = b"\x00\xfflegacy-image\r\n"
+
+        async def download(request):
+            return web.Response(body=body)
+
+        await self.serve(download)
+        expected = self.client._signed_headers("GET", self.key, now=FIXED)
+        with mock.patch.object(
+                self.client, "_signed_headers", side_effect=lambda method, key:
+                OSSClient._signed_headers(self.client, method, key, now=FIXED)) as sign, \
+                mock.patch.object(self.session, "request", wraps=self.session.request) as send:
+            result = await self.client.get_bytes(self.key, limit=len(body))
+        self.assertIs(type(result), bytes)
+        self.assertEqual(result, body)
+        sign.assert_called_once_with("GET", self.key)
+        self.client._url.assert_called_once_with(self.key)
+        send.assert_called_once()
+        args, kwargs = send.call_args
+        self.assertEqual(args, ("GET", self.url))
+        self.assertIs(kwargs["allow_redirects"], False)
+        self.assertIn("proxy", kwargs)
+        self.assertIsNone(kwargs["proxy"])
+        timeout = kwargs["timeout"]
+        self.assertIsNone(timeout.total)
+        self.assertEqual((timeout.sock_connect, timeout.sock_read), (10, 120))
+        self.assertEqual(len(self.requests), 1)
+        method, path, headers, query = self.requests[0]
+        self.assertEqual((method, path, query), ("GET", "/" + self.key, {}))
+        for name, value in expected.items():
+            self.assertEqual(headers[name], value)
+        self.assertTrue(headers["Authorization"].startswith("OSS4-HMAC-SHA256 Credential="))
+
+    async def test_empty_object_returns_empty_bytes(self):
+        async def download(request):
+            return web.Response(body=b"")
+
+        await self.serve(download)
+        self.assertEqual(await self.client.get_bytes(self.key, limit=0), b"")
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_oversized_content_length_is_rejected_before_body_read(self):
+        release = asyncio.Event()
+
+        async def download(request):
+            response = web.StreamResponse(headers={"Content-Length": "33"})
+            await response.prepare(request)
+            await release.wait()
+            return response
+
+        await self.serve(download)
+        try:
+            with mock.patch.object(aiohttp.StreamReader, "iter_chunked") as chunks, \
+                    mock.patch.object(aiohttp.StreamReader, "read", new_callable=mock.AsyncMock) as read:
+                with self.assertRaises(oss_client.OSSError) as caught:
+                    await asyncio.wait_for(self.client.get_bytes(self.key, limit=32), timeout=2)
+                chunks.assert_not_called()
+                read.assert_not_called()
+            self.assert_safe_error(caught.exception)
+            self.assertEqual(len(self.requests), 1)
+        finally:
+            release.set()
+
+    async def test_chunked_body_obeys_actual_size_limit(self):
+        async def download(request):
+            response = web.StreamResponse()
+            response.enable_chunked_encoding()
+            await response.prepare(request)
+            await response.write(b"x" * 65536)
+            await response.write(b"y")
+            await response.write_eof()
+            return response
+
+        await self.serve(download)
+        for limit in (65537, 65536):
+            with self.subTest(limit=limit):
+                if limit == 65537:
+                    result = await self.client.get_bytes(self.key, limit=limit)
+                    self.assertIs(type(result), bytes)
+                    self.assertEqual(result, b"x" * 65536 + b"y")
+                else:
+                    with self.assertRaises(oss_client.OSSError) as caught:
+                        await self.client.get_bytes(self.key, limit=limit)
+                    self.assert_safe_error(caught.exception)
+        self.assertEqual(len(self.requests), 2)
+
+    async def test_redirect_is_not_followed_or_leaked_credentials(self):
+        redirected = []
+
+        async def destination(request):
+            redirected.append(dict(request.headers))
+            return web.Response(body=b"must-not-download")
+
+        application = web.Application()
+        application.router.add_route("*", "/{key:.*}", destination)
+        target = TestServer(application)
+        await target.start_server()
+        self.addAsyncCleanup(target.close)
+
+        async def redirect(request):
+            return web.Response(status=302, headers={"Location": str(target.make_url("/stolen"))},
+                                text=self.secret_body)
+
+        await self.serve(redirect)
+        self.session.headers.update({"Cookie": "session=ambient-cookie-secret",
+                                     "X-Ambient-Secret": "ambient-header-secret"})
+        with self.assertRaises(oss_client.OSSError) as caught:
+            await self.client.get_bytes(self.key, limit=1024)
+        self.assertEqual(caught.exception.status, 302)
+        self.assert_safe_error(caught.exception)
+        self.assertEqual(len(self.requests), 1)
+        self.assertIn("Authorization", self.requests[0][2])
+        self.assertEqual(redirected, [])
+
+    async def test_only_http_200_is_accepted_and_error_bodies_are_private(self):
+        status = 403
+
+        async def download(request):
+            return web.Response(status=status, text=" ".join((
+                self.secret_body, self.config.access_key_id, self.config.access_key_secret,
+                self.config.security_token, str(self.url))))
+
+        await self.serve(download)
+        for status in (403, 404, 204, 206):
+            with self.subTest(status=status):
+                with self.assertRaises(oss_client.OSSError) as caught:
+                    await self.client.get_bytes(self.key, limit=4096)
+                self.assertEqual(caught.exception.status, status)
+                self.assertIn(f"HTTP {status}", str(caught.exception))
+                self.assert_safe_error(caught.exception)
+        self.assertEqual(len(self.requests), 4)
+
+    async def test_interrupted_payload_raises_safe_oss_error(self):
+        async def download(request):
+            response = web.StreamResponse(headers={"Content-Length": "32"})
+            await response.prepare(request)
+            await response.write(b"partial")
+            request.transport.close()
+            return response
+
+        await self.serve(download)
+        with self.assertRaises(oss_client.OSSError) as caught:
+            await asyncio.wait_for(self.client.get_bytes(self.key, limit=32), timeout=2)
+        self.assertIn("ClientPayloadError", str(caught.exception))
+        self.assert_safe_error(caught.exception)
+        self.assertTrue(caught.exception.__suppress_context__)
+        self.assertEqual(len(self.requests), 1)
+
+    async def test_stalled_payload_timeout_raises_safe_oss_error(self):
+        release = asyncio.Event()
+
+        async def download(request):
+            response = web.StreamResponse(headers={"Content-Length": "32"})
+            await response.prepare(request)
+            await response.write(b"partial")
+            await release.wait()
+            return response
+
+        await self.serve(download)
+        request = self.session.request
+
+        def short_read_timeout(*args, **kwargs):
+            timeout = kwargs["timeout"]
+            self.assertEqual((timeout.total, timeout.sock_connect, timeout.sock_read),
+                             (None, 10, 120))
+            # Exercise the real socket timeout without waiting the production 120 seconds.
+            kwargs["timeout"] = aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=0.05)
+            return request(*args, **kwargs)
+
+        try:
+            with mock.patch.object(self.session, "request", side_effect=short_read_timeout):
+                with self.assertRaises(oss_client.OSSError) as caught:
+                    await asyncio.wait_for(self.client.get_bytes(self.key, limit=32), timeout=2)
+            self.assertIn("Timeout", str(caught.exception))
+            self.assert_safe_error(caught.exception)
+            self.assertTrue(caught.exception.__suppress_context__)
+            self.assertEqual(len(self.requests), 1)
+        finally:
+            release.set()
+
+
 class ConfigTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()

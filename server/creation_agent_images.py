@@ -15,7 +15,7 @@ from aiohttp import web
 
 from . import cloud_images
 from .auth import require_user
-from .cloud_chat import ChatError
+from .cloud_chat import CHAT_IMAGE_VERSION, ChatError, prepare_chat_image
 from .oss_client import OSSClient
 from .resource_access import ResourceAccess
 from .sr_service import load_oss_config, SRConfigError
@@ -57,10 +57,13 @@ def _references(messages):
 
 
 def _snapshot(source, directory):
-    # Read a bounded, single snapshot; validate/hash/upload the very same bytes even
-    # when the source is changed or removed while the request is in flight.
-    with Path(source).open('rb') as handle:
-        data = handle.read(cloud_images.MAX_IMAGE_BYTES + 1)
+    # Originals remain untouched; hash/upload the exact processed snapshot.
+    if isinstance(source, bytes):
+        data = source
+    else:
+        with Path(source).open('rb') as handle:
+            data = handle.read(cloud_images.MAX_IMAGE_BYTES + 1)
+    data = prepare_chat_image(data)
     info = cloud_images.inspect_image(data)
     digest = hashlib.sha256(data).hexdigest()
     target = Path(directory) / (digest + info['extension'])
@@ -132,7 +135,8 @@ class CreationAgentImages:
             raise ChatError('创作助手图片存储未配置，请联系管理员', status=503) from None
         oss = config['oss']
         # Credentials (including STS and AK rotation) do not change object identity.
-        destination = json.dumps([oss.endpoint, oss.bucket, oss.prefix], separators=(',', ':'))
+        original_destination = json.dumps([oss.endpoint, oss.bucket, oss.prefix], separators=(',', ':'))
+        destination = json.dumps([oss.endpoint, oss.bucket, oss.prefix, CHAT_IMAGE_VERSION], separators=(',', ':'))
         client = self.client_factory(request.app['session'], oss)
         urls = {}
         async with self.upload_lock:
@@ -144,7 +148,13 @@ class CreationAgentImages:
                 key = await asyncio.to_thread(self._get, project_id, resource_id, destination)
                 if key is None:
                     try:
-                        source = await self.resolve_path(request, value, project_id)
+                        original_key = await asyncio.to_thread(
+                            self._get, project_id, resource_id, original_destination)
+                        if original_key:
+                            await self.authorize(request, project_id, messages)
+                            source = await client.get_bytes(original_key, limit=cloud_images.MAX_IMAGE_BYTES)
+                        else:
+                            source = await self.resolve_path(request, value, project_id)
                         with tempfile.TemporaryDirectory(prefix='chouka-agent-image-') as directory:
                             snapshot = asyncio.create_task(asyncio.to_thread(_snapshot, source, directory))
                             try:
@@ -153,7 +163,7 @@ class CreationAgentImages:
                                 # Wait for file IO before removing the temporary local snapshot.
                                 await asyncio.gather(snapshot, return_exceptions=True)
                                 raise
-                            key = client.key('creation-agent-images',
+                            key = client.key('creation-agent-images', CHAT_IMAGE_VERSION,
                                              hashlib.sha256(project_id.encode()).hexdigest(),
                                              digest + info['extension'])
                             await self.authorize(request, project_id, messages)

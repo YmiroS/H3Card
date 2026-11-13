@@ -2,6 +2,8 @@
 import asyncio
 import base64
 import binascii
+import copy
+from io import BytesIO
 import json
 import logging
 import os
@@ -10,12 +12,46 @@ from urllib.parse import urlsplit
 
 import aiohttp
 from aiohttp import web
+from PIL import Image, ImageOps
 
 from . import cloud_images, provider_billing
 
 MAX_REQUEST_BYTES = 24 * 1024 * 1024
 MAX_TEXT_CHARS = 100_000
 MAX_RESPONSE_BYTES = 2 * 1024 * 1024
+CHAT_IMAGE_MAX_EDGE = 3840
+CHAT_IMAGE_VERSION = "chat-image-3840-original-v3"
+
+
+def prepare_chat_image(data):
+    cloud_images.inspect_image(data)
+    with Image.open(BytesIO(data)) as source:
+        format = source.format
+        image = ImageOps.exif_transpose(source)
+        image.thumbnail((CHAT_IMAGE_MAX_EDGE, CHAT_IMAGE_MAX_EDGE), Image.Resampling.LANCZOS)
+        options = {"quality": 95} if format == "JPEG" else {"lossless": True} if format == "WEBP" else {}
+        output = BytesIO()
+        image.save(output, format=format, **options)
+        return output.getvalue()
+
+
+def _prepare_inline_images(messages):
+    result = None
+    processed = {}
+    for index, message in enumerate(messages):
+        if not isinstance(message["content"], list):
+            continue
+        for part_index, part in enumerate(message["content"]):
+            if part["type"] != "image_url" or not part["image_url"]["url"].startswith("data:"):
+                continue
+            if result is None:
+                result = copy.deepcopy(messages)
+            url = part["image_url"]["url"]
+            if url not in processed:
+                data = prepare_chat_image(base64.b64decode(url.split(",", 1)[1], validate=True))
+                processed[url] = url.split(",", 1)[0] + "," + base64.b64encode(data).decode("ascii")
+            result[index]["content"][part_index]["image_url"]["url"] = processed[url]
+    return messages if result is None else result
 
 
 class ChatError(Exception):
@@ -183,6 +219,7 @@ async def complete(session, messages, *, end_user_name, end_user_phone, model=No
     provider_billing.capture(billing_state, {}, model, config)
     if not isinstance(model, str) or not model.strip() or any(ord(c) < 33 for c in model):
         raise ChatError("聊天模型配置无效", status=503)
+    messages = await asyncio.to_thread(_prepare_inline_images, messages)
     body = {"model": model, "messages": messages, "stream": False}
     if max_tokens is not None:
         if type(max_tokens) is not int or not 1 <= max_tokens <= 100000:
@@ -242,6 +279,7 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone, b
     billing_state["status"] = "running"
     if not isinstance(model, str) or not model.strip() or any(ord(c) < 33 for c in model):
         raise ChatError("聊天模型配置无效", status=503)
+    messages = await asyncio.to_thread(_prepare_inline_images, messages)
     diagnostics = {"config": config, "messages": messages,
                    "end_user_name": end_user_name, "end_user_phone": end_user_phone}
     downstream = web.StreamResponse(

@@ -75,6 +75,17 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
     async def post(self, body, **kwargs):
         return await self.client.post('/api/chat/completions', json=body, **kwargs)
 
+    def assert_model_image(self, url, size=None, format='PNG'):
+        self.assertTrue(url.startswith('data:' + cloud_images.FORMATS[format][1] + ';base64,'))
+        data = base64.b64decode(url.split(',', 1)[1], validate=True)
+        with Image.open(BytesIO(data)) as image:
+            self.assertEqual(image.format, format)
+            self.assertLessEqual(max(image.size), 3840)
+            if size is not None:
+                self.assertEqual(image.size, size)
+            image.load()
+        return data
+
     def set_upstream_error(self, mode, payload, *, raw_body=None, partial=False):
         self.status = 200 if mode.startswith('sse_') else 422
         self.payload = payload
@@ -248,7 +259,9 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post({'messages': [{'role': 'user', 'content': [
             {'type': 'image_url', 'image_url': {'url': url}}]}]})
         self.assertEqual(response.status, 200, await response.text())
-        self.assertEqual(self.calls[0][0]['messages'][0]['content'][0]['image_url']['url'], url)
+        sent = self.calls[0][0]['messages'][0]['content'][0]['image_url']['url']
+        data = self.assert_model_image(sent, (1500, 1500))
+        self.assertGreater(len(data), 2 * 1024 * 1024)
 
     async def test_validation_and_auth_before_gateway(self):
         invalid = [None, {}, {'messages': []}, {'messages': [{'role': [], 'content': 'hi'}]},
@@ -591,9 +604,20 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         part = {'type': 'image_url', 'image_url': {'url': 'data:image/png;base64,' + base64.b64encode(data).decode()}}
         parts = [{'type': 'text', 'text': '参考图片'}, part] * 20
         body = {'messages': [{'role': 'user', 'content': parts}]}
-        response = await self.post(body)
+        with mock.patch.object(cloud_chat, 'prepare_chat_image', wraps=cloud_chat.prepare_chat_image) as process:
+            response = await self.post(body)
         self.assertEqual(response.status, 200, await response.text())
-        self.assertEqual(self.calls[0][0]['messages'], body['messages'])
+        process.assert_called_once()
+        sent = self.calls[0][0]['messages'][0]['content']
+        self.assertEqual(len(sent), 40)
+        for index, entry in enumerate(sent):
+            self.assertEqual(entry['type'], parts[index]['type'])
+            if entry['type'] == 'text':
+                self.assertEqual(entry, parts[index])
+            else:
+                self.assert_model_image(entry['image_url']['url'], (2, 2))
+        self.assertEqual(len({entry['image_url']['url'] for entry in sent if entry['type'] == 'image_url'}), 1)
+        self.assertTrue(part['image_url']['url'].startswith('data:image/png;base64,'))
 
     async def test_image_larger_than_fifteen_mib_within_transport_budget(self):
         output = BytesIO()
@@ -604,6 +628,49 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         response = await self.post({'messages': [{'role': 'user', 'content': [part]}]})
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(len(self.calls), 1)
+        self.assert_model_image(self.calls[0][0]['messages'][0]['content'][0]['image_url']['url'], (2, 2))
+
+    async def test_inline_history_and_current_images_share_processing_in_both_transports(self):
+        encoded = BytesIO()
+        Image.new('RGB', (4096, 2048), 'blue').save(encoded, format='PNG')
+        url = 'data:image/png;base64,' + base64.b64encode(encoded.getvalue()).decode()
+        messages = [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': url, 'detail': 'high'}}]},
+                    {'role': 'assistant', 'content': 'earlier analysis'},
+                    {'role': 'user', 'content': [{'type': 'text', 'text': 'compare with history'},
+                                               {'type': 'image_url', 'image_url': {'url': url, 'detail': 'low'}}]}]
+        original = json.dumps(messages)
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                if streaming:
+                    self.stream_chunks = [b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\n',
+                                          b'data: [DONE]\n\n']
+                with mock.patch.object(cloud_chat, 'prepare_chat_image', wraps=cloud_chat.prepare_chat_image) as process:
+                    response = await self.post({'messages': messages, 'stream': streaming})
+                    self.assertEqual(response.status, 200, await response.text())
+                process.assert_called_once()
+                sent = self.calls[-1][0]['messages']
+                self.assertEqual(sent[1], messages[1])
+                self.assertEqual(sent[2]['content'][0], messages[2]['content'][0])
+                first, last = sent[0]['content'][0]['image_url'], sent[2]['content'][1]['image_url']
+                self.assertEqual((first['detail'], last['detail']), ('high', 'low'))
+                self.assertEqual(first['url'], last['url'])
+                self.assert_model_image(first['url'], (3840, 1920))
+                self.assertEqual(json.dumps(messages), original)
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_direct_chat_processing_does_not_mutate_original_messages(self):
+        encoded = BytesIO()
+        Image.new('RGBA', (32, 16), (255, 0, 0, 0)).save(encoded, format='PNG')
+        url = 'data:image/png;base64,' + base64.b64encode(encoded.getvalue()).decode()
+        messages = [{'role': 'user', 'content': [{'type': 'image_url', 'image_url': {'url': url, 'detail': 'high'}}]}]
+        original = json.dumps(messages)
+        await cloud_chat.complete(self.session, messages, end_user_name=self.user['username'],
+                                  end_user_phone=self.user['phone'])
+        self.assertEqual(json.dumps(messages), original)
+        data = self.assert_model_image(self.calls[0][0]['messages'][0]['content'][0]['image_url']['url'], (32, 16))
+        with Image.open(BytesIO(data)) as image:
+            self.assertEqual(image.mode, 'RGBA')
+            self.assertEqual(image.getpixel((16, 8))[3], 0)
 
     async def test_timeout_settings(self):
         session = mock.Mock()

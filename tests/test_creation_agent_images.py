@@ -6,6 +6,7 @@ from io import BytesIO
 import json
 import os
 from pathlib import Path
+import random
 import tempfile
 import unittest
 from unittest import mock
@@ -28,6 +29,33 @@ def image_bytes(format='PNG'):
     output = BytesIO()
     Image.new('RGB', (4, 4), 'blue').save(output, format=format)
     return output.getvalue()
+
+
+def assert_chat_image(test, data, size=None, color=None, *, format='PNG', mode=None):
+    test.assertIsInstance(data, bytes)
+    with Image.open(BytesIO(data)) as image:
+        test.assertEqual(image.format, format)
+        allowed_modes = {'PNG': ('RGB', 'RGBA', 'P', 'L', 'LA', '1', 'I', 'I;16'),
+                         'JPEG': ('RGB', 'CMYK', 'L'), 'WEBP': ('RGB', 'RGBA')}
+        test.assertIn(image.mode, allowed_modes[format])
+        if mode is not None:
+            test.assertEqual(image.mode, mode)
+        test.assertLessEqual(max(image.size), 3840)
+        if size is not None:
+            test.assertEqual(image.size, size)
+        image.load()
+        if color is not None:
+            sample = image.convert('RGBA' if len(color) == 4 else 'RGB')
+            actual = sample.getpixel((image.width // 2, image.height // 2))
+            for got, expected in zip(actual, color):
+                test.assertLessEqual(abs(got - expected), 12)
+
+
+def large_original_bytes():
+    # A valid PNG followed by padding reproduces the confirmed >20 MiB input
+    # boundary without committing a large binary fixture to the repository.
+    data = image_bytes()
+    return data + b'\0' * (23 * 1024 * 1024 - len(data))
 
 
 def messages_for(*urls):
@@ -66,6 +94,89 @@ class ImageContractTests(unittest.TestCase):
         self.assertEqual(cloud_chat.validate({'messages': messages_for(value)}), messages_for(value))
 
 
+class PrepareChatImageTests(unittest.TestCase):
+    def test_all_supported_formats_are_preserved_without_upscaling(self):
+        for format in ('PNG', 'JPEG', 'WEBP'):
+            with self.subTest(format=format):
+                source = image_bytes(format)
+                original = bytes(source)
+                result = cloud_chat.prepare_chat_image(source)
+                assert_chat_image(self, result, (4, 4), (0, 0, 255), format=format)
+                self.assertEqual(source, original)
+
+    def test_large_landscape_and_portrait_preserve_aspect_ratio(self):
+        for size, expected in (((4096, 2048), (3840, 1920)),
+                               ((1024, 4096), (960, 3840))):
+            with self.subTest(size=size):
+                source = BytesIO()
+                Image.new('RGB', size, (40, 100, 180)).save(source, format='PNG')
+                assert_chat_image(self, cloud_chat.prepare_chat_image(source.getvalue()),
+                                 expected, (40, 100, 180))
+
+    def test_exif_orientation_is_applied_to_pixels_and_not_applied_twice(self):
+        source = Image.new('RGB', (80, 40), 'red')
+        source.paste('blue', (40, 0, 80, 40))
+        exif = Image.Exif()
+        exif[274] = 6  # Rotate 90 degrees clockwise: red above blue.
+        encoded = BytesIO()
+        source.save(encoded, format='JPEG', exif=exif)
+        result = cloud_chat.prepare_chat_image(encoded.getvalue())
+        assert_chat_image(self, result, (40, 80), format='JPEG')
+        with Image.open(BytesIO(result)) as image:
+            self.assertIn(image.getexif().get(274), (None, 1))
+            upper = image.getpixel((20, 10))
+            lower = image.getpixel((20, 70))
+            self.assertGreater(upper[0], 230)
+            self.assertLess(upper[2], 20)
+            self.assertGreater(lower[2], 230)
+            self.assertLess(lower[0], 20)
+
+    def test_png_rgba_and_palette_transparency_are_preserved(self):
+        for mode in ('RGBA', 'P'):
+            with self.subTest(mode=mode):
+                if mode == 'RGBA':
+                    image = Image.new('RGBA', (32, 16), (255, 0, 0, 128))
+                    image.paste((0, 0, 0, 0), (0, 0, 16, 16))
+                else:
+                    image = Image.new('P', (32, 16), 0)
+                    image.putpalette([0, 0, 0, 255, 0, 0] + [0] * 762)
+                    image.info['transparency'] = 0
+                    image.paste(1, (16, 0, 32, 16))
+                encoded = BytesIO()
+                image.save(encoded, format='PNG')
+                result = cloud_chat.prepare_chat_image(encoded.getvalue())
+                assert_chat_image(self, result, (32, 16))
+                with Image.open(BytesIO(result)) as output:
+                    rgba = output.convert('RGBA')
+                    self.assertEqual(rgba.getpixel((4, 8))[3], 0)
+                    expected = (255, 0, 0, 128) if mode == 'RGBA' else (255, 0, 0, 255)
+                    self.assertEqual(rgba.getpixel((28, 8)), expected)
+
+    def test_webp_preserves_alpha_without_white_background(self):
+        image = Image.new('RGBA', (32, 16), (30, 120, 200, 128))
+        image.paste((0, 0, 0, 0), (0, 0, 16, 16))
+        encoded = BytesIO()
+        image.save(encoded, format='WEBP', lossless=True)
+        result = cloud_chat.prepare_chat_image(encoded.getvalue())
+        assert_chat_image(self, result, (32, 16), format='WEBP', mode='RGBA')
+        with Image.open(BytesIO(result)) as output:
+            self.assertEqual(output.getpixel((4, 8))[3], 0)
+            self.assertEqual(output.getpixel((28, 8)), (30, 120, 200, 128))
+
+    def test_large_png_is_not_shrunk_to_meet_an_arbitrary_byte_budget(self):
+        size = (3840, 1920)
+        image = Image.frombytes('RGB', size, random.Random(3840).randbytes(size[0] * size[1] * 3))
+        encoded = BytesIO()
+        image.save(encoded, format='PNG')
+        source = encoded.getvalue()
+        self.assertGreater(len(source), 2 * 1024 * 1024)
+        result = cloud_chat.prepare_chat_image(source)
+        self.assertGreater(len(result), 2 * 1024 * 1024)
+        assert_chat_image(self, result, size)
+        with Image.open(BytesIO(result)) as output:
+            self.assertEqual(output.tobytes(), image.tobytes())
+
+
 class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         temporary = tempfile.TemporaryDirectory()
@@ -85,6 +196,7 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         self.source = self.add_resource('project-1', 'upload', 'original.wrong', image_bytes())
         self.reference = '/api/upload/original.wrong'
         self.uploads, self.deletes, self.calls, self.path_calls = [], [], [], []
+        self.oss_objects, self.oss_reads, self.upload_names = {}, [], []
         self.put_error = None
         self.after_put = None
         self.upload_gate = None
@@ -109,9 +221,21 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
                     await owner.upload_gate.wait()
                 if owner.put_error:
                     raise owner.put_error
-                owner.uploads.append((key, Path(path).read_bytes(), content_type))
+                data = Path(path).read_bytes()
+                owner.uploads.append((key, data, content_type))
+                owner.upload_names.append(Path(path).name)
+                owner.oss_objects[key] = data
                 if owner.after_put:
                     owner.after_put()
+
+            async def get_bytes(self, key, *, limit):
+                owner.oss_reads.append((key, limit))
+                if key not in owner.oss_objects:
+                    raise AssertionError('Fake OSS may read fixture objects only')
+                data = owner.oss_objects[key]
+                if len(data) > limit:
+                    raise OSSError('Fixture exceeds bounded OSS read')
+                return data
 
             async def delete(self, key):
                 owner.deletes.append(key)
@@ -191,6 +315,30 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         return CreationAgentImages(store or self.store, resources or self.resources,
                                    resolve_path or self.resolve_path, client_factory=self.fake_client)
 
+    def seed_legacy_cache(self, data):
+        oss = sr_service.load_oss_config()['oss']
+        destination = json.dumps([oss.endpoint, oss.bucket, oss.prefix], separators=(',', ':'))
+        resource_id = self.resources.lookup('upload', self.source.name)['resource_id']
+        digest = hashlib.sha256(data).hexdigest()
+        key = oss.prefix + '/creation-agent-images/' + hashlib.sha256(b'project-1').hexdigest() + '/' + digest + '.png'
+        row = ('project-1', resource_id, destination, key, digest, 'image/png')
+        with self.store._tx():
+            self.store.db.execute('INSERT INTO creation_agent_images VALUES (?,?,?,?,?,?)', row)
+        self.oss_objects[key] = data
+        return dict(self.store.db.execute('SELECT * FROM creation_agent_images').fetchone())
+
+    def assert_uploaded_image(self, index=0, size=(4, 4), color=(0, 0, 255), *, format='PNG', mode=None):
+        key, data, mime = self.uploads[index]
+        assert_chat_image(self, data, size, color, format=format, mode=mode)
+        extension, expected_mime = {'PNG': ('.png', 'image/png'), 'JPEG': ('.jpg', 'image/jpeg'),
+                                    'WEBP': ('.webp', 'image/webp')}[format]
+        self.assertEqual(mime, expected_mime)
+        digest = hashlib.sha256(data).hexdigest()
+        self.assertTrue(key.endswith('/' + digest + extension))
+        self.assertEqual(self.upload_names[index], digest + extension)
+        self.assertIn('/chat-image-3840-original-v3/', key)
+        return key, data
+
     async def post(self, urls=None, *, project_id='project-1', scene='creation_agent', stream=False):
         return await self.client.post('/api/chat/completions', json={
             'messages': messages_for(*(urls if urls is not None else [self.reference])), 'stream': stream,
@@ -212,10 +360,12 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         response = await self.client.post('/api/chat/completions', json=body)
         self.assertEqual(response.status, 200, await response.text())
         self.assertEqual(len(self.uploads), 2)
-        key, data, mime = self.uploads[0]
-        self.assertEqual(data, image_bytes())
-        self.assertEqual(mime, 'image/png')
-        self.assertEqual(key, 'shared-root/creation-agent-images/' + hashlib.sha256(b'project-1').hexdigest()
+        key, data = self.assert_uploaded_image()
+        self.assert_uploaded_image(1, format='JPEG')
+        self.assertEqual(self.source.read_bytes(), image_bytes())
+        self.assertEqual(self.resources.local_path('artifact', 'job/image.jpg').read_bytes(), image_bytes('JPEG'))
+        self.assertEqual(key, 'shared-root/creation-agent-images/chat-image-3840-original-v3/'
+                         + hashlib.sha256(b'project-1').hexdigest()
                          + '/' + hashlib.sha256(data).hexdigest() + '.png')
         sent = self.calls[0]['messages']
         signed = sent[0]['content'][0]['image_url']
@@ -230,6 +380,39 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn('x-oss-', str(persisted))
         self.assertNotIn('test-secret', str(persisted))
         self.assertNotIn('https:', str(persisted))
+        self.assertEqual(len(persisted), 2)
+        uploaded_by_key = {key: (data, mime) for key, data, mime in self.uploads}
+        for row in persisted:
+            self.assertEqual(json.loads(row['destination']), [
+                'oss-cn-test.aliyuncs.com', 'test-bucket', 'shared-root', 'chat-image-3840-original-v3'])
+            uploaded_data, mime = uploaded_by_key[row['object_key']]
+            self.assertEqual(row['content_sha256'], hashlib.sha256(uploaded_data).hexdigest())
+            self.assertEqual(row['mime'], mime)
+        self.assertEqual(self.oss_reads, [])
+
+    async def test_historical_and_current_local_images_are_both_resized_visual_copies(self):
+        encoded = BytesIO()
+        Image.new('RGB', (4096, 1024), (30, 160, 80)).save(encoded, format='PNG')
+        original = encoded.getvalue()
+        self.source.write_bytes(original)
+        current_data = BytesIO()
+        Image.new('RGBA', (40, 80), (0, 0, 0, 0)).save(current_data, format='PNG')
+        current = self.add_resource('project-1', 'upload', 'current.png', current_data.getvalue())
+        body = {'messages': messages_for(self.reference)
+                + [{'role': 'assistant', 'content': 'history'}]
+                + messages_for('/api/upload/current.png'),
+                'billing_context': {'scene': 'creation_agent', 'project_id': 'project-1'}}
+        response = await self.client.post('/api/chat/completions', json=body)
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(len(self.uploads), 2)
+        self.assert_uploaded_image(0, (3840, 960), (30, 160, 80))
+        self.assert_uploaded_image(1, (40, 80), (0, 0, 0, 0), mode='RGBA')
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertEqual(current.read_bytes(), current_data.getvalue())
+        for index, message_index in enumerate((0, 2)):
+            url = self.calls[0]['messages'][message_index]['content'][0]['image_url']['url']
+            self.assertIn(self.uploads[index][0], url)
+        self.assertEqual(self.oss_reads, [])
 
     async def test_comfy_file_reference_and_upload_alias_deduplicate(self):
         comfy = '/api/file?filename=render.webp&type=output&subfolder=images'
@@ -241,7 +424,9 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.uploads), 2)
         sent = self.calls[0]['messages'][0]['content']
         self.assertEqual(sent[0]['image_url']['url'], sent[1]['image_url']['url'])
-        self.assertEqual(self.uploads[1][2], 'image/webp')
+        self.assert_uploaded_image(0)
+        self.assert_uploaded_image(1, format='WEBP')
+        self.assertEqual(self.resources.local_path(*ref).read_bytes(), image_bytes('WEBP'))
 
     async def test_restart_resigns_with_rotated_credentials_without_original(self):
         self.assertEqual((await self.post()).status, 200)
@@ -264,6 +449,87 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         resolve.assert_not_awaited()
         self.assertEqual((await self.post()).status, 200)
         self.assertEqual(len(self.uploads), 1)
+        self.assertEqual(self.oss_reads, [])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM creation_agent_images').fetchone()[0], 1)
+
+    async def test_legacy_large_original_migrates_without_local_source_and_reuses_across_restart(self):
+        original = large_original_bytes()
+        self.assertGreater(len(original), 20 * 1024 * 1024)
+        with Image.open(BytesIO(original)) as image:
+            image.verify()
+        legacy = self.seed_legacy_cache(original)
+        self.source.unlink()
+        resolve = mock.AsyncMock(side_effect=AssertionError('Legacy migration must use OSS, not local source'))
+        self.registry.resolve_path = resolve
+
+        response = await self.post()
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual(self.oss_reads, [(legacy['object_key'], cloud_images.MAX_IMAGE_BYTES)])
+        self.assertEqual(len(self.uploads), 1)
+        key, data = self.assert_uploaded_image()
+        self.assertNotEqual(key, legacy['object_key'])
+        self.assertIn(key, self.calls[0]['messages'][0]['content'][0]['image_url']['url'])
+        self.assertEqual(self.oss_objects[legacy['object_key']], original)
+        self.assertEqual(set(self.oss_objects), {legacy['object_key'], key})
+        self.assertNotEqual(data, original)
+        persisted = [dict(row) for row in self.store.db.execute('SELECT * FROM creation_agent_images')]
+        self.assertEqual(len(persisted), 2)
+        self.assertIn(legacy, persisted)
+        new = next(row for row in persisted if row['destination'] != legacy['destination'])
+        self.assertEqual(json.loads(new['destination']), json.loads(legacy['destination']) + ['chat-image-3840-original-v3'])
+        self.assertEqual(new['object_key'], key)
+        self.assertEqual(new['content_sha256'], hashlib.sha256(data).hexdigest())
+        self.assertEqual(new['mime'], 'image/png')
+
+        response = await self.post()
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertIn(key, self.calls[-1]['messages'][0]['content'][0]['image_url']['url'])
+        reopened = AuthStore(self.db_path)
+        self.addCleanup(reopened.close)
+        registry = self.new_registry(reopened, ResourceAccess(reopened, self.root), resolve)
+        self.config_data['oss'].update(access_key_id='rotated-id', access_key_secret='rotated-secret',
+                                       security_token='rotated-token')
+        self.write_config()
+        result = await registry.prepare(self.request(), 'project-1', messages_for(self.reference))
+        signed = result[0]['content'][0]['image_url']['url']
+        self.assertIn(key, signed)
+        self.assertIn('rotated-id', signed)
+        self.assertIn('rotated-token', signed)
+        resolve.assert_not_awaited()
+        self.assertFalse(self.source.exists())
+        self.assertEqual(len(self.uploads), 1)
+        self.assertEqual(self.oss_reads, [(legacy['object_key'], cloud_images.MAX_IMAGE_BYTES)])
+        self.assertEqual(self.oss_objects[legacy['object_key']], original)
+        self.assertCountEqual([dict(row) for row in reopened.db.execute('SELECT * FROM creation_agent_images')], persisted)
+
+        self.user = self.other
+        self.store.set_grant(self.other['id'], self.owner['id'], 'operate')
+        self.store.delete_grant(self.other['id'], self.owner['id'])
+        self.assertEqual((await self.post()).status, 404)
+        self.assertEqual(self.oss_reads, [(legacy['object_key'], cloud_images.MAX_IMAGE_BYTES)])
+        self.assertEqual(len(self.calls), 2)
+
+    async def test_legacy_cache_rechecks_permissions_before_any_oss_get(self):
+        legacy = self.seed_legacy_cache(image_bytes())
+        self.source.unlink()
+        self.user = self.other
+        self.store.set_grant(self.other['id'], self.owner['id'], 'operate')
+        self.store.delete_grant(self.other['id'], self.owner['id'])
+        self.assertEqual((await self.post()).status, 404)
+        self.store.set_grant(self.other['id'], self.owner['id'], 'read')
+        self.assertEqual((await self.post()).status, 403)
+        self.user = self.owner
+        self.assertEqual((await self.post(project_id='project-2')).status, 404)
+        self.assertEqual((await self.post([self.reference, '/api/upload/forged.png'])).status, 404)
+        with self.store._tx():
+            self.store.db.execute('DELETE FROM project_resources WHERE project_id=?', ('project-1',))
+        self.assertEqual((await self.post()).status, 404)
+        self.assertEqual(self.oss_reads, [])
+        self.assertEqual(self.path_calls, [])
+        self.assertEqual(self.uploads, [])
+        self.assertEqual(self.calls, [])
+        self.assertEqual(self.oss_objects, {legacy['object_key']: image_bytes()})
+        self.assertEqual([dict(row) for row in self.store.db.execute('SELECT * FROM creation_agent_images')], [legacy])
 
     async def test_each_destination_component_invalidates_mapping_but_ak_does_not(self):
         self.assertEqual((await self.post()).status, 200)
@@ -284,6 +550,8 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.uploads), 1)
         self.assertEqual(len(self.path_calls), 1)
         self.assertEqual(len(self.calls), 4)
+        self.assertEqual(self.oss_reads, [])
+        self.assertEqual(self.store.db.execute('SELECT count(*) FROM creation_agent_images').fetchone()[0], 1)
 
     async def test_crossproject_and_unregistered_refs_denied_including_cached_hit(self):
         self.assertEqual((await self.post()).status, 200)
@@ -359,12 +627,17 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.uploads, [])
         self.assertEqual(self.calls, [])
 
-    async def test_more_than_fifteen_mib_is_allowed_with_existing_sixty_four_mib_safety(self):
-        data = image_bytes() + b'\0' * (16 * 1024 * 1024)
+    async def test_original_above_twenty_mib_is_processed_with_existing_sixty_four_mib_safety(self):
+        data = large_original_bytes()
+        self.assertGreater(len(data), 20 * 1024 * 1024)
+        with Image.open(BytesIO(data)) as original:
+            original.verify()
         self.source.write_bytes(data)
         response = await self.post()
         self.assertEqual(response.status, 200, await response.text())
-        self.assertEqual(self.uploads[0][1], data)
+        self.assert_uploaded_image()
+        self.assertEqual(self.source.read_bytes(), data)
+        self.assertEqual(self.oss_reads, [])
         # Exercise the exact existing byte/pixel boundaries without large fixtures.
         second = self.add_resource('project-1', 'upload', 'too-big.png', image_bytes())
         with mock.patch.object(cloud_images, 'MAX_IMAGE_BYTES', 10):
@@ -379,15 +652,19 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
         task = asyncio.create_task(self.post())
         try:
             await asyncio.wait_for(self.upload_started.wait(), 3)
-            self.source.write_bytes(image_bytes('JPEG'))
+            replacement = BytesIO()
+            Image.new('RGB', (4, 4), 'red').save(replacement, format='JPEG')
+            self.source.write_bytes(replacement.getvalue())
             self.upload_gate.set()
             response = await task
             self.assertEqual(response.status, 200, await response.text())
         finally:
             self.upload_gate.set()
             await asyncio.gather(task, return_exceptions=True)
-        self.assertEqual(self.uploads[0][1], original)
-        self.assertEqual(self.uploads[0][2], 'image/png')
+        self.assert_uploaded_image()
+        with Image.open(BytesIO(original)) as before, Image.open(BytesIO(self.uploads[0][1])) as uploaded:
+            self.assertEqual(uploaded.convert('RGB').tobytes(), before.convert('RGB').tobytes())
+        self.assertEqual(self.source.read_bytes(), replacement.getvalue())
 
     async def test_config_missing_safe_503_and_no_base64_fallback_including_cached(self):
         self.assertEqual((await self.post()).status, 200)
@@ -521,7 +798,7 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(self.view_calls), 1)
             self.assertEqual((await self.post([url], project_id='project-2')).status, 404)
             self.assertEqual(len(self.view_calls), 1)
-        self.assertEqual(self.uploads[0][2], 'image/webp')
+        self.assert_uploaded_image(format='WEBP')
         self.assertEqual(len(self.uploads), 1)
 
     async def test_real_app_callback_rechecks_permission_after_comfy_fetch(self):

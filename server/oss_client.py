@@ -171,6 +171,25 @@ class OSSClient:
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             raise OSSError(f"OSS {method} 请求失败：{type(exc).__name__}") from exc
 
+    async def get_bytes(self, key, *, limit):
+        try:
+            async with self.session.request(
+                    "GET", self._url(key), headers=self._signed_headers("GET", key),
+                    allow_redirects=False, proxy=None,
+                    timeout=aiohttp.ClientTimeout(total=None, sock_connect=10, sock_read=120)) as response:
+                if response.status != 200:
+                    raise OSSError(f"OSS GET 失败：HTTP {response.status}", status=response.status)
+                if response.content_length is not None and response.content_length > limit:
+                    raise OSSError("OSS 图片超过读取大小限制")
+                data = bytearray()
+                async for chunk in response.content.iter_chunked(65536):
+                    data.extend(chunk)
+                    if len(data) > limit:
+                        raise OSSError("OSS 图片超过读取大小限制")
+                return bytes(data)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            raise OSSError(f"OSS GET 请求失败：{type(exc).__name__}") from None
+
     async def put_file(self, key, path, content_type="application/octet-stream"):
         path = Path(path)
         size = path.stat().st_size
