@@ -1505,6 +1505,11 @@ class DistributedStore:
                 "server_time": now,
                 "lease_ttl_seconds": lease_ttl_seconds,
                 "maintenance_ack": maintenance_ack,
+                "maintenance_failure": ({
+                    "request_id": observed["sync_request_id"], "action": observed["sync_action"],
+                    "status": "error", "message": observed["sync_message"],
+                } if observed["sync_status"] == "error" and observed["sync_request_id"]
+                      and maintenance_blocks_worker(observed) else None),
             }
 
     def queue_ahead_snapshot(self):
@@ -1626,6 +1631,11 @@ class DistributedStore:
                 item["is_primary_node"] = bool(item["is_primary_node"])
             else:
                 item["is_primary_node"] = _primary_node(item["capabilities"])
+            if item.get("sync_status") == "error" and not maintenance_blocks_worker(item):
+                # Keep the failed result in storage, not as a current card error after recovery.
+                item["sync_status"] = "idle"
+                if "sync_message" in item:
+                    item["sync_message"] = None
             online = now - item["last_seen"] <= self.offline_seconds
             if not online:
                 item["state"] = "offline"

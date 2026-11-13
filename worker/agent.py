@@ -1239,6 +1239,27 @@ class WorkerAgent:
             return {"request_id": request_id}
         return None
 
+    def restore_failed_maintenance(self, failure):
+        if (not isinstance(failure, dict) or failure.get("status") != "error"
+                or not isinstance(failure.get("request_id"), str) or not failure["request_id"]
+                or failure.get("action") not in {"sync_files", "restart_services", "reboot_host"}
+                or self.pending_sync or getattr(self, "_maintenance_executing", False)):
+            return
+        maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
+        if (maintenance.get("status") in {"running", "restarting"}
+                or maintenance.get("request_id") == failure["request_id"]
+                and maintenance.get("status") == "error"):
+            return
+        self.state["maintenance"] = {
+            "request_id": failure["request_id"], "action": failure["action"],
+            "status": "error", "phase": "error",
+            "message": str(failure.get("message") or "上次节点维护失败")[:1000],
+        }
+        self.recovered_maintenance_request_id = None
+        self.fresh_capabilities_ready = False
+        self.last_capability_scan = 0.0
+        self._save_state()
+
     def maintenance_blocks_jobs(self):
         maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
         recovered = self.maintenance_recovery_report()
@@ -1294,6 +1315,12 @@ class WorkerAgent:
         guarded = any(key in command for key in ("expected_job_id", "expected_attempt_id"))
         guarded_assignment = None
         try:
+            if action == "sync_files":
+                self.state["maintenance"] = {
+                    **self.sync_report, "action": action, "phase": "syncing_files",
+                    "deadline": time.time() + max(float(self.config.get("file_sync_timeout_seconds", 3600)), 60.0) + 900,
+                }
+                self._save_state()
             if guarded:
                 # 在首次网络 await 前持久化去重，网络结果不确定也绝不重新启动第二次。
                 guarded_assignment = self._check_guarded_assignment(command)
@@ -1348,14 +1375,14 @@ class WorkerAgent:
                 attempted = self.state.setdefault("attempted_guarded_restarts", [])
                 if request_id not in attempted:
                     attempted.append(request_id)
-            if guarded or action in ("reboot_host", "restart_services"):
-                previous = self.state.get("maintenance") or {}
-                self.state["maintenance"] = {
-                    **(previous if previous.get("request_id") == request_id else {}),
-                    **self.sync_report, "action": action, "phase": "error",
-                }
-                self.fresh_capabilities_ready = False
-                self._save_state()
+            previous = self.state.get("maintenance") or {}
+            self.state["maintenance"] = {
+                **(previous if previous.get("request_id") == request_id else {}),
+                **self.sync_report, "action": action, "phase": "error",
+            }
+            self.fresh_capabilities_ready = False
+            self.last_capability_scan = 0.0
+            self._save_state()
             print(f"[Worker] 节点维护失败：{exc}", flush=True)
             if isinstance(exc, asyncio.CancelledError):
                 raise
@@ -1452,6 +1479,7 @@ class WorkerAgent:
                         self.state.pop("maintenance", None)
                     self._save_state()
                     self.sync_report = None
+                self.restore_failed_maintenance((reply or {}).get("maintenance_failure"))
                 for command in (reply or {}).get("commands", []):
                     if command.get("type") in ("cancel_job", "abort_job"):
                         await self.cancel_current(command.get("job_id"))

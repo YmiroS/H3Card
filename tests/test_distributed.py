@@ -2020,6 +2020,56 @@ class DistributedStoreTest(unittest.TestCase):
         })
         return request["request_id"], caps
 
+    def test_maintenance_failure_descriptor_requires_matching_fresh_recovery(self):
+        request_id, caps = self._failed_restart_for_recovery()
+        history = dict(self.store.db.execute(
+            "SELECT sync_status, sync_message, sync_finished_at FROM workers WHERE id=?",
+            (self.worker_id,),
+        ).fetchone())
+        expected = {"request_id": request_id, "action": "restart_services",
+                    "status": "error", "message": history["sync_message"]}
+        self.store.enqueue("descriptor-recovery", {"graph": {}}, ["KSampler"])
+        for proof in (None, {"request_id": "wrong-request"}):
+            with self.subTest(proof=proof):
+                reply = self.store.heartbeat(
+                    self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+                    maintenance_recovery=proof,
+                )
+                self.assertEqual(reply["maintenance_failure"], expected)
+                self.assertEqual(reply["commands"], [])
+                self.assertIsNone(self.store.acquire(self.worker_id))
+        reply = self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+            maintenance_recovery={"request_id": request_id},
+        )
+        self.assertIsNone(reply["maintenance_failure"])
+        self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "descriptor-recovery")
+        self.assertIsNone(self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=True)["maintenance_failure"])
+        self.assertEqual(dict(self.store.db.execute(
+            "SELECT sync_status, sync_message, sync_finished_at FROM workers WHERE id=?",
+            (self.worker_id,),
+        ).fetchone()), history)
+
+    def test_maintenance_failure_descriptor_absent_for_new_pending_and_running(self):
+        old, caps = self._failed_restart_for_recovery()
+        self.store.heartbeat(self.worker_id, comfy_online=True, busy=False,
+                             capabilities=caps, maintenance_recovery={"request_id": old})
+        new = self.store.request_worker_restart(self.worker_id, "restart_services")["request_id"]
+        self.assertNotEqual(old, new)
+        reply = self.store.heartbeat(self.worker_id, comfy_online=True, busy=False,
+                                     maintenance_recovery={"request_id": old})
+        self.assertIsNone(reply["maintenance_failure"])
+        self.assertEqual(reply["commands"], [{"type": "restart_services", "request_id": new}])
+        reply = self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=True,
+            maintenance={"request_id": new, "status": "running"},
+            maintenance_recovery={"request_id": old},
+        )
+        self.assertIsNone(reply["maintenance_failure"])
+        self.assertEqual(reply["commands"], [])
+        self.assertEqual(reply["maintenance_ack"], {"request_id": new, "status": "running"})
+
     def test_failed_restart_online_or_cached_capabilities_are_not_recovery(self):
         request_id, caps = self._failed_restart_for_recovery()
         self.store.enqueue("unproven-recovery", {"graph": {}}, ["KSampler"])
@@ -2087,9 +2137,9 @@ class DistributedStoreTest(unittest.TestCase):
                 for options in ({}, {"summary": True}, {"telemetry_only": True}):
                     worker = self.store.list_workers(**options)[0]
                     self.assertEqual(worker["state"], "busy" if busy else "idle")
-                    self.assertEqual(worker["sync_status"], "error")
+                    self.assertEqual(worker["sync_status"], "idle")
                     if not options.get("summary"):
-                        self.assertEqual(worker["sync_message"], history["sync_message"])
+                        self.assertIsNone(worker["sync_message"])
                 row = dict(self.store.db.execute(
                     "SELECT sync_status, sync_message, sync_requested_at, sync_started_at, sync_finished_at "
                     "FROM workers WHERE id=?", (self.worker_id,),
@@ -2319,7 +2369,7 @@ class DistributedStoreTest(unittest.TestCase):
         self.assertFalse(active(None))
         namespace["distributed_store"].assert_called_with(None)
         worker = self.store.list_workers(summary=True)[0]
-        self.assertEqual(worker["sync_status"], "error")
+        self.assertEqual(worker["sync_status"], "idle")
         self.assertEqual(worker["sync_recovered_request_id"], request_id)
         for status in ("pending", "running", "error"):
             with self.subTest(status=status):
@@ -2976,6 +3026,244 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
     def failed_requests(self):
         return [kwargs["json"] for _, url, kwargs in self.requests if url.endswith("/failed")]
 
+    async def test_maintenance_failure_sync_files_persists_failure_ack_and_scan_recovery(self):
+        agent = self.agent
+        agent.local_status = mock.AsyncMock()
+        agent.scan_telemetry = mock.AsyncMock()
+        agent.schedule_node_restart = mock.AsyncMock(side_effect=AssertionError("must not restart"))
+        for stage in ("script", "pull"):
+            with self.subTest(stage=stage):
+                agent.state = {"worker_id": "worker", "worker_token": "token"}
+                agent.sync_report = None
+                agent.fresh_capabilities_ready = True
+                agent.last_capability_scan = time.time()
+                agent.recovered_maintenance_request_id = None
+                saved = []
+                agent._save_state = mock.Mock(side_effect=lambda: saved.append(copy.deepcopy(agent.state)))
+                request_id = "sync-failure-" + stage
+                message = stage + " failed"
+
+                def assert_running():
+                    running = saved[0]["maintenance"]
+                    self.assertEqual(running["request_id"], request_id)
+                    self.assertEqual(running["action"], "sync_files")
+                    self.assertEqual(running["status"], "running")
+                    self.assertEqual(running["phase"], "syncing_files")
+                    self.assertGreater(running["deadline"], time.time())
+
+                async def script(*_args, **_kwargs):
+                    assert_running()
+                    if stage == "script":
+                        raise AgentError(message)
+                    return "files synchronized"
+
+                async def pull():
+                    assert_running()
+                    raise AgentError(message)
+
+                agent.run_local_command = mock.AsyncMock(side_effect=script)
+                agent.pull_code = mock.AsyncMock(side_effect=pull)
+                script_path = mock.Mock()
+                script_path.is_file.return_value = True
+                with mock.patch.object(agent, "sync_script_path", return_value=script_path), \
+                     mock.patch.object(agent, "batch_command_name", return_value=".\\sync.bat"), \
+                     mock.patch("agent.os.name", "nt"):
+                    agent.queue_sync({"type": "sync_files", "request_id": request_id})
+                    await agent.execute_pending_sync()
+                failure = copy.deepcopy(agent.state["maintenance"])
+                self.assertEqual(failure["request_id"], request_id)
+                self.assertEqual(failure["action"], "sync_files")
+                self.assertEqual(failure["status"], "error")
+                self.assertEqual(failure["phase"], "error")
+                self.assertEqual(failure["message"], message)
+                self.assertEqual(saved[-1]["maintenance"], failure)
+                self.assertFalse(agent.fresh_capabilities_ready)
+                self.assertEqual(agent.last_capability_scan, 0)
+                self.assertIsNone(agent.pending_sync)
+                self.assertFalse(agent._maintenance_executing)
+                self.assertTrue(agent.maintenance_blocks_jobs())
+                self.assertEqual(agent.pull_code.await_count, int(stage == "pull"))
+                agent.schedule_node_restart.assert_not_awaited()
+                # ACK must retain the associated failure, not rehydrate or erase it.
+                agent.last_capability_scan = time.time()
+                agent.stop_event = asyncio.Event()
+                agent.confirm_release_recovery = mock.AsyncMock()
+
+                async def ack(_method, _url, **kwargs):
+                    self.assertEqual(kwargs["json"]["maintenance"]["request_id"], request_id)
+                    agent.stop_event.set()
+                    return {"maintenance_ack": {"request_id": request_id, "status": "error"},
+                            "maintenance_failure": {**failure}}
+
+                agent._json_request = mock.AsyncMock(side_effect=ack)
+                await asyncio.wait_for(agent.heartbeat_loop(), 1)
+                self.assertNotIn("maintenance", agent.state)
+                self.assertEqual(agent.state["last_restart_result"], failure)
+                self.assertIsNone(agent.sync_report)
+                self.assertTrue(agent.maintenance_blocks_jobs())
+                agent._json_request = mock.AsyncMock(side_effect=lambda _method, url:
+                    {"KSampler": {}} if url.endswith("object_info") else {"system": {}, "devices": []})
+                await agent.scan_capabilities()
+                self.assertEqual(agent.maintenance_recovery_report(), {"request_id": request_id})
+                self.assertFalse(agent.maintenance_blocks_jobs())
+                self.assertEqual(agent.state["last_restart_result"], failure)
+
+    async def test_maintenance_failure_descriptor_restore_requires_new_scan_and_is_idempotent(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        agent.scan_telemetry = mock.AsyncMock()
+        failure = {"request_id": "lost-sync", "action": "sync_files",
+                   "status": "error", "message": "旧版本未存储的同步失败"}
+        agent.fresh_capabilities_ready = True
+        agent.recovered_maintenance_request_id = "older"
+        agent.restore_failed_maintenance(failure)
+        self.assertEqual(agent.state["maintenance"], {**failure, "phase": "error"})
+        agent._save_state.assert_called_once()
+        self.assertFalse(agent.fresh_capabilities_ready)
+        self.assertIsNone(agent.recovered_maintenance_request_id)
+        self.assertEqual(agent.last_capability_scan, 0)
+        self.assertTrue(agent.maintenance_blocks_jobs())
+        self.assertIsNone(agent.maintenance_recovery_report())
+        agent._json_request = mock.AsyncMock(side_effect=AgentError("scan unavailable"))
+        await agent.scan_capabilities()
+        agent.comfy_online = True
+        self.assertTrue(agent.maintenance_blocks_jobs())
+        agent._json_request = mock.AsyncMock(side_effect=lambda _method, url:
+            {"KSampler": {}} if url.endswith("object_info") else {"system": {}, "devices": []})
+        await agent.scan_capabilities()
+        scanned_at = agent.last_capability_scan
+        agent.restore_failed_maintenance(failure)
+        self.assertTrue(agent.fresh_capabilities_ready)
+        self.assertEqual(agent.last_capability_scan, scanned_at)
+        self.assertEqual(agent.maintenance_recovery_report(), {"request_id": failure["request_id"]})
+        self.assertFalse(agent.maintenance_blocks_jobs())
+        agent._save_state.assert_called_once()
+
+    async def test_maintenance_failure_descriptor_ignores_invalid_and_active_maintenance(self):
+        agent = self.agent
+        failure = {"request_id": "old-error", "action": "sync_files", "status": "error"}
+        invalid = [None, [], "error", {}, {**failure, "request_id": ""},
+                   {**failure, "request_id": 1}, {**failure, "status": "running"},
+                   {**failure, "action": "unknown"}]
+        for payload in invalid:
+            with self.subTest(payload=payload):
+                agent._save_state = mock.Mock()
+                before = copy.deepcopy(agent.state)
+                agent.restore_failed_maintenance(payload)
+                self.assertEqual(agent.state, before)
+                agent._save_state.assert_not_called()
+        for guard in ("pending", "executing", "running", "restarting", "same-error", "ack-error"):
+            with self.subTest(guard=guard):
+                agent.state.pop("maintenance", None)
+                agent.state.pop("last_restart_result", None)
+                agent.pending_sync = {"type": "sync_files", "request_id": "new"} if guard == "pending" else None
+                agent._maintenance_executing = guard == "executing"
+                if guard in {"running", "restarting"}:
+                    agent.state["maintenance"] = {"request_id": "new", "status": guard}
+                elif guard in {"same-error", "ack-error"}:
+                    agent.state["maintenance" if guard == "same-error" else "last_restart_result"] = dict(failure)
+                agent.fresh_capabilities_ready = True
+                agent.recovered_maintenance_request_id = "keep-proof"
+                agent.last_capability_scan = 12345
+                before = copy.deepcopy(agent.state)
+                agent.restore_failed_maintenance(failure)
+                self.assertEqual(agent.state, before)
+                self.assertTrue(agent.fresh_capabilities_ready)
+                self.assertEqual(agent.recovered_maintenance_request_id, "keep-proof")
+                self.assertEqual(agent.last_capability_scan, 12345)
+                agent._save_state.assert_not_called()
+
+    async def test_maintenance_failure_heartbeat_roundtrip_lost_state_then_real_scan(self):
+        agent = self.agent
+        agent.local_status = mock.AsyncMock()
+        agent.confirm_release_recovery = mock.AsyncMock()
+        agent.scan_telemetry = mock.AsyncMock()
+        agent._save_state = mock.Mock()
+        agent.run_local_command = mock.AsyncMock(side_effect=AssertionError("no real sync"))
+        agent.pull_code = mock.AsyncMock(side_effect=AssertionError("no git pull"))
+        agent.schedule_node_restart = mock.AsyncMock(side_effect=AssertionError("no restart"))
+        for fail_first_scan in (False, True):
+            with self.subTest(fail_first_scan=fail_first_scan):
+                fixture = DistributedStoreTest()
+                fixture.setUp()
+                try:
+                    store = fixture.store
+                    store.heartbeat(fixture.worker_id, comfy_online=True, busy=False, capabilities={
+                        "node_classes": ["KSampler", "SaveImage"], "supports_code_restart": True})
+                    self.assertEqual(store.request_sync_all()["worker_count"], 1)
+                    row = store.db.execute("SELECT * FROM workers WHERE id=?", (fixture.worker_id,)).fetchone()
+                    request_id = row["sync_request_id"]
+                    store.heartbeat(fixture.worker_id, comfy_online=True, maintenance={
+                        "request_id": request_id, "status": "error", "message": "旧同步脚本失败"})
+                    store.enqueue("lost-state-job", {"graph": {}}, ["KSampler"])
+                    agent.state = {"worker_id": fixture.worker_id, "worker_token": fixture.worker_token}
+                    agent.sync_report = None
+                    agent.pending_sync = None
+                    agent.comfy_online = True
+                    agent.fresh_capabilities_ready = True
+                    agent.recovered_maintenance_request_id = None
+                    agent.last_capability_scan = time.time()
+                    agent.last_telemetry_scan = time.time()
+                    agent.capabilities = {"node_classes": ["KSampler"], "cached": True}
+                    bodies, replies, scanned_urls = [], [], []
+                    round_number = 0
+
+                    async def request(_method, url, **kwargs):
+                        if url.endswith("heartbeat"):
+                            body = copy.deepcopy(kwargs["json"])
+                            bodies.append(body)
+                            reply = store.heartbeat(fixture.worker_id, **body)
+                            replies.append(reply)
+                            agent.stop_event.set()
+                            return reply
+                        scanned_urls.append(url)
+                        if fail_first_scan and round_number == 1:
+                            raise AgentError("ComfyUI not yet available")
+                        if url.endswith("object_info"):
+                            return {"KSampler": {}, "SaveImage": {}}
+                        if url.endswith("system_stats"):
+                            return {"system": {}, "devices": []}
+                        raise AssertionError("unexpected request: " + url)
+
+                    agent._json_request = mock.AsyncMock(side_effect=request)
+                    total_rounds = 3 if fail_first_scan else 2
+                    for round_number in range(total_rounds):
+                        agent.stop_event = asyncio.Event()
+                        await asyncio.wait_for(agent.heartbeat_loop(), 1)
+                        self.assertEqual(len(bodies), round_number + 1)
+                        if round_number < total_rounds - 1:
+                            self.assertNotIn("maintenance_recovery", bodies[-1])
+                            self.assertNotIn("capabilities", bodies[-1])
+                            self.assertEqual(replies[-1]["maintenance_failure"], {
+                                "request_id": request_id, "action": "sync_files",
+                                "status": "error", "message": "旧同步脚本失败"})
+                            self.assertTrue(agent.maintenance_blocks_jobs())
+                            self.assertIsNone(store.acquire(fixture.worker_id))
+                            if round_number == 0:
+                                self.assertEqual(scanned_urls, [])
+                                self.assertEqual(agent.last_capability_scan, 0)
+                                self.assertFalse(agent.fresh_capabilities_ready)
+                        self.assertEqual(replies[-1]["commands"], [])
+                    self.assertEqual(bodies[-1]["maintenance_recovery"], {"request_id": request_id})
+                    self.assertNotIn("cached", bodies[-1]["capabilities"])
+                    self.assertIn("KSampler", bodies[-1]["capabilities"]["node_classes"])
+                    self.assertFalse(bodies[-1]["busy"])
+                    self.assertTrue(bodies[-1]["capacity_released"])
+                    self.assertIsNone(replies[-1]["maintenance_failure"])
+                    self.assertEqual(len(scanned_urls), 2 * (total_rounds - 1))
+                    self.assertFalse(agent.maintenance_blocks_jobs())
+                    self.assertEqual(store.acquire(fixture.worker_id)["job_id"], "lost-state-job")
+                    history = store.db.execute(
+                        "SELECT sync_status, sync_message, sync_recovered_request_id FROM workers WHERE id=?",
+                        (fixture.worker_id,),
+                    ).fetchone()
+                    self.assertEqual(tuple(history), ("error", "旧同步脚本失败", request_id))
+                    agent.run_local_command.assert_not_awaited()
+                    agent.pull_code.assert_not_awaited()
+                    agent.schedule_node_restart.assert_not_awaited()
+                finally:
+                    fixture.tearDown()
+
     async def test_failed_restart_requires_successful_scan_for_local_recovery(self):
         agent = self.agent
         agent.scan_telemetry = mock.AsyncMock()
@@ -3410,8 +3698,16 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_sync_command_waits_for_files_then_pulls_and_restarts(self):
         calls = []
+        self.agent._save_state = mock.Mock()
 
         async def run_command(*arguments, **_kwargs):
+            self.agent._save_state.assert_called_once()
+            maintenance = self.agent.state["maintenance"]
+            self.assertEqual(maintenance["request_id"], "sync-1")
+            self.assertEqual(maintenance["action"], "sync_files")
+            self.assertEqual(maintenance["status"], "running")
+            self.assertEqual(maintenance["phase"], "syncing_files")
+            self.assertGreater(maintenance["deadline"], time.time())
             calls.append(("files", arguments))
             return "Synchronization completed successfully."
 
