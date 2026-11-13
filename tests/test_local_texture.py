@@ -17,7 +17,7 @@ from PIL import Image
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import test_texture_api as fixture
 from server import cloud_banana, cloud_images
-from server.local_texture import CAPABILITIES, callback_url, redact
+from server.local_texture import CAPABILITIES, redact
 from server.texture_api import source_version
 
 app = fixture.app
@@ -198,7 +198,10 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.received), 1)
 
     async def test_graph_ticket_private_and_card_not_written(self):
-        token, result = await self.issue()
+        # Auth origins do not select the local Comfy callback endpoint. The real
+        # local-test middleware still checks the request's loopback source.
+        with mock.patch.dict(os.environ, {"CHOUKA_AUTH_ORIGIN": "https://wrong.example/path"}):
+            token, result = await self.issue()
         self.assertEqual(self.submit.call_count, 1)
         inputs = self.graphs[-1]["30"]["inputs"]
         self.assertEqual(inputs["provider"], "gpt_image")
@@ -685,17 +688,46 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         token, _ = await self.issue()
         self.assertEqual((await self.callback(token, image=png("red", (544, 544)))).status, 422)
 
-    async def test_callback_origin_trusted_configuration_only(self):
-        with mock.patch.dict(os.environ, {"CHOUKA_AUTH_ORIGIN": "https://trusted.example"}):
-            self.assertEqual(callback_url({}, controller=True, port=8199),
-                             "https://trusted.example/agent/v1/local-edit/cloud")
-        with mock.patch.dict(os.environ, {"CHOUKA_AUTH_ORIGIN": ""}):
-            with self.assertRaises(web.HTTPServiceUnavailable):
-                callback_url({}, controller=True, port=8199)
-        for origin in ("https://trusted.example/path", "https://user:pass@trusted.example", "https://trusted.example?x=1", "//evil"):
-            with mock.patch.dict(os.environ, {"CHOUKA_AUTH_ORIGIN": origin}):
-                with self.assertRaises(web.HTTPServiceUnavailable):
-                    callback_url({}, controller=True, port=8199)
+    async def test_controller_callback_ticket_without_origin_configuration(self):
+        self.api.controller = True
+        with mock.patch.dict(os.environ):
+            for key in ("CHOUKA_AUTH_ORIGIN", "CHOUKA_HTTP_REDIRECT_ORIGIN", "CHOUKA_HTTPS_REDIRECT_ORIGIN"):
+                os.environ.pop(key, None)
+            for key in ("http_redirect_origin", "https_redirect_origin"):
+                self.application.pop(key, None)
+            for capability, selected in (("texture_local_gpt", "30"), ("texture_local_banana", "31")):
+                with self.subTest(capability=capability):
+                    token, _ = await self.issue(capability=capability)
+                    graph = self.graphs[-1]
+                    self.assertEqual(set(graph), set(self.template))
+                    for node_id in ("30", "31"):
+                        self.assertEqual(graph[node_id]["inputs"]["callback_url"], "")
+                        self.assertEqual(graph[node_id]["inputs"]["callback_token"],
+                                         token if node_id == selected else "")
+        self.assertEqual(self.submit.call_count, 2)
+
+    async def test_controller_callback_ticket_ignores_auth_and_redirect_origins(self):
+        self.api.controller = True
+        # Change settings only after fixture auth setup, and use POST generate:
+        # redirect configuration must not turn this into a browser redirect test.
+        for origin in ("", "https://other.example", "https://other.example/path",
+                       "https://user:pass@other.example", "https://other.example?x=1", "//invalid"):
+            with mock.patch.dict(os.environ, {
+                "CHOUKA_AUTH_ORIGIN": origin,
+                "CHOUKA_HTTP_REDIRECT_ORIGIN": origin,
+                "CHOUKA_HTTPS_REDIRECT_ORIGIN": origin,
+            }):
+                self.application["http_redirect_origin"] = origin
+                self.application["https_redirect_origin"] = origin
+                for capability, selected in (("texture_local_gpt", "30"), ("texture_local_banana", "31")):
+                    with self.subTest(origin=origin, capability=capability):
+                        token, _ = await self.issue(capability=capability)
+                        graph = self.graphs[-1]
+                        self.assertEqual(set(graph), set(self.template))
+                        for node_id in ("30", "31"):
+                            self.assertEqual(graph[node_id]["inputs"]["callback_url"], "")
+                            self.assertEqual(graph[node_id]["inputs"]["callback_token"],
+                                             token if node_id == selected else "")
 
     async def test_all_local_previews_recheck_source_before_job_display(self):
         for capability in CAPABILITIES:
@@ -792,6 +824,8 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(set(payload["graph"]), set(self.template))
         self.assertEqual(set(required_nodes), {node["class_type"] for node in self.template.values()})
         self.assertEqual(payload["graph"]["31"]["inputs"]["callback_token"], "")
+        for node_id in ("30", "31"):
+            self.assertEqual(payload["graph"][node_id]["inputs"]["callback_url"], "")
         self.assertIn(hashlib.sha256(token.encode()).hexdigest(), self.api.tickets)
 
     async def test_controller_all_caps_keep_full_required_nodes_and_model_families(self):

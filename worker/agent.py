@@ -1717,10 +1717,16 @@ class WorkerAgent:
                     raise JobFailed("任务已取消", canceled=True)
                 if self.release_failed:
                     raise JobFailed(self.release_failed)
+                payload = assignment["payload"]
+                graph = payload["graph"]
+                cloud_node = {"texture_local_gpt": "30", "texture_local_banana": "31"}.get(payload.get("capability"))
+                if cloud_node is not None:
+                    graph = copy.deepcopy(graph)
+                    graph[cloud_node]["inputs"]["callback_url"] = self.server + "/agent/v1/local-edit/cloud"
                 result = await self._json_request(
                     "POST", self.comfy + "/prompt",
                     json={
-                        "prompt": assignment["payload"]["graph"],
+                        "prompt": graph,
                         "client_id": client_id,
                         "prompt_id": job_id,
                     },

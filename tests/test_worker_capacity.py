@@ -753,6 +753,75 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.worker.session.ws_connect.return_value = ws
         self.worker.report_event = mock.AsyncMock()
 
+    async def test_local_cloud_callback_url_uses_connected_server_without_mutating_assignment(self):
+        for capability, selected, provider in (("texture_local_gpt", "30", "gpt_image"),
+                                                ("texture_local_banana", "31", "banana")):
+            for server in ("http://10.20.0.1:8199", "https://controller.example:8443"):
+                for old_url in ("", "http://127.0.0.1:8199/agent/v1/local-edit/cloud",
+                                "https://stale.example/agent/v1/local-edit/cloud"):
+                    with self.subTest(capability=capability, server=server, old_url=old_url):
+                        self.worker.server = server
+                        self.assignment["payload"]["capability"] = capability
+                        graph = self.assignment["payload"]["graph"]
+                        for node_id, branch_provider in (("30", "gpt_image"), ("31", "banana")):
+                            graph[node_id] = {"class_type": "ChoukaCloudImageEdit", "inputs": {
+                                "image": ["1", 0], "reference": ["1", 0],
+                                "prompt": "private-prompt", "provider": branch_provider,
+                                "callback_token": "private-selected-ticket" if node_id == selected else "",
+                                "callback_url": old_url if node_id == selected else "",
+                            }}
+                        graph["80"] = {"class_type": "ChoukaLocalModelSwitch", "inputs": {
+                            "model": provider, "flux_image": ["2", 0],
+                            "gpt_image": ["30", 0], "banana_image": ["31", 0],
+                        }}
+                        original = copy.deepcopy(graph)
+                        expected = copy.deepcopy(graph)
+                        expected[selected]["inputs"]["callback_url"] = server + "/agent/v1/local-edit/cloud"
+                        self.requests.clear()
+                        self.worker._json_request.reset_mock()
+                        self.set_execution_events([("execution_success", {"prompt_id": "job-1"})])
+                        with mock.patch.dict(os.environ, {
+                            "CHOUKA_AUTH_ORIGIN": "https://wrong-auth.example/path",
+                            "CHOUKA_HTTP_REDIRECT_ORIGIN": "http://wrong-redirect.example",
+                            "CHOUKA_HTTPS_REDIRECT_ORIGIN": "https://wrong-redirect.example",
+                        }):
+                            await self.worker.execute_comfy(self.assignment)
+                        prompts = [body for url, body in self.requests if url == self.worker.comfy + "/prompt"]
+                        self.assertEqual(len(prompts), 1)
+                        self.assertEqual(prompts[0]["prompt"], expected)
+                        self.assertEqual(self.assignment["payload"]["graph"], original)
+                        prompt_calls = [call for call in self.worker._json_request.await_args_list
+                                        if call.args[1] == self.worker.comfy + "/prompt"]
+                        self.assertEqual(len(prompt_calls), 1)
+                        self.assertEqual(prompt_calls[0].args[0], "POST")
+                        self.assertEqual(self.requests[0][0], server + "/agent/v1/jobs/job-1/start")
+
+    async def test_callback_url_does_not_change_ordinary_or_flux_graph(self):
+        original = copy.deepcopy(self.assignment["payload"]["graph"])
+        for capability in (None, "texture_local_flux"):
+            with self.subTest(capability=capability):
+                self.assignment["payload"] = {"graph": copy.deepcopy(original)}
+                if capability:
+                    self.assignment["payload"]["capability"] = capability
+                    graph = self.assignment["payload"]["graph"]
+                    for node_id, provider in (("30", "gpt_image"), ("31", "banana")):
+                        graph[node_id] = {"class_type": "ChoukaCloudImageEdit", "inputs": {
+                            "image": ["1", 0], "prompt": "private-prompt", "provider": provider,
+                            "callback_token": "", "callback_url": "",
+                        }}
+                    graph["80"] = {"class_type": "ChoukaLocalModelSwitch", "inputs": {
+                        "model": "flux", "flux_image": ["2", 0],
+                        "gpt_image": ["30", 0], "banana_image": ["31", 0],
+                    }}
+                expected = copy.deepcopy(self.assignment["payload"]["graph"])
+                self.requests.clear()
+                self.set_execution_events([("execution_success", {"prompt_id": "job-1"})])
+                await self.worker.execute_comfy(self.assignment)
+                prompts = [body for url, body in self.requests if url == self.worker.comfy + "/prompt"]
+                self.assertEqual(len(prompts), 1)
+                self.assertEqual(prompts[0]["prompt"], expected)
+                self.assertEqual(self.assignment["payload"]["graph"], expected)
+
     async def test_cache_events_keep_actual_partial_node_types_and_ignore_other_jobs(self):
         self.set_execution_events([
             ("execution_cached", {"prompt_id": "other", "nodes": ["2"]}),

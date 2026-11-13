@@ -5,11 +5,9 @@ import hashlib
 from io import BytesIO
 import json
 import math
-import os
 import re
 import secrets
 import time
-from urllib.parse import urlsplit
 
 from aiohttp import web
 from PIL import Image
@@ -68,26 +66,6 @@ def redact(value):
     if isinstance(value, list):
         return [redact(item) for item in value]
     return value
-
-
-def callback_url(app, *, controller, port):
-    # Never derive a paid callback endpoint from Host, forwarded headers or body fields.
-    origin = (os.environ.get("CHOUKA_AUTH_ORIGIN") or app.get("https_redirect_origin")
-              or app.get("http_redirect_origin"))
-    if not origin:
-        if controller:
-            raise web.HTTPServiceUnavailable(text="云局部编辑需要配置可信 CHOUKA_AUTH_ORIGIN 或服务 origin")
-        origin = f"http://127.0.0.1:{port}"
-    try:
-        parsed = urlsplit(origin)
-        if (parsed.scheme not in {"http", "https"} or not parsed.hostname
-                or parsed.username or parsed.password or parsed.path not in {"", "/"}
-                or parsed.query or parsed.fragment or parsed.port == 0
-                or any(ord(c) < 33 or ord(c) == 127 for c in origin)):
-            raise ValueError()
-    except (ValueError, TypeError):
-        raise web.HTTPServiceUnavailable(text="云局部编辑服务 origin 配置无效")
-    return origin.rstrip("/") + "/agent/v1/local-edit/cloud"
 
 
 def validate_mask(data, info, base_info):
@@ -255,7 +233,8 @@ class LocalTexture(TextureApi):
         await self.check_context(request, context["project"], context["card"], context["source"], context["refs"][0])
         if context["provider"] is None:
             return
-        url = callback_url(self.app, controller=self.controller, port=self.port)
+        # The Worker binds its actual controller connection just before /prompt.
+        url = "" if self.controller else f"http://127.0.0.1:{self.port}/agent/v1/local-edit/cloud"
         (cloud_images.load if context["provider"] == "gpt_image" else cloud_banana.load)()
         token = "lt_" + secrets.token_urlsafe(32)
         digest = hashlib.sha256(token.encode()).hexdigest()
