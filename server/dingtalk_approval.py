@@ -160,7 +160,8 @@ def build_task_alert_params(row):
         'taskName': str(row.get('task_name') or ''),
         'jobId': str(row.get('job_id') or ''),
         'projectName': str(row.get('project_name') or ''),
-        'cardId': str(row.get('card_id') or ''),
+        # 沿用已发布模板变量名，展示卡片名称而非内部 ID。
+        'cardId': str(row.get('card_name') or '未记录'),
         'submitter': str(row.get('submitter') or ''),
         'startTime': str(started_at or ''),
         'elapsedText': elapsed_text,

@@ -335,7 +335,8 @@ class TaskAlertService:
                 'elapsed_seconds': int(now - started), 'threshold_minutes': threshold_minutes,
                 'task_name': _text(job.get('name'), _text(job.get('capability'))),
                 'project_name': _text(job.get('projectName'), _text(job.get('project'))),
-                'card_id': _text(job.get('card')), 'submitter': person,
+                'card_id': _text(job.get('card')), 'card_name': _text(job.get('cardName')),
+                'submitter': person,
                 'restart_enabled': execution.get('restart_supported') is True,
                 'restart_reason': execution.get('restart_reason') or '',
             }

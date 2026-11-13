@@ -345,6 +345,64 @@ class AlertServiceTest(unittest.IsolatedAsyncioTestCase):
         self.service.client.deliver_task_alert.assert_awaited_once()
         self.assertEqual(self.service.client.update_task_alert.await_count, 2)
 
+    async def test_card_name_is_displayed_and_persisted_without_exposing_internal_id(self):
+        from server.dingtalk_approval import build_task_alert_params
+
+        job = self.jobs['job']
+        self.jobs = {execution: dict(job, id=execution, execution=execution,
+                                    card='internal-card-' + execution,
+                                    cardName='  镜头卡片 · ' + execution + '  ')
+                     for execution in ('local', 'cloud_image', 'remote_sr')}
+        with patch('server.task_alerts.time.time', return_value=START + 3601):
+            await self.service.run_once()
+            for job_id in self.jobs:
+                with self.subTest(job_id=job_id):
+                    row = self.service.store.get(job_id)
+                    self.assertEqual(row['card_id'], 'internal-card-' + job_id)
+                    self.assertEqual(row['card_name'], '镜头卡片 · ' + job_id)
+                    params = build_task_alert_params(row)
+                    self.assertEqual(params['cardId'], row['card_name'])
+                    self.assertEqual(params['projectName'], '测试项目')
+                    self.assertEqual(params['taskName'], '测试能力')
+                    self.assertNotIn(row['card_id'], str(params))
+            self.service.store.close()
+            self.service.store = TaskAlertStore(self.service.path)
+            for job in self.jobs.values():
+                job['cardName'] = '之后的改名不覆盖告警快照'
+            await self.service.run_once()
+            self.assertEqual(self.service.client.deliver_task_alert.await_count, len(self.jobs))
+            self.service.client.update_task_alert.assert_not_awaited()
+            for job in self.jobs.values():
+                job['status'] = 'done'
+            await self.service.run_once()
+        self.assertEqual(self.service.client.update_task_alert.await_count, len(self.jobs))
+        for call in self.service.client.update_task_alert.await_args_list:
+            row = call.args[1]
+            self.assertEqual(row['card_name'], '镜头卡片 · ' + row['job_id'])
+            self.assertEqual(row['status'], 'expired')
+            self.assertEqual(build_task_alert_params(row)['cardId'], row['card_name'])
+
+    async def test_missing_card_name_never_falls_back_to_id_project_or_capability(self):
+        from server.dingtalk_approval import build_task_alert_params
+
+        job = self.jobs['job']
+        names = (None, '', '  ', 42, False, [], {}, {'name': '不采信的嵌套名称'})
+        self.jobs = {f'job-{index}': dict(job, id=f'job-{index}',
+                                        card=f'private-card-{index}', cardName=name)
+                     for index, name in enumerate(names)}
+        await self.service.run_once()
+        for job_id in self.jobs:
+            with self.subTest(job_id=job_id):
+                row = self.service.store.get(job_id)
+                self.assertEqual(row['card_id'], self.jobs[job_id]['card'])
+                self.assertEqual(row['card_name'], '未记录')
+                params = build_task_alert_params(row)
+                self.assertEqual(params['cardId'], '未记录')
+                self.assertNotIn(row['card_id'], str(params))
+                self.assertEqual(params['projectName'], '测试项目')
+                self.assertEqual(params['taskName'], '测试能力')
+        self.assertEqual(self.service.client.deliver_task_alert.await_count, len(names))
+
     async def test_once_only_trusted_submitter_and_minimal_snapshot(self):
         await self.service.run_once()
         await self.service.run_once()
@@ -520,7 +578,7 @@ class AlertServiceTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_worker_authoritative_start_and_restart_authorized_once(self):
         worker, assignment = self.use_worker()
-        self.jobs['job']['started'] = NOW
+        self.jobs['job'].update(started=NOW, card='internal-action-card', cardName='可安全重启的镜头卡')
         await self.service.run_once()
         row = self.service.store.get('job')
         self.assertEqual(row['started_at'], START)
@@ -533,6 +591,9 @@ class AlertServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(current['actor_id'], 'approver-b')
         self.assertFalse(current['restart_enabled'])
         self.assertEqual(body['cardData']['cardParamMap']['status'], 'restart_pending')
+        self.assertEqual(body['cardData']['cardParamMap']['cardId'], '可安全重启的镜头卡')
+        self.assertEqual(current['card_id'], 'internal-action-card')
+        self.assertEqual(current['card_name'], '可安全重启的镜头卡')
         request_id = current['request_id']
         await asyncio.gather(*(self.service.process_callback(callback(row)) for _ in range(3)))
         self.assertEqual(self.service.store.get('job')['request_id'], request_id)

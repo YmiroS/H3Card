@@ -101,6 +101,26 @@ class TaskParamsTest(unittest.TestCase):
             self.assertNotIn(str(row[field]), str(params))
         self.assertNotIn('outTrackId', params)
 
+    def test_card_name_is_displayed_instead_of_internal_id_for_every_state(self):
+        for status in dta.TASK_ALERT_STATUSES:
+            with self.subTest(status=status):
+                row = {**ROW, 'card_name': '镜头一 · 雨夜街景', 'status': status}
+                params = dta.build_task_alert_params(row)
+                self.assertEqual(params['cardId'], '镜头一 · 雨夜街景')
+                self.assertNotIn(ROW['card_id'], str(params))
+                self.assertEqual(set(params), PARAM_KEYS)
+                self.assertEqual(row['card_id'], ROW['card_id'])
+                self.assertEqual(params['jobId'], ROW['job_id'])
+                self.assertEqual(params['workerId'], ROW['worker_id'])
+
+    def test_legacy_card_id_is_never_used_as_the_display_name(self):
+        for name in (None, ''):
+            with self.subTest(name=name):
+                params = dta.build_task_alert_params({**ROW, 'card_name': name})
+                self.assertEqual(params['cardId'], '未记录')
+                self.assertNotIn(ROW['card_id'], str(params))
+        self.assertEqual(dta.build_task_alert_params(ROW)['cardId'], '未记录')
+
     def test_title_uses_persisted_threshold_for_every_card_state(self):
         for threshold in (35, 60):
             for status in dta.TASK_ALERT_STATUSES:
@@ -161,7 +181,7 @@ class TaskClientTest(unittest.IsolatedAsyncioTestCase):
         ])
         client = dta.DingTalkClient(ALERT_CONFIG)
         row = {**ROW, 'threshold_minutes': 60, 'elapsed_seconds': 3601,
-               'task_name': 'H3无损融合单采V3'}
+               'task_name': 'H3无损融合单采V3', 'card_name': '镜头二 · 日落海岸'}
         await client.deliver_task_alert(session, row)
         await client.update_task_alert(session, {**row, 'status': 'expired'})
         for method, _url, request in calls[1:]:
@@ -170,6 +190,8 @@ class TaskClientTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(set(params), PARAM_KEYS)
                 self.assertEqual(params['title'], '生成任务运行超过 60 分钟')
                 self.assertEqual(params['elapsedText'], '1小时0分1秒')
+                self.assertEqual(params['cardId'], '镜头二 · 日落海岸')
+                self.assertNotIn(ROW['card_id'], str(params))
                 self.assertEqual(request['json']['outTrackId'], ROW['out_track_id'])
         self.assertEqual(calls[1][2]['json']['cardTemplateId'], 'task-alert.schema')
         self.assertEqual(calls[2][2]['json']['cardData']['cardParamMap']['restartEnabled'], 'false')
