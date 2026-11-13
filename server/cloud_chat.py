@@ -1,8 +1,9 @@
-"""Bounded chat gateway; never retries or exposes upstream errors."""
+"""Bounded chat gateway; never retries and exposes only sanitized upstream diagnostics."""
 import asyncio
 import base64
 import binascii
 import json
+import logging
 import os
 import re
 from urllib.parse import urlsplit
@@ -18,13 +19,17 @@ MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 
 class ChatError(Exception):
-    def __init__(self, message, *, status=502, answer_unknown=False):
+    def __init__(self, message, *, status=502, answer_unknown=False, request_id=None):
         super().__init__(message)
         self.status = status
         self.answer_unknown = answer_unknown
+        self.request_id = request_id
 
     def response(self):
-        return {"error": str(self), "answer_unknown": self.answer_unknown, "retryable": False}
+        result = {"error": str(self), "answer_unknown": self.answer_unknown, "retryable": False}
+        if self.request_id:
+            result["request_id"] = self.request_id
+        return result
 
 
 def load():
@@ -120,6 +125,56 @@ def validate(body, *, allow_local_images=False):
     return messages
 
 
+def _upstream_error(payload, *, config, messages, end_user_name, end_user_phone,
+                    request_id, status=None, raw=b""):
+    prompts, image_urls = [], []
+    for message in messages:
+        content = message["content"]
+        if isinstance(content, str):
+            prompts.append(content)
+        else:
+            for part in content:
+                if part["type"] == "text":
+                    prompts.append(part["text"])
+                elif part["type"] == "image_url":
+                    image_urls.append(part["image_url"]["url"])
+    secrets = (config["api_key"], end_user_name, end_user_phone, *image_urls)
+    if (not request_id or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)
+            or config["api_key"] in request_id or request_id.lower().startswith("sk-")
+            or any(value and (value == request_id or (len(value) >= 8 and value in request_id))
+                   for value in (*secrets[1:], *prompts))):
+        request_id = None
+    error = cloud_images.provider_error_fields(payload)
+    if raw:
+        try:
+            error = raw.decode("utf-8")
+        except UnicodeError:
+            pass
+    detail = cloud_images.sanitize_error_detail(error, secrets=secrets, prompts=prompts) or "无可用错误详情"
+    logging.getLogger(__name__).warning(
+        "Cloud chat upstream error status=%s request_id=%r detail=%s", status, request_id, detail)
+    kind = f"返回 HTTP {status}" if status is not None else "流式返回错误"
+    receipt = f"，X-Request-ID: {request_id}" if request_id else ""
+    return ChatError(f"云端聊天{kind}{receipt}：{detail}。请联系管理员核对，不要自动重试",
+                     request_id=request_id)
+
+
+async def _http_error(response, *, model, billing_state, **diagnostics):
+    payload, raw = None, b""
+    try:
+        body = await cloud_images.read_limited(response, 16 * 1024)
+        try:
+            payload = provider_billing.loads(body)
+        except (ValueError, UnicodeError):
+            raw = body
+        provider_billing.capture(billing_state, payload, model, diagnostics["config"])
+    except (cloud_images.ImageEditError, ValueError, UnicodeError, OSError, RecursionError,
+            aiohttp.ClientError, asyncio.TimeoutError):
+        pass
+    return _upstream_error(payload, raw=raw, status=response.status,
+                           request_id=response.headers.get("X-Request-ID"), **diagnostics)
+
+
 async def complete(session, messages, *, end_user_name, end_user_phone, model=None, max_tokens=None,
                    billing_state=None):
     config = load()
@@ -133,6 +188,8 @@ async def complete(session, messages, *, end_user_name, end_user_phone, model=No
         if type(max_tokens) is not int or not 1 <= max_tokens <= 100000:
             raise ChatError("聊天 token 限制无效", status=503)
         body["max_tokens"] = max_tokens
+    diagnostics = {"config": config, "messages": messages,
+                   "end_user_name": end_user_name, "end_user_phone": end_user_phone}
     try:
         async with session.post(
                 config["base_url"].rstrip("/") + "/chat/completions",
@@ -142,6 +199,8 @@ async def complete(session, messages, *, end_user_name, end_user_phone, model=No
                          "X-End-User-Phone": end_user_phone},
                 proxy=None, allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=300)) as response:
+            if not 200 <= response.status < 300:
+                raise await _http_error(response, model=model, billing_state=billing_state, **diagnostics)
             raw = bytearray()
             async for chunk in response.content.iter_chunked(65536):
                 raw.extend(chunk)
@@ -152,8 +211,6 @@ async def complete(session, messages, *, end_user_name, end_user_phone, model=No
             except (ValueError, UnicodeError):
                 payload = None
             provider_billing.capture(billing_state, payload, model, config)
-            if not 200 <= response.status < 300:
-                raise ChatError(f"云端聊天返回 HTTP {response.status}，请联系管理员核对，不要自动重试")
             request_id = response.headers.get("X-Request-ID")
     except (aiohttp.ClientError, asyncio.TimeoutError):
         raise ChatError("请求未完成，回答状态可能未知。不要自动重试，请联系管理员确认。",
@@ -185,6 +242,8 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone, b
     billing_state["status"] = "running"
     if not isinstance(model, str) or not model.strip() or any(ord(c) < 33 for c in model):
         raise ChatError("聊天模型配置无效", status=503)
+    diagnostics = {"config": config, "messages": messages,
+                   "end_user_name": end_user_name, "end_user_phone": end_user_phone}
     downstream = web.StreamResponse(
         headers={"Content-Type": "text/event-stream; charset=utf-8",
                  "Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"})
@@ -199,12 +258,7 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone, b
                 proxy=None, allow_redirects=False,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=300)) as upstream:
             if not 200 <= upstream.status < 300:
-                try:
-                    raw = await cloud_images.read_limited(upstream, MAX_RESPONSE_BYTES)
-                    provider_billing.capture(billing_state, provider_billing.loads(raw), model, config)
-                except (cloud_images.ImageEditError, ValueError, UnicodeError):
-                    pass
-                raise ChatError(f"云端聊天返回 HTTP {upstream.status}，请联系管理员核对，不要自动重试")
+                raise await _http_error(upstream, model=model, billing_state=billing_state, **diagnostics)
             if upstream.content_type != "text/event-stream":
                 try:
                     raw = await cloud_images.read_limited(upstream, MAX_RESPONSE_BYTES)
@@ -234,17 +288,26 @@ async def stream(session, request, messages, *, end_user_name, end_user_phone, b
                         data, error_event = _stream_frame(frame)
                         if not data:
                             if error_event:
-                                raise ValueError()
+                                raise _upstream_error(None,
+                                    request_id=upstream.headers.get("X-Request-ID"), **diagnostics)
                             continue
                         if data == "[DONE]" and not error_event:
                             finished = True
                             billing_state["status"] = "done"
                             await downstream.write(b"data: [DONE]\n\n")
                             break
-                        payload = provider_billing.loads(data)
+                        try:
+                            payload = provider_billing.loads(data)
+                        except (ValueError, UnicodeError):
+                            if error_event:
+                                raise _upstream_error(None, raw=data.encode("utf-8"),
+                                    request_id=upstream.headers.get("X-Request-ID"), **diagnostics) from None
+                            raise
                         provider_billing.capture(billing_state, payload, model, config)
-                        if error_event or isinstance(payload, dict) and "error" in payload:
-                            raise ValueError()
+                        if (error_event or isinstance(payload, dict) and ("error" in payload
+                                or "choices" not in payload and any(key in payload for key in ("message", "detail")))):
+                            raise _upstream_error(payload,
+                                request_id=upstream.headers.get("X-Request-ID"), **diagnostics)
                         if (isinstance(payload, dict) and "choices" not in payload
                                 and ("usage" in payload or "cost" in payload)):
                             continue
