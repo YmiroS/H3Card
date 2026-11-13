@@ -213,6 +213,8 @@ class CharacterApiTests(unittest.IsolatedAsyncioTestCase):
         result = await response.json()
         self.assertEqual(result["source_digest"], self.digest)
         self.assertEqual(result["request_id"], "texture-request-1")
+        self.assertEqual(self.received_fields[0]["model"], "gpt-image-2.6-sunburst")
+        self.assertEqual(result["model"], "gpt-image-2.6-sunburst")
         self.assertEqual(self.received_fields[0]["size"], "576x432")
         with Image.open(BytesIO(self.received[0][0])) as image:
             self.assertEqual(image.size, (576, 432))

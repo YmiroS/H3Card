@@ -241,6 +241,8 @@ class TextureApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(self.auth_user["username"], self.auth_user["display_name"])
         self.assertEqual(result["source_kind"], "upstream")
         self.assertEqual(result["request_id"], "texture-request-1")
+        self.assertEqual(self.received_fields[0]["model"], "gpt-image-2.6-sunburst")
+        self.assertEqual(result["model"], "gpt-image-2.6-sunburst")
         self.assertEqual(self.received_fields[0]["size"], "4x3")
         self.assertEqual((result["source"]["width"], result["source"]["height"]), (4, 3))
         self.assertEqual((result["image"]["width"], result["image"]["height"]), (4, 3))

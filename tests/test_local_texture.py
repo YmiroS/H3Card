@@ -237,6 +237,7 @@ class LocalTextureTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(response.headers["X-Request-ID"], "texture-request-1")
         self.assertEqual(cloud_images.inspect_image(await response.read())["width"], 4)
         self.assertEqual(self.received, [[png("red", (4, 4)), png("green", (2, 3))]])
+        self.assertEqual(self.received_fields[0]["model"], "gpt-image-2.6-sunburst")
         self.assertEqual(self.received_fields[0]["size"], "4x4")
         self.assertEqual(self.received_fields[0]["prompt"], self.body["params"]["prompt"])
         self.assertEqual(self.received_headers, [(self.auth_user["username"], self.auth_user["phone"])])

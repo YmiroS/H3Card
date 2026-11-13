@@ -330,7 +330,8 @@ class LocalTexture(TextureApi):
             kwargs = {"end_user_name": record["username"], "end_user_phone": record["phone"]}
             if record["provider"] == "gpt_image":
                 result = await cloud_images.edit(self.app["session"], payload, record["prompt"],
-                                                 size=f"{info['width']}x{info['height']}", **kwargs)
+                                                 size=f"{info['width']}x{info['height']}",
+                                                 model="gpt-image-2.6-sunburst", **kwargs)
             else:
                 result = await cloud_banana.generate(self.app["session"], payload, record["prompt"], **kwargs)
             ledger = self.app.get("costs")

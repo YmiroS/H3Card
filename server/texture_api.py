@@ -199,7 +199,7 @@ class TextureApi:
             user = require_user(request)
             result = await cloud_images.edit(self.app["session"], [data], body["prompt"],
                                              end_user_name=user["username"], end_user_phone=user["phone"],
-                                             size=f"{info['width']}x{info['height']}")
+                                             size=f"{info['width']}x{info['height']}", model="gpt-image-2.6-sunburst")
             if "image_bytes" in result and (result["width"], result["height"]) != (info["width"], info["height"]):
                 raise cloud_images.ImageEditError(
                     f"云端返回图片尺寸 {result['width']}x{result['height']} 与本轮底图 "

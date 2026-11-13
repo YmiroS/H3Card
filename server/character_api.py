@@ -143,7 +143,8 @@ class CharacterApi(TextureApi):
             if provider == "banana":
                 result = await cloud_banana.generate(self.app["session"], [generation_base], prompt, **identity)
             else:
-                result = await cloud_images.edit(self.app["session"], [generation_base], prompt, size=size, **identity)
+                result = await cloud_images.edit(self.app["session"], [generation_base], prompt, size=size,
+                                                 model="gpt-image-2.6-sunburst", **identity)
             async with self.app["project_locks"][project_id]:
                 try:
                     await self.check_context(request, project_id, card_id, version, ref)
