@@ -2,7 +2,8 @@
 rem Synchronize authoritative ComfyUI data to a Windows worker.
 rem Default mode synchronizes ComfyUI 0.37 core, H3 customizations, models and user.
 rem Use --models-only only when an operator intentionally wants the legacy behavior.
-rem Robocopy skips files whose size and timestamp already match.
+rem Models/user remain incremental; custom nodes follow the authoritative source.
+rem Core files are refreshed even when size and timestamp match.
 setlocal EnableExtensions DisableDelayedExpansion
 chcp 65001 >nul
 cd /d "%~dp0"
@@ -65,6 +66,18 @@ if not exist "%SOURCE_ROOT%\ComfyUI\user\" (
   goto failure
 )
 if "%SYNC_CORE%"=="1" (
+  if not exist "%SOURCE_ROOT%\ComfyUI\custom_nodes\" (
+    echo ERROR: Cannot access source custom_nodes directory.
+    goto failure
+  )
+  if not exist "%DEST_ROOT%\python_embeded\python.exe" (
+    echo ERROR: Cannot find ComfyUI Python: %DEST_ROOT%\python_embeded\python.exe
+    goto failure
+  )
+  if not exist "%~dp0worker\sync_custom_nodes.py" (
+    echo ERROR: Cannot find custom node synchronization helper.
+    goto failure
+  )
   if not exist "%SOURCE_ROOT%\ComfyUI\comfyui_version.py" (
     echo ERROR: Cannot access source ComfyUI core.
     goto failure
@@ -95,6 +108,7 @@ echo Source:      %SOURCE_ROOT%
 echo Destination: %DEST_ROOT%
 if "%SYNC_CORE%"=="1" (echo Mode:        ComfyUI upgrade + models + user) else (echo Mode:        models + user only)
 if "%DRY_RUN%"=="1" echo DRY RUN:     no files will be changed.
+if "%SYNC_CORE%"=="1" echo IMPORTANT: Stop ComfyUI and Worker before applying updates; restart after success.
 echo.
 
 rem Synchronize large assets first. Core code remains untouched if an asset copy fails.
@@ -114,7 +128,11 @@ if "%SYNC_CORE%"=="1" if "%DRY_RUN%"=="0" (
 )
 
 if "%SYNC_CORE%"=="1" (
+  call :sync_custom_nodes
+  if errorlevel 1 goto failure
   call :sync_comfy_core "ComfyUI core" "%SOURCE_ROOT%\ComfyUI" "%DEST_ROOT%\ComfyUI"
+  if errorlevel 1 goto failure
+  call :clear_core_cache
   if errorlevel 1 goto failure
   if "%DRY_RUN%"=="1" (
     echo DRY RUN: obsolete ComfyUI 0.37 files would be removed.
@@ -131,13 +149,24 @@ if "%DRY_RUN%"=="1" (
   echo Dry-run inspection completed successfully. No files were changed.
 ) else (
   echo File synchronization completed successfully.
-  echo Files that exist only on this node were not deleted.
+  echo Models and user: destination-only files were not deleted.
+  if "%SYNC_CORE%"=="1" echo Custom nodes: obsolete files were backed up and removed; local tooling directories were excluded.
   if "%SYNC_CORE%"=="1" (
     echo Managed plugin dependencies verified. Node loading still requires a ComfyUI restart.
     echo IMPORTANT: Update Python packages from ComfyUI\requirements.txt, then restart ComfyUI.
   )
 )
 goto success
+
+:sync_custom_nodes
+set "CUSTOM_NODE_DRY_RUN="
+if "%DRY_RUN%"=="1" set "CUSTOM_NODE_DRY_RUN=--dry-run"
+"%DEST_ROOT%\python_embeded\python.exe" -B -s "%~dp0worker\sync_custom_nodes.py" --source "%SOURCE_ROOT%\ComfyUI\custom_nodes" --destination "%DEST_ROOT%\ComfyUI\custom_nodes" --backup-root "%DEST_ROOT%\chouka-sync-backups" %CUSTOM_NODE_DRY_RUN%
+exit /b %ERRORLEVEL%
+
+:clear_core_cache
+"%DEST_ROOT%\python_embeded\python.exe" -B -s "%~dp0worker\sync_custom_nodes.py" --clear-core-cache "%DEST_ROOT%\ComfyUI" %CUSTOM_NODE_DRY_RUN%
+exit /b %ERRORLEVEL%
 
 :sync_plugin_dependencies
 set "COMFY_PYTHON=%DEST_ROOT%\python_embeded\python.exe"
@@ -158,8 +187,8 @@ set "SYNC_NAME=%~1"
 echo ============================================================
 echo Synchronizing %SYNC_NAME%...
 echo ============================================================
-robocopy "%~2" "%~3" /E /Z /MT:32 /R:2 /W:2 /XJ /COPY:DAT /DCOPY:DAT %ROBOCOPY_DRY_RUN% ^
-  /XD "%~2\models" "%~2\user" "%~2\input" "%~2\output" "%~2\temp" ^
+robocopy "%~2" "%~3" /E /IS /IT /IM /Z /MT:32 /R:2 /W:2 /XJ /COPY:DAT /DCOPY:DAT %ROBOCOPY_DRY_RUN% ^
+  /XD "%~2\models" "%~2\user" "%~2\input" "%~2\output" "%~2\temp" "%~2\custom_nodes" ^
       "%~2\.git" "%~2\.github" "%~2\tests" "%~2\tests-unit" ^
       "%~2\config" "%~2\styles" "%~2\ComfyUI-EditUtils" ^
       ".git" "__pycache__" ".venv" "venv" "node_modules" ^

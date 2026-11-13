@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import py_compile
 from pathlib import Path
 import shutil
 import subprocess
@@ -24,6 +25,10 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 HELPER = ROOT / "worker" / "sync_dependencies.py"
 BATCH = ROOT / "同步主节点模型和用户.bat"
+NODE_HELPER = ROOT / "worker" / "sync_custom_nodes.py"
+NODE_SPEC = importlib.util.spec_from_file_location("node_sync_under_test", NODE_HELPER)
+node_sync = importlib.util.module_from_spec(NODE_SPEC)
+NODE_SPEC.loader.exec_module(node_sync)
 SPEC = importlib.util.spec_from_file_location("dependency_executor_under_test", HELPER)
 dependencies = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(dependencies)
@@ -673,6 +678,139 @@ print('CHECK_OK')
                         process.wait(timeout=10)
 
 
+class CustomNodeSyncTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="node-sync-test-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.source = self.root / "source"
+        self.target = self.root / "target"
+        self.backups = self.root / "backups"
+        self.source.mkdir()
+        self.target.mkdir()
+        self.write(self.source / "plugin" / "__init__.py", b"new = 1\n")
+        self.enterContext(redirect_stdout(io.StringIO()))
+
+    def write(self, path, content):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(content)
+        return path
+
+    def sync(self, **kwargs):
+        node_sync.synchronize(self.source, self.target, self.backups, **kwargs)
+
+    def test_add_replace_remove_and_back_up_even_with_identical_metadata(self):
+        source = self.source / "plugin" / "__init__.py"
+        target = self.write(self.target / "plugin" / "__init__.py", b"old = 1\n")
+        os.utime(target, ns=(source.stat().st_atime_ns, source.stat().st_mtime_ns))
+        stale = self.write(self.target / "old_plugin" / "__init__.py", b"obsolete")
+        self.write(self.source / "plugin" / "added.json", b"{}")
+        self.sync()
+        self.assertEqual(target.read_bytes(), source.read_bytes())
+        self.assertFalse(stale.parent.exists())
+        self.assertEqual((self.target / "plugin" / "added.json").read_bytes(), b"{}")
+        backup, = self.backups.iterdir()
+        self.assertEqual((backup / "plugin" / "__init__.py").read_bytes(), b"old = 1\n")
+        self.assertEqual((backup / "old_plugin" / "__init__.py").read_bytes(), b"obsolete")
+        self.sync()
+        self.assertEqual(len(list(self.backups.iterdir())), 1)
+
+    def test_dry_run_does_not_copy_delete_or_create_backup(self):
+        stale = self.write(self.target / "old.py", b"old")
+        self.sync(dry_run=True)
+        self.assertEqual(stale.read_bytes(), b"old")
+        self.assertFalse((self.target / "plugin").exists())
+        self.assertFalse(self.backups.exists())
+
+    def test_empty_or_missing_source_fails_before_deleting(self):
+        stale = self.write(self.target / "old.py", b"old")
+        for missing in (False, True):
+            with self.subTest(missing=missing):
+                source = self.root / "empty"
+                if not missing:
+                    source.mkdir()
+                else:
+                    source.rmdir()
+                with self.assertRaises(RuntimeError):
+                    node_sync.synchronize(source, self.target, self.backups)
+                self.assertEqual(stale.read_bytes(), b"old")
+
+    def test_overlapping_roots_fail_closed(self):
+        for destination, backup in ((self.source, self.backups),
+                                    (self.source / "nested", self.backups),
+                                    (self.target, self.target / "backup")):
+            with self.subTest(destination=destination, backup=backup):
+                with self.assertRaises(RuntimeError):
+                    node_sync.synchronize(self.source, destination, backup)
+
+    def test_source_caches_are_not_copied_and_worker_caches_are_removed(self):
+        self.write(self.source / "plugin" / "__pycache__" / "cached.pyc", b"source cache")
+        cached = self.write(self.target / "plugin" / "__pycache__" / "cached.pyc", b"old cache")
+        self.sync()
+        self.assertFalse(cached.exists())
+        self.assertFalse(cached.parent.exists())
+
+    def test_tooling_directories_are_not_copied_or_deleted(self):
+        for name in node_sync.EXCLUDED_DIRECTORIES:
+            self.write(self.source / "plugin" / name / "source", b"source")
+            self.write(self.target / "plugin" / name / "target", b"target")
+        self.sync()
+        for name in node_sync.EXCLUDED_DIRECTORIES:
+            self.assertFalse((self.target / "plugin" / name / "source").exists())
+            self.assertEqual((self.target / "plugin" / name / "target").read_bytes(), b"target")
+
+    def test_backup_failure_prevents_all_file_changes(self):
+        target = self.write(self.target / "plugin" / "__init__.py", b"old")
+        stale = self.write(self.target / "stale.py", b"stale")
+        with mock.patch.object(node_sync.shutil, "copy2", side_effect=OSError("backup failed")):
+            with self.assertRaisesRegex(OSError, "backup failed"):
+                self.sync()
+        self.assertEqual(target.read_bytes(), b"old")
+        self.assertEqual(stale.read_bytes(), b"stale")
+
+    @unittest.skipUnless(os.name == "nt", "Requires Windows directory junctions")
+    def test_junctions_are_rejected_without_touching_external_files(self):
+        outside = self.root / "outside"
+        outside.mkdir()
+        sentinel = self.write(outside / "keep.py", b"external data")
+        for root in (self.source, self.target):
+            with self.subTest(root=root):
+                link = root / "linked_plugin"
+                result = subprocess_run_real(
+                    f'cmd.exe /d /c mklink /J "{link}" "{outside}"')
+                self.assertEqual(result.returncode, 0, result.stdout)
+                try:
+                    with self.assertRaisesRegex(RuntimeError, "linked/reparse"):
+                        self.sync()
+                    self.assertEqual(sentinel.read_bytes(), b"external data")
+                    self.assertFalse(self.backups.exists())
+                finally:
+                    link.rmdir()
+
+    def test_core_cache_cleanup_preserves_data_and_respects_dry_run(self):
+        cached = self.write(self.target / "comfy" / "__pycache__" / "module.pyc", b"old cache")
+        legacy = self.write(self.target / "old.pyo", b"old cache")
+        code = self.write(self.target / "comfy" / "module.py", b"code")
+        retained = [self.write(self.target / name / "__pycache__" / "keep.pyc", b"data")
+                    for name in ("models", "user", "custom_nodes", "input", "output", "config", ".git")]
+        node_sync.clear_core_cache(self.target, dry_run=True)
+        self.assertTrue(cached.exists())
+        self.assertTrue(legacy.exists())
+        node_sync.clear_core_cache(self.target)
+        self.assertFalse(cached.exists())
+        self.assertFalse(cached.parent.exists())
+        self.assertFalse(legacy.exists())
+        self.assertEqual(code.read_bytes(), b"code")
+        for path in retained:
+            self.assertEqual(path.read_bytes(), b"data")
+
+    def test_type_conflict_fails_before_copying(self):
+        self.write(self.target / "plugin", b"not a directory")
+        with self.assertRaisesRegex(RuntimeError, "conflict"):
+            self.sync()
+        self.assertFalse(self.backups.exists())
+
+
 @unittest.skipUnless(os.name == "nt", "Requires real Windows cmd and robocopy")
 class WindowsBatchDependencyTests(unittest.TestCase):
     @classmethod
@@ -698,6 +836,7 @@ class WindowsBatchDependencyTests(unittest.TestCase):
         self.comfy.mkdir(parents=True)
         self.batch = self.chouka / BATCH.name
         shutil.copyfile(BATCH, self.batch)
+        shutil.copyfile(NODE_HELPER, self.worker / NODE_HELPER.name)
         self.log = self.worker / "helper-invocation.json"
         self.exit_file = self.worker / "helper-exit.txt"
         self.exit_file.write_text("0", encoding="ascii")
@@ -719,7 +858,9 @@ class WindowsBatchDependencyTests(unittest.TestCase):
         self.python_dir = self.pack / "python_embeded"
         self.python_dir.mkdir()
         required = ("python.exe", self.python_tag + ".dll", self.python_tag + ".zip")
-        optional = ("python3.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+        optional = ("python3.dll", "vcruntime140.dll", "vcruntime140_1.dll",
+                    "_hashlib.pyd", "libcrypto-3.dll", "libcrypto-3-x64.dll",
+                    "_sha256.pyd", "_sha512.pyd", "_sha2.pyd")
         for name in required + optional:
             original = self.runtime_source / name
             if name in required or original.is_file():
@@ -797,6 +938,74 @@ class WindowsBatchDependencyTests(unittest.TestCase):
         self.assert_models_copied()
         self.assertTrue((self.comfy / "custom_nodes" / PLUGIN / "__init__.py").is_file())
         self.assertIn("Managed plugin dependencies verified", result.stdout)
+
+    def test_full_sync_replaces_same_metadata_core_and_nodes_and_removes_old_nodes(self):
+        for relative in ("comfyui_version.py", f"custom_nodes/{PLUGIN}/__init__.py"):
+            source = self.source / "ComfyUI" / relative
+            target = self.comfy / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"x" * source.stat().st_size)
+            os.utime(target, ns=(source.stat().st_atime_ns, source.stat().st_mtime_ns))
+        stale = self.comfy / "custom_nodes" / "removed_plugin" / "__init__.py"
+        stale.parent.mkdir(parents=True)
+        stale.write_bytes(b"obsolete plugin")
+        local_model = self.comfy / "models" / "keep.safetensors"
+        local_model.parent.mkdir(parents=True)
+        local_model.write_bytes(b"local model")
+        local_user = self.comfy / "user" / "keep.json"
+        local_user.parent.mkdir(parents=True)
+        local_user.write_bytes(b"local user data")
+        result = self.execute_batch()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        for relative in ("comfyui_version.py", f"custom_nodes/{PLUGIN}/__init__.py"):
+            self.assertEqual((self.comfy / relative).read_bytes(),
+                             (self.source / "ComfyUI" / relative).read_bytes(),
+                             f"{relative}\n{result.stdout}")
+        self.assertFalse(stale.parent.exists())
+        backup, = (self.pack / "chouka-sync-backups").iterdir()
+        self.assertEqual((backup / "removed_plugin" / "__init__.py").read_bytes(), b"obsolete plugin")
+        self.assertEqual(local_model.read_bytes(), b"local model")
+        self.assertEqual(local_user.read_bytes(), b"local user data")
+        self.assert_helper_invocation()
+
+    def test_full_sync_invalidates_old_core_bytecode_for_fresh_python_process(self):
+        source = self.source / "ComfyUI" / "comfyui_version.py"
+        target = self.comfy / "comfyui_version.py"
+        source.write_bytes(b"VALUE = 'NEW'\n")
+        target.write_bytes(b"VALUE = 'OLD'\n")
+        for path in (source, target):
+            os.utime(path, ns=(1700000000000000000, 1700000000000000000))
+        cache = Path(py_compile.compile(str(target), doraise=True))
+        result = self.execute_batch()
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(cache.exists(), result.stdout)
+        probe = (
+            "import importlib.util,sys; "
+            "s=importlib.util.spec_from_file_location('core_probe',sys.argv[1]); "
+            "m=importlib.util.module_from_spec(s); s.loader.exec_module(m); print(m.VALUE)"
+        )
+        loaded = subprocess_run_real([str(self.python), "-B", "-s", "-c", probe, str(target)])
+        self.assertEqual(loaded.returncode, 0, loaded.stdout)
+        self.assertEqual(loaded.stdout.strip(), "NEW")
+
+    def test_dry_run_preserves_obsolete_nodes_and_does_not_create_backup(self):
+        stale = self.comfy / "custom_nodes" / "removed.py"
+        stale.parent.mkdir()
+        stale.write_bytes(b"old")
+        result = self.execute_batch("--dry-run")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertEqual(stale.read_bytes(), b"old")
+        self.assertIn("REMOVE: removed.py", result.stdout)
+        self.assertFalse((self.pack / "chouka-sync-backups").exists())
+        self.assertFalse(self.log.exists())
+
+    def test_node_sync_failure_stops_core_and_dependency_updates(self):
+        (self.worker / NODE_HELPER.name).write_text("raise SystemExit(19)\n", encoding="utf-8")
+        result = self.execute_batch()
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertFalse((self.comfy / "comfyui_version.py").exists())
+        self.assertFalse(self.log.exists())
+        self.assertNotIn("File synchronization completed successfully", result.stdout)
 
     def test_full_sync_private_runtime_ignores_pythonpath_and_pythonhome(self):
         untrusted = self.root / "untrusted Python environment"
