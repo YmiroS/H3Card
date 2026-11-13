@@ -981,6 +981,15 @@ class WorkerAgent:
         )
         return commit.strip(), output
 
+    async def stop_comfy_for_update(self):
+        if os.name != "nt":
+            raise AgentError("文件同步只能在 Windows Worker 上运行")
+        from restart_node import stop_comfy
+        await asyncio.to_thread(stop_comfy, self.comfy)
+        self.comfy_online = False
+        self.fresh_capabilities_ready = False
+        self.recovered_maintenance_request_id = None
+
     async def restart_comfy_only(self):
         if os.name != "nt":
             raise AgentError("ComfyUI 自动重启只能在 Windows Worker 上运行")
@@ -1307,17 +1316,18 @@ class WorkerAgent:
         self.sync_report = {
             "request_id": request_id,
             "status": "running",
-            "message": ("正在同步 ComfyUI、模型和用户目录" if action == "sync_files"
+            "message": ("正在停止 ComfyUI，随后拉取代码并同步文件" if action == "sync_files"
                         else "正在重启节点服务，未更新代码"),
         }
         print(f"[Worker] 开始维护 {action}：{request_id}", flush=True)
         self._maintenance_executing = True
         guarded = any(key in command for key in ("expected_job_id", "expected_attempt_id"))
         guarded_assignment = None
+        comfy_stopped = False
         try:
             if action == "sync_files":
                 self.state["maintenance"] = {
-                    **self.sync_report, "action": action, "phase": "syncing_files",
+                    **self.sync_report, "action": action, "phase": "stopping_comfy",
                     "deadline": time.time() + max(float(self.config.get("file_sync_timeout_seconds", 3600)), 60.0) + 900,
                 }
                 self._save_state()
@@ -1350,8 +1360,17 @@ class WorkerAgent:
                         self._check_guarded_assignment(command, guarded_assignment)
                     await self.schedule_node_restart(request_id, "")
                 return
-            if os.name != "nt":
-                raise AgentError("文件同步脚本只能在 Windows Worker 上运行")
+            await self.stop_comfy_for_update()
+            comfy_stopped = True
+            self.sync_report["message"] = "ComfyUI 已停止，正在拉取 chouka 代码"
+            self.state["maintenance"].update(phase="pulling_code", message=self.sync_report["message"])
+            self._save_state()
+            commit, _ = await self.pull_code()
+            self.sync_report["message"] = "代码已更新，正在同步 ComfyUI、模型和用户目录"
+            self.state["maintenance"].update(
+                phase="syncing_files", target_commit=commit, message=self.sync_report["message"],
+            )
+            self._save_state()
             script = self.sync_script_path()
             if not script.is_file():
                 raise AgentError(f"找不到同步脚本：{script}")
@@ -1361,16 +1380,27 @@ class WorkerAgent:
                 cwd=script.parent,
                 timeout=max(float(self.config.get("file_sync_timeout_seconds", 3600)), 60.0),
             )
-            self.sync_report["message"] = "文件同步完成，正在拉取 chouka 代码"
-            commit, _ = await self.pull_code()
-            print(f"[Worker] chouka 已更新至 {commit[:12]}，准备重启节点", flush=True)
+            self.sync_report["message"] = "代码和文件同步完成，正在交接旧 Worker 并重启节点"
+            print(f"[Worker] chouka 已更新至 {commit[:12]}，文件同步完成，准备重启节点", flush=True)
             await self.schedule_node_restart(request_id, commit)
         except (Exception, asyncio.CancelledError) as exc:
-            self.sync_report = {
-                "request_id": request_id,
-                "status": "error",
-                "message": str(exc)[:1000] or "维护流程被取消，未确认重启完成",
-            }
+            message = str(exc)[:1000] or "维护流程被取消，未确认重启完成"
+            if comfy_stopped and not self.stop_event.is_set():
+                self.sync_report = {
+                    "request_id": request_id, "status": "running",
+                    "message": "更新未完成，正在恢复 ComfyUI，旧 Worker 保持运行",
+                }
+                self.state["maintenance"].update(
+                    **self.sync_report, phase="recovering_comfy",
+                    deadline=time.time() + max(float(self.config.get("restart_timeout_seconds", 300)), 60.0) * 2 + 120,
+                )
+                self._save_state()
+                try:
+                    await self.restart_comfy_only()
+                    message += "；已重新启动 ComfyUI，旧 Worker 保持运行，等待重新扫描确认"
+                except Exception as recovery_exc:
+                    message += f"；ComfyUI 恢复启动失败：{recovery_exc}"
+            self.sync_report = {"request_id": request_id, "status": "error", "message": message[:1000]}
             if guarded:
                 attempted = self.state.setdefault("attempted_guarded_restarts", [])
                 if request_id not in attempted:
@@ -1383,7 +1413,7 @@ class WorkerAgent:
             self.fresh_capabilities_ready = False
             self.last_capability_scan = 0.0
             self._save_state()
-            print(f"[Worker] 节点维护失败：{exc}", flush=True)
+            print(f"[Worker] 节点维护失败：{self.sync_report['message']}", flush=True)
             if isinstance(exc, asyncio.CancelledError):
                 raise
         finally:

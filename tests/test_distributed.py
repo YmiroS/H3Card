@@ -2975,6 +2975,10 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         agent.last_capability_scan = time.time()
         agent.last_telemetry_scan = time.time()
         agent.last_release_check = 0.0
+        agent.stop_event = asyncio.Event()
+        agent.restart_token = None
+        agent.stop_comfy_for_update = mock.AsyncMock()
+        agent.restart_comfy_only = mock.AsyncMock()
         agent.prepare_inputs = mock.AsyncMock()
         agent.patch_silent_video_audio = mock.AsyncMock()
         agent.collect_outputs = mock.AsyncMock(return_value=[])
@@ -3030,60 +3034,112 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         agent = self.agent
         agent.local_status = mock.AsyncMock()
         agent.scan_telemetry = mock.AsyncMock()
-        agent.schedule_node_restart = mock.AsyncMock(side_effect=AssertionError("must not restart"))
-        for stage in ("script", "pull"):
+        for stage in ("stop", "pull", "script", "handoff"):
             with self.subTest(stage=stage):
                 agent.state = {"worker_id": "worker", "worker_token": "token"}
                 agent.sync_report = None
+                agent.stop_event = asyncio.Event()
+                agent.comfy_online = True
                 agent.fresh_capabilities_ready = True
                 agent.last_capability_scan = time.time()
                 agent.recovered_maintenance_request_id = None
-                saved = []
+                saved, calls = [], []
                 agent._save_state = mock.Mock(side_effect=lambda: saved.append(copy.deepcopy(agent.state)))
                 request_id = "sync-failure-" + stage
                 message = stage + " failed"
 
-                def assert_running():
-                    running = saved[0]["maintenance"]
+                def assert_running(phase):
+                    running = saved[-1]["maintenance"]
                     self.assertEqual(running["request_id"], request_id)
                     self.assertEqual(running["action"], "sync_files")
                     self.assertEqual(running["status"], "running")
-                    self.assertEqual(running["phase"], "syncing_files")
+                    self.assertEqual(running["phase"], phase)
                     self.assertGreater(running["deadline"], time.time())
+                    self.assertTrue(agent.maintenance_blocks_jobs())
+                    self.assertFalse(agent.stop_event.is_set())
+
+                async def stop():
+                    assert_running("stopping_comfy")
+                    calls.append("stop")
+                    if stage == "stop":
+                        raise AgentError(message)
+                    agent.comfy_online = False
+                    agent.fresh_capabilities_ready = False
+
+                async def pull():
+                    assert_running("pulling_code")
+                    calls.append("pull")
+                    if stage == "pull":
+                        raise AgentError(message)
+                    return "abc123def456", "code updated"
 
                 async def script(*_args, **_kwargs):
-                    assert_running()
+                    assert_running("syncing_files")
+                    self.assertEqual(saved[-1]["maintenance"]["target_commit"], "abc123def456")
+                    calls.append("script")
                     if stage == "script":
                         raise AgentError(message)
                     return "files synchronized"
 
-                async def pull():
-                    assert_running()
+                async def handoff(*_args):
+                    assert_running("syncing_files")
+                    calls.append("handoff")
                     raise AgentError(message)
 
+                async def recover():
+                    assert_running("recovering_comfy")
+                    self.assertEqual(agent.sync_report["status"], "running")
+                    calls.append("recover")
+
+                agent.stop_comfy_for_update = mock.AsyncMock(side_effect=stop)
                 agent.run_local_command = mock.AsyncMock(side_effect=script)
                 agent.pull_code = mock.AsyncMock(side_effect=pull)
+                agent.schedule_node_restart = mock.AsyncMock(side_effect=handoff)
+                agent.restart_comfy_only = mock.AsyncMock(side_effect=recover)
                 script_path = mock.Mock()
                 script_path.is_file.return_value = True
-                with mock.patch.object(agent, "sync_script_path", return_value=script_path), \
+                with mock.patch.object(agent, "sync_script_path", return_value=script_path) as locate_script, \
                      mock.patch.object(agent, "batch_command_name", return_value=".\\sync.bat"), \
                      mock.patch("agent.os.name", "nt"):
                     agent.queue_sync({"type": "sync_files", "request_id": request_id})
                     await agent.execute_pending_sync()
+                self.assertEqual(locate_script.call_count, int(stage in {"script", "handoff"}))
                 failure = copy.deepcopy(agent.state["maintenance"])
                 self.assertEqual(failure["request_id"], request_id)
                 self.assertEqual(failure["action"], "sync_files")
                 self.assertEqual(failure["status"], "error")
                 self.assertEqual(failure["phase"], "error")
-                self.assertEqual(failure["message"], message)
+                expected_message = message if stage == "stop" else (
+                    message + "；已重新启动 ComfyUI，旧 Worker 保持运行，等待重新扫描确认")
+                self.assertEqual(failure["message"], expected_message)
                 self.assertEqual(saved[-1]["maintenance"], failure)
                 self.assertFalse(agent.fresh_capabilities_ready)
                 self.assertEqual(agent.last_capability_scan, 0)
                 self.assertIsNone(agent.pending_sync)
                 self.assertFalse(agent._maintenance_executing)
                 self.assertTrue(agent.maintenance_blocks_jobs())
-                self.assertEqual(agent.pull_code.await_count, int(stage == "pull"))
-                agent.schedule_node_restart.assert_not_awaited()
+                self.assertFalse(agent.stop_event.is_set())
+                stages = ["stop", "pull", "script", "handoff"]
+                expected_calls = stages[:stages.index(stage) + 1]
+                if stage != "stop":
+                    expected_calls.append("recover")
+                self.assertEqual(calls, expected_calls)
+                expected_phases = ["stopping_comfy"]
+                if stage != "stop":
+                    expected_phases.append("pulling_code")
+                if stage in {"script", "handoff"}:
+                    expected_phases.append("syncing_files")
+                if stage != "stop":
+                    expected_phases.append("recovering_comfy")
+                self.assertEqual([s["maintenance"]["phase"] for s in saved], expected_phases + ["error"])
+                agent.stop_comfy_for_update.assert_awaited_once_with()
+                self.assertEqual(agent.pull_code.await_count, int(stage != "stop"))
+                self.assertEqual(agent.run_local_command.await_count, int(stage in {"script", "handoff"}))
+                self.assertEqual(agent.restart_comfy_only.await_count, int(stage != "stop"))
+                if stage == "handoff":
+                    agent.schedule_node_restart.assert_awaited_once_with(request_id, "abc123def456")
+                else:
+                    agent.schedule_node_restart.assert_not_awaited()
                 # ACK must retain the associated failure, not rehydrate or erase it.
                 agent.last_capability_scan = time.time()
                 agent.stop_event = asyncio.Event()
@@ -3107,6 +3163,117 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(agent.maintenance_recovery_report(), {"request_id": request_id})
                 self.assertFalse(agent.maintenance_blocks_jobs())
                 self.assertEqual(agent.state["last_restart_result"], failure)
+
+    async def test_maintenance_failure_sync_recovery_start_failure_preserves_both_errors(self):
+        agent = self.agent
+        saved = []
+        agent._save_state = mock.Mock(side_effect=lambda: saved.append(copy.deepcopy(agent.state)))
+        agent.local_status = mock.AsyncMock()
+        agent.fresh_capabilities_ready = True
+        agent.pull_code = mock.AsyncMock(side_effect=AgentError("pull failed"))
+        agent.run_local_command = mock.AsyncMock()
+        agent.schedule_node_restart = mock.AsyncMock()
+        agent.restart_comfy_only.side_effect = AgentError("launcher failed")
+        with mock.patch.object(agent, "sync_script_path") as locate_script:
+            agent.queue_sync({"type": "sync_files", "request_id": "recovery-failed"})
+            await agent.execute_pending_sync()
+        self.assertEqual([s["maintenance"]["phase"] for s in saved],
+                         ["stopping_comfy", "pulling_code", "recovering_comfy", "error"])
+        self.assertEqual(saved[-2]["maintenance"]["status"], "running")
+        failure = agent.state["maintenance"]
+        self.assertEqual(failure["status"], "error")
+        self.assertEqual(failure["message"], "pull failed；ComfyUI 恢复启动失败：launcher failed")
+        self.assertEqual(agent.sync_report["message"], failure["message"])
+        self.assertEqual(saved[-1]["maintenance"], failure)
+        agent.stop_comfy_for_update.assert_awaited_once_with()
+        agent.restart_comfy_only.assert_awaited_once_with()
+        agent.pull_code.assert_awaited_once_with()
+        locate_script.assert_not_called()
+        agent.run_local_command.assert_not_awaited()
+        agent.schedule_node_restart.assert_not_awaited()
+        self.assertFalse(agent.stop_event.is_set())
+        self.assertFalse(agent.fresh_capabilities_ready)
+        self.assertEqual(agent.last_capability_scan, 0)
+        self.assertIsNone(agent.pending_sync)
+        self.assertFalse(agent._maintenance_executing)
+        self.assertTrue(agent.maintenance_blocks_jobs())
+
+    async def test_maintenance_failure_sync_recovery_heartbeat_cannot_ack_error_or_acquire(self):
+        agent = self.agent
+        agent._save_state = mock.Mock()
+        agent.local_status = mock.AsyncMock()
+        agent.confirm_release_recovery = mock.AsyncMock()
+        agent.scan_capabilities = mock.AsyncMock()
+        agent.scan_telemetry = mock.AsyncMock()
+        agent.last_capability_scan = 0
+        agent.pull_code = mock.AsyncMock(side_effect=AgentError("pull failed"))
+        agent.run_local_command = mock.AsyncMock()
+        agent.schedule_node_restart = mock.AsyncMock()
+        bodies = []
+        heartbeat_received = asyncio.Event()
+        command = {"type": "sync_files", "request_id": "recovering-sync"}
+
+        async def request(_method, _url, **kwargs):
+            bodies.append(copy.deepcopy(kwargs["json"]))
+            heartbeat_received.set()
+            return {
+                "maintenance_ack": {"request_id": command["request_id"], "status": "error"},
+                "maintenance_failure": {"request_id": command["request_id"], "action": "sync_files",
+                                        "status": "error", "message": "stale terminal error"},
+                "commands": [{"type": "restart_services", "request_id": "must-not-run"}],
+            }
+
+        agent._json_request = mock.AsyncMock(side_effect=request)
+
+        async def recover():
+            self.assertTrue(agent._maintenance_executing)
+            self.assertEqual(agent.state["maintenance"]["phase"], "recovering_comfy")
+            self.assertEqual(agent.state["maintenance"]["status"], "running")
+            # Even a live local status cannot reopen dispatch while recovery awaits.
+            agent.comfy_online = True
+            agent.fresh_capabilities_ready = True
+            heartbeat = asyncio.create_task(agent.heartbeat_loop())
+            try:
+                await asyncio.wait_for(heartbeat_received.wait(), 1)
+                self.assertEqual(agent.sync_report["status"], "running")
+                self.assertEqual(agent.state["maintenance"]["phase"], "recovering_comfy")
+                self.assertEqual(agent.pending_sync, command)
+                self.assertNotIn("last_maintenance_request_id", agent.state)
+                self.assertNotIn("last_restart_result", agent.state)
+                self.assertFalse(agent.stop_event.is_set())
+                self.assertTrue(agent.maintenance_blocks_jobs())
+                self.assertIsNone(await agent.acquire())
+                agent._json_request.assert_awaited_once()
+            finally:
+                heartbeat.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await heartbeat
+
+        agent.restart_comfy_only.side_effect = recover
+        agent.queue_sync(command)
+        await asyncio.wait_for(agent.execute_pending_sync(), 2)
+        agent.restart_comfy_only.assert_awaited_once_with()
+        self.assertEqual(len(bodies), 1)
+        body = bodies[0]
+        self.assertEqual(body["maintenance"]["status"], "running")
+        self.assertEqual(body["maintenance"]["request_id"], command["request_id"])
+        self.assertTrue(body["busy"])
+        self.assertTrue(body["local_busy"])
+        self.assertFalse(body["capacity_released"])
+        self.assertNotIn("capabilities", body)
+        self.assertNotIn("maintenance_recovery", body)
+        agent.scan_capabilities.assert_not_awaited()
+        agent.run_local_command.assert_not_awaited()
+        agent.schedule_node_restart.assert_not_awaited()
+        self.assertEqual(agent.sync_report["status"], "error")
+        self.assertEqual(agent.state["maintenance"]["phase"], "error")
+        self.assertIn("pull failed；已重新启动 ComfyUI", agent.sync_report["message"])
+        self.assertFalse(agent.fresh_capabilities_ready)
+        self.assertEqual(agent.last_capability_scan, 0)
+        self.assertFalse(agent.stop_event.is_set())
+        self.assertIsNone(agent.pending_sync)
+        self.assertFalse(agent._maintenance_executing)
+        self.assertTrue(agent.maintenance_blocks_jobs())
 
     async def test_maintenance_failure_descriptor_restore_requires_new_scan_and_is_idempotent(self):
         agent = self.agent
@@ -3696,45 +3863,135 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(agent.pending_sync)
             agent.pending_sync = None
 
-    async def test_sync_command_waits_for_files_then_pulls_and_restarts(self):
-        calls = []
-        self.agent._save_state = mock.Mock()
+    async def test_sync_stop_comfy_for_update_reuses_stop_comfy_then_invalidates_scan(self):
+        agent = self.agent
+        agent.fresh_capabilities_ready = True
+        agent.recovered_maintenance_request_id = "previous-recovery"
 
-        async def run_command(*arguments, **_kwargs):
-            self.agent._save_state.assert_called_once()
-            maintenance = self.agent.state["maintenance"]
+        async def to_thread(function, *args):
+            self.assertTrue(agent.comfy_online)
+            self.assertTrue(agent.fresh_capabilities_ready)
+            self.assertEqual(agent.recovered_maintenance_request_id, "previous-recovery")
+            function(*args)
+
+        # Invoke the class method explicitly: the fixture's instance method is mocked.
+        with mock.patch("agent.os.name", "nt"), \
+             mock.patch.object(restart_node, "stop_comfy") as stop, \
+             mock.patch("agent.asyncio.to_thread", side_effect=to_thread) as thread, \
+             mock.patch.object(agent, "run_local_command") as run:
+            await WorkerAgent.stop_comfy_for_update(agent)
+            thread.assert_awaited_once_with(stop, agent.comfy)
+            stop.assert_called_once_with(agent.comfy)
+            run.assert_not_awaited()
+        self.assertFalse(agent.comfy_online)
+        self.assertFalse(agent.fresh_capabilities_ready)
+        self.assertIsNone(agent.recovered_maintenance_request_id)
+        self.assertFalse(agent.stop_event.is_set())
+        agent.restart_comfy_only.assert_not_awaited()
+
+    async def test_sync_stop_comfy_for_update_rejects_non_windows_and_preserves_flags_on_failure(self):
+        agent = self.agent
+        for platform in ("posix", "nt"):
+            with self.subTest(platform=platform):
+                agent.comfy_online = True
+                agent.fresh_capabilities_ready = True
+                agent.recovered_maintenance_request_id = "keep-proof"
+
+                async def to_thread(function, *args):
+                    return function(*args)
+
+                with mock.patch("agent.os.name", platform), \
+                     mock.patch.object(restart_node, "stop_comfy", side_effect=AgentError("stop failed")) as stop, \
+                     mock.patch("agent.asyncio.to_thread", side_effect=to_thread) as thread, \
+                     mock.patch.object(agent, "run_local_command") as run:
+                    with self.assertRaisesRegex(AgentError, "stop failed" if platform == "nt" else "Windows"):
+                        await WorkerAgent.stop_comfy_for_update(agent)
+                    if platform == "nt":
+                        thread.assert_awaited_once_with(stop, agent.comfy)
+                        stop.assert_called_once_with(agent.comfy)
+                    else:
+                        thread.assert_not_awaited()
+                        stop.assert_not_called()
+                    run.assert_not_awaited()
+                self.assertTrue(agent.comfy_online)
+                self.assertTrue(agent.fresh_capabilities_ready)
+                self.assertEqual(agent.recovered_maintenance_request_id, "keep-proof")
+                self.assertFalse(agent.stop_event.is_set())
+                agent.restart_comfy_only.assert_not_awaited()
+
+    async def test_sync_command_waits_for_files_then_pulls_and_restarts(self):
+        agent = self.agent
+        calls, saved = [], []
+        agent._save_state = mock.Mock(side_effect=lambda: saved.append(copy.deepcopy(agent.state)))
+
+        def assert_phase(phase):
+            maintenance = saved[-1]["maintenance"]
             self.assertEqual(maintenance["request_id"], "sync-1")
             self.assertEqual(maintenance["action"], "sync_files")
             self.assertEqual(maintenance["status"], "running")
-            self.assertEqual(maintenance["phase"], "syncing_files")
+            self.assertEqual(maintenance["phase"], phase)
             self.assertGreater(maintenance["deadline"], time.time())
+            self.assertTrue(agent.maintenance_blocks_jobs())
+            self.assertFalse(agent.stop_event.is_set())
+
+        async def stop():
+            assert_phase("stopping_comfy")
+            calls.append(("stop", None))
+            agent.comfy_online = False
+            agent.fresh_capabilities_ready = False
+
+        async def pull_code():
+            assert_phase("pulling_code")
+            self.assertFalse(agent.comfy_online)
+            locate_script.assert_not_called()
+            self.assertFalse(script.exists())
+            calls.append(("pull", None))
+            # Only the newly pulled revision provides this BAT.
+            script.write_text("@rem latest revision\n@exit /b 0", encoding="ascii")
+            return "abc123def456", "code updated"
+
+        def latest_script():
+            assert_phase("syncing_files")
+            self.assertEqual(saved[-1]["maintenance"]["target_commit"], "abc123def456")
+            calls.append(("locate_script", None))
+            return script
+
+        async def run_command(*arguments, **kwargs):
+            assert_phase("syncing_files")
+            self.assertIn("latest revision", script.read_text(encoding="ascii"))
+            self.assertEqual(kwargs["cwd"], script.parent)
+            self.assertEqual(kwargs["timeout"], 3600)
             calls.append(("files", arguments))
             return "Synchronization completed successfully."
 
-        async def pull_code():
-            calls.append(("pull", None))
-            return "abc123def456", "Already up to date."
-
         async def restart(request_id, commit):
-            calls.append(("restart", (request_id, commit)))
+            assert_phase("syncing_files")
+            calls.append(("handoff", (request_id, commit)))
+            agent.stop_event.set()
 
         with tempfile.TemporaryDirectory() as directory:
             script = Path(directory) / "sync.bat"
-            script.write_text("@exit /b 0", encoding="ascii")
-            with mock.patch.object(self.agent, "sync_script_path", return_value=script), \
-                 mock.patch.object(self.agent, "run_local_command", side_effect=run_command), \
-                 mock.patch.object(self.agent, "pull_code", side_effect=pull_code), \
-                 mock.patch.object(self.agent, "schedule_node_restart", side_effect=restart), \
+            with mock.patch.object(agent, "stop_comfy_for_update", side_effect=stop) as stop_comfy, \
+                 mock.patch.object(agent, "sync_script_path", side_effect=latest_script) as locate_script, \
+                 mock.patch.object(agent, "run_local_command", side_effect=run_command), \
+                 mock.patch.object(agent, "pull_code", side_effect=pull_code), \
+                 mock.patch.object(agent, "schedule_node_restart", side_effect=restart), \
                  mock.patch("agent.os.name", "nt"):
-                self.agent.queue_sync({"type": "sync_files", "request_id": "sync-1"})
-                await self.agent.execute_pending_sync()
+                agent.queue_sync({"type": "sync_files", "request_id": "sync-1"})
+                await agent.execute_pending_sync()
 
-        self.assertIsNone(self.agent.pending_sync)
-        self.assertEqual([item[0] for item in calls], ["files", "pull", "restart"])
-        self.assertEqual(calls[0][1][:3], ("cmd.exe", "/d", "/c"))
-        self.assertEqual(calls[0][1][3], f".\\{script.name}")
-        self.assertEqual(calls[0][1][-2:], ("--upgrade", "--non-interactive"))
+        self.assertIsNone(agent.pending_sync)
+        self.assertFalse(agent._maintenance_executing)
+        self.assertTrue(agent.stop_event.is_set())
+        self.assertEqual([s["maintenance"]["phase"] for s in saved],
+                         ["stopping_comfy", "pulling_code", "syncing_files"])
+        self.assertEqual([item[0] for item in calls], ["stop", "pull", "locate_script", "files", "handoff"])
+        self.assertEqual(calls[3][1][:3], ("cmd.exe", "/d", "/c"))
+        self.assertEqual(calls[3][1][3], f".\\{script.name}")
+        self.assertEqual(calls[3][1][-2:], ("--upgrade", "--non-interactive"))
         self.assertEqual(calls[-1][1], ("sync-1", "abc123def456"))
+        stop_comfy.assert_awaited_once_with()
+        agent.restart_comfy_only.assert_not_awaited()
 
     async def test_restart_handoff_waits_for_supervisor_ack_and_keeps_log(self):
         for commit in ("abc123def456", ""):
