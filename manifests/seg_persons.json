@@ -1,0 +1,61 @@
+{
+ "id": "seg_persons",
+ "name": "逐人分割（识别用）",
+ "editor_only": true,
+ "group": "图片",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "image",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slots": "img1+aud0+vid0",
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/seg_persons.api.json",
+ "output": {
+  "node": "6"
+ },
+ "note": "局部打光面板「本地模型识别」的执行体：一张原图进去，出一张身份索引层 PNG（0=背景，1..255 按人从左到右编号）和一份逐身份条目 JSON。\n不挂在画布卡片菜单里，只由 /api/lighting/subjects 派发；用户看不到这张能力，看到的还是面板上的识别按钮。\n口径与服务端逐人分割链一致：imgsz 640、conf 0.3、最小面积线 0.002，补洞闭运算和人脸锚点补漏都在节点里做完，重叠像素归右边的人。",
+ "rewrite": null,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "原图",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "min_area_ratio",
+   "label": "最小人物占比",
+   "type": "slider",
+   "min": 0.0005,
+   "max": 0.05,
+   "step": 0.0005,
+   "default": 0.002,
+   "advanced": true,
+   "target": {
+    "node": "2",
+    "input": "min_area_ratio",
+    "vtype": "FLOAT"
+   }
+  }
+ ]
+}

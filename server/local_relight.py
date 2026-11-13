@@ -1,7 +1,10 @@
 """局部打光：人物/物体分割、蒙版并集、软过渡回贴、接地阴影、头肩补光。
 
-分割依赖 rembg + opencv + numpy，按需懒加载；缺依赖时 available() 返回 False，
-由调用方在 HTTP 边界回 501（链路未接入），不做假实现。
+模型推理一律跑在 Windows 节点的 ComfyUI 里（见 comfyui_nodes/chouka_local_models），
+服务机这半边只剩 cv2/numpy/Pillow 的纯计算：回贴、接地、头肩、区域投票、蒙版编解码。
+所以本模块的体检只查纯计算依赖（in_process_ready），「识别能不能用」是集群判据，
+在 cloud_lighting.perception_block 里查节点名册；缺依赖时由调用方在 HTTP 边界回 501，
+不做假实现。
 回贴/接地/头肩都是纯 numpy 运算，可用合成图单测，不触网、不调用云端。
 """
 import base64
@@ -37,19 +40,18 @@ RING_SIGMA_FRAC = 0.20
 TINT = dict(amount=0.5, sigma_frac=0.12)
 
 
-def available():
-    """分割链路是否就绪：整图抠图（rembg）或逐人实例分割（ultralytics + 权重）任一可用。"""
+def in_process_ready():
+    """服务机这半边（纯 cv2/numpy 的回贴、接地、投票、蒙版编解码）是否就绪。
+
+    刻意不含模型判据：分割权重在不在服务机上，跟「识别能不能用」已经无关
+    （推理一律派到节点），拿它当判据会把只依赖投票的远端分区路一起拦死。
+    """
     try:
         import cv2  # noqa: F401
         import numpy  # noqa: F401
     except Exception:
         return False
-    try:
-        import rembg  # noqa: F401
-        return True
-    except Exception:
-        pass
-    return yolo_available()
+    return True
 
 
 def _imports():
@@ -144,6 +146,23 @@ def yolo_available():
         return False
     person, _face = _seg_weights()
     return person is not None
+
+
+def rembg_available():
+    try:
+        import rembg  # noqa: F401
+        return True
+    except Exception:
+        return False
+
+
+def legacy_segmentation_ready():
+    """服务机自己开模型跑分割的老路是否可用（Spec M2-11/M2-15：派发上线后整段下架）。
+
+    它只回答「这台机器自己算得动吗」，不回答「识别能不能用」——后者是集群判据，
+    在 cloud_lighting.perception_block。两者混成一把尺子就是这次 501 的成因。
+    """
+    return yolo_available() or rembg_available()
 
 
 def _seg_yolo(path):
@@ -582,14 +601,73 @@ def mask_to_data_url(mask, side=PREVIEW_SIDE):
     return "data:image/png;base64," + base64.b64encode(buffer.getvalue()).decode("ascii")
 
 
-def decode_mask(data, size):
-    """把上传的灰度蒙版解码并缩放到目标尺寸；白=打光范围。"""
+def load_rgb(data):
+    """字节 → 转正的 RGB 图：手机/微信传来的图带 EXIF 方向，不转正的话蒙版和像素会转 90°。
+
+    全链原来只有上传那处做转正（app.py 的 exif_transpose），识别入口直接
+    Image.open().convert("RGB") 就喂模型，导致同一张图「看到的」和「识别到的」方向不一致。
+    """
+    from io import BytesIO
+
+    from PIL import Image, ImageOps
+
+    return ImageOps.exif_transpose(Image.open(BytesIO(data))).convert("RGB")
+
+
+class MaskSizeMismatch(ValueError):
+    """蒙版/索引层尺寸和它对的那张图不符。
+
+    继承 ValueError 让既有捕获继续生效；单独立类是为了在 HTTP 边界翻成
+    「请回面板重新识别」这种人话，而不是笼统一条 500。
+    """
+
+
+def layer_source_size(data):
+    """索引层 PNG 自己的尺寸（宽, 高）：收节点回传的层时先量这一把，别急着解码。
+
+    `decode_identity_layer` 内部会按最近邻缩放对齐到目标尺寸，先解码再查就永远查不出问题，
+    所以这道尺子必须读文件头、在解码之前做。
+    """
+    from io import BytesIO
+
+    from PIL import Image
+
+    with Image.open(BytesIO(data)) as image:
+        return image.size
+
+
+def check_layer_size(layer, size):
+    """节点回传的索引层必须与原图逐像素同尺寸（size=宽,高）；差 1 像素也算不合格。
+
+    识别阶段没有任何缩放需求，收到不同尺寸的层只可能是链路中途把图缩过；
+    这里不 resample：_scale_index 会把边缘身份按面积投票掉，错得看不出来又对不上号。
+    """
+    height, width = layer.shape[:2]
+    target = (int(size[0]), int(size[1]))
+    if (width, height) != target:
+        raise MaskSizeMismatch(
+            f"识别结果尺寸 {width}x{height} 与原图 {target[0]}x{target[1]} 不符")
+    return layer
+
+
+def decode_mask(data, size, *, resample=None):
+    """把上传的灰度蒙版解码成目标尺寸数组；白=打光范围。
+
+    尺寸不符默认直接报错，不静默拉伸：蒙版是逐像素对齐用的，拉伸等于把打光范围整体挪位，
+    差一两像素肉眼看不出来、出了图才知道错。确实要重采样（编辑器粗蒙版放大到出图尺寸）
+    必须显式传 resample="lanczos" 或 "nearest"。
+    """
     import numpy as np
 
     width, height = size
     image = Image.open(BytesIO(data)).convert("L")
     if image.size != (width, height):
-        image = image.resize((width, height), Image.LANCZOS)
+        if resample is None:
+            raise MaskSizeMismatch(
+                f"蒙版尺寸 {image.size[0]}x{image.size[1]} 与目标 {width}x{height} 不符，"
+                "已拒绝拉伸；请回面板重新识别后再出图")
+        image = image.resize((width, height),
+                             Image.LANCZOS if resample == "lanczos" else Image.NEAREST)
     return np.asarray(image).astype("float32") / 255.0
 
 

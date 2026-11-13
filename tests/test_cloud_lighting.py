@@ -218,6 +218,11 @@ class CloudLightingFixture:
         (manifests / "_cards.json").write_text("[]", encoding="utf-8")
         shutil.copyfile(ROOT / "manifests" / "qwen_lighting_multi.json",
                         manifests / "qwen_lighting_multi.json")
+        # 识别用的内部能力：预检要按能力清单找到 API 图，测试环境也得有这一份。
+        shutil.copyfile(ROOT / "manifests" / "seg_persons.json", manifests / "seg_persons.json")
+        graphs = self.root / "graphs"
+        graphs.mkdir()
+        shutil.copyfile(ROOT / "graphs" / "seg_persons.api.json", graphs / "seg_persons.api.json")
         (self.root / "pricing.json").write_text("{}", encoding="utf-8")
         self.enterContext(mock.patch.dict(os.environ, {
             "CHOUKA_LOCAL_TEST": "0", "CHOUKA_ADMIN_SANDBOX": "0",
@@ -1239,6 +1244,281 @@ class CloudLightingControllerTests(CloudLightingFixture, unittest.IsolatedAsynci
         self.save_jobs.assert_not_called()
 
 
+class SubjectsPerceptionPreflightTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
+    """集群模式的识别提交期预检（Spec §5.4）：没有合格执行端要当场说清楚，不许静默排队。"""
+
+    controller_mode = True
+
+    def setUp(self):
+        self.enterContext(mock.patch("server.local_relight.yolo_available", return_value=False))
+
+    async def subjects(self, **extra):
+        return await self.client.post("/api/lighting/subjects", headers=self.headers,
+                                      json={"project": self.project,
+                                            "image": self.upstream["ref"], **extra})
+
+    def capabilities(self, *, classes, model_names=True):
+        capabilities = {"hardware": {"os": {"name": "Windows"}},
+                        "node_classes": sorted(classes),
+                        "devices": [{"name": "RTX 4090", "type": "cuda",
+                                     "memory_total": 24 * 1024 ** 3}],
+                        "input_choices": {}, "input_types": {}}
+        if model_names:
+            capabilities["input_choices"] = {
+                "ChoukaPersonSeg": {"model_name": ["person_yolov8m-seg.pt"]},
+                "ChoukaFaceSeg": {"model_name": ["face_yolov8m.pt"]},
+            }
+        return capabilities
+
+    def register(self, capabilities):
+        """登记一台「ComfyUI 在线且空闲」的 Windows 执行端。
+
+        只 register 不心跳时名册状态是 error（ComfyUI 未在线），预检会先卡在状态判据上，
+        报不到节点类/权重那两层，所以这里补一次心跳把状态推到 idle。
+        """
+        distributed = self.application["distributed"]
+        worker_id = distributed.register_worker("seg-node-1", capabilities)["worker_id"]
+        distributed.heartbeat(worker_id, capabilities=capabilities, comfy_online=True)
+        return distributed
+
+    SEG_CLASSES = {"LoadImage", "ChoukaPersonSeg", "ChoukaFaceSeg", "ChoukaSamPrompt",
+                   "ChoukaSegMerge", "ChoukaSaveIdentityLayer", "ChoukaSaveJson"}
+
+    async def test_node_without_segmentation_classes_is_refused_at_submit(self):
+        self.register(self.capabilities(classes={"LoadImage", "KSampler"}))
+        response = await self.subjects(mode="local")
+        text = await response.text()
+        self.assertEqual(response.status, 501, text)
+        self.assertIn("缺少此能力所需节点", text)
+        self.assertEqual(self.application["cloud_lighting"].subject_jobs, {})
+
+    async def test_node_without_weight_inventory_is_refused(self):
+        """节点类齐了但权重清单缺失：预检就得报，不能派上去运行期才炸（Spec §10-C1）。"""
+        self.register(self.capabilities(classes=self.SEG_CLASSES, model_names=False))
+        response = await self.subjects(mode="local")
+        self.assertEqual(response.status, 501, await response.text())
+        self.assertIn("模型", await response.text())
+
+    async def test_qualified_node_passes_the_preflight(self):
+        self.register(self.capabilities(classes=self.SEG_CLASSES))
+        work = mock.patch.object(self.application["cloud_lighting"], "_subjects_work",
+                                 return_value=([], "node"))
+        with work:
+            response = await self.subjects(mode="local")
+        self.assertEqual(response.status, 200, await response.text())
+
+    async def test_remote_partition_skips_the_cluster_check(self):
+        """远端分区只在服务机做索引层投票：一台执行端都没登记也不能拦（风险 R1 的反例）。"""
+        service = self.application["cloud_lighting"]
+        plan = service._subjects_plan({"project": self.project, "image": self.upstream["ref"],
+                                       "mode": "remote"})
+        await service._preflight_segmentation(plan, {"id": self.user})
+
+
+class StubComfySession:
+    """假 ComfyUI 会话：只认 /view（按文件名给字节）和 /history/<pid>（给执行状态）两种取法。
+
+    产物与状态都从宿主用例对象上现取，所以用例中途改 self.files / self.blobs 也能生效。
+    """
+
+    def __init__(self, owner):
+        self.owner = owner
+
+    def get(self, url, *, params=None):
+        return StubComfyResponse(self.owner, url, params)
+
+
+class StubComfyResponse:
+    def __init__(self, owner, url, params):
+        self.owner, self.url, self.params = owner, url, params or {}
+        self.status = 200
+        self.payload = None
+        self._body = b""
+
+    async def __aenter__(self):
+        if "/history/" in self.url:
+            self.payload = {self.url.rsplit("/", 1)[-1]: self.owner.history_entry}
+        else:
+            name = self.params.get("filename")
+            if name not in self.owner.blobs:
+                self.status = 404
+            else:
+                self._body = self.owner.blobs[name]
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def json(self):
+        return self.payload
+
+    async def read(self):
+        return self._body
+
+
+class SubjectsNodeSegmentationTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
+    """整图自动识别交给节点跑（M2）：只吃「身份索引层 PNG + 条目 JSON」这一份契约。
+
+    交给 ComfyUI 的五个动作（会话 / 上传 / 拼图 / 提交 / 取产物）整组换成假件，
+    测的是服务端这侧的收线口径：产物怎么认、尺寸怎么卡、编号从哪来、失败了说什么。
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.enterContext(mock.patch.dict(os.environ, {"CHOUKA_SEG_VIA_NODE": "1"}))
+        self.backend_calls = {"upload": [], "patch": [], "submit": [], "collect": 0}
+        self.files = [{"kind": "file", "filename": "segidx_00001_.png",
+                       "subfolder": "chouka", "type": "output"},
+                      {"kind": "file", "filename": "segentries_00001_json.json",
+                       "subfolder": "chouka", "type": "output"}]
+        self.history_entry = {"status": {"status_str": "success", "completed": True,
+                                         "messages": []}}
+        self.blobs = {}
+        node = self.application["comfy_node"]
+        self.real_node = dict(node)
+        node["http"] = "http://fake-comfy"
+        node["session"] = StubComfySession(self)
+        node["upload"] = self.stub_upload
+        node["patch"] = self.stub_patch
+        node["submit"] = self.stub_submit
+        node["collect"] = self.stub_collect
+        # 假 ComfyUI 不会把作业停在「排队中」，等产物那段按秒级判超时即可，别真等 180 秒
+        self.application["cloud_lighting"].SEG_TIMEOUT_SECONDS = 0.2
+
+    def set_layer(self, rows):
+        np = local_relight._imports()[1]  # 本套用例默认不引 numpy，按服务端同一套懒加载取
+        output = BytesIO()
+        Image.fromarray(np.asarray(rows, np.uint8), mode="L").save(output, format="PNG")
+        self.blobs["segidx_00001_.png"] = output.getvalue()
+
+    def set_entries(self, payload):
+        self.blobs["segentries_00001_json.json"] = json.dumps(payload, ensure_ascii=False).encode()
+
+    async def stub_upload(self, session, field_name, filename, data):
+        self.backend_calls["upload"].append(filename)
+        return f"chouka/{filename}"
+
+    def stub_patch(self, cap, params, uploaded):
+        self.backend_calls["patch"].append((cap["id"], dict(params), dict(uploaded)))
+        return {"1": {"class_type": "LoadImage", "inputs": {"image": uploaded["images[0]"]}}}
+
+    async def stub_submit(self, app_, graph, prompt_id=None, *, capability=None):
+        self.backend_calls["submit"].append((prompt_id, capability))
+        # 真机上 ComfyUI 只认标准格式 UUID，所以服务端不自造 id，这里照生产回一个服务端生成的
+        return "0f1e2d3c-4b5a-4978-8675-4321fedcba09"
+
+    async def stub_collect(self, session, pid, *, wait_history=False):
+        self.backend_calls["collect"] += 1
+        return self.files
+
+    async def asyncTearDown(self):
+        node = self.application["comfy_node"]
+        for key, value in self.real_node.items():
+            node[key] = value
+        await super().asyncTearDown()
+
+    def two_person_layer(self):
+        """4x3 的层：左两列是 2 号、右两列是 1 号 —— 编号来自节点，服务端不许重排。"""
+        self.set_layer([[2, 2, 1, 1]] * 3)
+        self.set_entries({"count": 2, "dropped": 0, "entries": [
+            {"index": 1, "box": [0.5, 0.0, 1.0, 1.0], "coverage": 0.5, "cx": 0.75},
+            {"index": 2, "box": [0.0, 0.0, 0.5, 1.0], "coverage": 0.5, "cx": 0.25}]})
+
+    async def subjects(self, **extra):
+        return await self.client.post("/api/lighting/subjects", headers=self.headers,
+                                      json={"project": self.project,
+                                            "image": self.upstream["ref"], **extra})
+
+    async def test_layer_and_entries_become_candidates(self):
+        self.two_person_layer()
+        response = await self.subjects(mode="local", sensitivity="strict")
+        self.assertEqual(response.status, 200, await response.text())
+        payload = await response.json()
+        self.assertEqual(payload["engine"], "node")
+        self.assertIsNone(payload["partition"])
+        self.assertEqual([item["id"] for item in payload["candidates"]], ["p1", "p2"])
+        self.assertEqual(payload["candidates"][0]["box"], [0.5, 0.0, 1.0, 1.0])
+        self.assertTrue(payload["candidates"][0]["mask"].startswith("data:image/png;base64,"))
+        self.assertTrue(self.backend_calls["upload"][0].startswith("ck_"))
+        cap, params, uploaded = self.backend_calls["patch"][0]
+        self.assertEqual((cap, params), ("seg_persons", {"min_area_ratio": 0.01}))
+        self.assertTrue(uploaded["images[0]"].startswith("chouka/ck_"))
+        self.assertEqual(self.backend_calls["submit"][0][1], "seg_persons")
+        # 不自造 prompt_id：真机 ComfyUI 只认标准 UUID，编个 hex 会被整单拒收
+        self.assertIsNone(self.backend_calls["submit"][0][0])
+
+    async def test_switch_off_keeps_the_in_process_path(self):
+        self.two_person_layer()
+        with mock.patch.dict(os.environ, {"CHOUKA_SEG_VIA_NODE": "0"}):
+            with mock.patch.object(self.application["cloud_lighting"], "_subjects_work",
+                                   return_value=([], "yolo")) as work:
+                response = await self.subjects(mode="local")
+        self.assertEqual(response.status, 200, await response.text())
+        self.assertEqual((await response.json())["engine"], "yolo")
+        work.assert_called_once()
+        self.assertEqual(self.backend_calls["submit"], [])
+
+    async def test_point_and_box_stay_in_process(self):
+        """点选 / 框选这一轮还没进节点（M2-10）：开关开着也不能悄悄改路。"""
+        self.two_person_layer()
+        with mock.patch.object(self.application["cloud_lighting"], "_subjects_work",
+                               return_value=([], "yolo")) as work:
+            response = await self.subjects(mode="local", point=[0.5, 0.5])
+        self.assertEqual(response.status, 200, await response.text())
+        work.assert_called_once()
+        self.assertEqual(self.backend_calls["submit"], [])
+
+    async def test_layer_with_wrong_size_is_refused(self):
+        """节点回传的层多一列也不收：拉伸会把相邻身份按面积投票掉，错得看不出来。"""
+        self.two_person_layer()
+        self.set_layer([[2, 2, 1, 1, 1]] * 3)
+        response = await self.subjects(mode="local")
+        text = await response.text()
+        self.assertEqual(response.status, 502, text)
+        self.assertIn("不做拉伸", text)
+
+    async def test_missing_entries_artifact_is_refused(self):
+        self.set_layer([[1, 1, 1, 1]] * 3)
+        self.files = [item for item in self.files if not item["filename"].startswith("segentries")]
+        response = await self.subjects(mode="local")
+        text = await response.text()
+        self.assertEqual(response.status, 502, text)
+        self.assertIn("没出齐产物", text)
+
+    async def test_execution_failure_reads_the_node_reason(self):
+        """作业执行失败时不能回「等超时」：ComfyUI 给的失败原因要念出来才查得动。"""
+        self.files = []
+        self.history_entry = {"status": {"status_str": "error", "completed": True,
+                                         "messages": [["execution_failed",
+                                                       "person_yolov8m-seg.pt 不在位"]]}}
+        response = await self.subjects(mode="local")
+        text = await response.text()
+        self.assertEqual(response.status, 502, text)
+        self.assertIn("节点识别执行失败", text)
+        self.assertIn("person_yolov8m-seg.pt 不在位", text)
+
+    async def test_pending_job_times_out_without_resenting(self):
+        """跑不完就明说等超时，并且绝不当场重提：重复提交等于再占一次队列。"""
+        self.files = []
+        response = await self.subjects(mode="local")
+        text = await response.text()
+        self.assertEqual(response.status, 504, text)
+        self.assertIn("还没出结果", text)
+        self.assertIn("没有重复提交", text)
+        self.assertEqual(len(self.backend_calls["submit"]), 1)
+        self.assertGreater(self.backend_calls["collect"], 1)
+
+    async def test_dropped_identities_are_explained(self):
+        self.set_layer([[1, 1, 1, 1]] * 3)
+        self.set_entries({"count": 1, "dropped": 3, "entries": [
+            {"index": 1, "box": [0.0, 0.0, 1.0, 1.0], "coverage": 1.0, "cx": 0.5}]})
+        response = await self.subjects(mode="local")
+        self.assertEqual(response.status, 200, await response.text())
+        payload = await response.json()
+        self.assertIn("255", payload["note"])
+        self.assertEqual(len(payload["candidates"]), 1)
+
+
 class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
     """局部打光：识别端点门禁与提交校验；dry_run 不触分割、不调云端。"""
 
@@ -1262,7 +1542,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
                                             "image": self.upstream["ref"], **extra})
 
     async def test_subjects_returns_501_when_segmentation_unavailable(self):
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=False):
+        with mock.patch("server.cloud_lighting.local_relight.in_process_ready", return_value=False):
             response = await self.subjects()
         self.assertEqual(response.status, 501, await response.text())
         self.assertIn("还没接入", await response.text())
@@ -1274,14 +1554,14 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         self.assertEqual(response.status, 400, await response.text())
 
     async def test_subjects_rejects_invalid_box(self):
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True):
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True):
             response = await self.subjects(box=[0.5, 0.5, 0.2, 0.9])
         self.assertEqual(response.status, 400, await response.text())
 
     async def test_subjects_returns_person_candidates(self):
         people = [{"box": [0.1, 0.1, 0.4, 0.9], "mask": object(),
                    "coverage": 0.2, "cx": 0.25}]
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons", return_value=people), \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
                            return_value="data:image/png;base64,AAAA"):
@@ -1300,7 +1580,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         def fake_segment(image, min_area_ratio=0.002):
             seen["min_area_ratio"] = min_area_ratio
             return people
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons", side_effect=fake_segment), \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
                            return_value="data:image/png;base64,AAAA"):
@@ -1314,7 +1594,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         def fake_segment(image, min_area_ratio=0.002):
             seen["min_area_ratio"] = min_area_ratio
             return []
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons", side_effect=fake_segment):
             response = await self.subjects(sensitivity="nonsense")
         self.assertEqual(response.status, 200, await response.text())
@@ -1322,7 +1602,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
                          cloud_lighting.local_relight.MIN_PERSON_AREA_RATIO)
 
     async def test_subjects_rejects_invalid_point(self):
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True):
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True):
             response = await self.subjects(point=[0.5, 1.4])
         self.assertEqual(response.status, 400, await response.text())
 
@@ -1331,7 +1611,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         def fake_point(image, point):
             seen["point"] = list(point)
             return {"box": [0.3, 0.2, 0.7, 0.8], "mask": object(), "coverage": 0.11}
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_point", side_effect=fake_point), \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
                            return_value="data:image/png;base64,AAAA"):
@@ -1382,7 +1662,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
     async def test_local_dry_run_validates_but_never_segments_or_calls_gateway(self):
         with mock.patch("server.cloud_lighting.local_relight.segment_persons",
                         side_effect=AssertionError("dry_run must not segment")), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True):
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True):
             response = await self.generate(params=self.local_params(), dry_run=True)
         self.assertEqual(response.status, 200, await response.text())
         body = await response.json()
@@ -1426,7 +1706,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
                      "mask": __import__("numpy").ones((height, width), __import__("numpy").float32)}]
 
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            side_effect=fake_persons):
             response = await self.generate(params=self.local_params())
@@ -1484,7 +1764,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
             return out
 
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            side_effect=fake_persons), \
                 mock.patch("server.cloud_lighting.local_relight.composite",
@@ -1610,7 +1890,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
              "box": [0.1, 0.1, 0.4, 0.6], "source": "manual", "mode": "point",
              "point": [0.2, 0.3]}])
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            side_effect=fake_persons), \
                 mock.patch("server.cloud_lighting.local_relight.segment_point",
@@ -1645,7 +1925,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
             return {"box": box, "mask": np.ones((height, width), np.float32), "coverage": 0.2}
 
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            side_effect=fake_persons), \
                 mock.patch("server.cloud_lighting.local_relight.segment_box",
@@ -1692,7 +1972,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
             seen["box"] = list(box)
             return {"box": box, "mask": object(), "coverage": 0.13}
 
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_box",
                            side_effect=fake_box), \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
@@ -1708,7 +1988,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
 
     async def test_subjects_target_kind_is_orthogonal_to_mode(self):
         """类型和识别方式正交：编辑器选「物体」时，本地粗分割回来的就是物体，不再写死人物。"""
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_box",
                            return_value={"box": [0.2, 0.2, 0.6, 0.8], "mask": object(),
                                          "coverage": 0.13}), \
@@ -1722,13 +2002,13 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         self.assertEqual(candidate["label"], "框选物体")
 
     async def test_subjects_rejects_unknown_target_kind(self):
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True):
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True):
             response = await self.subjects(mode="local", target_kind="cat")
         self.assertEqual(response.status, 400, await response.text())
         self.assertIn("目标类型", await response.text())
 
     async def test_manual_subjects_requires_a_box(self):
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True):
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True):
             response = await self.subjects(mode="manual")
         self.assertEqual(response.status, 400, await response.text())
         self.assertIn("框住目标", await response.text())
@@ -1778,7 +2058,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
             return original(job_id, refs)
 
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            side_effect=fail_segment), \
                 mock.patch("server.cloud_lighting.local_relight.segment_box",
@@ -1813,7 +2093,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         params = self.manual_params()
         params["local_subjects"][0]["mask_index"] = 9  # 位图里只有 1 号身份
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.grounding",
                            side_effect=fake_grounding):
             response = await self.generate(params=params)
@@ -1841,7 +2121,7 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
                      "mask": np.ones((height, width), np.float32)}]
 
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            side_effect=fake_persons):
             response = await self.generate(params=self.manual_params(
@@ -1893,7 +2173,7 @@ class SubjectsJobTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
     async def test_local_job_polling_reaches_done(self):
         people = [{"box": [0.1, 0.1, 0.4, 0.9], "mask": object(),
                    "coverage": 0.2, "cx": 0.25}]
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            return_value=people), \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
@@ -1915,7 +2195,7 @@ class SubjectsJobTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
         people = [{"box": [0.1, 0.1, 0.4, 0.9], "mask": object(),
                    "coverage": 0.2, "cx": 0.25}]
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1"}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.segment_persons",
                            return_value=people), \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
@@ -1942,7 +2222,7 @@ class SubjectsJobTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
     async def test_real_remote_job_uses_gateway_partition_image(self):
         record = partition_record()
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": ""}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.partition_index_layer",
                            return_value=record) as partition, \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
@@ -1971,7 +2251,7 @@ class SubjectsJobTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
 
     async def test_remote_rejects_point_selection(self):
         """远端分区只能按区域投票，点选没有可投票的面积，仍然只走本地模型。"""
-        with mock.patch("server.cloud_lighting.local_relight.available", return_value=True):
+        with mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True):
             response = await self.client.post("/api/lighting/subjects/job", headers=self.headers,
                                               json={"project": self.project,
                                                     "image": self.upstream["ref"],
@@ -1984,7 +2264,7 @@ class SubjectsJobTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase):
         """同一个识别请求还在跑时连点：复用任务号，不排第二遍队（远端一次就是一笔计费）。"""
         record = partition_record()
         with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": ""}), \
-                mock.patch("server.cloud_lighting.local_relight.available", return_value=True), \
+                mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready", return_value=True), \
                 mock.patch("server.cloud_lighting.local_relight.partition_index_layer",
                            return_value=record), \
                 mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
@@ -2004,8 +2284,8 @@ class RemotePartitionCacheTests(CloudLightingFixture, unittest.IsolatedAsyncioTe
 
     def setUp(self):
         self.enterContext(mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": ""}))
-        self.enterContext(mock.patch("server.cloud_lighting.local_relight.available",
-                                     return_value=True))
+        self.enterContext(mock.patch("server.cloud_lighting.local_relight.legacy_segmentation_ready",
+                                      return_value=True))
         self.enterContext(mock.patch("server.cloud_lighting.local_relight.mask_to_data_url",
                                      return_value="data:image/png;base64,AAAA"))
 

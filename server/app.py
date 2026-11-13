@@ -4491,6 +4491,10 @@ async def on_start(app):
     app["session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
         trace_configs=trace_configs, trust_env=False)
+    # 识别交给节点跑时用的是同一份会话（含沙箱出站拦截），不在业务模块里另开一路连接。
+    # 通道字典由 make_app 挂；自建 app 的测试没有它，那种情况下识别会回「未挂载提交客户端」的 501。
+    if isinstance(app.get("comfy_node"), dict):
+        app["comfy_node"]["session"] = app["session"]
     if app["local_test"]:
         await setup_local_test_auth(app)
     elif not app.get("admin_sandbox"):
@@ -4617,6 +4621,12 @@ def make_app(auth_path=None, *, project_repository=None):
     app = web.Application(client_max_size=512 * 1024 ** 2,
                           middlewares=[sandbox_guard, auth_middleware, project_write_lock])
     app["comfy_lock"] = asyncio.Lock()
+    # 能力清单按引用挂到 app 上：load_caps 是原地 clear()/回填，所以这里挂的始终是最新一份。
+    app["caps"] = CAPS
+    # 服务端内部「把一次识别交给 ComfyUI」的四个动作挂在这。语义与提示词改写用本地 27B 的
+    # rewrite_local 一致（同一把提交锁、同一套显存门禁），业务模块不再各造一份客户端。
+    app["comfy_node"] = {"http": COMFY_HTTP, "upload": comfy_upload, "patch": patch_graph,
+                         "submit": local_submit, "collect": collect_outputs}
     app["cleanup_pending"] = {pid for pid, job in JOBS.items()
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}

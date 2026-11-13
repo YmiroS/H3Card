@@ -1,0 +1,5 @@
+ultralytics
+sam2
+rtmlib
+opencv-python
+numpy

@@ -13,6 +13,37 @@ from aiohttp import web
 
 from . import cloud_banana
 from . import cloud_images, local_relight, provider_billing
+from distributed import generation_worker_reason, worker_access_allowed
+
+
+SEG_CAPABILITY = "seg_persons"
+
+
+def perception_block(app, graph, *, capability=SEG_CAPABILITY, team_ids=None):
+    """识别作业派发前的集群预检：返回一句人话原因，None 表示有合格执行端。
+
+    必须查在提交期：自动派发对不合格节点是静默 continue（distributed 的领取循环），
+    不查的话前端只剩转圈、作业里连失败原因都写不出来（Spec §5.4）。
+    单机自环（开发机直连一台 ComfyUI）没有名册可查，返回 None 放行给提交期的报错。
+    """
+    store = app.get("distributed")
+    if store is None:
+        return None
+    workers = store.list_generation_workers()
+    if team_ids is not None:
+        workers = [worker for worker in workers if worker_access_allowed(worker, team_ids)]
+    if not workers:
+        return "当前团队没有可见的执行端，请先在管理端登记并启用 Windows 执行端"
+    reasons = set()
+    for worker in workers:
+        if worker.get("state") in ("idle", "busy") and not isinstance(worker.get("capabilities"), dict):
+            reasons.add("执行端还没上报能力清单")
+            continue
+        reason = generation_worker_reason(worker, graph, capability)
+        if reason is None:
+            return None
+        reasons.add(reason)
+    return "没有合格的执行端：" + "；".join(sorted(reasons))
 
 
 def lighting_size(info, megapixels):
@@ -271,12 +302,14 @@ class CloudLighting:
         project_id, image = body.get("project"), body.get("image")
         if not isinstance(image, str) or not image.strip():
             raise web.HTTPBadRequest(text="识别对象需要一张画布内已登记的图片")
+        if not local_relight.in_process_ready():
+            raise web.HTTPNotImplemented(
+                text="局部打光识别还没接入：服务端缺少纯计算依赖（OpenCV/NumPy）")
         mode = body.get("mode", "local")
         if mode not in ("local", "remote", "manual"):
             raise web.HTTPBadRequest(text="识别方式只支持 local、remote 或 manual")
-        if mode == "remote" and not local_relight.available():
-            raise web.HTTPNotImplemented(
-                text="远端识别需要服务端具备本地分割兜底（实例分割权重或 rembg/onnxruntime）")
+        # 远端分区只用索引层投票（纯 numpy），不再拿「服务机有没有分割权重」当前置：
+        # 那条老判据会把云端路一起拦死（Spec §5.3 / 风险 R1）。
         target_kind = body.get("target_kind")
         if target_kind not in (None, "person", "object"):
             raise web.HTTPBadRequest(text="目标类型只支持 person 或 object")
@@ -312,9 +345,7 @@ class CloudLighting:
 
     def _subjects_candidates(self, data, mode, min_area, box, point, user, target_kind=None):
         """按识别方式出候选：local 走分割模型；remote 走大模型颜色分区（演练模式用本地结果模拟）。"""
-        from io import BytesIO
-        from PIL import Image
-        picture = Image.open(BytesIO(data)).convert("RGB")
+        picture = local_relight.load_rgb(data)
         if mode in ("local", "manual"):
             if point is not None:
                 seg = local_relight.segment_point(picture, point)
@@ -451,20 +482,164 @@ class CloudLighting:
                  "coverage": vote["coverage"],
                  "mask": local_relight.mask_to_data_url(vote["mask"])}], "cloud", freshness, note
 
+    async def _preflight_segmentation(self, plan, user):
+        """跑分割那几路（local / manual / 点选 / 框选）落地前的可用性预检，缺就当场说清楚。
+
+        集群模式查节点名册（perception_block），单机自环查服务机能不能自己跑老路；
+        远端分区只用投票，不在这条判据里（Spec §5.3/§5.4）。
+        """
+        if plan[2] == "remote":
+            return
+        store = self.app.get("distributed")
+        if store is None:
+            if self._node_segment_on(plan):
+                return  # 自环走节点：服务机有没有权重不算前置，连不上 ComfyUI 由提交期那条 503 说清楚
+            if not local_relight.legacy_segmentation_ready():
+                raise web.HTTPNotImplemented(
+                    text="本机识别还没接入：服务机既没有实例分割权重，也没有 rembg 兜底；"
+                         "要么预置权重，要么把执行模式切到走节点")
+            return
+        graph = self._capability_graph(SEG_CAPABILITY)
+        team_ids = await self.call_store(self.app, "user_worker_teams", user["id"])
+        reason = await asyncio.to_thread(perception_block, self.app, graph, team_ids=team_ids)
+        if reason:
+            raise web.HTTPNotImplemented(text=reason)
+
+    def _capability_graph(self, capability):
+        """按能力 id 取 API 图（提交期预检要用它推节点类清单）。"""
+        caps = self.app.get("caps") or {}
+        cap = caps.get(capability)
+        if not cap:
+            raise web.HTTPNotImplemented(
+                text=f"识别能力「{capability}」还没登记：服务端缺少对应的能力清单与工作流图")
+        graph_path = self.root / cap["graph"]
+        if not graph_path.is_file():
+            raise web.HTTPNotImplemented(
+                text=f"识别能力「{capability}」缺少工作流图文件 {cap['graph']}")
+        return json.loads(graph_path.read_text(encoding="utf-8"))
+
+    SEG_TIMEOUT_SECONDS = 180.0
+    SEG_POLL_SECONDS = 0.4
+
+    def _node_segment_on(self, plan):
+        """整图自动识别是否交节点跑（M2）。点选 / 框选这一轮仍留服务机内实现（M2-10 待接）。
+
+        默认关：`CHOUKA_SEG_VIA_NODE=1` 才翻。理由不是没实现，而是**集群侧的派发口径还没拍**
+        （Spec R13 / M2-8b：作业要不要进任务面板、怎么取消、计费台账归谁）。
+        翻档前请先在 §7 台账留下一次真机证据，别拿本机自环当生产绿。
+        """
+        if plan[2] != "local" or plan[4] is not None or plan[5] is not None:
+            return False
+        return os.environ.get("CHOUKA_SEG_VIA_NODE") == "1"
+
+    def _comfy_node(self):
+        """服务端把识别交给 ComfyUI 的四个动作（上传 / 按 manifest 拼图 / 提交 / 取产物）。
+
+        由 app 启动时挂上来，和「提示词改写用本地 27B」那条 `rewrite_local` 同一套通道；
+        不在这里另造客户端，避免两份提交语义（锁、显存门禁、错误翻成人话）走偏。
+        """
+        backend = self.app.get("comfy_node")
+        if not isinstance(backend, dict):
+            raise web.HTTPNotImplemented(
+                text="识别还没接节点执行通道：服务端未挂载 ComfyUI 提交客户端")
+        return backend
+
+    async def _seg_artifacts(self, backend, pid):
+        """等节点把这一步跑完 → 产物清单；执行失败或超时要说得出原因，不许静默空手回来。"""
+        deadline = time.monotonic() + self.SEG_TIMEOUT_SECONDS
+        while True:
+            files = await backend["collect"](backend["session"], pid, wait_history=True)
+            if files:
+                return files
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(self.SEG_POLL_SECONDS)
+        async with backend["session"].get(f'{backend["http"]}/history/{pid}') as response:
+            entry = (await response.json()).get(pid) or {}
+        status = entry.get("status") or {}
+        if status.get("status_str") == "error":
+            details = "; ".join(str(m[-1]) for m in (status.get("messages") or [])
+                                if isinstance(m, list) and m)
+            raise web.HTTPBadGateway(text=f"节点识别执行失败：{details or 'ComfyUI 未给出原因'}"[:400])
+        raise web.HTTPGatewayTimeout(
+            text=f"识别在节点上等了 {int(self.SEG_TIMEOUT_SECONDS)} 秒还没出结果，"
+                 "请先看执行端队列是否被大作业占住（本次没有重复提交）")
+
+    def _seg_pick(self, files):
+        """从产物清单里挑出身份层与条目 JSON。
+
+        `collect_outputs` 不带节点号，只带文件名，所以这里靠图里写死的 filename_prefix 认；
+        换前缀要连同 graphs/seg_persons.api.json 一起改。
+        """
+        layer = next((item for item in files
+                      if str(item.get("filename", "")).startswith("segidx_")), None)
+        entries = next((item for item in files
+                        if str(item.get("filename", "")).startswith("segentries_")), None)
+        if layer is None or entries is None:
+            raise web.HTTPBadGateway(
+                text="节点识别没出齐产物：缺身份索引层或逐身份条目，请检查工作流 "
+                     "graphs/seg_persons.api.json 的落盘节点")
+        return layer, entries
+
+    async def _seg_view(self, backend, item):
+        """按产物名把节点写出的文件取回来（PNG 层 / JSON 条目走同一个通道）。"""
+        params = {"filename": item["filename"], "subfolder": item.get("subfolder") or "",
+                  "type": item.get("type") or "output"}
+        async with backend["session"].get(f'{backend["http"]}/view', params=params) as response:
+            if response.status != 200:
+                raise web.HTTPBadGateway(
+                    text=f"节点产物读不出来：{item['filename']} 返回 {response.status}")
+            return await response.read()
+
+    async def _subjects_node(self, plan, data, user):
+        """整图自动识别交给节点：原图 → 身份索引层 + 逐身份条目 → 候选（口径同远端分区路）。
+
+        层与原图尺寸差 1 像素就当场报错，不做拉伸（Spec §5.2）；候选直接吃
+        `_layer_candidates`，所以编号、box、coverage 与大模型分区那条路完全可比。
+        """
+        backend = self._comfy_node()
+        cap = (self.app.get("caps") or {}).get(SEG_CAPABILITY)
+        if not cap:
+            raise web.HTTPNotImplemented(
+                text=f"识别能力「{SEG_CAPABILITY}」还没登记：服务端缺少对应的能力清单与工作流图")
+        name = f"ck_{uuid.uuid4().hex[:12]}.png"
+        uploaded = await backend["upload"](backend["session"], "image", name, data)
+        graph = await asyncio.to_thread(backend["patch"], cap,
+                                        {"min_area_ratio": plan[3]}, {"images[0]": uploaded})
+        # 不自己编 prompt_id：ComfyUI 0.45 只收标准格式 UUID（带连字符、小写），
+        # 而 comfy_submit 本来就把服务端生成的 id 回传，拿返回值轮询即可。
+        pid = await backend["submit"](self.app, graph, capability=SEG_CAPABILITY)
+        layer_item, entries_item = self._seg_pick(await self._seg_artifacts(backend, pid))
+        layer_bytes = await self._seg_view(backend, layer_item)
+        entries = json.loads((await self._seg_view(backend, entries_item)).decode("utf-8"))
+        picture = local_relight.load_rgb(data)
+        size = picture.size
+        got = local_relight.layer_source_size(layer_bytes)
+        if got != size:
+            raise web.HTTPBadGateway(
+                text=f"节点回传的身份层是 {got[0]}x{got[1]}，原图是 {size[0]}x{size[1]}；"
+                     "尺寸对不上不做拉伸，请重新识别")
+        layer = local_relight.decode_identity_layer(layer_bytes, size)
+        candidates = await asyncio.to_thread(self._layer_candidates, layer, entries["entries"])
+        dropped = int(entries.get("dropped") or 0)
+        note = (f"有 {dropped} 个人超出 255 个身份上限，本次没编号" if dropped else None)
+        return candidates, "node", note
+
     def _subjects_work(self, plan, data, user):
         return self._subjects_candidates(data, plan[2], plan[3], plan[4], plan[5], user,
                                          target_kind=plan[6])
 
     async def subjects(self, request, body):
-        """识别局部打光候选：整图抠人，或按框抠一个物体。缺分割模型回 501。"""
-        if not local_relight.available():
-            raise web.HTTPNotImplemented(
-                text="局部打光识别还没接入：服务端缺少分割模型（实例分割权重或 rembg/onnxruntime）")
+        """识别局部打光候选：整图抠人，或按框抠一个物体。缺依赖或缺执行端回 501。"""
         plan = self._subjects_plan(body)
         user = self.require_user(request)
+        await self._preflight_segmentation(plan, user)
         data, ref, _info = await self.source(request, plan[0], plan[1])
         if self._remote_real(plan):
             candidates, engine, partition, note = await self._subjects_remote(plan, ref, data, user)
+        elif self._node_segment_on(plan):
+            candidates, engine, note = await self._subjects_node(plan, data, user)
+            partition = None
         else:
             candidates, engine = await asyncio.to_thread(self._subjects_work, plan, data, user)
             partition = note = None
@@ -480,6 +655,7 @@ class CloudLighting:
         """异步识别：建 job 立即返回，步骤进度走 GET 状态端点（本地秒过、远端逐步可见）。"""
         plan = self._subjects_plan(body)
         user = self.require_user(request)
+        await self._preflight_segmentation(plan, user)
         data, ref, _info = await self.source(request, plan[0], plan[1])
         now = time.time()
         for job_id, old in list(self.subject_jobs.items()):
@@ -510,6 +686,9 @@ class CloudLighting:
                 await asyncio.sleep(1.0)  # 演练模式模拟大模型推理耗时，步骤条可感知
             if self._remote_real(plan):
                 candidates, engine, partition, note = await self._subjects_remote(plan, ref, data, user)
+            elif self._node_segment_on(plan):
+                candidates, engine, note = await self._subjects_node(plan, data, user)
+                partition = None
             else:
                 candidates, engine = await asyncio.to_thread(self._subjects_work, plan, data, user)
                 partition = note = None
@@ -815,7 +994,9 @@ class CloudLighting:
         self.save_jobs()
         person_boxes = []
         if local["mask_data"]:
-            mask = await asyncio.to_thread(local_relight.decode_mask, local["mask_data"], (width, height))
+            # 编辑器蒙版按画布长边导出、出图尺寸是另一套，这里缩放是刻意的（软边缘要留住）。
+            mask = await asyncio.to_thread(local_relight.decode_mask, local["mask_data"],
+                                           (width, height), resample="lanczos")
             person_mask = np.zeros((height, width), np.float32)
         else:
             subjects = local["subjects"]
