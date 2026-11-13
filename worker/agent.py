@@ -213,6 +213,7 @@ class WorkerAgent:
         self.config = json.loads(self.config_path.read_text(encoding="utf-8"))
         self.restart_token = str(restart_token or "")
         self.fresh_capabilities_ready = False
+        self.recovered_maintenance_request_id = None
         self.server = str(self.config["server_url"]).rstrip("/")
         self.comfy = str(self.config.get("comfy_url", "http://127.0.0.1:8188")).rstrip("/")
         self.comfy_ws = self.comfy.replace("http://", "ws://", 1).replace(
@@ -806,6 +807,9 @@ class WorkerAgent:
         }
         self.last_capability_scan = time.time()
         self.fresh_capabilities_ready = True
+        maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
+        if maintenance.get("status") == "error":
+            self.recovered_maintenance_request_id = maintenance.get("request_id")
         return self.capabilities
 
     async def local_status(self):
@@ -1226,11 +1230,24 @@ class WorkerAgent:
             self._save_state()
             self.sync_report = {"request_id": maintenance["request_id"], "status": "error", "message": message}
 
+    def maintenance_recovery_report(self):
+        maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
+        request_id = maintenance.get("request_id")
+        if (request_id and maintenance.get("status") == "error"
+                and self.recovered_maintenance_request_id == request_id
+                and self.comfy_online and self.fresh_capabilities_ready):
+            return {"request_id": request_id}
+        return None
+
     def maintenance_blocks_jobs(self):
         maintenance = self.state.get("maintenance") or self.state.get("last_restart_result") or {}
+        recovered = self.maintenance_recovery_report()
         return (getattr(self, "_maintenance_executing", False)
-                or maintenance.get("status") in {"running", "restarting", "error"}
-                or bool(self.sync_report and self.sync_report.get("status") in {"running", "error"}))
+                or maintenance.get("status") in {"running", "restarting"}
+                or maintenance.get("status") == "error" and not recovered
+                or bool(self.sync_report and (
+                    self.sync_report.get("status") == "running"
+                    or self.sync_report.get("status") == "error" and not recovered)))
 
     async def execute_pending_sync(self):
         command = self.pending_sync
@@ -1399,8 +1416,11 @@ class WorkerAgent:
                 }
                 if self.telemetry:
                     body["telemetry"] = self.telemetry
-                if include_caps and self.capabilities:
+                if include_caps and self.fresh_capabilities_ready and self.capabilities:
                     body["capabilities"] = self.capabilities
+                    recovery = self.maintenance_recovery_report()
+                    if recovery:
+                        body["maintenance_recovery"] = recovery
                 if self.sync_report:
                     body["maintenance"] = dict(self.sync_report)
                 reply = await self._json_request(

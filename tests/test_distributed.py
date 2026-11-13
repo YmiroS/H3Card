@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import copy
 import hashlib
@@ -2006,6 +2007,344 @@ class DistributedStoreTest(unittest.TestCase):
             self.assertEqual(self.store.temperature_history(
                 worker_id, gpu_index=255, now=now + 10)["points"], points)
 
+    def _failed_restart_for_recovery(self, worker_id=None, **extra_caps):
+        worker_id = worker_id or self.worker_id
+        caps = {"node_classes": ["KSampler", "SaveImage"],
+                "supports_service_restart": True, "supports_code_restart": True,
+                **extra_caps}
+        self.store.heartbeat(worker_id, comfy_online=True, busy=False, capabilities=caps)
+        request = self.store.request_worker_restart(worker_id, "restart_services")
+        self.store.heartbeat(worker_id, comfy_online=True, busy=False, maintenance={
+            "request_id": request["request_id"], "status": "error",
+            "message": "重启失败：服务启动超时，保留历史诊断",
+        })
+        return request["request_id"], caps
+
+    def test_failed_restart_online_or_cached_capabilities_are_not_recovery(self):
+        request_id, caps = self._failed_restart_for_recovery()
+        self.store.enqueue("unproven-recovery", {"graph": {}}, ["KSampler"])
+        for heartbeat in ({}, {"capabilities": caps}):
+            with self.subTest(heartbeat=heartbeat):
+                self.store.heartbeat(self.worker_id, comfy_online=True, busy=False, **heartbeat)
+                self.assertIsNone(self.store.acquire(self.worker_id))
+                self.assertEqual(self.store.list_workers()[0]["state"], "error")
+                row = self.store.db.execute(
+                    "SELECT sync_request_id, sync_recovered_request_id FROM workers WHERE id=?",
+                    (self.worker_id,),
+                ).fetchone()
+                self.assertEqual(tuple(row), (request_id, None))
+
+    def test_failed_restart_rejects_invalid_or_premature_recovery_proof(self):
+        request_id, caps = self._failed_restart_for_recovery()
+        self.store.enqueue("invalid-recovery", {"graph": {}}, ["KSampler"])
+        cases = [
+            ("wrong-request", "error", True, caps, {"request_id": "wrong"}),
+            ("missing-capabilities", "error", True, None, {"request_id": request_id}),
+            ("missing-nodes", "error", True, {}, {"request_id": request_id}),
+            ("missing-KSampler", "error", True, {"node_classes": ["SaveImage"]}, {"request_id": request_id}),
+            ("non-list-nodes", "error", True, {"node_classes": "KSampler"}, {"request_id": request_id}),
+            ("offline", "error", False, caps, {"request_id": request_id}),
+            ("pending", "pending", True, caps, {"request_id": request_id}),
+            ("running", "running", True, caps, {"request_id": request_id}),
+        ]
+        for name, status, online, capabilities, proof in cases:
+            with self.subTest(case=name):
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE workers SET sync_status=?, sync_recovered_request_id=NULL WHERE id=?",
+                        (status, self.worker_id),
+                    )
+                self.store.heartbeat(self.worker_id, comfy_online=online, busy=False,
+                                     capabilities=capabilities, maintenance_recovery=proof)
+                self.assertIsNone(self.store.db.execute(
+                    "SELECT sync_recovered_request_id FROM workers WHERE id=?", (self.worker_id,),
+                ).fetchone()[0])
+                self.assertIsNone(self.store.acquire(self.worker_id))
+                # Even an already persisted matching proof cannot override active maintenance.
+                if status in {"pending", "running"}:
+                    with self.store.db:
+                        self.store.db.execute(
+                            "UPDATE workers SET sync_recovered_request_id=? WHERE id=?",
+                            (request_id, self.worker_id),
+                        )
+                    self.assertIsNone(self.store.acquire(self.worker_id))
+                    for options in ({}, {"summary": True}, {"telemetry_only": True}):
+                        self.assertEqual(self.store.list_workers(**options)[0]["state"], "syncing")
+
+    def test_failed_restart_recovery_preserves_history_and_local_occupancy(self):
+        request_id, caps = self._failed_restart_for_recovery()
+        history = dict(self.store.db.execute(
+            "SELECT sync_status, sync_message, sync_requested_at, sync_started_at, sync_finished_at "
+            "FROM workers WHERE id=?", (self.worker_id,),
+        ).fetchone())
+        self.store.enqueue("recovered-idle", {"graph": {}}, ["KSampler"])
+        for busy in (True, False):
+            with self.subTest(local_busy=busy):
+                self.store.heartbeat(
+                    self.worker_id, comfy_online=True, busy=busy, local_busy=busy,
+                    capabilities=caps, maintenance_recovery={"request_id": request_id},
+                )
+                for options in ({}, {"summary": True}, {"telemetry_only": True}):
+                    worker = self.store.list_workers(**options)[0]
+                    self.assertEqual(worker["state"], "busy" if busy else "idle")
+                    self.assertEqual(worker["sync_status"], "error")
+                    if not options.get("summary"):
+                        self.assertEqual(worker["sync_message"], history["sync_message"])
+                row = dict(self.store.db.execute(
+                    "SELECT sync_status, sync_message, sync_requested_at, sync_started_at, sync_finished_at "
+                    "FROM workers WHERE id=?", (self.worker_id,),
+                ).fetchone())
+                self.assertEqual(row, history)
+                if busy:
+                    self.assertIsNone(self.store.acquire(self.worker_id))
+                else:
+                    self.assertEqual(self.store.acquire(self.worker_id)["job_id"], "recovered-idle")
+
+    def test_recovered_host_peer_is_unblocked_but_new_maintenance_needs_new_proof(self):
+        request_id, caps = self._failed_restart_for_recovery(hardware={"host_id": "recovery-host"})
+        peer = self.store.register_worker("recovery-peer", caps)["worker_id"]
+        self.store.heartbeat(peer, comfy_online=True, busy=False)
+        self.store.enqueue("host-recovery", {"graph": {}, "target_worker_id": peer}, ["KSampler"])
+        self.assertIsNone(self.store.acquire(peer))
+        self.assertEqual(next(w for w in self.store.list_generation_workers() if w["id"] == peer)["state"], "error")
+        self.store.heartbeat(self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+                             maintenance_recovery={"request_id": request_id})
+        self.assertEqual(self.store._service_maintenance_hosts_locked(), {})
+        self.assertEqual(next(w for w in self.store.list_generation_workers() if w["id"] == peer)["state"], "idle")
+        # A live duplicate host is correctly rejected at request time. Simulate
+        # stopping the peer before maintenance, then its registration returning.
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET retired=1 WHERE id=?", (peer,))
+        new = self.store.request_worker_restart(self.worker_id, "restart_services")["request_id"]
+        with self.store.db:
+            self.store.db.execute("UPDATE workers SET retired=0 WHERE id=?", (peer,))
+        self.assertNotEqual(new, request_id)
+        self.assertIsNone(self.store.acquire(peer))
+        self.store.heartbeat(self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+                             maintenance={"request_id": new, "status": "error", "message": "第二次重启失败"},
+                             maintenance_recovery={"request_id": request_id})
+        self.assertIsNone(self.store.acquire(peer))
+        self.assertEqual(self.store._service_maintenance_hosts_locked(), {"recovery-host": "error"})
+        self.store.heartbeat(self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+                             maintenance_recovery={"request_id": new})
+        self.assertEqual(self.store.acquire(peer)["job_id"], "host-recovery")
+
+    def test_capacity_report_recovered_restart_uses_live_occupancy_and_keeps_history(self):
+        request_id, caps = self._failed_restart_for_recovery()
+        history = dict(self.store.db.execute(
+            "SELECT sync_status, sync_message, sync_requested_at, sync_started_at, sync_finished_at "
+            "FROM workers WHERE id=?", (self.worker_id,),
+        ).fetchone())
+        self.assertEqual(self.store.capacity.report()["workers"][0]["state"], "error")
+        for busy in (False, True, False):
+            with self.subTest(busy=busy):
+                self.store.heartbeat(
+                    self.worker_id, comfy_online=True, busy=busy, local_busy=busy,
+                    capabilities=caps, maintenance_recovery={"request_id": request_id},
+                )
+                worker = next(w for w in self.store.capacity.report()["workers"]
+                              if w["id"] == self.worker_id)
+                self.assertEqual(worker["state"], "busy" if busy else "idle")
+                self.assertEqual(dict(self.store.db.execute(
+                    "SELECT sync_status, sync_message, sync_requested_at, sync_started_at, sync_finished_at "
+                    "FROM workers WHERE id=?", (self.worker_id,),
+                ).fetchone()), history)
+
+    def _recovery_command_body(self, request_key="recovery_command_0001"):
+        return {"request_key": request_key, "all_online": False,
+                "worker_ids": [self.worker_id], "interpreter": "python",
+                "script": "print('regression only; never executed')", "cwd": "",
+                "timeout_seconds": 30}
+
+    def test_recovered_restart_allows_remote_command_create_and_claim(self):
+        request_id, caps = self._failed_restart_for_recovery(
+            hardware={"host_id": "recovered-command-host"},
+            remote_commands={"version": 1, "interpreters": ["python"]},
+        )
+        blocked = self.store.commands.create("admin", self._recovery_command_body())
+        self.assertEqual(blocked["executions"][0]["status"], "skipped")
+        self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+            maintenance_recovery={"request_id": request_id},
+        )
+        detail = self.store.commands.create(
+            "admin", self._recovery_command_body("recovery_command_0002"))
+        self.assertEqual(len(detail["executions"]), 1)
+        execution = detail["executions"][0]
+        self.assertEqual(execution["status"], "pending")
+        self.assertEqual(execution["error"], "")
+        claim = self.store.commands.claim(execution["id"], self.worker_id, "recovery_claim_0001")
+        self.assertTrue(claim["authorized"])
+        self.assertEqual(claim["status"], "running")
+        row = self.store.db.execute(
+            "SELECT sync_status, sync_recovered_request_id FROM workers WHERE id=?",
+            (self.worker_id,),
+        ).fetchone()
+        self.assertEqual(tuple(row), ("error", request_id))
+
+    def test_recovered_restart_new_maintenance_still_skips_remote_command_create(self):
+        request_id, caps = self._failed_restart_for_recovery(
+            hardware={"host_id": "new-maintenance-command-host"},
+            remote_commands={"version": 1, "interpreters": ["python"]},
+        )
+        self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+            maintenance_recovery={"request_id": request_id},
+        )
+        new = self.store.request_worker_restart(self.worker_id, "restart_services")["request_id"]
+        self.assertNotEqual(new, request_id)
+        for index, status in enumerate(("pending", "running", "error")):
+            with self.subTest(status=status):
+                # An old proof must not bypass a new request, even while pending/running.
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE workers SET sync_status=?, sync_recovered_request_id=? WHERE id=?",
+                        (status, request_id, self.worker_id),
+                    )
+                detail = self.store.commands.create(
+                    "admin", self._recovery_command_body(f"new_maintenance_{index:04}"))
+                self.assertEqual(detail["executions"][0]["status"], "skipped")
+                self.assertIn("维护", detail["executions"][0]["error"])
+
+    def test_recovered_restart_remote_command_claim_still_rejects_busy_or_new_maintenance(self):
+        from worker_commands import CommandConflict
+
+        request_id, caps = self._failed_restart_for_recovery(
+            hardware={"host_id": "claim-gate-host"},
+            remote_commands={"version": 1, "interpreters": ["python"]},
+        )
+        self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+            maintenance_recovery={"request_id": request_id},
+        )
+        detail = self.store.commands.create("admin", self._recovery_command_body())
+        execution = detail["executions"][0]
+        self.assertEqual(execution["status"], "pending")
+        cases = [(True, "error", request_id),
+                 (False, "pending", request_id), (False, "running", request_id),
+                 (False, "pending", "new-restart"), (False, "running", "new-restart"),
+                 (False, "error", "new-restart")]
+        for busy, status, current_request in cases:
+            with self.subTest(busy=busy, status=status, request=current_request):
+                # Simulate a change between offer and claim without executing a command.
+                with self.store.db:
+                    self.store.db.execute(
+                        "UPDATE workers SET busy=?, sync_status=?, sync_request_id=? WHERE id=?",
+                        (busy, status, current_request, self.worker_id),
+                    )
+                with self.assertRaises(CommandConflict):
+                    self.store.commands.claim(execution["id"], self.worker_id, "recovery_claim_0001")
+                self.assertEqual(self.store.commands.detail(detail["batch"]["id"])
+                                 ["executions"][0]["status"], "pending")
+        with self.store.db:
+            self.store.db.execute(
+                "UPDATE workers SET busy=0, sync_status='error', sync_request_id=? WHERE id=?",
+                (request_id, self.worker_id),
+            )
+        self.assertTrue(self.store.commands.claim(
+            execution["id"], self.worker_id, "recovery_claim_0001")["authorized"])
+
+    def test_failed_restart_replay_only_acks_and_can_persist_recovery_proof(self):
+        request_id, caps = self._failed_restart_for_recovery()
+        history = dict(self.store.db.execute(
+            "SELECT sync_request_id, sync_status, sync_message, sync_requested_at, "
+            "sync_started_at, sync_finished_at FROM workers WHERE id=?", (self.worker_id,),
+        ).fetchone())
+        self.assertIsNotNone(history["sync_finished_at"])
+        for index, proof in enumerate((None, {"request_id": request_id}, None)):
+            with self.subTest(proof=proof, replay=index):
+                with mock.patch("distributed.time.time", return_value=history["sync_finished_at"] + index + 1):
+                    reply = self.store.heartbeat(
+                        self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+                        maintenance={"request_id": request_id, "status": "error",
+                                     "message": f"重放不能覆盖原始失败诊断 {index}"},
+                        maintenance_recovery=proof,
+                    )
+                self.assertEqual(reply["maintenance_ack"], {"request_id": request_id, "status": "error"})
+                row = dict(self.store.db.execute(
+                    "SELECT sync_request_id, sync_status, sync_message, sync_requested_at, "
+                    "sync_started_at, sync_finished_at FROM workers WHERE id=?", (self.worker_id,),
+                ).fetchone())
+                self.assertEqual(row, history)
+                recovered = self.store.db.execute(
+                    "SELECT sync_recovered_request_id FROM workers WHERE id=?", (self.worker_id,),
+                ).fetchone()[0]
+                self.assertEqual(recovered, request_id if index else None)
+
+    def test_restart_done_replay_only_acks_without_rewriting_terminal_history(self):
+        request_id, caps = self._failed_restart_for_recovery()
+        # The existing error -> done recovery transition must remain supported.
+        reply = self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+            maintenance={"request_id": request_id, "status": "done", "message": "服务恢复完成"},
+        )
+        self.assertEqual(reply["maintenance_ack"], {"request_id": request_id, "status": "done"})
+        history = dict(self.store.db.execute(
+            "SELECT sync_status, sync_message, sync_requested_at, sync_started_at, sync_finished_at "
+            "FROM workers WHERE id=?", (self.worker_id,),
+        ).fetchone())
+        self.assertEqual(history["sync_status"], "done")
+        self.assertEqual(history["sync_message"], "服务恢复完成")
+        self.assertIsNotNone(history["sync_finished_at"])
+        with mock.patch("distributed.time.time", return_value=history["sync_finished_at"] + 1):
+            reply = self.store.heartbeat(
+                self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+                maintenance={"request_id": request_id, "status": "done", "message": "重复成功上报"},
+                maintenance_recovery={"request_id": request_id},
+            )
+        self.assertEqual(reply["maintenance_ack"], {"request_id": request_id, "status": "done"})
+        self.assertEqual(dict(self.store.db.execute(
+            "SELECT sync_status, sync_message, sync_requested_at, sync_started_at, sync_finished_at "
+            "FROM workers WHERE id=?", (self.worker_id,),
+        ).fetchone()), history)
+
+    def test_controller_maintenance_active_ignores_recovered_error_without_importing_app(self):
+        from worker_commands import maintenance_blocks_worker
+
+        path = ROOT / "server" / "app.py"
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        function = next(node for node in tree.body
+                        if isinstance(node, ast.FunctionDef) and node.name == "controller_maintenance_active")
+        namespace = {"CONTROLLER_MODE": True, "maintenance_blocks_worker": maintenance_blocks_worker,
+                     "distributed_store": mock.Mock(return_value=self.store)}
+        # Execute only this pure gate, never app's imports or runtime initialization.
+        exec(compile(ast.Module(body=[function], type_ignores=[]), str(path), "exec"), namespace)
+        active = namespace["controller_maintenance_active"]
+        request_id, caps = self._failed_restart_for_recovery()
+        self.assertTrue(active(None))
+        self.store.heartbeat(
+            self.worker_id, comfy_online=True, busy=False, capabilities=caps,
+            maintenance_recovery={"request_id": request_id},
+        )
+        self.assertFalse(active(None))
+        namespace["distributed_store"].assert_called_with(None)
+        worker = self.store.list_workers(summary=True)[0]
+        self.assertEqual(worker["sync_status"], "error")
+        self.assertEqual(worker["sync_recovered_request_id"], request_id)
+        for status in ("pending", "running", "error"):
+            with self.subTest(status=status):
+                new = {**worker, "sync_status": status, "sync_request_id": "new-restart"}
+                self.assertTrue(active(None, [new]))
+                self.assertFalse(active(None, [{**new, "state": "offline"}]))
+                self.assertFalse(active(None, [{**new, "is_primary_node": True}]))
+        namespace["CONTROLLER_MODE"] = False
+        self.assertFalse(active(None, [{**worker, "sync_status": "pending"}]))
+
+    def test_recovered_larger_idle_worker_participates_in_dispatch_preference(self):
+        self.store.heartbeat(self.worker_id, comfy_online=True, capabilities={
+            "node_classes": ["KSampler"],
+            "devices": [{"type": "cuda", "name": "GPU 32GB", "vram_total": 32 * 1024 ** 3}],
+        })
+        peer = self.store.register_worker("recovered-48GB", {})["worker_id"]
+        request_id, caps = self._failed_restart_for_recovery(peer, devices=[
+            {"type": "cuda", "name": "RTX A6000", "vram_total": 48 * 1024 ** 3},
+        ])
+        self.store.heartbeat(peer, comfy_online=True, busy=False, capabilities=caps,
+                             maintenance_recovery={"request_id": request_id})
+        self.store.enqueue("prefer-recovered", {"graph": {}, "capability": "minimax_h3_ref_2pass"}, ["KSampler"])
+        self.assertIsNone(self.store.acquire(self.worker_id))
+        self.assertEqual(self.store.acquire(peer)["job_id"], "prefer-recovered")
+
     def test_heartbeat_merges_telemetry_without_dropping_capabilities(self):
         telemetry = {
             "hostname": "RENDER-01",
@@ -2581,6 +2920,8 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
         agent.config = {}
         agent.telemetry = {}
         agent.capabilities = {}
+        agent.fresh_capabilities_ready = False
+        agent.recovered_maintenance_request_id = None
         agent.last_capability_scan = time.time()
         agent.last_telemetry_scan = time.time()
         agent.last_release_check = 0.0
@@ -2634,6 +2975,104 @@ class WorkerCleanupTest(unittest.IsolatedAsyncioTestCase):
 
     def failed_requests(self):
         return [kwargs["json"] for _, url, kwargs in self.requests if url.endswith("/failed")]
+
+    async def test_failed_restart_requires_successful_scan_for_local_recovery(self):
+        agent = self.agent
+        agent.scan_telemetry = mock.AsyncMock()
+        cached = {"node_classes": ["KSampler"], "cached": True}
+        for state_key in ("maintenance", "last_restart_result"):
+            with self.subTest(state_key=state_key):
+                failure = {"request_id": "failed-" + state_key, "status": "error",
+                           "action": "restart_services", "message": "服务启动失败"}
+                agent.state.pop("maintenance", None)
+                agent.state.pop("last_restart_result", None)
+                agent.state[state_key] = dict(failure)
+                agent.capabilities = cached
+                agent.fresh_capabilities_ready = False
+                agent.recovered_maintenance_request_id = None
+                agent.sync_report = dict(failure)
+                agent._json_request = mock.AsyncMock(side_effect=AgentError("connection refused"))
+                self.assertIs(await agent.scan_capabilities(), cached)
+                self.assertFalse(agent.fresh_capabilities_ready)
+                self.assertIsNone(agent.recovered_maintenance_request_id)
+                # An online queue check must not turn cached nodes into recovery evidence.
+                agent.comfy_online = True
+                self.assertIsNone(agent.maintenance_recovery_report())
+                self.assertTrue(agent.maintenance_blocks_jobs())
+                agent._json_request = mock.AsyncMock(side_effect=lambda _method, url:
+                    {"KSampler": {}} if url.endswith("object_info") else {"system": {}, "devices": []})
+                await agent.scan_capabilities()
+                self.assertEqual(agent.recovered_maintenance_request_id, failure["request_id"])
+                self.assertEqual(agent.maintenance_recovery_report(), {"request_id": failure["request_id"]})
+                self.assertFalse(agent.maintenance_blocks_jobs())
+                self.assertEqual(agent.state[state_key], failure)
+                self.assertEqual(agent.sync_report, failure)
+                for invalid in ("not-fresh", "offline", "new-request", "running", "restarting", "executing"):
+                    with self.subTest(gate=invalid):
+                        agent.state[state_key] = dict(failure)
+                        agent.fresh_capabilities_ready = invalid != "not-fresh"
+                        agent.comfy_online = invalid != "offline"
+                        agent._maintenance_executing = invalid == "executing"
+                        if invalid == "new-request":
+                            agent.state[state_key]["request_id"] = "new-request"
+                        elif invalid in {"running", "restarting"}:
+                            agent.state[state_key]["status"] = invalid
+                        if invalid != "executing":
+                            self.assertIsNone(agent.maintenance_recovery_report())
+                        self.assertTrue(agent.maintenance_blocks_jobs())
+                agent._maintenance_executing = False
+
+    async def test_heartbeat_recovery_payload_requires_fresh_successful_scan(self):
+        agent = self.agent
+        agent.scan_telemetry = mock.AsyncMock()
+        agent.local_status = mock.AsyncMock()
+        agent.confirm_release_recovery = mock.AsyncMock()
+        failure = {"request_id": "heartbeat-recovery", "status": "error",
+                   "action": "restart_services", "message": "重启失败历史"}
+        agent.state["last_restart_result"] = dict(failure)
+        for scan in ("success", "failed", "incomplete", "not-due"):
+            with self.subTest(scan=scan):
+                agent.stop_event = asyncio.Event()
+                agent.last_capability_scan = time.time() if scan == "not-due" else 0
+                agent.last_telemetry_scan = time.time()
+                agent.capabilities = {"node_classes": ["KSampler"], "cached": True}
+                agent.fresh_capabilities_ready = True
+                agent.comfy_online = True
+                agent.recovered_maintenance_request_id = failure["request_id"] if scan == "not-due" else None
+                payloads = []
+
+                async def request(_method, url, **kwargs):
+                    if url.endswith("heartbeat"):
+                        payloads.append(copy.deepcopy(kwargs["json"]))
+                        agent.stop_event.set()
+                        return {}
+                    if scan == "failed":
+                        raise AgentError("scan failed")
+                    if url.endswith("object_info"):
+                        return {"SaveImage": {}} if scan == "incomplete" else {"KSampler": {}}
+                    return {"system": {}, "devices": []}
+
+                agent._json_request = mock.AsyncMock(side_effect=request)
+                await asyncio.wait_for(agent.heartbeat_loop(), 1)
+                self.assertEqual(len(payloads), 1)
+                body = payloads[0]
+                if scan == "success":
+                    self.assertEqual(body["maintenance_recovery"], {"request_id": failure["request_id"]})
+                    self.assertIn("KSampler", body["capabilities"]["node_classes"])
+                    self.assertNotIn("cached", body["capabilities"])
+                    self.assertTrue(body["comfy_online"])
+                    self.assertFalse(body["busy"])
+                    self.assertFalse(body["local_busy"])
+                    self.assertTrue(body["capacity_released"])
+                else:
+                    self.assertNotIn("capabilities", body)
+                    self.assertNotIn("maintenance_recovery", body)
+                    if scan != "not-due":
+                        self.assertFalse(body["comfy_online"])
+                        self.assertTrue(body["busy"])
+                        self.assertFalse(agent.fresh_capabilities_ready)
+                        self.assertIsNone(agent.recovered_maintenance_request_id)
+                self.assertEqual(agent.state["last_restart_result"], failure)
 
     async def test_service_restart_capability_is_windows_only(self):
         self.agent.scan_telemetry = mock.AsyncMock()

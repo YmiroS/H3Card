@@ -15,6 +15,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 
+from worker_commands import maintenance_blocks_worker
+
 
 TERMINAL = {"done", "error", "canceled"}
 MIN_BASELINE_SAMPLES = 30
@@ -1411,7 +1413,7 @@ class CapacityStore:
                 state = "offline"
             elif not is_primary and worker.get("sync_status") in {"pending", "running"}:
                 state = "syncing"
-            elif not is_primary and worker.get("sync_status") == "error":
+            elif not is_primary and maintenance_blocks_worker(worker):
                 state = "error"
             elif not worker.get("enabled", True):
                 state = "disabled"

@@ -48,6 +48,7 @@ import rewrite as rw
 import llm
 import translate as tr
 from costs import CostLedger
+from worker_commands import maintenance_blocks_worker
 from capacity import make_spec, export_csv, model_summary_from_graph, _hash as capacity_output_key
 from distributed import (
     DistributedStore, HIGH_VRAM_GPU_POLICY, HIGH_VRAM_CAPABILITIES,
@@ -310,7 +311,7 @@ def controller_maintenance_active(app, workers=None):
     return any(
         w.get("state") != "offline"
         and not w.get("is_primary_node")
-        and w.get("sync_status") in ("pending", "running", "error")
+        and maintenance_blocks_worker(w)
         for w in workers
     )
 
@@ -2528,6 +2529,8 @@ async def api_agent_heartbeat(request):
             local_busy=body.get("local_busy") if "local_busy" in body else None,
             current_job_id=body.get("current_job_id"),
             maintenance=body.get("maintenance") if isinstance(body.get("maintenance"), dict) else None,
+            maintenance_recovery=(body.get("maintenance_recovery")
+                                  if isinstance(body.get("maintenance_recovery"), dict) else None),
             capacity_released=body.get("capacity_released") is True,
         )
     except WorkerBusyError as exc:

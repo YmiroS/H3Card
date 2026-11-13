@@ -12,6 +12,15 @@ ACTIVE = ("pending", "running", "unknown")
 TERMINAL = ("succeeded", "failed", "canceled", "timed_out", "skipped", "expired")
 
 
+def maintenance_blocks_worker(worker):
+    worker = dict(worker)
+    status = worker.get("sync_status")
+    return (status in {"pending", "running"}
+            or status == "error" and not (
+                worker.get("sync_request_id")
+                and worker.get("sync_recovered_request_id") == worker["sync_request_id"]))
+
+
 class CommandConflict(ValueError):
     pass
 
@@ -98,7 +107,7 @@ class WorkerCommands:
         # Read only identity/scheduling fields, not multi-MB node inventories.
         rows = self.db.execute("""
             SELECT id, name, last_seen, busy, current_job_id, comfy_online, retired,
-                   sync_status, created_at,
+                   sync_status, sync_request_id, sync_recovered_request_id, created_at,
                    json_extract(capabilities_json, '$.hardware.host_id') AS hardware_host_id,
                    json_extract(capabilities_json, '$.telemetry.host_id') AS telemetry_host_id,
                    json_extract(capabilities_json, '$.host_id') AS reported_host_id,
@@ -239,7 +248,7 @@ class WorkerCommands:
                     reason = "节点不在线，不会等待未来上线执行"
                 elif any(self.blocks_worker_locked(w["id"], host) for w in peers):
                     reason = "同一宿主已有远程命令或执行状态未知"
-                elif any(w["host_id"] == host and w["sync_status"] in ("pending", "running", "error") for w in workers):
+                elif any(w["host_id"] == host and maintenance_blocks_worker(w) for w in workers):
                     reason = "同一宿主已有维护请求或维护故障"
                 status = "skipped" if reason else "pending"
                 self.db.execute("""INSERT INTO worker_command_executions
@@ -342,7 +351,7 @@ class WorkerCommands:
             for peer in workers:
                 if peer["host_id"] != row["host_id"]:
                     continue
-                if (peer["current_job_id"] or peer["sync_status"] in ("pending", "running", "error")
+                if (peer["current_job_id"] or maintenance_blocks_worker(peer)
                         or peer["busy"]
                         or self.db.execute("SELECT 1 FROM dispatch_jobs WHERE worker_id=? AND status IN "
                                            "('assigned','running','cancel_requested') LIMIT 1", (peer["id"],)).fetchone()):

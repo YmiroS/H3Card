@@ -16,7 +16,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from capacity import CapacityStore
-from worker_commands import WorkerCommands
+from worker_commands import WorkerCommands, maintenance_blocks_worker
 
 
 LIVE_DISPATCH = ("assigned", "running", "cancel_requested")
@@ -508,6 +508,7 @@ class DistributedStore:
                     sync_requested_at REAL,
                     sync_started_at REAL,
                     sync_finished_at REAL,
+                    sync_recovered_request_id TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL
                 );
@@ -579,11 +580,12 @@ class DistributedStore:
                 "sync_requested_at": "REAL",
                 "sync_started_at": "REAL",
                 "sync_finished_at": "REAL",
+                "sync_recovered_request_id": "TEXT",
             }
             for name, definition in sync_columns.items():
                 if name not in columns:
                     self.db.execute(f"ALTER TABLE workers ADD COLUMN {name} {definition}")
-            if "access_daily_window_json" not in columns:
+            if "access_daily_window_json" not in columns or "sync_recovered_request_id" not in columns:
                 # Rebuild only these metadata indexes on upgrade, keeping the new
                 # schedule checks covered without reading large capability rows.
                 self.db.execute("DROP INDEX IF EXISTS idx_workers_poll_summary")
@@ -593,7 +595,7 @@ class DistributedStore:
                 CREATE INDEX IF NOT EXISTS idx_workers_poll_summary ON workers(
                     retired, created_at DESC, id DESC, name, enabled, comfy_online, busy,
                     current_job_id, last_seen, sync_status, access_team_id, access_expires_at,
-                    access_daily_window_json,
+                    access_daily_window_json, sync_request_id, sync_recovered_request_id,
                     json_type(COALESCE(NULLIF(capabilities_json, ''), '{}'), '$.is_primary_node') = 'true'
                 );
                 CREATE INDEX IF NOT EXISTS idx_workers_restart_expiry
@@ -1255,7 +1257,7 @@ class DistributedStore:
 
     def heartbeat(self, worker_id, *, capabilities=None, telemetry=None,
                   comfy_online=False, busy=False, local_busy=None,
-                  current_job_id=None, maintenance=None, capacity_released=False):
+                  current_job_id=None, maintenance=None, maintenance_recovery=None, capacity_released=False):
         now = time.time()
         with self.lock, self.db:
             self._begin_guarded_transaction_locked()
@@ -1350,7 +1352,10 @@ class DistributedStore:
             elif isinstance(maintenance, dict):
                 report_request_id = str(maintenance.get("request_id") or "")
                 report_status = str(maintenance.get("status") or "")
-                if (report_request_id == sync_request_id
+                if (report_request_id == sync_request_id and sync_status in {"done", "error"}
+                        and report_status == sync_status):
+                    maintenance_ack = {"request_id": sync_request_id, "status": sync_status}
+                elif (report_request_id == sync_request_id
                         and report_status in {"running", "done", "error"}
                         and (sync_status in {"pending", "running"} or report_status == sync_status
                              or sync_status == "error" and report_status == "done")):
@@ -1385,6 +1390,18 @@ class DistributedStore:
                         "request_id": report_request_id,
                         "status": report_status,
                     }
+
+            # Recovery is current health evidence, not a rewrite of a failed operation.
+            if (sync_request_id and sync_status == "error" and comfy_online is True
+                    and isinstance(maintenance_recovery, dict)
+                    and maintenance_recovery.get("request_id") == sync_request_id
+                    and isinstance(capabilities, dict)
+                    and isinstance(capabilities.get("node_classes"), list)
+                    and "KSampler" in capabilities["node_classes"]):
+                self.db.execute(
+                    "UPDATE workers SET sync_recovered_request_id = ? WHERE id = ?",
+                    (sync_request_id, worker_id),
+                )
 
             commands = self.commands.offer_locked(worker_id)
             lease_ttl_seconds = None
@@ -1536,11 +1553,12 @@ class DistributedStore:
         if summary or telemetry_only:
             # 轮询只取所需字段，避免把每台数 MB 的节点/模型清单解码成 Python 对象。
             columns = """id, name, enabled, comfy_online, busy, current_job_id,
-                         last_seen, sync_status, access_team_id, access_expires_at, access_daily_window_json,
+                         last_seen, sync_status, sync_request_id, sync_recovered_request_id,
+                         access_team_id, access_expires_at, access_daily_window_json,
                          json_type(COALESCE(NULLIF(capabilities_json, ''), '{}'),
                                    '$.is_primary_node') = 'true' AS is_primary_node"""
             if telemetry_only and not summary:
-                columns += """, sync_request_id, sync_requested_at, sync_finished_at, sync_message,
+                columns += """, sync_requested_at, sync_finished_at, sync_message,
                     json_object(
                         'agent_version', json(COALESCE(COALESCE(NULLIF(capabilities_json, ''), '{}') -> '$.agent_version', 'null')),
                         'telemetry', json_extract(COALESCE(NULLIF(capabilities_json, ''), '{}'), '$.telemetry'),
@@ -1613,7 +1631,7 @@ class DistributedStore:
                 item["state"] = "offline"
             elif not item["is_primary_node"] and item.get("sync_status") in {"pending", "running"}:
                 item["state"] = "syncing"
-            elif not item["is_primary_node"] and item.get("sync_status") == "error":
+            elif not item["is_primary_node"] and maintenance_blocks_worker(item):
                 item["state"] = "error"
             elif not item["enabled"]:
                 item["state"] = "disabled"
@@ -1629,10 +1647,13 @@ class DistributedStore:
     def _service_maintenance_hosts_locked(self):
         hosts = {}
         for row in self.db.execute(
-            """SELECT capabilities_json, sync_action, sync_status FROM workers WHERE retired = 0
+            """SELECT capabilities_json, sync_action, sync_status, sync_request_id,
+                      sync_recovered_request_id FROM workers WHERE retired = 0
                AND sync_action IN ('reboot_host', 'restart_services', 'sync_files')
                AND sync_status IN ('pending', 'running', 'error')"""
         ):
+            if not maintenance_blocks_worker(row):
+                continue
             capabilities = json.loads(row["capabilities_json"] or "{}")
             if row["sync_action"] == "sync_files" and _primary_node(capabilities):
                 continue
@@ -1713,7 +1734,7 @@ class DistributedStore:
             if host_id and host_id in maintenance_hosts:
                 return None
             if (not _primary_node(capabilities)
-                    and worker["sync_status"] in ("pending", "running", "error")):
+                    and maintenance_blocks_worker(worker)):
                 return None
             available_nodes = set(capabilities.get("node_classes") or [])
             current_vram = primary_gpu_vram_bytes(capabilities.get("devices"))
@@ -1764,7 +1785,8 @@ class DistributedStore:
                                 seen_names.add(name_key)
                                 latest_ids.add(registration["id"])
                         others = self.db.execute(
-                            """SELECT id, capabilities_json, sync_status, access_team_id, access_expires_at,
+                            """SELECT id, capabilities_json, sync_status, sync_request_id,
+                                      sync_recovered_request_id, access_team_id, access_expires_at,
                                       access_daily_window_json
                                FROM workers
                                WHERE id != ? AND retired = 0 AND enabled = 1 AND comfy_online = 1
@@ -1778,7 +1800,7 @@ class DistributedStore:
                                 continue
                             other = json.loads(item["capabilities_json"] or "{}")
                             if (not _primary_node(other)
-                                    and item["sync_status"] in ("pending", "running", "error")):
+                                    and maintenance_blocks_worker(item)):
                                 continue
                             other_host = _worker_host_id(other)
                             if other_host and other_host in maintenance_hosts:
