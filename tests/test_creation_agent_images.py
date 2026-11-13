@@ -130,7 +130,11 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
             payload = await request.json()
             self.calls.append(payload)
             if self.gateway_status != 200:
-                return web.json_response({'error': 'private-signed-url-and-token'}, status=self.gateway_status)
+                image_url = payload['messages'][0]['content'][0]['image_url']['url']
+                return web.json_response(
+                    {'error': {'message': 'Invalid image URL: ' + image_url + '; key=fake-chat-key',
+                               'param': 'image_url', 'code': 'invalid_image_url'}},
+                    status=self.gateway_status, headers={'X-Request-ID': 'assistant-image-error'})
             if payload.get('stream'):
                 return web.Response(body=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
                                     content_type='text/event-stream')
@@ -428,9 +432,21 @@ class CreationAgentImagesTests(unittest.IsolatedAsyncioTestCase):
     async def test_done_and_upstream_error_keep_same_object_and_stream_works(self):
         self.assertEqual((await self.post()).status, 200)
         self.gateway_status = 500
-        response = await self.post()
+        with self.assertLogs(cloud_chat.__name__, level='WARNING') as logs:
+            response = await self.post()
         self.assertEqual(response.status, 502)
-        self.assertNotIn('private-signed-url-and-token', await response.text())
+        result = await response.json()
+        self.assertEqual(result['request_id'], 'assistant-image-error')
+        self.assertFalse(result['retryable'])
+        self.assertIn('HTTP 500', result['error'])
+        self.assertIn('status=500', ' '.join(logs.output))
+        for text in (result['error'], ' '.join(logs.output)):
+            for detail in ('Invalid image URL', 'param=image_url', 'invalid_image_url',
+                           'assistant-image-error'):
+                self.assertIn(detail, text)
+            for secret in ('fake-chat-key', 'https://', 'x-oss-', 'test-bucket'):
+                self.assertNotIn(secret, text)
+        self.assertEqual(len(self.calls), 2)
         self.gateway_status = 200
         response = await self.post(stream=True)
         self.assertEqual(response.status, 200)

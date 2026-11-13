@@ -241,42 +241,72 @@ async def download_result(result, config):
                if key in result}, **info, "image_bytes": data}
 
 
-def _error_fields(value, depth=0):
+def provider_error_fields(value, depth=0):
     """Select diagnostics only; never stringify validation input, context or config."""
     if depth > 4:
         return ""
     if isinstance(value, str):
         return value
     if isinstance(value, list):
-        return "; ".join(filter(None, (_error_fields(item, depth + 1) for item in value[:16])))
+        return "; ".join(filter(None, (provider_error_fields(item, depth + 1) for item in value[:16])))
     if isinstance(value, dict):
         fields = []
         for key in ("message", "msg", "type", "param", "code", "loc", "error", "detail"):
             item = value.get(key)
             if key == "loc" and isinstance(item, list):
                 text = ".".join(str(part) for part in item[:16] if isinstance(part, (str, int)))
+            elif key == "code" and type(item) is int:
+                text = str(item)
             else:
-                text = _error_fields(item, depth + 1)
+                text = provider_error_fields(item, depth + 1)
             if text.strip():
                 fields.append(f"{key}={text}")
         return "; ".join(fields)
     return ""
 
 
-def _sanitize_error_detail(text, *, secrets, prompt):
+def sanitize_error_detail(text, *, secrets, prompts):
     # Normalize HTML entities before redaction; strip markup, not plain comparisons.
+    if len(text) > 16 * 1024:
+        return ""
     text = html.unescape(text)
-    for value, replacement in ((prompt, "[prompt redacted]"),
-                               *((secret, "[redacted]") for secret in secrets)):
+    redaction_patterns = {}
+    for value, replacement in (
+            *((prompt, "[prompt redacted]") for prompt in prompts),
+            *((secret, "[redacted]") for secret in secrets)):
         if value:
             variants = {value, html.unescape(value), json.dumps(value, ensure_ascii=True)[1:-1],
                         json.dumps(value, ensure_ascii=False)[1:-1]}
-            for variant in sorted(variants, key=len, reverse=True):
-                text = text.replace(variant, replacement)
+            patterns = {re.escape(variant) for variant in variants}
             words = value.split()
             if len(words) > 1:
-                pattern = r"\s+".join(re.escape(word) for word in words)
-                text = re.sub(pattern, lambda _: replacement, text)
+                patterns.add(r"\s+".join(re.escape(word) for word in words))
+            for pattern in patterns:
+                if replacement == "[prompt redacted]" and len(value) < 8:
+                    pattern = r"(?<!\w)" + pattern + r"(?!\w)"
+                if replacement == "[prompt redacted]" or pattern not in redaction_patterns:
+                    redaction_patterns[pattern] = replacement
+    # Lookahead finds overlapping occurrences of the same prompt as well as
+    # overlapping ranges from different messages, before any text is replaced.
+    matches = []
+    for pattern, replacement in redaction_patterns.items():
+        matches.extend((match.start(1), match.end(1), replacement)
+                       for match in re.finditer("(?=(" + pattern + "))", text))
+    ranges = []
+    for start, end, replacement in sorted(matches):
+        if ranges and start <= ranges[-1][1]:
+            previous_start, previous_end, previous_replacement = ranges[-1]
+            if previous_replacement == "[prompt redacted]":
+                replacement = previous_replacement
+            ranges[-1] = (previous_start, max(previous_end, end), replacement)
+        else:
+            ranges.append((start, end, replacement))
+    parts, cursor = [], 0
+    for start, end, replacement in ranges:
+        parts.extend((text[cursor:start], replacement))
+        cursor = end
+    parts.append(text[cursor:])
+    text = "".join(parts)
     text = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>", " ", text)
     text = re.sub(r"(?is)<!--.*?-->|<![A-Za-z][^>]*>|<\?[^>]*\?>|"
                   r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^<>]*|\s*/?)>", " ", text)
@@ -342,10 +372,10 @@ async def request_image(session, config, prompt, endpoint, *, end_user_name, end
                     else:
                         if isinstance(error_payload, dict):
                             error = next((text for key in ("error", "detail", "message")
-                                          if (text := _error_fields(error_payload.get(key))).strip()), "")
+                                          if (text := provider_error_fields(error_payload.get(key))).strip()), "")
                         else:
-                            error = _error_fields(error_payload)
-                    detail = _sanitize_error_detail(error, secrets=secrets, prompt=prompt.strip()) or detail
+                            error = provider_error_fields(error_payload)
+                    detail = sanitize_error_detail(error, secrets=secrets, prompts=(prompt.strip(),)) or detail
                     if on_metadata and error_payload is not None:
                         await on_metadata({**provider_billing.normalize(error_payload, config["model"], config),
                                            "request_id": request_id})
