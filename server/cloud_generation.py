@@ -36,7 +36,26 @@ GPT_IMAGE_MODELS = {
 }
 
 
-def generation_dimensions(params, needs_images, info=None):
+def gpt_image_dimensions(width, height, *, minimum_pixels=655_360):
+    # The paid GPT gateway is stricter than local workflows: 16px alignment,
+    # 3840px longest edge, 8,294,400 pixels and at most a 3:1 output canvas.
+    width, height = max(width, height / 3), max(height, width / 3)
+    scale = min(1, 3840 / max(width, height), math.sqrt(8_294_400 / (width * height)))
+    scale = max(scale, math.sqrt(minimum_pixels / (width * height)))
+    scaled = (width * scale, height * scale)
+    width, height = (max(16, math.floor(side / 16 + .5) * 16) for side in scaled)
+    if width * height > 8_294_400:
+        width, height = (max(16, math.floor(side / 16) * 16) for side in scaled)
+    elif width * height < minimum_pixels:
+        width, height = (max(16, math.ceil(side / 16) * 16) for side in scaled)
+    if width > height * 3:
+        height = math.ceil(width / 3 / 16) * 16
+    elif height > width * 3:
+        width = math.ceil(height / 3 / 16) * 16
+    return width, height
+
+
+def generation_dimensions(params, needs_images, info=None, *, provider=None):
     ratio = params.get("image_ratio", "original" if needs_images else "3:4")
     clarity = params.get("image_clarity", "720P")
     if not isinstance(ratio, str) or ratio not in RATIOS + (("original",) if needs_images else ()):
@@ -47,17 +66,22 @@ def generation_dimensions(params, needs_images, info=None):
     scale = CLARITIES[clarity] / min(w, h)
     width = max(16, math.floor(w * scale / 16 + .5) * 16)
     height = max(16, math.floor(h * scale / 16 + .5) * 16)
-    return ratio, clarity, bounded_dimensions(width, height)
+    dimensions = (gpt_image_dimensions(width, height) if provider == "gpt_image"
+                  else bounded_dimensions(width, height))
+    return ratio, clarity, dimensions
 
 
-def resize_image(data, size, *, crop=False):
+def resize_image(data, size, *, crop=False, pad=False):
     info = cloud_images.inspect_image(data)
     if (info["width"], info["height"]) == size:
         return data, info
     with Image.open(BytesIO(data)) as image:
         image = image.convert("RGBA" if "A" in image.getbands() or "transparency" in image.info else "RGB")
-        image = (ImageOps.fit(image, size, method=Image.Resampling.LANCZOS) if crop
-                 else image.resize(size, Image.Resampling.LANCZOS))
+        if pad:
+            image = ImageOps.pad(image, size, method=Image.Resampling.LANCZOS)
+        else:
+            image = (ImageOps.fit(image, size, method=Image.Resampling.LANCZOS) if crop
+                     else image.resize(size, Image.Resampling.LANCZOS))
         output = BytesIO()
         image.save(output, format="PNG")
     data = output.getvalue()
@@ -96,7 +120,8 @@ class CloudGeneration(CloudLighting):
                         for job in self.jobs.values())):
             raise web.HTTPConflict(text="当前卡片已有云端生图任务，请等待结果，不要重复提交")
         sources = [await self.source(request, project_id, assets[key]) for key in keys]
-        ratio, clarity, dimensions = generation_dimensions(params, needs_images, sources[0][2] if sources else None)
+        ratio, clarity, dimensions = generation_dimensions(
+            params, needs_images, sources[0][2] if sources else None, provider=provider)
         size = f"{dimensions[0]}x{dimensions[1]}"
         if body.get("dry_run"):
             return {"dry_run": True, "execution": "cloud_image", "billingMode": "paid_api",
@@ -106,9 +131,17 @@ class CloudGeneration(CloudLighting):
         config = cloud_banana.load() if provider == "banana" else cloud_images.load()
         prepared = []
         for index, (data, ref, info) in enumerate(sources):
-            target = dimensions if index == 0 else bounded_dimensions(
-                *(max(16, info[key] // 16 * 16) for key in ("width", "height")))
-            data, info = await asyncio.to_thread(resize_image, data, target, crop=index == 0 and ratio != "original")
+            if index == 0:
+                target = dimensions
+            elif provider == "gpt_image":
+                target = gpt_image_dimensions(info["width"], info["height"], minimum_pixels=0)
+            else:
+                target = bounded_dimensions(
+                    *(max(16, info[key] // 16 * 16) for key in ("width", "height")))
+            pad = (provider == "gpt_image" and (index > 0 or ratio == "original")
+                   and max(info["width"], info["height"]) > 3 * min(info["width"], info["height"]))
+            data, info = await asyncio.to_thread(
+                resize_image, data, target, crop=index == 0 and ratio != "original", pad=pad)
             prepared.append((data, ref, info))
         await self.require_project(request, project_id, operate=True)
         inputs = {key: await self.snapshot_input(project_id, ref, data, info, copy_upload=True)

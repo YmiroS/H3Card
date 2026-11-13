@@ -2,6 +2,7 @@
 import asyncio
 import base64
 import binascii
+import html
 import ipaddress
 from io import BytesIO
 import json
@@ -240,6 +241,76 @@ async def download_result(result, config):
                if key in result}, **info, "image_bytes": data}
 
 
+def _error_fields(value, depth=0):
+    """Select diagnostics only; never stringify validation input, context or config."""
+    if depth > 4:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "; ".join(filter(None, (_error_fields(item, depth + 1) for item in value[:16])))
+    if isinstance(value, dict):
+        fields = []
+        for key in ("message", "msg", "type", "param", "code", "loc", "error", "detail"):
+            item = value.get(key)
+            if key == "loc" and isinstance(item, list):
+                text = ".".join(str(part) for part in item[:16] if isinstance(part, (str, int)))
+            else:
+                text = _error_fields(item, depth + 1)
+            if text.strip():
+                fields.append(f"{key}={text}")
+        return "; ".join(fields)
+    return ""
+
+
+def _sanitize_error_detail(text, *, secrets, prompt):
+    # Normalize HTML entities before redaction; strip markup, not plain comparisons.
+    text = html.unescape(text)
+    for value, replacement in ((prompt, "[prompt redacted]"),
+                               *((secret, "[redacted]") for secret in secrets)):
+        if value:
+            variants = {value, html.unescape(value), json.dumps(value, ensure_ascii=True)[1:-1],
+                        json.dumps(value, ensure_ascii=False)[1:-1]}
+            for variant in sorted(variants, key=len, reverse=True):
+                text = text.replace(variant, replacement)
+            words = value.split()
+            if len(words) > 1:
+                pattern = r"\s+".join(re.escape(word) for word in words)
+                text = re.sub(pattern, lambda _: replacement, text)
+    text = re.sub(r"(?is)<(script|style)\b[^>]*>.*?</\1\s*>", " ", text)
+    text = re.sub(r"(?is)<!--.*?-->|<![A-Za-z][^>]*>|<\?[^>]*\?>|"
+                  r"</?[A-Za-z][A-Za-z0-9:-]*(?:\s+[^<>]*|\s*/?)>", " ", text)
+    # Drop entire URL queries/fragments (including unknown signing schemes) and userinfo.
+    text = re.sub(r"(?i)https?://[^\s<>]+", lambda match: re.sub(
+        r"([?#]).*", r"\1[query redacted]", re.sub(
+            r"(?i)(https?://)[^/@]+@", r"\1[redacted]@", match[0])), text)
+    text = re.sub(r"(?i)\bBearer\s+[^\s\"'<>;,]+|\bsk-[A-Za-z0-9_-]+",
+                  "[credential redacted]", text)
+    # Quoted values may contain spaces, commas and semicolons. For unquoted cookie
+    # headers, redact the whole line rather than exposing subsequent cookie pairs.
+    quoted = r'''"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*' '''.strip()
+    labels = (r"api[-_ ]?key|(?:access|refresh|auth|id)[-_ ]?token|token|"
+              r"password|passwd|pwd|(?:client[-_ ]?)?secret|credentials?|"
+              r"authorization|(?:set[-_ ]?)?cookie|"
+              r"(?:x[-_ ]?)?end[-_ ]?user[-_ ]?(?:name|phone)|"
+              r"(?:x[-_ ]?(?:amz|oss)[-_ ]?)?(?:signature|security[-_ ]?token)|"
+              r"awsaccesskeyid|sig")
+    text = re.sub(rf'''(?i)(\b(?:set[-_ ]?)?cookie["']?\s*[:=]\s*)(?:{quoted}|[^\r\n]+)''',
+                  r"\1[credential redacted]", text)
+    text = re.sub(rf'''(?i)(\b(?:{labels})["']?\s*[:=]\s*)(?:{quoted}|[^\r\n;,<>{{}}\]]+)''',
+                  r"\1[credential redacted]", text)
+    text = re.sub(rf'''(?i)(\b(?:image[-_ ]?(?:base64|data|bytes)|b64_json)["']?\s*[:=]\s*)'''
+                  rf'''(?:{quoted}|[A-Za-z0-9+/_=-]+(?:\s+[A-Za-z0-9+/_=-]+)*)''',
+                  r"\1[data redacted]", text)
+    image_header = "|".join(r"\s*".join(re.escape(char) for char in prefix)
+                            for prefix in ("iVBORw0KGgo", "/9j/", "UklGR"))
+    text = re.sub(rf"(?:{image_header})[A-Za-z0-9+/_-]*(?:\s+[A-Za-z0-9+/_-]+)*={{0,2}}",
+                  "[data redacted]", text)
+    text = re.sub(r"data:[^\s\"'<>]+|[A-Za-z0-9+/=_-]{80,}", "[data redacted]", text)
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", text)
+    return text.strip()[:512]
+
+
 async def request_image(session, config, prompt, endpoint, *, end_user_name, end_user_phone,
                         on_metadata=None, **payload):
     request_id = None
@@ -251,32 +322,41 @@ async def request_image(session, config, prompt, endpoint, *, end_user_name, end
                          "X-End-User-Phone": end_user_phone},
                 allow_redirects=False, proxy=None,
                 timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_connect=10, sock_read=450)) as response:
+            secrets = (config["api_key"], end_user_name, end_user_phone)
             request_id = response.headers.get("X-Request-ID", "")
             if (not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", request_id)
-                    or config["api_key"] in request_id):
+                    or config["api_key"] in request_id
+                    or any(value and (value == request_id or (len(value) >= 8 and value in request_id))
+                           for value in (end_user_name, end_user_phone, prompt.strip()))
+                    or request_id.lower().startswith("sk-")):
                 request_id = None
             if not 200 <= response.status < 300:
-                detail = "无可用结构化错误详情"
+                detail = "无可用错误详情"
                 try:
-                    payload = provider_billing.loads(await read_limited(response, 16 * 1024))
-                    if on_metadata:
-                        await on_metadata({**provider_billing.normalize(payload, config["model"], config),
+                    body = await read_limited(response, 16 * 1024)
+                    try:
+                        error_payload = provider_billing.loads(body)
+                    except (ValueError, UnicodeError):
+                        error = body.decode("utf-8")
+                        error_payload = None
+                    else:
+                        if isinstance(error_payload, dict):
+                            error = next((text for key in ("error", "detail", "message")
+                                          if (text := _error_fields(error_payload.get(key))).strip()), "")
+                        else:
+                            error = _error_fields(error_payload)
+                    detail = _sanitize_error_detail(error, secrets=secrets, prompt=prompt.strip()) or detail
+                    if on_metadata and error_payload is not None:
+                        await on_metadata({**provider_billing.normalize(error_payload, config["model"], config),
                                            "request_id": request_id})
-                    error = payload.get("error", payload.get("detail", payload.get("message"))) if isinstance(payload, dict) else None
-                    if isinstance(error, dict):
-                        error = "; ".join(f"{key}={error[key]}" for key in ("message", "type", "param", "code")
-                                          if isinstance(error.get(key), str))
-                    if isinstance(error, str) and error.strip():
-                        detail = error.replace(config["api_key"], "[redacted]").replace(prompt.strip(), "[prompt redacted]")
-                        detail = re.sub(r"(?i)\bBearer\s+[^\s\"'<>;,]+|\bsk-[A-Za-z0-9_-]+", "[credential redacted]", detail)
-                        detail = re.sub(r"data:[^\s\"'<>]+|[A-Za-z0-9+/=_-]{80,}", "[data redacted]", detail)
-                        detail = re.sub(r"[\x00-\x1f\x7f]", " ", detail)[:512]
-                except (ImageEditError, ValueError, UnicodeError, aiohttp.ClientError, asyncio.TimeoutError):
+                except (ImageEditError, ValueError, UnicodeError, OSError, RecursionError,
+                        aiohttp.ClientError, asyncio.TimeoutError):
                     pass
                 logging.getLogger(__name__).warning(
                     "Cloud image edit HTTP %s request_id=%r detail=%s", response.status, request_id, detail)
-                raise ImageEditError(f"云端图片编辑返回 HTTP {response.status}，请联系管理员核对，不要自动重试",
-                                     request_id=request_id)
+                receipt = f"，X-Request-ID: {request_id}" if request_id else ""
+                raise ImageEditError(f"云端图片编辑返回 HTTP {response.status}{receipt}：{detail}。"
+                                     "请联系管理员核对，不要自动重试", request_id=request_id)
             body = await read_limited(response, MAX_RESPONSE_BYTES)
     except ImageEditError as error:
         error.request_id = error.request_id or request_id

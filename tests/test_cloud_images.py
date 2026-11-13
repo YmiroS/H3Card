@@ -166,10 +166,17 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
     async def test_generation_http_failure_does_not_retry(self):
         self.status = 429
         self.payload = {"error": "rate limit test-secret"}
-        with self.assertRaises(cloud_images.ImageEditError) as caught:
-            await cloud_images.generate(self.session, "猫", end_user_name="user", end_user_phone="13800138000")
+        with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+            with self.assertRaises(cloud_images.ImageEditError) as caught:
+                await cloud_images.generate(self.session, "猫", end_user_name="user", end_user_phone="13800138000")
+        for output in (" ".join(logs.output), str(caught.exception)):
+            self.assertIn("rate limit", output)
+            self.assertIn("HTTP 429", output)
+            self.assertIn("image-request-1", output)
+            self.assertNotIn("test-secret", output)
         self.assertFalse(caught.exception.response()["retryable"])
-        self.assertNotIn("test-secret", str(caught.exception))
+        self.assertFalse(caught.exception.generation_unknown)
+        self.assertEqual(caught.exception.status, 502)
         self.assertEqual(len(self.generations), 1)
 
     async def test_edit_quality_override_is_forwarded(self):
@@ -382,7 +389,7 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("test-secret", json.dumps(raised.exception.response()))
         self.assertEqual(raised.exception.request_id, "image-request-1")
 
-    async def test_http_error_logs_structured_diagnostics_only_on_server(self):
+    async def test_http_error_exposes_only_selected_structured_diagnostics(self):
         self.status = 400
         self.payload = {"error": {"message": "Unsupported output size", "type": "invalid_request_error",
                                   "param": "size", "code": "invalid_size"},
@@ -390,72 +397,298 @@ class CloudImageTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
             with self.assertRaises(cloud_images.ImageEditError) as raised:
                 await cloud_images.edit(self.session, [png()], "编辑", end_user_name="image-test-user", end_user_phone="13800138000")
-        logged = " ".join(logs.output)
-        for text in ("HTTP 400", "image-request-1", "Unsupported output size", "param=size", "code=invalid_size"):
-            self.assertIn(text, logged)
-        self.assertNotIn("unrelated-private-field", logged)
-        self.assertNotIn("Unsupported output size", json.dumps(raised.exception.response()))
+        for output in (" ".join(logs.output), raised.exception.response()["error"]):
+            for text in ("HTTP 400", "image-request-1", "Unsupported output size", "type=invalid_request_error",
+                         "param=size", "code=invalid_size"):
+                self.assertIn(text, output)
+            self.assertNotIn("unrelated-private-field", output)
         self.assertEqual(raised.exception.request_id, "image-request-1")
+        self.assertEqual(raised.exception.response()["request_id"], "image-request-1")
+        self.assertEqual(raised.exception.status, 502)
         self.assertFalse(raised.exception.generation_unknown)
         self.assertFalse(raised.exception.response()["retryable"])
         self.assertEqual(len(self.received), 1)
 
-    async def test_http_error_log_redacts_credentials_prompt_and_image_data(self):
+    async def test_http_error_redacts_credentials_prompt_and_image_data_everywhere(self):
         self.status = 400
         prompt = "private prompt content"
-        self.payload = {"error": {"message": "test-secret Bearer another-secret sk-vendor-secret "
+        self.payload = {"error": {"message": "Invalid size: test-secret Bearer another-secret sk-vendor-secret "
                                   + prompt + "\nnew line data:image/png;base64,aGVsbG8= " + "A" * 100}}
         with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
-            with self.assertRaises(cloud_images.ImageEditError):
+            with self.assertRaises(cloud_images.ImageEditError) as raised:
                 await cloud_images.edit(self.session, [png()], prompt,
                                         end_user_name="image-test-user", end_user_phone="13800138000")
-        logged = " ".join(logs.output)
-        for secret in ("test-secret", "another-secret", "sk-vendor-secret", prompt, "aGVsbG8=", "A" * 100):
-            self.assertNotIn(secret, logged)
-        self.assertNotIn("\n", logs.output[0])
-        self.assertIn("[redacted]", logged)
-        self.assertIn("[data redacted]", logged)
+        for output in (" ".join(logs.output), raised.exception.response()["error"]):
+            for secret in ("test-secret", "another-secret", "sk-vendor-secret", prompt, "aGVsbG8=", "A" * 100):
+                self.assertNotIn(secret, output)
+            self.assertNotIn("\n", output)
+            self.assertIn("Invalid size", output)
+            self.assertIn("[redacted]", output)
+            self.assertIn("[prompt redacted]", output)
+            self.assertIn("[data redacted]", output)
         self.assertEqual(len(self.received), 1)
+
+    async def test_http_error_redacts_whitespace_normalized_prompt_in_response_and_logs(self):
+        self.status = 400
+        prompt = "PRIVATE first line\nPRIVATE second line"
+        for echo in (" ".join(prompt.split()), "\t".join(prompt.split()),
+                     " \n ".join(prompt.split())):
+            with self.subTest(echo=repr(echo)):
+                self.payload = {"error": {"message": "Invalid size; prompt=" + echo}}
+                with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                    with self.assertRaises(cloud_images.ImageEditError) as raised:
+                        await cloud_images.edit(self.session, [png()], prompt,
+                                                end_user_name="image-test-user", end_user_phone="13800138000")
+                for output in (logs.output[0], str(raised.exception)):
+                    self.assertIn("Invalid size", output)
+                    self.assertIn("[prompt redacted]", output)
+                    self.assertNotIn("PRIVATE", output)
+                self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), 3)
+
+    async def test_http_error_redacts_wrapped_image_base64_in_response_and_logs(self):
+        self.status = 400
+        image = png()
+        encoded = base64.b64encode(image).decode()
+        cases = [("image_base64: ", base64.encodebytes(image).decode()),
+                 ("", base64.encodebytes(image).decode()),
+                 ("", "\n".join(encoded[i:i + 16] for i in range(0, len(encoded), 16))),
+                 ("", "\n".join(encoded[i:i + 4] for i in range(0, len(encoded), 4))),
+                 ("data:image/png;base64,", "\n".join(encoded[i:i + 4] for i in range(0, len(encoded), 4))),
+                 ("image_data=", json.dumps(encoded)),
+                 ("data:image/png;base64,", base64.encodebytes(image).decode())]
+        for marker, echo in cases:
+            for raw in (False, True):
+                with self.subTest(marker=marker, raw=raw):
+                    message = "Invalid size; " + marker + echo
+                    self.raw_body = message.encode() if raw else None
+                    self.payload = {"error": {"message": message}}
+                    with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                        with self.assertRaises(cloud_images.ImageEditError) as raised:
+                            await cloud_images.edit(self.session, [image], "编辑",
+                                                    end_user_name="image-test-user", end_user_phone="13800138000")
+                    for output in (logs.output[0], str(raised.exception)):
+                        self.assertIn("Invalid size", output)
+                        self.assertIn("[data redacted]", output)
+                        self.assertNotIn("iVBORw0KGgo", output)
+                        self.assertNotIn("".join(echo.split()), "".join(output.split()))
+                    self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), len(cases) * 2)
+
+    async def test_http_error_supports_json_error_shapes_without_validation_input(self):
+        self.status = 422
+        cases = [({"error": "Invalid image format"}, "Invalid image format"),
+                 ({"detail": "Invalid size"}, "Invalid size"),
+                 ({"message": "Invalid format"}, "Invalid format"),
+                 ({"error": ["Invalid quality", "Invalid size"]}, "Invalid quality; Invalid size"),
+                 ({"message": ["Invalid output"]}, "Invalid output"),
+                 ({"detail": [{"msg": "Field required", "type": "missing", "loc": ["body", "size", 0],
+                               "input": "private-validation-input", "ctx": {"value": "private-context"},
+                               "api_key": "private-nested-key"}]}, "loc=body.size.0"),
+                 ({"error": None, "detail": [{"message": "Invalid count", "param": "n"}]}, "param=n"),
+                 ({"error": {"detail": "Nested error", "config": {"key": "private-config"}}}, "Nested error")]
+        for payload, expected in cases:
+            with self.subTest(shape=expected):
+                self.payload = {**payload, "api_key": "private-top-key", "config": "private-top-config"}
+                with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                    with self.assertRaises(cloud_images.ImageEditError) as raised:
+                        await cloud_images.edit(self.session, [png()], "编辑",
+                                                end_user_name="image-test-user", end_user_phone="13800138000")
+                for output in (" ".join(logs.output), raised.exception.response()["error"]):
+                    self.assertIn(expected, output)
+                    self.assertIn("HTTP 422", output)
+                    self.assertIn("image-request-1", output)
+                    self.assertNotIn("private-", output)
+                self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), len(cases))
+
+    async def test_http_error_preserves_plain_comparison_operators(self):
+        self.status = 400
+        reason = ("size <= 3840; pixels >= 655360; min<=pixels<=max; width <3840; height >16; "
+                  "unsupported_output_resolution invalid_dimension_parameter")
+        bodies = [reason.encode(), None,
+                  ("<html><body><p>" + reason + "</p></body></html>").encode()]
+        for body in bodies:
+            with self.subTest(body_type="json" if body is None else "text"):
+                self.raw_body = body
+                self.payload = {"error": {"message": reason, "param": "size", "code": "invalid_value"}}
+                with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                    with self.assertRaises(cloud_images.ImageEditError) as raised:
+                        await cloud_images.edit(self.session, [png()], "编辑",
+                                                end_user_name="image-test-user", end_user_phone="13800138000")
+                for output in (" ".join(logs.output), raised.exception.response()["error"]):
+                    self.assertIn(reason, output)
+                    self.assertIn("HTTP 400", output)
+                    self.assertIn("image-request-1", output)
+                    self.assertNotIn("<html>", output)
+                    self.assertNotIn("<p>", output)
+                self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), len(bodies))
 
     async def test_http_error_diagnostic_limits_and_unstructured_bodies(self):
         self.status = 400
-        for payload in ({"detail": "Invalid size"}, {"message": "Invalid format"},
-                        {"error": {"message": "x " * 1000}}):
-            with self.subTest(payload_type=next(iter(payload))):
-                self.payload = payload
-                with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
-                    with self.assertRaises(cloud_images.ImageEditError):
-                        await cloud_images.edit(self.session, [png()], "编辑", end_user_name="image-test-user", end_user_phone="13800138000")
-                self.assertLessEqual(len(logs.output[0].split("detail=", 1)[1]), 512)
-                self.assertNotIn("无可用结构化错误详情", logs.output[0])
-        for body in (b"<html>private proxy error</html>", b"{invalid json", b"x" * 17000):
+        self.payload = {"error": {"message": "Invalid size " + "x " * 1000 + "test-secret"}}
+        with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+            with self.assertRaises(cloud_images.ImageEditError) as raised:
+                await cloud_images.edit(self.session, [png()], "编辑",
+                                        end_user_name="image-test-user", end_user_phone="13800138000")
+        detail = logs.output[0].split("detail=", 1)[1]
+        self.assertEqual(len(detail), 512)
+        self.assertIn(detail, str(raised.exception))
+        self.assertLess(len(str(raised.exception)), 750)
+        cases = [(b"upstream unavailable test-secret", "upstream unavailable"),
+                 (b"<html><script>alert('private-script')</script><h1>Proxy &amp; gateway error</h1>"
+                  b"<img src=x onerror='private-event'></html>", "Proxy & gateway error"),
+                 (b"&lt;img src=x onerror='private-event'&gt;Invalid gateway", "Invalid gateway"),
+                 (b"{invalid json", "{invalid json"),
+                 (b"x" * 17000, "无可用错误详情"),
+                 (b"", "无可用错误详情"), (b"\xff\xfe", "无可用错误详情")]
+        for body, expected in cases:
             self.raw_body = body
             with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
                 with self.assertRaises(cloud_images.ImageEditError) as raised:
-                    await cloud_images.edit(self.session, [png()], "编辑", end_user_name="image-test-user", end_user_phone="13800138000")
-            self.assertIn("无可用结构化错误详情", logs.output[0])
-            self.assertNotIn("private proxy error", logs.output[0])
-            self.assertIn("HTTP 400", str(raised.exception))
+                    await cloud_images.edit(self.session, [png()], "编辑",
+                                            end_user_name="image-test-user", end_user_phone="13800138000")
+            for output in (" ".join(logs.output), str(raised.exception)):
+                self.assertIn(expected, output)
+                self.assertIn("HTTP 400", output)
+                self.assertIn("image-request-1", output)
+                for unwanted in ("test-secret", "<", ">", "private-script", "private-event"):
+                    self.assertNotIn(unwanted, output)
             self.assertEqual(raised.exception.request_id, "image-request-1")
-        self.assertEqual(len(self.received), 6)
+            self.assertFalse(raised.exception.generation_unknown)
+            self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), 1 + len(cases))
+
+    async def test_http_error_without_selected_details_has_explicit_fallback(self):
+        self.status = 400
+        cases = [{}, {"error": {"api_key": "private-nested-key"}, "config": "private-config"},
+                 {"error": [], "detail": " \n\t"}, {"error": None},
+                 {"detail": [{"input": "private-input", "ctx": "private-context"}]}]
+        for payload in cases:
+            self.payload = payload
+            with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                with self.assertRaises(cloud_images.ImageEditError) as raised:
+                    await cloud_images.edit(self.session, [png()], "编辑",
+                                            end_user_name="image-test-user", end_user_phone="13800138000")
+            for output in (" ".join(logs.output), str(raised.exception)):
+                self.assertIn("无可用错误详情", output)
+                self.assertIn("HTTP 400", output)
+                self.assertIn("image-request-1", output)
+                self.assertNotIn("private-", output)
+        self.assertEqual(len(self.received), len(cases))
+
+    async def test_http_error_redacts_labeled_credentials_signed_urls_and_pii(self):
+        self.status = 400
+        prompt = 'private prompt\nwith "quotes" and 中文'
+        cases = [
+            ('api_key="unrelated key"; token: token-value; password=plain-pass; '
+             "client_secret: 'secret with spaces'; credentials=private-creds",
+             ("unrelated key", "token-value", "plain-pass", "secret with spaces", "private-creds")),
+            ('Authorization: Bearer other-bearer; access_token="access-value"; '
+             'refresh-token=refresh-value; pwd=pwd-value; '
+             '"api_key": "json-key-value"; "password": "quoted, password; value"',
+             ("other-bearer", "access-value", "refresh-value", "pwd-value", "json-key-value", "quoted, password; value")),
+            ('Cookie: session=cookie-one; csrf=cookie-two\nSet-Cookie: auth=cookie-three; Path=/',
+             ("cookie-one", "cookie-two", "cookie-three")),
+            ('https://storage.example/image?X-Amz-Credential=signed-credential&X-Amz-Signature=signed-value '
+             'https://other.example/image?unknown_signing_field=opaque-value&amp;sig=signed-two '
+             'HTTPS://url-user:url-password@example.com/image?token=url-token '
+             'https://example.com/image?signature="quoted-signature"',
+             ("signed-credential", "signed-value", "opaque-value", "signed-two", "url-user", "url-password", "url-token",
+              "quoted-signature")),
+            ('image-test-user 13800138000; end_user_name="another private user"; '
+             'end_user_phone: 13900139000; X-End-User-Name: alternate-user',
+             ("image-test-user", "13800138000", "another private user", "13900139000", "alternate-user")),
+            (prompt + " " + json.dumps(prompt)[1:-1] + " test-secret",
+             (prompt, json.dumps(prompt)[1:-1], "test-secret")),
+        ]
+        for raw in (False, True):
+            for echo, sensitive in cases:
+                with self.subTest(raw=raw, case=cases.index((echo, sensitive))):
+                    message = "Invalid output size; " + echo
+                    self.raw_body = message.encode() if raw else None
+                    self.payload = {"error": {"message": message}}
+                    with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                        with self.assertRaises(cloud_images.ImageEditError) as raised:
+                            await cloud_images.edit(self.session, [png()], prompt,
+                                                    end_user_name="image-test-user", end_user_phone="13800138000")
+                    for output in (" ".join(logs.output), raised.exception.response()["error"]):
+                        self.assertIn("Invalid output size", output)
+                        for secret in sensitive:
+                            self.assertNotIn(secret, output)
+                    self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), len(cases) * 2)
+
+    async def test_http_error_request_id_is_visible_only_when_valid_and_safe(self):
+        self.status = 400
+        self.payload = {"error": "Invalid size"}
+        cases = [("provider-request_123", "provider-request_123"), ("A" * 128, "A" * 128),
+                 (None, None), ("", None), ("invalid id", None), ("<script>", None),
+                 ("A" * 129, None), ("test-secret", None), ("sk-private-key", None),
+                 ("req-image-test-user", None), ("req-13800138000", None)]
+        for header, expected in cases:
+            with self.subTest(header=header):
+                self.response_headers = {} if header is None else {"X-Request-ID": header}
+                with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                    with self.assertRaises(cloud_images.ImageEditError) as raised:
+                        await cloud_images.edit(self.session, [png()], "编辑",
+                                                end_user_name="image-test-user", end_user_phone="13800138000")
+                self.assertEqual(raised.exception.response()["request_id"], expected)
+                for output in (" ".join(logs.output), str(raised.exception)):
+                    self.assertIn("HTTP 400", output)
+                    self.assertIn("Invalid size", output)
+                    if expected:
+                        self.assertIn(expected, output)
+                    elif header:
+                        self.assertNotIn(header, output)
+                self.assertFalse(raised.exception.response()["retryable"])
+        self.assertEqual(len(self.received), len(cases))
+
+    async def test_short_prompt_and_name_do_not_discard_valid_request_id(self):
+        request_id = "a-user-request-123"
+        self.response_headers = {"X-Request-ID": request_id}
+        result = await cloud_images.edit(self.session, [png()], "a",
+                                         end_user_name="user", end_user_phone="13800138000")
+        self.assertEqual(result["request_id"], request_id)
+        self.status = 400
+        self.payload = {"error": "Size unsupported"}
+        with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+            with self.assertRaises(cloud_images.ImageEditError) as raised:
+                await cloud_images.edit(self.session, [png()], "a",
+                                        end_user_name="user", end_user_phone="13800138000")
+        self.assertEqual(raised.exception.response()["request_id"], request_id)
+        for output in (" ".join(logs.output), str(raised.exception)):
+            self.assertIn(request_id, output)
+            self.assertIn("HTTP 400", output)
+        self.assertEqual(len(self.received), 2)
 
     async def test_failed_diagnostic_read_preserves_known_http_error(self):
-        async def broken_stream():
-            yield b'{"error":'
-            raise aiohttp.ClientPayloadError("interrupted")
-        response = mock.Mock(status=400, headers={"X-Request-ID": "interrupted-id"})
-        response.content.iter_chunked.return_value = broken_stream()
-        context = mock.AsyncMock()
-        context.__aenter__.return_value = response
-        session = mock.Mock()
-        session.post.return_value = context
-        with self.assertLogs(cloud_images.__name__, level="WARNING"):
-            with self.assertRaises(cloud_images.ImageEditError) as raised:
-                await cloud_images.edit(session, [png()], "编辑", end_user_name="image-test-user", end_user_phone="13800138000")
-        self.assertIn("HTTP 400", str(raised.exception))
-        self.assertFalse(raised.exception.generation_unknown)
-        self.assertEqual(raised.exception.request_id, "interrupted-id")
-        self.assertEqual(session.post.call_count, 1)
+        for failure in (aiohttp.ClientPayloadError("private-read-error"), asyncio.TimeoutError(),
+                        OSError("private-read-error")):
+            async def broken_stream():
+                yield b'{"error":'
+                raise failure
+            response = mock.Mock(status=400, headers={"X-Request-ID": "interrupted-id"})
+            response.content.iter_chunked.return_value = broken_stream()
+            context = mock.AsyncMock()
+            context.__aenter__.return_value = response
+            session = mock.Mock()
+            session.post.return_value = context
+            with self.assertLogs(cloud_images.__name__, level="WARNING") as logs:
+                with self.assertRaises(cloud_images.ImageEditError) as raised:
+                    await cloud_images.edit(session, [png()], "编辑",
+                                            end_user_name="image-test-user", end_user_phone="13800138000")
+            for output in (" ".join(logs.output), str(raised.exception)):
+                self.assertIn("HTTP 400", output)
+                self.assertIn("interrupted-id", output)
+                self.assertIn("无可用错误详情", output)
+                self.assertNotIn("private-read-error", output)
+            self.assertFalse(raised.exception.generation_unknown)
+            self.assertFalse(raised.exception.response()["retryable"])
+            self.assertEqual(raised.exception.status, 502)
+            self.assertEqual(raised.exception.request_id, "interrupted-id")
+            self.assertEqual(session.post.call_count, 1)
 
     async def test_timeout_has_unknown_state_and_no_retry(self):
         session = mock.Mock()

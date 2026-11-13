@@ -908,7 +908,7 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assertEqual(self.saved_card(), before)
         self.assertEqual(list((self.root / "data").glob("artifacts/*/*")), [])
 
-    async def test_gateway_400_logs_diagnostics_but_keeps_task_error_private(self):
+    async def test_gateway_400_exposes_original_diagnostics_but_keeps_credentials_private(self):
         self.gateway_status = 400
         self.result_payload = {"error": {"message": "Unsupported size: fake-lighting-secret",
                                          "param": "size", "code": "invalid_size"}}
@@ -918,7 +918,9 @@ class CloudLightingTests(CloudLightingFixture, unittest.IsolatedAsyncioTestCase)
         self.assertIn("HTTP 400", done["error"])
         self.assertFalse(done["retryable"])
         self.assertEqual(done["request_id"], "lighting-request-1")
-        self.assertNotIn("Unsupported size", done["error"])
+        for detail in ("Unsupported size: [redacted]", "param=size", "invalid_size", "lighting-request-1"):
+            self.assertIn(detail, done["error"])
+        self.assertNotIn("fake-lighting-secret", done["error"])
         self.assertNotIn("fake-lighting-secret", " ".join(logs.output))
         self.assertIn("Unsupported size: [redacted]", " ".join(logs.output))
         self.assertIn("param=size", " ".join(logs.output))
