@@ -13,9 +13,11 @@ from aiohttp.test_utils import TestClient, TestServer
 from server.color_grade_export import (
     ColorGradeExportApi,
     _ffmpeg_filter_path,
+    _normalize_blur,
     _normalize_motion_blur,
     _normalize_sharpen,
     _normalize_vignette,
+    blur_sigma,
     build_color_grade_vf,
     build_grade_args,
     motion_blur_mix_frames,
@@ -136,6 +138,27 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("unsharp=5:5:1.25:3:3:0", graph)
         self.assertLess(graph.index("unsharp="), graph.index("overlay="))
 
+    def test_blur_gblur_after_unsharp(self):
+        self.assertAlmostEqual(blur_sigma(0.5, 4), 2.0)
+        self.assertIsNone(_normalize_blur({"enabled": False, "amount": 1}))
+        self.assertIsNone(_normalize_blur({"enabled": True, "amount": 0}))
+        soft = _normalize_blur({"enabled": True, "amount": 0.5, "radius": 4})
+        self.assertAlmostEqual(soft["sigma"], 2.0)
+        args = build_grade_args(
+            Path("D:/in.mp4"), Path("D:/tmp/grade.cube"), Path("D:/out.part.mp4"),
+            blur=soft,
+        )
+        vf = args[args.index("-vf") + 1]
+        self.assertIn("lut3d=", vf)
+        self.assertIn("gblur=sigma=2", vf)
+        sharp = _normalize_sharpen({"enabled": True, "amount": 1, "radius": 1})
+        both = build_grade_args(
+            Path("D:/in.mp4"), Path("D:/tmp/grade.cube"), Path("D:/out.part.mp4"),
+            sharpen=sharp, blur=soft,
+        )
+        vf_both = both[both.index("-vf") + 1]
+        self.assertLess(vf_both.index("unsharp="), vf_both.index("gblur="))
+
     async def test_apply_runs_ffmpeg_and_returns_video_asset(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -220,6 +243,77 @@ class ColorGradeExportTests(unittest.IsolatedAsyncioTestCase):
                     self.assertTrue(
                         (root / "data" / "uploads" / Path(payload["url"]).name).is_file()
                     )
+
+    async def test_apply_passes_blur_gblur_into_ffmpeg_vf(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            uploads = root / "data" / "uploads"
+            uploads.mkdir(parents=True)
+            source = uploads / "source.mp4"
+            source.write_bytes(b"fake-video")
+            cube = (
+                'TITLE "t"\nLUT_3D_SIZE 2\nDOMAIN_MIN 0 0 0\nDOMAIN_MAX 1 1 1\n'
+                "0 0 0\n1 0 0\n0 1 0\n1 1 0\n0 0 1\n1 0 1\n0 1 1\n1 1 1\n"
+            ).encode()
+            seen = {}
+
+            async def require_project(request, project_id, operate=False):
+                return None
+
+            async def require_resource(request, *ref, project_id=None):
+                return None
+
+            async def resource_call(app, action, *args, **kwargs):
+                if action == "reference":
+                    return ("upload", "source.mp4")
+                if action == "local_path":
+                    return source
+                if action == "register":
+                    return {"resource_id": 1}
+                if action == "publish":
+                    return None
+                raise AssertionError(action)
+
+            ffmpeg = root / "ffmpeg.exe"
+            ffmpeg.write_bytes(b"")
+
+            async def fake_probe(exe, source):
+                return 160, 90, 1.0
+
+            async def fake_run(exe, args, duration=0.0, on_progress=None):
+                seen["vf"] = args[args.index("-vf") + 1]
+                Path(args[-1]).write_bytes(b"graded")
+
+            api = ColorGradeExportApi(
+                {},
+                root=root,
+                ffmpeg_bin=lambda: ffmpeg,
+                require_project=require_project,
+                require_resource=require_resource,
+                resource_call=resource_call,
+                kind_of=lambda name: "video",
+                vid_ext={".mp4"},
+            )
+            app = web.Application()
+            app.router.add_post("/api/color-grade/video", api.apply)
+            with mock.patch("server.color_grade_export._probe_media", side_effect=fake_probe), \
+                    mock.patch("server.color_grade_export._run_ffmpeg", side_effect=fake_run):
+                async with TestClient(TestServer(app)) as client:
+                    form = FormData()
+                    form.add_field("project", "p")
+                    form.add_field("video_url", "/api/upload/source.mp4")
+                    form.add_field(
+                        "cube", cube, filename="grade.cube", content_type="text/plain",
+                    )
+                    form.add_field(
+                        "blur",
+                        '{"enabled":true,"amount":0.5,"radius":4}',
+                    )
+                    response = await client.post("/api/color-grade/video", data=form)
+                    body = await response.text()
+                    self.assertEqual(response.status, 200, body)
+                    self.assertIn("gblur=sigma=2", seen["vf"])
+                    self.assertIn("lut3d=", seen["vf"])
 
 
 if __name__ == "__main__":

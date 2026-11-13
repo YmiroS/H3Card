@@ -18,6 +18,7 @@ _MAX_CUBE_BYTES = 8 * 1024 * 1024
 _MAX_VIDEO_BYTES = 2 * 1024 * 1024 * 1024
 _MAX_VIGNETTE_BYTES = 4096
 _MAX_SHARPEN_BYTES = 4096
+_MAX_BLUR_BYTES = 4096
 _MAX_MOTION_BLUR_BYTES = 4096
 
 
@@ -178,6 +179,36 @@ def sharpen_unsharp(params: dict) -> str:
     return f"unsharp={matrix}:{matrix}:{amount:.4g}:3:3:0"
 
 
+def _normalize_blur(raw: object) -> dict | None:
+    """Return sanitized spatial-blur params, or None when the effect is off/invalid."""
+    if not isinstance(raw, dict):
+        return None
+    if raw.get("enabled") is not True:
+        return None
+    try:
+        amount = float(raw.get("amount", 0.5))
+        radius = float(raw.get("radius", 4.0))
+    except (TypeError, ValueError):
+        return None
+    amount = _clamp(amount, 0.0, 1.0)
+    radius = _clamp(radius, 0.5, 30.0)
+    sigma = blur_sigma(amount, radius)
+    if amount <= 0 or sigma <= 0:
+        return None
+    return {"amount": amount, "radius": radius, "sigma": sigma}
+
+
+def blur_sigma(amount: float, radius: float) -> float:
+    """Effective gblur sigma from mix amount × radius, matching the preview control."""
+    return max(0.01, min(50.0, amount * radius))
+
+
+def blur_gblur(params: dict) -> str:
+    """Gaussian blur after grade/sharpen; sigma already folded from amount×radius."""
+    sigma = float(params["sigma"])
+    return f"gblur=sigma={sigma:.4g}"
+
+
 def _normalize_motion_blur(raw: object) -> dict | None:
     """Return sanitized motion-blur params, or None when the effect is off/invalid."""
     if not isinstance(raw, dict):
@@ -223,10 +254,11 @@ def build_color_grade_vf(cube_path: Path, vignette: dict | None = None) -> str:
 def build_grade_args(source: Path, cube_path: Path, temporary: Path, *,
                      mask: Path | None = None, size: tuple[int, int] | None = None,
                      sharpen: dict | None = None,
+                     blur: dict | None = None,
                      motion_blur: dict | None = None) -> list[str]:
     """FFmpeg args. `-progress pipe:1` reports encode time on stdout.
 
-    Order matches preview: lut3d → unsharp → vignette overlay → tmix.
+    Order matches preview: lut3d → unsharp → gblur → vignette overlay → tmix.
     """
     args = [
         "-y", "-hide_banner", "-loglevel", "error", "-nostats",
@@ -234,23 +266,25 @@ def build_grade_args(source: Path, cube_path: Path, temporary: Path, *,
         "-i", str(source.resolve()),
     ]
     cube = _ffmpeg_filter_path(cube_path)
-    sharp = ""
+    spatial = ""
     if sharpen is not None:
-        sharp = "," + sharpen_unsharp(sharpen)
-    blur = ""
+        spatial += "," + sharpen_unsharp(sharpen)
+    if blur is not None:
+        spatial += "," + blur_gblur(blur)
+    temporal = ""
     if motion_blur is not None:
-        blur = "," + motion_blur_tmix(int(motion_blur["frames"]))
+        temporal = "," + motion_blur_tmix(int(motion_blur["frames"]))
     if mask is not None and size is not None:
         width, height = size
         args += ["-i", str(mask.resolve())]
         graph = (
             f"[1:v]scale={width}:{height}:flags=bilinear[vig];"
-            f"[0:v]lut3d='{cube}'{sharp}[graded];"
-            f"[graded][vig]overlay=format=auto{blur}[vout]"
+            f"[0:v]lut3d='{cube}'{spatial}[graded];"
+            f"[graded][vig]overlay=format=auto{temporal}[vout]"
         )
         args += ["-filter_complex", graph, "-map", "[vout]", "-map", "0:a?"]
     else:
-        args += ["-vf", f"lut3d='{cube}'{sharp}{blur}"]
+        args += ["-vf", f"lut3d='{cube}'{spatial}{temporal}"]
     args += [
         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", "-preset", "veryfast",
         "-c:a", "copy",
@@ -349,6 +383,7 @@ class ColorGradeExportApi:
         cube_name = "grade.cube"
         vignette_raw = None
         sharpen_raw = None
+        blur_raw = None
         motion_blur_raw = None
         while True:
             part = await reader.next()
@@ -374,6 +409,14 @@ class ColorGradeExportApi:
                     sharpen_raw = json.loads(text)
                 except json.JSONDecodeError as exc:
                     raise web.HTTPBadRequest(text="锐化参数不是合法 JSON") from exc
+            elif part.name == "blur":
+                text = await part.text()
+                if len(text.encode("utf-8")) > _MAX_BLUR_BYTES:
+                    raise web.HTTPRequestEntityTooLarge(text="模糊参数过大")
+                try:
+                    blur_raw = json.loads(text)
+                except json.JSONDecodeError as exc:
+                    raise web.HTTPBadRequest(text="模糊参数不是合法 JSON") from exc
             elif part.name == "motion_blur":
                 text = await part.text()
                 if len(text.encode("utf-8")) > _MAX_MOTION_BLUR_BYTES:
@@ -403,6 +446,7 @@ class ColorGradeExportApi:
             raise web.HTTPBadRequest(text="不是有效的 3D LUT（.cube）")
         vignette = _normalize_vignette(vignette_raw)
         sharpen = _normalize_sharpen(sharpen_raw)
+        blur = _normalize_blur(blur_raw)
         motion_blur = _normalize_motion_blur(motion_blur_raw)
         await self.require_project(request, project_id, operate=True)
         ref = await self.resource_call(self.app, "reference", video_url)
@@ -462,6 +506,7 @@ class ColorGradeExportApi:
                         source, cube_path, temporary,
                         mask=mask, size=(width, height) if mask else None,
                         sharpen=sharpen,
+                        blur=blur,
                         motion_blur=motion_blur,
                     ),
                     duration=duration,
