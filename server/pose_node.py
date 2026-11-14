@@ -8,6 +8,7 @@ COCO-WholeBody 133 → MediaPipe 33、肩中点到髋中点当 0.5m 定尺度、
 服务机上（D5：服务端后面迁云端）。缺执行端或缺权重都在提交期说清原因，不静默排队、
 也不会自动升级成计费请求。
 """
+import asyncio
 import json
 
 from aiohttp import web
@@ -42,15 +43,19 @@ class PoseNode:
             raise web.HTTPBadRequest(text="姿势引擎只支持 rtmw（2D）或 rtmw3d（带相对深度）")
         return project_id, image, engine
 
-    def _block(self, capability):
-        """派发前置：服务机纯计算依赖 + 集群里有没有能跑这张图的执行端。"""
+    async def _block(self, capability):
+        """派发前置：服务机纯计算依赖 + 集群里有没有能跑这张图的执行端。
+
+        名册查询走 `to_thread`：`perception_block` 要读 SQLite，识别那条也是这么包的，
+        别让预检把事件循环卡住（一次预检就是几个 worker 的 capability JSON）。
+        """
         if not local_relight.in_process_ready():
             raise web.HTTPNotImplemented(
                 text="姿势估计还没接入：服务端缺少纯计算依赖（OpenCV/NumPy）")
         graph = self.lighting.capability_graph(capability)
         if self.app.get("distributed") is None:
             return  # 单机自环：连不上 ComfyUI 由提交期那条错误说清楚
-        reason = perception_block(self.app, graph, capability=capability)
+        reason = await asyncio.to_thread(perception_block, self.app, graph, capability=capability)
         if reason:
             raise web.HTTPNotImplemented(text=f"姿势估计没有可用的执行端：{reason}")
 
@@ -58,7 +63,7 @@ class PoseNode:
         """一张图 → 所有人的 33 点关键点（landmarks / worldLandmarks / diagnostics）。"""
         project_id, image, engine = self._plan(body)
         spec = ENGINES[engine]
-        self._block(spec["capability"])
+        await self._block(spec["capability"])
         data, _ref, _info = await self.lighting.source(request, project_id, image)
         np = local_relight._imports()[1]
         # 先按 EXIF 转正再重编码：节点回传的坐标是归一化的，但骨架预览和后续拟合
