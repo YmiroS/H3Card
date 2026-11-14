@@ -1,0 +1,52 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "example.png"
+  },
+  "_meta": {
+   "title": "原图"
+  }
+ },
+ "2": {
+  "class_type": "ChoukaU2netMask",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "mode": "point",
+   "model_name": "u2net_human_seg.onnx",
+   "prompt_json": ""
+  },
+  "_meta": {
+   "title": "点框选补块"
+  }
+ },
+ "3": {
+  "class_type": "ChoukaSaveMask",
+  "inputs": {
+   "mask": [
+    "2",
+    0
+   ],
+   "filename_prefix": "chouka/ckmask"
+  },
+  "_meta": {
+   "title": "软蒙版落盘"
+  }
+ },
+ "4": {
+  "class_type": "ChoukaSaveJson",
+  "inputs": {
+   "text": [
+    "2",
+    2
+   ],
+   "filename_prefix": "chouka/ckmaskbox"
+  },
+  "_meta": {
+   "title": "补块包围盒"
+  }
+ }
+}

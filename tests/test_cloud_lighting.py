@@ -219,10 +219,11 @@ class CloudLightingFixture:
         shutil.copyfile(ROOT / "manifests" / "qwen_lighting_multi.json",
                         manifests / "qwen_lighting_multi.json")
         # 识别用的内部能力：预检要按能力清单找到 API 图，测试环境也得有这一份。
-        shutil.copyfile(ROOT / "manifests" / "seg_persons.json", manifests / "seg_persons.json")
         graphs = self.root / "graphs"
         graphs.mkdir()
-        shutil.copyfile(ROOT / "graphs" / "seg_persons.api.json", graphs / "seg_persons.api.json")
+        for name in ("seg_persons", "seg_manual"):
+            shutil.copyfile(ROOT / "manifests" / f"{name}.json", manifests / f"{name}.json")
+            shutil.copyfile(ROOT / "graphs" / f"{name}.api.json", graphs / f"{name}.api.json")
         (self.root / "pricing.json").write_text("{}", encoding="utf-8")
         self.enterContext(mock.patch.dict(os.environ, {
             "CHOUKA_LOCAL_TEST": "0", "CHOUKA_ADMIN_SANDBOX": "0",
@@ -1267,6 +1268,7 @@ class SubjectsPerceptionPreflightTests(CloudLightingFixture, unittest.IsolatedAs
             capabilities["input_choices"] = {
                 "ChoukaPersonSeg": {"model_name": ["person_yolov8m-seg.pt"]},
                 "ChoukaFaceSeg": {"model_name": ["face_yolov8m.pt"]},
+                "ChoukaU2netMask": {"model_name": ["u2net.onnx", "u2net_human_seg.onnx"]},
             }
         return capabilities
 
@@ -1283,6 +1285,33 @@ class SubjectsPerceptionPreflightTests(CloudLightingFixture, unittest.IsolatedAs
 
     SEG_CLASSES = {"LoadImage", "ChoukaPersonSeg", "ChoukaFaceSeg", "ChoukaSamPrompt",
                    "ChoukaSegMerge", "ChoukaSaveIdentityLayer", "ChoukaSaveJson"}
+    MANUAL_CLASSES = {"ChoukaU2netMask", "ChoukaSaveMask"}
+
+    async def test_manual_point_is_checked_against_the_manual_graph(self):
+        """点框选派 seg_manual：整图那套节点齐不代表补块这套齐，缺 ChoukaU2netMask 要当场拦。"""
+        self.register(self.capabilities(classes=self.SEG_CLASSES))
+        response = await self.subjects(mode="local", point=[0.5, 0.5])
+        text = await response.text()
+        self.assertEqual(response.status, 501, text)
+        self.assertIn("缺少此能力所需节点", text)
+
+    async def test_manual_point_passes_with_the_cutout_node_and_weight(self):
+        self.register(self.capabilities(classes=self.SEG_CLASSES | self.MANUAL_CLASSES))
+        with mock.patch.object(self.application["cloud_lighting"], "_subjects_work",
+                               return_value=([], "node")) as work:
+            response = await self.subjects(mode="local", point=[0.5, 0.5])
+        self.assertEqual(response.status, 200, await response.text())
+        work.assert_called_once()
+
+    async def test_manual_point_without_the_weight_inventory_is_refused(self):
+        """节点类在、权重清单没有 u2net：派发上去运行期才炸，预检这关就该拦（同 C1 口径）。"""
+        capabilities = self.capabilities(classes=self.SEG_CLASSES | self.MANUAL_CLASSES)
+        capabilities["input_choices"].pop("ChoukaU2netMask")
+        self.register(capabilities)
+        response = await self.subjects(mode="local", point=[0.5, 0.5])
+        text = await response.text()
+        self.assertEqual(response.status, 501, text)
+        self.assertIn("模型", text)
 
     async def test_node_without_segmentation_classes_is_refused_at_submit(self):
         self.register(self.capabilities(classes={"LoadImage", "KSampler"}))
@@ -1394,6 +1423,20 @@ class SubjectsNodeSegmentationTests(CloudLightingFixture, unittest.IsolatedAsync
     def set_entries(self, payload):
         self.blobs["segentries_00001_json.json"] = json.dumps(payload, ensure_ascii=False).encode()
 
+    def set_manual_mask(self, size=(4, 3), value=0.6, meta=None):
+        """补块那条图的两件产物：16 位软蒙版 PNG + 包围盒 JSON（文件名按 graphs/seg_manual 写死的前缀）。"""
+        np = local_relight._imports()[1]
+        output = BytesIO()
+        Image.fromarray(np.full((size[1], size[0]), int(value * 65535), np.uint16)).save(
+            output, format="PNG")
+        self.files = [{"kind": "file", "filename": "ckmask_00001_.png",
+                       "subfolder": "chouka", "type": "output"},
+                      {"kind": "file", "filename": "ckmaskbox_00001_json.json",
+                       "subfolder": "chouka", "type": "output"}]
+        self.blobs["ckmask_00001_.png"] = output.getvalue()
+        self.blobs["ckmaskbox_00001_json.json"] = json.dumps(
+            meta or {"box": [0.25, 0.0, 0.75, 1.0], "coverage": 0.5}, ensure_ascii=False).encode()
+
     async def stub_upload(self, session, field_name, filename, data):
         self.backend_calls["upload"].append(filename)
         return f"chouka/{filename}"
@@ -1458,15 +1501,58 @@ class SubjectsNodeSegmentationTests(CloudLightingFixture, unittest.IsolatedAsync
         work.assert_called_once()
         self.assertEqual(self.backend_calls["submit"], [])
 
-    async def test_point_and_box_stay_in_process(self):
-        """点选 / 框选这一轮还没进节点（M2-10）：开关开着也不能悄悄改路。"""
-        self.two_person_layer()
-        with mock.patch.object(self.application["cloud_lighting"], "_subjects_work",
-                               return_value=([], "yolo")) as work:
-            response = await self.subjects(mode="local", point=[0.5, 0.5])
+    async def test_point_dispatches_the_manual_graph(self):
+        """点选也交节点跑（M2-10）：派的是 seg_manual、用人像权重、一次只带一个提示。"""
+        self.set_manual_mask()
+        response = await self.subjects(mode="local", point=[0.5, 0.5])
         self.assertEqual(response.status, 200, await response.text())
-        work.assert_called_once()
-        self.assertEqual(self.backend_calls["submit"], [])
+        payload = await response.json()
+        self.assertEqual(payload["engine"], "node")
+        candidate = payload["candidates"][0]
+        self.assertEqual(candidate["id"], "c0")
+        self.assertEqual(candidate["mode"], "point")
+        self.assertEqual(candidate["kind"], "person")
+        self.assertEqual(candidate["label"], "点选人物")
+        self.assertEqual(candidate["box"], [0.25, 0.0, 0.75, 1.0])
+        self.assertEqual(candidate["coverage"], 0.5)
+        cap, params, _uploaded = self.backend_calls["patch"][0]
+        self.assertEqual(cap, "seg_manual")
+        self.assertEqual(params["mode"], "point")
+        self.assertEqual(params["model_name"], "u2net_human_seg.onnx")
+        self.assertEqual(json.loads(params["prompt_json"]), {"point": [0.5, 0.5]})
+        self.assertEqual(self.backend_calls["submit"][0][1], "seg_manual")
+
+    async def test_box_uses_the_general_cutout_weight(self):
+        """框选派的是同一张图，但换通用抠图权重、候选类型跟进程内那条一致（local ⇒ 物体）。"""
+        self.set_manual_mask()
+        response = await self.subjects(mode="local", box=[0.2, 0.2, 0.8, 0.8])
+        self.assertEqual(response.status, 200, await response.text())
+        candidate = (await response.json())["candidates"][0]
+        self.assertEqual(candidate["id"], "m0")
+        self.assertEqual(candidate["kind"], "object")
+        self.assertEqual(candidate["label"], "框选物体")
+        cap, params, _uploaded = self.backend_calls["patch"][0]
+        self.assertEqual((cap, params["mode"], params["model_name"]),
+                         ("seg_manual", "box", "u2net.onnx"))
+        self.assertEqual(json.loads(params["prompt_json"]), {"box": [0.2, 0.2, 0.8, 0.8]})
+
+    async def test_manual_mask_with_wrong_size_is_refused(self):
+        """补块蒙版差一像素都不收：拉伸之后打光会整体挪位，看起来像照错了人。"""
+        self.set_manual_mask(size=(6, 5))
+        response = await self.subjects(mode="local", point=[0.5, 0.5])
+        text = await response.text()
+        self.assertEqual(response.status, 502, text)
+        self.assertIn("不做拉伸", text)
+
+    async def test_missing_manual_artifact_names_the_prefix(self):
+        self.set_manual_mask()
+        self.files = [item for item in self.files
+                      if not item["filename"].startswith("ckmaskbox_")]
+        response = await self.subjects(mode="local", point=[0.5, 0.5])
+        text = await response.text()
+        self.assertEqual(response.status, 502, text)
+        self.assertIn("ckmaskbox_", text)
+        self.assertIn("graphs/seg_manual.api.json", text)
 
     async def test_replay_people_keeps_the_node_numbering(self):
         """出图回放用同一张工作流、同一套编号：p1/p2 由节点的号决定，服务端不许自己重排。"""
@@ -1973,6 +2059,57 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         self.assertEqual(seen["point"], [0.2, 0.3])
         self.assertNotIn("box_called", seen)
         self.assertEqual(seen.get("grounding_coverage"), 1.0)
+
+    async def test_manual_point_subject_replays_through_the_node(self):
+        """翻档以后补块回放也在节点上跑（M2-16 ②）：服务机这段一个 rembg 都不加载。
+
+        和整图那条同一分界：识别接了、回放没接，出图时照样要在服务机进程里再抠一遍。
+        另外仍要按当初的选取方式回放——点选退化成包围盒会把精细蒙版压成一大块。
+        """
+        np = cloud_lighting.local_relight._imports()[1]
+        seen = {}
+
+        async def fake_manual(data, mode, prompt):
+            seen["mode"] = mode
+            seen["prompt"] = list(prompt)
+            width, height = Image.open(BytesIO(data)).size
+            seen["size"] = (width, height)
+            return {"box": [0.1, 0.1, 0.4, 0.6], "coverage": 0.12,
+                    "mask": np.ones((height, width), np.float32)}
+
+        async def fake_people(base_img):
+            return []
+
+        def never_called(*args, **kwargs):
+            raise AssertionError("翻档以后出图不该在服务机进程内跑 rembg / YOLO")
+
+        params = self.local_params(local_subjects=[
+            {"id": "c1", "kind": "person", "label": "点选人物 1",
+             "box": [0.1, 0.1, 0.4, 0.6], "source": "manual", "mode": "point",
+             "point": [0.2, 0.3]}])
+        with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1", "CHOUKA_SEG_VIA_NODE": "1"}), \
+                mock.patch("server.cloud_lighting.local_relight.segment_point",
+                           side_effect=never_called), \
+                mock.patch("server.cloud_lighting.local_relight.segment_box",
+                           side_effect=never_called), \
+                mock.patch("server.cloud_lighting.local_relight.segment_auto",
+                           side_effect=never_called), \
+                mock.patch.object(self.application["cloud_lighting"], "_node_manual_mask",
+                                  new=fake_manual), \
+                mock.patch.object(self.application["cloud_lighting"], "_replay_people_node",
+                                  new=fake_people):
+            response = await self.generate(params=params)
+            self.assertEqual(response.status, 200, await response.text())
+            submitted = await response.json()
+            for _ in range(400):
+                if app.JOBS.get(submitted["id"], {}).get("status") in ("done", "error"):
+                    break
+                await asyncio.sleep(0.05)
+        job = app.JOBS[submitted["id"]]
+        self.assertEqual(job["status"], "done", job.get("error"))
+        self.assertEqual((seen["mode"], seen["prompt"]), ("point", [0.2, 0.3]))
+        # 送进节点的是出图那一张（已按出图尺寸摆好），不是识别时的原图
+        self.assertEqual(seen["size"], (job["outputs"][0]["width"], job["outputs"][0]["height"]))
 
     async def test_manual_object_subject_stays_out_of_grounding(self):
         """标成物体的手动对象不参与接地，避免给一块石头打接触阴影。"""

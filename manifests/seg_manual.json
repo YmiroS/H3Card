@@ -1,0 +1,82 @@
+{
+ "id": "seg_manual",
+ "name": "点框选补块（出图回放用）",
+ "editor_only": true,
+ "group": "图片",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "image",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slots": "img1+aud0+vid0",
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/seg_manual.api.json",
+ "output": {
+  "node": "3"
+ },
+ "note": "局部打光面板「手工补块」在出图前的回放执行体：一张原图 + 一个提示（点或框）进去，出一张 16 位无损软蒙版 PNG 和它的包围盒。\n不挂在画布卡片菜单里，只由出图任务 _run_local 派发；一次只提交一个提示，多个人就派多次，避免某块为空时后面的身份号整体前移。\n口径与服务端 segment_point / segment_box 完全一致：点选用 u2net_human_seg、框选用 u2net，GrabCut 阈值与迭代次数照抄，最后 1.2 像素羽化。",
+ "rewrite": null,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "原图",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "mode",
+   "label": "补块方式",
+   "type": "text",
+   "advanced": true,
+   "default": "point",
+   "target": {
+    "node": "2",
+    "input": "mode",
+    "vtype": "STRING"
+   }
+  },
+  {
+   "key": "model_name",
+   "label": "抠图权重",
+   "type": "text",
+   "advanced": true,
+   "default": "u2net_human_seg.onnx",
+   "target": {
+    "node": "2",
+    "input": "model_name",
+    "vtype": "STRING"
+   }
+  },
+  {
+   "key": "prompt_json",
+   "label": "提示坐标",
+   "type": "text",
+   "advanced": true,
+   "default": "",
+   "target": {
+    "node": "2",
+    "input": "prompt_json",
+    "vtype": "STRING"
+   }
+  }
+ ]
+}

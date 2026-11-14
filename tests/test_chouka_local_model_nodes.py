@@ -3,6 +3,7 @@
 不启动 ComfyUI、不加载权重、不调任何付费接口。folder_paths 用临时目录假件顶掉，
 torch/numpy/cv2 缺失时相关用例整体跳过（那是环境问题，不算回归）。
 """
+import io
 import json
 import os
 from pathlib import Path
@@ -68,6 +69,38 @@ from chouka_local_models import chouka_rules as rules  # noqa: E402
 from server import local_relight  # noqa: E402
 
 GRAPH = json.loads((ROOT / "graphs" / "seg_persons.api.json").read_text(encoding="utf-8"))
+MANUAL_GRAPH = json.loads((ROOT / "graphs" / "seg_manual.api.json").read_text(encoding="utf-8"))
+# 两条图都要过签名对账：节点改了输入名、图没跟着改，是提交期才炸的错。
+GRAPHS = {"seg_persons": GRAPH, "seg_manual": MANUAL_GRAPH}
+
+
+def blob_alpha(rgb):
+    """中间一块前景、四周一圈背景：GrabCut 的前景/背景样本都有，兜底分支不会误触发。"""
+    height, width = rgb.shape[:2]
+    ys, xs = np.mgrid[0:height, 0:width]
+    dist = np.sqrt((xs - width * 0.5) ** 2 + (ys - height * 0.5) ** 2)
+    blob = 1.15 - dist / max(1.0, min(width, height) * 0.34)
+    shade = np.asarray(rgb, np.float32).mean(axis=2) / 255.0
+    return np.clip(blob + (shade - 0.5) * 0.2, 0.0, 1.0)
+
+
+def solid_alpha(rgb):
+    return np.ones(rgb.shape[:2], np.float32)
+
+
+def fake_rembg(alpha_fn=blob_alpha):
+    """假 rembg：不做真推理，只按像素给一个两边共用的确定 alpha。"""
+    module = types.ModuleType("rembg")
+    module.new_session = lambda *args, **kwargs: object()
+
+    def remove(image, *args, **kwargs):
+        rgb = np.asarray(image.convert("RGB"))
+        bands = [Image.fromarray(rgb[..., i]) for i in range(3)]
+        bands.append(Image.fromarray((alpha_fn(rgb) * 255.0).astype("uint8")))
+        return Image.merge("RGBA", bands)
+
+    module.remove = remove
+    return module
 
 
 def as_tensor(mask):
@@ -75,10 +108,11 @@ def as_tensor(mask):
 
 
 class PackageTests(unittest.TestCase):
-    def test_eight_capabilities_registered(self):
+    def test_ten_capabilities_registered(self):
         self.assertEqual(set(package.NODE_CLASS_MAPPINGS), {
             "ChoukaPersonSeg", "ChoukaFaceSeg", "ChoukaSamPrompt", "ChoukaSegMerge",
-            "ChoukaSaveIdentityLayer", "ChoukaRtmwPose", "ChoukaRtmw3dPose", "ChoukaSaveJson"})
+            "ChoukaSaveIdentityLayer", "ChoukaU2netMask", "ChoukaSaveMask",
+            "ChoukaRtmwPose", "ChoukaRtmw3dPose", "ChoukaSaveJson"})
         self.assertEqual(set(package.NODE_DISPLAY_NAME_MAPPINGS),
                          set(package.NODE_CLASS_MAPPINGS))
 
@@ -98,26 +132,28 @@ class GraphSignatureTests(unittest.TestCase):
         return len(cls.RETURN_TYPES)
 
     def test_nodes_and_inputs_match_signatures(self):
-        for node_id, node in GRAPH.items():
-            cls = package.NODE_CLASS_MAPPINGS.get(node["class_type"])
-            if cls is None:
-                # 标准节点（LoadImage 等）由 ComfyUI 本体提供，签名不在这个包里，这里不校验。
-                continue
-            spec = cls.INPUT_TYPES()
-            allowed = set(spec.get("required") or {}) | set(spec.get("optional") or {})
-            for input_name in node.get("inputs") or {}:
-                with self.subTest(node=node_id, inp=input_name):
-                    self.assertIn(input_name, allowed)
+        for graph_name, graph in GRAPHS.items():
+            for node_id, node in graph.items():
+                cls = package.NODE_CLASS_MAPPINGS.get(node["class_type"])
+                if cls is None:
+                    # 标准节点（LoadImage 等）由 ComfyUI 本体提供，签名不在这个包里，这里不校验。
+                    continue
+                spec = cls.INPUT_TYPES()
+                allowed = set(spec.get("required") or {}) | set(spec.get("optional") or {})
+                for input_name in node.get("inputs") or {}:
+                    with self.subTest(graph=graph_name, node=node_id, inp=input_name):
+                        self.assertIn(input_name, allowed)
 
     def test_links_point_at_existing_nodes(self):
-        for node_id, node in GRAPH.items():
-            for input_name, value in (node.get("inputs") or {}).items():
-                if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
-                    with self.subTest(node=node_id, inp=input_name):
-                        self.assertIn(value[0], GRAPH)
-                        cls = package.NODE_CLASS_MAPPINGS.get(GRAPH[value[0]]["class_type"])
-                        if cls is not None:
-                            self.assertLess(value[1], self.outputs_of(cls))
+        for graph_name, graph in GRAPHS.items():
+            for node_id, node in graph.items():
+                for input_name, value in (node.get("inputs") or {}).items():
+                    if isinstance(value, list) and len(value) == 2 and isinstance(value[0], str):
+                        with self.subTest(graph=graph_name, node=node_id, inp=input_name):
+                            self.assertIn(value[0], graph)
+                            cls = package.NODE_CLASS_MAPPINGS.get(graph[value[0]]["class_type"])
+                            if cls is not None:
+                                self.assertLess(value[1], self.outputs_of(cls))
 
     def test_model_names_are_the_ones_preset_in_m0(self):
         """图里写的权重名必须就是预置清单里那几份，名字对不上运行期才炸。"""
@@ -134,6 +170,24 @@ class GraphSignatureTests(unittest.TestCase):
         self.assertEqual(GRAPH["2"]["inputs"]["conf"], local_relight.SEG_CONF)
         self.assertEqual(GRAPH["2"]["inputs"]["min_area_ratio"],
                          local_relight.MIN_PERSON_AREA_RATIO)
+
+    def test_manual_graph_wires_mask_and_box_artifacts(self):
+        """补块图：默认用人像权重，一头出软蒙版、一头出包围盒，产物名要和服务端取物前缀对得上。"""
+        from chouka_local_models import chouka_models as models
+
+        self.assertEqual(MANUAL_GRAPH["2"]["inputs"]["mode"], "point")
+        self.assertEqual(MANUAL_GRAPH["2"]["inputs"]["model_name"],
+                         models.U2NET_HUMAN_MODEL_DEFAULT)
+        self.assertEqual(MANUAL_GRAPH["3"]["inputs"]["filename_prefix"], "chouka/ckmask")
+        self.assertEqual(MANUAL_GRAPH["4"]["inputs"]["filename_prefix"], "chouka/ckmaskbox")
+
+    def test_server_picks_the_same_two_weights(self):
+        """服务端点框选各用哪档权重，必须就是节点下拉里有的那两个文件名。"""
+        from server import cloud_lighting
+        from chouka_local_models import chouka_models as models
+
+        self.assertEqual(cloud_lighting.MANUAL_MODELS["point"], models.U2NET_HUMAN_MODEL_DEFAULT)
+        self.assertEqual(cloud_lighting.MANUAL_MODELS["box"], models.U2NET_MODEL_DEFAULT)
 
 
 class RulesParityTests(unittest.TestCase):
@@ -187,6 +241,176 @@ class RulesParityTests(unittest.TestCase):
         mask = rules.box_to_mask(box, (100, 100))
         self.assertEqual(rules.mask_to_box(mask), box)
         self.assertIsNone(rules.mask_to_box(np.zeros((8, 8), np.uint8)))
+
+
+class ManualCutoutParityTests(unittest.TestCase):
+    """手工补块：节点侧规则与服务端 segment_point / segment_box 逐像素对齐。
+
+    rembg 换成一个只看像素的确定函数（两边共用同一个），剩下的差异只可能来自
+    GrabCut 播种、连通域筛选、沿列延伸、1.2 羽化这几段口径本身——复制过去最容易走样的正是这几段。
+    """
+
+    def alpha_of(self, rgb, alpha_fn=blob_alpha):
+        """节点里那一套：PIL 进、float32 alpha 出，与 nodes_cutout 的 alpha_of 同形。"""
+        pil = Image.fromarray(rgb)
+        cut = fake_rembg(alpha_fn).remove(pil).split()[-1].resize(pil.size, Image.BILINEAR)
+        return np.asarray(cut).astype("float32") / 255.0
+
+    def picture(self, width=160, height=120, seed=3):
+        rng = np.random.default_rng(seed)
+        return (rng.random((height, width, 3)) * 255).astype("uint8")
+
+    def server_side(self, func, rgb, prompt):
+        with mock.patch.dict(sys.modules, {"rembg": fake_rembg()}):
+            return func(Image.fromarray(rgb), prompt)
+
+    def test_point_rules_match_server_constants(self):
+        self.assertEqual(rules.POINT_WINDOW, local_relight.POINT_WINDOW)
+        self.assertEqual(rules.FEATHER_SIGMA, 1.2)
+
+    def test_point_matches_inprocess_chain_pixel_for_pixel(self):
+        rgb = self.picture()
+        point = [0.42, 0.38]
+        server = self.server_side(local_relight.segment_point, rgb, point)
+        node = rules.point_mask(rgb, self.alpha_of, point)
+        self.assertEqual(node["box"], server["box"])
+        self.assertEqual(node["coverage"], server["coverage"])
+        self.assertTrue((node["mask"] == server["mask"]).all())
+        # 沿列延伸要真的生效：不延伸时下边界停在裁窗底 79/120=0.658，延伸到全身要越过这个数
+        self.assertGreater(node["box"][3], 0.66)
+
+    def test_box_matches_inprocess_chain_pixel_for_pixel(self):
+        rgb = self.picture()
+        box = [0.2, 0.15, 0.75, 0.9]
+        server = self.server_side(local_relight.segment_box, rgb, box)
+        node = rules.box_mask(rgb, self.alpha_of, box)
+        self.assertEqual(node["box"], server["box"])
+        self.assertEqual(node["coverage"], server["coverage"])
+        self.assertTrue((node["mask"] == server["mask"]).all())
+
+    def test_all_foreground_box_takes_the_same_fallback(self):
+        """框内全是前景时 GrabCut 没有背景样本，两边都走 alpha>0.5 兜底而不是各自崩。"""
+        rgb = np.full((60, 80, 3), 255, np.uint8)
+        box = [0.1, 0.1, 0.9, 0.9]
+        with mock.patch.dict(sys.modules, {"rembg": fake_rembg(solid_alpha)}):
+            server = local_relight.segment_box(Image.fromarray(rgb), box)
+        node = rules.box_mask(rgb, lambda crop: self.alpha_of(crop, solid_alpha), box)
+        self.assertEqual(node["coverage"], server["coverage"])
+        self.assertTrue((node["mask"] == server["mask"]).all())
+        self.assertGreater(node["coverage"], 0)
+
+
+class ChoukaU2netMaskNodeTests(unittest.TestCase):
+    """节点入口的硬约束：像素不暗一档、坏提示与缺权重当场说清楚、整条入口结果同进程内链。"""
+
+    def setUp(self):
+        from chouka_local_models import chouka_models as models
+
+        models._CACHE.pop("cutout:u2net_human_seg.onnx", None)
+        models._CACHE.pop("cutout:u2net_human_seg.onnx:error", None)
+
+    def tearDown(self):
+        self.setUp()
+
+    def tensor(self, rgb):
+        return torch.from_numpy(rgb.astype("float32") / 255.0)[None, ...]
+
+    def random_rgb(self, height=48, width=64, seed=5):
+        rng = np.random.default_rng(seed)
+        return (rng.random((height, width, 3)) * 255).astype("uint8")
+
+    def big_rgb(self, width=160, height=120, seed=9):
+        rng = np.random.default_rng(seed)
+        return (rng.random((height, width, 3)) * 255).astype("uint8")
+
+    def test_tensor_to_rgb_does_not_lose_one_level(self):
+        """IMAGE 张量换回 uint8 要逐位相同：截断取整会让整图暗 1 个色阶，GrabCut 颜色模型跟着变。"""
+        from chouka_local_models import nodes_cutout
+
+        rgb = self.random_rgb()
+        self.assertTrue((nodes_cutout._image_to_rgb(self.tensor(rgb)) == rgb).all())
+
+    def test_bad_prompt_json_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "不是合法 JSON"):
+            package.ChoukaU2netMask().segment(self.tensor(self.random_rgb()), "point",
+                                              "u2net_human_seg.onnx", "{不是 JSON")
+
+    def test_missing_weights_say_why(self):
+        """假 folder_paths 把权重目录指到临时区 ⇒ 这里必然「不在位」，要抛错而不是出空蒙版。"""
+        with self.assertRaisesRegex(ValueError, "权重不可用"):
+            package.ChoukaU2netMask().segment(self.tensor(self.random_rgb()), "point",
+                                              "u2net_human_seg.onnx", '{"point": [0.5, 0.5]}')
+
+    def test_point_without_prompt_is_refused(self):
+        """有会话但提示不合法：也算作业失败，回一张空蒙版会让出图「看起来成功但没照着块打光」。"""
+        from chouka_local_models import chouka_models as models
+
+        models._CACHE["cutout:u2net_human_seg.onnx"] = object()
+        with mock.patch.dict(sys.modules, {"rembg": fake_rembg()}):
+            with self.assertRaisesRegex(ValueError, "缺 point"):
+                package.ChoukaU2netMask().segment(self.tensor(self.random_rgb()), "point",
+                                                  "u2net_human_seg.onnx", "{}")
+
+    def test_node_runs_the_same_rules_as_the_server_chain(self):
+        """走完整节点入口（含张量换算）出的蒙版，要和服务端进程内链同一份结果。"""
+        from chouka_local_models import chouka_models as models
+
+        rgb = self.big_rgb()
+        point = [0.42, 0.38]
+        models._CACHE["cutout:u2net_human_seg.onnx"] = object()
+        with mock.patch.dict(sys.modules, {"rembg": fake_rembg()}):
+            mask, coverage, meta, _note = package.ChoukaU2netMask().segment(
+                self.tensor(rgb), "point", "u2net_human_seg.onnx",
+                json.dumps({"point": point}))
+        with mock.patch.dict(sys.modules, {"rembg": fake_rembg()}):
+            server = local_relight.segment_point(Image.fromarray(rgb), point)
+        # 包围盒过一遍 JSON，只剩 6 位小数（归一化坐标，等效亚像素）；蒙版本身必须逐位相同
+        self.assertEqual(json.loads(meta)["box"], [round(float(v), 6) for v in server["box"]])
+        self.assertEqual(json.loads(meta)["coverage"], round(float(server["coverage"]), 8))
+        self.assertEqual(coverage, server["coverage"])
+        self.assertTrue((mask[0].numpy() == server["mask"]).all())
+
+
+class SaveMaskNodeTests(unittest.TestCase):
+    """软蒙版落盘：16 位无损，服务端解码回来逐位可用；8 位或改尺寸一律拒收。"""
+
+    def setUp(self):
+        for path in _OUTPUT.glob("*"):
+            shutil.rmtree(path) if path.is_dir() else path.unlink()
+
+    def ramp(self, width=60, height=40):
+        row = np.linspace(0.0, 1.0, width, dtype="float32")
+        return np.tile(row, (height, 1))
+
+    def test_soft_gradient_survives_the_roundtrip(self):
+        ramp = self.ramp()
+        result = package.ChoukaSaveMask().save(torch.from_numpy(ramp)[None, ...],
+                                               filename_prefix="chouka/ckmask")
+        entry = result["ui"]["images"][0]
+        self.assertEqual(entry["subfolder"], "chouka")
+        data = (_OUTPUT / entry["subfolder"] / entry["filename"]).read_bytes()
+        decoded = local_relight.decode_soft_mask(data, (ramp.shape[1], ramp.shape[0]))
+        self.assertEqual(decoded.shape, ramp.shape)
+        # 16 位量化误差上限 1/65535；换成 8 位会放大到 1/255，羽化就被削成台阶
+        self.assertLessEqual(float(np.abs(decoded - ramp).max()), 1.0 / 65535.0)
+
+    def test_empty_mask_returns_lists(self):
+        result = package.ChoukaSaveMask().save(torch.zeros((0, 1, 1), dtype=torch.float32))
+        self.assertEqual(result["ui"], {"images": []})
+        self.assertEqual(result["result"], ("",))
+
+    def test_eight_bit_mask_is_rejected(self):
+        buffer = io.BytesIO()
+        Image.fromarray(np.full((8, 8), 200, np.uint8), mode="L").save(buffer, format="PNG")
+        with self.assertRaisesRegex(local_relight.MaskSizeMismatch, "16 位"):
+            local_relight.decode_soft_mask(buffer.getvalue(), (8, 8))
+
+    def test_size_mismatch_is_rejected_not_stretched(self):
+        ramp = self.ramp()
+        buffer = io.BytesIO()
+        Image.fromarray((ramp * 65535).astype(np.uint16)).save(buffer, format="PNG")
+        with self.assertRaisesRegex(local_relight.MaskSizeMismatch, "不符"):
+            local_relight.decode_soft_mask(buffer.getvalue(), (ramp.shape[1] + 1, ramp.shape[0]))
 
 
 class SaveJsonNodeTests(unittest.TestCase):

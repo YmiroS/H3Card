@@ -200,3 +200,127 @@ def index_layer_entries(layer):
             "cx": float(xs.mean()) / width,
         })
     return entries
+
+
+# ---------------------------------------------------------------------------
+# 手工补块（点选 / 框选）：这一段的服务端原件是 local_relight.segment_point /
+# segment_box / _extend_along_column，逐行搬过来，阈值与迭代次数一个数都没改。
+# 抠图 alpha 由调用方注入（节点里是 rembg 的 u2net / u2net_human_seg），
+# 规则本身只剩 GrabCut 播种 + 连通域筛选 + 沿列延伸 + 1.2 羽化。
+# ---------------------------------------------------------------------------
+
+# 点选裁窗占整图的比例（宽 40%、高 55%）：窗口太小抠不到肩，太大把邻居带进来
+POINT_WINDOW = (0.40, 0.55)
+# alpha → GrabCut 种子：框选用通用抠图（阈值偏松），点选用人像抠图（点击处给确定前景）
+BOX_SEED = {"pr_fgd": 0.55, "bgd": 0.06, "fgd": 0.85, "iters": 5}
+POINT_SEED = {"pr_fgd": 0.60, "bgd": 0.15, "iters": 6}
+FEATHER_SIGMA = 1.2
+
+
+def blur(a, sigma=FEATHER_SIGMA):
+    """软边缘：与 local_relight._blur 同一句 GaussianBlur(a, (0,0), sigma)。"""
+    return cv2.GaussianBlur(np.asarray(a).astype("float32"), (0, 0), sigma)
+
+
+def box_mask(rgb, alpha_of, box):
+    """框选手工补块（对应 segment_box）：归一化框内抠一遍，GrabCut 精修边界后羽化贴回整图。"""
+    height, width = rgb.shape[:2]
+    x0, y0, x1, y1 = (int(round(v * s)) for v, s in zip(box, (width, height, width, height)))
+    x0, y0 = max(0, min(x0, width - 1)), max(0, min(y0, height - 1))
+    x1, y1 = max(x0 + 1, min(x1, width)), max(y0 + 1, min(y1, height))
+    # 连续内存：服务端那边是 PIL 裁出来的连续数组，切片视图直接喂 GrabCut 会带上步长，
+    # 两边就不是同一份数据了。
+    crop = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+    a = alpha_of(crop)
+    seed = BOX_SEED
+    gc = np.full(a.shape, cv2.GC_PR_BGD, np.uint8)
+    gc[a > seed["pr_fgd"]] = cv2.GC_PR_FGD
+    gc[a < seed["bgd"]] = cv2.GC_BGD
+    gc[a > seed["fgd"]] = cv2.GC_FGD
+    # 框内全是前景（或全是背景）时 GrabCut 没有样本会崩，直接用抠图阈值兜底。
+    has_fore = bool(((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD)).any())
+    has_back = bool(((gc == cv2.GC_BGD) | (gc == cv2.GC_PR_BGD)).any())
+    if has_fore and has_back:
+        bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+        cv2.grabCut(cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), gc, None, bgd, fgd, seed["iters"],
+                    cv2.GC_INIT_WITH_MASK)
+        refined = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 1.0, 0.0).astype("float32")
+    else:
+        refined = (a > 0.5).astype("float32")
+    full = np.zeros((height, width), np.float32)
+    full[y0:y1, x0:x1] = blur(refined)
+    return {"box": [x0 / width, y0 / height, x1 / width, y1 / height],
+            "mask": full, "coverage": float((full > 0.5).sum()) / (width * height)}
+
+
+def point_mask(rgb, alpha_of, point, window=POINT_WINDOW):
+    """点选手工补块（对应 segment_point）：以点击处为确定前景在裁窗内 GrabCut，再沿自己的列延到全身。"""
+    height, width = rgb.shape[:2]
+    px, py = float(point[0]), float(point[1])
+    half_w = window[0] * width / 2
+    half_h = window[1] * height / 2
+    x0 = int(max(0, min(width - 1, px * width - half_w)))
+    y0 = int(max(0, min(height - 1, py * height - half_h)))
+    x1 = int(max(x0 + 8, min(width, px * width + half_w)))
+    y1 = int(max(y0 + 8, min(height, py * height + half_h)))
+    # 连续内存：服务端那边是 PIL 裁出来的连续数组，切片视图直接喂 GrabCut 会带上步长，
+    # 两边就不是同一份数据了。
+    crop = np.ascontiguousarray(rgb[y0:y1, x0:x1])
+    a = alpha_of(crop)
+    seed = POINT_SEED
+    gc = np.full(a.shape, cv2.GC_PR_BGD, np.uint8)
+    gc[a > seed["pr_fgd"]] = cv2.GC_PR_FGD
+    gc[a < seed["bgd"]] = cv2.GC_BGD
+    cx = int(min(crop.shape[1] - 1, max(0, px * width - x0)))
+    cy = int(min(crop.shape[0] - 1, max(0, py * height - y0)))
+    cv2.circle(gc, (cx, cy), max(2, int(min(crop.shape[1], crop.shape[0]) * 0.035)), cv2.GC_FGD, -1)
+    # 裁窗四边当确定背景，GrabCut 才有背景样本可学。
+    border = max(1, int(min(crop.shape[1], crop.shape[0]) * 0.03))
+    gc[:border, :] = cv2.GC_BGD
+    gc[-border:, :] = cv2.GC_BGD
+    gc[:, :border] = cv2.GC_BGD
+    gc[:, -border:] = cv2.GC_BGD
+    bgd, fgd = np.zeros((1, 65), np.float64), np.zeros((1, 65), np.float64)
+    cv2.grabCut(cv2.cvtColor(crop, cv2.COLOR_RGB2BGR), gc, None, bgd, fgd, seed["iters"],
+                cv2.GC_INIT_WITH_MASK)
+    binary = np.where((gc == cv2.GC_FGD) | (gc == cv2.GC_PR_FGD), 1.0, 0.0).astype("uint8")
+    # 只留点击处那一块，别把窗口里别的东西也带上。
+    count, labels, _stats, _cent = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    keep = int(labels[cy, cx])
+    picked = (labels == keep).astype("float32") if keep > 0 else binary.astype("float32")
+    full = np.zeros((height, width), np.float32)
+    full[y0:y1, x0:x1] = picked
+    full = extend_along_column(rgb, alpha_of, full)
+    refined = blur(full)
+    ys, xs = np.nonzero(refined > 0.5)
+    if len(xs):
+        box = [xs.min() / width, ys.min() / height, (xs.max() + 1) / width, (ys.max() + 1) / height]
+    else:
+        box = [x0 / width, y0 / height, x1 / width, y1 / height]
+    return {"box": box, "mask": refined,
+            "coverage": float((refined > 0.5).sum()) / (width * height)}
+
+
+def extend_along_column(rgb, alpha_of, mask):
+    """把窗口内抠出的那块沿自己的列往下延伸成全身（对应 _extend_along_column）。
+
+    整图再抠一次拿 alpha，只保留这个人自己那几列、并且与窗口内蒙版连通的那些，
+    所以相邻的人不会跟着长进来。
+    """
+    height, width = mask.shape
+    inside = mask > 0.5
+    ys, xs = np.nonzero(inside)
+    if not len(xs):
+        return mask
+    a = alpha_of(rgb)
+    band = a.copy()
+    band[:, :max(0, int(xs.min()) - 6)] = 0
+    band[:, min(width, int(xs.max()) + 7):] = 0
+    band[inside] = 1.0
+    grown = (band > 0.5).astype("uint8")
+    _count, labels = cv2.connectedComponents(grown, connectivity=8)
+    seeds = {int(v) for v in labels[ys, xs]}
+    seeds.discard(0)
+    if not seeds:
+        return mask
+    return np.isin(labels, list(seeds)).astype("float32")

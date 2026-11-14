@@ -17,6 +17,10 @@ from distributed import generation_worker_reason, worker_access_allowed
 
 
 SEG_CAPABILITY = "seg_persons"
+# 手工补块（点选 / 框选）走另一条工作流：一次只提交一个提示，见 _node_manual_mask
+MANUAL_SEG_CAPABILITY = "seg_manual"
+# 与服务端进程内那条老链各用一档权重一致：点选认人、框选认任意前景
+MANUAL_MODELS = {"point": "u2net_human_seg.onnx", "box": "u2net.onnx"}
 
 
 def perception_block(app, graph, *, capability=SEG_CAPABILITY, team_ids=None):
@@ -499,9 +503,13 @@ class CloudLighting:
                     text="本机识别还没接入：服务机既没有实例分割权重，也没有 rembg 兜底；"
                          "要么预置权重，要么把执行模式切到走节点")
             return
-        graph = self._capability_graph(SEG_CAPABILITY)
+        # 预检查的那条工作流要和实际要派发的一致：点框选派 seg_manual，整流派 seg_persons
+        capability = (MANUAL_SEG_CAPABILITY if (plan[4] is not None or plan[5] is not None)
+                      else SEG_CAPABILITY)
+        graph = self._capability_graph(capability)
         team_ids = await self.call_store(self.app, "user_worker_teams", user["id"])
-        reason = await asyncio.to_thread(perception_block, self.app, graph, team_ids=team_ids)
+        reason = await asyncio.to_thread(perception_block, self.app, graph,
+                                         capability=capability, team_ids=team_ids)
         if reason:
             raise web.HTTPNotImplemented(text=reason)
 
@@ -522,18 +530,18 @@ class CloudLighting:
     SEG_POLL_SECONDS = 0.4
 
     def _node_segment_on(self, plan):
-        """整图自动识别是否交节点跑（M2）。点选 / 框选这一轮仍留服务机内实现（M2-10 待接）。
+        """识别预览是否交节点跑（M2 / M2-10）。整图走 seg_persons，点选框选走 seg_manual。
 
         默认关：`CHOUKA_SEG_VIA_NODE=1` 才翻。理由不是没实现，而是**集群侧的派发口径还没拍**
         （Spec R13 / M2-8b：作业要不要进任务面板、怎么取消、计费台账归谁）。
         翻档前请先在 §7 台账留下一次真机证据，别拿本机自环当生产绿。
         """
-        if plan[2] != "local" or plan[4] is not None or plan[5] is not None:
+        if plan[2] not in ("local", "manual"):
             return False
         return os.environ.get("CHOUKA_SEG_VIA_NODE") == "1"
 
     def _node_replay_on(self):
-        """出图前的整图分割回放是否也交节点（M2-16，与识别同一个开关）。
+        """出图前的分割回放是否也交节点（M2-16，与识别同一个开关）：整图走 seg_persons、点框选走 seg_manual。
 
         这条不接的话，翻档只省掉识别那一步：`_run_local` 打光前还要验一次「候选没变」，
         那时服务机照样得加载 YOLO，torch + ultralytics 一行都卸不掉。
@@ -573,22 +581,6 @@ class CloudLighting:
             text=f"识别在节点上等了 {int(self.SEG_TIMEOUT_SECONDS)} 秒还没出结果，"
                  "请先看执行端队列是否被大作业占住（本次没有重复提交）")
 
-    def _seg_pick(self, files):
-        """从产物清单里挑出身份层与条目 JSON。
-
-        `collect_outputs` 不带节点号，只带文件名，所以这里靠图里写死的 filename_prefix 认；
-        换前缀要连同 graphs/seg_persons.api.json 一起改。
-        """
-        layer = next((item for item in files
-                      if str(item.get("filename", "")).startswith("segidx_")), None)
-        entries = next((item for item in files
-                        if str(item.get("filename", "")).startswith("segentries_")), None)
-        if layer is None or entries is None:
-            raise web.HTTPBadGateway(
-                text="节点识别没出齐产物：缺身份索引层或逐身份条目，请检查工作流 "
-                     "graphs/seg_persons.api.json 的落盘节点")
-        return layer, entries
-
     async def _seg_view(self, backend, item):
         """按产物名把节点写出的文件取回来（PNG 层 / JSON 条目走同一个通道）。"""
         params = {"filename": item["filename"], "subfolder": item.get("subfolder") or "",
@@ -599,11 +591,11 @@ class CloudLighting:
                     text=f"节点产物读不出来：{item['filename']} 返回 {response.status}")
             return await response.read()
 
-    async def _node_identity_layer(self, data, capability, params):
-        """一张原图交给一张分割工作流 → 身份索引层 + 逐身份条目（识别与出图回放共用这一条）。
+    async def _node_run_graph(self, capability, data, params, prefixes):
+        """一张图交给一条 editor_only 工作流 → 按 filename_prefix 取回各产物字节。
 
-        尺寸校验放在这里而不是调用方：层和送进去的那张图必须逐像素同尺，
-        差 1 像素就当场报错，拉伸对齐会让回贴看起来像「打光照错了人」。
+        产物只靠图里写死的 filename_prefix 认（`collect_outputs` 不带节点号），
+        换前缀要连同 graphs/<capability>.api.json 一起改。
         """
         backend = self._comfy_node()
         cap = (self.app.get("caps") or {}).get(capability)
@@ -616,16 +608,80 @@ class CloudLighting:
         # 不自己编 prompt_id：ComfyUI 0.45 只收标准格式 UUID（带连字符、小写），
         # 而 comfy_submit 本来就把服务端生成的 id 回传，拿返回值轮询即可。
         pid = await backend["submit"](self.app, graph, capability=capability)
-        layer_item, entries_item = self._seg_pick(await self._seg_artifacts(backend, pid))
-        layer_bytes = await self._seg_view(backend, layer_item)
-        entries = json.loads((await self._seg_view(backend, entries_item)).decode("utf-8"))
+        files = await self._seg_artifacts(backend, pid)
+        picked = {}
+        for key, (prefix, suffix) in prefixes.items():
+            item = next((entry for entry in files
+                         if str(entry.get("filename", "")).startswith(prefix)
+                         and str(entry.get("filename", "")).endswith(suffix)), None)
+            if item is None:
+                raise web.HTTPBadGateway(
+                    text=f"节点没出齐产物：缺 {prefix}*{suffix}，请检查工作流 "
+                         f"graphs/{capability}.api.json 的落盘节点")
+            picked[key] = await self._seg_view(backend, item)
+        return picked
+
+    async def _node_identity_layer(self, data, capability, params):
+        """一张原图交给一张分割工作流 → 身份索引层 + 逐身份条目（识别与出图回放共用这一条）。
+
+        尺寸校验放在这里而不是调用方：层和送进去的那张图必须逐像素同尺，
+        差 1 像素就当场报错，拉伸对齐会让回贴看起来像「打光照错了人」。
+        """
+        got = await self._node_run_graph(capability, data, params,
+                                         {"layer": ("segidx_", ".png"),
+                                          "entries": ("segentries_", ".json")})
+        entries = json.loads(got["entries"].decode("utf-8"))
         size = local_relight.load_rgb(data).size
-        got = local_relight.layer_source_size(layer_bytes)
-        if got != size:
+        got_size = local_relight.layer_source_size(got["layer"])
+        if got_size != size:
             raise web.HTTPBadGateway(
-                text=f"节点回传的身份层是 {got[0]}x{got[1]}，原图是 {size[0]}x{size[1]}；"
+                text=f"节点回传的身份层是 {got_size[0]}x{got_size[1]}，原图是 {size[0]}x{size[1]}；"
                      "尺寸对不上不做拉伸，请重新识别")
-        return local_relight.decode_identity_layer(layer_bytes, size), entries
+        return local_relight.decode_identity_layer(got["layer"], size), entries
+
+    async def _node_manual_mask(self, data, mode, prompt):
+        """一个提示（点或框）交给 seg_manual 工作流 → 与 `segment_point` / `segment_box` 同形的结果。
+
+        一次只提交一个提示：补块的包围盒和 coverage 都按蒙版算，一批里空掉一块会让后面的
+        编号整体前移，打光打错人但画面看不出来。
+        送图前先按 EXIF 转正再重编码，节点回传的蒙版才能和面板那张图像素对像素。
+        """
+        np = local_relight._imports()[1]
+        picture = local_relight.load_rgb(data)
+        payload = local_relight.encode_png(np.asarray(picture))
+        got = await self._node_run_graph(
+            MANUAL_SEG_CAPABILITY, payload,
+            {"mode": mode, "model_name": MANUAL_MODELS[mode],
+             "prompt_json": json.dumps({mode: prompt}, ensure_ascii=False)},
+            {"mask": ("ckmask_", ".png"), "meta": ("ckmaskbox_", ".json")})
+        size = picture.size
+        got_size = local_relight.layer_source_size(got["mask"])
+        if got_size != size:
+            raise web.HTTPBadGateway(
+                text=f"节点回传的补块蒙版是 {got_size[0]}x{got_size[1]}，原图是 "
+                     f"{size[0]}x{size[1]}；尺寸对不上不做拉伸，请回面板重新补选")
+        meta = json.loads(got["meta"].decode("utf-8"))
+        return {"box": meta["box"], "coverage": float(meta["coverage"]),
+                "mask": local_relight.decode_soft_mask(got["mask"], size)}
+
+    async def _subjects_node_manual(self, plan, data):
+        """面板上点一下 / 框一下的补块也交给节点跑，候选结构与进程内那条完全同形。"""
+        kind_target = plan[6]
+        if plan[5] is not None:
+            seg = await self._node_manual_mask(data, "point", plan[5])
+            kind = kind_target or "person"
+            return [{"id": "c0", "kind": kind,
+                     "label": "点选人物" if kind == "person" else "点选物体",
+                     "mode": "point", "point": plan[5], "box": seg["box"],
+                     "coverage": seg["coverage"],
+                     "mask": local_relight.mask_to_data_url(seg["mask"])}]
+        seg = await self._node_manual_mask(data, "box", plan[4])
+        # 手工通道（K6）拿粗分割当编辑器底稿；类型跟用户在编辑器里的选择走，不再写死人物。
+        kind = kind_target or ("person" if plan[2] == "manual" else "object")
+        return [{"id": "m0", "kind": kind,
+                 "label": "框选人物" if kind == "person" else "框选物体",
+                 "mode": "box", "box": seg["box"], "coverage": seg["coverage"],
+                 "mask": local_relight.mask_to_data_url(seg["mask"])}]
 
     async def _subjects_node(self, plan, data, user):
         """整图自动识别交给节点：原图 → 身份索引层 + 逐身份条目 → 候选（口径同远端分区路）。
@@ -633,6 +689,8 @@ class CloudLighting:
         层与原图尺寸差 1 像素就当场报错，不做拉伸（Spec §5.2）；候选直接吃
         `_layer_candidates`，所以编号、box、coverage 与大模型分区那条路完全可比。
         """
+        if plan[4] is not None or plan[5] is not None:
+            return await self._subjects_node_manual(plan, data), "node", None
         layer, entries = await self._node_identity_layer(data, SEG_CAPABILITY,
                                                          {"min_area_ratio": plan[3]})
         candidates = await asyncio.to_thread(self._layer_candidates, layer, entries["entries"])
@@ -1066,12 +1124,19 @@ class CloudLighting:
                         person_boxes.append(subject["box"])
                 elif subject.get("source") == "manual":
                     # 按当初的选取方式回放：点选必须重跑点选分割，用包围盒框选会把精细蒙版退化成一大块。
+                    # 变量别叫 prompt：外层那个 prompt 是发给云端的重打光提示词，同名会把出图提示词换掉。
                     if subject.get("mode") == "point" and _valid_subject_point(subject.get("point")):
-                        seg = await asyncio.to_thread(local_relight.segment_point,
-                                                      base_img, subject["point"])
+                        seg_mode, seg_hint = "point", subject["point"]
                     else:
-                        seg = await asyncio.to_thread(local_relight.segment_box,
-                                                      base_img, subject["box"])
+                        seg_mode, seg_hint = "box", subject["box"]
+                    if self._node_replay_on():
+                        # 翻档以后这一步也在节点上跑，服务机不再加载 rembg / u2net（M2-16 ②）。
+                        seg = await self._node_manual_mask(
+                            local_relight.encode_png(np.asarray(base_img)), seg_mode, seg_hint)
+                    else:
+                        segment = (local_relight.segment_point if seg_mode == "point"
+                                   else local_relight.segment_box)
+                        seg = await asyncio.to_thread(segment, base_img, seg_hint)
                     masks.append(seg["mask"])
                     if subject.get("kind") == "person":
                         person_masks.append(seg["mask"])

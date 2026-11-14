@@ -671,6 +671,25 @@ def decode_mask(data, size, *, resample=None):
     return np.asarray(image).astype("float32") / 255.0
 
 
+def decode_soft_mask(data, size):
+    """节点回传的 16 位软蒙版 PNG → (高, 宽) float32（0..1）。
+
+    只认 16 位、且尺寸必须和目标逐像素一致：8 位会把 1.2 像素的羽化渐变削成台阶，
+    拉伸会把蒙版整体挪位，两种都让「节点回放的补块」和面板预览对不上。
+    """
+    np = _imports()[1]
+    image = Image.open(BytesIO(data))
+    width, height = size
+    if image.size != (int(width), int(height)):
+        raise MaskSizeMismatch(
+            f"补块蒙版尺寸 {image.size[0]}x{image.size[1]} 与目标 {width}x{height} 不符，"
+            "已拒绝拉伸；请回面板重新补选后再出图")
+    array = np.asarray(image)
+    if array.dtype != np.uint16:
+        raise MaskSizeMismatch(f"补块蒙版不是 16 位无损图（实际 {array.dtype}），拒绝使用")
+    return array.astype("float32") / 65535.0
+
+
 def encode_identity_layer(layer):
     """身份索引层 uint8 → PNG 字节（无损，缓存和落盘都用它）。"""
     np = _imports()[1]

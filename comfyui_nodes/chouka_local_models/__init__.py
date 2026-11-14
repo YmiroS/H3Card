@@ -3,6 +3,7 @@
 包内只放「需要模型文件」的部分；回贴、接地、合成这些纯 cv2 运算仍留在服务进程里，
 搬过来省不掉依赖，只会让一次识别变成两次跨机传图。
 """
+from .nodes_cutout import ChoukaSaveMask, ChoukaU2netMask
 from .nodes_pose import ChoukaRtmw3dPose, ChoukaRtmwPose
 from .nodes_save_json import ChoukaSaveJson
 from .nodes_segment import (ChoukaFaceSeg, ChoukaPersonSeg, ChoukaSamPrompt,
@@ -14,6 +15,8 @@ NODE_CLASS_MAPPINGS = {
     "ChoukaSamPrompt": ChoukaSamPrompt,
     "ChoukaSegMerge": ChoukaSegMerge,
     "ChoukaSaveIdentityLayer": ChoukaSaveIdentityLayer,
+    "ChoukaU2netMask": ChoukaU2netMask,
+    "ChoukaSaveMask": ChoukaSaveMask,
     "ChoukaRtmwPose": ChoukaRtmwPose,
     "ChoukaRtmw3dPose": ChoukaRtmw3dPose,
     "ChoukaSaveJson": ChoukaSaveJson,
@@ -25,6 +28,8 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ChoukaSamPrompt": "ChouKa SAM2 补漏/点框选",
     "ChoukaSegMerge": "ChouKa 身份合并编号",
     "ChoukaSaveIdentityLayer": "ChouKa 保存身份索引层",
+    "ChoukaU2netMask": "ChouKa 点框选补块（u2net）",
+    "ChoukaSaveMask": "ChouKa 保存软蒙版（16 位无损）",
     "ChoukaRtmwPose": "ChouKa RTMW 全身姿势",
     "ChoukaRtmw3dPose": "ChouKa RTMW3D 姿势（带相对深度）",
     "ChoukaSaveJson": "ChouKa 保存文本产物",

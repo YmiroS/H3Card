@@ -12,11 +12,17 @@ import folder_paths
 ULTRALYTICS_CATEGORY = "ultralytics"
 SAM_CATEGORY = "sam2"
 POSE_CATEGORY = "rtmlib"
+# 手工补块（点选 / 框选）用的通用抠图。整合包里 background_removal 这个类目本来就有
+# （带占位文件），不用新建目录名，节点下拉和派发预检都能直接枚举到。
+CUTOUT_CATEGORY = "background_removal"
 
 PERSON_MODEL_DEFAULT = "person_yolov8m-seg.pt"
 FACE_MODEL_DEFAULT = "face_yolov8m.pt"
 SAM_MODEL_DEFAULT = "sam2.1_hiera_small.pt"
 SAM_CONFIG_DEFAULT = "configs/sam2.1/sam2.1_hiera_s.yaml"
+# 抠图两档：点选走人像模型、框选走通用模型（与服务端 segment_point / segment_box 各用一档一致）
+U2NET_MODEL_DEFAULT = "u2net.onnx"
+U2NET_HUMAN_MODEL_DEFAULT = "u2net_human_seg.onnx"
 # 姿势档：检测框 + 全身点位；文件名是实测下载下来的那份（models/rtmlib/ 下平铺）。
 DET_MODEL_DEFAULT = "yolox_m_8xb8-300e_humanart.onnx"
 RTMW_MODEL_DEFAULT = "rtmw-dw-x-l_simcc-cocktail14_384x288.onnx"
@@ -141,6 +147,37 @@ def sam_predictor(model_name, config_name):
 
 def sam_error(model_name, config_name):
     return _CACHE.get(f"sam:{model_name}:{config_name}:error")
+
+
+def cutout_session(filename):
+    """rembg 抠图会话（u2net / u2net_human_seg）：只认 models/background_removal 里那份权重。
+
+    rembg 自己只会去 U2NET_HOME（默认 ~/.u2net）找文件，找不到就联网下载 —— 节点机是离线机，
+    表现是「点一下卡在下载进度条」。所以创建会话前把 U2NET_HOME 指到我们刚 resolve 出来的
+    那个目录，让「在位就读、不在位就说缺」，永远不给它联网的机会。
+    provider 写死 CPU：这档蒙版要和面板预览逐像素一致，换执行后端会差出边界像素。
+    """
+    key = f"cutout:{filename}"
+    if key not in _CACHE:
+        session = None
+        path = resolve(CUTOUT_CATEGORY, filename)
+        if path:
+            try:
+                os.environ["U2NET_HOME"] = os.path.dirname(path)
+                from rembg import new_session
+
+                session = new_session(os.path.splitext(filename)[0],
+                                      providers=["CPUExecutionProvider"])
+            except Exception as error:  # 缺依赖（onnxruntime / rembg）也算这条支路不可用
+                _CACHE[key + ":error"] = str(error)
+        else:
+            _CACHE[key + ":error"] = f"权重 {filename} 不在 models/{CUTOUT_CATEGORY}/ 里"
+        _CACHE[key] = session
+    return _CACHE[key]
+
+
+def cutout_error(filename):
+    return _CACHE.get(f"cutout:{filename}:error")
 
 
 def pose_model(cls, mode, det_name, pose_name):

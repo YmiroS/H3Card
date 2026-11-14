@@ -1,5 +1,7 @@
 ultralytics
 sam2
 rtmlib
+rembg
+onnxruntime
 opencv-python
 numpy
