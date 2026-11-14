@@ -98,7 +98,7 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
             self.stream_chunks = ([b'data: {"choices":[{"delta":{"content":"partial"}}]}\n\n']
                                   if partial else []) + [frame, b'data: [DONE]\n\n']
 
-    async def read_upstream_error(self, mode, *, messages=None):
+    async def read_upstream_error(self, mode, *, messages=None, expect_diagnostic_echo=True):
         messages = messages or [{'role': 'user', 'content': 'hello upstream'}]
         before = len(self.calls)
         with self.assertLogs(cloud_chat.__name__, level='WARNING') as logs:
@@ -126,7 +126,8 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(logs.records), 1)
         self.upstream_logs = '\n'.join(logs.output)
         logged_detail = logs.records[0].getMessage().split(' detail=', 1)[1]
-        self.assertIn(logged_detail, result['error'])
+        if expect_diagnostic_echo:
+            self.assertIn(logged_detail, result['error'])
         # Parse the wire response first; combined text is only for diagnostics/privacy checks.
         return result, state, text + '\n' + self.upstream_logs
 
@@ -345,6 +346,70 @@ class ChatTests(unittest.IsolatedAsyncioTestCase):
                     if mode.startswith('sse_'):
                         self.assertIn('"content":"partial"', text)
                         self.assertNotIn(self.stream_chunks[-2].decode(), text)
+
+    async def test_content_policy_errors_are_chinese_on_every_transport(self):
+        image_reason = 'Your input image may contain content that is not allowed by our content safety system.'
+        cases = [({'error': {'message': image_reason, 'type': 'invalid_request_error',
+                             'code': 'content_policy_violation'}}, True),
+                 ({'code': 'content_policy_violation', 'message': image_reason}, True),
+                 ({'error': {'message': 'Request blocked by safety policy',
+                             'code': 'content_policy_violation'}}, False),
+                 ({'error': {'message': 'Response blocked by safety policy',
+                             'type': 'content_filter'}}, False)]
+        self.response_headers = {'X-Request-ID': 'policy-request-1'}
+        for mode in ('complete', 'stream_http', 'sse_event', 'sse_json'):
+            for payload, image in cases:
+                with self.subTest(mode=mode, payload=payload):
+                    self.set_upstream_error(mode, payload, partial=True)
+                    if not mode.startswith('sse_'):
+                        self.status = 400
+                    result, _, _ = await self.read_upstream_error(mode, expect_diagnostic_echo=False)
+                    message = result['error']
+                    self.assertIn('输入图片' if image else '输入内容', message)
+                    self.assertIn('未通过上游内容安全检查', message)
+                    self.assertIn('符合平台规则', message)
+                    self.assertIn('重新提交', message)
+                    self.assertIn('不会自动重试', message)
+                    self.assertIn('请求编号：policy-request-1', message)
+                    self.assertEqual(result['request_id'], 'policy-request-1')
+                    self.assertIn('上游流式响应错误' if mode.startswith('sse_') else '上游 HTTP 400', message)
+                    for raw in ('Your input image', 'content_policy_violation', 'invalid_request_error',
+                                'content_filter', '联系管理员'):
+                        self.assertNotIn(raw, message)
+                    if image:
+                        self.assertIn(image_reason, self.upstream_logs)
+                    else:
+                        self.assertNotIn('图片', message)
+
+    def test_policy_translation_requires_an_explicit_known_error_code(self):
+        reason = 'Your input image may contain content that is not allowed by our content safety system.'
+        for payload in (None, reason, [reason], {'error': reason},
+                        {'error': {'message': reason, 'type': 'invalid_request_error'}},
+                        {'error': {'message': 'content_policy_violation ' + reason, 'code': 'invalid_image'}},
+                        {'error': {'message': reason, 'code': 400}},
+                        {'error': {'message': reason, 'code': ['content_policy_violation']}}):
+            with self.subTest(payload=payload):
+                self.assertIsNone(cloud_chat._content_policy_message(payload))
+        self.assertIn('输入内容', cloud_chat._content_policy_message(
+            {'error': {'code': 'content_policy_violation'}}))
+
+    async def test_localized_policy_error_keeps_diagnostics_private_and_request_id_safe(self):
+        prompt = 'PRIVATE_POLICY_PROMPT'
+        reason = ('Your input image may contain content that is not allowed by our content safety system.; '
+                  'fake-secret; chat-test-user; 13800138000; PRIVATE_POLICY_PROMPT; '
+                  'https://storage.example/img.png?token=private-policy-token')
+        for mode in ('complete', 'stream_http', 'sse_event', 'sse_json'):
+            with self.subTest(mode=mode):
+                self.response_headers = {'X-Request-ID': 'fake-secret'}
+                self.set_upstream_error(mode, {'error': {'code': 'content_policy_violation', 'message': reason}})
+                result, _, text = await self.read_upstream_error(
+                    mode, messages=[{'role': 'user', 'content': prompt}], expect_diagnostic_echo=False)
+                self.assertIn('输入图片未通过上游内容安全检查', result['error'])
+                self.assertIsNone(result.get('request_id'))
+                self.assertNotIn('请求编号', result['error'])
+                self.assertIn('content_policy_violation', self.upstream_logs)
+                for secret in ('fake-secret', 'chat-test-user', '13800138000', prompt, 'private-policy-token'):
+                    self.assertNotIn(secret, text)
 
     async def test_plaintext_html_and_json_preserve_diagnostic_comparisons(self):
         reason = ('tokens <= 4096; pixels >= 655360; min<=pixels<=max; width <3840; height >16; '

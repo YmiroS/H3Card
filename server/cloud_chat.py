@@ -161,6 +161,21 @@ def validate(body, *, allow_local_images=False):
     return messages
 
 
+def _content_policy_message(payload):
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        error = payload
+    code = error.get("code") or error.get("type")
+    if not isinstance(code, str) or code.strip().lower() not in ("content_policy_violation", "content_filter"):
+        return None
+    message = error.get("message", error.get("error", ""))
+    if isinstance(message, str) and re.search(r"\binput[ _]image\b", message, re.IGNORECASE):
+        return "输入图片未通过上游内容安全检查，本次请求已被拒绝。请更换符合平台规则的图片后重新提交。"
+    return "本次请求未通过上游内容安全检查，已被拒绝。请检查输入内容是否符合平台规则后重新提交。"
+
+
 def _upstream_error(payload, *, config, messages, end_user_name, end_user_phone,
                     request_id, status=None, raw=b""):
     prompts, image_urls = [], []
@@ -189,6 +204,11 @@ def _upstream_error(payload, *, config, messages, end_user_name, end_user_phone,
     detail = cloud_images.sanitize_error_detail(error, secrets=secrets, prompts=prompts) or "无可用错误详情"
     logging.getLogger(__name__).warning(
         "Cloud chat upstream error status=%s request_id=%r detail=%s", status, request_id, detail)
+    localized = _content_policy_message(payload)
+    if localized:
+        kind = f"上游 HTTP {status}" if status is not None else "上游流式响应错误"
+        receipt = f"；请求编号：{request_id}" if request_id else ""
+        return ChatError(f"{localized}不会自动重试。（{kind}{receipt}）", request_id=request_id)
     kind = f"返回 HTTP {status}" if status is not None else "流式返回错误"
     receipt = f"，X-Request-ID: {request_id}" if request_id else ""
     return ChatError(f"云端聊天{kind}{receipt}：{detail}。请联系管理员核对，不要自动重试",
