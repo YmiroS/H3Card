@@ -221,7 +221,7 @@ class CloudLightingFixture:
         # 识别用的内部能力：预检要按能力清单找到 API 图，测试环境也得有这一份。
         graphs = self.root / "graphs"
         graphs.mkdir()
-        for name in ("seg_persons", "seg_manual"):
+        for name in ("seg_persons", "seg_manual", "pose_rtmw", "pose_rtmw3d"):
             shutil.copyfile(ROOT / "manifests" / f"{name}.json", manifests / f"{name}.json")
             shutil.copyfile(ROOT / "graphs" / f"{name}.api.json", graphs / f"{name}.api.json")
         (self.root / "pricing.json").write_text("{}", encoding="utf-8")

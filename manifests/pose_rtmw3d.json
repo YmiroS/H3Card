@@ -1,0 +1,82 @@
+{
+ "id": "pose_rtmw3d",
+ "name": "全身姿势关键点 + 相对深度（RTMW3D，打光台用）",
+ "editor_only": true,
+ "group": "图片",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "image",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slots": "img1+aud0+vid0",
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/pose_rtmw3d.api.json",
+ "output": {
+  "node": "4"
+ },
+ "note": "与 pose_rtmw 同一套 33 点口径，只是 z 由 RTMW3D 自己预测（相对深度，没标定，不是世界坐标）；多人前后排序要用它。\n由 /api/pose/estimate 以 engine=rtmw3d 派发；缺权重时和 2D 档一样在派发预检就判不在位，不静默退回 2D 档当结果。",
+ "rewrite": null,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "原图",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "model_mode",
+   "label": "姿势档位",
+   "type": "text",
+   "advanced": true,
+   "default": "balanced",
+   "target": {
+    "node": "2",
+    "input": "model_mode",
+    "vtype": "STRING"
+   }
+  },
+  {
+   "key": "det_model",
+   "label": "人体检测权重",
+   "type": "text",
+   "advanced": true,
+   "default": "yolox_m_8xb8-300e_humanart.onnx",
+   "target": {
+    "node": "2",
+    "input": "det_model",
+    "vtype": "STRING"
+   }
+  },
+  {
+   "key": "pose_model",
+   "label": "姿势权重",
+   "type": "text",
+   "advanced": true,
+   "default": "rtmw3d-x_8xb64_cocktail14-384x288.onnx",
+   "target": {
+    "node": "2",
+    "input": "pose_model",
+    "vtype": "STRING"
+   }
+  }
+ ]
+}

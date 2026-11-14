@@ -1,0 +1,52 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "example.png"
+  },
+  "_meta": {
+   "title": "原图"
+  }
+ },
+ "2": {
+  "class_type": "ChoukaRtmw3dPose",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "model_mode": "balanced",
+   "det_model": "yolox_m_8xb8-300e_humanart.onnx",
+   "pose_model": "rtmw3d-x_8xb64_cocktail14-384x288.onnx"
+  },
+  "_meta": {
+   "title": "RTMW3D 姿势（带相对深度）"
+  }
+ },
+ "3": {
+  "class_type": "ChoukaSaveJson",
+  "inputs": {
+   "text": [
+    "2",
+    0
+   ],
+   "filename_prefix": "chouka/ckpose3d"
+  },
+  "_meta": {
+   "title": "关键点落盘"
+  }
+ },
+ "4": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "2",
+    2
+   ],
+   "filename_prefix": "chouka/ckpose3dprev"
+  },
+  "_meta": {
+   "title": "骨架预览"
+  }
+ }
+}

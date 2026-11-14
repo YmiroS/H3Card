@@ -84,6 +84,7 @@ from server.creation_agent_images import CreationAgentImages
 from server.cost_dashboard import register_cost_dashboard_routes
 from server.creation_agent.skills import register_skill_routes
 from server.cloud_lighting import CloudLighting
+from server.pose_node import PoseNode
 from server.job_polling import CACHE_KEY as JOB_POLL_CACHE_KEY, JobPollCache, job_poll_response
 from server.cloud_generation import CloudGeneration, CAPABILITIES as CLOUD_GENERATION_CAPABILITIES
 from server.cloud_images import ImageEditError
@@ -1569,6 +1570,12 @@ async def api_lighting_subjects_job(request):
 
 async def api_lighting_subjects_job_status(request):
     return request.app["cloud_lighting"].subjects_job(request)
+
+
+async def api_pose_estimate(request):
+    """姿势估计交节点跑（M3）：输入画布内已登记的图片，输出与浏览器 detectPose 同形的三段数据。"""
+    body = await authorized_body(request)
+    return await request.app["pose_node"].estimate(request, body)
 
 
 async def api_generate(request):
@@ -4636,6 +4643,8 @@ def make_app(auth_path=None, *, project_repository=None):
         require_project=require_project, require_resource=require_resource,
         require_user=require_user, resource_call=resource_call, call_store=call_store)
     app["cloud_lighting"] = CloudLighting(app, **cloud_job_options)
+    # 姿势估计（M3）：图片取回与预检都借 CloudLighting 那套，派发走 cloud_lighting 的公共通道
+    app["pose_node"] = PoseNode(app, root=ROOT, lighting=app["cloud_lighting"])
     app["cloud_generation"] = CloudGeneration(app, **cloud_job_options)
     app[JOB_POLL_CACHE_KEY] = JobPollCache()
     app["local_gpu_state"] = {}
@@ -4716,7 +4725,8 @@ def make_app(auth_path=None, *, project_repository=None):
         api_cancel=api_cancel, api_job_delete=api_job_delete,
         api_lighting_subjects=api_lighting_subjects,
         api_lighting_subjects_job=api_lighting_subjects_job,
-        api_lighting_subjects_job_status=api_lighting_subjects_job_status)
+        api_lighting_subjects_job_status=api_lighting_subjects_job_status,
+        api_pose_estimate=api_pose_estimate)
     register_media_routes(
         app, api_upload=api_upload, api_preview_file=api_preview_file,
         api_preview_status=api_preview_status, api_thumbnail=api_thumbnail,

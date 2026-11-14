@@ -50,6 +50,90 @@ def perception_block(app, graph, *, capability=SEG_CAPABILITY, team_ids=None):
     return "没有合格的执行端：" + "；".join(sorted(reasons))
 
 
+NODE_WAIT_SECONDS = 180.0
+NODE_POLL_SECONDS = 0.4
+
+
+def comfy_node_backend(app):
+    """服务端把一次推理交给 ComfyUI 的四个动作（上传 / 按 manifest 拼图 / 提交 / 取产物）。
+
+    由 app 启动时挂上来，和「提示词改写用本地 27B」那条 `rewrite_local` 同一套通道；
+    不在这里另造客户端，避免两份提交语义（锁、显存门禁、错误翻成人话）走偏。
+    """
+    backend = app.get("comfy_node")
+    if not isinstance(backend, dict):
+        raise web.HTTPNotImplemented(
+            text="还没接节点执行通道：服务端未挂载 ComfyUI 提交客户端")
+    return backend
+
+
+async def node_wait_artifacts(backend, pid, label="识别", timeout=NODE_WAIT_SECONDS,
+                              poll=NODE_POLL_SECONDS):
+    """等节点把这一步跑完 → 产物清单；执行失败或超时要说得出原因，不许静默空手回来。"""
+    deadline = time.monotonic() + timeout
+    while True:
+        files = await backend["collect"](backend["session"], pid, wait_history=True)
+        if files:
+            return files
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(poll)
+    async with backend["session"].get(f'{backend["http"]}/history/{pid}') as response:
+        entry = (await response.json()).get(pid) or {}
+    status = entry.get("status") or {}
+    if status.get("status_str") == "error":
+        details = "; ".join(str(m[-1]) for m in (status.get("messages") or [])
+                            if isinstance(m, list) and m)
+        raise web.HTTPBadGateway(text=f"节点{label}执行失败：{details or 'ComfyUI 未给出原因'}"[:400])
+    raise web.HTTPGatewayTimeout(
+        text=f"{label}在节点上等了 {int(timeout)} 秒还没出结果，"
+             "请先看执行端队列是否被大作业占住（本次没有重复提交）")
+
+
+async def node_fetch_artifact(backend, item):
+    """按产物名把节点写出的文件取回来（PNG 层 / JSON 条目 / 蒙版走同一个通道）。"""
+    params = {"filename": item["filename"], "subfolder": item.get("subfolder") or "",
+              "type": item.get("type") or "output"}
+    async with backend["session"].get(f'{backend["http"]}/view', params=params) as response:
+        if response.status != 200:
+            raise web.HTTPBadGateway(
+                text=f"节点产物读不出来：{item['filename']} 返回 {response.status}")
+        return await response.read()
+
+
+async def node_run_graph(app, capability, data, params, prefixes, label="识别",
+                        timeout=NODE_WAIT_SECONDS, poll=NODE_POLL_SECONDS):
+    """一张图交给一条 editor_only 工作流 → 按 filename_prefix 取回各产物字节。
+
+    识别（seg_persons）、手工补块（seg_manual）、姿势（pose_rtmw / pose_rtmw3d）共用这一条，
+    产物只靠图里写死的 filename_prefix 认（`collect_outputs` 不带节点号），
+    换前缀要连同 graphs/<capability>.api.json 一起改。
+    """
+    backend = comfy_node_backend(app)
+    cap = (app.get("caps") or {}).get(capability)
+    if not cap:
+        raise web.HTTPNotImplemented(
+            text=f"能力「{capability}」还没登记：服务端缺少对应的能力清单与工作流图")
+    name = f"ck_{uuid.uuid4().hex[:12]}.png"
+    uploaded = await backend["upload"](backend["session"], "image", name, data)
+    graph = await asyncio.to_thread(backend["patch"], cap, params, {"images[0]": uploaded})
+    # 不自己编 prompt_id：ComfyUI 0.45 只收标准格式 UUID（带连字符、小写），
+    # 而 comfy_submit 本来就把服务端生成的 id 回传，拿返回值轮询即可。
+    pid = await backend["submit"](app, graph, capability=capability)
+    files = await node_wait_artifacts(backend, pid, label, timeout, poll)
+    picked = {}
+    for key, (prefix, suffix) in prefixes.items():
+        item = next((entry for entry in files
+                     if str(entry.get("filename", "")).startswith(prefix)
+                     and str(entry.get("filename", "")).endswith(suffix)), None)
+        if item is None:
+            raise web.HTTPBadGateway(
+                text=f"节点没出齐产物：缺 {prefix}*{suffix}，请检查工作流 "
+                     f"graphs/{capability}.api.json 的落盘节点")
+        picked[key] = await node_fetch_artifact(backend, item)
+    return picked
+
+
 def lighting_size(info, megapixels):
     if (isinstance(megapixels, bool) or not isinstance(megapixels, (int, float))
             or not math.isfinite(megapixels) or not 0.25 <= megapixels <= 16):
@@ -513,6 +597,10 @@ class CloudLighting:
         if reason:
             raise web.HTTPNotImplemented(text=reason)
 
+    def capability_graph(self, capability):
+        """给其它派发方（姿势等）用的公开入口：按能力 id 取 API 图。"""
+        return self._capability_graph(capability)
+
     def _capability_graph(self, capability):
         """按能力 id 取 API 图（提交期预检要用它推节点类清单）。"""
         caps = self.app.get("caps") or {}
@@ -549,77 +637,21 @@ class CloudLighting:
         return os.environ.get("CHOUKA_SEG_VIA_NODE") == "1"
 
     def _comfy_node(self):
-        """服务端把识别交给 ComfyUI 的四个动作（上传 / 按 manifest 拼图 / 提交 / 取产物）。
-
-        由 app 启动时挂上来，和「提示词改写用本地 27B」那条 `rewrite_local` 同一套通道；
-        不在这里另造客户端，避免两份提交语义（锁、显存门禁、错误翻成人话）走偏。
-        """
-        backend = self.app.get("comfy_node")
-        if not isinstance(backend, dict):
-            raise web.HTTPNotImplemented(
-                text="识别还没接节点执行通道：服务端未挂载 ComfyUI 提交客户端")
-        return backend
+        """节点执行通道（与姿势等其它派发共用同一个模块级入口，不再各造客户端）。"""
+        return comfy_node_backend(self.app)
 
     async def _seg_artifacts(self, backend, pid):
-        """等节点把这一步跑完 → 产物清单；执行失败或超时要说得出原因，不许静默空手回来。"""
-        deadline = time.monotonic() + self.SEG_TIMEOUT_SECONDS
-        while True:
-            files = await backend["collect"](backend["session"], pid, wait_history=True)
-            if files:
-                return files
-            if time.monotonic() >= deadline:
-                break
-            await asyncio.sleep(self.SEG_POLL_SECONDS)
-        async with backend["session"].get(f'{backend["http"]}/history/{pid}') as response:
-            entry = (await response.json()).get(pid) or {}
-        status = entry.get("status") or {}
-        if status.get("status_str") == "error":
-            details = "; ".join(str(m[-1]) for m in (status.get("messages") or [])
-                                if isinstance(m, list) and m)
-            raise web.HTTPBadGateway(text=f"节点识别执行失败：{details or 'ComfyUI 未给出原因'}"[:400])
-        raise web.HTTPGatewayTimeout(
-            text=f"识别在节点上等了 {int(self.SEG_TIMEOUT_SECONDS)} 秒还没出结果，"
-                 "请先看执行端队列是否被大作业占住（本次没有重复提交）")
+        return await node_wait_artifacts(backend, pid, timeout=self.SEG_TIMEOUT_SECONDS,
+                                         poll=self.SEG_POLL_SECONDS)
 
     async def _seg_view(self, backend, item):
-        """按产物名把节点写出的文件取回来（PNG 层 / JSON 条目走同一个通道）。"""
-        params = {"filename": item["filename"], "subfolder": item.get("subfolder") or "",
-                  "type": item.get("type") or "output"}
-        async with backend["session"].get(f'{backend["http"]}/view', params=params) as response:
-            if response.status != 200:
-                raise web.HTTPBadGateway(
-                    text=f"节点产物读不出来：{item['filename']} 返回 {response.status}")
-            return await response.read()
+        return await node_fetch_artifact(backend, item)
 
     async def _node_run_graph(self, capability, data, params, prefixes):
-        """一张图交给一条 editor_only 工作流 → 按 filename_prefix 取回各产物字节。
-
-        产物只靠图里写死的 filename_prefix 认（`collect_outputs` 不带节点号），
-        换前缀要连同 graphs/<capability>.api.json 一起改。
-        """
-        backend = self._comfy_node()
-        cap = (self.app.get("caps") or {}).get(capability)
-        if not cap:
-            raise web.HTTPNotImplemented(
-                text=f"识别能力「{capability}」还没登记：服务端缺少对应的能力清单与工作流图")
-        name = f"ck_{uuid.uuid4().hex[:12]}.png"
-        uploaded = await backend["upload"](backend["session"], "image", name, data)
-        graph = await asyncio.to_thread(backend["patch"], cap, params, {"images[0]": uploaded})
-        # 不自己编 prompt_id：ComfyUI 0.45 只收标准格式 UUID（带连字符、小写），
-        # 而 comfy_submit 本来就把服务端生成的 id 回传，拿返回值轮询即可。
-        pid = await backend["submit"](self.app, graph, capability=capability)
-        files = await self._seg_artifacts(backend, pid)
-        picked = {}
-        for key, (prefix, suffix) in prefixes.items():
-            item = next((entry for entry in files
-                         if str(entry.get("filename", "")).startswith(prefix)
-                         and str(entry.get("filename", "")).endswith(suffix)), None)
-            if item is None:
-                raise web.HTTPBadGateway(
-                    text=f"节点没出齐产物：缺 {prefix}*{suffix}，请检查工作流 "
-                         f"graphs/{capability}.api.json 的落盘节点")
-            picked[key] = await self._seg_view(backend, item)
-        return picked
+        """一张图交给一条 editor_only 工作流 → 按 filename_prefix 取回各产物字节。"""
+        return await node_run_graph(self.app, capability, data, params, prefixes,
+                                    timeout=self.SEG_TIMEOUT_SECONDS,
+                                    poll=self.SEG_POLL_SECONDS)
 
     async def _node_identity_layer(self, data, capability, params):
         """一张原图交给一张分割工作流 → 身份索引层 + 逐身份条目（识别与出图回放共用这一条）。

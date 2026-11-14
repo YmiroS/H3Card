@@ -1,0 +1,82 @@
+{
+ "id": "pose_rtmw",
+ "name": "全身姿势关键点（RTMW 2D，打光台用）",
+ "editor_only": true,
+ "group": "图片",
+ "kind": "tool",
+ "card": "card_tools",
+ "outputType": "image",
+ "images": 1,
+ "audios": 0,
+ "videos": 0,
+ "slots": "img1+aud0+vid0",
+ "slotLimits": {
+  "image": {
+   "min": 1,
+   "max": 1
+  },
+  "audio": {
+   "min": 0,
+   "max": 0
+  },
+  "video": {
+   "min": 0,
+   "max": 0
+  }
+ },
+ "graph": "graphs/pose_rtmw.api.json",
+ "output": {
+  "node": "4"
+ },
+ "note": "3D 打光台「自动估计人体姿态」的执行体：一张图进去，出所有人的 33 点关键点 JSON（node 3）和一张骨架预览图（node 4，只作核对用）。\n不挂在画布卡片菜单里，由 /api/pose/estimate 派发；口径沿用外部 Lumen-4 那份本机姿势服务：COCO-WholeBody 133 → MediaPipe 33、以「肩中点到髋中点 = 0.5m」定尺度、每人上限 6 人、核心点置信不足的人丢掉。\n权重必须显式传本地文件名（models\\rtmlib\\ 三份 .onnx），传对了就不会联网下载；缺任何一份，派发预检当场判「权重不在位」，作业不会静默排队。",
+ "rewrite": null,
+ "inputs": [
+  {
+   "key": "images[0]",
+   "label": "原图",
+   "type": "image",
+   "required": true,
+   "target": {
+    "node": "1",
+    "input": "image",
+    "kind": "upload_image"
+   }
+  },
+  {
+   "key": "model_mode",
+   "label": "姿势档位",
+   "type": "text",
+   "advanced": true,
+   "default": "performance",
+   "target": {
+    "node": "2",
+    "input": "model_mode",
+    "vtype": "STRING"
+   }
+  },
+  {
+   "key": "det_model",
+   "label": "人体检测权重",
+   "type": "text",
+   "advanced": true,
+   "default": "yolox_m_8xb8-300e_humanart.onnx",
+   "target": {
+    "node": "2",
+    "input": "det_model",
+    "vtype": "STRING"
+   }
+  },
+  {
+   "key": "pose_model",
+   "label": "姿势权重",
+   "type": "text",
+   "advanced": true,
+   "default": "rtmw-dw-x-l_simcc-cocktail14_384x288.onnx",
+   "target": {
+    "node": "2",
+    "input": "pose_model",
+    "vtype": "STRING"
+   }
+  }
+ ]
+}
