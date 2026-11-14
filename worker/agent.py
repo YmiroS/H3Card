@@ -31,6 +31,8 @@ from remote_commands import RemoteCommands, capabilities as remote_command_capab
 
 
 CANCEL_GRACE_SECONDS = 60
+OUTPUT_HISTORY_TIMEOUT_SECONDS = 30
+OUTPUT_HISTORY_RETRY_SECONDS = 0.5
 
 
 class AgentError(RuntimeError):
@@ -1899,24 +1901,54 @@ class WorkerAgent:
 
     async def collect_outputs(self, assignment):
         job_id = assignment["job_id"]
-        history = await self._json_request("GET", self.comfy + f"/history/{job_id}")
-        entry = history.get(job_id) or {}
-        candidates = []
-        seen = set()
-        for output in (entry.get("outputs") or {}).values():
-            for value in output.values():
-                if not isinstance(value, list):
-                    continue
-                for item in value:
-                    if not isinstance(item, dict) or not item.get("filename"):
-                        continue
-                    key = (item["filename"], item.get("subfolder", ""), item.get("type", "output"))
-                    if key in seen:
-                        continue
-                    seen.add(key)
-                    candidates.append(item)
-        real = [item for item in candidates if item.get("type", "output") == "output"]
-        return await self.upload_outputs(assignment, real or candidates)
+        deadline = time.monotonic() + OUTPUT_HISTORY_TIMEOUT_SECONDS
+        while True:
+            if assignment.get("cancel_requested"):
+                raise JobFailed("任务已取消", canceled=True)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise JobFailed("ComfyUI 执行已结束，但等待产物超时；请检查节点输出，不要直接重新生成")
+            # execution_success precedes history publication in ComfyUI.
+            try:
+                history = await self._json_request(
+                    "GET", self.comfy + f"/history/{job_id}",
+                    timeout=aiohttp.ClientTimeout(total=min(5, remaining),
+                                                  sock_connect=min(3, remaining)),
+                )
+                entry = history.get(job_id) or {}
+            except (aiohttp.ClientError, asyncio.TimeoutError):
+                entry = {}
+            if assignment.get("cancel_requested"):
+                raise JobFailed("任务已取消", canceled=True)
+            status = entry.get("status") or {}
+            if status.get("status_str") == "error":
+                for event_type, data in reversed(status.get("messages") or []):
+                    if event_type == "execution_interrupted":
+                        raise JobFailed("任务已取消", canceled=True)
+                    if event_type == "execution_error":
+                        raise JobFailed.from_execution_error(data)
+                raise JobFailed("ComfyUI 执行失败")
+            candidates = []
+            seen = set()
+            if status.get("completed") and status.get("status_str") == "success":
+                for output in (entry.get("outputs") or {}).values():
+                    for value in output.values():
+                        if not isinstance(value, list):
+                            continue
+                        for item in value:
+                            if not isinstance(item, dict) or not item.get("filename"):
+                                continue
+                            key = (item["filename"], item.get("subfolder", ""), item.get("type", "output"))
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            candidates.append(item)
+            if candidates:
+                real = [item for item in candidates if item.get("type", "output") == "output"]
+                return await self.upload_outputs(assignment, real or candidates)
+            remaining = deadline - time.monotonic()
+            if remaining > 0:
+                await asyncio.sleep(min(OUTPUT_HISTORY_RETRY_SECONDS, remaining))
 
     async def upload_outputs(self, assignment, items):
         outputs = []
@@ -2005,6 +2037,8 @@ class WorkerAgent:
                 raise JobFailed("任务已取消", canceled=True)
             stage = "upload"
             outputs = await self.collect_outputs(assignment)
+            if not outputs:
+                raise JobFailed("未取得任务产物，不能上报完成")
             uploaded = time.monotonic()
             measurements["upload_seconds"] = uploaded - executed
             if assignment.get("cancel_requested"):

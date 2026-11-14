@@ -2790,6 +2790,8 @@ async def api_agent_complete(request):
         raise web.HTTPConflict(reason="正在释放显存，等待 Worker 确认")
     if distributed_store(request.app).dispatch_status(pid) == "cancel_requested":
         raise web.HTTPConflict(text="任务已取消")
+    if not outputs:
+        raise web.HTTPConflict(text="未收到任务产物，不能标记为已完成")
     store = distributed_store(request.app)
     with store.lock:
         capacity_outputs = store.capacity.artifact_outputs(pid, output_keys)

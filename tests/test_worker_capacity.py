@@ -13,6 +13,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 import aiohttp
+from aiohttp import web
+from aiohttp.test_utils import TestServer
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "worker"))
@@ -509,6 +511,157 @@ class WorkerIPTransmissionTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         factory.assert_not_called()
 
 
+class WorkerOutputCollectionTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.worker = self.make_worker()
+        self.assignment = {"job_id": "job-1"}
+        self.now = 100.0
+        self.enterContext(mock.patch("agent.time", SimpleNamespace(monotonic=lambda: self.now)))
+        self.enterContext(mock.patch("agent.OUTPUT_HISTORY_TIMEOUT_SECONDS", 2))
+
+        async def sleep(seconds):
+            self.now += seconds
+
+        self.sleep = self.enterContext(mock.patch("agent.asyncio.sleep", side_effect=sleep))
+        self.video = {"filename": "H3_fusion_v3_00047.mp4", "subfolder": "chouka", "type": "output"}
+        self.history = {"job-1": {
+            "status": {"completed": True, "status_str": "success"},
+            "outputs": {"148": {"gifs": [self.video]}},
+        }}
+        self.worker.upload_outputs = mock.AsyncMock(return_value=[{"kind": "video", "url": "/artifact.mp4"}])
+
+    async def test_waits_for_history_completion_and_nonempty_video_outputs(self):
+        pending = copy.deepcopy(self.history)
+        pending["job-1"]["status"]["completed"] = False
+        empty = {"job-1": {"status": {"completed": True, "status_str": "success"}, "outputs": {}}}
+        self.worker._json_request = mock.AsyncMock(side_effect=[{}, pending, empty, self.history])
+        outputs = await self.worker.collect_outputs(self.assignment)
+        self.assertEqual(outputs, [{"kind": "video", "url": "/artifact.mp4"}])
+        self.assertEqual(self.worker._json_request.await_count, 4)
+        self.worker.upload_outputs.assert_awaited_once_with(self.assignment, [self.video])
+        self.assertEqual(self.sleep.await_count, 3)
+        for call in self.worker._json_request.await_args_list:
+            self.assertEqual(call.args, ("GET", self.worker.comfy + "/history/job-1"))
+            self.assertLessEqual(call.kwargs["timeout"].total, 2)
+
+    async def test_transient_history_network_errors_retry_without_resubmitting(self):
+        self.worker._json_request = mock.AsyncMock(side_effect=[
+            aiohttp.ClientConnectionError("history unavailable"), asyncio.TimeoutError(), self.history,
+        ])
+        await self.worker.collect_outputs(self.assignment)
+        self.worker.upload_outputs.assert_awaited_once_with(self.assignment, [self.video])
+        self.assertTrue(all(call.args[0] == "GET" for call in self.worker._json_request.await_args_list))
+
+    async def test_missing_or_empty_history_has_bounded_wait_and_never_uploads(self):
+        for history in ({}, {"job-1": {"status": {"completed": True, "status_str": "success"},
+                                       "outputs": {"148": {"gifs": []}}}}):
+            with self.subTest(history=history):
+                self.now = 100.0
+                self.worker._json_request = mock.AsyncMock(return_value=history)
+                with self.assertRaisesRegex(JobFailed, "等待产物超时"):
+                    await self.worker.collect_outputs(self.assignment)
+                self.assertEqual(self.now, 102.0)
+                self.assertEqual(self.worker._json_request.await_count, 4)
+                self.worker.upload_outputs.assert_not_awaited()
+
+    async def test_cancel_during_history_request_does_not_upload(self):
+        async def request(*args, **kwargs):
+            self.assignment["cancel_requested"] = True
+            return self.history
+
+        self.worker._json_request = mock.AsyncMock(side_effect=request)
+        with self.assertRaises(JobFailed) as caught:
+            await self.worker.collect_outputs(self.assignment)
+        self.assertTrue(caught.exception.canceled)
+        self.worker.upload_outputs.assert_not_awaited()
+        self.sleep.assert_not_awaited()
+
+    async def test_cancel_during_retry_stops_before_next_history_request(self):
+        async def sleep(seconds):
+            self.now += seconds
+            self.assignment["cancel_requested"] = True
+
+        self.sleep.side_effect = sleep
+        self.worker._json_request = mock.AsyncMock(return_value={})
+        with self.assertRaises(JobFailed) as caught:
+            await self.worker.collect_outputs(self.assignment)
+        self.assertTrue(caught.exception.canceled)
+        self.worker._json_request.assert_awaited_once()
+        self.worker.upload_outputs.assert_not_awaited()
+
+    async def test_history_failure_is_not_hidden_as_an_output_timeout(self):
+        self.worker._json_request = mock.AsyncMock(return_value={"job-1": {
+            "status": {"completed": False, "status_str": "error", "messages": [
+                ["execution_error", {"exception_message": "encoder failed", "node_id": "148"}],
+            ]},
+        }})
+        with self.assertRaisesRegex(JobFailed, "encoder failed") as caught:
+            await self.worker.collect_outputs(self.assignment)
+        self.assertEqual(caught.exception.node_id, "148")
+        self.sleep.assert_not_awaited()
+        self.worker.upload_outputs.assert_not_awaited()
+
+    async def test_real_outputs_are_deduplicated_and_preferred_over_temp_previews(self):
+        self.history["job-1"]["outputs"]["148"]["gifs"] = [
+            {"filename": "preview.png", "type": "temp"}, self.video, self.video,
+        ]
+        self.worker._json_request = mock.AsyncMock(return_value=self.history)
+        await self.worker.collect_outputs(self.assignment)
+        self.worker.upload_outputs.assert_awaited_once_with(self.assignment, [self.video])
+        self.sleep.assert_not_awaited()
+
+
+class WorkerOutputHttpTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
+    async def test_late_history_is_collected_over_real_http_without_regeneration(self):
+        calls = []
+        video = {"filename": "H3_fusion_v3_00047.mp4", "subfolder": "chouka", "type": "output"}
+
+        async def history(request):
+            calls.append(request.method)
+            if len(calls) < 3:
+                return web.json_response({})
+            return web.json_response({"job-1": {
+                "status": {"completed": True, "status_str": "success"},
+                "outputs": {"148": {"gifs": [video]}},
+            }})
+
+        app = web.Application()
+        app.router.add_get("/history/job-1", history)
+        worker = self.make_worker()
+        assignment = {"job_id": "job-1"}
+        worker.upload_outputs = mock.AsyncMock(return_value=[{"kind": "video"}])
+        async with TestServer(app) as server, aiohttp.ClientSession() as session:
+            worker.session = session
+            worker.comfy = str(server.make_url("")).rstrip("/")
+            with mock.patch("agent.OUTPUT_HISTORY_RETRY_SECONDS", 0.01):
+                self.assertEqual(await worker.collect_outputs(assignment), [{"kind": "video"}])
+        self.assertEqual(calls, ["GET", "GET", "GET"])
+        worker.upload_outputs.assert_awaited_once_with(assignment, [video])
+
+    async def test_stalled_history_http_request_obeys_total_collection_deadline(self):
+        gate = asyncio.Event()
+
+        async def history(request):
+            await gate.wait()
+            return web.json_response({})
+
+        app = web.Application()
+        app.router.add_get("/history/job-1", history)
+        worker = self.make_worker()
+        worker.upload_outputs = mock.AsyncMock()
+        async with TestServer(app) as server, aiohttp.ClientSession() as session:
+            worker.session = session
+            worker.comfy = str(server.make_url("")).rstrip("/")
+            try:
+                with mock.patch("agent.OUTPUT_HISTORY_TIMEOUT_SECONDS", 0.05):
+                    async with asyncio.timeout(1):
+                        with self.assertRaisesRegex(JobFailed, "等待产物超时"):
+                            await worker.collect_outputs({"job_id": "job-1"})
+            finally:
+                gate.set()
+        worker.upload_outputs.assert_not_awaited()
+
+
 class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         environment = mock.patch.dict(os.environ)
@@ -599,6 +752,14 @@ class WorkerCapacityTest(WorkerFixture, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private-", json.dumps(body))
         self.assertNotIn("456789", json.dumps(body))
         self.assertNotIn("_cleanup_task", self.assignment)
+
+    async def test_empty_collected_outputs_are_reported_as_failure_not_completion(self):
+        self.worker.collect_outputs = mock.AsyncMock(return_value=[])
+        body = await self.execute()
+        self.assertTrue(self.requests[-1][0].endswith("/failed"))
+        self.assertIn("未取得任务产物", body["error"])
+        self.assertFalse(any(url.endswith("/complete") for url, _body in self.requests))
+        self.assertTrue(body["capacity_released"])
 
     async def test_graph_in_place_change_is_detected_without_reporting_contents(self):
         self.change_graph = True

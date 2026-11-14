@@ -4790,6 +4790,22 @@ class ControllerApiTest(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
         self.assertEqual(controller_app.JOBS["job-1"]["progress"], 0.99)
         self.assertEqual(controller_app.JOBS["job-1"]["step"], "正在归集产物")
 
+        # 空历史不能提前结束租约、结算计费或把画布任务标记为完成。
+        for outputs in ([], None, {}, "not-an-output-list"):
+            with self.subTest(outputs=outputs):
+                response = await self.client.post(
+                    "/agent/v1/jobs/job-1/complete", headers=lease_headers,
+                    json={"outputs": outputs, "capacity_released": True},
+                )
+                self.assertEqual(response.status, 409, await response.text())
+                self.assertIn("未收到任务产物", await response.text())
+                self.assertEqual(controller_app.JOBS["job-1"]["status"], "running")
+                self.assertEqual(self.store.dispatch_status("job-1"), "running")
+                self.assertTrue(self.store.validate_lease(
+                    "job-1", credentials["worker_id"], assignment["lease_token"],
+                ))
+                self.assertEqual(self.ledger.report()["jobs"][0]["status"], "running")
+
         # 产物必须先经 Worker 上传登记，完成回调只认本任务已登记的产物。
         artifact_form = aiohttp.FormData()
         artifact_form.add_field("file", b"png-bytes", filename="file.png",
