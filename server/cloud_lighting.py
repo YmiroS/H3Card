@@ -532,6 +532,14 @@ class CloudLighting:
             return False
         return os.environ.get("CHOUKA_SEG_VIA_NODE") == "1"
 
+    def _node_replay_on(self):
+        """出图前的整图分割回放是否也交节点（M2-16，与识别同一个开关）。
+
+        这条不接的话，翻档只省掉识别那一步：`_run_local` 打光前还要验一次「候选没变」，
+        那时服务机照样得加载 YOLO，torch + ultralytics 一行都卸不掉。
+        """
+        return os.environ.get("CHOUKA_SEG_VIA_NODE") == "1"
+
     def _comfy_node(self):
         """服务端把识别交给 ComfyUI 的四个动作（上传 / 按 manifest 拼图 / 提交 / 取产物）。
 
@@ -591,39 +599,61 @@ class CloudLighting:
                     text=f"节点产物读不出来：{item['filename']} 返回 {response.status}")
             return await response.read()
 
+    async def _node_identity_layer(self, data, capability, params):
+        """一张原图交给一张分割工作流 → 身份索引层 + 逐身份条目（识别与出图回放共用这一条）。
+
+        尺寸校验放在这里而不是调用方：层和送进去的那张图必须逐像素同尺，
+        差 1 像素就当场报错，拉伸对齐会让回贴看起来像「打光照错了人」。
+        """
+        backend = self._comfy_node()
+        cap = (self.app.get("caps") or {}).get(capability)
+        if not cap:
+            raise web.HTTPNotImplemented(
+                text=f"识别能力「{capability}」还没登记：服务端缺少对应的能力清单与工作流图")
+        name = f"ck_{uuid.uuid4().hex[:12]}.png"
+        uploaded = await backend["upload"](backend["session"], "image", name, data)
+        graph = await asyncio.to_thread(backend["patch"], cap, params, {"images[0]": uploaded})
+        # 不自己编 prompt_id：ComfyUI 0.45 只收标准格式 UUID（带连字符、小写），
+        # 而 comfy_submit 本来就把服务端生成的 id 回传，拿返回值轮询即可。
+        pid = await backend["submit"](self.app, graph, capability=capability)
+        layer_item, entries_item = self._seg_pick(await self._seg_artifacts(backend, pid))
+        layer_bytes = await self._seg_view(backend, layer_item)
+        entries = json.loads((await self._seg_view(backend, entries_item)).decode("utf-8"))
+        size = local_relight.load_rgb(data).size
+        got = local_relight.layer_source_size(layer_bytes)
+        if got != size:
+            raise web.HTTPBadGateway(
+                text=f"节点回传的身份层是 {got[0]}x{got[1]}，原图是 {size[0]}x{size[1]}；"
+                     "尺寸对不上不做拉伸，请重新识别")
+        return local_relight.decode_identity_layer(layer_bytes, size), entries
+
     async def _subjects_node(self, plan, data, user):
         """整图自动识别交给节点：原图 → 身份索引层 + 逐身份条目 → 候选（口径同远端分区路）。
 
         层与原图尺寸差 1 像素就当场报错，不做拉伸（Spec §5.2）；候选直接吃
         `_layer_candidates`，所以编号、box、coverage 与大模型分区那条路完全可比。
         """
-        backend = self._comfy_node()
-        cap = (self.app.get("caps") or {}).get(SEG_CAPABILITY)
-        if not cap:
-            raise web.HTTPNotImplemented(
-                text=f"识别能力「{SEG_CAPABILITY}」还没登记：服务端缺少对应的能力清单与工作流图")
-        name = f"ck_{uuid.uuid4().hex[:12]}.png"
-        uploaded = await backend["upload"](backend["session"], "image", name, data)
-        graph = await asyncio.to_thread(backend["patch"], cap,
-                                        {"min_area_ratio": plan[3]}, {"images[0]": uploaded})
-        # 不自己编 prompt_id：ComfyUI 0.45 只收标准格式 UUID（带连字符、小写），
-        # 而 comfy_submit 本来就把服务端生成的 id 回传，拿返回值轮询即可。
-        pid = await backend["submit"](self.app, graph, capability=SEG_CAPABILITY)
-        layer_item, entries_item = self._seg_pick(await self._seg_artifacts(backend, pid))
-        layer_bytes = await self._seg_view(backend, layer_item)
-        entries = json.loads((await self._seg_view(backend, entries_item)).decode("utf-8"))
-        picture = local_relight.load_rgb(data)
-        size = picture.size
-        got = local_relight.layer_source_size(layer_bytes)
-        if got != size:
-            raise web.HTTPBadGateway(
-                text=f"节点回传的身份层是 {got[0]}x{got[1]}，原图是 {size[0]}x{size[1]}；"
-                     "尺寸对不上不做拉伸，请重新识别")
-        layer = local_relight.decode_identity_layer(layer_bytes, size)
+        layer, entries = await self._node_identity_layer(data, SEG_CAPABILITY,
+                                                         {"min_area_ratio": plan[3]})
         candidates = await asyncio.to_thread(self._layer_candidates, layer, entries["entries"])
         dropped = int(entries.get("dropped") or 0)
         note = (f"有 {dropped} 个人超出 255 个身份上限，本次没编号" if dropped else None)
         return candidates, "node", note
+
+    async def _replay_people_node(self, base_img):
+        """出图前的整图分割回放交给节点（M2-16），返回与 `segment_auto` 同形的逐人列表。
+
+        回放这一步只为两件事：确认「候选还是那些人」和按编号取回蒙版。
+        编号按质心左到右，识别那一步用的是同一张工作流，所以 p1/p2/… 不会换人。
+        蒙版从 `layer_to_candidates` 取：身份层是硬边整数号，回贴前要过与老链同一档
+        的 1.2 像素羽化，直接拿硬边会让节点回放的边缘比进程内那条更锐。
+        """
+        np = local_relight._imports()[1]
+        data = local_relight.encode_png(np.asarray(base_img))
+        layer, entries = await self._node_identity_layer(data, SEG_CAPABILITY, {})
+        return [{"id": f"p{entry['index']}", "box": entry["box"], "coverage": entry["coverage"],
+                 "mask": mask} for entry, mask in
+                local_relight.layer_to_candidates(layer, entries["entries"])]
 
     def _subjects_work(self, plan, data, user):
         return self._subjects_candidates(data, plan[2], plan[3], plan[4], plan[5], user,
@@ -1008,9 +1038,15 @@ class CloudLighting:
                 layer = await asyncio.to_thread(local_relight.decode_identity_layer,
                                                 local["manual_layer"], (width, height))
             pending = [subject for subject in subjects if subject["id"] not in manual_ids]
-            people = (await asyncio.to_thread(local_relight.segment_auto, base_img)
-                      if pending else [])
-            found_ids = [f"p{index}" for index in range(1, len(people) + 1)]
+            if not pending:
+                people = []
+            elif self._node_replay_on():
+                # 翻档以后这一步也在节点上跑，服务机不再加载 YOLO（M2-16）。
+                people = await self._replay_people_node(base_img)
+            else:
+                people = [{**person, "id": f"p{index}"} for index, person in enumerate(
+                    await asyncio.to_thread(local_relight.segment_auto, base_img), 1)]
+            found_ids = [person["id"] for person in people]
             missing = [s["id"] for s in pending
                        if s.get("source") == "auto" and s.get("kind") == "person"
                        and s["id"] not in found_ids]

@@ -1468,6 +1468,32 @@ class SubjectsNodeSegmentationTests(CloudLightingFixture, unittest.IsolatedAsync
         work.assert_called_once()
         self.assertEqual(self.backend_calls["submit"], [])
 
+    async def test_replay_people_keeps_the_node_numbering(self):
+        """出图回放用同一张工作流、同一套编号：p1/p2 由节点的号决定，服务端不许自己重排。"""
+        self.two_person_layer()
+        np = local_relight._imports()[1]
+        people = await self.application["cloud_lighting"]._replay_people_node(
+            Image.new("RGB", (4, 3), (10, 20, 30)))
+        self.assertEqual([person["id"] for person in people], ["p1", "p2"])
+        self.assertEqual(people[0]["box"], [0.5, 0.0, 1.0, 1.0])
+        mask = np.asarray(people[0]["mask"])
+        self.assertEqual(mask.shape, (3, 4))
+        # 蒙版要和身份层其它派生路一样带 1.2 像素羽化：硬边只有 0 和 1 两种值，
+        # 回贴时边缘会比进程内那条老链更锐，这里用「有没有中间灰度」钉住口径。
+        self.assertTrue(0.0 < float(mask.min()) and float(mask.max()) < 1.0,
+                        f"蒙版没有羽化：min={mask.min()} max={mask.max()}")
+        self.assertGreater(float(mask[:, 2:].mean()), float(mask[:, :2].mean()))
+        cap, params, _uploaded = self.backend_calls["patch"][0]
+        # 回放这一段没有面板上的敏感度可调，按工作流默认面积线走
+        self.assertEqual((cap, params), ("seg_persons", {}))
+        self.assertEqual(self.backend_calls["submit"][0][1], "seg_persons")
+
+    async def test_replay_switch_follows_the_same_env(self):
+        """不翻档时出图回放仍是进程内老路，行为与改动前一致（R16）。"""
+        self.assertTrue(self.application["cloud_lighting"]._node_replay_on())
+        with mock.patch.dict(os.environ, {"CHOUKA_SEG_VIA_NODE": "0"}):
+            self.assertFalse(self.application["cloud_lighting"]._node_replay_on())
+
     async def test_layer_with_wrong_size_is_refused(self):
         """节点回传的层多一列也不收：拉伸会把相邻身份按面积投票掉，错得看不出来。"""
         self.two_person_layer()
@@ -1727,6 +1753,42 @@ class CloudLightingLocalTests(CloudLightingFixture, unittest.IsolatedAsyncioTest
         self.assertEqual(response.status, 200)
         payload = await response.read()
         self.assertTrue(payload.startswith(b"\x89PNG"), "artifact must be a PNG")
+
+    async def test_local_replay_uses_the_node_when_switched_on(self):
+        """翻档以后，出图前的整图分割回放也交节点（M2-16）：服务机这边一段模型都不加载。
+
+        这条是「翻档能不能卸掉 torch」的分界：识别接了但回放没接，出图时照样要在
+        服务机进程里跑一遍 YOLO，依赖一行都省不掉。
+        """
+        np = cloud_lighting.local_relight._imports()[1]
+        seen = {}
+
+        async def fake_replay(base_img):
+            seen["size"] = base_img.size
+            height, width = np.asarray(base_img).shape[:2]
+            return [{"id": "p1", "box": [0.1, 0.1, 0.9, 0.9], "coverage": 0.4,
+                     "mask": np.ones((height, width), np.float32)}]
+
+        def never_called(*args, **kwargs):
+            raise AssertionError("翻档以后出图不该在服务机进程内跑分割")
+
+        with mock.patch.dict(os.environ, {"CHOUKA_REHEARSAL": "1", "CHOUKA_SEG_VIA_NODE": "1"}), \
+                mock.patch("server.cloud_lighting.local_relight.segment_persons",
+                           side_effect=never_called), \
+                mock.patch.object(self.application["cloud_lighting"], "_replay_people_node",
+                                  new=fake_replay):
+            response = await self.generate(params=self.local_params())
+            self.assertEqual(response.status, 200, await response.text())
+            submitted = await response.json()
+            for _ in range(400):
+                status = app.JOBS.get(submitted["id"], {}).get("status")
+                if status in ("done", "error"):
+                    break
+                await asyncio.sleep(0.05)
+        job = app.JOBS[submitted["id"]]
+        self.assertEqual(job["status"], "done", job.get("error"))
+        # 回放送进节点的就是出图那一张（已按出图尺寸摆正），不是识别时的原图
+        self.assertEqual(seen["size"], (job["outputs"][0]["width"], job["outputs"][0]["height"]))
 
     async def _run_local_chain(self, params):
         """跑一遍局部打光链路，返回接地阴影用的主光方位角。"""
