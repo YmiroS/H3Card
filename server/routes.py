@@ -72,7 +72,8 @@ def register_generation_routes(app, *, api_health, api_status, api_cards, api_re
                                api_generate, api_generation_workers, api_rewrite, api_text, api_jobs,
                                api_jobs_clear, api_jobs_history, api_job, api_job_inputs,
                                api_cancel, api_job_delete, api_lighting_subjects,
-                               api_lighting_subjects_job, api_lighting_subjects_job_status):
+                               api_lighting_subjects_job, api_lighting_subjects_job_status,
+                               api_pose_estimate):
     app.router.add_get("/api/health", api_health)
     app.router.add_get("/api/status", api_status)
     app.router.add_get("/api/cards", api_cards)
@@ -81,6 +82,8 @@ def register_generation_routes(app, *, api_health, api_status, api_cards, api_re
     app.router.add_post("/api/lighting/subjects", api_lighting_subjects)
     app.router.add_post("/api/lighting/subjects/job", api_lighting_subjects_job)
     app.router.add_get("/api/lighting/subjects/job/{jid}", api_lighting_subjects_job_status)
+    # 姿势估计交节点跑（M3）：一张已登记图片 → 与浏览器 detectPose 同形的三段关键点数据
+    app.router.add_post("/api/pose/estimate", api_pose_estimate)
     app.router.add_get("/api/generation/workers", api_generation_workers)
     app.router.add_post("/api/rewrite", api_rewrite)
     app.router.add_post("/api/text", api_text)

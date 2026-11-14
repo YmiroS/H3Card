@@ -905,5 +905,50 @@ class RegionIndexVoteTests(unittest.TestCase):
         self.assertEqual(result["index"], 1)
 
 
+class MaskSizeContractTests(unittest.TestCase):
+    """回传尺寸契约（Spec §5.2）：默认拒绝拉伸、重采样要显式点名、EXIF 方向在入口转正。"""
+
+    def png(self, array):
+        buffer = BytesIO()
+        Image.fromarray(array, "L").save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def test_exact_size_passes_without_resampling(self):
+        raw = self.png(np.ones((64, 96), np.uint8) * 255)
+        decoded = lr.decode_mask(raw, (96, 64))
+        self.assertEqual(decoded.shape, (64, 96))
+        self.assertAlmostEqual(float(decoded[0, 0]), 1.0, places=6)
+
+    def test_one_pixel_off_is_refused(self):
+        # 反向验证：故意只差 1 列也必须失败，否则「同尺寸」这条断言等于没写。
+        raw = self.png(np.ones((64, 96), np.uint8) * 255)
+        with self.assertRaises(lr.MaskSizeMismatch):
+            lr.decode_mask(raw, (97, 64))
+
+    def test_resampling_is_opt_in(self):
+        raw = self.png(np.ones((64, 96), np.uint8) * 255)
+        self.assertEqual(lr.decode_mask(raw, (32, 20), resample="lanczos").shape, (20, 32))
+        self.assertEqual(lr.decode_mask(raw, (128, 80), resample="nearest").shape, (80, 128))
+
+    def test_check_layer_size_rejects_one_pixel(self):
+        layer = np.zeros((64, 96), np.uint8)
+        self.assertIs(lr.check_layer_size(layer, (96, 64)), layer)
+        with self.assertRaises(lr.MaskSizeMismatch):
+            lr.check_layer_size(layer, (96, 63))
+
+    def test_load_rgb_applies_exif_orientation(self):
+        exif = Image.Exif()
+        exif[274] = 6  # 不转正的话，蒙版和像素会整整差一个 90°
+        image = Image.new("RGB", (40, 20), (10, 200, 30))
+        buffer = BytesIO()
+        image.save(buffer, format="JPEG", exif=exif.tobytes())
+        self.assertEqual(lr.load_rgb(buffer.getvalue()).size, (20, 40))
+
+    def test_in_process_ready_does_not_consult_weights(self):
+        # 体检这把尺子只看 cv2/numpy：拿权重在不在当判据，会把只用投票的远端分区路一起拦死。
+        with mock.patch.object(lr, "yolo_available", side_effect=AssertionError("不该查权重")):
+            self.assertTrue(lr.in_process_ready())
+
+
 if __name__ == "__main__":
     unittest.main()

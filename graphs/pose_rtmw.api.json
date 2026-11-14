@@ -1,0 +1,52 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "example.png"
+  },
+  "_meta": {
+   "title": "原图"
+  }
+ },
+ "2": {
+  "class_type": "ChoukaRtmwPose",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "model_mode": "performance",
+   "det_model": "yolox_m_8xb8-300e_humanart.onnx",
+   "pose_model": "rtmw-dw-x-l_simcc-cocktail14_384x288.onnx"
+  },
+  "_meta": {
+   "title": "RTMW 全身姿势"
+  }
+ },
+ "3": {
+  "class_type": "ChoukaSaveJson",
+  "inputs": {
+   "text": [
+    "2",
+    0
+   ],
+   "filename_prefix": "chouka/ckpose"
+  },
+  "_meta": {
+   "title": "关键点落盘"
+  }
+ },
+ "4": {
+  "class_type": "SaveImage",
+  "inputs": {
+   "images": [
+    "2",
+    2
+   ],
+   "filename_prefix": "chouka/ckposeprev"
+  },
+  "_meta": {
+   "title": "骨架预览"
+  }
+ }
+}

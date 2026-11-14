@@ -84,6 +84,7 @@ from server.creation_agent_images import CreationAgentImages
 from server.cost_dashboard import register_cost_dashboard_routes
 from server.creation_agent.skills import register_skill_routes
 from server.cloud_lighting import CloudLighting
+from server.pose_node import PoseNode
 from server.job_polling import CACHE_KEY as JOB_POLL_CACHE_KEY, JobPollCache, job_poll_response
 from server.cloud_generation import CloudGeneration, CAPABILITIES as CLOUD_GENERATION_CAPABILITIES
 from server.cloud_images import ImageEditError
@@ -1569,6 +1570,12 @@ async def api_lighting_subjects_job(request):
 
 async def api_lighting_subjects_job_status(request):
     return request.app["cloud_lighting"].subjects_job(request)
+
+
+async def api_pose_estimate(request):
+    """姿势估计交节点跑（M3）：输入画布内已登记的图片，输出与浏览器 detectPose 同形的三段数据。"""
+    body = await authorized_body(request)
+    return await request.app["pose_node"].estimate(request, body)
 
 
 async def api_generate(request):
@@ -4493,6 +4500,10 @@ async def on_start(app):
     app["session"] = aiohttp.ClientSession(
         timeout=aiohttp.ClientTimeout(total=None, sock_connect=10),
         trace_configs=trace_configs, trust_env=False)
+    # 识别交给节点跑时用的是同一份会话（含沙箱出站拦截），不在业务模块里另开一路连接。
+    # 通道字典由 make_app 挂；自建 app 的测试没有它，那种情况下识别会回「未挂载提交客户端」的 501。
+    if isinstance(app.get("comfy_node"), dict):
+        app["comfy_node"]["session"] = app["session"]
     if app["local_test"]:
         await setup_local_test_auth(app)
     elif not app.get("admin_sandbox"):
@@ -4619,6 +4630,12 @@ def make_app(auth_path=None, *, project_repository=None):
     app = web.Application(client_max_size=512 * 1024 ** 2,
                           middlewares=[sandbox_guard, auth_middleware, project_write_lock])
     app["comfy_lock"] = asyncio.Lock()
+    # 能力清单按引用挂到 app 上：load_caps 是原地 clear()/回填，所以这里挂的始终是最新一份。
+    app["caps"] = CAPS
+    # 服务端内部「把一次识别交给 ComfyUI」的四个动作挂在这。语义与提示词改写用本地 27B 的
+    # rewrite_local 一致（同一把提交锁、同一套显存门禁），业务模块不再各造一份客户端。
+    app["comfy_node"] = {"http": COMFY_HTTP, "upload": comfy_upload, "patch": patch_graph,
+                         "submit": local_submit, "collect": collect_outputs}
     app["cleanup_pending"] = {pid for pid, job in JOBS.items()
                               if job.get("cleanup_pending") and not CONTROLLER_MODE}
     app["cleanup_tasks"] = {}
@@ -4628,6 +4645,8 @@ def make_app(auth_path=None, *, project_repository=None):
         require_project=require_project, require_resource=require_resource,
         require_user=require_user, resource_call=resource_call, call_store=call_store)
     app["cloud_lighting"] = CloudLighting(app, **cloud_job_options)
+    # 姿势估计（M3）：图片取回与预检都借 CloudLighting 那套，派发走 cloud_lighting 的公共通道
+    app["pose_node"] = PoseNode(app, root=ROOT, lighting=app["cloud_lighting"])
     app["cloud_generation"] = CloudGeneration(app, **cloud_job_options)
     app[JOB_POLL_CACHE_KEY] = JobPollCache()
     app["local_gpu_state"] = {}
@@ -4708,7 +4727,8 @@ def make_app(auth_path=None, *, project_repository=None):
         api_cancel=api_cancel, api_job_delete=api_job_delete,
         api_lighting_subjects=api_lighting_subjects,
         api_lighting_subjects_job=api_lighting_subjects_job,
-        api_lighting_subjects_job_status=api_lighting_subjects_job_status)
+        api_lighting_subjects_job_status=api_lighting_subjects_job_status,
+        api_pose_estimate=api_pose_estimate)
     register_media_routes(
         app, api_upload=api_upload, api_preview_file=api_preview_file,
         api_preview_status=api_preview_status, api_thumbnail=api_thumbnail,

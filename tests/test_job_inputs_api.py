@@ -43,7 +43,8 @@ class JobInputsApiTests(unittest.IsolatedAsyncioTestCase, auth_support.AuthFixtu
             api_cancel=backend.api_cancel, api_job_delete=backend.api_job_delete,
             api_lighting_subjects=backend.api_lighting_subjects,
             api_lighting_subjects_job=backend.api_lighting_subjects_job,
-            api_lighting_subjects_job_status=backend.api_lighting_subjects_job_status)
+            api_lighting_subjects_job_status=backend.api_lighting_subjects_job_status,
+            api_pose_estimate=backend.api_pose_estimate)
         await self.start_client(application)
         self.addAsyncCleanup(self.client.close)
 

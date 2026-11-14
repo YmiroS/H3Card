@@ -1,0 +1,112 @@
+{
+ "1": {
+  "class_type": "LoadImage",
+  "inputs": {
+   "image": "example.png"
+  },
+  "_meta": {
+   "title": "原图"
+  }
+ },
+ "2": {
+  "class_type": "ChoukaPersonSeg",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "model_name": "person_yolov8m-seg.pt",
+   "imgsz": 640,
+   "conf": 0.3,
+   "min_area_ratio": 0.002
+  },
+  "_meta": {
+   "title": "逐人实例分割"
+  }
+ },
+ "3": {
+  "class_type": "ChoukaFaceSeg",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "model_name": "face_yolov8m.pt",
+   "imgsz": 640,
+   "conf": 0.3
+  },
+  "_meta": {
+   "title": "人脸锚点"
+  }
+ },
+ "4": {
+  "class_type": "ChoukaSamPrompt",
+  "inputs": {
+   "image": [
+    "1",
+    0
+   ],
+   "mode": "recover_faces",
+   "sam_model": "sam2.1_hiera_small.pt",
+   "sam_config": "configs/sam2.1/sam2.1_hiera_s.yaml",
+   "prompt_json": "",
+   "person_masks": [
+    "2",
+    0
+   ],
+   "face_boxes": [
+    "3",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "漏检补块"
+  }
+ },
+ "5": {
+  "class_type": "ChoukaSegMerge",
+  "inputs": {
+   "masks": [
+    "2",
+    0
+   ],
+   "more_masks": [
+    "4",
+    0
+   ],
+   "image": [
+    "1",
+    0
+   ]
+  },
+  "_meta": {
+   "title": "按左到右编号"
+  }
+ },
+ "6": {
+  "class_type": "ChoukaSaveIdentityLayer",
+  "inputs": {
+   "ordered_masks": [
+    "5",
+    0
+   ],
+   "filename_prefix": "chouka/segidx"
+  },
+  "_meta": {
+   "title": "身份索引层"
+  }
+ },
+ "7": {
+  "class_type": "ChoukaSaveJson",
+  "inputs": {
+   "text": [
+    "5",
+    3
+   ],
+   "filename_prefix": "chouka/segentries"
+  },
+  "_meta": {
+   "title": "逐身份条目"
+  }
+ }
+}
